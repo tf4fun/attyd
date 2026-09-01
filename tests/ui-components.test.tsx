@@ -77,11 +77,10 @@ describe("ACP UI component contract", () => {
               type: "object",
               required: ["name", "count", "channel", "tags"],
               properties: {
-                name: {
+                channel: {
                   type: "string",
-                  title: "Name",
-                  minLength: 2,
-                  pattern: "^[A-Za-z ]+$",
+                  title: "Channel",
+                  enum: ["stable", "preview"],
                 },
                 count: {
                   type: "integer",
@@ -89,10 +88,11 @@ describe("ACP UI component contract", () => {
                   minimum: 1,
                   maximum: 3,
                 },
-                channel: {
+                name: {
                   type: "string",
-                  title: "Channel",
-                  enum: ["stable", "preview"],
+                  title: "Name",
+                  minLength: 2,
+                  pattern: "^[A-Za-z ]+$",
                 },
                 tags: {
                   type: "array",
@@ -118,6 +118,8 @@ describe("ACP UI component contract", () => {
     expect(html).toContain("Cancel");
     expect(html).toContain('role="dialog"');
     expect(html).toContain('aria-label="Agent input request"');
+    expect(html.indexOf("Name *")).toBeLessThan(html.indexOf("Count *"));
+    expect(html.indexOf("Count *")).toBeLessThan(html.indexOf("Channel *"));
   });
 
   it("renders a cancelled external flow as terminal and dismissible", () => {

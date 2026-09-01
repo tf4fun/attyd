@@ -7,25 +7,33 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
-import type { WebSocket } from "ws";
-import { AcpBridge } from "../server/acp-bridge.js";
+import WebSocket from "ws";
 import { parseServerEvent, type ServerEvent } from "../shared/bridge.js";
 import { appReducer, initialState, type AppState } from "../src/lib/state.js";
+import { startRustTestServer } from "./rust-test-server.js";
 
 const LOCAL_PROVIDER_KEY = "attyd-local-provider-fixture";
 const LOCAL_TOOL_OUTPUT = "ATTYD_GOOSE_TOOL_OK";
 const LOCAL_AGENT_OUTPUT = "LOCAL_GOOSE_ACP_OK";
 
 class TestSocket {
-  readonly OPEN = 1;
-  readonly readyState = 1;
   readonly events: ServerEvent[] = [];
   state: AppState = initialState;
 
+  constructor(private readonly socket: WebSocket) {
+    socket.on("message", (data) => {
+      const event = parseServerEvent(data.toString());
+      this.events.push(event);
+      this.state = appReducer(this.state, { type: "server/event", event });
+    });
+  }
+
   send(data: string): void {
-    const event = parseServerEvent(data);
-    this.events.push(event);
-    this.state = appReducer(this.state, { type: "server/event", event });
+    this.socket.send(data);
+  }
+
+  close(): void {
+    this.socket.terminate();
   }
 }
 
@@ -441,15 +449,18 @@ async function exerciseConfiguredBridge(
   expectedVersion: string,
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
-  const socket = new TestSocket();
-  const bridge = new AcpBridge(socket as unknown as WebSocket, {
+  const server = await startRustTestServer({
     command: [resolve("bin/goose"), "acp", "--with-builtin", "developer"],
     cwd: process.cwd(),
-    readOnly: false,
     env,
   });
+  let socket: TestSocket | undefined;
   try {
-    await bridge.start();
+    socket = await connectTestSocket(server.port);
+    await waitForEvent(socket, (event) => event.type === "acp/initialized");
+    await waitForEvent(socket, (event) =>
+      event.type === "bridge/phase" && event.phase === "ready"
+    );
     if (
       socket.state.phase !== "ready" ||
       socket.state.initialized?.agentInfo?.name !== "goose" ||
@@ -464,7 +475,7 @@ async function exerciseConfiguredBridge(
       kind: "new",
       requestId: newRequestId,
     });
-    bridge.receive(JSON.stringify({ type: "session/new", requestId: newRequestId }));
+    socket.send(JSON.stringify({ type: "session/new", requestId: newRequestId }));
     const created = await waitForEvent(socket, (event) =>
       event.type === "acp/session_created" && event.requestId === newRequestId,
       10_000,
@@ -486,13 +497,13 @@ async function exerciseConfiguredBridge(
       sessionId,
       blocks,
     });
-    bridge.receive(JSON.stringify({
+    socket.send(JSON.stringify({
       type: "session/prompt",
       requestId: promptRequestId,
       sessionId,
       prompt: blocks,
     }));
-    await waitForConfiguredPrompt(socket, bridge, promptRequestId);
+    await waitForConfiguredPrompt(socket, promptRequestId);
     if (socket.state.running || socket.state.pendingPrompt != null) {
       throw new Error("Configured Goose prompt did not settle in the browser reducer");
     }
@@ -534,13 +545,13 @@ async function exerciseConfiguredBridge(
       throw new Error(`Configured Goose stop response was not preserved: ${JSON.stringify(stop)}`);
     }
   } finally {
-    bridge.close();
+    socket?.close();
+    await server.close();
   }
 }
 
 async function waitForConfiguredPrompt(
   socket: TestSocket,
-  bridge: AcpBridge,
   requestId: string,
 ): Promise<void> {
   const responded = new Set<string>();
@@ -556,7 +567,7 @@ async function waitForConfiguredPrompt(
         permissionId: event.permissionId,
         requestId: responseRequestId,
       });
-      bridge.receive(JSON.stringify({
+      socket.send(JSON.stringify({
         type: "permission/respond",
         requestId: responseRequestId,
         permissionId: event.permissionId,
@@ -583,15 +594,18 @@ async function exerciseBridge(
   expectedVersion: string,
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
-  const socket = new TestSocket();
-  const bridge = new AcpBridge(socket as unknown as WebSocket, {
+  const server = await startRustTestServer({
     command: [resolve("bin/goose"), "acp"],
     cwd: process.cwd(),
-    readOnly: false,
     env,
   });
+  let socket: TestSocket | undefined;
   try {
-    await bridge.start();
+    socket = await connectTestSocket(server.port);
+    await waitForEvent(socket, (event) => event.type === "acp/initialized");
+    await waitForEvent(socket, (event) =>
+      event.type === "bridge/phase" && event.phase === "ready"
+    );
     if (
       socket.state.phase !== "ready" ||
       socket.state.initialized?.agentInfo?.name !== "goose" ||
@@ -600,7 +614,7 @@ async function exerciseBridge(
       throw new Error(`Goose bridge did not initialize correctly: ${JSON.stringify(socket.state.initialized)}`);
     }
 
-    bridge.receive(JSON.stringify({
+    socket.send(JSON.stringify({
       type: "session/new",
       requestId: "goose-bridge-new",
     }));
@@ -610,20 +624,21 @@ async function exerciseBridge(
     if (error.type !== "bridge/error") throw new Error("Unreachable Goose bridge event");
     if (
       error.operation !== "session/new" ||
-      !error.message.includes("ACP error -32603") ||
-      !error.message.includes("GOOSE_PROVIDER")
+      error.code !== -32_603 ||
+      !JSON.stringify(error.data).includes("GOOSE_PROVIDER")
     ) {
       throw new Error(`Goose bridge lost ACP error details: ${JSON.stringify(error)}`);
     }
     const visibleError = socket.state.timeline.at(-1);
     if (
       visibleError?.type !== "error" ||
-      !visibleError.message.includes("GOOSE_PROVIDER")
+      visibleError.code !== -32_603 ||
+      !JSON.stringify(visibleError.data).includes("GOOSE_PROVIDER")
     ) {
       throw new Error(`Goose error did not reach the browser reducer: ${JSON.stringify(visibleError)}`);
     }
 
-    bridge.receive(JSON.stringify({
+    socket.send(JSON.stringify({
       type: "session/list",
       requestId: "goose-bridge-list",
     }));
@@ -637,8 +652,19 @@ async function exerciseBridge(
       throw new Error("Goose bridge/reducer did not remain usable after session/new failed");
     }
   } finally {
-    bridge.close();
+    socket?.close();
+    await server.close();
   }
+}
+
+async function connectTestSocket(port: number): Promise<TestSocket> {
+  const connection = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const socket = new TestSocket(connection);
+  await new Promise<void>((resolvePromise, reject) => {
+    connection.once("open", resolvePromise);
+    connection.once("error", reject);
+  });
+  return socket;
 }
 
 async function waitForEvent(

@@ -98,6 +98,7 @@ export default function App() {
   const sidebarClose = useRef<HTMLButtonElement>(null);
   const previousRunning = useRef(false);
   const lastPositionedSession = useRef<string | undefined>(undefined);
+  const followLatestOnViewport = useRef(false);
 
   const measureThreadScroll = useCallback(() => {
     const element = scroll.current;
@@ -119,14 +120,20 @@ export default function App() {
   const navigateThread = useCallback((target: ThreadNavigationTarget) => {
     const element = scroll.current;
     if (!element) return;
+    followLatestOnViewport.current = target === "bottom";
     if (target === "top" || target === "bottom") {
       // Boundary controls should be deterministic even while streamed content
       // is changing the scroll height. Smooth scrolling can be interrupted by
       // those layout updates and leave the thread between endpoints.
+      const previousBehavior = element.style.scrollBehavior;
+      element.style.scrollBehavior = "auto";
       element.scrollTop = target === "top"
         ? 0
         : Math.max(0, element.scrollHeight - element.clientHeight);
-      requestAnimationFrame(measureThreadScroll);
+      requestAnimationFrame(() => {
+        element.style.scrollBehavior = previousBehavior;
+        measureThreadScroll();
+      });
       return;
     }
     if (target === "page-up" || target === "page-down") {
@@ -185,18 +192,17 @@ export default function App() {
     const element = scroll.current;
     if (!element) return;
 
-    let keepLatestVisible = false;
     let frame = 0;
     const composerOwnsFocus = () =>
       document.activeElement instanceof Element &&
       document.activeElement.closest(".composer") != null;
     const moveToLatest = () => {
-      if (!keepLatestVisible || !composerOwnsFocus()) return;
+      if (!followLatestOnViewport.current || !composerOwnsFocus()) return;
       element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
       measureThreadScroll();
     };
     const followViewport = () => {
-      if (!keepLatestVisible || !composerOwnsFocus()) return;
+      if (!followLatestOnViewport.current || !composerOwnsFocus()) return;
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         moveToLatest();
@@ -206,11 +212,11 @@ export default function App() {
     const rememberPosition = (event: FocusEvent) => {
       if (!(event.target instanceof Element) || event.target.closest(".composer") == null) return;
       const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-      keepLatestVisible = distance <= 48;
+      followLatestOnViewport.current = distance <= 48;
       followViewport();
     };
     const stopFollowing = () => {
-      keepLatestVisible = false;
+      followLatestOnViewport.current = false;
       cancelAnimationFrame(frame);
     };
 

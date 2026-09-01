@@ -1,16 +1,12 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
-import { startHttpServer } from "../server/http-server.js";
 import type { ServerEvent } from "../shared/bridge.js";
 import { appReducer, initialState, type AppState } from "../src/lib/state.js";
+import { startRustTestServer } from "./rust-test-server.js";
 
 const cwd = process.cwd();
-const backend = process.env.ATTYD_SMOKE_BACKEND === "rust" ? "rust" : "node";
-const server = await startSmokeServer(cwd, backend);
+const server = await startSmokeServer(cwd);
 
 try {
   const origin = `http://127.0.0.1:${server.port}`;
@@ -19,7 +15,7 @@ try {
   assert.deepEqual(await health.json(), {
     ok: true,
     protocol: "acp/v1",
-    ...(backend === "rust" ? { backend: "rust" } : {}),
+    backend: "rust",
   });
 
   const page = await fetch(origin);
@@ -33,13 +29,13 @@ try {
   assert.equal(bundle.status, 200);
   assert.match(bundle.headers.get("content-type") ?? "", /^text\/javascript/);
 
-  await exerciseAgentHardening(cwd, backend);
+  await exerciseAgentHardening(cwd);
   if (process.env.ATTYD_SMOKE_SKIP_OVERSIZED_LINE !== "1") {
-    await exerciseOversizedAgentLine(cwd, backend);
+    await exerciseOversizedAgentLine(cwd);
   }
-  await exerciseAgentSemanticHardening(cwd, backend);
-  await exerciseEarlySemanticRejection(cwd, backend);
-  await exerciseMcpConnectCancellation(cwd, backend);
+  await exerciseAgentSemanticHardening(cwd);
+  await exerciseEarlySemanticRejection(cwd);
+  await exerciseMcpConnectCancellation(cwd);
   const webSocketUrl = `ws://127.0.0.1:${server.port}/ws`;
   const hardeningEvents = await exerciseHardeningWebSocket(webSocketUrl);
   assert.ok(hardeningEvents.some((event) =>
@@ -361,7 +357,6 @@ interface SmokeServer {
 
 async function startSmokeServer(
   cwd: string,
-  backend: "node" | "rust",
   agentFlags: string[] = ["--early-new-updates", "--early-fork-updates"],
   agentFixture = "fake-agent.ts",
 ): Promise<SmokeServer> {
@@ -380,75 +375,19 @@ async function startSmokeServer(
     env: [{ name: "BROWSER_MCP_SECRET", value: "server-side-only" }],
   };
 
-  if (backend === "node") {
-    return startHttpServer({
-      host: "127.0.0.1",
-      port: 0,
-      cwd,
-      readOnly: false,
-      dev: false,
-      additionalDirectories: [],
-      mcpServers: [{
-        type: "acp",
-        name: provider.name,
-        serverId: provider.serverId,
-      }],
-      acpMcpProviders: [provider],
-      transport: "stdio",
-      command: agentCommand,
-    });
-  }
-
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-rust-smoke-"));
-  const mcpConfig = join(temporaryDirectory, "mcp.json");
-  await writeFile(mcpConfig, JSON.stringify({
-    mcpServers: [{ type: "acp", ...provider }],
-  }), "utf8");
-
-  const rustBinary = process.env.ATTYD_RUST_BINARY ?? join(cwd, "target/debug/attyd");
-  const child = spawn(rustBinary, [
-    "--host",
-    "127.0.0.1",
-    "--port",
-    "0",
-    "--cwd",
+  return startRustTestServer({
     cwd,
-    "--mcp-config",
-    mcpConfig,
-    "--",
-    ...agentCommand,
-  ], {
-    cwd,
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
+    command: agentCommand,
+    mcpConfig: {
+      mcpServers: [{ type: "acp", ...provider }],
+    },
   });
-
-  try {
-    const port = await waitForRustServer(child);
-    return {
-      port,
-      async close() {
-        child.kill("SIGTERM");
-        await Promise.race([
-          new Promise<void>((resolve) => child.once("exit", () => resolve())),
-          new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-        ]);
-        if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
-        await rm(temporaryDirectory, { recursive: true, force: true });
-      },
-    };
-  } catch (error) {
-    child.kill("SIGKILL");
-    await rm(temporaryDirectory, { recursive: true, force: true });
-    throw error;
-  }
 }
 
 async function exerciseAgentHardening(
   cwd: string,
-  backend: "node" | "rust",
 ): Promise<void> {
-  const cyclicServer = await startSmokeServer(cwd, backend, ["--cyclic-list"]);
+  const cyclicServer = await startSmokeServer(cwd, ["--cyclic-list"]);
   try {
     const socket = new WebSocket(`ws://127.0.0.1:${cyclicServer.port}/ws`);
     const events: ServerEvent[] = [];
@@ -504,9 +443,8 @@ async function exerciseAgentHardening(
 
 async function exerciseOversizedAgentLine(
   cwd: string,
-  backend: "node" | "rust",
 ): Promise<void> {
-  const oversizedServer = await startSmokeServer(cwd, backend, ["--oversized-stdout-line"]);
+  const oversizedServer = await startSmokeServer(cwd, ["--oversized-stdout-line"]);
   try {
     const socket = new WebSocket(`ws://127.0.0.1:${oversizedServer.port}/ws`);
     const events: ServerEvent[] = [];
@@ -542,11 +480,9 @@ async function exerciseOversizedAgentLine(
 
 async function exerciseMcpConnectCancellation(
   cwd: string,
-  backend: "node" | "rust",
 ): Promise<void> {
   const cancellationServer = await startSmokeServer(
     cwd,
-    backend,
     [],
     "raw-connect-cancel-agent.ts",
   );
@@ -612,9 +548,8 @@ async function exerciseMcpConnectCancellation(
 
 async function exerciseAgentSemanticHardening(
   cwd: string,
-  backend: "node" | "rust",
 ): Promise<void> {
-  const semanticServer = await startSmokeServer(cwd, backend, []);
+  const semanticServer = await startSmokeServer(cwd, []);
   try {
     const socket = new WebSocket(`ws://127.0.0.1:${semanticServer.port}/ws`);
     const events: ServerEvent[] = [];
@@ -729,11 +664,9 @@ async function exerciseAgentSemanticHardening(
 
 async function exerciseEarlySemanticRejection(
   cwd: string,
-  backend: "node" | "rust",
 ): Promise<void> {
   const semanticServer = await startSmokeServer(
     cwd,
-    backend,
     ["--invalid-early-content-once"],
   );
   try {
@@ -990,38 +923,6 @@ async function waitForSmokeEvent(
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for hardening event: ${JSON.stringify(events)}`);
-}
-
-function waitForRustServer(child: ChildProcessWithoutNullStreams): Promise<number> {
-  return new Promise((resolve, reject) => {
-    let output = "";
-    let errors = "";
-    const timeout = setTimeout(() => {
-      reject(new Error(`Rust attyd did not start in time. stdout=${output} stderr=${errors}`));
-    }, 10_000);
-    const finish = (error?: Error, port?: number) => {
-      clearTimeout(timeout);
-      child.stdout.removeAllListeners("data");
-      child.stderr.removeAllListeners("data");
-      child.removeAllListeners("exit");
-      if (error) reject(error);
-      else resolve(port!);
-    };
-    child.stdout.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-      const match = output.match(/attyd listening on http:\/\/127\.0\.0\.1:(\d+)/u);
-      if (match) finish(undefined, Number(match[1]));
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      errors += chunk.toString();
-    });
-    child.once("exit", (code, signal) => {
-      finish(new Error(
-        `Rust attyd exited before listening (code=${String(code)}, signal=${String(signal)}). ` +
-        `stdout=${output} stderr=${errors}`,
-      ));
-    });
-  });
 }
 
 function exerciseAttachmentWebSocket(url: string): Promise<{

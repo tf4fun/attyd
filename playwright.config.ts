@@ -19,7 +19,7 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
   webServer: {
-    command: "npm run test:ui:serve -- 7332",
+    command: "npm run test:browser:serve -- 7332",
     url: "http://127.0.0.1:7332/api/health",
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

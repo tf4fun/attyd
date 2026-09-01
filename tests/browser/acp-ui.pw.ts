@@ -2,7 +2,7 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startHttpServer } from "../../server/http-server";
+import { startRustTestServer } from "../../scripts/rust-test-server";
 
 test("drives permission and form ACP interactions with real focus restoration", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
@@ -875,6 +875,7 @@ test("navigates long threads and opens a faithful Markdown view", async ({ page 
     element.scrollHeight - element.clientHeight - element.scrollTop
   )).toBeLessThan(3);
   await composer.focus();
+  await expect(composer).toBeFocused();
   await page.keyboard.press("Control+Home");
   await expect.poll(() => thread.evaluate((element) => element.scrollTop)).toBeLessThan(3);
 
@@ -951,16 +952,8 @@ test("reconnects a stale mobile-style socket after a focus liveness probe", asyn
 });
 
 test("recovers startup through Agent-owned ACP authentication", async ({ page }) => {
-  const authServer = await startHttpServer({
-    host: "127.0.0.1",
-    port: 0,
+  const authServer = await startRustTestServer({
     cwd: process.cwd(),
-    readOnly: false,
-    dev: false,
-    additionalDirectories: [],
-    mcpServers: [],
-    acpMcpProviders: [],
-    transport: "stdio",
     command: [
       process.execPath,
       "--import",
@@ -1013,17 +1006,9 @@ test("recovers startup through Agent-owned ACP authentication", async ({ page })
 test("runs negotiated terminal authentication and reconnects the Agent", async ({ page }) => {
   const root = await mkdtemp(join(tmpdir(), "attyd-browser-terminal-auth-"));
   const authFile = join(root, "authenticated");
-  const authServer = await startHttpServer({
-    host: "127.0.0.1",
-    port: 0,
+  const authServer = await startRustTestServer({
     cwd: process.cwd(),
-    readOnly: false,
-    dev: false,
-    additionalDirectories: [],
-    mcpServers: [],
-    acpMcpProviders: [],
     env: { ...process.env, ATTYD_FAKE_AUTH_FILE: authFile },
-    transport: "stdio",
     command: [
       process.execPath,
       "--import",

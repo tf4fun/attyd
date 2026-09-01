@@ -9,6 +9,7 @@ interface PendingRoundTrip {
 const pendingRoundTrips = new Map<JsonRpcId, PendingRoundTrip>();
 let nextServerRequest = 0;
 let cancellationCount = 0;
+let pendingCount = 0;
 
 const lines = createInterface({ input: process.stdin });
 lines.on("line", (line) => {
@@ -92,6 +93,12 @@ lines.on("line", (line) => {
       break;
     }
     case "never":
+      pendingCount += 1;
+      write({
+        jsonrpc: "2.0",
+        method: "notifications/progress",
+        params: { progressToken: "pending", progress: pendingCount },
+      });
       break;
     case "exit":
       setTimeout(() => process.exit(23), 0);

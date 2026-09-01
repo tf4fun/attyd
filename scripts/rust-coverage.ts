@@ -3,34 +3,21 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-interface NodeCoverageSummary {
-  total: { lines: { pct: number } };
-}
-
 interface RustCoverageSummary {
   data: Array<{ totals: { lines: { percent: number } } }>;
 }
 
 const workspace = process.cwd();
-const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-backend-coverage-"));
-const nodeReportDirectory = join(temporaryDirectory, "node");
-const rustReportPath = join(temporaryDirectory, "rust.json");
+const minimumLines = Number(process.env.ATTYD_MIN_RUST_COVERAGE ?? "85");
+if (!Number.isFinite(minimumLines) || minimumLines < 0 || minimumLines > 100) {
+  throw new Error("ATTYD_MIN_RUST_COVERAGE must be a percentage from 0 through 100");
+}
+
+const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-rust-coverage-"));
+const reportPath = join(temporaryDirectory, "rust.json");
 const coverageTarget = join(workspace, "target", "llvm-cov-target");
 
 try {
-  run("npx", [
-    "vitest",
-    "run",
-    "--coverage",
-    "--coverage.reporter=json-summary",
-    `--coverage.reportsDirectory=${nodeReportDirectory}`,
-    "--coverage.include=server/**/*.ts",
-    "--coverage.include=shared/**/*.ts",
-  ]);
-  const nodeSummary = JSON.parse(
-    await readFile(join(nodeReportDirectory, "coverage-summary.json"), "utf8"),
-  ) as NodeCoverageSummary;
-
   run("cargo", ["llvm-cov", "clean", "--workspace", "--offline"]);
   run("cargo", ["llvm-cov", "--offline", "--all-targets", "--no-report"], {
     ATTYD_SKIP_WEB_BUILD: "1",
@@ -46,12 +33,12 @@ try {
     "debug",
     process.platform === "win32" ? "attyd.exe" : "attyd",
   );
-  run("npm", ["run", "test:ui:rust"], {
+  run("node", ["--import", "tsx", "scripts/ui-smoke.ts"], {
     ...instrumentedEnvironment,
     ATTYD_RUST_BINARY: rustBinary,
     ATTYD_SMOKE_SKIP_OVERSIZED_LINE: "1",
   });
-  run("npm", ["run", "test:rust:remote"], {
+  run("node", ["--import", "tsx", "scripts/rust-remote-smoke.ts"], {
     ...instrumentedEnvironment,
     ATTYD_RUST_BINARY: rustBinary,
   });
@@ -63,28 +50,22 @@ try {
     "--json",
     "--summary-only",
     "--output-path",
-    rustReportPath,
+    reportPath,
   ]);
   run("cargo", ["llvm-cov", "report", "--offline"]);
-  const rustSummary = JSON.parse(
-    await readFile(rustReportPath, "utf8"),
-  ) as RustCoverageSummary;
-
-  const nodeLines = nodeSummary.total.lines.pct;
-  const rustLines = rustSummary.data[0]?.totals.lines.percent;
-  if (rustLines == null || !Number.isFinite(rustLines)) {
+  const summary = JSON.parse(await readFile(reportPath, "utf8")) as RustCoverageSummary;
+  const lines = summary.data[0]?.totals.lines.percent;
+  if (lines == null || !Number.isFinite(lines)) {
     throw new Error("Rust coverage report did not contain a finite line percentage");
   }
 
-  console.log("\nBackend line coverage parity");
-  console.log(`  Node server/shared: ${nodeLines.toFixed(2)}%`);
-  console.log(`  Rust backend:       ${rustLines.toFixed(2)}%`);
-  if (rustLines + Number.EPSILON < nodeLines) {
+  console.log(`\nRust backend line coverage: ${lines.toFixed(2)}%`);
+  if (lines + Number.EPSILON < minimumLines) {
     throw new Error(
-      `Rust backend line coverage ${rustLines.toFixed(2)}% is below Node ${nodeLines.toFixed(2)}%`,
+      `Rust backend line coverage ${lines.toFixed(2)}% is below ${minimumLines.toFixed(2)}%`,
     );
   }
-  console.log("  Result: PASS (Rust is at or above the Node line-coverage baseline)");
+  console.log(`Result: PASS (minimum ${minimumLines.toFixed(2)}%)`);
 } finally {
   await rm(temporaryDirectory, { recursive: true, force: true });
 }

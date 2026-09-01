@@ -159,7 +159,7 @@ impl WorkspaceFileSystem {
             }
             Err(error) => return Err(fs_error(error)),
         };
-        // Match the Node oracle: cancellation is honored until the mutation starts.
+        // Cancellation is honored until the filesystem mutation starts.
         // Once an in-place write begins it must finish, otherwise the peer could leave
         // a previously valid file truncated or partially written.
         ensure_not_cancelled(cancellation)?;

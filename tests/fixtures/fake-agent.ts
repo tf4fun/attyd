@@ -75,6 +75,7 @@ let configuredMcpServers: acp.McpServer[] = [];
 const observedNesRejects: acp.RejectNesNotification[] = [];
 const observedNesEvents: string[] = [];
 const observedSessionCloses: string[] = [];
+const observedMcpNotifications: acp.MessageMcpNotification[] = [];
 let closeAttempts = 0;
 let deleteAttempts = 0;
 let controlAttempts = 0;
@@ -560,7 +561,9 @@ const agent = acp
   .onNotification<acp.MessageMcpNotification>(
     acp.AGENT_METHODS.mcp_message,
     parseMcpMessage,
-    () => {},
+    ({ params }) => {
+      observedMcpNotifications.push(params);
+    },
   )
   .onRequest(acp.methods.agent.session.prompt, async ({ params, client, requestId }) => {
     const promptText = params.prompt
@@ -829,7 +832,7 @@ const agent = acp
           () => true,
         )
       );
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitForMcpPendingNotifications(bounded.connectionId, 128);
       const overflow = client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
         acp.CLIENT_METHODS.mcp_message,
         { connectionId: bounded.connectionId, method: "never" },
@@ -1870,4 +1873,24 @@ function requestErrorDetails(error: unknown): { code?: number; message: string; 
     ...(error instanceof acp.RequestError ? { code: error.code, data: error.data } : {}),
     message: errorText(error),
   };
+}
+
+async function waitForMcpPendingNotifications(
+  connectionId: string,
+  expected: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const observed = observedMcpNotifications.filter((notification) =>
+      notification.connectionId === connectionId &&
+      notification.method === "notifications/progress" &&
+      typeof notification.params === "object" &&
+      notification.params !== null &&
+      "progressToken" in notification.params &&
+      notification.params.progressToken === "pending"
+    ).length;
+    if (observed >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${expected} pending MCP requests`);
 }

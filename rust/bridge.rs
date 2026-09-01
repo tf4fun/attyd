@@ -2141,6 +2141,10 @@ async fn cancel_interactions(
             let _ = pending.sender.send(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,
             ));
+            sink.send(json!({
+                "type": "acp/permission_resolved",
+                "permissionId": id,
+            }));
         }
     }
     let elicitation_ids = state
@@ -2152,9 +2156,13 @@ async fn cancel_interactions(
         .collect::<Vec<_>>();
     for id in elicitation_ids {
         if let Some(pending) = state.elicitations.remove(&id) {
-            let _ = pending
-                .sender
-                .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
+            let response = CreateElicitationResponse::new(ElicitationAction::Cancel);
+            let _ = pending.sender.send(response.clone());
+            sink.send(json!({
+                "type": "acp/elicitation_resolved",
+                "elicitationId": id,
+                "response": response,
+            }));
         }
     }
     let url_elicitation_ids = state
@@ -2993,9 +3001,21 @@ mod tests {
         assert!(!state.url_elicitations.contains_key("session-url"));
         assert!(state.url_elicitations.contains_key("request-url"));
         drop(state);
-        let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(event["type"], "acp/elicitation_aborted");
-        assert_eq!(event["reason"], "session_cancelled");
+        let events = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().any(|event| {
+            event["type"] == "acp/permission_resolved" && event["permissionId"] == "permission"
+        }));
+        assert!(events.iter().any(|event| {
+            event["type"] == "acp/elicitation_resolved"
+                && event["elicitationId"] == "session-elicitation"
+                && event["response"]["action"] == "cancel"
+        }));
+        assert!(events.iter().any(|event| {
+            event["type"] == "acp/elicitation_aborted" && event["reason"] == "session_cancelled"
+        }));
     }
 
     #[tokio::test]

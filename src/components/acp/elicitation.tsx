@@ -45,6 +45,13 @@ export function ElicitationCard({
     () => new Set(formRequest?.requestedSchema.required ?? []),
     [formRequest],
   );
+  const orderedProperties = useMemo(
+    () => orderedPropertyEntries(
+      properties,
+      formRequest?.requestedSchema.required ?? [],
+    ),
+    [formRequest, properties],
+  );
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -80,7 +87,7 @@ export function ElicitationCard({
 
       {formRequest ? (
         <fieldset className="elicitation-fields" disabled={responding}>
-          {Object.entries(properties).map(([name, schema]) => (
+          {orderedProperties.map(([name, schema]) => (
             <ElicitationField
               key={name}
               name={name}
@@ -134,6 +141,22 @@ export function ElicitationCard({
       <RawJson label="Input request" value={request} />
     </form>
   );
+}
+
+function orderedPropertyEntries(
+  properties: Record<string, ElicitationPropertySchema>,
+  requiredNames: string[],
+): Array<[string, ElicitationPropertySchema]> {
+  const entries = Object.entries(properties);
+  const required = new Set(requiredNames);
+  const byName = new Map(entries);
+  return [
+    ...requiredNames.flatMap((name) => {
+      const schema = byName.get(name);
+      return schema == null ? [] : [[name, schema] as [string, ElicitationPropertySchema]];
+    }),
+    ...entries.filter(([name]) => !required.has(name)),
+  ];
 }
 
 export function ExternalFlowCard({
