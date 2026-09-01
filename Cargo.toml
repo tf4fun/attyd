@@ -1,0 +1,49 @@
+[package]
+name = "attyd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Expose an ACP agent as a lightweight web workspace"
+build = "build.rs"
+
+[[bin]]
+name = "attyd"
+path = "rust/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "754d5aa1ce2cfa54ba2c2a6d3edc7e7b6bce28eb", features = ["unstable"] }
+agent-client-protocol-http = { git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "754d5aa1ce2cfa54ba2c2a6d3edc7e7b6bce28eb", features = ["client"] }
+anyhow = "1.0"
+async-process = "2.5"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+mime_guess = "2.0"
+portable-pty = "0.9"
+regex = "1.11"
+rustix = { version = "1.1", features = ["process"] }
+rust-embed = { version = "8.7", features = ["compression"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower-http = { version = "0.6", features = ["compression-full", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["v4"] }
+url = "2.5"
+walkdir = "2.5"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+tempfile = "3.20"
+tokio-tungstenite = "0.27"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

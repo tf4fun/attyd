@@ -1,0 +1,12 @@
+{
+  "mcpServers": [
+    {
+      "name": "browser-regression",
+      "type": "http",
+      "url": "https://example.test/mcp",
+      "headers": [
+        { "name": "Authorization", "value": "browser-regression-secret" }
+      ]
+    }
+  ]
+}
