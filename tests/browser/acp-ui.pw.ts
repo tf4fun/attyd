@@ -326,6 +326,47 @@ test("switches between already-open ACP threads without loading them twice", asy
   expect(browserErrors).toEqual([]);
 });
 
+test("closes then deletes both switched-away and current ACP sessions", async ({ page }) => {
+  const server = await startRustTestServer({
+    cwd: process.cwd(),
+    command: [
+      process.execPath,
+      "--import",
+      "tsx",
+      join(process.cwd(), "tests/fixtures/fake-agent.ts"),
+      "--require-close-before-delete",
+    ],
+  });
+  const browserErrors = collectBrowserErrors(page);
+
+  try {
+    await page.goto(`http://127.0.0.1:${server.port}`);
+    const sidebar = page.getByRole("complementary", { name: "Application sidebar" });
+    await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+
+    await sidebar.locator(".session-open")
+      .filter({ hasText: "Earlier Agent thread" })
+      .click();
+    await expect(page.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
+    const oldDelete = sidebar.getByRole("button", { name: "Delete Saved ACP session" });
+    await expect(oldDelete).toBeEnabled();
+    page.once("dialog", (dialog) => dialog.accept());
+    await oldDelete.click();
+    await expect(sidebar.getByText("Saved ACP session", { exact: true })).toBeHidden();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+
+    await page.getByRole("button", { name: "Thread actions" }).click();
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Delete thread" }).click();
+    await expect(page.getByRole("heading", { name: "No active session" })).toBeVisible();
+    await expect(sidebar.getByText("Earlier Agent thread", { exact: true })).toBeHidden();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await server.close();
+  }
+});
+
 test("keeps expanded ACP turn payloads inside the message flow", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");

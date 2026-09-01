@@ -14,6 +14,7 @@ const slowClose = process.argv.includes("--slow-close");
 const failCloseOnce = process.argv.includes("--fail-close-once");
 const slowDelete = process.argv.includes("--slow-delete");
 const failDeleteOnce = process.argv.includes("--fail-delete-once");
+const requireCloseBeforeDelete = process.argv.includes("--require-close-before-delete");
 const slowControl = process.argv.includes("--slow-control");
 const failControlOnce = process.argv.includes("--fail-control-once");
 const raceNew = process.argv.includes("--race-new");
@@ -349,9 +350,12 @@ const agent = acp
     }
     return {};
   })
-  .onRequest(acp.methods.agent.session.delete, async () => {
+  .onRequest(acp.methods.agent.session.delete, async ({ params }) => {
     deleteAttempts += 1;
     if (slowDelete) await new Promise((resolve) => setTimeout(resolve, 150));
+    if (requireCloseBeforeDelete && !observedSessionCloses.includes(params.sessionId)) {
+      throw new acp.RequestError(-32600, "Session must be closed before deletion");
+    }
     if (failDeleteOnce && deleteAttempts === 1) {
       throw new acp.RequestError(-32603, "Synthetic delete failure");
     }

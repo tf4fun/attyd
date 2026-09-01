@@ -1488,7 +1488,16 @@ async fn handle_command(
             state.lock().await.pending_deletions.remove(session_id);
             let response = result?;
             ensure_relay_size(&response, "session/delete response")?;
-            state.lock().await.listed_sessions.remove(session_id);
+            cancel_interactions(session_id, "session_closed", &state, &sink).await;
+            if let Some(terminals) = &terminals {
+                terminals.release_session(session_id).await;
+            }
+            {
+                let mut state = state.lock().await;
+                state.active_sessions.remove(session_id);
+                state.listed_sessions.remove(session_id);
+                state.session_updates.remove(session_id);
+            }
             sink.send(json!({
                 "type": "acp/session_deleted",
                 "requestId": request_id,
@@ -2061,6 +2070,7 @@ fn reserve_session_operation(
         || state.pending_forks.contains(session_id)
         || state.pending_closes.contains(session_id)
         || state.pending_controls.contains(session_id)
+        || state.pending_deletions.contains(session_id)
     {
         return Err(
             Error::invalid_request().data("another prompt or session mutation is already running")
@@ -2091,16 +2101,15 @@ fn release_session_operation(
 }
 
 fn reserve_deletion(state: &mut BridgeState, session_id: &str) -> Result<(), Error> {
-    if !state.listed_sessions.contains_key(session_id) {
-        return Err(Error::invalid_params().data(format!(
-            "session was not returned by session/list: {session_id}"
-        )));
-    }
-    if state.active_sessions.contains_key(session_id) {
-        return Err(Error::invalid_request().data("close the active session before deleting it"));
-    }
-    if state.pending_attachments.contains(session_id) {
-        return Err(Error::invalid_request().data("session attachment is already running"));
+    if state.pending_attachments.contains(session_id)
+        || state.prompts.contains(session_id)
+        || state.pending_forks.contains(session_id)
+        || state.pending_closes.contains(session_id)
+        || state.pending_controls.contains(session_id)
+    {
+        return Err(
+            Error::invalid_request().data("another prompt or session mutation is already running")
+        );
     }
     if state.pending_deletions.len() >= MAX_TRACKED_SESSIONS {
         return Err(semantic_error(format!(
@@ -2688,6 +2697,18 @@ mod tests {
         state.pending_attachments.clear();
         reserve_deletion(&mut state, "saved").unwrap();
         assert!(reserve_deletion(&mut state, "saved").is_err());
+        assert!(reserve_session_operation(&mut state, "active", SessionOperation::Prompt).is_ok());
+        release_session_operation(&mut state, "active", SessionOperation::Prompt);
+
+        state.pending_deletions.clear();
+        reserve_deletion(&mut state, "active").unwrap();
+        assert!(reserve_session_operation(&mut state, "active", SessionOperation::Prompt).is_err());
+        state.pending_deletions.clear();
+
+        // Session identity is owned by the Agent. The bridge must not reject a
+        // just-closed or remotely known session merely because it was not in a
+        // local session/list snapshot.
+        reserve_deletion(&mut state, "agent-owned-session").unwrap();
     }
 
     #[test]

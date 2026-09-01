@@ -1438,10 +1438,12 @@ function exerciseWebSocket(url: string): Promise<{
           type: "session/delete_start",
           requestId: "ui-smoke-delete",
           sessionId: "saved-session",
+          stage: "deleting",
         });
         assert.deepEqual(state.pendingSessionDeletions, [{
           requestId: "ui-smoke-delete",
           sessionId: "saved-session",
+          stage: "deleting",
         }]);
         socket.send(JSON.stringify({
           type: "session/delete",

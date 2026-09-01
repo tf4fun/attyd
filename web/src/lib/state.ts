@@ -150,6 +150,7 @@ export interface SessionTransition {
 export interface PendingSessionDeletion {
   requestId: string;
   sessionId: string;
+  stage: "closing" | "deleting";
 }
 
 export interface PendingSessionControl {
@@ -290,7 +291,19 @@ export type AppAction =
       cwd?: string;
       title?: string | null;
     }
-  | { type: "session/delete_start"; requestId: string; sessionId: string }
+  | {
+      type: "session/delete_start";
+      requestId: string;
+      sessionId: string;
+      stage: PendingSessionDeletion["stage"];
+    }
+  | {
+      type: "session/delete_continue";
+      closeRequestId: string;
+      requestId: string;
+      sessionId: string;
+    }
+  | { type: "session/delete_cancel"; requestId: string; sessionId: string }
   | {
       type: "session/control_start";
       requestId: string;
@@ -475,12 +488,45 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         ({ requestId, sessionId }) =>
           requestId === action.requestId || sessionId === action.sessionId,
       )) return state;
+      {
+        const next = state.session?.sessionId === action.sessionId
+          ? resetActiveSession(cacheCurrentSession(state))
+          : state;
+        return {
+          ...next,
+          pendingSessionDeletions: [
+            ...next.pendingSessionDeletions,
+            {
+              requestId: action.requestId,
+              sessionId: action.sessionId,
+              stage: action.stage,
+            },
+          ].slice(-100),
+        };
+      }
+    case "session/delete_continue":
+      if (!state.pendingSessionDeletions.some(
+        ({ requestId, sessionId, stage }) =>
+          requestId === action.closeRequestId &&
+          sessionId === action.sessionId &&
+          stage === "closing",
+      )) return state;
       return {
         ...state,
-        pendingSessionDeletions: [
-          ...state.pendingSessionDeletions,
-          { requestId: action.requestId, sessionId: action.sessionId },
-        ].slice(-100),
+        pendingSessionDeletions: state.pendingSessionDeletions.map((pending) =>
+          pending.requestId === action.closeRequestId &&
+            pending.sessionId === action.sessionId
+            ? { ...pending, requestId: action.requestId, stage: "deleting" }
+            : pending
+        ),
+      };
+    case "session/delete_cancel":
+      return {
+        ...state,
+        pendingSessionDeletions: state.pendingSessionDeletions.filter(
+          ({ requestId, sessionId }) =>
+            requestId !== action.requestId || sessionId !== action.sessionId,
+        ),
       };
     case "session/control_start":
       if (
@@ -906,6 +952,17 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         pendingPrompt: undefined,
       }, event.response, event.earlyUpdates);
     case "acp/session_closed":
+      if (state.pendingSessionDeletions.some(
+        ({ requestId, sessionId, stage }) =>
+          requestId === event.requestId &&
+          sessionId === event.sessionId &&
+          stage === "closing",
+      )) {
+        const next = state.session?.sessionId === event.sessionId
+          ? resetActiveSession(state)
+          : state;
+        return removeCachedSession(next, event.sessionId);
+      }
       if (
         state.session?.sessionId !== event.sessionId ||
         state.sessionTransition?.kind !== "close" ||
@@ -915,8 +972,10 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       return resetActiveSession(removeCachedSession(state, event.sessionId));
     case "acp/session_deleted": {
       const pendingDeletion = state.pendingSessionDeletions.find(
-        ({ requestId, sessionId }) =>
-          requestId === event.requestId && sessionId === event.sessionId,
+        ({ requestId, sessionId, stage }) =>
+          requestId === event.requestId &&
+          sessionId === event.sessionId &&
+          stage === "deleting",
       );
       if (!pendingDeletion) return appendBackgroundEvent(state, event);
       return {

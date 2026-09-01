@@ -131,9 +131,17 @@ describe("Agent thread history interactions", () => {
     expect(filter.value).toBe("");
     expect(container.textContent).toContain("Release notes");
 
+    const currentDelete = requireButton(container, "Delete Current Agent task");
+    expect(currentDelete.disabled).toBe(false);
+    expect(currentDelete.title).toContain("Close and delete this thread");
+    await act(async () => currentDelete.click());
+    expect(onDelete).toHaveBeenCalledWith("active-session");
+
     const openDelete = requireButton(container, "Delete Release notes");
-    expect(openDelete.disabled).toBe(true);
-    expect(openDelete.title).toContain("Close this open thread");
+    expect(openDelete.disabled).toBe(false);
+    expect(openDelete.title).toContain("Close and delete this thread");
+    await act(async () => openDelete.click());
+    expect(onDelete).toHaveBeenCalledWith("release-session");
     expect(container.textContent).toContain("open");
     await act(async () => requireButton(container, "Refresh Agent threads").click());
     expect(onRefresh).toHaveBeenCalledOnce();

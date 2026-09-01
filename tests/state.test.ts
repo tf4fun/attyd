@@ -885,7 +885,11 @@ describe("ACP UI state", () => {
     });
     const failed = appReducer({
       ...transitioning,
-      pendingSessionDeletions: [{ requestId: "delete", sessionId: "saved" }],
+      pendingSessionDeletions: [{
+        requestId: "delete",
+        sessionId: "saved",
+        stage: "deleting" as const,
+      }],
       pendingSessionControl: {
         requestId: "control",
         sessionId: "current",
@@ -1534,9 +1538,10 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "delete-current",
       sessionId: "saved",
+      stage: "deleting",
     });
     expect(pending.pendingSessionDeletions).toEqual([
-      { requestId: "delete-current", sessionId: "saved" },
+      { requestId: "delete-current", sessionId: "saved", stage: "deleting" },
     ]);
 
     const stale = appReducer(pending, event({
@@ -1565,6 +1570,7 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "delete-retry",
       sessionId: "saved",
+      stage: "deleting",
     });
     const deleted = appReducer(retrying, event({
       type: "acp/session_deleted",
@@ -1573,6 +1579,99 @@ describe("ACP UI state", () => {
     }));
     expect(deleted.sessions).toEqual([]);
     expect(deleted.pendingSessionDeletions).toEqual([]);
+  });
+
+  it("deselects the current session and advances close-before-delete atomically", () => {
+    const active = {
+      ...initialState,
+      session: { sessionId: "current" },
+      title: "Current thread",
+      cwd: "/workspace/current",
+      sessions: [{
+        sessionId: "current",
+        cwd: "/workspace/current",
+        title: "Current thread",
+      }],
+      timeline: [{ id: "answer", type: "agent_message" as const, text: "Kept snapshot" }],
+    };
+    const closing = appReducer(active, {
+      type: "session/delete_start",
+      requestId: "close-current-for-delete",
+      sessionId: "current",
+      stage: "closing",
+    });
+    expect(closing.session).toBeUndefined();
+    expect(closing.title).toBeUndefined();
+    expect(closing.cachedSessions.get("current")?.timeline).toEqual(active.timeline);
+    expect(closing.pendingSessionDeletions).toEqual([{
+      requestId: "close-current-for-delete",
+      sessionId: "current",
+      stage: "closing",
+    }]);
+
+    const closed = appReducer(closing, event({
+      type: "acp/session_closed",
+      requestId: "close-current-for-delete",
+      sessionId: "current",
+    }));
+    expect(closed.cachedSessions.has("current")).toBe(false);
+    expect(closed.backgroundEvents).toEqual([]);
+
+    const deleting = appReducer(closed, {
+      type: "session/delete_continue",
+      closeRequestId: "close-current-for-delete",
+      requestId: "delete-current",
+      sessionId: "current",
+    });
+    expect(deleting.pendingSessionDeletions).toEqual([{
+      requestId: "delete-current",
+      sessionId: "current",
+      stage: "deleting",
+    }]);
+
+    const deleted = appReducer(deleting, event({
+      type: "acp/session_deleted",
+      requestId: "delete-current",
+      sessionId: "current",
+    }));
+    expect(deleted.sessions).toEqual([]);
+    expect(deleted.pendingSessionDeletions).toEqual([]);
+  });
+
+  it("keeps a current-session snapshot recoverable when delete close fails", () => {
+    const active = {
+      ...initialState,
+      session: { sessionId: "current" },
+      title: "Current thread",
+      cwd: "/workspace/current",
+      timeline: [{ id: "answer", type: "agent_message" as const, text: "Recover me" }],
+    };
+    const closing = appReducer(active, {
+      type: "session/delete_start",
+      requestId: "close-current-for-delete",
+      sessionId: "current",
+      stage: "closing",
+    });
+    const failed = appReducer(closing, event({
+      type: "bridge/error",
+      requestId: "close-current-for-delete",
+      operation: "session/close",
+      message: "Synthetic close failure",
+    }));
+    expect(failed.session).toBeUndefined();
+    expect(failed.pendingSessionDeletions).toEqual([]);
+    expect(failed.cachedSessions.get("current")?.timeline).toEqual(active.timeline);
+    expect(failed.timeline.at(-1)).toMatchObject({
+      type: "error",
+      message: "Synthetic close failure",
+    });
+
+    const restored = appReducer(failed, {
+      type: "session/activate_cached",
+      sessionId: "current",
+    });
+    expect(restored.session?.sessionId).toBe("current");
+    expect(restored.timeline).toEqual(active.timeline);
   });
 
   it("tracks URL consent and completion as separate states", () => {

@@ -68,7 +68,7 @@ export function useAcp() {
   const reconnectRef = useRef<() => void>(() => window.location.reload());
   const pendingContextRequests = useRef(new Map<string, PendingContextRequest>());
   const pendingSessionRequests = useRef(new Map<string, {
-    kind: "new" | "attach" | "fork" | "close" | "delete";
+    kind: "new" | "attach" | "fork" | "close" | "delete-close" | "delete";
     sessionId?: string;
   }>());
   const transmit = useCallback((command: ClientCommand) =>
@@ -312,6 +312,32 @@ export function useAcp() {
       } else if (event.type === "acp/session_forked" && pendingSession?.kind === "fork") {
         storeSessionId(event.response.sessionId);
         pendingSessionRequests.current.delete(event.requestId);
+      } else if (event.type === "acp/session_closed" && pendingSession?.kind === "delete-close") {
+        if (readStoredSessionId() === event.sessionId) storeSessionId(undefined);
+        pendingSessionRequests.current.delete(event.requestId);
+        const deleteRequestId = randomId();
+        if (sendClientCommand(socket, {
+          type: "session/delete",
+          requestId: deleteRequestId,
+          sessionId: event.sessionId,
+        }, (message) => dispatch({ type: "client/error", message }))) {
+          pendingSessionRequests.current.set(deleteRequestId, {
+            kind: "delete",
+            sessionId: event.sessionId,
+          });
+          dispatch({
+            type: "session/delete_continue",
+            closeRequestId: event.requestId,
+            requestId: deleteRequestId,
+            sessionId: event.sessionId,
+          });
+        } else {
+          dispatch({
+            type: "session/delete_cancel",
+            requestId: event.requestId,
+            sessionId: event.sessionId,
+          });
+        }
       } else if (
         (event.type === "acp/session_closed" || event.type === "acp/session_deleted") &&
         (pendingSession?.kind === "close" || pendingSession?.kind === "delete")
@@ -738,15 +764,30 @@ export function useAcp() {
   }, [state.session, transmit]);
 
   const deleteSession = useCallback((sessionId: string) => {
+    if (state.pendingSessionDeletions.some((pending) => pending.sessionId === sessionId)) return;
+    const isOpen = state.session?.sessionId === sessionId || state.cachedSessions.has(sessionId);
+    const closeFirst = isOpen &&
+      state.initialized?.agentCapabilities?.sessionCapabilities?.close != null;
     const requestId = randomId();
     if (!transmit({
-      type: "session/delete",
+      type: closeFirst ? "session/close" : "session/delete",
       requestId,
       sessionId,
     })) return;
-    pendingSessionRequests.current.set(requestId, { kind: "delete", sessionId });
-    dispatch({ type: "session/delete_start", requestId, sessionId });
-  }, [transmit]);
+    pendingSessionRequests.current.set(requestId, {
+      kind: closeFirst ? "delete-close" : "delete",
+      sessionId,
+    });
+    if (state.session?.sessionId === sessionId && readStoredSessionId() === sessionId) {
+      storeSessionId(undefined);
+    }
+    dispatch({
+      type: "session/delete_start",
+      requestId,
+      sessionId,
+      stage: closeFirst ? "closing" : "deleting",
+    });
+  }, [state.cachedSessions, state.initialized, state.pendingSessionDeletions, state.session, transmit]);
 
   const respondElicitation = useCallback(
     (elicitationId: string, response: CreateElicitationResponse) => {

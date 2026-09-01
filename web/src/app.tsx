@@ -16,6 +16,7 @@ import {
   ScrollText,
   Settings2,
   ShieldCheck,
+  Trash2,
   X,
 } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -330,6 +331,9 @@ export default function App() {
   const authBlocksCurrent = state.authStatus === "required" || state.pendingAuth != null;
   const authBlocksNewSession = authBlocksCurrent || state.authStatus === "logged_out";
   const ready = state.phase === "ready" && state.session != null && !transitioning && !changingControl && !authBlocksCurrent;
+  const deletingCurrentSession = state.pendingSessionDeletions.some(
+    ({ sessionId }) => sessionId === state.session?.sessionId,
+  );
   const terminalAuthOwnsInteraction = state.authTerminal?.status === "starting" ||
     state.authTerminal?.status === "running" ||
     state.authTerminal?.status === "succeeded";
@@ -355,6 +359,11 @@ export default function App() {
     state.timeline,
     state.title,
   ]);
+  const requestSessionDeletion = useCallback((sessionId: string) => {
+    if (window.confirm("Close and delete this session from the agent?")) {
+      deleteSession(sessionId);
+    }
+  }, [deleteSession]);
 
   useEffect(() => {
     if (reviewChanges.fileCount === 0) setReviewOpen(false);
@@ -465,9 +474,7 @@ export default function App() {
             attachSession(session);
             closeMobileSidebar();
           }}
-          onDelete={(sessionId) => {
-            if (window.confirm("Delete this session from the agent?")) deleteSession(sessionId);
-          }}
+          onDelete={requestSessionDeletion}
           onRefresh={() => listSessions()}
           onMore={(cursor) => listSessions(cursor)}
         />
@@ -593,6 +600,14 @@ export default function App() {
                   ) : null}
                   {sessionCapabilities?.close != null ? (
                     <button type="button" className="danger" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={closeSession}><LogOut size={14} /> Close thread</button>
+                  ) : null}
+                  {sessionCapabilities?.delete != null ? (
+                    <button
+                      type="button"
+                      className="danger"
+                      disabled={state.running || transitioning || changingControl || deletingCurrentSession || queuedPrompts.length > 0}
+                      onClick={() => state.session && requestSessionDeletion(state.session.sessionId)}
+                    ><Trash2 size={14} /> Delete thread</button>
                   ) : null}
                 </div>
               </details>

@@ -114,10 +114,10 @@ export function SessionHistory({
             <SessionRow
               session={activeSession}
               active
-              deleting={false}
-              disabled
+              deleting={deletingSessionIds.includes(activeSession.sessionId)}
+              disabled={disabled}
               canAttach={canAttach}
-              canDelete={false}
+              canDelete={canDelete}
               onAttach={onAttach}
               onDelete={onDelete}
             />
@@ -201,13 +201,13 @@ function SessionRow({
             : `${formatSessionDate(session.updatedAt)}${open ? " · open" : ""}`}</small>
         </span>
       </button>
-      {canDelete && !active ? (
+      {canDelete ? (
         <button
           type="button"
           className="session-delete"
-          disabled={disabled || deleting || open}
+          disabled={disabled || deleting}
           aria-label={`${deleting ? "Deleting" : "Delete"} ${title}`}
-          title={open ? "Close this open thread before deleting it" : undefined}
+          title={open || active ? "Close and delete this thread" : undefined}
           onClick={() => onDelete(session.sessionId)}
         >
           <Trash2 size={12} />

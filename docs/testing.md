@@ -8,7 +8,7 @@ drivers; there is no second backend implementation.
 
 | Layer | Command | Purpose |
 | --- | --- | --- |
-| Frontend and browser contract | `npm test` | 133 reducer, event-envelope, content, prompt-history, search, interaction, accessibility, and adversarial-state cases |
+| Frontend and browser contract | `npm test` | 135 reducer, event-envelope, content, prompt-history, search, interaction, accessibility, and adversarial-state cases |
 | Rust backend | `npm run test:rust` | 69 native cases for semantic validation, CLI/MCP configuration, capability negotiation, response bounds, session mutation locks, pagination, filesystem confinement/context, terminal/auth-terminal lifecycle, Agent process I/O, final error relay, and MCP boundaries |
 | Remote ACP transports | `npm run test:remote` | Connects the Rust binary to SDK HTTP/SSE and WebSocket ACP servers; verifies remote capability boundaries and Agent-owned absolute cwd |
 | Rust-hosted black box | `npm run test:ui` | Drives real browser WebSockets, fake ACP Agents, and an MCP provider through the Rust binary; covers 733 bridge events and 328 malformed/binary frames with same-connection recovery |
