@@ -125,38 +125,45 @@ impl BridgeHub {
         })
     }
 
-    async fn subscribe(self: &Arc<Self>) -> Option<BridgeSubscription> {
-        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let mut runtime = None;
-        let generation;
-        {
+    async fn ensure_runtime(self: &Arc<Self>) {
+        let runtime = {
             let mut state = self.state.lock().await;
-            if state.shutting_down {
-                return None;
-            }
-            if state.input.is_none() {
+            if state.shutting_down || state.input.is_some() {
+                None
+            } else {
                 state.generation = state.generation.wrapping_add(1).max(1);
                 state.bootstrap = BridgeBootstrap::default();
-                let (input_tx, input_rx) = mpsc::channel(256);
-                let (bridge_event_tx, bridge_event_rx) = mpsc::unbounded_channel();
+                let (input_tx, input) = mpsc::channel(256);
+                let (event_tx, events) = mpsc::unbounded_channel();
                 state.input = Some(input_tx);
-                runtime = Some(BridgeRuntime {
+                Some(BridgeRuntime {
                     generation: state.generation,
-                    input: input_rx,
-                    events: bridge_event_rx,
-                    event_tx: bridge_event_tx,
-                });
+                    input,
+                    events,
+                    event_tx,
+                })
             }
-            generation = state.generation;
+        };
+        if let Some(runtime) = runtime {
+            self.spawn_runtime(runtime);
+        }
+    }
+
+    async fn subscribe(self: &Arc<Self>) -> Option<BridgeSubscription> {
+        self.ensure_runtime().await;
+        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let generation = {
+            let mut state = self.state.lock().await;
+            if state.shutting_down || state.input.is_none() {
+                return None;
+            }
             for event in state.bootstrap.events() {
                 let _ = event_tx.send(event.clone());
             }
             state.subscribers.insert(id, event_tx);
-        }
-        if let Some(runtime) = runtime {
-            self.spawn_runtime(runtime);
-        }
+            state.generation
+        };
         Some(BridgeSubscription {
             id,
             generation,
@@ -297,6 +304,7 @@ pub async fn serve(options: Options) -> Result<()> {
     }
     let address = SocketAddr::new(options.host, options.port);
     let bridge = BridgeHub::new(options.clone());
+    bridge.ensure_runtime().await;
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/ws", get(websocket))

@@ -438,6 +438,7 @@ pub async fn run(
     match result {
         Ok(()) => sink.send(json!({ "type": "bridge/phase", "phase": "stopped" })),
         Err(error) => {
+            tracing::error!(error = ?error, "ACP bridge failed");
             sink.acp_error(error, None, None);
             sink.send(json!({ "type": "bridge/phase", "phase": "error" }));
         }

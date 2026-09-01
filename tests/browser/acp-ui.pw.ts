@@ -1040,11 +1040,11 @@ test("cancels an active prompt without terminating the stdio Agent", async ({ br
   });
 
   try {
+    await expect.poll(() => readMarker(processMarker)).not.toBe("");
+    const agentPid = await readMarker(processMarker);
     await page.goto(`http://127.0.0.1:${server.port}`);
     const composer = page.locator('textarea[role="combobox"]');
     await expect(composer).toBeEnabled();
-    await expect.poll(() => readMarker(processMarker)).not.toBe("");
-    const agentPid = await readMarker(processMarker);
     await composer.fill("disconnect-cancel-flow");
     await composer.press("Enter");
     await expect.poll(() => readMarker(marker)).toBe("prompt");
