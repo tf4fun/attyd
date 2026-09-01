@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
@@ -1020,6 +1020,39 @@ test("offers an explicit reconnect over the composer after the ACP connection st
   expect(browserErrors).toEqual([]);
 });
 
+test("cancels an active ACP prompt when its browser disconnects", async ({ page }) => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-disconnect-cancel-"));
+  const marker = join(temporaryDirectory, "lifecycle.txt");
+  const server = await startRustTestServer({
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      ATTYD_FAKE_DISCONNECT_CANCEL_FILE: marker,
+    },
+    command: [
+      process.execPath,
+      "--import",
+      "tsx",
+      join(process.cwd(), "tests/fixtures/fake-agent.ts"),
+    ],
+  });
+
+  try {
+    await page.goto(`http://127.0.0.1:${server.port}`);
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill("disconnect-cancel-flow");
+    await composer.press("Enter");
+    await expect.poll(() => readMarker(marker)).toBe("prompt");
+
+    await page.close();
+    await expect.poll(() => readMarker(marker)).toBe("cancel");
+  } finally {
+    await server.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
 test("reconnects a stale mobile-style socket after a focus liveness probe", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");
@@ -1144,6 +1177,14 @@ function collectBrowserErrors(page: Page): string[] {
   });
   page.on("pageerror", (error) => errors.push(error.message));
   return errors;
+}
+
+async function readMarker(path: string): Promise<string> {
+  try {
+    return (await readFile(path, "utf8")).trim();
+  } catch {
+    return "";
+  }
 }
 
 function horizontalOverflow(page: Page): Promise<number> {

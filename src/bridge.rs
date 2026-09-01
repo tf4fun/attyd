@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
 use agent_client_protocol::{AcpAgentConfig, Agent, Client, ConnectTo, ConnectionTo};
 use agent_client_protocol_http::HttpClient;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agent_process::BoundedAcpAgent;
@@ -44,6 +46,7 @@ const MAX_BRIDGE_ERROR_DATA_BYTES: usize = 256 * 1024;
 const MAX_BRIDGE_ERROR_MESSAGE_CHARS: usize = 16_384;
 const MAX_SESSION_LIST_TOTAL_BYTES: usize = 16_000_000;
 const MAX_LISTED_SESSIONS: usize = 10_000;
+const DISCONNECT_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct EventSink {
@@ -202,6 +205,58 @@ struct BridgeState {
     seen_url_elicitation_ids: HashSet<String>,
 }
 
+#[derive(Default)]
+struct PromptLifecycle {
+    starting: AtomicUsize,
+    changed: Notify,
+}
+
+impl PromptLifecycle {
+    fn register_start(self: &Arc<Self>) -> PromptStartGuard {
+        self.starting.fetch_add(1, Ordering::AcqRel);
+        PromptStartGuard {
+            lifecycle: self.clone(),
+            pending: true,
+        }
+    }
+
+    async fn wait_until_started(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.starting.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn prompt_finished(&self) {
+        self.changed.notify_one();
+    }
+}
+
+struct PromptStartGuard {
+    lifecycle: Arc<PromptLifecycle>,
+    pending: bool,
+}
+
+impl PromptStartGuard {
+    fn finish(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        self.lifecycle.starting.fetch_sub(1, Ordering::AcqRel);
+        self.lifecycle.changed.notify_one();
+    }
+}
+
+impl Drop for PromptStartGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 fn response_controls(response: &Value) -> Result<(Option<Value>, Value), Error> {
     let modes = response
         .get("modes")
@@ -310,6 +365,7 @@ struct CommandContext {
     terminals: Option<TerminalManager>,
     filesystem: Option<Arc<WorkspaceFileSystem>>,
     auth_terminal: AuthTerminalManager,
+    prompt_lifecycle: Arc<PromptLifecycle>,
 }
 
 #[derive(Clone, Copy)]
@@ -410,6 +466,7 @@ where
         sink.tx.clone(),
     );
     let auth_terminal = AuthTerminalManager::new(sink.tx.clone());
+    let prompt_lifecycle = Arc::new(PromptLifecycle::default());
 
     let builder = Client
         .builder()
@@ -883,6 +940,8 @@ where
                     continue;
                 }
                 let task_connection = connection.clone();
+                let prompt_start =
+                    (operation == "session/prompt").then(|| prompt_lifecycle.register_start());
                 let context = CommandContext {
                     options: options.clone(),
                     state: state.clone(),
@@ -890,6 +949,7 @@ where
                     terminals: terminals.clone(),
                     filesystem: filesystem.clone(),
                     auth_terminal: auth_terminal.clone(),
+                    prompt_lifecycle: prompt_lifecycle.clone(),
                 };
                 connection.spawn(async move {
                     let request_id = command
@@ -897,12 +957,15 @@ where
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
                     let task_sink = context.sink.clone();
-                    if let Err(error) = handle_command(command, task_connection, context).await {
+                    if let Err(error) =
+                        handle_command(command, task_connection, context, prompt_start).await
+                    {
                         task_sink.acp_error(error, request_id.as_deref(), Some(&operation));
                     }
                     Ok(())
                 })?;
             }
+            cancel_prompts_on_disconnect(&connection, &state, &sink, &prompt_lifecycle).await;
             if let Some(terminals) = terminals {
                 terminals.close_all().await;
             }
@@ -1099,10 +1162,53 @@ async fn handle_session_update(
     }
 }
 
+async fn cancel_prompts_on_disconnect(
+    connection: &ConnectionTo<Agent>,
+    state: &Arc<Mutex<BridgeState>>,
+    sink: &EventSink,
+    lifecycle: &PromptLifecycle,
+) {
+    // A browser can disconnect immediately after sending session/prompt. Wait
+    // until every accepted prompt command has either failed validation or
+    // published its ACP request so cancellation cannot overtake the prompt.
+    lifecycle.wait_until_started().await;
+
+    let session_ids = state.lock().await.prompts.clone();
+    if session_ids.is_empty() {
+        return;
+    }
+
+    for session_id in &session_ids {
+        let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
+        cancel_interactions(session_id, "client_disconnected", state, sink).await;
+    }
+
+    // ACP cancellation completes through the original session/prompt response.
+    // Keep the connection alive briefly so the notification reaches the Agent
+    // and that response can be consumed before the transport is released.
+    let wait_for_completion = async {
+        loop {
+            let changed = lifecycle.changed.notified();
+            let all_finished = {
+                let state = state.lock().await;
+                session_ids
+                    .iter()
+                    .all(|session_id| !state.prompts.contains(session_id))
+            };
+            if all_finished {
+                return;
+            }
+            changed.await;
+        }
+    };
+    let _ = tokio::time::timeout(DISCONNECT_CANCEL_GRACE_PERIOD, wait_for_completion).await;
+}
+
 async fn handle_command(
     command: Value,
     connection: ConnectionTo<Agent>,
     context: CommandContext,
+    mut prompt_start: Option<PromptStartGuard>,
 ) -> Result<(), Error> {
     let CommandContext {
         options,
@@ -1111,6 +1217,7 @@ async fn handle_command(
         terminals,
         filesystem,
         auth_terminal,
+        prompt_lifecycle,
     } = context;
     let operation = bounded_string_field(&command, "type", MAX_BRIDGE_TYPE_LENGTH)?;
     match operation {
@@ -1526,14 +1633,16 @@ async fn handle_command(
                 let mut state = state.lock().await;
                 reserve_session_operation(&mut state, &session_id, SessionOperation::Prompt)?;
             }
-            let result = connection
-                .send_request(PromptRequest::new(session_id.clone(), prompt))
-                .block_task()
-                .await;
+            let request = connection.send_request(PromptRequest::new(session_id.clone(), prompt));
+            if let Some(prompt_start) = prompt_start.as_mut() {
+                prompt_start.finish();
+            }
+            let result = request.block_task().await;
             {
                 let mut state = state.lock().await;
                 release_session_operation(&mut state, &session_id, SessionOperation::Prompt);
             }
+            prompt_lifecycle.prompt_finished();
             let response = result?;
             validate_prompt_response(&response).map_err(semantic_error)?;
             sink.send(json!({

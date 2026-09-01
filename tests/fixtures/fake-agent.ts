@@ -42,6 +42,7 @@ const terminalAuthRequired = process.argv.includes("--terminal-auth-required");
 const terminalLogin = process.argv.includes("--terminal-login");
 const oversizedStdoutLine = process.argv.includes("--oversized-stdout-line");
 const terminalAuthFile = process.env.ATTYD_FAKE_AUTH_FILE;
+const disconnectCancelFile = process.env.ATTYD_FAKE_DISCONNECT_CANCEL_FILE;
 
 if (oversizedStdoutLine) {
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -91,6 +92,7 @@ let authenticated = terminalAuthRequired
   ? terminalAuthFile != null && existsSync(terminalAuthFile)
   : !authRequiredAtStart;
 const structuredErrorAttempts = new Map<string, number>();
+let finishDisconnectPrompt: (() => void) | undefined;
 
 const agent = acp
   .agent({ name: "attyd-test-agent" })
@@ -577,6 +579,11 @@ const agent = acp
     if (promptText.includes("disconnect-flow")) {
       setTimeout(() => process.exit(0), 25);
       await new Promise(() => {});
+    }
+    if (promptText.includes("disconnect-cancel-flow")) {
+      if (disconnectCancelFile) writeFileSync(disconnectCancelFile, "prompt\n");
+      await new Promise<void>((resolve) => { finishDisconnectPrompt = resolve; });
+      return { stopReason: "cancelled" };
     }
     if (promptText.includes("oversized-notification-flow")) {
       await client.notify(acp.methods.client.session.update, {
@@ -1840,7 +1847,11 @@ const agent = acp
     });
     return { stopReason: "end_turn" };
   })
-  .onNotification(acp.methods.agent.session.cancel, () => {});
+  .onNotification(acp.methods.agent.session.cancel, () => {
+    if (disconnectCancelFile) writeFileSync(disconnectCancelFile, "cancel\n");
+    finishDisconnectPrompt?.();
+    finishDisconnectPrompt = undefined;
+  });
 
 const stream = acp.ndJsonStream(
   Writable.toWeb(process.stdout),

@@ -15,6 +15,9 @@ import type { ServerEvent } from "../shared/bridge.js";
 for (const transport of ["http", "ws"] as const) {
   let initializedCapabilities: acp.ClientCapabilities | undefined;
   let createdCwd: string | undefined;
+  let promptStarted = false;
+  let cancellationObserved = false;
+  let finishPrompt: (() => void) | undefined;
   const agent = acp
     .agent({ name: `rust-remote-${transport}` })
     .onRequest(acp.methods.agent.initialize, ({ params }) => {
@@ -28,6 +31,16 @@ for (const transport of ["http", "ws"] as const) {
     .onRequest(acp.methods.agent.session.new, ({ params }) => {
       createdCwd = params.cwd;
       return { sessionId: `${transport}-session` };
+    })
+    .onRequest(acp.methods.agent.session.prompt, async () => {
+      promptStarted = true;
+      await new Promise<void>((resolve) => { finishPrompt = resolve; });
+      return { stopReason: "cancelled" };
+    })
+    .onNotification(acp.methods.agent.session.cancel, () => {
+      cancellationObserved = true;
+      finishPrompt?.();
+      finishPrompt = undefined;
     });
   const remote = await startRemoteAgent(agent);
   const endpoint = `${transport === "http" ? "http" : "ws"}://127.0.0.1:${remote.port}/acp`;
@@ -73,8 +86,21 @@ for (const transport of ["http", "ws"] as const) {
     assert.equal(created.cwd, "/home/agent/project");
     assert.equal(created.response.sessionId, `${transport}-session`);
     assert.equal(createdCwd, "/home/agent/project");
-  } finally {
+
+    socket.send(JSON.stringify({
+      type: "session/prompt",
+      requestId: `${transport}-prompt`,
+      sessionId: `${transport}-session`,
+      prompt: [{ type: "text", text: "cancel me when the browser disconnects" }],
+    }));
+    await waitUntil(() => promptStarted, `${transport} prompt to start`);
     socket.terminate();
+    await waitUntil(
+      () => cancellationObserved,
+      `${transport} disconnect cancellation`,
+    );
+  } finally {
+    if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
     await host.close();
     await remote.close();
   }
@@ -169,4 +195,13 @@ async function waitFor(
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for remote event: ${JSON.stringify(events)}`);
+}
+
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
 }

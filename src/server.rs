@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -17,6 +18,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::bridge;
 use crate::options::Options;
+
+const BRIDGE_DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
 #[derive(RustEmbed)]
 #[folder = "dist/client/"]
@@ -150,9 +153,17 @@ async fn serve_websocket(socket: WebSocket, options: Arc<Options>) {
     };
 
     match completed {
-        CompletedTask::Reader => {
-            bridge_task.abort();
+        CompletedTask::Reader | CompletedTask::Writer => {
+            // Closing the browser command channel asks the bridge to cancel any
+            // active ACP Prompt Turn before it releases the Agent transport.
+            drop(command_tx);
             writer_task.abort();
+            if tokio::time::timeout(BRIDGE_DISCONNECT_GRACE_PERIOD, &mut bridge_task)
+                .await
+                .is_err()
+            {
+                bridge_task.abort();
+            }
         }
         CompletedTask::Bridge => {
             if tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task)
@@ -162,7 +173,6 @@ async fn serve_websocket(socket: WebSocket, options: Arc<Options>) {
                 writer_task.abort();
             }
         }
-        CompletedTask::Writer => bridge_task.abort(),
     }
 }
 
