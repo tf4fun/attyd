@@ -1020,14 +1020,16 @@ test("offers an explicit reconnect over the composer after the ACP connection st
   expect(browserErrors).toEqual([]);
 });
 
-test("cancels an active ACP prompt when its browser disconnects", async ({ page }) => {
+test("cancels an active prompt without terminating the stdio Agent", async ({ browser, page }) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-disconnect-cancel-"));
   const marker = join(temporaryDirectory, "lifecycle.txt");
+  const processMarker = join(temporaryDirectory, "agent.pid");
   const server = await startRustTestServer({
     cwd: process.cwd(),
     env: {
       ...process.env,
       ATTYD_FAKE_DISCONNECT_CANCEL_FILE: marker,
+      ATTYD_FAKE_PROCESS_MARKER_FILE: processMarker,
     },
     command: [
       process.execPath,
@@ -1041,12 +1043,23 @@ test("cancels an active ACP prompt when its browser disconnects", async ({ page 
     await page.goto(`http://127.0.0.1:${server.port}`);
     const composer = page.locator('textarea[role="combobox"]');
     await expect(composer).toBeEnabled();
+    await expect.poll(() => readMarker(processMarker)).not.toBe("");
+    const agentPid = await readMarker(processMarker);
     await composer.fill("disconnect-cancel-flow");
     await composer.press("Enter");
     await expect.poll(() => readMarker(marker)).toBe("prompt");
 
     await page.close();
     await expect.poll(() => readMarker(marker)).toBe("cancel");
+
+    const reconnected = await browser.newPage();
+    try {
+      await reconnected.goto(`http://127.0.0.1:${server.port}`);
+      await expect(reconnected.locator('textarea[role="combobox"]')).toBeEnabled();
+      await expect.poll(() => readMarker(processMarker)).toBe(agentPid);
+    } finally {
+      await reconnected.close();
+    }
   } finally {
     await server.close();
     await rm(temporaryDirectory, { recursive: true, force: true });

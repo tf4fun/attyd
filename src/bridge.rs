@@ -376,9 +376,16 @@ enum SessionOperation {
     Control,
 }
 
+pub(crate) enum BridgeInput {
+    Command(String),
+    SubscribersGone,
+    Restart,
+    Shutdown,
+}
+
 pub async fn run(
     options: Arc<Options>,
-    commands: mpsc::Receiver<String>,
+    commands: mpsc::Receiver<BridgeInput>,
     events: mpsc::UnboundedSender<String>,
 ) {
     let sink = EventSink { tx: events };
@@ -440,7 +447,7 @@ pub async fn run(
 async fn run_connection<T>(
     transport: T,
     options: Arc<Options>,
-    mut commands: mpsc::Receiver<String>,
+    mut commands: mpsc::Receiver<BridgeInput>,
     sink: EventSink,
 ) -> Result<(), Error>
 where
@@ -906,7 +913,18 @@ where
             sink.typed("acp/initialized", &response);
             sink.send(json!({ "type": "bridge/phase", "phase": "ready" }));
 
-            while let Some(raw) = commands.recv().await {
+            loop {
+                let raw = match commands.recv().await {
+                    Some(BridgeInput::Command(raw)) => raw,
+                    Some(BridgeInput::SubscribersGone) => {
+                        cancel_prompts_on_disconnect(&connection, &state, &sink, &prompt_lifecycle)
+                            .await;
+                        detach_browser_sessions(&state).await;
+                        auth_terminal.close();
+                        continue;
+                    }
+                    Some(BridgeInput::Restart | BridgeInput::Shutdown) | None => break,
+                };
                 if raw.len() > MAX_BRIDGE_MESSAGE_BYTES {
                     sink.error(
                         format!("WebSocket command exceeds {MAX_BRIDGE_MESSAGE_BYTES} bytes"),
@@ -1202,6 +1220,29 @@ async fn cancel_prompts_on_disconnect(
         }
     };
     let _ = tokio::time::timeout(DISCONNECT_CANCEL_GRACE_PERIOD, wait_for_completion).await;
+}
+
+async fn detach_browser_sessions(state: &Arc<Mutex<BridgeState>>) {
+    let (permissions, elicitations) = {
+        let mut state = state.lock().await;
+        state.active_sessions.clear();
+        state.session_updates.clear();
+        state.url_elicitations.clear();
+        (
+            std::mem::take(&mut state.permissions),
+            std::mem::take(&mut state.elicitations),
+        )
+    };
+    for (_, pending) in permissions {
+        let _ = pending.sender.send(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+    }
+    for (_, pending) in elicitations {
+        let _ = pending
+            .sender
+            .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
+    }
 }
 
 async fn handle_command(

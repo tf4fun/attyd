@@ -43,6 +43,9 @@ const terminalLogin = process.argv.includes("--terminal-login");
 const oversizedStdoutLine = process.argv.includes("--oversized-stdout-line");
 const terminalAuthFile = process.env.ATTYD_FAKE_AUTH_FILE;
 const disconnectCancelFile = process.env.ATTYD_FAKE_DISCONNECT_CANCEL_FILE;
+const processMarkerFile = process.env.ATTYD_FAKE_PROCESS_MARKER_FILE;
+
+if (processMarkerFile) writeFileSync(processMarkerFile, `${process.pid}\n`);
 
 if (oversizedStdoutLine) {
   await new Promise<void>((resolve) => setImmediate(resolve));
