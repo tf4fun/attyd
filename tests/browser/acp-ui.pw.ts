@@ -652,6 +652,52 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   expect(browserErrors).toEqual([]);
 });
 
+test("stops following streamed Agent output after the user scrolls upward", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.setViewportSize({ width: 900, height: 480 });
+  await page.goto("/");
+  await page.addStyleTag({ content: ".conversation-wrap{min-height:1500px!important}" });
+
+  const thread = page.getByRole("region", { name: "Conversation thread" });
+  const composer = page.locator('textarea[role="combobox"]');
+  await thread.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await composer.fill("activity-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Inspecting the requested task.", { exact: true })).toBeVisible();
+
+  await thread.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", {
+      bubbles: true,
+      deltaY: -120,
+    }));
+    element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight - 120);
+  });
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeGreaterThan(100);
+
+  await expect(page.getByText("Activity flow complete.", { exact: true })).toBeVisible();
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeGreaterThan(100);
+  const toBottom = page.getByRole("button", { name: "Jump to bottom of thread" });
+  await expect(toBottom).toBeEnabled();
+  await toBottom.click();
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeLessThan(3);
+
+  await composer.fill("activity-flow after returning to bottom");
+  await composer.press("Enter");
+  await expect(page.getByText("Activity flow complete.", { exact: true })).toHaveCount(2);
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeLessThan(3);
+  expect(browserErrors).toEqual([]);
+});
+
 test("searches the visible ACP Agent thread with Zed-style match navigation", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");

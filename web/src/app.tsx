@@ -100,6 +100,7 @@ export default function App() {
   const previousRunning = useRef(false);
   const lastPositionedSession = useRef<string | undefined>(undefined);
   const followLatestOnViewport = useRef(false);
+  const followLatestContent = useRef(true);
 
   const measureThreadScroll = useCallback(() => {
     const element = scroll.current;
@@ -122,6 +123,7 @@ export default function App() {
     const element = scroll.current;
     if (!element) return;
     followLatestOnViewport.current = target === "bottom";
+    followLatestContent.current = target === "bottom";
     if (target === "top" || target === "bottom") {
       // Boundary controls should be deterministic even while streamed content
       // is changing the scroll height. Smooth scrolling can be interrupted by
@@ -175,6 +177,8 @@ export default function App() {
     }
     if (lastPositionedSession.current === sessionId) return;
     lastPositionedSession.current = sessionId;
+    followLatestContent.current = true;
+    followLatestOnViewport.current = true;
 
     const element = scroll.current;
     if (!element) return;
@@ -218,6 +222,7 @@ export default function App() {
     };
     const stopFollowing = () => {
       followLatestOnViewport.current = false;
+      followLatestContent.current = false;
       cancelAnimationFrame(frame);
     };
 
@@ -283,11 +288,21 @@ export default function App() {
   useEffect(() => {
     const element = scroll.current;
     if (!element) return;
-    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-    if (distance < 420) element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    if (followLatestContent.current) {
+      element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+    }
     const frame = requestAnimationFrame(measureThreadScroll);
     return () => cancelAnimationFrame(frame);
   }, [measureThreadScroll, state.timeline, state.permissions, state.elicitations]);
+
+  const handleThreadScroll = useCallback(() => {
+    const element = scroll.current;
+    if (!element) return;
+    if (element.scrollHeight - element.scrollTop - element.clientHeight <= 2) {
+      followLatestContent.current = true;
+    }
+    measureThreadScroll();
+  }, [measureThreadScroll]);
 
   useEffect(() => {
     const element = scroll.current;
@@ -634,9 +649,23 @@ export default function App() {
             aria-label="Conversation thread"
             aria-keyshortcuts="Escape Home End Shift+PageUp Shift+PageDown"
             tabIndex={0}
-            onScroll={measureThreadScroll}
+            onScroll={handleThreadScroll}
+            onPointerDown={(event) => {
+              const bounds = event.currentTarget.getBoundingClientRect();
+              if (event.clientX < bounds.right - 20) return;
+              followLatestContent.current = false;
+              followLatestOnViewport.current = false;
+            }}
             onKeyDown={(event) => {
               if (event.target !== event.currentTarget) return;
+              if (
+                event.key === "ArrowUp" ||
+                event.key === "PageUp" ||
+                (event.key === " " && event.shiftKey)
+              ) {
+                followLatestContent.current = false;
+                followLatestOnViewport.current = false;
+              }
               if (event.key === "Escape" && state.running) {
                 event.preventDefault();
                 setQueuePaused(true);
