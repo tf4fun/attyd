@@ -97,6 +97,14 @@ npm run build
 
 `target/release/attyd` embeds the frontend assets and is the only runtime artifact.
 
+Every CI run also publishes self-contained Linux archives for four targets. Each
+archive contains the `attyd` executable and its `attyd.sha256` checksum:
+
+- `attyd-linux-x86_64-gnu.tar.gz`
+- `attyd-linux-aarch64-gnu.tar.gz`
+- `attyd-linux-x86_64-musl.tar.gz`
+- `attyd-linux-aarch64-musl.tar.gz`
+
 CLI options:
 
 ```text

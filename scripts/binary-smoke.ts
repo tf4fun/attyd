@@ -4,7 +4,7 @@ import { chmod, copyFile, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const source = join(process.cwd(), "target/release/attyd");
+const source = process.env.ATTYD_RUST_BINARY ?? join(process.cwd(), "target/release/attyd");
 const directory = await mkdtemp(join(tmpdir(), "attyd-binary-smoke-"));
 const executable = join(directory, "attyd");
 await copyFile(source, executable);

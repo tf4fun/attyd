@@ -18,10 +18,33 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Check TypeScript frontend
-        run: npm run check
+      - name: Check TypeScript
+        run: npm run typecheck
+      - name: Test frontend
+        run: npm test
+
+  web-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build frontend bundle
+        run: npm run build:client
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-client
+          path: dist/client
+          if-no-files-found: error
+          retention-days: 1
 
   backend:
+    needs: web-client
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -33,18 +56,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-client
+          path: dist/client
       - name: Test Rust backend
         run: npm run test:rust
       - name: Test remote ACP transports
         run: npm run test:remote
       - name: Test Rust-hosted bridge
-        run: npm run test:ui
-      - name: Build release binary
-        run: npm run build
-      - name: Test standalone binary
-        run: npm run test:binary
+        run: node --import tsx scripts/ui-smoke.ts
 
   browser:
+    needs: web-client
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -56,11 +81,102 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-client
+          path: dist/client
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:browser
-      - uses: actions/upload-artifact@v4
+      - name: Build browser-test host
+        run: cargo build --locked
+        env:
+          ATTYD_SKIP_WEB_BUILD: "1"
+      - name: Test browser UI
+        run: npx playwright test
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-report
           path: playwright-report/
           if-no-files-found: ignore
+
+  binaries:
+    name: binary (${{ matrix.artifact }})
+    needs: web-client
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: attyd-linux-x86_64-gnu
+            runner: ubuntu-24.04
+            musl: false
+          - target: aarch64-unknown-linux-gnu
+            artifact: attyd-linux-aarch64-gnu
+            runner: ubuntu-24.04-arm
+            musl: false
+          - target: x86_64-unknown-linux-musl
+            artifact: attyd-linux-x86_64-musl
+            runner: ubuntu-24.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            artifact: attyd-linux-aarch64-musl
+            runner: ubuntu-24.04-arm
+            musl: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-client
+          path: dist/client
+      - name: Install musl package index
+        if: matrix.musl
+        run: sudo apt-get update
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get install --no-install-recommends musl-tools
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+        env:
+          ATTYD_SKIP_WEB_BUILD: "1"
+      - name: Verify release binary
+        run: target/${{ matrix.target }}/release/attyd --version
+      - name: Set up Node.js for native smoke test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install native smoke-test dependencies
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: npm ci
+      - name: Test standalone release binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: npm run test:binary
+        env:
+          ATTYD_RUST_BINARY: target/${{ matrix.target }}/release/attyd
+      - name: Generate checksum
+        working-directory: target/${{ matrix.target }}/release
+        run: sha256sum attyd > attyd.sha256
+      - name: Create artifact directory
+        run: mkdir -p artifacts
+      - name: Package release binary
+        run: >-
+          tar -C target/${{ matrix.target }}/release -czf
+          artifacts/${{ matrix.artifact }}.tar.gz attyd attyd.sha256
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
