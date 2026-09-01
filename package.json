@@ -19,7 +19,7 @@
     "test:ui": "npm run build:client && ATTYD_SKIP_WEB_BUILD=1 cargo build && node --import tsx scripts/ui-smoke.ts",
     "test:coverage": "node --import tsx scripts/rust-coverage.ts",
     "test:browser:serve": "node --import tsx scripts/browser-server.ts",
-    "check": "npm run typecheck && npm test && npm run test:rust && npm run test:remote && npm run test:ui && npm run build && npm run test:binary"
+    "check": "npm run typecheck && npm test && npm run build:client"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.4.0",

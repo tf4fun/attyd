@@ -17,10 +17,11 @@ drivers; there is no second backend implementation.
 | Browser interaction | `npm run test:browser` | Runs the production Rust host with the fake Agent and verifies Zed-style Agent interaction and mobile behavior in Chromium |
 | Real Agent | `npm run test:goose` | Runs Goose ACP v1 recovery and a deterministic local prompt/tool lifecycle through the Rust host without a real provider key |
 
-`npm run check` runs type checking, frontend/shared tests, Rust unit tests, HTTP/SSE and WebSocket
-transport smoke tests, the Rust-hosted black box, the release build, and the standalone binary
-test. CI additionally runs the Chromium browser suite. The slower coverage and Goose suites remain
-separate.
+`npm run check` runs type checking, frontend/shared tests, and the production client build. CI
+runs the frontend, Rust backend, and Chromium browser suites as independent parallel jobs. Each
+Rust unit, remote-transport, Rust-hosted black-box, release-build, and standalone-binary layer is
+also a separate backend step, so failures identify their layer directly. The slower coverage and
+Goose suites remain separate.
 
 ## Backend migration status
 

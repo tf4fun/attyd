@@ -8,19 +8,54 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Check TypeScript frontend
+        run: npm run check
+
+  backend:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
-      - run: npm run check
+      - name: Test Rust backend
+        run: npm run test:rust
+      - name: Test remote ACP transports
+        run: npm run test:remote
+      - name: Test Rust-hosted bridge
+        run: npm run test:ui
+      - name: Build release binary
+        run: npm run build
+      - name: Test standalone binary
+        run: npm run test:binary
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser
       - uses: actions/upload-artifact@v4
