@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ThreadSearchBar,
   scanThreadSearchDom,
-} from "../src/components/acp/thread-search";
+} from "../web/src/components/acp/thread-search";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;

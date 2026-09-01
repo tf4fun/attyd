@@ -31,7 +31,7 @@ import {
 import type {
   WorkspaceContextAttachment,
   WorkspaceContextMatch,
-} from "../../../shared/bridge";
+} from "../../../../shared/bridge";
 import { randomId } from "../../lib/id";
 import { MAX_ATTACHMENT_BYTES, createPromptAttachments, type PromptAttachment } from "../../lib/prompt-attachments";
 import { ContextUsage, type ContextUsageValue } from "./context-usage";

@@ -6,12 +6,12 @@ import type {
   RequestPermissionResponse,
   SessionInfo,
 } from "@agentclientprotocol/sdk";
-import type { ClientCommand, ServerEvent } from "../../shared/bridge";
+import type { ClientCommand, ServerEvent } from "../../../shared/bridge";
 import type {
   WorkspaceContextAttachment,
   WorkspaceContextMatch,
-} from "../../shared/bridge";
-import { parseServerEvent } from "../../shared/bridge";
+} from "../../../shared/bridge";
+import { parseServerEvent } from "../../../shared/bridge";
 import { randomId } from "./id";
 import { appReducer, initialState } from "./state";
 

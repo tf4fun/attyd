@@ -1,7 +1,7 @@
 import { FolderGit2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { AgentTransport } from "../../../shared/bridge";
-import { isAbsoluteWorkspacePath } from "../../../shared/bridge";
+import type { AgentTransport } from "../../../../shared/bridge";
+import { isAbsoluteWorkspacePath } from "../../../../shared/bridge";
 
 export interface NewSessionDialogProps {
   transport: AgentTransport;

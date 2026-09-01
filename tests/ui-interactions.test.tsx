@@ -4,14 +4,14 @@ import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
-import { ElicitationCard } from "../src/components/acp/elicitation";
-import { Conversation } from "../src/components/acp/conversation";
-import { PermissionCard } from "../src/components/acp/permission";
-import { PromptComposer } from "../src/components/acp/prompt-composer";
-import { QueuedPrompts, type QueuedPrompt } from "../src/components/acp/queued-prompts";
-import { SessionControls } from "../src/components/acp/session-controls";
-import { ChangeReview } from "../src/components/acp/change-review";
-import { collectReviewChanges } from "../src/lib/review-changes";
+import { ElicitationCard } from "../web/src/components/acp/elicitation";
+import { Conversation } from "../web/src/components/acp/conversation";
+import { PermissionCard } from "../web/src/components/acp/permission";
+import { PromptComposer } from "../web/src/components/acp/prompt-composer";
+import { QueuedPrompts, type QueuedPrompt } from "../web/src/components/acp/queued-prompts";
+import { SessionControls } from "../web/src/components/acp/session-controls";
+import { ChangeReview } from "../web/src/components/acp/change-review";
+import { collectReviewChanges } from "../web/src/lib/review-changes";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;

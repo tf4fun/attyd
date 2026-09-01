@@ -25,8 +25,8 @@ import type {
   NesDocumentState,
   ServerEvent,
   TerminalSnapshot,
-} from "../../shared/bridge";
-import { assertNever } from "../../shared/exhaustive";
+} from "../../../shared/bridge";
+import { assertNever } from "../../../shared/exhaustive";
 import { randomId } from "./id";
 
 export interface AssistantMessageChunk {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { safeHttpUrl } from "../src/lib/safe-url";
+import { safeHttpUrl } from "../web/src/lib/safe-url";
 
 describe("URL elicitation safety", () => {
   it("allows HTTP(S) flows and blocks executable or malformed URLs", () => {

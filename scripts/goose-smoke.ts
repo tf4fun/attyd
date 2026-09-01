@@ -9,7 +9,7 @@ import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import WebSocket from "ws";
 import { parseServerEvent, type ServerEvent } from "../shared/bridge.js";
-import { appReducer, initialState, type AppState } from "../src/lib/state.js";
+import { appReducer, initialState, type AppState } from "../web/src/lib/state.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
 const LOCAL_PROVIDER_KEY = "attyd-local-provider-fixture";

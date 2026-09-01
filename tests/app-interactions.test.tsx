@@ -4,8 +4,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../src/lib/use-acp", async () => {
-  const { initialState } = await import("../src/lib/state");
+vi.mock("../web/src/lib/use-acp", async () => {
+  const { initialState } = await import("../web/src/lib/state");
   const noop = () => undefined;
   return {
     useAcp: () => ({
@@ -44,7 +44,7 @@ vi.mock("../src/lib/use-acp", async () => {
   };
 });
 
-import App from "../src/app";
+import App from "../web/src/app";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;

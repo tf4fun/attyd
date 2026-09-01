@@ -4,8 +4,8 @@ import type {
   PlanEntry,
   ToolCallContent,
 } from "@agentclientprotocol/sdk";
-import type { TerminalSnapshot } from "../../shared/bridge";
-import { assertNever } from "../../shared/exhaustive";
+import type { TerminalSnapshot } from "../../../shared/bridge";
+import { assertNever } from "../../../shared/exhaustive";
 import type { TimelineItem } from "./state";
 
 export interface ThreadMarkdownOptions {

@@ -19,7 +19,7 @@ import type {
   AssistantMessageChunk,
   TimelineItem,
 } from "../../lib/state";
-import type { TerminalSnapshot } from "../../../shared/bridge";
+import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { contentBlocksToMarkdown } from "../../lib/thread-markdown";
 import { ContentBlocks } from "./content-block";
 import { CompactionCard } from "./compaction";

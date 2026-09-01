@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { contentBlocksToMarkdown, timelineToMarkdown } from "../src/lib/thread-markdown";
+import { contentBlocksToMarkdown, timelineToMarkdown } from "../web/src/lib/thread-markdown";
 
 describe("Zed-style thread Markdown export", () => {
   it("preserves ACP message content, annotations, tools, terminals, and turn usage", () => {

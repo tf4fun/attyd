@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ServerEvent } from "../shared/bridge";
-import { appReducer, initialState, type AppState } from "../src/lib/state";
+import { appReducer, initialState, type AppState } from "../web/src/lib/state";
 
 function event(value: ServerEvent) {
   return { type: "server/event" as const, event: value };

@@ -10,7 +10,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { assertNever } from "../../../shared/exhaustive";
+import { assertNever } from "../../../../shared/exhaustive";
 
 export const MAX_QUEUED_PROMPTS = 8;
 

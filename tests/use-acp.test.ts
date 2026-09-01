@@ -4,7 +4,7 @@ import {
   sendClientCommand,
   shouldReconnectAfterResume,
   startupAttachMethod,
-} from "../src/lib/use-acp";
+} from "../web/src/lib/use-acp";
 
 describe("browser ACP command transport", () => {
   const command = { type: "session/new", requestId: "request-1" } as const;

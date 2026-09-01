@@ -4,8 +4,8 @@ import type { SessionInfo } from "@agentclientprotocol/sdk";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SessionHistory } from "../src/components/acp/session-history";
-import { filterSessions, groupSessionsByRecency } from "../src/lib/session-history";
+import { SessionHistory } from "../web/src/components/acp/session-history";
+import { filterSessions, groupSessionsByRecency } from "../web/src/lib/session-history";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import WebSocket from "ws";
 import type { ServerEvent } from "../shared/bridge.js";
-import { appReducer, initialState, type AppState } from "../src/lib/state.js";
+import { appReducer, initialState, type AppState } from "../web/src/lib/state.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
 const cwd = process.cwd();

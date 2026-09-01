@@ -5,11 +5,6 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 description = "Expose an ACP agent as a lightweight web workspace"
-build = "build.rs"
-
-[[bin]]
-name = "attyd"
-path = "rust/main.rs"
 
 [features]
 default = []

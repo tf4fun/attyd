@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { TimelineItem } from "../../lib/state";
-import type { TerminalSnapshot } from "../../../shared/bridge";
+import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { ContentBlockView } from "./content-block";
 import { DebugInfoButton, DebugInfoPanel, StructuredData } from "./debug-info";
 

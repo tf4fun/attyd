@@ -17,7 +17,7 @@ The useful mental model is a lightweight, browser-based Zed agent panel—not a 
 
 The Zed reference is deliberately limited to Agent interaction: threads, message presentation, composer behavior, plans, tools, permissions, elicitation, changes, and protocol inspection. Project trees, editor tabs, text-editor surfaces, panes, and the rest of Zed's workbench are outside attyd's UI scope.
 
-The interface borrows the composable, neutral visual language of [Vercel AI Elements](https://github.com/vercel/ai-elements), but none of its AI SDK message or streaming state. The components in `src/components/acp` consume ACP objects directly.
+The interface borrows the composable, neutral visual language of [Vercel AI Elements](https://github.com/vercel/ai-elements), but none of its AI SDK message or streaming state. The components in `web/src/components/acp` consume ACP objects directly.
 
 The current method-by-method acceptance ledger is maintained in [`docs/acp-coverage.md`](docs/acp-coverage.md).
 
@@ -183,6 +183,17 @@ There are two deliberately separate protocols:
 2. A small typed WebSocket bridge between the host and browser. Its events carry original ACP values rather than inventing a second agent abstraction.
 
 This separation keeps process execution, files, and terminal handles on the trusted host while allowing the UI to reconnect or evolve independently.
+
+The repository keeps the executable as a conventional Rust binary crate while separating the
+build-time web application clearly:
+
+```text
+src/           Rust binary source (`src/main.rs`)
+web/           Vite entry point and React source
+shared/        browser protocol types shared with test drivers
+scripts/       integration and coverage drivers
+tests/         TypeScript, browser, and fixture tests
+```
 
 ## Verification
 

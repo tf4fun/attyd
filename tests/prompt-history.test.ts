@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
-import { collectPromptHistory, MAX_PROMPT_HISTORY } from "../src/lib/prompt-history";
-import type { TimelineItem } from "../src/lib/state";
+import { collectPromptHistory, MAX_PROMPT_HISTORY } from "../web/src/lib/prompt-history";
+import type { TimelineItem } from "../web/src/lib/state";
 
 describe("ACP prompt history", () => {
   it("collects local and Agent-replayed user messages in thread order", () => {

@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_ATTACHMENT_BYTES,
   createPromptAttachments,
-} from "../src/lib/prompt-attachments";
+} from "../web/src/lib/prompt-attachments";
 
 describe("ACP prompt attachment conversion", () => {
   it("maps browser files to the exact negotiated ContentBlock variants", async () => {

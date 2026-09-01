@@ -3,7 +3,7 @@ import {
   MAX_THREAD_SEARCH_MATCHES,
   MAX_THREAD_SEARCH_QUERY_CHARS,
   compileThreadSearch,
-} from "../src/lib/thread-search";
+} from "../web/src/lib/thread-search";
 
 const defaults = { caseSensitive: false, wholeWord: false, regex: false };
 

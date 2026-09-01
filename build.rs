@@ -6,9 +6,10 @@ fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let client_index = manifest.join("dist/client/index.html");
 
-    println!("cargo:rerun-if-changed=index.html");
-    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=web");
+    println!("cargo:rerun-if-changed=shared");
     println!("cargo:rerun-if-changed=package.json");
+    println!("cargo:rerun-if-changed=package-lock.json");
     println!("cargo:rerun-if-changed=vite.config.ts");
     println!("cargo:rerun-if-env-changed=ATTYD_SKIP_WEB_BUILD");
 

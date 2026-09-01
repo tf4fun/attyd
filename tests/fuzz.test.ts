@@ -2,7 +2,7 @@ import type { ServerEvent, ClientCommand } from "../shared/bridge";
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import { parseClientCommand } from "../shared/bridge";
-import { appReducer, initialState } from "../src/lib/state";
+import { appReducer, initialState } from "../web/src/lib/state";
 
 const commandTypes = new Set<ClientCommand["type"]>([
   "session/new",

@@ -4,7 +4,7 @@ import type { AuthMethod } from "@agentclientprotocol/sdk";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentAuthCard, AgentAuthControls } from "../src/components/acp/agent-auth";
+import { AgentAuthCard, AgentAuthControls } from "../web/src/components/acp/agent-auth";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;

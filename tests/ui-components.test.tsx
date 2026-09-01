@@ -1,14 +1,14 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ElicitationCard, ExternalFlowCard } from "../src/components/acp/elicitation";
-import { PromptComposer } from "../src/components/acp/prompt-composer";
-import { PlanCard } from "../src/components/acp/plan";
-import { CompactionCard } from "../src/components/acp/compaction";
-import { Conversation } from "../src/components/acp/conversation";
-import { ContentBlocks } from "../src/components/acp/content-block";
-import { RawJson } from "../src/components/acp/raw-json";
-import { ChangeReview } from "../src/components/acp/change-review";
-import { collectReviewChanges } from "../src/lib/review-changes";
+import { ElicitationCard, ExternalFlowCard } from "../web/src/components/acp/elicitation";
+import { PromptComposer } from "../web/src/components/acp/prompt-composer";
+import { PlanCard } from "../web/src/components/acp/plan";
+import { CompactionCard } from "../web/src/components/acp/compaction";
+import { Conversation } from "../web/src/components/acp/conversation";
+import { ContentBlocks } from "../web/src/components/acp/content-block";
+import { RawJson } from "../web/src/components/acp/raw-json";
+import { ChangeReview } from "../web/src/components/acp/change-review";
+import { collectReviewChanges } from "../web/src/lib/review-changes";
 
 describe("ACP UI component contract", () => {
   it("renders Agent-reported ACP diffs as a read-only interaction review", () => {

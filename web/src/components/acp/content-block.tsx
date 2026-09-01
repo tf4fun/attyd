@@ -13,8 +13,8 @@ import type { ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { safeHttpUrl } from "../../lib/safe-url";
-import { safeMediaDataUrl } from "../../../shared/content-validation";
-import { assertNever } from "../../../shared/exhaustive";
+import { safeMediaDataUrl } from "../../../../shared/content-validation";
+import { assertNever } from "../../../../shared/exhaustive";
 
 export function ContentBlocks({ blocks }: { blocks: ContentBlock[] }) {
   return (

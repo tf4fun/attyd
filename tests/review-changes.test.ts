@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { collectReviewChanges } from "../src/lib/review-changes";
-import type { TimelineItem } from "../src/lib/state";
+import { collectReviewChanges } from "../web/src/lib/review-changes";
+import type { TimelineItem } from "../web/src/lib/state";
 
 describe("ACP change review aggregation", () => {
   it("groups Agent-reported diffs by file and computes exact line changes", () => {
