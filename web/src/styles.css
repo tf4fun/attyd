@@ -181,7 +181,7 @@ button { color: inherit; }
 .session-metrics span { display: flex; align-items: center; gap: 5px; }
 .live-indicator { color: #577700; }
 .thread-body { position: relative; min-height: 0; flex: 1; }
-.scroll-region { height: 100%; overflow-y: auto; outline: 0; overscroll-behavior: contain; scroll-behavior: smooth; }
+.scroll-region { height: 100%; overflow-y: auto; outline: 0; overscroll-behavior: contain; scroll-behavior: auto; }
 .scroll-region:focus-visible { box-shadow: inset 0 0 0 2px #7f954b66; }
 .thread-scroll-controls {
   position: absolute; z-index: 8; right: 16px; bottom: 12px; display: flex; gap: 3px;

@@ -698,6 +698,46 @@ test("stops following streamed Agent output after the user scrolls upward", asyn
   expect(browserErrors).toEqual([]);
 });
 
+test("keeps bottom following stable during rapid streamed output", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.setViewportSize({ width: 900, height: 420 });
+  await page.goto("/");
+
+  const thread = page.getByRole("region", { name: "Conversation thread" });
+  await expect(thread).toHaveCSS("scroll-behavior", "auto");
+  await thread.evaluate((element) => {
+    const samples: number[] = [];
+    let frame = 0;
+    const content = element.querySelector(".conversation-wrap");
+    const observer = new MutationObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        if (element.scrollHeight <= element.clientHeight + 1) return;
+        samples.push(element.scrollHeight - element.clientHeight - element.scrollTop);
+      });
+    });
+    if (content) observer.observe(content, { childList: true, characterData: true, subtree: true });
+    Object.assign(element, { __bottomFollowSamples: samples, __bottomFollowObserver: observer });
+  });
+
+  const composer = page.locator('textarea[role="combobox"]');
+  await composer.fill("stream-follow-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+
+  const samples = await thread.evaluate((element) => {
+    const instrumented = element as HTMLDivElement & {
+      __bottomFollowSamples: number[];
+      __bottomFollowObserver: MutationObserver;
+    };
+    instrumented.__bottomFollowObserver.disconnect();
+    return instrumented.__bottomFollowSamples;
+  });
+  expect(samples.length).toBeGreaterThan(3);
+  expect(Math.max(...samples)).toBeLessThanOrEqual(2);
+  expect(browserErrors).toEqual([]);
+});
+
 test("searches the visible ACP Agent thread with Zed-style match navigation", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");

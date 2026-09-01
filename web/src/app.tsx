@@ -285,7 +285,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [sidebarOpen]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = scroll.current;
     if (!element) return;
     if (followLatestContent.current) {

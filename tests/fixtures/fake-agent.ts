@@ -1115,6 +1115,31 @@ const agent = acp
       });
       return { stopReason: "end_turn" };
     }
+    if (promptText.includes("stream-follow-flow")) {
+      for (let index = 1; index <= 20; index += 1) {
+        await client.notify(acp.methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            messageId: "stream-follow-answer",
+            content: {
+              type: "text",
+              text: `Streamed paragraph ${index}: ${"follow the latest Agent output without competing scroll animations. ".repeat(3)}\n\n`,
+            },
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "stream-follow-answer",
+          content: { type: "text", text: "Stream follow complete." },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (promptText.includes("activity-flow")) {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
