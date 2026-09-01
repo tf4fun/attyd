@@ -1,21 +1,20 @@
-use std::future::Future;
 use std::pin::pin;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::{
-    AcpAgent, AcpAgentConfig, Agent, BoxFuture, Channel, Client, ConnectTo, Error, Lines,
+    AcpAgentConfig, Agent, BoxFuture, Channel, Client, ConnectTo, Error, Lines,
 };
-use async_process::Child;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future::{Either, select};
-use futures::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use futures::{Stream, stream};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
 
 pub const MAX_AGENT_NDJSON_LINE_BYTES: usize = 8_000_000;
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
-const STDOUT_POLL_HEARTBEAT: Duration = Duration::from_millis(25);
 const STDERR_CHUNK_BYTES: usize = 8 * 1024;
 
 type StderrCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
@@ -68,8 +67,29 @@ impl ConnectTo<Client> for BoundedAcpAgent {
 
 impl BoundedAcpAgent {
     fn spawn_channel(self) -> Result<(Channel, BoxFuture<'static, Result<(), Error>>), Error> {
-        let (child_stdin, child_stdout, mut child_stderr, child) =
-            AcpAgent::new(self.config).spawn_process()?;
+        let mut command = Command::new(self.config.command());
+        command
+            .args(self.config.arguments())
+            .envs(self.config.environment())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(Error::into_internal_error)?;
+        let child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::internal_error().data("Failed to open Agent stdin"))?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::internal_error().data("Failed to open Agent stdout"))?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::internal_error().data("Failed to open Agent stderr"))?;
         let mut child = ProcessGuard(child);
 
         let stderr_callback = self.stderr_callback;
@@ -89,7 +109,7 @@ impl BoundedAcpAgent {
         };
 
         let (incoming_tx, incoming) = mpsc::unbounded::<std::io::Result<String>>();
-        let stdout_future = poll_with_heartbeat(async move {
+        let stdout_future = async move {
             let lines = bounded_lines(BufReader::new(child_stdout), MAX_AGENT_NDJSON_LINE_BYTES);
             let mut lines = pin!(lines);
             while let Some(line) = lines.next().await {
@@ -101,7 +121,7 @@ impl BoundedAcpAgent {
                 }
             }
             Ok(())
-        });
+        };
         let outgoing = futures::sink::unfold(child_stdin, |mut writer, line: String| async move {
             writer.write_all(line.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -163,34 +183,23 @@ impl BoundedAcpAgent {
     }
 }
 
-async fn poll_with_heartbeat<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let mut heartbeat = tokio::time::interval(STDOUT_POLL_HEARTBEAT);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut future => return result,
-            _ = heartbeat.tick() => {}
-        }
-    }
-}
-
 struct ProcessGuard(Child);
 
 impl ProcessGuard {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.0.status().await
+        self.0.wait().await
     }
 }
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(pid) = rustix::process::Pid::from_raw(self.0.id().cast_signed()) {
+        if let Some(id) = self.0.id()
+            && let Some(pid) = rustix::process::Pid::from_raw(id.cast_signed())
+        {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
-        let _ = self.0.kill();
+        let _ = self.0.start_kill();
     }
 }
 
@@ -231,7 +240,7 @@ where
                 let consumed = newline.map_or(available.len(), |index| index + 1);
                 let content = newline.map_or(available, |index| &available[..index]);
                 if line.len().saturating_add(content.len()) > maximum {
-                    reader.consume_unpin(consumed);
+                    reader.consume(consumed);
                     return Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -241,7 +250,7 @@ where
                     ));
                 }
                 line.extend_from_slice(content);
-                reader.consume_unpin(consumed);
+                reader.consume(consumed);
                 if newline.is_some() {
                     return Some((decode_line(line), (reader, Vec::new(), false)));
                 }
@@ -263,12 +272,11 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::{ProtocolVersion, v1::InitializeRequest};
     use futures::StreamExt;
-    use futures::io::Cursor;
     use std::io::Write;
 
     #[tokio::test]
     async fn bounds_agent_lines_by_encoded_bytes_and_resets_at_newlines() {
-        let input = Cursor::new("12345\n你好\nnext".as_bytes().to_vec());
+        let input = "12345\n你好\nnext".as_bytes();
         let lines = bounded_lines(BufReader::new(input), 6)
             .collect::<Vec<_>>()
             .await;
@@ -277,7 +285,7 @@ mod tests {
         assert_eq!(lines[1].as_ref().unwrap(), "你好");
         assert_eq!(lines[2].as_ref().unwrap(), "next");
 
-        let oversized = Cursor::new("你好\n".as_bytes().to_vec());
+        let oversized = "你好\n".as_bytes();
         let lines = bounded_lines(BufReader::new(oversized), 5)
             .collect::<Vec<_>>()
             .await;
@@ -351,6 +359,34 @@ mod tests {
             .await
             .expect("transport failure must wake the client foreground")
             .expect_err("oversized child stdout must fail the client connection");
+        assert!(
+            format!("{error:?}").contains("Agent NDJSON line exceeds 8000000 bytes"),
+            "unexpected connection error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaces_the_typescript_fixture_oversized_line() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-agent.ts");
+        let config = AcpAgentConfig::new("node").args([
+            "--import".to_string(),
+            "tsx".to_string(),
+            fixture.to_string_lossy().into_owned(),
+            "--oversized-stdout-line".to_string(),
+        ]);
+        let agent = BoundedAcpAgent::new(config);
+        let connection = Client.builder().connect_with(agent, async |connection| {
+            connection
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            Ok(())
+        });
+        let error = tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .expect("TypeScript fixture stdout must not leave the connection pending")
+            .expect_err("oversized TypeScript fixture stdout must fail the connection");
         assert!(
             format!("{error:?}").contains("Agent NDJSON line exceeds 8000000 bytes"),
             "unexpected connection error: {error:?}"

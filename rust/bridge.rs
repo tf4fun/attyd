@@ -28,6 +28,9 @@ use crate::semantic::{
 use crate::terminal::TerminalManager;
 
 pub const MAX_BRIDGE_MESSAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_BRIDGE_TYPE_LENGTH: usize = 128;
+const MAX_BRIDGE_IDENTIFIER_LENGTH: usize = 1_024;
+const MAX_BRIDGE_PATH_LENGTH: usize = 16_384;
 const MAX_AGENT_RELAY_BYTES: usize = 4_000_000;
 const MAX_PENDING_INTERACTIONS: usize = 128;
 const MAX_URL_ELICITATION_IDS: usize = 10_000;
@@ -1109,7 +1112,7 @@ async fn handle_command(
         filesystem,
         auth_terminal,
     } = context;
-    let operation = string_field(&command, "type")?;
+    let operation = bounded_string_field(&command, "type", MAX_BRIDGE_TYPE_LENGTH)?;
     match operation {
         "auth/authenticate" => {
             let request_id = string_field(&command, "requestId")?;
@@ -1732,7 +1735,7 @@ async fn handle_command(
         "context/read" => {
             let request_id = string_field(&command, "requestId")?;
             let session_id = string_field(&command, "sessionId")?;
-            let path = string_field(&command, "path")?;
+            let path = bounded_string_field(&command, "path", MAX_BRIDGE_PATH_LENGTH)?;
             require_active(session_id, &state).await?;
             let filesystem = filesystem.ok_or_else(|| {
                 Error::method_not_found()
@@ -1811,11 +1814,23 @@ async fn handle_command(
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
+    bounded_string_field(value, field, MAX_BRIDGE_IDENTIFIER_LENGTH)
+}
+
+fn bounded_string_field<'a>(
+    value: &'a Value,
+    field: &str,
+    maximum: usize,
+) -> Result<&'a str, Error> {
     value
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 16_384)
-        .ok_or_else(|| Error::invalid_params().data(format!("{field} must be a non-empty string")))
+        .filter(|value| !value.is_empty() && value.encode_utf16().count() <= maximum)
+        .ok_or_else(|| {
+            Error::invalid_params().data(format!(
+                "{field} must contain between 1 and {maximum} characters"
+            ))
+        })
 }
 
 fn string_field_allow_empty<'a>(
@@ -1826,7 +1841,7 @@ fn string_field_allow_empty<'a>(
     value
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| value.len() <= maximum)
+        .filter(|value| value.encode_utf16().count() <= maximum)
         .ok_or_else(|| Error::invalid_params().data(format!("{field} must be a string")))
 }
 
@@ -2290,6 +2305,55 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn relays_a_fatal_oversized_stdio_line_before_initialization() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--oversized-stdout-line",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let (_commands, command_rx) = mpsc::channel(1);
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        tokio::spawn(run(Arc::new(options), command_rx, event_tx));
+
+        let mut received = Vec::new();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.expect("bridge event channel closed");
+                let value: Value = serde_json::from_str(&event).unwrap();
+                received.push(value.clone());
+                if value["type"] == "bridge/error" {
+                    return value;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("bridge did not relay fatal transport error: {received:?}"));
+        assert!(
+            error
+                .to_string()
+                .contains("Agent NDJSON line exceeds 8000000 bytes"),
+            "unexpected bridge error: {error}"
+        );
+        assert!(
+            !received
+                .iter()
+                .any(|event| event["type"] == "acp/initialized")
+        );
+    }
+
     #[test]
     fn advertises_agent_interaction_capabilities_without_editor_features() {
         // Selected from Zed's `client_capabilities_include_elicitation_without_acp_beta`
@@ -2517,13 +2581,19 @@ mod tests {
         let command = json!({
             "requestId": "request",
             "empty": "",
-            "tooLong": "x".repeat(16_385),
+            "tooLong": "x".repeat(MAX_BRIDGE_IDENTIFIER_LENGTH + 1),
+            "wideIdentifier": "😀".repeat(MAX_BRIDGE_IDENTIFIER_LENGTH / 2),
+            "tooWideIdentifier": "😀".repeat(MAX_BRIDGE_IDENTIFIER_LENGTH / 2 + 1),
+            "path": "x".repeat(MAX_BRIDGE_PATH_LENGTH),
             "cols": 80,
             "zero": 0,
         });
         assert_eq!(string_field(&command, "requestId").unwrap(), "request");
         assert!(string_field(&command, "empty").is_err());
         assert!(string_field(&command, "tooLong").is_err());
+        assert!(string_field(&command, "wideIdentifier").is_ok());
+        assert!(string_field(&command, "tooWideIdentifier").is_err());
+        assert!(bounded_string_field(&command, "path", MAX_BRIDGE_PATH_LENGTH).is_ok());
         assert_eq!(string_field_allow_empty(&command, "empty", 4).unwrap(), "");
         assert_eq!(u16_field(&command, "cols").unwrap(), 80);
         assert!(u16_field(&command, "zero").is_err());

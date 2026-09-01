@@ -93,6 +93,17 @@ lines.on("line", (line) => {
     }
     case "never":
       break;
+    case "exit":
+      setTimeout(() => process.exit(23), 0);
+      break;
+    case "resultAndError":
+      write({
+        jsonrpc: "2.0",
+        id: value.id,
+        result: { invalid: true },
+        error: { code: -32099, message: "must not win" },
+      });
+      break;
     case "duplicateResponse":
       write({ jsonrpc: "2.0", id: value.id, result: "first" });
       write({ jsonrpc: "2.0", id: value.id, result: "second" });

@@ -8,11 +8,11 @@ host is not part of the release binary.
 
 | Layer | Command | Purpose |
 | --- | --- | --- |
-| TypeScript contract oracle | `npm test` | 257 protocol, reducer, validation, filesystem, terminal, MCP, transport, race, and UI-state cases accumulated by the original backend |
-| Rust unit tests | `npm run test:rust` | 67 native cases for semantic validation, CLI/MCP configuration, capability negotiation, response bounds, early/late update routing, session mutation locks, cyclic pagination, filesystem confinement/context, terminal/auth-terminal lifecycle, bounded Agent process I/O, and MCP message boundaries |
+| TypeScript contract oracle | `npm test` | 258 protocol, reducer, validation, filesystem, terminal, MCP, transport, race, and UI-state cases accumulated by the original backend |
+| Rust unit tests | `npm run test:rust` | 69 native cases for semantic validation, CLI/MCP configuration, capability negotiation, response bounds, early/late update routing, session mutation locks, cyclic pagination, filesystem confinement/context, terminal/auth-terminal lifecycle, bounded Agent process I/O, final transport-error relay, and MCP message boundaries |
 | Rust remote transports | `npm run test:rust:remote` | Connects the Rust binary to real SDK HTTP/SSE and WebSocket ACP servers; verifies remote capability boundaries and Agent-owned absolute cwd |
-| Shared black-box bridge | `npm run test:ui:rust` and `npm run test:ui:node` | Runs both hosts against the same fake ACP Agent and MCP provider; the current flow observes 128 Node/130 Rust bridge events across initialize, authentication recovery, malformed-command recovery, liveness, list/load/resume/new/fork, pre-response updates, mode/config, prompt/usage/error, permission, form/URL elicitation, terminal, cancellable filesystem RPC, MCP cancellation/disconnect recovery, close, and delete, plus isolated semantic/cyclic-pagination and oversized-Agent-line checks |
-| Backend coverage parity | `npm run test:coverage:backends` | Starts from clean profiles, runs the 257-test Node oracle and 67 Rust unit tests, drives the instrumented Rust binary through the shared and remote black boxes, and fails when Rust line coverage is below that run's Node `server/shared` line coverage. The 8 MB shared hostile-line flow is skipped only under whole-binary coverage instrumentation because the same instrumented run already executes two native process-level line-limit cases. Requires `cargo-llvm-cov`. |
+| Shared black-box bridge | `npm run test:ui:rust` and `npm run test:ui:node` | Runs both hosts against the same fake ACP Agents and MCP provider; the current flow observes 601 Node/603 Rust bridge events across initialize, authentication recovery, 328 targeted malformed/binary WebSocket frames with recovery, liveness, list/load/resume/new/fork, pre-response updates, mode/config, prompt/usage/error, permission, form/URL elicitation, terminal, cancellable filesystem RPC, ordered MCP connect cancellation, message cancellation, disconnect/process-exit recovery, the 128-request pending bound, close, and delete, plus isolated semantic/cyclic-pagination and oversized-Agent-line checks |
+| Backend coverage parity | `npm run test:coverage:backends` | Starts from clean profiles, runs the 258-test Node oracle and 69 Rust unit tests, drives the instrumented Rust binary through the shared and remote black boxes, and fails when Rust line coverage is below that run's Node `server/shared` line coverage. The 8 MB shared hostile-line flow is skipped only under whole-binary coverage instrumentation because the same instrumented run already executes three native process-level line-limit cases. Requires `cargo-llvm-cov`. |
 | Standalone artifact | `npm run test:binary` | Copies only the release executable to an empty temporary directory and verifies embedded HTML, JavaScript, health metadata, and static MIME types |
 | Browser interaction | `npm run test:browser` | Zed-style Agent interaction and mobile behavior in Chromium |
 | Real Agent | `npm run test:goose` | Goose ACP v1 recovery and a deterministic local prompt/tool lifecycle without a real provider key |
@@ -22,7 +22,7 @@ remote transport smoke tests, the Rust black-box bridge, the release build, and 
 binary test. CI additionally runs the Chromium browser suite.
 
 The slower coverage gate is intentionally separate from `npm run check`. The current clean result
-is 83.32% lines for Node `server/shared` and 86.83% for the complete Rust backend. The comparison is
+is 83.38% lines for Node `server/shared` and 87.22% for the complete Rust backend. The comparison is
 dynamic, so increasing the Node oracle's coverage raises the Rust gate automatically.
 
 ## Current Node-to-Rust parity
@@ -48,11 +48,13 @@ its source session.
 
 The deterministic cross-session reducer corpus remains in TypeScript because the browser state
 machine is still TypeScript and is shared by both hosts; it is not a Rust-backend migration gap.
-Filesystem RPC cancellation, MCP message cancellation/disconnect recovery, and oversized stdio
-Agent lines now run against both hosts. The remaining Node-only backend depth is the exhaustive raw
-WebSocket adversarial corpus plus MCP provider-start cancellation, process-exit, and pending-limit
-races. Browser and Goose fixtures still use the Node host until those cases are native or shared;
-coverage parity alone is not treated as authorization to switch them.
+Filesystem RPC cancellation, MCP connect/message cancellation, disconnect/process-exit recovery,
+the 128-request MCP pending bound, oversized stdio Agent lines, binary WebSocket rejection, and a
+targeted raw WebSocket adversarial corpus now run against both hosts. The ordered connect-cancel
+fixture writes `mcp/connect` and `$/cancel_request` in one Agent stdout batch, avoiding a false test
+race against a provider that starts before a separately scheduled cancellation. No known backend
+behavior case remains Node-only. Browser and Goose harnesses still use the Node reference bridge;
+migrating those harnesses is the next verification-infrastructure step, not a production-runtime gap.
 
 ## Zed-derived cases
 

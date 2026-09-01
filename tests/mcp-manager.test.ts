@@ -38,6 +38,10 @@ describe("ACP-transport MCP manager", () => {
       message: "deliberate MCP failure",
       data: { fixture: true },
     });
+    await expect(manager.message({ connectionId, method: "resultAndError" })).rejects.toMatchObject({
+      code: -32603,
+      message: "MCP response contains both result and error",
+    });
 
     const slow = manager.message({
       connectionId,
@@ -155,6 +159,26 @@ describe("ACP-transport MCP manager", () => {
     })).rejects.toThrow("128 MCP requests");
     manager.disconnect(connected);
     expect(await Promise.all(pending)).toHaveLength(128);
+  }, 10_000);
+
+  it("rejects pending work with the provider name and exit status", async () => {
+    const manager = createManager();
+    const connected = await manager.connect({ serverId: "fixture" });
+    await expect(manager.message({
+      connectionId: connected.connectionId,
+      method: "exit",
+    })).rejects.toThrow("MCP server fixture exited (23)");
+    await expect(manager.message({
+      connectionId: connected.connectionId,
+      method: "echo",
+    })).rejects.toMatchObject({ code: -32002 });
+
+    const recovered = await manager.connect({ serverId: "fixture" });
+    await expect(manager.message({
+      connectionId: recovered.connectionId,
+      method: "echo",
+      params: { recovered: true },
+    })).resolves.toEqual({ recovered: true });
   }, 10_000);
 
   it("strictly parses generated ACP transport params", () => {

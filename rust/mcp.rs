@@ -40,6 +40,7 @@ struct McpConnection {
     stdin: Mutex<tokio::process::ChildStdin>,
     pending: Mutex<HashMap<String, PendingMcpRequest>>,
     next_request_id: AtomicU64,
+    closed: AtomicBool,
     announced: AtomicBool,
     kill: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -145,6 +146,7 @@ impl McpManager {
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
             announced: AtomicBool::new(false),
             kill: Mutex::new(Some(kill_tx)),
         });
@@ -167,13 +169,21 @@ impl McpManager {
                 .await;
             return Err(Error::request_cancelled());
         }
-        if !self.connections.lock().await.contains_key(&id) {
+        let active = {
+            let connections = self.connections.lock().await;
+            if connections.contains_key(&id) && !connection.closed.load(Ordering::Acquire) {
+                connection.announced.store(true, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        };
+        if !active {
             return Err(Error::new(
                 -32_000,
                 format!("MCP server {} exited during startup", provider.name),
             ));
         }
-        connection.announced.store(true, Ordering::Release);
         self.connection_event("connected", &connection);
         Ok(ConnectMcpResponse::new(id))
     }
@@ -185,24 +195,32 @@ impl McpManager {
     ) -> Result<MessageMcpResponse, Error> {
         validate_message(&request.method, request.params.as_ref())?;
         let connection = self.require(&request.connection_id.0).await?;
-        if connection.pending.lock().await.len() >= MAX_PENDING_REQUESTS {
-            return Err(Error::new(
-                -32000,
-                format!("at most {MAX_PENDING_REQUESTS} MCP requests may be pending"),
-            ));
-        }
         let id = format!(
             "attyd-{}",
             connection.next_request_id.fetch_add(1, Ordering::Relaxed) + 1
         );
         let (sender, receiver) = oneshot::channel();
-        connection.pending.lock().await.insert(
-            id.clone(),
-            PendingMcpRequest {
-                method: request.method.clone(),
-                sender,
-            },
-        );
+        {
+            let mut pending = connection.pending.lock().await;
+            if connection.closed.load(Ordering::Acquire) {
+                return Err(unknown_connection(&connection.id));
+            }
+            if pending.len() >= MAX_PENDING_REQUESTS {
+                return Err(Error::new(
+                    -32000,
+                    format!(
+                        "at most {MAX_PENDING_REQUESTS} MCP requests may be pending on one connection"
+                    ),
+                ));
+            }
+            pending.insert(
+                id.clone(),
+                PendingMcpRequest {
+                    method: request.method.clone(),
+                    sender,
+                },
+            );
+        }
         self.activity(
             "agent-to-server",
             &connection,
@@ -308,10 +326,8 @@ impl McpManager {
             .await
             .get(connection_id)
             .cloned()
-            .ok_or_else(|| {
-                Error::resource_not_found(None)
-                    .data(format!("unknown MCP connection: {connection_id}"))
-            })
+            .filter(|connection| !connection.closed.load(Ordering::Acquire))
+            .ok_or_else(|| unknown_connection(connection_id))
     }
 
     fn spawn_reader(
@@ -377,16 +393,28 @@ impl McpManager {
     ) {
         let manager = self.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = child.wait() => {},
+            let reason = tokio::select! {
+                result = child.wait() => match result {
+                    Ok(status) => Error::new(
+                        -32_000,
+                        format!(
+                            "MCP server {} exited ({})",
+                            connection.provider.name,
+                            exit_status_label(status),
+                        ),
+                    ),
+                    Err(error) => Error::new(
+                        -32_000,
+                        format!("MCP server {} exited (unknown)", connection.provider.name),
+                    ).data(error.to_string()),
+                },
                 _ = &mut kill_rx => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
+                    return;
                 }
-            }
-            manager
-                .terminate(&connection, Error::new(-32000, "MCP server exited"))
-                .await;
+            };
+            manager.terminate(&connection, reason).await;
         });
     }
 
@@ -396,6 +424,9 @@ impl McpManager {
         acp: &ConnectionTo<Agent>,
         value: Value,
     ) -> Result<(), Error> {
+        if connection.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let object = value
             .as_object()
             .ok_or_else(|| Error::invalid_request().data("MCP message must be an object"))?;
@@ -455,6 +486,7 @@ impl McpManager {
                             }),
                         )
                         .await?;
+                        self.activity_error("agent-to-server", connection, method, &error);
                     }
                 }
             } else {
@@ -481,45 +513,64 @@ impl McpManager {
             self.stderr(connection, "unknown MCP response id ignored");
             return Ok(());
         };
-        let result = if let Some(error) = object.get("error").and_then(Value::as_object) {
-            let code = error
-                .get("code")
-                .and_then(Value::as_i64)
-                .and_then(|code| i32::try_from(code).ok())
-                .unwrap_or(-32603);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("MCP request failed");
-            Err(Error::new(code, message).data(error.get("data").cloned()))
-        } else if let Some(result) = object.get("result") {
-            Ok(result.clone())
-        } else {
-            Err(Error::internal_error().data("MCP response has neither result nor error"))
-        };
-        let activity_result = result.as_ref().ok().cloned();
-        self.activity(
-            "server-to-agent",
-            connection,
-            &pending.method,
-            "response",
-            None,
-            activity_result,
-        );
+        let result =
+            if object.get("error").is_some_and(Value::is_object) && object.contains_key("result") {
+                Err(Error::new(
+                    -32_603,
+                    "MCP response contains both result and error",
+                ))
+            } else if let Some(error) = object.get("error").and_then(Value::as_object) {
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .and_then(|code| i32::try_from(code).ok())
+                    .unwrap_or(-32603);
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP request failed");
+                let mut result = Error::new(code, message);
+                if let Some(data) = error.get("data") {
+                    result = result.data(data.clone());
+                }
+                Err(result)
+            } else if let Some(result) = object.get("result") {
+                Ok(result.clone())
+            } else {
+                Err(Error::internal_error().data("MCP response has neither result nor error"))
+            };
+        match &result {
+            Ok(result) => self.activity(
+                "server-to-agent",
+                connection,
+                &pending.method,
+                "response",
+                None,
+                Some(result.clone()),
+            ),
+            Err(error) => {
+                self.activity_error("server-to-agent", connection, &pending.method, error)
+            }
+        }
         let _ = pending.sender.send(result);
         Ok(())
     }
 
     async fn terminate(&self, connection: &Arc<McpConnection>, reason: Error) {
+        if connection
+            .closed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let removed = self
             .connections
             .lock()
             .await
             .remove(&connection.id)
             .is_some();
-        if !removed {
-            return;
-        }
+        debug_assert!(removed, "an open MCP connection must be registered");
         if let Some(kill) = connection.kill.lock().await.take() {
             let _ = kill.send(());
         }
@@ -569,6 +620,33 @@ impl McpManager {
         let _ = self.events.send(event.to_string());
     }
 
+    fn activity_error(
+        &self,
+        direction: &str,
+        connection: &McpConnection,
+        method: &str,
+        error: &Error,
+    ) {
+        let mut activity_error = json!({
+            "code": i32::from(error.code),
+            "message": error.message,
+        });
+        if let Some(data) = &error.data {
+            activity_error["data"] = data.clone();
+        }
+        let _ = self.events.send(
+            json!({
+                "type": "acp/mcp_message",
+                "direction": direction,
+                "connectionId": connection.id,
+                "method": method,
+                "kind": "response",
+                "error": activity_error,
+            })
+            .to_string(),
+        );
+    }
+
     fn stderr(&self, connection: &McpConnection, message: &str) {
         let _ = self.events.send(
             json!({
@@ -578,6 +656,33 @@ impl McpManager {
             .to_string(),
         );
     }
+}
+
+fn unknown_connection(connection_id: &str) -> Error {
+    Error::resource_not_found(None).data(format!("unknown MCP connection: {connection_id}"))
+}
+
+fn exit_status_label(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return code.to_string();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return match signal {
+                1 => "SIGHUP".to_string(),
+                2 => "SIGINT".to_string(),
+                3 => "SIGQUIT".to_string(),
+                6 => "SIGABRT".to_string(),
+                9 => "SIGKILL".to_string(),
+                15 => "SIGTERM".to_string(),
+                signal => format!("signal {signal}"),
+            };
+        }
+    }
+    "unknown".to_string()
 }
 
 async fn read_bounded_line<R>(

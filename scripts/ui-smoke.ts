@@ -39,10 +39,14 @@ try {
   }
   await exerciseAgentSemanticHardening(cwd, backend);
   await exerciseEarlySemanticRejection(cwd, backend);
+  await exerciseMcpConnectCancellation(cwd, backend);
   const webSocketUrl = `ws://127.0.0.1:${server.port}/ws`;
   const hardeningEvents = await exerciseHardeningWebSocket(webSocketUrl);
   assert.ok(hardeningEvents.some((event) =>
     event.type === "bridge/pong" && event.nonce === "ui-smoke-liveness"
+  ));
+  assert.ok(hardeningEvents.some((event) =>
+    event.type === "bridge/pong" && event.nonce === "ui-smoke-adversarial-recovery"
   ));
   assert.ok(hardeningEvents.some((event) =>
     event.type === "bridge/error" &&
@@ -126,6 +130,21 @@ try {
     event.direction === "server-to-agent" &&
     event.method === "roots/list",
   ));
+  assert.ok(events.some((event) =>
+    event.type === "acp/mcp_message" &&
+    event.direction === "server-to-agent" &&
+    event.method === "fail" &&
+    event.kind === "response" &&
+    event.error?.code === -32_042 &&
+    event.error.message === "deliberate MCP failure",
+  ));
+  assert.ok(events.some((event) =>
+    event.type === "acp/mcp_message" &&
+    event.direction === "server-to-agent" &&
+    event.method === "resultAndError" &&
+    event.kind === "response" &&
+    event.error?.code === -32_603,
+  ));
   const mcpCancellationUpdate = events.find((event) =>
     event.type === "acp/session_update" &&
     event.notification.update.sessionUpdate === "agent_message_chunk" &&
@@ -142,6 +161,28 @@ try {
     disconnectRejectedPending: true,
     recoveredEcho: { recovered: true },
   });
+  const mcpLifecycleUpdate = events.find((event) =>
+    event.type === "acp/session_update" &&
+    event.notification.update.sessionUpdate === "agent_message_chunk" &&
+    event.notification.update.messageId === "mcp-lifecycle-result"
+  );
+  assert.ok(
+    mcpLifecycleUpdate?.type === "acp/session_update" &&
+      mcpLifecycleUpdate.notification.update.sessionUpdate === "agent_message_chunk" &&
+      mcpLifecycleUpdate.notification.update.content.type === "text",
+  );
+  const mcpLifecycleResult = JSON.parse(
+    mcpLifecycleUpdate.notification.update.content.text,
+  ) as {
+    pendingLimitRejected: boolean;
+    pendingRejected: number;
+    exitError: string;
+    recoveredEcho: unknown;
+  };
+  assert.equal(mcpLifecycleResult.pendingLimitRejected, true);
+  assert.equal(mcpLifecycleResult.pendingRejected, 128);
+  assert.match(mcpLifecycleResult.exitError, /MCP server browser-fixture exited \(23\)/u);
+  assert.deepEqual(mcpLifecycleResult.recoveredEcho, { recoveredAfterExit: true });
   const filesystemCancellationUpdate = events.find((event) =>
     event.type === "acp/session_update" &&
     event.notification.update.sessionUpdate === "agent_message_chunk" &&
@@ -247,7 +288,8 @@ try {
     state.externalFlows.find(({ elicitationId }) => elicitationId === "pending-external-flow")?.status,
     "cancelled",
   );
-  assert.ok(state.mcpActivity.some(({ method }) => method === "roots/list"));
+  assert.equal(state.mcpActivity.length, 100);
+  assert.ok(state.mcpActivity.some(({ method }) => method === "exit"));
   assert.deepEqual(state.timeline, []);
   assert.doesNotMatch(JSON.stringify(beforeClose.timeline), /BACKGROUND_ONLY_SENTINEL/);
   assert.match(
@@ -321,12 +363,13 @@ async function startSmokeServer(
   cwd: string,
   backend: "node" | "rust",
   agentFlags: string[] = ["--early-new-updates", "--early-fork-updates"],
+  agentFixture = "fake-agent.ts",
 ): Promise<SmokeServer> {
   const agentCommand = [
     process.execPath,
     "--import",
     "tsx",
-    join(cwd, "tests/fixtures/fake-agent.ts"),
+    join(cwd, "tests/fixtures", agentFixture),
     ...agentFlags,
   ];
   const provider = {
@@ -494,6 +537,76 @@ async function exerciseOversizedAgentLine(
     }
   } finally {
     await oversizedServer.close();
+  }
+}
+
+async function exerciseMcpConnectCancellation(
+  cwd: string,
+  backend: "node" | "rust",
+): Promise<void> {
+  const cancellationServer = await startSmokeServer(
+    cwd,
+    backend,
+    [],
+    "raw-connect-cancel-agent.ts",
+  );
+  try {
+    const socket = new WebSocket(`ws://127.0.0.1:${cancellationServer.port}/ws`);
+    const events: ServerEvent[] = [];
+    socket.on("message", (data) => {
+      events.push(JSON.parse(data.toString()) as ServerEvent);
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+    try {
+      await waitForSmokeEvent(events, (event) => event.type === "acp/initialized");
+      socket.send(JSON.stringify({
+        type: "session/new",
+        requestId: "raw-connect-cancel-new",
+      }));
+      const created = await waitForSmokeEvent(events, (event) =>
+        event.type === "acp/session_created" &&
+        event.requestId === "raw-connect-cancel-new"
+      );
+      assert.equal(created.type, "acp/session_created");
+      socket.send(JSON.stringify({
+        type: "session/prompt",
+        requestId: "raw-connect-cancel-prompt",
+        sessionId: created.response.sessionId,
+        prompt: [{ type: "text", text: "test ordered MCP connect cancellation" }],
+      }));
+      const result = await waitForSmokeEvent(events, (event) =>
+        event.type === "acp/session_update" &&
+        event.notification.update.sessionUpdate === "agent_message_chunk" &&
+        event.notification.update.messageId === "raw-connect-cancel-result"
+      );
+      assert.ok(
+        result.type === "acp/session_update" &&
+          result.notification.update.sessionUpdate === "agent_message_chunk" &&
+          result.notification.update.content.type === "text",
+      );
+      assert.deepEqual(JSON.parse(result.notification.update.content.text), {
+        connectCancelled: true,
+        recovered: true,
+      });
+      await waitForSmokeEvent(events, (event) =>
+        event.type === "acp/prompt_complete" &&
+        event.requestId === "raw-connect-cancel-prompt"
+      );
+      assert.deepEqual(
+        events
+          .filter((event) => event.type === "acp/mcp_connection")
+          .map(({ action }) => action),
+        ["connected", "disconnected"],
+        "the cancelled, unannounced MCP connection must not leak lifecycle events",
+      );
+    } finally {
+      socket.close();
+    }
+  } finally {
+    await cancellationServer.close();
   }
 }
 
@@ -719,6 +832,30 @@ async function exerciseHardeningWebSocket(url: string): Promise<ServerEvent[]> {
       current.filter((event) => event.type === "bridge/error").length > errorsBeforeArray
     );
 
+    const errorsBeforeBinary = events.filter((event) => event.type === "bridge/error").length;
+    socket.send(Buffer.from([0xff, 0xfe, 0xfd]));
+    await waitForSmokeEvent(events, (_event, current) =>
+      current.filter((event) => event.type === "bridge/error").length > errorsBeforeBinary
+    );
+
+    const adversarialFrames = rawWebSocketAdversarialCorpus();
+    const errorsBeforeCorpus = events.filter((event) => event.type === "bridge/error").length;
+    for (const frame of adversarialFrames) socket.send(frame);
+    await waitForSmokeEvent(
+      events,
+      (_event, current) =>
+        current.filter((event) => event.type === "bridge/error").length >=
+          errorsBeforeCorpus + adversarialFrames.length,
+      30_000,
+    );
+    socket.send(JSON.stringify({
+      type: "bridge/ping",
+      nonce: "ui-smoke-adversarial-recovery",
+    }));
+    await waitForSmokeEvent(events, (event) =>
+      event.type === "bridge/pong" && event.nonce === "ui-smoke-adversarial-recovery"
+    );
+
     socket.send(JSON.stringify({
       type: "unsupported/command",
       requestId: "ui-smoke-unknown-command",
@@ -759,6 +896,86 @@ async function exerciseHardeningWebSocket(url: string): Promise<ServerEvent[]> {
   } finally {
     socket.close();
   }
+}
+
+function rawWebSocketAdversarialCorpus(): string[] {
+  const frames = [
+    "",
+    "null",
+    "true",
+    "0",
+    '"string"',
+    "[]",
+    "{}",
+    "{",
+  ];
+  for (let index = 0; index < 320; index += 1) {
+    switch (index % 10) {
+      case 0:
+        frames.push(`{"type":`);
+        break;
+      case 1:
+        frames.push(JSON.stringify([index, { type: "session/list" }]));
+        break;
+      case 2:
+        frames.push(JSON.stringify({
+          type: `unsupported/adversarial-${index}`,
+          requestId: `adversarial-${index}`,
+        }));
+        break;
+      case 3:
+        frames.push(JSON.stringify({ type: "bridge/ping", nonce: index }));
+        break;
+      case 4:
+        frames.push(JSON.stringify({
+          type: "session/list",
+          requestId: { invalid: index },
+          cursor: null,
+        }));
+        break;
+      case 5:
+        frames.push(JSON.stringify({
+          type: "context/search",
+          requestId: `adversarial-${index}`,
+          query: ["invalid"],
+        }));
+        break;
+      case 6:
+        frames.push(JSON.stringify({
+          type: "session/prompt",
+          requestId: `adversarial-${index}`,
+          sessionId: null,
+          prompt: "not-blocks",
+        }));
+        break;
+      case 7:
+        frames.push(JSON.stringify({
+          type: "session/set_config_option",
+          requestId: `adversarial-${index}`,
+          sessionId: "missing-session",
+          configId: [],
+          value: { invalid: true },
+        }));
+        break;
+      case 8:
+        frames.push(JSON.stringify({
+          type: "permission/respond",
+          requestId: `adversarial-${index}`,
+          permissionId: `missing-${index}`,
+          outcome: { outcome: "selected", optionId: index },
+        }));
+        break;
+      default:
+        frames.push(JSON.stringify({
+          type: "auth/terminal_resize",
+          requestId: `adversarial-${index}`,
+          cols: -1,
+          rows: 65_536,
+        }));
+        break;
+    }
+  }
+  return frames;
 }
 
 async function waitForSmokeEvent(
@@ -911,7 +1128,7 @@ function exerciseWebSocket(url: string): Promise<{
     const timeout = setTimeout(() => {
       socket.terminate();
       reject(new Error(`Timed out waiting for UI WebSocket flow: ${JSON.stringify(events)}`));
-    }, 15_000);
+    }, 30_000);
     const sendVisiblePrompt = (requestId: string, sessionId: string, text: string) => {
       const blocks = [{ type: "text" as const, text }];
       state = appReducer(state, {
@@ -1229,6 +1446,19 @@ function exerciseWebSocket(url: string): Promise<{
       if (
         event.type === "acp/prompt_complete" &&
         event.requestId === "ui-smoke-mcp-cancel"
+      ) {
+        assert.equal(state.pendingPrompt, undefined);
+        assert.ok(forkedSessionId);
+        sendVisiblePrompt(
+          "ui-smoke-mcp-lifecycle",
+          forkedSessionId,
+          "mcp-lifecycle-flow",
+        );
+        return;
+      }
+      if (
+        event.type === "acp/prompt_complete" &&
+        event.requestId === "ui-smoke-mcp-lifecycle"
       ) {
         assert.equal(state.pendingPrompt, undefined);
         assert.ok(forkedSessionId);

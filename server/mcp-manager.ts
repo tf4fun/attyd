@@ -233,7 +233,7 @@ export class McpManager {
 
   disconnect(request: acp.DisconnectMcpRequest): acp.DisconnectMcpResponse {
     const connection = this.requireConnection(request.connectionId);
-    this.terminate(connection, new Error("MCP connection was disconnected"));
+    this.terminate(connection, new acp.RequestError(-32000, "MCP connection was disconnected"));
     return {};
   }
 
@@ -241,7 +241,7 @@ export class McpManager {
     if (this.closed) return;
     this.closed = true;
     for (const connection of [...this.connections.values()]) {
-      this.terminate(connection, new Error("ACP connection was closed"));
+      this.terminate(connection, new acp.RequestError(-32000, "ACP connection was closed"));
     }
   }
 
@@ -252,11 +252,16 @@ export class McpManager {
     connection.child.stderr.on("data", (chunk: string) => {
       this.options.onStderr?.(`[MCP ${connection.provider.name}] ${chunk}`);
     });
-    connection.child.once("error", (error) => this.terminate(connection, error));
+    connection.child.once("error", (error) => {
+      this.terminate(connection, new acp.RequestError(-32000, error.message));
+    });
     connection.child.once("exit", (code, signal) => {
       this.terminate(
         connection,
-        new Error(`MCP server ${connection.provider.name} exited (${code ?? signal ?? "unknown"})`),
+        new acp.RequestError(
+          -32000,
+          `MCP server ${connection.provider.name} exited (${code ?? signal ?? "unknown"})`,
+        ),
       );
     });
   }
@@ -268,7 +273,10 @@ export class McpManager {
       const newline = connection.input.indexOf("\n");
       if (newline < 0) {
         if (Buffer.byteLength(connection.input, "utf8") > MAX_INPUT_BYTES) {
-          this.terminate(connection, new Error("MCP server output exceeded the input buffer limit"));
+          this.terminate(
+            connection,
+            new acp.RequestError(-32000, "MCP server output exceeded the input buffer limit"),
+          );
         }
         return;
       }
@@ -276,7 +284,10 @@ export class McpManager {
       connection.input = connection.input.slice(newline + 1);
       if (line.trim().length === 0) continue;
       if (Buffer.byteLength(line, "utf8") > MAX_MESSAGE_BYTES) {
-        this.terminate(connection, new Error("MCP server emitted an oversized JSON-RPC message"));
+        this.terminate(
+          connection,
+          new acp.RequestError(-32000, "MCP server emitted an oversized JSON-RPC message"),
+        );
         return;
       }
       let message: unknown;

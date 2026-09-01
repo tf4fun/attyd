@@ -735,6 +735,7 @@ const agent = acp
         { connectionId: connected.connectionId, method: "never" },
         { cancellationSignal: messageController.signal },
       );
+      await new Promise((resolve) => setTimeout(resolve, 25));
       messageController.abort();
       let messageCancelled = false;
       try {
@@ -808,6 +809,99 @@ const agent = acp
       });
       return { stopReason: "end_turn" };
     }
+    if (promptText.includes("mcp-lifecycle-flow")) {
+      const server = configuredMcpServers.find(
+        (candidate): candidate is acp.McpServer & { type: "acp" } =>
+          "type" in candidate && candidate.type === "acp",
+      );
+      if (!server) throw new Error("No ACP-transport MCP server was configured");
+
+      const bounded = await client.request<acp.ConnectMcpResponse, acp.ConnectMcpRequest>(
+        acp.CLIENT_METHODS.mcp_connect,
+        { serverId: server.serverId },
+      );
+      const pending = Array.from({ length: 128 }, () =>
+        client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+          acp.CLIENT_METHODS.mcp_message,
+          { connectionId: bounded.connectionId, method: "never" },
+        ).then(
+          () => false,
+          () => true,
+        )
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const overflow = client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+        acp.CLIENT_METHODS.mcp_message,
+        { connectionId: bounded.connectionId, method: "never" },
+      ).then(
+        () => ({ kind: "resolved" as const, message: "" }),
+        (error: unknown) => ({ kind: "rejected" as const, message: errorText(error) }),
+      );
+      const overflowBeforeDisconnect = await Promise.race([
+        overflow,
+        new Promise<{ kind: "timeout"; message: string }>((resolve) =>
+          setTimeout(() => resolve({ kind: "timeout", message: "" }), 1_000)
+        ),
+      ]);
+      await client.request<acp.DisconnectMcpResponse, acp.DisconnectMcpRequest>(
+        acp.CLIENT_METHODS.mcp_disconnect,
+        { connectionId: bounded.connectionId },
+      );
+      const pendingRejected = (await Promise.all(pending)).filter(Boolean).length;
+      await overflow;
+
+      const exiting = await client.request<acp.ConnectMcpResponse, acp.ConnectMcpRequest>(
+        acp.CLIENT_METHODS.mcp_connect,
+        { serverId: server.serverId },
+      );
+      let exitError = "";
+      try {
+        await client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+          acp.CLIENT_METHODS.mcp_message,
+          { connectionId: exiting.connectionId, method: "exit" },
+        );
+      } catch (error) {
+        exitError = errorText(error);
+      }
+
+      const recovered = await client.request<acp.ConnectMcpResponse, acp.ConnectMcpRequest>(
+        acp.CLIENT_METHODS.mcp_connect,
+        { serverId: server.serverId },
+      );
+      const recoveredEcho = await client.request<
+        acp.MessageMcpResponse,
+        acp.MessageMcpRequest
+      >(
+        acp.CLIENT_METHODS.mcp_message,
+        {
+          connectionId: recovered.connectionId,
+          method: "echo",
+          params: { recoveredAfterExit: true },
+        },
+      );
+      await client.request<acp.DisconnectMcpResponse, acp.DisconnectMcpRequest>(
+        acp.CLIENT_METHODS.mcp_disconnect,
+        { connectionId: recovered.connectionId },
+      );
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "mcp-lifecycle-result",
+          content: {
+            type: "text",
+            text: JSON.stringify({
+              pendingLimitRejected: overflowBeforeDisconnect.kind === "rejected" &&
+                overflowBeforeDisconnect.message.includes("128 MCP requests"),
+              pendingRejected,
+              exitError,
+              recoveredEcho,
+            }),
+          },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (promptText.includes("mcp-flow")) {
       const server = configuredMcpServers.find(
         (candidate): candidate is acp.McpServer & { type: "acp" } =>
@@ -838,6 +932,24 @@ const agent = acp
           params: { from: "agent" },
         },
       );
+      let failed: { code?: number; message: string; data?: unknown } | undefined;
+      try {
+        await client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+          acp.CLIENT_METHODS.mcp_message,
+          { connectionId: connected.connectionId, method: "fail" },
+        );
+      } catch (error) {
+        failed = requestErrorDetails(error);
+      }
+      let resultAndError: { code?: number; message: string; data?: unknown } | undefined;
+      try {
+        await client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+          acp.CLIENT_METHODS.mcp_message,
+          { connectionId: connected.connectionId, method: "resultAndError" },
+        );
+      } catch (error) {
+        resultAndError = requestErrorDetails(error);
+      }
       const roundTrip = await client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
         acp.CLIENT_METHODS.mcp_message,
         { connectionId: connected.connectionId, method: "serverRoundTrip" },
@@ -857,7 +969,7 @@ const agent = acp
           messageId: "mcp-result",
           content: {
             type: "text",
-            text: JSON.stringify({ initialized, echoed, roundTrip }),
+            text: JSON.stringify({ initialized, echoed, failed, resultAndError, roundTrip }),
           },
         },
       });
@@ -1747,4 +1859,15 @@ async function beforeControlResponse(): Promise<void> {
 function parseMcpMessage(value: unknown): acp.MessageMcpRequest {
   if (typeof value !== "object" || value === null) throw new Error("Invalid mcp/message params");
   return value as acp.MessageMcpRequest;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function requestErrorDetails(error: unknown): { code?: number; message: string; data?: unknown } {
+  return {
+    ...(error instanceof acp.RequestError ? { code: error.code, data: error.data } : {}),
+    message: errorText(error),
+  };
 }

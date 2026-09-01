@@ -105,6 +105,7 @@ async fn serve_websocket(socket: WebSocket, options: Arc<Options>) {
     let (mut writer, mut reader) = socket.split();
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<String>(256);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let transport_events = event_tx.clone();
 
     let mut bridge_task = tokio::spawn(bridge::run(options, command_rx, event_tx));
     let mut writer_task = tokio::spawn(async move {
@@ -115,7 +116,13 @@ async fn serve_websocket(socket: WebSocket, options: Arc<Options>) {
         }
     });
 
-    tokio::select! {
+    enum CompletedTask {
+        Reader,
+        Bridge,
+        Writer,
+    }
+
+    let completed = tokio::select! {
         _ = async {
             while let Some(message) = reader.next().await {
                 match message {
@@ -125,17 +132,38 @@ async fn serve_websocket(socket: WebSocket, options: Arc<Options>) {
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
-                    Ok(Message::Binary(_)) => break,
+                    Ok(Message::Binary(_)) => {
+                        let _ = transport_events.send(
+                            json!({
+                                "type": "bridge/error",
+                                "message": "WebSocket commands must use text frames",
+                            })
+                            .to_string(),
+                        );
+                    }
                     Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
                 }
             }
-        } => {},
-        _ = &mut bridge_task => {},
-        _ = &mut writer_task => {},
-    }
+        } => CompletedTask::Reader,
+        _ = &mut bridge_task => CompletedTask::Bridge,
+        _ = &mut writer_task => CompletedTask::Writer,
+    };
 
-    bridge_task.abort();
-    writer_task.abort();
+    match completed {
+        CompletedTask::Reader => {
+            bridge_task.abort();
+            writer_task.abort();
+        }
+        CompletedTask::Bridge => {
+            if tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer_task)
+                .await
+                .is_err()
+            {
+                writer_task.abort();
+            }
+        }
+        CompletedTask::Writer => bridge_task.abort(),
+    }
 }
 
 async fn static_asset(uri: Uri) -> Response {
