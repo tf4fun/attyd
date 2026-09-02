@@ -736,14 +736,6 @@ pub(crate) enum BridgeInput {
     RuntimeSnapshotRequest,
 }
 
-pub async fn run(
-    options: Arc<Options>,
-    commands: mpsc::Receiver<BridgeInput>,
-    events: mpsc::UnboundedSender<String>,
-) {
-    run_with_cancellation(options, commands, events, CancellationToken::new()).await;
-}
-
 pub async fn run_with_cancellation(
     options: Arc<Options>,
     commands: mpsc::Receiver<BridgeInput>,
@@ -2725,8 +2717,7 @@ async fn handle_command(
                 session_id.clone(),
                 cwd.to_string_lossy(),
                 response_value,
-                &source_id,
-                source_incarnation,
+                (&source_id, source_incarnation),
                 target_replay,
             );
             let incarnation = match runtime_result {
@@ -4335,7 +4326,12 @@ mod tests {
         .unwrap();
         let (_commands, command_rx) = mpsc::channel(1);
         let (event_tx, mut events) = mpsc::unbounded_channel();
-        tokio::spawn(run(Arc::new(options), command_rx, event_tx));
+        tokio::spawn(run_with_cancellation(
+            Arc::new(options),
+            command_rx,
+            event_tx,
+            CancellationToken::new(),
+        ));
 
         let mut received = Vec::new();
         let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -5870,7 +5866,14 @@ mod tests {
             .unwrap();
         state
             .runtime
-            .delete_failed(&epoch, "session", incarnation, "first-delete")
+            .fail_operation(
+                &epoch,
+                "session",
+                incarnation,
+                "first-delete",
+                RuntimeSessionOperationKind::Delete,
+                json!("delete failed"),
+            )
             .unwrap();
 
         assert_eq!(

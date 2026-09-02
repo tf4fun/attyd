@@ -416,10 +416,10 @@ impl RuntimeCache {
             }
         }
         replay.extend(session.terminal_states.values().cloned());
-        if let Some(event) = &session.active_operation {
-            if !retained.contains(event.as_str()) {
-                replay.push(event.clone());
-            }
+        if let Some(event) = &session.active_operation
+            && !retained.contains(event.as_str())
+        {
+            replay.push(event.clone());
         }
         replay.extend(session.events.iter().cloned());
         replay
@@ -687,11 +687,12 @@ impl RuntimeSession {
                         .insert(id.to_string(), event.to_string());
                 }
             }
-            "acp/mode_changed" | "acp/config_changed" => {
-                if same_request(&self.active_operation, &value) {
-                    self.active_operation = None;
-                }
+            "acp/mode_changed" | "acp/config_changed"
+                if same_request(&self.active_operation, &value) =>
+            {
+                self.active_operation = None;
             }
+            "acp/mode_changed" | "acp/config_changed" => {}
             _ => {}
         }
     }

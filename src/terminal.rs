@@ -57,13 +57,6 @@ struct TerminalState {
 }
 
 impl TerminalManager {
-    pub fn new(
-        filesystem: Arc<WorkspaceFileSystem>,
-        events: mpsc::UnboundedSender<String>,
-    ) -> Self {
-        Self::new_with_snapshots(filesystem, events, None)
-    }
-
     pub fn new_with_snapshots(
         filesystem: Arc<WorkspaceFileSystem>,
         events: mpsc::UnboundedSender<String>,
@@ -75,13 +68,6 @@ impl TerminalManager {
             events,
             snapshots,
         }
-    }
-
-    pub async fn create(
-        &self,
-        request: CreateTerminalRequest,
-    ) -> Result<CreateTerminalResponse, Error> {
-        self.create_for_incarnation(request, 0).await
     }
 
     pub(crate) async fn create_for_incarnation(
@@ -456,7 +442,17 @@ mod tests {
     fn manager(root: &Path) -> (TerminalManager, mpsc::UnboundedReceiver<String>) {
         let filesystem = Arc::new(WorkspaceFileSystem::new(root, false, &[]).unwrap());
         let (events, receiver) = mpsc::unbounded_channel();
-        (TerminalManager::new(filesystem, events), receiver)
+        (
+            TerminalManager::new_with_snapshots(filesystem, events, None),
+            receiver,
+        )
+    }
+
+    async fn create_terminal(
+        terminals: &TerminalManager,
+        request: CreateTerminalRequest,
+    ) -> Result<CreateTerminalResponse, Error> {
+        terminals.create_for_incarnation(request, 0).await
     }
 
     fn output_request(session_id: &str, terminal_id: &TerminalId) -> TerminalOutputRequest {
@@ -489,14 +485,14 @@ mod tests {
     async fn scopes_handles_emits_snapshots_and_releases_terminal() {
         let root = tempfile::tempdir().unwrap();
         let (terminals, mut events) = manager(root.path());
-        let created = terminals
-            .create(
-                CreateTerminalRequest::new("owner", "/bin/sh")
-                    .args(vec!["-c".to_string(), "printf ok".to_string()])
-                    .cwd(root.path().to_path_buf()),
-            )
-            .await
-            .unwrap();
+        let created = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("owner", "/bin/sh")
+                .args(vec!["-c".to_string(), "printf ok".to_string()])
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
         let exited = wait_until_exited(&terminals, "owner", &created.terminal_id).await;
         assert_eq!(exited.output, "ok");
         assert!(
@@ -533,18 +529,18 @@ mod tests {
     async fn truncates_output_only_at_utf8_boundaries() {
         let root = tempfile::tempdir().unwrap();
         let (terminals, _events) = manager(root.path());
-        let created = terminals
-            .create(
-                CreateTerminalRequest::new("session", "/bin/sh")
-                    .args(vec![
-                        "-c".to_string(),
-                        r"printf '\360\237\231\202\360\237\231\202\360\237\231\202'".to_string(),
-                    ])
-                    .cwd(root.path().to_path_buf())
-                    .output_byte_limit(9),
-            )
-            .await
-            .unwrap();
+        let created = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", "/bin/sh")
+                .args(vec![
+                    "-c".to_string(),
+                    r"printf '\360\237\231\202\360\237\231\202\360\237\231\202'".to_string(),
+                ])
+                .cwd(root.path().to_path_buf())
+                .output_byte_limit(9),
+        )
+        .await
+        .unwrap();
         let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
         assert!(output.truncated);
         assert_eq!(output.output, "🙂🙂");
@@ -557,25 +553,25 @@ mod tests {
     async fn falls_back_to_shell_only_for_compound_commands_without_args() {
         let root = tempfile::tempdir().unwrap();
         let (terminals, _events) = manager(root.path());
-        let created = terminals
-            .create(
-                CreateTerminalRequest::new("goose-compatible", "printf ATTYD_COMPOUND_OK")
-                    .cwd(root.path().to_path_buf()),
-            )
-            .await
-            .unwrap();
+        let created = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("goose-compatible", "printf ATTYD_COMPOUND_OK")
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
         let output = wait_until_exited(&terminals, "goose-compatible", &created.terminal_id).await;
         assert_eq!(output.output, "ATTYD_COMPOUND_OK");
 
         assert!(
-            terminals
-                .create(
-                    CreateTerminalRequest::new("strict", "printf ATTYD_MUST_NOT_RUN")
-                        .args(vec!["keep-strict-argv".to_string()])
-                        .cwd(root.path().to_path_buf()),
-                )
-                .await
-                .is_err()
+            create_terminal(
+                &terminals,
+                CreateTerminalRequest::new("strict", "printf ATTYD_MUST_NOT_RUN")
+                    .args(vec!["keep-strict-argv".to_string()])
+                    .cwd(root.path().to_path_buf()),
+            )
+            .await
+            .is_err()
         );
         terminals.close_all().await;
     }
@@ -586,42 +582,45 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (terminals, mut events) = manager(root.path());
         assert!(
-            terminals
-                .create(CreateTerminalRequest::new(
-                    "session",
-                    "x".repeat(MAX_TERMINAL_COMMAND_LENGTH + 1),
-                ))
-                .await
-                .is_err()
+            create_terminal(
+                &terminals,
+                CreateTerminalRequest::new("session", "x".repeat(MAX_TERMINAL_COMMAND_LENGTH + 1),)
+            )
+            .await
+            .is_err()
         );
         assert!(
-            terminals
-                .create(CreateTerminalRequest::new("session", "/bin/sh").env(vec![
+            create_terminal(
+                &terminals,
+                CreateTerminalRequest::new("session", "/bin/sh").env(vec![
                     EnvVariable::new("DUPLICATE", "one"),
                     EnvVariable::new("DUPLICATE", "two"),
-                ]),)
-                .await
-                .is_err()
+                ])
+            )
+            .await
+            .is_err()
         );
         assert!(
-            terminals
-                .create(CreateTerminalRequest::new(
+            create_terminal(
+                &terminals,
+                CreateTerminalRequest::new(
                     "session",
                     root.path().join("missing-command").to_string_lossy(),
-                ))
-                .await
-                .is_err()
+                )
+            )
+            .await
+            .is_err()
         );
         assert!(events.try_recv().is_err());
 
-        let recovered = terminals
-            .create(
-                CreateTerminalRequest::new("session", "/bin/sh")
-                    .args(vec!["-c".to_string(), "printf recovered".to_string()])
-                    .cwd(root.path().to_path_buf()),
-            )
-            .await
-            .unwrap();
+        let recovered = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", "/bin/sh")
+                .args(vec!["-c".to_string(), "printf recovered".to_string()])
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             wait_until_exited(&terminals, "session", &recovered.terminal_id)
                 .await
@@ -636,25 +635,25 @@ mod tests {
     async fn releases_only_terminals_owned_by_closed_session() {
         let root = tempfile::tempdir().unwrap();
         let (terminals, _events) = manager(root.path());
-        let owner = terminals
-            .create(
-                CreateTerminalRequest::new("owner", "/bin/sh")
-                    .args(vec![
-                        "-c".to_string(),
-                        "while :; do sleep 1; done".to_string(),
-                    ])
-                    .cwd(root.path().to_path_buf()),
-            )
-            .await
-            .unwrap();
-        let survivor = terminals
-            .create(
-                CreateTerminalRequest::new("survivor", "/bin/sh")
-                    .args(vec!["-c".to_string(), "printf alive".to_string()])
-                    .cwd(root.path().to_path_buf()),
-            )
-            .await
-            .unwrap();
+        let owner = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("owner", "/bin/sh")
+                .args(vec![
+                    "-c".to_string(),
+                    "while :; do sleep 1; done".to_string(),
+                ])
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let survivor = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("survivor", "/bin/sh")
+                .args(vec!["-c".to_string(), "printf alive".to_string()])
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
 
         terminals.release_session("owner").await;
         assert!(

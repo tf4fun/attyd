@@ -150,10 +150,6 @@ struct CanonicalProjection {
 }
 
 impl CanonicalProjection {
-    fn update(&mut self, event: &str) -> bool {
-        self.update_with_public_event(event).0
-    }
-
     fn update_with_public_event(&mut self, event: &str) -> (bool, Option<String>) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(event) else {
             return (false, None);
@@ -246,7 +242,7 @@ impl CanonicalProjection {
                 }
                 snapshot
                     .sessions
-                    .insert(session.session_id.clone(), session);
+                    .insert(session.session_id.clone(), *session);
             }
             RuntimeChange::TurnUpdateAppended {
                 session_id,
@@ -357,10 +353,6 @@ impl QueuedSubscriberEvent {
                 bytes,
             },
         )
-    }
-
-    fn into_string(mut self) -> String {
-        std::mem::take(&mut self.event)
     }
 }
 
@@ -868,6 +860,18 @@ mod tests {
     use super::*;
     use crate::runtime_state::{RuntimeLimits, RuntimeState};
     use clap::Parser;
+
+    impl CanonicalProjection {
+        fn update(&mut self, event: &str) -> bool {
+            self.update_with_public_event(event).0
+        }
+    }
+
+    impl QueuedSubscriberEvent {
+        fn into_string(mut self) -> String {
+            std::mem::take(&mut self.event)
+        }
+    }
 
     fn test_hub() -> Arc<BridgeHub> {
         let options = Options::try_parse_from(["attyd", "--", "fake-agent"]).unwrap();
@@ -1424,7 +1428,9 @@ mod tests {
             epoch: "epoch".to_string(),
             seq: runtime.seq() + 1,
             scope_revision: Some(jumped.revision),
-            change: RuntimeChange::SessionUpsert { session: jumped },
+            change: RuntimeChange::SessionUpsert {
+                session: Box::new(jumped),
+            },
             intent_results: Vec::new(),
             evicted_intent_result_ids: Vec::new(),
         };

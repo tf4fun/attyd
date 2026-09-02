@@ -144,6 +144,12 @@ pub(crate) enum ObservedTurnOutcome {
     Uncertain { reason: String },
 }
 
+struct TurnTerminal {
+    outcome: ObservedTurnOutcome,
+    status: IntentStatus,
+    lifecycle: Option<SessionLifecycle>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionOperationState {
@@ -218,7 +224,7 @@ pub(crate) enum RuntimeChange {
         request_url_flows: BTreeMap<String, UrlFlow>,
     },
     SessionUpsert {
-        session: SessionRuntime,
+        session: Box<SessionRuntime>,
     },
     TurnUpdateAppended {
         session_id: String,
@@ -401,10 +407,6 @@ impl RuntimeState {
         &self.epoch
     }
 
-    pub(crate) fn seq(&self) -> u64 {
-        self.seq
-    }
-
     pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             epoch: self.epoch.clone(),
@@ -520,23 +522,6 @@ impl RuntimeState {
         Ok(())
     }
 
-    pub(crate) fn open_new(
-        &mut self,
-        expected_epoch: &str,
-        session_id: impl Into<String>,
-        cwd: impl Into<String>,
-        session: Value,
-    ) -> Result<u64, RuntimeStateError> {
-        self.open_session(
-            expected_epoch,
-            session_id.into(),
-            cwd.into(),
-            session,
-            TranscriptBaseline::Empty,
-            BTreeMap::new(),
-        )
-    }
-
     pub(crate) fn open_new_with_replay(
         &mut self,
         expected_epoch: &str,
@@ -561,45 +546,6 @@ impl RuntimeState {
             session,
             transcript,
             control_state,
-        )
-    }
-
-    pub(crate) fn open_loaded(
-        &mut self,
-        expected_epoch: &str,
-        session_id: impl Into<String>,
-        cwd: impl Into<String>,
-        session: Value,
-        replay: Vec<Value>,
-    ) -> Result<u64, RuntimeStateError> {
-        let (replay, control_state) = partition_replay_entries(replay);
-        self.open_session(
-            expected_epoch,
-            session_id.into(),
-            cwd.into(),
-            session,
-            TranscriptBaseline::AgentReplay {
-                entries: replay,
-                turn_boundaries_known: false,
-            },
-            control_state,
-        )
-    }
-
-    pub(crate) fn open_resumed(
-        &mut self,
-        expected_epoch: &str,
-        session_id: impl Into<String>,
-        cwd: impl Into<String>,
-        session: Value,
-    ) -> Result<u64, RuntimeStateError> {
-        self.open_session(
-            expected_epoch,
-            session_id.into(),
-            cwd.into(),
-            session,
-            TranscriptBaseline::HistoryUnavailable,
-            BTreeMap::new(),
         )
     }
 
@@ -788,11 +734,11 @@ impl RuntimeState {
         session_id: impl Into<String>,
         cwd: impl Into<String>,
         session: Value,
-        source_session_id: &str,
-        source_incarnation: u64,
+        source: (&str, u64),
         target_replay: Option<Vec<Value>>,
     ) -> Result<u64, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
+        let (source_session_id, source_incarnation) = source;
         let (transcript, control_state) = if let Some(entries) = target_replay {
             let (entries, control_state) = partition_replay_entries(entries);
             (
@@ -1181,9 +1127,11 @@ impl RuntimeState {
             session_id,
             incarnation,
             operation_id,
-            ObservedTurnOutcome::Completed { response },
-            status,
-            None,
+            TurnTerminal {
+                outcome: ObservedTurnOutcome::Completed { response },
+                status,
+                lifecycle: None,
+            },
         )
     }
 
@@ -1200,9 +1148,11 @@ impl RuntimeState {
             session_id,
             incarnation,
             operation_id,
-            ObservedTurnOutcome::Failed { error },
-            IntentStatus::Failed,
-            None,
+            TurnTerminal {
+                outcome: ObservedTurnOutcome::Failed { error },
+                status: IntentStatus::Failed,
+                lifecycle: None,
+            },
         )
     }
 
@@ -1219,11 +1169,13 @@ impl RuntimeState {
             session_id,
             incarnation,
             operation_id,
-            ObservedTurnOutcome::Uncertain {
-                reason: reason.into(),
+            TurnTerminal {
+                outcome: ObservedTurnOutcome::Uncertain {
+                    reason: reason.into(),
+                },
+                status: IntentStatus::Uncertain,
+                lifecycle: Some(SessionLifecycle::Uncertain),
             },
-            IntentStatus::Uncertain,
-            Some(SessionLifecycle::Uncertain),
         )
     }
 
@@ -1233,10 +1185,13 @@ impl RuntimeState {
         session_id: &str,
         incarnation: u64,
         operation_id: &str,
-        outcome: ObservedTurnOutcome,
-        status: IntentStatus,
-        lifecycle: Option<SessionLifecycle>,
+        terminal: TurnTerminal,
     ) -> Result<(), RuntimeStateError> {
+        let TurnTerminal {
+            outcome,
+            status,
+            lifecycle,
+        } = terminal;
         self.require_epoch(expected_epoch)?;
         let limits = self.limits;
         let result_payload = match &outcome {
@@ -1415,28 +1370,6 @@ impl RuntimeState {
         pending.responding_operation_id = Some(operation_id);
         self.commit_session(session_id);
         Ok(InteractionResponseStart::Applied)
-    }
-
-    pub(crate) fn fail_permission_response(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        interaction_id: &str,
-        operation_id: &str,
-    ) -> Result<(), RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let pending = session
-            .permissions
-            .get_mut(interaction_id)
-            .ok_or(RuntimeStateError::UnknownInteraction)?;
-        if pending.responding_operation_id.as_deref() != Some(operation_id) {
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        pending.responding_operation_id = None;
-        self.commit_session(session_id);
-        Ok(())
     }
 
     pub(crate) fn complete_permission_response(
@@ -1674,42 +1607,6 @@ impl RuntimeState {
         Ok(InteractionResponseStart::Applied)
     }
 
-    pub(crate) fn fail_elicitation_response(
-        &mut self,
-        expected_epoch: &str,
-        scope: Option<(&str, u64)>,
-        interaction_id: &str,
-        operation_id: &str,
-    ) -> Result<(), RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        match scope {
-            Some((session_id, incarnation)) => {
-                let pending = self
-                    .require_session_mut(session_id, incarnation)?
-                    .elicitations
-                    .get_mut(interaction_id)
-                    .ok_or(RuntimeStateError::UnknownInteraction)?;
-                if pending.responding_operation_id.as_deref() != Some(operation_id) {
-                    return Err(RuntimeStateError::OperationMismatch);
-                }
-                pending.responding_operation_id = None;
-                self.commit_session(session_id);
-            }
-            None => {
-                let pending = self
-                    .request_elicitations
-                    .get_mut(interaction_id)
-                    .ok_or(RuntimeStateError::UnknownInteraction)?;
-                if pending.responding_operation_id.as_deref() != Some(operation_id) {
-                    return Err(RuntimeStateError::OperationMismatch);
-                }
-                pending.responding_operation_id = None;
-                self.commit_connection();
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn complete_elicitation_response(
         &mut self,
         expected_epoch: &str,
@@ -1939,39 +1836,6 @@ impl RuntimeState {
         let intent_results = self.cancel_queued_intents(session_id, queued);
         self.effects.extend(effects);
         self.commit_session_with_results(session_id, intent_results);
-        Ok(())
-    }
-
-    pub(crate) fn delete_failed(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        operation_id: &str,
-    ) -> Result<(), RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let Some(operation) = session.operation.take() else {
-            return Err(RuntimeStateError::OperationMismatch);
-        };
-        if operation.operation_id != operation_id || operation.kind != SessionOperationKind::Delete
-        {
-            session.operation = Some(operation);
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        session.lifecycle = if operation.stage == "deleting" {
-            SessionLifecycle::Closed
-        } else {
-            SessionLifecycle::Active
-        };
-        self.set_intent_status(operation_id, IntentStatus::Failed);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::Failed,
-            None,
-        );
-        self.commit_session_with_results(session_id, vec![intent_result]);
         Ok(())
     }
 
@@ -2372,7 +2236,9 @@ impl RuntimeState {
         let session = session.clone();
         self.commit_delta(
             Some(revision),
-            RuntimeChange::SessionUpsert { session },
+            RuntimeChange::SessionUpsert {
+                session: Box::new(session),
+            },
             intent_results,
         );
     }
@@ -2590,6 +2456,69 @@ fn drain_session_liveness(
 
 fn serialized_len(value: &impl Serialize) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+#[cfg(test)]
+impl RuntimeState {
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub(crate) fn open_new(
+        &mut self,
+        expected_epoch: &str,
+        session_id: impl Into<String>,
+        cwd: impl Into<String>,
+        session: Value,
+    ) -> Result<u64, RuntimeStateError> {
+        self.open_session(
+            expected_epoch,
+            session_id.into(),
+            cwd.into(),
+            session,
+            TranscriptBaseline::Empty,
+            BTreeMap::new(),
+        )
+    }
+
+    pub(crate) fn open_loaded(
+        &mut self,
+        expected_epoch: &str,
+        session_id: impl Into<String>,
+        cwd: impl Into<String>,
+        session: Value,
+        replay: Vec<Value>,
+    ) -> Result<u64, RuntimeStateError> {
+        let (replay, control_state) = partition_replay_entries(replay);
+        self.open_session(
+            expected_epoch,
+            session_id.into(),
+            cwd.into(),
+            session,
+            TranscriptBaseline::AgentReplay {
+                entries: replay,
+                turn_boundaries_known: false,
+            },
+            control_state,
+        )
+    }
+
+    pub(crate) fn open_resumed(
+        &mut self,
+        expected_epoch: &str,
+        session_id: impl Into<String>,
+        cwd: impl Into<String>,
+        session: Value,
+    ) -> Result<u64, RuntimeStateError> {
+        self.open_session(
+            expected_epoch,
+            session_id.into(),
+            cwd.into(),
+            session,
+            TranscriptBaseline::HistoryUnavailable,
+            BTreeMap::new(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -2876,7 +2805,7 @@ mod tests {
             match delta.change {
                 RuntimeChange::ConnectionUpsert { .. } => {}
                 RuntimeChange::SessionUpsert { session } => {
-                    projection.insert(session.session_id.clone(), session);
+                    projection.insert(session.session_id.clone(), *session);
                 }
                 RuntimeChange::TurnUpdateAppended {
                     session_id,
@@ -3584,7 +3513,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_response_is_visible_retryable_and_exactly_correlated() {
+    fn permission_response_is_visible_and_exactly_correlated() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
@@ -3640,17 +3569,6 @@ mod tests {
             Err(RuntimeStateError::InteractionCollision),
         );
 
-        state
-            .fail_permission_response("epoch", "session", incarnation, "permission", "response-1")
-            .unwrap();
-        assert!(
-            state.session("session").unwrap().permissions["permission"]
-                .responding_operation_id
-                .is_none()
-        );
-        state
-            .begin_permission_response("epoch", "session", incarnation, "permission", "response-2")
-            .unwrap();
         let before_stale_completion = state.snapshot();
         assert_eq!(
             state.complete_permission_response(
@@ -3658,7 +3576,7 @@ mod tests {
                 "session",
                 incarnation,
                 "permission",
-                "response-1",
+                "stale-response",
             ),
             Err(RuntimeStateError::OperationMismatch),
         );
@@ -3670,7 +3588,7 @@ mod tests {
                     "session",
                     incarnation,
                     "permission",
-                    "response-2",
+                    "response-1",
                 )
                 .unwrap(),
             InteractionResolution::Applied,
@@ -3724,7 +3642,14 @@ mod tests {
         );
 
         state
-            .delete_failed("epoch", "session", incarnation, "delete-operation")
+            .fail_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "delete-operation",
+                SessionOperationKind::Delete,
+                json!("delete failed"),
+            )
             .unwrap();
         let session = state.session("session").unwrap();
         assert_eq!(session.lifecycle, SessionLifecycle::Closed);
@@ -3810,8 +3735,7 @@ mod tests {
                 "derived",
                 "/derived",
                 json!({ "sessionId": "derived" }),
-                "source",
-                source,
+                ("source", source),
                 None,
             )
             .unwrap();
@@ -3830,8 +3754,7 @@ mod tests {
                 "replayed",
                 "/replayed",
                 json!({ "sessionId": "replayed" }),
-                "source",
-                source,
+                ("source", source),
                 Some(vec![json!({ "sessionUpdate": "agent_message_chunk" })]),
             )
             .unwrap();
@@ -4166,7 +4089,14 @@ mod tests {
             .delete_close_succeeded("epoch", "session", incarnation, "first-delete")
             .unwrap();
         state
-            .delete_failed("epoch", "session", incarnation, "first-delete")
+            .fail_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "first-delete",
+                SessionOperationKind::Delete,
+                json!("delete failed"),
+            )
             .unwrap();
 
         state
@@ -4176,7 +4106,14 @@ mod tests {
         assert_eq!(retrying.lifecycle, SessionLifecycle::Deleting);
         assert_eq!(retrying.operation.as_ref().unwrap().stage, "deleting");
         state
-            .delete_failed("epoch", "session", incarnation, "retry-delete")
+            .fail_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "retry-delete",
+                SessionOperationKind::Delete,
+                json!("delete failed"),
+            )
             .unwrap();
 
         assert_eq!(
@@ -4985,31 +4922,11 @@ mod tests {
             Err(RuntimeStateError::OperationMismatch),
         );
         state
-            .fail_elicitation_response(
-                "epoch",
-                Some(("session", incarnation)),
-                "session-form",
-                "response-1",
-            )
-            .unwrap();
-        assert_eq!(
-            state.session("session").unwrap().elicitations["session-form"].responding_operation_id,
-            None,
-        );
-        state
-            .begin_elicitation_response(
-                "epoch",
-                Some(("session", incarnation)),
-                "session-form",
-                "response-2",
-            )
-            .unwrap();
-        state
             .complete_elicitation_response(
                 "epoch",
                 Some(("session", incarnation)),
                 "session-form",
-                "response-2",
+                "response-1",
                 Some("url-flow"),
             )
             .unwrap();

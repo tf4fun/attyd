@@ -272,7 +272,7 @@ invariants and red-to-green cases remain the acceptance criteria.
 | bridge-owned FIFO follow-up | `queued_prompt_claim_is_fifo_and_shutdown_cancellation_is_terminal`, `new_prompt_at_handoff_cannot_bypass_an_existing_queue`, `accepted_follow_up_dispatches_fifo_without_a_browser_owner` |
 | pre-dispatch/shutdown ordering | `claimed_queued_prompt_reenters_the_predispatch_starting_barrier`, `prompt_completion_releases_exclusion_before_notifying_shutdown`, `shutdown_cancels_queued_prompt_before_stopped_without_dispatching_it`, `shutdown_cancels_every_queued_prompt_with_exact_terminal_results` |
 | bounded prompt memory | `active_turn_has_a_hard_byte_limit_without_losing_cancellability`, `queued_prompt_admission_has_count_and_byte_limits_without_partial_mutation`, `queued_prompt_is_rechecked_against_the_active_turn_limit_before_dispatch` |
-| transactional interactions | `permission_response_is_visible_retryable_and_exactly_correlated`, `elicitation_response_is_transactional_for_session_and_request_scopes` |
+| transactional interactions | `permission_response_is_visible_and_exactly_correlated`, `elicitation_response_is_transactional_for_session_and_request_scopes` |
 | interaction cancellation truthfulness | `failed_interaction_delivery_is_never_reported_as_resolved` |
 | late update quarantine | `late_turn_update_without_active_turn_is_quarantined_from_all_business_streams` |
 | linear streaming replication | `streaming_turn_deltas_do_not_republish_the_full_active_tail`, `canonical_projection_folds_typed_snapshot_and_contiguous_deltas`, `stale_turn_update_operation_forces_resnapshot_without_partial_mutation` |
