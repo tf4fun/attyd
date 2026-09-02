@@ -8,6 +8,15 @@ import { startRustTestServer } from "./rust-test-server.js";
 const cwd = process.cwd();
 const server = await startSmokeServer(cwd);
 
+function reduceSmokeServerEvent(state: AppState, event: ServerEvent): AppState {
+  const next = appReducer(state, { type: "server/event", event });
+  if (event.type !== "bridge/runtime_replay_complete") return next;
+  return appReducer(next, {
+    type: "runtime/replay_complete",
+    fallbackSessionId: event.sessionIds.at(-1),
+  });
+}
+
 try {
   const origin = `http://127.0.0.1:${server.port}`;
   const health = await fetch(`${origin}/api/health`);
@@ -75,7 +84,8 @@ try {
   const resumeEvents = await exerciseResumeWebSocket(webSocketUrl);
   assert.ok(resumeEvents.some((event) =>
     event.type === "bridge/runtime_replay_complete" &&
-    event.sessionIds.includes("saved-session")
+    !event.sessionIds.includes("saved-session") &&
+    !event.sessionIds.includes("test-session")
   ));
   assert.ok(resumeEvents.some((event) =>
     event.type === "acp/session_attached" &&
@@ -248,7 +258,11 @@ try {
   ));
   assert.ok(events.some((event) =>
     event.type === "acp/terminal_state" &&
-    event.terminal.output === "TERMINAL_FLOW_OUTPUT" &&
+    event.terminal.outputAppend === true &&
+    event.terminal.output === "TERMINAL_FLOW_OUTPUT"
+  ));
+  assert.ok(events.some((event) =>
+    event.type === "acp/terminal_state" &&
     event.terminal.exitStatus?.exitCode === 0 &&
     event.terminal.released
   ));
@@ -258,7 +272,12 @@ try {
   assert.deepEqual(beforeClose.availableCommands, [{
     name: "fork-status",
     description: "Inspect the forked session",
-  }]);
+  }], JSON.stringify(events.filter((event) =>
+    (event.type === "acp/session_forked" && event.requestId === "ui-smoke-fork") ||
+    (event.type === "acp/session_update" &&
+      event.notification.update.sessionUpdate === "available_commands_update") ||
+    event.type === "bridge/runtime_session"
+  )));
   assert.equal(beforeClose.title, "Early ACP session");
   assert.ok(
     beforeClose.timeline.some((item) =>
@@ -945,7 +964,7 @@ function exerciseAttachmentWebSocket(url: string): Promise<{
     socket.on("message", (data) => {
       const event = JSON.parse(data.toString()) as ServerEvent;
       events.push(event);
-      state = appReducer(state, { type: "server/event", event });
+      state = reduceSmokeServerEvent(state, event);
       if (event.type === "bridge/error") {
         clearTimeout(timeout);
         socket.terminate();
@@ -1001,8 +1020,8 @@ async function exerciseResumeWebSocket(url: string): Promise<ServerEvent[]> {
       event.type === "bridge/runtime_replay_complete"
     );
     assert.equal(replay.type, "bridge/runtime_replay_complete");
-    assert.ok(replay.sessionIds.includes("saved-session"));
-    assert.ok(replay.sessionIds.includes("test-session"));
+    assert.ok(!replay.sessionIds.includes("saved-session"));
+    assert.ok(!replay.sessionIds.includes("test-session"));
     socket.send(JSON.stringify({
       type: "session/close",
       requestId: "ui-resume-close-test",
@@ -1052,6 +1071,9 @@ function exerciseWebSocket(url: string): Promise<{
     let beforeClose: AppState | undefined;
     let sourceSessionId: string | undefined;
     let forkedSessionId: string | undefined;
+    let initialized = false;
+    let runtimeReplayComplete = false;
+    let newRequested = false;
     const timeout = setTimeout(() => {
       socket.terminate();
       reject(new Error(`Timed out waiting for UI WebSocket flow: ${JSON.stringify(events)}`));
@@ -1092,7 +1114,7 @@ function exerciseWebSocket(url: string): Promise<{
     socket.on("message", (data) => {
       const event = JSON.parse(data.toString()) as ServerEvent;
       events.push(event);
-      state = appReducer(state, { type: "server/event", event });
+      state = reduceSmokeServerEvent(state, event);
       if (
         event.type === "bridge/error" &&
         event.requestId !== "ui-smoke-structured-error"
@@ -1102,7 +1124,12 @@ function exerciseWebSocket(url: string): Promise<{
         reject(new Error(event.message));
         return;
       }
-      if (event.type === "acp/initialized") {
+      if (event.type === "acp/initialized") initialized = true;
+      if (event.type === "bridge/runtime_replay_complete") {
+        runtimeReplayComplete = true;
+      }
+      if (initialized && runtimeReplayComplete && !newRequested) {
+        newRequested = true;
         state = appReducer(state, {
           type: "session/transition_start",
           kind: "new",
@@ -1115,7 +1142,10 @@ function exerciseWebSocket(url: string): Promise<{
         }));
         return;
       }
-      if (event.type === "acp/session_created") {
+      if (
+        event.type === "acp/session_created" &&
+        event.requestId === "ui-smoke-new"
+      ) {
         sourceSessionId = event.response.sessionId;
         state = appReducer(state, {
           type: "session/control_start",
@@ -1257,6 +1287,11 @@ function exerciseWebSocket(url: string): Promise<{
       if (event.type === "acp/session_forked" && event.requestId === "ui-smoke-fork") {
         assert.equal(event.sourceSessionId, sourceSessionId);
         forkedSessionId = event.response.sessionId;
+        assert.deepEqual(state.availableCommands, [{
+          name: "fork-status",
+          description: "Inspect the forked session",
+        }], JSON.stringify(event));
+        assert.match(JSON.stringify(state.timeline), /early-fork-message/u);
         socket.send(JSON.stringify({
           type: "session/prompt",
           requestId: "ui-smoke-background",

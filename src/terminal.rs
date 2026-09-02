@@ -2,16 +2,21 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_client_protocol::Error;
 use agent_client_protocol::RequestCancellation;
 use agent_client_protocol::schema::v1::*;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::task::AbortHandle;
 use uuid::Uuid;
 
+use crate::event_queue::EventSender;
 use crate::filesystem::WorkspaceFileSystem;
 
 #[derive(Debug, Clone)]
@@ -34,8 +39,8 @@ const MAX_TERMINAL_ENV_VALUE_LENGTH: usize = 65_536;
 pub struct TerminalManager {
     filesystem: Arc<WorkspaceFileSystem>,
     terminals: Arc<Mutex<HashMap<String, Arc<Terminal>>>>,
-    events: mpsc::UnboundedSender<String>,
-    snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
+    events: EventSender,
+    snapshots: Option<mpsc::Sender<TerminalSnapshot>>,
 }
 
 struct Terminal {
@@ -46,26 +51,36 @@ struct Terminal {
     state: Mutex<TerminalState>,
     changed: Notify,
     kill: Mutex<Option<oneshot::Sender<()>>>,
+    readers_remaining: AtomicUsize,
+    reader_tasks: Mutex<Vec<AbortHandle>>,
 }
 
 #[derive(Default)]
 struct TerminalState {
     output: Vec<u8>,
+    pending_output: Vec<u8>,
+    last_published_output: Vec<u8>,
     truncated: bool,
     exit_status: Option<TerminalExitStatus>,
     released: bool,
+    internal_initialized: bool,
+    internal_exit_published: bool,
+    internal_release_published: bool,
 }
 
 impl TerminalManager {
-    pub fn new_with_snapshots(
+    pub fn new_with_snapshots<E>(
         filesystem: Arc<WorkspaceFileSystem>,
-        events: mpsc::UnboundedSender<String>,
-        snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
-    ) -> Self {
+        events: E,
+        snapshots: Option<mpsc::Sender<TerminalSnapshot>>,
+    ) -> Self
+    where
+        E: Into<EventSender>,
+    {
         Self {
             filesystem,
             terminals: Arc::new(Mutex::new(HashMap::new())),
-            events,
+            events: events.into(),
             snapshots,
         }
     }
@@ -102,6 +117,7 @@ impl TerminalManager {
         };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let reader_count = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
         let id = Uuid::new_v4().to_string();
         let terminal = Arc::new(Terminal {
             id: id.clone(),
@@ -111,6 +127,8 @@ impl TerminalManager {
             state: Mutex::new(TerminalState::default()),
             changed: Notify::new(),
             kill: Mutex::new(None),
+            readers_remaining: AtomicUsize::new(reader_count),
+            reader_tasks: Mutex::new(Vec::with_capacity(reader_count)),
         });
         let (kill_tx, kill_rx) = oneshot::channel();
         *terminal.kill.lock().await = Some(kill_tx);
@@ -119,12 +137,14 @@ impl TerminalManager {
             .await
             .insert(id.clone(), terminal.clone());
 
+        let mut reader_tasks = Vec::with_capacity(reader_count);
         if let Some(stdout) = stdout {
-            self.spawn_reader(terminal.clone(), stdout);
+            reader_tasks.push(self.spawn_reader(terminal.clone(), stdout));
         }
         if let Some(stderr) = stderr {
-            self.spawn_reader(terminal.clone(), stderr);
+            reader_tasks.push(self.spawn_reader(terminal.clone(), stderr));
         }
+        *terminal.reader_tasks.lock().await = reader_tasks;
         self.spawn_waiter(terminal.clone(), child, kill_rx);
         self.emit_snapshot(&terminal).await;
         Ok(CreateTerminalResponse::new(id))
@@ -182,6 +202,7 @@ impl TerminalManager {
             .require(&request.terminal_id.0, &request.session_id.0)
             .await?;
         Self::signal_kill(&terminal).await;
+        Self::abort_readers(&terminal).await;
         terminal.state.lock().await.released = true;
         self.emit_snapshot(&terminal).await;
         self.terminals.lock().await.remove(terminal.id.as_str());
@@ -200,6 +221,7 @@ impl TerminalManager {
         };
         for terminal in terminals {
             Self::signal_kill(&terminal).await;
+            Self::abort_readers(&terminal).await;
             terminal.state.lock().await.released = true;
             self.emit_snapshot(&terminal).await;
             self.terminals.lock().await.remove(terminal.id.as_str());
@@ -221,6 +243,7 @@ impl TerminalManager {
             .collect::<Vec<_>>();
         for terminal in terminals {
             Self::signal_kill(&terminal).await;
+            Self::abort_readers(&terminal).await;
             terminal.state.lock().await.released = true;
             self.emit_snapshot(&terminal).await;
         }
@@ -245,7 +268,7 @@ impl TerminalManager {
         Ok(terminal)
     }
 
-    fn spawn_reader<R>(&self, terminal: Arc<Terminal>, mut reader: R)
+    fn spawn_reader<R>(&self, terminal: Arc<Terminal>, mut reader: R) -> AbortHandle
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
@@ -259,7 +282,11 @@ impl TerminalManager {
                 };
                 {
                     let mut state = terminal.state.lock().await;
+                    if state.released {
+                        break;
+                    }
                     state.output.extend_from_slice(&buffer[..count]);
+                    state.pending_output.extend_from_slice(&buffer[..count]);
                     if state.output.len() > terminal.output_limit {
                         let overflow = state.output.len() - terminal.output_limit;
                         state.output.drain(..overflow);
@@ -271,7 +298,11 @@ impl TerminalManager {
                 }
                 manager.emit_snapshot(&terminal).await;
             }
-        });
+            if terminal.readers_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                manager.emit_snapshot(&terminal).await;
+            }
+        })
+        .abort_handle()
     }
 
     fn spawn_waiter(
@@ -308,16 +339,78 @@ impl TerminalManager {
         }
     }
 
+    async fn abort_readers(terminal: &Arc<Terminal>) {
+        for task in std::mem::take(&mut *terminal.reader_tasks.lock().await) {
+            task.abort();
+        }
+    }
+
     async fn emit_snapshot(&self, terminal: &Terminal) {
-        let state = terminal.state.lock().await;
-        let snapshot = json!({
-            "sessionId": terminal.session_id,
-            "terminalId": terminal.id,
-            "output": String::from_utf8_lossy(&state.output),
-            "truncated": state.truncated,
-            "exitStatus": state.exit_status,
-            "released": state.released,
-        });
+        let (snapshot, internal_snapshot) = {
+            let mut state = terminal.state.lock().await;
+            let (output, append) = if !state.pending_output.is_empty() {
+                (std::mem::take(&mut state.pending_output), true)
+            } else if state.output.starts_with(&state.last_published_output) {
+                (
+                    state.output[state.last_published_output.len()..].to_vec(),
+                    true,
+                )
+            } else {
+                (state.output.clone(), false)
+            };
+            state.last_published_output = state.output.clone();
+            let snapshot = json!({
+                "sessionId": terminal.session_id,
+                "terminalId": terminal.id,
+                "output": String::from_utf8_lossy(&output),
+                "outputBytes": BASE64_STANDARD.encode(&output),
+                "outputAppend": append,
+                "retainedBytes": state.output.len(),
+                "truncated": state.truncated,
+                "exitStatus": state.exit_status,
+                "released": state.released,
+            });
+
+            let internal_snapshot = if !state.internal_initialized {
+                state.internal_initialized = true;
+                Some(json!({
+                    "sessionId": terminal.session_id,
+                    "terminalId": terminal.id,
+                    "output": String::from_utf8_lossy(&state.output),
+                    "truncated": state.truncated,
+                    "exitStatus": state.exit_status,
+                    "released": state.released,
+                }))
+            } else if state.released && !state.internal_release_published {
+                state.internal_release_published = true;
+                Some(json!({
+                    "sessionId": terminal.session_id,
+                    "terminalId": terminal.id,
+                    "output": "",
+                    "outputAppend": true,
+                    "retainedBytes": state.output.len(),
+                    "truncated": state.truncated,
+                    "exitStatus": state.exit_status,
+                    "released": true,
+                }))
+            } else if state.exit_status.is_some()
+                && terminal.readers_remaining.load(Ordering::Acquire) == 0
+                && !state.internal_exit_published
+            {
+                state.internal_exit_published = true;
+                Some(json!({
+                    "sessionId": terminal.session_id,
+                    "terminalId": terminal.id,
+                    "output": String::from_utf8_lossy(&state.output),
+                    "truncated": state.truncated,
+                    "exitStatus": state.exit_status,
+                    "released": false,
+                }))
+            } else {
+                None
+            };
+            (snapshot, internal_snapshot)
+        };
         let _ = self.events.send(
             json!({
                 "type": "acp/terminal_state",
@@ -325,11 +418,16 @@ impl TerminalManager {
             })
             .to_string(),
         );
-        if let Some(snapshots) = &self.snapshots {
-            let _ = snapshots.send(TerminalSnapshot {
-                incarnation: terminal.incarnation,
-                value: snapshot,
-            });
+        if let (Some(snapshots), Some(snapshot)) = (&self.snapshots, internal_snapshot) {
+            if snapshots
+                .try_send(TerminalSnapshot {
+                    incarnation: terminal.incarnation,
+                    value: snapshot,
+                })
+                .is_err()
+            {
+                self.events.cancel_generation();
+            }
         }
     }
 }
@@ -480,6 +578,57 @@ mod tests {
         .expect("terminal did not exit")
     }
 
+    #[tokio::test]
+    async fn terminal_n_bytes_produce_linear_internal_and_public_bytes() {
+        const CHUNK_COUNT: usize = 8;
+        const CHUNK_BYTES: usize = 1_024;
+
+        let root = tempfile::tempdir().unwrap();
+        let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (snapshots, mut snapshot_rx) = mpsc::channel(CHUNK_COUNT + 1);
+        let terminals = TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots));
+        let terminal = Arc::new(Terminal {
+            id: "linear-terminal".to_string(),
+            session_id: "session".to_string(),
+            incarnation: 1,
+            output_limit: CHUNK_COUNT * CHUNK_BYTES,
+            state: Mutex::new(TerminalState::default()),
+            changed: Notify::new(),
+            kill: Mutex::new(None),
+            readers_remaining: AtomicUsize::new(0),
+            reader_tasks: Mutex::new(Vec::new()),
+        });
+
+        for index in 0..CHUNK_COUNT {
+            terminal
+                .state
+                .lock()
+                .await
+                .output
+                .extend(vec![b'a' + index as u8; CHUNK_BYTES]);
+            terminals.emit_snapshot(&terminal).await;
+        }
+
+        let public_output_bytes = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .map(|event| {
+                serde_json::from_str::<Value>(&event).unwrap()["terminal"]["output"]
+                    .as_str()
+                    .unwrap()
+                    .len()
+            })
+            .sum::<usize>();
+        let internal_output_bytes = std::iter::from_fn(|| snapshot_rx.try_recv().ok())
+            .map(|snapshot| snapshot.value["output"].as_str().unwrap().len())
+            .sum::<usize>();
+        let input_bytes = CHUNK_COUNT * CHUNK_BYTES;
+
+        assert!(
+            public_output_bytes + internal_output_bytes <= input_bytes * 2,
+            "each output byte may cross each publication channel once; cumulative full snapshots published {public_output_bytes} public bytes and {internal_output_bytes} internal bytes for {input_bytes} input bytes"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn scopes_handles_emits_snapshots_and_releases_terminal() {
@@ -518,9 +667,20 @@ mod tests {
         let snapshots = std::iter::from_fn(|| events.try_recv().ok())
             .map(|event| serde_json::from_str::<Value>(&event).unwrap())
             .collect::<Vec<_>>();
-        assert!(snapshots.iter().any(|event| {
-            event["terminal"]["output"] == "ok" && event["terminal"]["exitStatus"]["exitCode"] == 0
-        }));
+        let mut published_output = String::new();
+        for event in &snapshots {
+            let terminal = &event["terminal"];
+            if terminal["outputAppend"] == false {
+                published_output.clear();
+            }
+            published_output.push_str(terminal["output"].as_str().unwrap());
+        }
+        assert_eq!(published_output, "ok");
+        assert!(
+            snapshots
+                .iter()
+                .any(|event| event["terminal"]["exitStatus"]["exitCode"] == 0)
+        );
         assert_eq!(snapshots.last().unwrap()["terminal"]["released"], true);
     }
 

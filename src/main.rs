@@ -2,6 +2,7 @@ mod agent_process;
 mod auth_terminal;
 mod bridge;
 mod elicitation_validation;
+mod event_queue;
 mod filesystem;
 mod mcp;
 mod mcp_config;

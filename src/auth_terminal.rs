@@ -6,7 +6,10 @@ use agent_client_protocol::Error;
 use agent_client_protocol::schema::v1::AuthMethodTerminal;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::json;
+#[cfg(test)]
 use tokio::sync::mpsc;
+
+use crate::event_queue::EventSender;
 
 const MAX_AUTH_ARGUMENTS: usize = 256;
 const MAX_AUTH_ARGUMENT_LENGTH: usize = 16_384;
@@ -20,7 +23,7 @@ const MAX_AUTH_TERMINAL_EVENT_BYTES: usize = 32_768;
 #[derive(Clone)]
 pub struct AuthTerminalManager {
     active: Arc<Mutex<Option<Arc<ActiveAuthTerminal>>>>,
-    events: mpsc::UnboundedSender<String>,
+    events: EventSender,
 }
 
 struct ActiveAuthTerminal {
@@ -36,10 +39,13 @@ struct ActiveAuthTerminal {
 }
 
 impl AuthTerminalManager {
-    pub fn new(events: mpsc::UnboundedSender<String>) -> Self {
+    pub fn new<E>(events: E) -> Self
+    where
+        E: Into<EventSender>,
+    {
         Self {
             active: Arc::new(Mutex::new(None)),
-            events,
+            events: events.into(),
         }
     }
 

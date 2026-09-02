@@ -478,6 +478,19 @@ describe("ACP UI state", () => {
       terminal: {
         sessionId: "current",
         terminalId: "terminal-0",
+        output: "-append",
+        outputAppend: true,
+        retainedBytes: 12,
+        truncated: false,
+        released: false,
+      },
+    }));
+    expect(state.terminalSnapshots[0].output).toBe("first-append");
+    state = appReducer(state, event({
+      type: "acp/terminal_state",
+      terminal: {
+        sessionId: "current",
+        terminalId: "terminal-0",
         output: "second",
         truncated: true,
         exitStatus: { exitCode: 0 },
@@ -1069,9 +1082,9 @@ describe("ACP UI state", () => {
       sessionId: "saved",
       title: "Saved session",
     });
-    expect(pending.session).toBeUndefined();
+    expect(pending.session?.sessionId).toBe("current");
     expect(pending.pendingSessionId).toBe("saved");
-    expect(pending.timeline).toEqual([]);
+    expect(pending.timeline).toEqual(previous.timeline);
 
     pending = appReducer(pending, event({
       type: "acp/session_update",
@@ -1084,7 +1097,8 @@ describe("ACP UI state", () => {
         },
       },
     }));
-    expect(pending.timeline).toHaveLength(1);
+    expect(pending.timeline).toEqual(previous.timeline);
+    expect(JSON.stringify(pending.timeline)).not.toContain("Loaded history");
 
     const restored = appReducer(pending, event({
       type: "bridge/error",
@@ -1334,6 +1348,175 @@ describe("ACP UI state", () => {
       chunks: [{ messageId: "loaded" }],
     });
     expect(state.sessionTransition).toBeUndefined();
+  });
+
+  it("keeps load replay hidden until session/load attaches, then replaces atomically", () => {
+    const original: AppState = {
+      ...initialState,
+      phase: "ready",
+      socketOpen: true,
+      session: { sessionId: "current" },
+      timeline: [{
+        id: "current-answer",
+        type: "assistant",
+        chunks: [{
+          id: "current-answer-chunk",
+          role: "agent",
+          blocks: [{ type: "text", text: "Stable current projection" }],
+          raw: [],
+        }],
+      }],
+    };
+
+    let loading = appReducer(original, {
+      type: "session/transition_start",
+      kind: "attach",
+      requestId: "load-saved",
+      sessionId: "saved",
+      title: "Saved",
+    });
+    loading = appReducer(loading, event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "saved",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "loaded-answer",
+          content: { type: "text", text: "Hidden loaded projection" },
+        },
+      },
+    }));
+
+    expect(loading.session?.sessionId).toBe("current");
+    expect(JSON.stringify(loading.timeline)).toContain("Stable current projection");
+    expect(JSON.stringify(loading.timeline)).not.toContain("Hidden loaded projection");
+
+    const attached = appReducer(loading, event({
+      type: "acp/session_attached",
+      requestId: "load-saved",
+      method: "load",
+      sessionId: "saved",
+      response: {},
+    }));
+
+    expect(attached.session?.sessionId).toBe("saved");
+    expect(JSON.stringify(attached.timeline)).toContain("Hidden loaded projection");
+    expect(JSON.stringify(attached.timeline)).not.toContain("Stable current projection");
+    expect(attached.sessionTransition).toBeUndefined();
+  });
+
+  it("never exposes a failed session/load candidate and retains the prior projection", () => {
+    const original: AppState = {
+      ...initialState,
+      phase: "ready",
+      socketOpen: true,
+      session: { sessionId: "current" },
+      timeline: [{
+        id: "current-answer",
+        type: "assistant",
+        chunks: [{
+          id: "current-answer-chunk",
+          role: "agent",
+          blocks: [{ type: "text", text: "Stable current projection" }],
+          raw: [],
+        }],
+      }],
+    };
+    let loading = appReducer(original, {
+      type: "session/transition_start",
+      kind: "attach",
+      requestId: "load-saved",
+      sessionId: "saved",
+    });
+    loading = appReducer(loading, event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "saved",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "partial-answer",
+          content: { type: "text", text: "Must remain hidden" },
+        },
+      },
+    }));
+    const failed = appReducer(loading, event({
+      type: "bridge/error",
+      requestId: "load-saved",
+      operation: "session/load",
+      message: "Agent rejected load",
+    }));
+
+    expect(failed.session?.sessionId).toBe("current");
+    expect(JSON.stringify(failed.timeline)).toContain("Stable current projection");
+    expect(JSON.stringify(failed.timeline)).not.toContain("Must remain hidden");
+    expect(failed.timeline.at(-1)).toMatchObject({
+      type: "error",
+      message: "Agent rejected load",
+    });
+    expect(failed.sessionTransition).toBeUndefined();
+  });
+
+  it("drops a session/load candidate on disconnect without exposing it", () => {
+    const original: AppState = {
+      ...initialState,
+      phase: "ready",
+      socketOpen: true,
+      session: { sessionId: "current" },
+      timeline: [{
+        id: "current-answer",
+        type: "assistant",
+        chunks: [{
+          id: "current-answer-chunk",
+          role: "agent",
+          blocks: [{ type: "text", text: "Stable current projection" }],
+          raw: [],
+        }],
+      }],
+    };
+    let loading = appReducer(original, {
+      type: "session/transition_start",
+      kind: "attach",
+      requestId: "load-saved",
+      sessionId: "saved",
+    });
+    loading = appReducer(loading, event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "saved",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "partial-answer",
+          content: { type: "text", text: "Must remain hidden" },
+        },
+      },
+    }));
+    const disconnected = appReducer(loading, { type: "socket/closed" });
+
+    expect(disconnected.phase).toBe("stopped");
+    expect(disconnected.session?.sessionId).toBe("current");
+    expect(JSON.stringify(disconnected.timeline)).toContain("Stable current projection");
+    expect(JSON.stringify(disconnected.timeline)).not.toContain("Must remain hidden");
+    expect(disconnected.sessionTransition).toBeUndefined();
+  });
+
+  it("represents unavailable saved history explicitly in state and the visible timeline", () => {
+    const unavailable = appReducer(initialState, {
+      type: "history/unavailable",
+      sessionId: "saved",
+      reason: "load_not_supported",
+    });
+
+    expect(unavailable.historyStatus).toMatchObject({
+      state: "unavailable",
+      sessionId: "saved",
+      reason: "load_not_supported",
+    });
+    expect(unavailable.timeline).toHaveLength(1);
+    expect(unavailable.timeline[0]).toMatchObject({
+      type: "error",
+      operation: "session/load",
+    });
+    expect(JSON.stringify(unavailable.timeline)).toContain("History unavailable");
   });
 
   it("coalesces text chunks only when they belong to the same message", () => {
@@ -1616,10 +1799,30 @@ describe("ACP UI state", () => {
           availableModes: [{ id: "plan", name: "Plan" }],
         },
       },
+      earlyUpdates: [
+        {
+          sessionId: "forked",
+          update: {
+            sessionUpdate: "available_commands_update",
+            availableCommands: [{ name: "fork-status", description: "Inspect fork" }],
+          },
+        },
+        {
+          sessionId: "forked",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            messageId: "early-fork-message",
+            content: { type: "text", text: "Fork ready" },
+          },
+        },
+      ],
     }));
     expect(forked.session?.sessionId).toBe("forked");
     expect(forked.modeId).toBe("plan");
-    expect(forked.timeline).toEqual(active.timeline);
+    expect(forked.availableCommands).toEqual([
+      { name: "fork-status", description: "Inspect fork" },
+    ]);
+    expect(JSON.stringify(forked.timeline)).toContain("early-fork-message");
     expect(forked.running).toBe(false);
     expect(forked.sessionTransition).toBeUndefined();
 
@@ -2639,5 +2842,122 @@ describe("ACP UI state", () => {
       size: 100,
       cost: { amount: 0.25, currency: "USD" },
     });
+  });
+
+  it("atomically replaces the visible projection only after a replacement generation succeeds", () => {
+    const original: AppState = {
+      ...initialState,
+      phase: "ready",
+      socketOpen: true,
+      session: { sessionId: "completed" },
+      cwd: "/workspace/completed",
+      timeline: [{
+        id: "completed-answer",
+        type: "assistant",
+        chunks: [{
+          id: "completed-answer-chunk",
+          role: "agent",
+          blocks: [{ type: "text", text: "previous generation" }],
+          raw: [],
+        }],
+      }],
+    };
+
+    let replacing = appReducer(original, event({
+      type: "bridge/runtime_replay_started",
+      sessionCount: 1,
+    }));
+    replacing = appReducer(replacing, event({
+      type: "bridge/runtime_session",
+      sessionId: "active",
+      cwd: "/workspace/active",
+      session: { sessionId: "active" },
+      truncated: false,
+    }));
+    replacing = appReducer(replacing, event({
+      type: "acp/prompt_started",
+      requestId: "active-prompt",
+      sessionId: "active",
+      prompt: [{ type: "text", text: "still running" }],
+    }));
+    replacing = appReducer(replacing, event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "active",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "replacement-answer",
+          content: { type: "text", text: "replacement generation" },
+        },
+      },
+    }));
+
+    expect(replacing.session?.sessionId).toBe("completed");
+    expect(JSON.stringify(replacing.timeline)).toContain("previous generation");
+    expect(JSON.stringify(replacing.timeline)).not.toContain("replacement generation");
+
+    replacing = appReducer(replacing, event({
+      type: "bridge/runtime_replay_complete",
+      sessionIds: ["active"],
+    }));
+    const committed = appReducer(replacing, {
+      type: "runtime/replay_complete",
+      preferredSessionId: "active",
+    });
+
+    expect(committed.session?.sessionId).toBe("active");
+    expect(JSON.stringify(committed.timeline)).toContain("replacement generation");
+    expect(JSON.stringify(committed.timeline)).not.toContain("previous generation");
+  });
+
+  it("keeps the prior projection when a replacement generation fails without exposing partial state", () => {
+    const original: AppState = {
+      ...initialState,
+      phase: "ready",
+      socketOpen: true,
+      session: { sessionId: "completed" },
+      cwd: "/workspace/completed",
+      timeline: [{
+        id: "completed-answer",
+        type: "assistant",
+        chunks: [{
+          id: "completed-answer-chunk",
+          role: "agent",
+          blocks: [{ type: "text", text: "stable projection" }],
+          raw: [],
+        }],
+      }],
+    };
+
+    let replacing = appReducer(original, event({
+      type: "bridge/runtime_replay_started",
+      sessionCount: 1,
+    }));
+    replacing = appReducer(replacing, event({
+      type: "bridge/runtime_session",
+      sessionId: "partial",
+      cwd: "/workspace/partial",
+      session: { sessionId: "partial" },
+      truncated: false,
+    }));
+    replacing = appReducer(replacing, event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "partial",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "partial-answer",
+          content: { type: "text", text: "must stay hidden" },
+        },
+      },
+    }));
+    const failed = appReducer(replacing, event({
+      type: "bridge/phase",
+      phase: "error",
+    }));
+
+    expect(failed.session?.sessionId).toBe("completed");
+    expect(JSON.stringify(failed.timeline)).toContain("stable projection");
+    expect(JSON.stringify(failed.timeline)).not.toContain("must stay hidden");
   });
 });

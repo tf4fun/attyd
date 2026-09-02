@@ -59,6 +59,8 @@ export interface TerminalSnapshot {
   truncated: boolean;
   exitStatus?: TerminalExitStatus | null;
   released: boolean;
+  outputAppend?: boolean;
+  retainedBytes?: number;
 }
 
 export interface WorkspaceContextMatch {
@@ -82,7 +84,6 @@ export interface CanonicalRuntimeSnapshot {
   sessions: Record<string, unknown>;
   requestElicitations: Record<string, unknown>;
   requestUrlFlows: Record<string, unknown>;
-  intentResults: Record<string, unknown>;
 }
 
 export interface CanonicalRuntimeDelta {
@@ -90,17 +91,11 @@ export interface CanonicalRuntimeDelta {
   seq: number;
   scopeRevision: number | null;
   change: Record<string, unknown>;
-  intentResults: unknown[];
-  evictedIntentResultIds: string[];
 }
 
 export type CanonicalIntentStatus =
   | "accepted"
   | "in_flight"
-  | "agent_acknowledged"
-  | "failed"
-  | "rejected"
-  | "cancelled"
   | "uncertain";
 
 export type ConnectionPhase =
@@ -658,11 +653,6 @@ function validateServerEventEnvelope(
         MAX_RUNTIME_INTENT_RESULTS,
         "bridge/runtime_snapshot requestUrlFlows",
       );
-      requireBoundedRecord(
-        snapshot.intentResults,
-        MAX_RUNTIME_INTENT_RESULTS,
-        "bridge/runtime_snapshot intentResults",
-      );
       return;
     }
     case "bridge/runtime_delta": {
@@ -686,17 +676,6 @@ function validateServerEventEnvelope(
         ],
         "bridge/runtime_delta change kind",
       );
-      requireArray(delta.intentResults, "bridge/runtime_delta intentResults");
-      if (delta.intentResults.length > MAX_RUNTIME_INTENT_RESULTS) {
-        throw new Error("bridge/runtime_delta has too many intent results");
-      }
-      requireStringArray(
-        delta.evictedIntentResultIds,
-        "bridge/runtime_delta evictedIntentResultIds",
-      );
-      if (delta.evictedIntentResultIds.length > MAX_RUNTIME_INTENT_RESULTS) {
-        throw new Error("bridge/runtime_delta has too many evicted intent results");
-      }
       return;
     }
     case "bridge/intent_ack":
@@ -712,10 +691,6 @@ function validateServerEventEnvelope(
         [
           "accepted",
           "in_flight",
-          "agent_acknowledged",
-          "failed",
-          "rejected",
-          "cancelled",
           "uncertain",
         ],
         "bridge/intent_ack status",
@@ -909,6 +884,15 @@ function validateServerEventEnvelope(
       }
       if (typeof terminal.released !== "boolean") {
         throw new Error("acp/terminal_state requires released");
+      }
+      if (terminal.outputAppend != null && typeof terminal.outputAppend !== "boolean") {
+        throw new Error("acp/terminal_state outputAppend must be boolean");
+      }
+      if (
+        terminal.retainedBytes != null &&
+        (!Number.isSafeInteger(terminal.retainedBytes) || Number(terminal.retainedBytes) < 0)
+      ) {
+        throw new Error("acp/terminal_state retainedBytes must be a non-negative safe integer");
       }
       if (terminal.exitStatus != null) {
         const status = requireRecordValue(
@@ -1234,6 +1218,9 @@ export function parseClientCommand(raw: string): ClientCommand {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || typeof value.type !== "string") {
     throw new Error("WebSocket message must be an object with a type");
+  }
+  if (Object.hasOwn(value, "history")) {
+    throw new Error("WebSocket commands must not contain completed browser history");
   }
   if (value.type.length > MAX_BRIDGE_TYPE_LENGTH) {
     throw new Error("WebSocket command type is too long");

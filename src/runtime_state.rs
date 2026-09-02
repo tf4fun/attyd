@@ -1,34 +1,29 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuntimeLimits {
-    pub max_observed_turns_per_session: usize,
-    pub max_observed_bytes_per_session: usize,
     pub max_active_turn_bytes_per_session: usize,
     pub max_queued_prompts_per_session: usize,
     pub max_queued_prompt_bytes_per_session: usize,
     pub max_delta_events: usize,
     pub max_delta_bytes: usize,
     pub max_intent_records: usize,
-    pub max_intent_results: usize,
 }
 
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_observed_turns_per_session: 1_000,
-            max_observed_bytes_per_session: 32 * 1024 * 1024,
             max_active_turn_bytes_per_session: 32 * 1024 * 1024,
             max_queued_prompts_per_session: 32,
             max_queued_prompt_bytes_per_session: 8 * 1024 * 1024,
             max_delta_events: 4_096,
             max_delta_bytes: 16 * 1024 * 1024,
             max_intent_records: 4_096,
-            max_intent_results: 4_096,
         }
     }
 }
@@ -42,7 +37,6 @@ pub(crate) struct RuntimeSnapshot {
     pub sessions: BTreeMap<String, SessionRuntime>,
     pub request_elicitations: BTreeMap<String, PendingInteraction>,
     pub request_url_flows: BTreeMap<String, UrlFlow>,
-    pub intent_results: BTreeMap<String, IntentResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,8 +49,6 @@ pub(crate) struct SessionRuntime {
     pub session: Value,
     pub control_state: BTreeMap<String, Value>,
     pub lifecycle: SessionLifecycle,
-    pub transcript: TranscriptBaseline,
-    pub observed_turns: VecDeque<ObservedTurn>,
     pub active_turn: Option<ActiveTurn>,
     pub queued_prompts: VecDeque<QueuedPrompt>,
     pub operation: Option<SessionOperationState>,
@@ -64,15 +56,16 @@ pub(crate) struct SessionRuntime {
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
-    pub history_gap: Option<HistoryGap>,
-    #[serde(skip)]
-    observed_bytes: usize,
     #[serde(skip)]
     queued_prompt_bytes: usize,
     #[serde(skip)]
     resolved_permissions: VecDeque<String>,
     #[serde(skip)]
     resolved_elicitations: VecDeque<String>,
+    #[serde(skip)]
+    resolved_url_flows: VecDeque<String>,
+    #[serde(skip)]
+    released_terminals: VecDeque<String>,
     #[serde(skip)]
     attachment_candidate: Vec<Value>,
     #[serde(skip)]
@@ -92,24 +85,6 @@ pub(crate) enum SessionLifecycle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum TranscriptBaseline {
-    PendingAttachment,
-    Empty,
-    AgentReplay {
-        entries: Vec<Value>,
-        turn_boundaries_known: bool,
-    },
-    HistoryUnavailable,
-    ClientDerivedFork {
-        source_session_id: String,
-        source_incarnation: u64,
-        source_revision: u64,
-        entries: Vec<Value>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ActiveTurn {
     pub operation_id: String,
@@ -126,27 +101,7 @@ pub(crate) struct QueuedPrompt {
     pub prompt: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ObservedTurn {
-    pub turn_id: String,
-    pub prompt: Vec<Value>,
-    pub updates: Vec<Value>,
-    pub cancel_requested: bool,
-    pub outcome: ObservedTurnOutcome,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum ObservedTurnOutcome {
-    Completed { response: Value },
-    Failed { error: Value },
-    Uncertain { reason: String },
-}
-
 struct TurnTerminal {
-    outcome: ObservedTurnOutcome,
-    status: IntentStatus,
     lifecycle: Option<SessionLifecycle>,
 }
 
@@ -196,14 +151,6 @@ pub(crate) enum UrlFlowStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct HistoryGap {
-    pub evicted_turns: usize,
-    pub evicted_bytes: usize,
-    pub through_revision: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeDelta {
@@ -211,9 +158,6 @@ pub(crate) struct RuntimeDelta {
     pub seq: u64,
     pub scope_revision: Option<u64>,
     pub change: RuntimeChange,
-    pub intent_results: Vec<IntentResult>,
-    #[serde(default)]
-    pub evicted_intent_result_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -249,20 +193,7 @@ struct ClientIntentKey {
 pub(crate) enum IntentStatus {
     Accepted,
     InFlight,
-    AgentAcknowledged,
-    Rejected,
-    Failed,
-    Cancelled,
     Uncertain,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct IntentResult {
-    pub operation_id: String,
-    pub session_id: Option<String>,
-    pub status: IntentStatus,
-    pub result: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +251,7 @@ pub(crate) enum RuntimeEffect {
 
 #[derive(Debug, Clone)]
 struct IntentRecord {
-    payload_hash: String,
+    payload_digest: [u8; 32],
     operation_id: String,
     status: IntentStatus,
 }
@@ -362,11 +293,8 @@ pub(crate) struct RuntimeState {
     request_elicitations: BTreeMap<String, PendingInteraction>,
     request_url_flows: BTreeMap<String, UrlFlow>,
     resolved_request_elicitations: VecDeque<String>,
+    resolved_request_url_flows: VecDeque<String>,
     intents: BTreeMap<ClientIntentKey, IntentRecord>,
-    intent_order: VecDeque<ClientIntentKey>,
-    intent_results: BTreeMap<String, IntentResult>,
-    intent_result_order: VecDeque<String>,
-    pending_intent_result_removals: Vec<String>,
     effects: VecDeque<RuntimeEffect>,
     delta_journal: VecDeque<RuntimeDelta>,
     delta_bytes: usize,
@@ -391,11 +319,8 @@ impl RuntimeState {
             request_elicitations: BTreeMap::new(),
             request_url_flows: BTreeMap::new(),
             resolved_request_elicitations: VecDeque::new(),
+            resolved_request_url_flows: VecDeque::new(),
             intents: BTreeMap::new(),
-            intent_order: VecDeque::new(),
-            intent_results: BTreeMap::new(),
-            intent_result_order: VecDeque::new(),
-            pending_intent_result_removals: Vec::new(),
             effects: VecDeque::new(),
             delta_journal: VecDeque::new(),
             delta_bytes: 0,
@@ -415,7 +340,6 @@ impl RuntimeState {
             sessions: self.sessions.clone(),
             request_elicitations: self.request_elicitations.clone(),
             request_url_flows: self.request_url_flows.clone(),
-            intent_results: self.intent_results.clone(),
         }
     }
 
@@ -459,15 +383,15 @@ impl RuntimeState {
         expected_epoch: &str,
         _subscriber_id: u64,
         client_intent_id: impl Into<String>,
-        payload_hash: impl Into<String>,
+        payload: impl AsRef<str>,
     ) -> Result<IntentAck, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let key = ClientIntentKey {
             client_intent_id: client_intent_id.into(),
         };
-        let payload_hash = payload_hash.into();
+        let payload_digest: [u8; 32] = Sha256::digest(payload.as_ref().as_bytes()).into();
         if let Some(existing) = self.intents.get(&key) {
-            return Ok(if existing.payload_hash == payload_hash {
+            return Ok(if existing.payload_digest == payload_digest {
                 IntentAck::Duplicate {
                     operation_id: existing.operation_id.clone(),
                     status: existing.status.clone(),
@@ -481,11 +405,10 @@ impl RuntimeState {
         }
         self.next_operation_id = self.next_operation_id.wrapping_add(1).max(1);
         let operation_id = format!("{}:{}", self.epoch, self.next_operation_id);
-        self.intent_order.push_back(key.clone());
         self.intents.insert(
             key,
             IntentRecord {
-                payload_hash,
+                payload_digest,
                 operation_id: operation_id.clone(),
                 status: IntentStatus::Accepted,
             },
@@ -497,8 +420,8 @@ impl RuntimeState {
         &mut self,
         expected_epoch: &str,
         operation_id: &str,
-        session_id: Option<String>,
-        reason: Value,
+        _session_id: Option<String>,
+        _reason: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let Some(intent) = self
@@ -511,14 +434,7 @@ impl RuntimeState {
         if intent.status != IntentStatus::Accepted {
             return Err(RuntimeStateError::OperationMismatch);
         }
-        intent.status = IntentStatus::Rejected;
-        let result = self.record_intent_result(
-            operation_id,
-            session_id,
-            IntentStatus::Rejected,
-            Some(reason),
-        );
-        self.commit_connection_with_results(vec![result]);
+        self.retire_intent(operation_id);
         Ok(())
     }
 
@@ -530,21 +446,12 @@ impl RuntimeState {
         session: Value,
         replay: Vec<Value>,
     ) -> Result<u64, RuntimeStateError> {
-        let (replay, control_state) = partition_replay_entries(replay);
-        let transcript = if replay.is_empty() {
-            TranscriptBaseline::Empty
-        } else {
-            TranscriptBaseline::AgentReplay {
-                entries: replay,
-                turn_boundaries_known: false,
-            }
-        };
+        let control_state = extract_control_state(replay);
         self.open_session(
             expected_epoch,
             session_id.into(),
             cwd.into(),
             session,
-            transcript,
             control_state,
         )
     }
@@ -587,8 +494,6 @@ impl RuntimeState {
                 session: Value::Null,
                 control_state: BTreeMap::new(),
                 lifecycle: SessionLifecycle::Attaching,
-                transcript: TranscriptBaseline::PendingAttachment,
-                observed_turns: VecDeque::new(),
                 active_turn: None,
                 queued_prompts: VecDeque::new(),
                 operation: Some(SessionOperationState {
@@ -601,11 +506,11 @@ impl RuntimeState {
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
-                history_gap: None,
-                observed_bytes: 0,
                 queued_prompt_bytes: 0,
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
+                resolved_url_flows: VecDeque::new(),
+                released_terminals: VecDeque::new(),
                 attachment_candidate: Vec::new(),
                 attachment_candidate_bytes: 0,
             },
@@ -613,6 +518,49 @@ impl RuntimeState {
         self.set_intent_status(&operation_id, IntentStatus::InFlight);
         self.commit_session(&session_id);
         Ok(incarnation)
+    }
+
+    pub(crate) fn start_reload(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        operation_id: impl Into<String>,
+        kind: SessionOperationKind,
+    ) -> Result<(), RuntimeStateError> {
+        self.require_epoch(expected_epoch)?;
+        if kind != SessionOperationKind::Load {
+            return Err(RuntimeStateError::OperationMismatch);
+        }
+        let operation_id = operation_id.into();
+        if self.operation_in_use(&operation_id) {
+            return Err(RuntimeStateError::OperationCollision);
+        }
+        let session = self.require_session_mut(session_id, incarnation)?;
+        if session.lifecycle != SessionLifecycle::Active {
+            return Err(RuntimeStateError::SessionNotActive);
+        }
+        if session.active_turn.is_some()
+            || !session.queued_prompts.is_empty()
+            || session.operation.is_some()
+            || !session.permissions.is_empty()
+            || !session.elicitations.is_empty()
+            || !session.url_flows.is_empty()
+            || !session.terminals.is_empty()
+            || !session.attachment_candidate.is_empty()
+        {
+            return Err(RuntimeStateError::BusySession);
+        }
+        session.operation = Some(SessionOperationState {
+            operation_id: operation_id.clone(),
+            kind,
+            stage: "reloading".to_string(),
+            uncertainty_reason: None,
+        });
+        session.attachment_candidate_bytes = 0;
+        self.set_intent_status(&operation_id, IntentStatus::InFlight);
+        self.commit_session(session_id);
+        Ok(())
     }
 
     pub(crate) fn append_attachment_candidate(
@@ -624,9 +572,24 @@ impl RuntimeState {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let session = self.require_session_mut(session_id, incarnation)?;
-        if session.lifecycle != SessionLifecycle::Attaching {
+        let collecting_attachment = session.lifecycle == SessionLifecycle::Attaching
+            && session.operation.as_ref().is_some_and(|operation| {
+                operation.stage == "attaching"
+                    && matches!(
+                        operation.kind,
+                        SessionOperationKind::Load | SessionOperationKind::Resume
+                    )
+            });
+        let collecting_reload = session.lifecycle == SessionLifecycle::Active
+            && session.operation.as_ref().is_some_and(|operation| {
+                operation.stage == "reloading" && operation.kind == SessionOperationKind::Load
+            });
+        if !collecting_attachment && !collecting_reload {
             return Err(RuntimeStateError::OperationMismatch);
         }
+        let Some(update) = retain_control_update(update) else {
+            return Ok(());
+        };
         let bytes = serialized_len(&update);
         if session.attachment_candidate.len() >= 10_000
             || session.attachment_candidate_bytes.saturating_add(bytes) > 1_000_000
@@ -636,6 +599,63 @@ impl RuntimeState {
         session.attachment_candidate.push(update);
         session.attachment_candidate_bytes =
             session.attachment_candidate_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn complete_reload(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        operation_id: &str,
+        response: Value,
+    ) -> Result<(), RuntimeStateError> {
+        self.require_epoch(expected_epoch)?;
+        let response = retain_session_metadata(session_id, response);
+        let session = self.require_session_mut(session_id, incarnation)?;
+        if session.lifecycle != SessionLifecycle::Active
+            || session.operation.as_ref().is_none_or(|operation| {
+                operation.operation_id != operation_id
+                    || operation.kind != SessionOperationKind::Load
+                    || operation.stage != "reloading"
+            })
+        {
+            return Err(RuntimeStateError::OperationMismatch);
+        }
+        let candidate = std::mem::take(&mut session.attachment_candidate);
+        session.attachment_candidate_bytes = 0;
+        session.control_state = extract_control_state(candidate);
+        session.session = response;
+        session.operation = None;
+        self.retire_intent(operation_id);
+        self.commit_session(session_id);
+        Ok(())
+    }
+
+    pub(crate) fn fail_reload(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        operation_id: &str,
+        _error: Value,
+    ) -> Result<(), RuntimeStateError> {
+        self.require_epoch(expected_epoch)?;
+        let session = self.require_session_mut(session_id, incarnation)?;
+        if session.lifecycle != SessionLifecycle::Active
+            || session.operation.as_ref().is_none_or(|operation| {
+                operation.operation_id != operation_id
+                    || operation.kind != SessionOperationKind::Load
+                    || operation.stage != "reloading"
+            })
+        {
+            return Err(RuntimeStateError::OperationMismatch);
+        }
+        session.attachment_candidate.clear();
+        session.attachment_candidate_bytes = 0;
+        session.operation = None;
+        self.retire_intent(operation_id);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -650,6 +670,7 @@ impl RuntimeState {
         response: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
+        let response = retain_session_metadata(session_id, response);
         let session = self.require_session_mut(session_id, incarnation)?;
         if session.lifecycle != SessionLifecycle::Attaching
             || session.operation.as_ref().is_none_or(|operation| {
@@ -663,28 +684,14 @@ impl RuntimeState {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let candidate = std::mem::take(&mut session.attachment_candidate);
-        let (conversation, controls) = partition_replay_entries(candidate);
+        let controls = extract_control_state(candidate);
         session.attachment_candidate_bytes = 0;
-        session.transcript = match kind {
-            SessionOperationKind::Load => TranscriptBaseline::AgentReplay {
-                entries: conversation,
-                turn_boundaries_known: false,
-            },
-            SessionOperationKind::Resume => TranscriptBaseline::HistoryUnavailable,
-            _ => unreachable!("attachment kind checked above"),
-        };
         session.control_state.extend(controls);
-        session.session = response.clone();
+        session.session = response;
         session.lifecycle = SessionLifecycle::Active;
         session.operation = None;
-        self.set_intent_status(operation_id, IntentStatus::AgentAcknowledged);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::AgentAcknowledged,
-            Some(response),
-        );
-        self.commit_session_with_results(session_id, vec![intent_result]);
+        self.retire_intent(operation_id);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -696,7 +703,7 @@ impl RuntimeState {
         incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
-        error: Value,
+        _error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         {
@@ -714,17 +721,10 @@ impl RuntimeState {
             .remove(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
         let (queued, effects) = drain_session_liveness(session_id, &mut session);
-        let mut intent_results = self.cancel_queued_intents(session_id, queued);
+        self.retire_intents(queued);
         self.effects.extend(effects);
-        self.set_intent_status(operation_id, IntentStatus::Failed);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::Failed,
-            Some(error),
-        );
-        intent_results.push(intent_result);
-        self.commit_removal_with_results(session_id, incarnation, intent_results);
+        self.retire_intent(operation_id);
+        self.commit_removal(session_id, incarnation);
         Ok(())
     }
 
@@ -739,43 +739,18 @@ impl RuntimeState {
     ) -> Result<u64, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let (source_session_id, source_incarnation) = source;
-        let (transcript, control_state) = if let Some(entries) = target_replay {
-            let (entries, control_state) = partition_replay_entries(entries);
-            (
-                TranscriptBaseline::AgentReplay {
-                    entries,
-                    turn_boundaries_known: false,
-                },
-                control_state,
-            )
-        } else {
+        {
             let source = self.require_session(source_session_id, source_incarnation)?;
             if source.lifecycle != SessionLifecycle::Active {
                 return Err(RuntimeStateError::SessionNotActive);
             }
-            let mut entries = transcript_entries(&source.transcript);
-            entries.extend(
-                source
-                    .observed_turns
-                    .iter()
-                    .filter_map(|turn| serde_json::to_value(turn).ok()),
-            );
-            (
-                TranscriptBaseline::ClientDerivedFork {
-                    source_session_id: source_session_id.to_string(),
-                    source_incarnation,
-                    source_revision: source.revision,
-                    entries,
-                },
-                BTreeMap::new(),
-            )
-        };
+        }
+        let control_state = target_replay.map_or_else(BTreeMap::new, extract_control_state);
         self.open_session(
             expected_epoch,
             session_id.into(),
             cwd.into(),
             session,
-            transcript,
             control_state,
         )
     }
@@ -786,7 +761,6 @@ impl RuntimeState {
         session_id: String,
         cwd: String,
         session: Value,
-        transcript: TranscriptBaseline,
         control_state: BTreeMap<String, Value>,
     ) -> Result<u64, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
@@ -798,6 +772,7 @@ impl RuntimeState {
         }
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
+        let session = retain_session_metadata(&session_id, session);
         self.sessions.insert(
             session_id.clone(),
             SessionRuntime {
@@ -808,8 +783,6 @@ impl RuntimeState {
                 session,
                 control_state,
                 lifecycle: SessionLifecycle::Active,
-                transcript,
-                observed_turns: VecDeque::new(),
                 active_turn: None,
                 queued_prompts: VecDeque::new(),
                 operation: None,
@@ -817,11 +790,11 @@ impl RuntimeState {
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
-                history_gap: None,
-                observed_bytes: 0,
                 queued_prompt_bytes: 0,
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
+                resolved_url_flows: VecDeque::new(),
+                released_terminals: VecDeque::new(),
                 attachment_candidate: Vec::new(),
                 attachment_candidate_bytes: 0,
             },
@@ -975,7 +948,7 @@ impl RuntimeState {
         session_id: &str,
         incarnation: u64,
         operation_id: &str,
-        reason: Value,
+        _reason: Value,
     ) -> Result<bool, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let removed = {
@@ -996,14 +969,8 @@ impl RuntimeState {
                 .saturating_sub(serialized_len(&queued));
             queued
         };
-        self.set_intent_status(operation_id, IntentStatus::Cancelled);
-        let result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::Cancelled,
-            Some(reason),
-        );
-        self.commit_session_with_results(session_id, vec![result]);
+        self.retire_intent(operation_id);
+        self.commit_session(session_id);
         drop(removed);
         Ok(true)
     }
@@ -1053,11 +1020,14 @@ impl RuntimeState {
             .active_turn
             .as_mut()
             .ok_or(RuntimeStateError::NoActiveTurn)?;
-        if serialized_len(turn).saturating_add(serialized_len(&update)) > max_active_bytes {
+        let folded_updates = fold_active_turn_update(&turn.updates, &update)?;
+        let mut candidate = turn.clone();
+        candidate.updates = folded_updates;
+        if serialized_len(&candidate) > max_active_bytes {
             return Err(RuntimeStateError::ResourceLimit);
         }
         let operation_id = turn.operation_id.clone();
-        turn.updates.push(update.clone());
+        turn.updates = candidate.updates;
         self.commit_turn_update(session_id, incarnation, operation_id, update);
         Ok(())
     }
@@ -1117,21 +1087,13 @@ impl RuntimeState {
         operation_id: &str,
         response: Value,
     ) -> Result<(), RuntimeStateError> {
-        let status = if prompt_response_cancelled(&response) {
-            IntentStatus::Cancelled
-        } else {
-            IntentStatus::AgentAcknowledged
-        };
+        drop(response);
         self.seal_turn(
             expected_epoch,
             session_id,
             incarnation,
             operation_id,
-            TurnTerminal {
-                outcome: ObservedTurnOutcome::Completed { response },
-                status,
-                lifecycle: None,
-            },
+            TurnTerminal { lifecycle: None },
         )
     }
 
@@ -1143,16 +1105,13 @@ impl RuntimeState {
         operation_id: &str,
         error: Value,
     ) -> Result<(), RuntimeStateError> {
+        drop(error);
         self.seal_turn(
             expected_epoch,
             session_id,
             incarnation,
             operation_id,
-            TurnTerminal {
-                outcome: ObservedTurnOutcome::Failed { error },
-                status: IntentStatus::Failed,
-                lifecycle: None,
-            },
+            TurnTerminal { lifecycle: None },
         )
     }
 
@@ -1164,16 +1123,13 @@ impl RuntimeState {
         operation_id: &str,
         reason: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
+        drop(reason.into());
         self.seal_turn(
             expected_epoch,
             session_id,
             incarnation,
             operation_id,
             TurnTerminal {
-                outcome: ObservedTurnOutcome::Uncertain {
-                    reason: reason.into(),
-                },
-                status: IntentStatus::Uncertain,
                 lifecycle: Some(SessionLifecycle::Uncertain),
             },
         )
@@ -1187,18 +1143,8 @@ impl RuntimeState {
         operation_id: &str,
         terminal: TurnTerminal,
     ) -> Result<(), RuntimeStateError> {
-        let TurnTerminal {
-            outcome,
-            status,
-            lifecycle,
-        } = terminal;
+        let TurnTerminal { lifecycle } = terminal;
         self.require_epoch(expected_epoch)?;
-        let limits = self.limits;
-        let result_payload = match &outcome {
-            ObservedTurnOutcome::Completed { response } => Some(response.clone()),
-            ObservedTurnOutcome::Failed { error } => Some(error.clone()),
-            ObservedTurnOutcome::Uncertain { reason } => Some(Value::String(reason.clone())),
-        };
         let session = self.require_session_mut(session_id, incarnation)?;
         let active = session
             .active_turn
@@ -1208,18 +1154,7 @@ impl RuntimeState {
             session.active_turn = Some(active);
             return Err(RuntimeStateError::OperationMismatch);
         }
-        let observed = ObservedTurn {
-            turn_id: active.turn_id,
-            prompt: active.prompt,
-            updates: active.updates,
-            cancel_requested: active.cancel_requested,
-            outcome,
-        };
-        session.observed_bytes = session
-            .observed_bytes
-            .saturating_add(serialized_len(&observed));
-        session.observed_turns.push_back(observed);
-        enforce_observed_budget(session, limits);
+        drop(active);
         if let Some(lifecycle) = lifecycle {
             session.lifecycle = lifecycle;
         }
@@ -1228,6 +1163,15 @@ impl RuntimeState {
             .iter()
             .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
             .map(|(interaction_id, _)| interaction_id.clone())
+            .collect::<Vec<_>>();
+        let mut responding_operation_ids = resolved_permissions
+            .iter()
+            .filter_map(|interaction_id| {
+                session
+                    .permissions
+                    .get(interaction_id)
+                    .and_then(|interaction| interaction.responding_operation_id.clone())
+            })
             .collect::<Vec<_>>();
         for interaction_id in &resolved_permissions {
             session.permissions.remove(interaction_id);
@@ -1239,6 +1183,14 @@ impl RuntimeState {
             .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
             .map(|(interaction_id, _)| interaction_id.clone())
             .collect::<Vec<_>>();
+        responding_operation_ids.extend(resolved_elicitations.iter().filter_map(
+            |interaction_id| {
+                session
+                    .elicitations
+                    .get(interaction_id)
+                    .and_then(|interaction| interaction.responding_operation_id.clone())
+            },
+        ));
         for interaction_id in &resolved_elicitations {
             session.elicitations.remove(interaction_id);
             remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
@@ -1257,14 +1209,10 @@ impl RuntimeState {
                     interaction_id,
                 }
             }));
-        self.set_intent_status(operation_id, status.clone());
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            status,
-            result_payload,
-        );
-        self.commit_session_with_results(session_id, vec![intent_result]);
+        self.retire_intents(responding_operation_ids);
+        self.retire_intent(operation_id);
+        self.drop_turn_delivery_payload(session_id, incarnation, operation_id);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -1326,12 +1274,16 @@ impl RuntimeState {
         {
             return Ok(InteractionResolution::AlreadyResolved);
         }
-        session
+        let pending = session
             .permissions
             .remove(interaction_id)
             .ok_or(RuntimeStateError::UnknownInteraction)?;
+        let responding_operation_id = pending.responding_operation_id;
         remember_resolved_permission(session, interaction_id);
         self.commit_session(session_id);
+        if let Some(operation_id) = responding_operation_id {
+            self.retire_intent(&operation_id);
+        }
         Ok(InteractionResolution::Applied)
     }
 
@@ -1362,6 +1314,7 @@ impl RuntimeState {
         if self.operation_in_use(&operation_id) {
             return Err(RuntimeStateError::OperationCollision);
         }
+        self.set_intent_status(&operation_id, IntentStatus::InFlight);
         let session = self.require_session_mut(session_id, incarnation)?;
         let pending = session
             .permissions
@@ -1398,6 +1351,7 @@ impl RuntimeState {
         }
         session.permissions.remove(interaction_id);
         remember_resolved_permission(session, interaction_id);
+        self.retire_intent(operation_id);
         self.commit_session(session_id);
         Ok(InteractionResolution::Applied)
     }
@@ -1503,18 +1457,26 @@ impl RuntimeState {
                     .elicitations
                     .remove(interaction_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
+                let PendingInteraction {
+                    request,
+                    responding_operation_id,
+                    ..
+                } = pending;
                 remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
                 if let Some(elicitation_id) = accepted_url_id {
                     session.url_flows.insert(
                         elicitation_id.to_string(),
                         UrlFlow {
                             elicitation_id: elicitation_id.to_string(),
-                            request: pending.request,
+                            request,
                             status: UrlFlowStatus::Waiting,
                         },
                     );
                 }
                 self.commit_session(session_id);
+                if let Some(operation_id) = responding_operation_id {
+                    self.retire_intent(&operation_id);
+                }
             }
             None => {
                 if self
@@ -1533,6 +1495,11 @@ impl RuntimeState {
                     .request_elicitations
                     .remove(interaction_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
+                let PendingInteraction {
+                    request,
+                    responding_operation_id,
+                    ..
+                } = pending;
                 remember_resolved_interaction(
                     &mut self.resolved_request_elicitations,
                     interaction_id,
@@ -1542,12 +1509,15 @@ impl RuntimeState {
                         elicitation_id.to_string(),
                         UrlFlow {
                             elicitation_id: elicitation_id.to_string(),
-                            request: pending.request,
+                            request,
                             status: UrlFlowStatus::Waiting,
                         },
                     );
                 }
                 self.commit_connection();
+                if let Some(operation_id) = responding_operation_id {
+                    self.retire_intent(&operation_id);
+                }
             }
         }
         Ok(InteractionResolution::Applied)
@@ -1587,6 +1557,7 @@ impl RuntimeState {
         if self.operation_in_use(&operation_id) {
             return Err(RuntimeStateError::OperationCollision);
         }
+        self.set_intent_status(&operation_id, IntentStatus::InFlight);
         match scope {
             Some((session_id, incarnation)) => {
                 self.require_session_mut(session_id, incarnation)?
@@ -1665,25 +1636,39 @@ impl RuntimeState {
         match scope {
             Some((session_id, incarnation)) => {
                 let session = self.require_session_mut(session_id, incarnation)?;
+                if session
+                    .resolved_url_flows
+                    .iter()
+                    .any(|resolved| resolved == elicitation_id)
+                {
+                    return Ok(UrlFlowResolution::AlreadyTerminal);
+                }
                 let flow = session
                     .url_flows
-                    .get_mut(elicitation_id)
+                    .remove(elicitation_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
                 if flow.status != UrlFlowStatus::Waiting {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
-                flow.status = status;
+                remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
                 self.commit_session(session_id);
             }
             None => {
+                if self
+                    .resolved_request_url_flows
+                    .iter()
+                    .any(|resolved| resolved == elicitation_id)
+                {
+                    return Ok(UrlFlowResolution::AlreadyTerminal);
+                }
                 let flow = self
                     .request_url_flows
-                    .get_mut(elicitation_id)
+                    .remove(elicitation_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
                 if flow.status != UrlFlowStatus::Waiting {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
-                flow.status = status;
+                remember_resolved_interaction(&mut self.resolved_request_url_flows, elicitation_id);
                 self.commit_connection();
             }
         }
@@ -1701,13 +1686,24 @@ impl RuntimeState {
         self.require_epoch(expected_epoch)?;
         let session = self.require_session_mut(session_id, incarnation)?;
         let terminal_id = terminal_id.into();
+        if session
+            .released_terminals
+            .iter()
+            .any(|released| released == &terminal_id)
+        {
+            return Ok(TerminalUpsert::Stale);
+        }
         let outcome = match session.terminals.get(&terminal_id) {
             Some(existing) if existing == &terminal => return Ok(TerminalUpsert::Duplicate),
-            Some(existing) if terminal_released(existing) => return Ok(TerminalUpsert::Stale),
             Some(_) => TerminalUpsert::Updated,
             None => TerminalUpsert::Inserted,
         };
-        session.terminals.insert(terminal_id, terminal);
+        if terminal_released(&terminal) {
+            session.terminals.remove(&terminal_id);
+            remember_resolved_interaction(&mut session.released_terminals, &terminal_id);
+        } else {
+            session.terminals.insert(terminal_id, terminal);
+        }
         self.commit_session(session_id);
         Ok(outcome)
     }
@@ -1833,9 +1829,9 @@ impl RuntimeState {
         operation.stage = "deleting".to_string();
         session.lifecycle = SessionLifecycle::Deleting;
         let (queued, effects) = drain_session_liveness(session_id, session);
-        let intent_results = self.cancel_queued_intents(session_id, queued);
+        self.retire_intents(queued);
         self.effects.extend(effects);
-        self.commit_session_with_results(session_id, intent_results);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -1864,17 +1860,10 @@ impl RuntimeState {
             .remove(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
         let (queued, effects) = drain_session_liveness(session_id, &mut session);
-        let mut intent_results = self.cancel_queued_intents(session_id, queued);
+        self.retire_intents(queued);
         self.effects.extend(effects);
-        self.set_intent_status(operation_id, IntentStatus::AgentAcknowledged);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::AgentAcknowledged,
-            None,
-        );
-        intent_results.push(intent_result);
-        self.commit_removal_with_results(session_id, incarnation, intent_results);
+        self.retire_intent(operation_id);
+        self.commit_removal(session_id, incarnation);
         Ok(())
     }
 
@@ -1901,17 +1890,10 @@ impl RuntimeState {
             session.lifecycle = SessionLifecycle::Uncertain;
             drain_session_liveness(session_id, session)
         };
-        let mut intent_results = self.cancel_queued_intents(session_id, queued);
+        self.retire_intents(queued);
         self.effects.extend(effects);
         self.set_intent_status(operation_id, IntentStatus::Uncertain);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::Uncertain,
-            Some(Value::String(reason)),
-        );
-        intent_results.push(intent_result);
-        self.commit_session_with_results(session_id, intent_results);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -1922,7 +1904,7 @@ impl RuntimeState {
         incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
-        result: Value,
+        _result: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let session = self.require_session_mut(session_id, incarnation)?;
@@ -1935,14 +1917,8 @@ impl RuntimeState {
             return Err(RuntimeStateError::OperationMismatch);
         }
         session.operation = None;
-        self.set_intent_status(operation_id, IntentStatus::AgentAcknowledged);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::AgentAcknowledged,
-            Some(result),
-        );
-        self.commit_session_with_results(session_id, vec![intent_result]);
+        self.retire_intent(operation_id);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -1956,7 +1932,7 @@ impl RuntimeState {
         kind: SessionOperationKind,
         control_key: impl Into<String>,
         control_update: Value,
-        result: Value,
+        _result: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         if !matches!(
@@ -1975,14 +1951,8 @@ impl RuntimeState {
             .control_state
             .insert(control_key.into(), control_update);
         session.operation = None;
-        self.set_intent_status(operation_id, IntentStatus::AgentAcknowledged);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::AgentAcknowledged,
-            Some(result),
-        );
-        self.commit_session_with_results(session_id, vec![intent_result]);
+        self.retire_intent(operation_id);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -1993,7 +1963,7 @@ impl RuntimeState {
         incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
-        error: Value,
+        _error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let session = self.require_session_mut(session_id, incarnation)?;
@@ -2011,14 +1981,8 @@ impl RuntimeState {
             SessionOperationKind::Delete => SessionLifecycle::Active,
             _ => session.lifecycle.clone(),
         };
-        self.set_intent_status(operation_id, IntentStatus::Failed);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::Failed,
-            Some(error),
-        );
-        self.commit_session_with_results(session_id, vec![intent_result]);
+        self.retire_intent(operation_id);
+        self.commit_session(session_id);
         Ok(())
     }
 
@@ -2044,17 +2008,10 @@ impl RuntimeState {
             .remove(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
         let (queued, effects) = drain_session_liveness(session_id, &mut session);
-        let mut intent_results = self.cancel_queued_intents(session_id, queued);
+        self.retire_intents(queued);
         self.effects.extend(effects);
-        self.set_intent_status(operation_id, IntentStatus::AgentAcknowledged);
-        let intent_result = self.record_intent_result(
-            operation_id,
-            Some(session_id.to_string()),
-            IntentStatus::AgentAcknowledged,
-            None,
-        );
-        intent_results.push(intent_result);
-        self.commit_removal_with_results(session_id, session.incarnation, intent_results);
+        self.retire_intent(operation_id);
+        self.commit_removal(session_id, session.incarnation);
         Ok(())
     }
 
@@ -2097,58 +2054,51 @@ impl RuntimeState {
     }
 
     fn operation_in_use(&self, operation_id: &str) -> bool {
-        self.intent_results.contains_key(operation_id)
-            || self.intents.values().any(|intent| {
-                intent.operation_id == operation_id && intent.status != IntentStatus::Accepted
-            })
-            || self.sessions.values().any(|session| {
-                session
-                    .active_turn
+        self.intents.values().any(|intent| {
+            intent.operation_id == operation_id && intent.status != IntentStatus::Accepted
+        }) || self.sessions.values().any(|session| {
+            session
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.operation_id == operation_id)
+                || session
+                    .queued_prompts
+                    .iter()
+                    .any(|prompt| prompt.operation_id == operation_id)
+                || session
+                    .operation
                     .as_ref()
-                    .is_some_and(|turn| turn.operation_id == operation_id)
-                    || session
-                        .queued_prompts
-                        .iter()
-                        .any(|prompt| prompt.operation_id == operation_id)
-                    || session
-                        .operation
-                        .as_ref()
-                        .is_some_and(|operation| operation.operation_id == operation_id)
-                    || session.permissions.values().any(|interaction| {
-                        interaction.responding_operation_id.as_deref() == Some(operation_id)
-                    })
-                    || session.elicitations.values().any(|interaction| {
-                        interaction.responding_operation_id.as_deref() == Some(operation_id)
-                    })
-            })
-            || self.request_elicitations.values().any(|interaction| {
-                interaction.responding_operation_id.as_deref() == Some(operation_id)
-            })
+                    .is_some_and(|operation| operation.operation_id == operation_id)
+                || session.permissions.values().any(|interaction| {
+                    interaction.responding_operation_id.as_deref() == Some(operation_id)
+                })
+                || session.elicitations.values().any(|interaction| {
+                    interaction.responding_operation_id.as_deref() == Some(operation_id)
+                })
+        }) || self
+            .request_elicitations
+            .values()
+            .any(|interaction| interaction.responding_operation_id.as_deref() == Some(operation_id))
     }
 
     fn reserve_intent_record_capacity(&mut self) -> bool {
         let limit = self.limits.max_intent_records;
-        while self.intents.len() >= limit && limit > 0 {
-            let Some(position) = self.intent_order.iter().position(|key| {
-                self.intents
-                    .get(key)
-                    .is_some_and(|intent| intent_status_is_evictable(&intent.status))
-            }) else {
-                return false;
-            };
-            if let Some(key) = self.intent_order.remove(position) {
-                self.intents.remove(&key);
-            }
-        }
-        limit > 0
+        limit > 0 && self.intents.len() < limit
     }
 
     fn url_flow_in_use(&self, elicitation_id: &str) -> bool {
         self.request_url_flows.contains_key(elicitation_id)
             || self
-                .sessions
-                .values()
-                .any(|session| session.url_flows.contains_key(elicitation_id))
+                .resolved_request_url_flows
+                .iter()
+                .any(|resolved| resolved == elicitation_id)
+            || self.sessions.values().any(|session| {
+                session.url_flows.contains_key(elicitation_id)
+                    || session
+                        .resolved_url_flows
+                        .iter()
+                        .any(|resolved| resolved == elicitation_id)
+            })
     }
 
     fn set_intent_status(&mut self, operation_id: &str, status: IntentStatus) {
@@ -2161,73 +2111,65 @@ impl RuntimeState {
         }
     }
 
-    fn record_intent_result(
-        &mut self,
-        operation_id: &str,
-        session_id: Option<String>,
-        status: IntentStatus,
-        result: Option<Value>,
-    ) -> IntentResult {
-        let intent_result = IntentResult {
-            operation_id: operation_id.to_string(),
-            session_id,
-            status,
-            result,
-        };
-        if !self.intent_results.contains_key(operation_id) {
-            self.intent_result_order.push_back(operation_id.to_string());
+    fn retire_intent(&mut self, operation_id: &str) {
+        let key = self
+            .intents
+            .iter()
+            .find_map(|(key, intent)| (intent.operation_id == operation_id).then(|| key.clone()));
+        if let Some(key) = key {
+            self.intents.remove(&key);
         }
-        self.intent_results
-            .insert(operation_id.to_string(), intent_result.clone());
-        while self.intent_result_order.len() > self.limits.max_intent_results {
-            if let Some(evicted) = self.intent_result_order.pop_front() {
-                self.intent_results.remove(&evicted);
-                self.pending_intent_result_removals.push(evicted);
-            }
-        }
-        intent_result
     }
 
-    fn cancel_queued_intents(
+    fn drop_turn_delivery_payload(
         &mut self,
         session_id: &str,
-        operation_ids: Vec<String>,
-    ) -> Vec<IntentResult> {
-        operation_ids
-            .into_iter()
-            .map(|operation_id| {
-                self.set_intent_status(&operation_id, IntentStatus::Cancelled);
-                self.record_intent_result(
-                    &operation_id,
-                    Some(session_id.to_string()),
-                    IntentStatus::Cancelled,
-                    None,
-                )
-            })
-            .collect()
+        incarnation: u64,
+        operation_id: &str,
+    ) {
+        // A journal suffix must remain sequence-contiguous. Removing only this session's entries
+        // would leave holes when sessions interleave, so invalidate the whole prefix through the
+        // last delta that could own this turn's payload.
+        let discard_through =
+            self.delta_journal
+                .iter()
+                .filter(|delta| match &delta.change {
+                    RuntimeChange::SessionUpsert { session } => {
+                        session.session_id == session_id && session.incarnation == incarnation
+                    }
+                    RuntimeChange::TurnUpdateAppended {
+                        session_id: delta_session_id,
+                        incarnation: delta_incarnation,
+                        operation_id: delta_operation_id,
+                        ..
+                    } => {
+                        (delta_session_id == session_id && *delta_incarnation == incarnation)
+                            || delta_operation_id == operation_id
+                    }
+                    RuntimeChange::ConnectionUpsert { .. }
+                    | RuntimeChange::SessionRemoved { .. } => false,
+                })
+                .map(|delta| delta.seq)
+                .max();
+        if let Some(discard_through) = discard_through {
+            while self
+                .delta_journal
+                .front()
+                .is_some_and(|delta| delta.seq <= discard_through)
+            {
+                self.delta_journal.pop_front();
+            }
+        }
+        self.delta_bytes = self.delta_journal.iter().map(serialized_len).sum();
+    }
+
+    fn retire_intents(&mut self, operation_ids: Vec<String>) {
+        for operation_id in operation_ids {
+            self.retire_intent(&operation_id);
+        }
     }
 
     fn commit_session(&mut self, session_id: &str) {
-        self.commit_session_with_results(session_id, Vec::new());
-    }
-
-    fn commit_connection(&mut self) {
-        self.commit_connection_with_results(Vec::new());
-    }
-
-    fn commit_connection_with_results(&mut self, intent_results: Vec<IntentResult>) {
-        self.connection_revision = self.connection_revision.wrapping_add(1).max(1);
-        self.commit_delta(
-            Some(self.connection_revision),
-            RuntimeChange::ConnectionUpsert {
-                request_elicitations: self.request_elicitations.clone(),
-                request_url_flows: self.request_url_flows.clone(),
-            },
-            intent_results,
-        );
-    }
-
-    fn commit_session_with_results(&mut self, session_id: &str, intent_results: Vec<IntentResult>) {
         let Some(session) = self.sessions.get_mut(session_id) else {
             return;
         };
@@ -2239,7 +2181,17 @@ impl RuntimeState {
             RuntimeChange::SessionUpsert {
                 session: Box::new(session),
             },
-            intent_results,
+        );
+    }
+
+    fn commit_connection(&mut self) {
+        self.connection_revision = self.connection_revision.wrapping_add(1).max(1);
+        self.commit_delta(
+            Some(self.connection_revision),
+            RuntimeChange::ConnectionUpsert {
+                request_elicitations: self.request_elicitations.clone(),
+                request_url_flows: self.request_url_flows.clone(),
+            },
         );
     }
 
@@ -2264,40 +2216,26 @@ impl RuntimeState {
                 operation_id,
                 update,
             },
-            Vec::new(),
         );
     }
 
-    fn commit_removal_with_results(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-        intent_results: Vec<IntentResult>,
-    ) {
+    fn commit_removal(&mut self, session_id: &str, incarnation: u64) {
         self.commit_delta(
             None,
             RuntimeChange::SessionRemoved {
                 session_id: session_id.to_string(),
                 incarnation,
             },
-            intent_results,
         );
     }
 
-    fn commit_delta(
-        &mut self,
-        scope_revision: Option<u64>,
-        change: RuntimeChange,
-        intent_results: Vec<IntentResult>,
-    ) {
+    fn commit_delta(&mut self, scope_revision: Option<u64>, change: RuntimeChange) {
         self.seq = self.seq.wrapping_add(1).max(1);
         let delta = RuntimeDelta {
             epoch: self.epoch.clone(),
             seq: self.seq,
             scope_revision,
             change,
-            intent_results,
-            evicted_intent_result_ids: std::mem::take(&mut self.pending_intent_result_removals),
         };
         self.delta_bytes = self.delta_bytes.saturating_add(serialized_len(&delta));
         self.delta_journal.push_back(delta);
@@ -2312,48 +2250,38 @@ impl RuntimeState {
     }
 }
 
-fn enforce_observed_budget(session: &mut SessionRuntime, limits: RuntimeLimits) {
-    while session.observed_turns.len() > limits.max_observed_turns_per_session
-        || session.observed_bytes > limits.max_observed_bytes_per_session
-    {
-        let Some(removed) = session.observed_turns.pop_front() else {
-            break;
-        };
-        let bytes = serialized_len(&removed);
-        session.observed_bytes = session.observed_bytes.saturating_sub(bytes);
-        let gap = session.history_gap.get_or_insert_with(HistoryGap::default);
-        gap.evicted_turns = gap.evicted_turns.saturating_add(1);
-        gap.evicted_bytes = gap.evicted_bytes.saturating_add(bytes);
-        gap.through_revision = session.revision.saturating_add(1);
-    }
-}
-
-fn transcript_entries(transcript: &TranscriptBaseline) -> Vec<Value> {
-    match transcript {
-        TranscriptBaseline::PendingAttachment
-        | TranscriptBaseline::Empty
-        | TranscriptBaseline::HistoryUnavailable => Vec::new(),
-        TranscriptBaseline::AgentReplay { entries, .. }
-        | TranscriptBaseline::ClientDerivedFork { entries, .. } => entries.clone(),
-    }
-}
-
-fn partition_replay_entries(entries: Vec<Value>) -> (Vec<Value>, BTreeMap<String, Value>) {
-    let mut conversation = Vec::new();
+fn extract_control_state(entries: Vec<Value>) -> BTreeMap<String, Value> {
     let mut controls = BTreeMap::new();
     for entry in entries {
-        let update = entry.get("update").unwrap_or(&entry);
-        let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
-            conversation.push(entry);
-            continue;
-        };
-        if is_conversation_update_kind(kind) {
-            conversation.push(entry);
-        } else {
-            controls.insert(kind.to_string(), update.clone());
+        if let Some(update) = retain_control_update(entry) {
+            let kind = update["sessionUpdate"]
+                .as_str()
+                .expect("retained control update has a kind")
+                .to_string();
+            controls.insert(kind, update);
         }
     }
-    (conversation, controls)
+    controls
+}
+
+fn retain_session_metadata(session_id: &str, response: Value) -> Value {
+    let mut retained = Map::new();
+    retained.insert(
+        "sessionId".to_string(),
+        Value::String(session_id.to_string()),
+    );
+    for key in ["modes", "configOptions"] {
+        if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
+            retained.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(retained)
+}
+
+fn retain_control_update(entry: Value) -> Option<Value> {
+    let update = entry.get("update").unwrap_or(&entry);
+    let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
+    (!is_conversation_update_kind(kind)).then(|| update.clone())
 }
 
 fn is_conversation_update_kind(kind: &str) -> bool {
@@ -2372,29 +2300,11 @@ fn is_conversation_update_kind(kind: &str) -> bool {
     )
 }
 
-fn prompt_response_cancelled(response: &Value) -> bool {
-    response
-        .get("stopReason")
-        .or_else(|| response.get("stop_reason"))
-        .and_then(Value::as_str)
-        == Some("cancelled")
-}
-
 fn terminal_released(terminal: &Value) -> bool {
     terminal
         .get("released")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-}
-
-fn intent_status_is_evictable(status: &IntentStatus) -> bool {
-    matches!(
-        status,
-        IntentStatus::AgentAcknowledged
-            | IntentStatus::Rejected
-            | IntentStatus::Failed
-            | IntentStatus::Cancelled
-    )
 }
 
 fn remember_resolved_permission(session: &mut SessionRuntime, interaction_id: &str) {
@@ -2412,27 +2322,37 @@ fn drain_session_liveness(
     session_id: &str,
     session: &mut SessionRuntime,
 ) -> (Vec<String>, Vec<RuntimeEffect>) {
-    let queued = session
+    let mut operation_ids = session
         .queued_prompts
         .drain(..)
         .map(|prompt| prompt.operation_id)
         .collect::<Vec<_>>();
     session.queued_prompt_bytes = 0;
-    let mut effects = std::mem::take(&mut session.permissions)
+    let permissions = std::mem::take(&mut session.permissions);
+    operation_ids.extend(
+        permissions
+            .values()
+            .filter_map(|pending| pending.responding_operation_id.clone()),
+    );
+    let mut effects = permissions
         .into_keys()
         .map(|interaction_id| RuntimeEffect::CancelPermissionResponder {
             session_id: session_id.to_string(),
             interaction_id,
         })
         .collect::<Vec<_>>();
-    effects.extend(
-        std::mem::take(&mut session.elicitations)
-            .into_keys()
-            .map(|interaction_id| RuntimeEffect::CancelElicitationResponder {
-                session_id: Some(session_id.to_string()),
-                interaction_id,
-            }),
+    let elicitations = std::mem::take(&mut session.elicitations);
+    operation_ids.extend(
+        elicitations
+            .values()
+            .filter_map(|pending| pending.responding_operation_id.clone()),
     );
+    effects.extend(elicitations.into_keys().map(|interaction_id| {
+        RuntimeEffect::CancelElicitationResponder {
+            session_id: Some(session_id.to_string()),
+            interaction_id,
+        }
+    }));
     effects.extend(
         std::mem::take(&mut session.url_flows)
             .into_iter()
@@ -2451,11 +2371,218 @@ fn drain_session_liveness(
                 terminal_id,
             }),
     );
-    (queued, effects)
+    (operation_ids, effects)
 }
 
 fn serialized_len(value: &impl Serialize) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+pub(crate) fn fold_active_turn_update(
+    retained: &[Value],
+    update: &Value,
+) -> Result<Vec<Value>, RuntimeStateError> {
+    let mut folded = retained.to_vec();
+    let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        folded.push(update.clone());
+        return Ok(folded);
+    };
+
+    match kind {
+        "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" => {
+            let Some((shape, text)) = text_chunk_shape(update)? else {
+                folded.push(update.clone());
+                return Ok(folded);
+            };
+            if let Some(previous) = folded.last_mut() {
+                if text_chunk_shape(previous)?
+                    .as_ref()
+                    .is_some_and(|(previous_shape, _)| previous_shape == &shape)
+                {
+                    let previous_text = previous
+                        .get_mut("content")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|content| content.get_mut("text"))
+                        .and_then(|value| value.as_str())
+                        .ok_or(RuntimeStateError::OperationMismatch)?;
+                    let mut merged = String::with_capacity(previous_text.len() + text.len());
+                    merged.push_str(previous_text);
+                    merged.push_str(text);
+                    previous["content"]["text"] = Value::String(merged);
+                    return Ok(folded);
+                }
+            }
+            folded.push(update.clone());
+        }
+        "tool_call" | "tool_call_update" => {
+            let tool_call_id = required_fold_string(update, "toolCallId")?;
+            if let Some(position) = folded.iter().position(|candidate| {
+                matches!(
+                    candidate.get("sessionUpdate").and_then(Value::as_str),
+                    Some("tool_call" | "tool_call_update")
+                ) && candidate.get("toolCallId").and_then(Value::as_str) == Some(tool_call_id)
+            }) {
+                let retained_kind = folded[position]["sessionUpdate"].clone();
+                deep_merge_json_object(&mut folded[position], update)?;
+                folded[position]["sessionUpdate"] = if kind == "tool_call" {
+                    Value::String("tool_call".to_string())
+                } else {
+                    retained_kind
+                };
+                folded[position]["toolCallId"] = Value::String(tool_call_id.to_string());
+            } else {
+                folded.push(update.clone());
+            }
+        }
+        "plan" => {
+            if !update.get("entries").is_some_and(Value::is_array) {
+                return Err(RuntimeStateError::OperationMismatch);
+            }
+            replace_fold_slot(
+                &mut folded,
+                |candidate| candidate.get("sessionUpdate").and_then(Value::as_str) == Some("plan"),
+                update,
+            );
+        }
+        "plan_update" => {
+            let plan = update
+                .get("plan")
+                .and_then(Value::as_object)
+                .ok_or(RuntimeStateError::OperationMismatch)?;
+            let plan_id = plan
+                .get("planId")
+                .and_then(Value::as_str)
+                .filter(|plan_id| !plan_id.is_empty())
+                .ok_or(RuntimeStateError::OperationMismatch)?;
+            if plan.get("type").and_then(Value::as_str) == Some("items")
+                && !plan.get("entries").is_some_and(Value::is_array)
+            {
+                return Err(RuntimeStateError::OperationMismatch);
+            }
+            replace_fold_slot(
+                &mut folded,
+                |candidate| {
+                    candidate.get("sessionUpdate").and_then(Value::as_str) == Some("plan_update")
+                        && candidate
+                            .get("plan")
+                            .and_then(|plan| plan.get("planId"))
+                            .and_then(Value::as_str)
+                            == Some(plan_id)
+                },
+                update,
+            );
+        }
+        "plan_removed" => {
+            let plan_id = required_fold_string(update, "planId")?;
+            if let Some(position) = folded.iter().position(|candidate| {
+                candidate.get("sessionUpdate").and_then(Value::as_str) == Some("plan_update")
+                    && candidate
+                        .get("plan")
+                        .and_then(|plan| plan.get("planId"))
+                        .and_then(Value::as_str)
+                        == Some(plan_id)
+            }) {
+                folded.remove(position);
+            }
+        }
+        _ => folded.push(update.clone()),
+    }
+    Ok(folded)
+}
+
+fn text_chunk_shape(update: &Value) -> Result<Option<(Value, &str)>, RuntimeStateError> {
+    if !matches!(
+        update.get("sessionUpdate").and_then(Value::as_str),
+        Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk")
+    ) {
+        return Ok(None);
+    }
+    let content = update
+        .get("content")
+        .and_then(Value::as_object)
+        .ok_or(RuntimeStateError::OperationMismatch)?;
+    let content_type = content
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or(RuntimeStateError::OperationMismatch)?;
+    if update
+        .get("messageId")
+        .is_some_and(|message_id| !message_id.is_null() && !message_id.is_string())
+    {
+        return Err(RuntimeStateError::OperationMismatch);
+    }
+    if content_type != "text" {
+        return Ok(None);
+    }
+    let text = content
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or(RuntimeStateError::OperationMismatch)?;
+    let mut shape = update.clone();
+    if shape.get("messageId").is_some_and(Value::is_null) {
+        shape
+            .as_object_mut()
+            .expect("a session update with fields is an object")
+            .remove("messageId");
+    }
+    shape["content"]["text"] = Value::String(String::new());
+    Ok(Some((shape, text)))
+}
+
+fn required_fold_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, RuntimeStateError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(RuntimeStateError::OperationMismatch)
+}
+
+fn replace_fold_slot(
+    folded: &mut Vec<Value>,
+    matches_slot: impl Fn(&Value) -> bool,
+    update: &Value,
+) {
+    if let Some(position) = folded.iter().position(matches_slot) {
+        folded[position] = update.clone();
+    } else {
+        folded.push(update.clone());
+    }
+}
+
+fn deep_merge_json_object(target: &mut Value, patch: &Value) -> Result<(), RuntimeStateError> {
+    let target = target
+        .as_object_mut()
+        .ok_or(RuntimeStateError::OperationMismatch)?;
+    let patch = patch
+        .as_object()
+        .ok_or(RuntimeStateError::OperationMismatch)?;
+    for (key, patch_value) in patch {
+        match (target.get_mut(key), patch_value) {
+            (Some(Value::Object(target_object)), Value::Object(patch_object)) => {
+                deep_merge_json_maps(target_object, patch_object);
+            }
+            _ => {
+                target.insert(key.clone(), patch_value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn deep_merge_json_maps(
+    target: &mut serde_json::Map<String, Value>,
+    patch: &serde_json::Map<String, Value>,
+) {
+    for (key, patch_value) in patch {
+        match (target.get_mut(key), patch_value) {
+            (Some(Value::Object(target_object)), Value::Object(patch_object)) => {
+                deep_merge_json_maps(target_object, patch_object);
+            }
+            _ => {
+                target.insert(key.clone(), patch_value.clone());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2476,46 +2603,6 @@ impl RuntimeState {
             session_id.into(),
             cwd.into(),
             session,
-            TranscriptBaseline::Empty,
-            BTreeMap::new(),
-        )
-    }
-
-    pub(crate) fn open_loaded(
-        &mut self,
-        expected_epoch: &str,
-        session_id: impl Into<String>,
-        cwd: impl Into<String>,
-        session: Value,
-        replay: Vec<Value>,
-    ) -> Result<u64, RuntimeStateError> {
-        let (replay, control_state) = partition_replay_entries(replay);
-        self.open_session(
-            expected_epoch,
-            session_id.into(),
-            cwd.into(),
-            session,
-            TranscriptBaseline::AgentReplay {
-                entries: replay,
-                turn_boundaries_known: false,
-            },
-            control_state,
-        )
-    }
-
-    pub(crate) fn open_resumed(
-        &mut self,
-        expected_epoch: &str,
-        session_id: impl Into<String>,
-        cwd: impl Into<String>,
-        session: Value,
-    ) -> Result<u64, RuntimeStateError> {
-        self.open_session(
-            expected_epoch,
-            session_id.into(),
-            cwd.into(),
-            session,
-            TranscriptBaseline::HistoryUnavailable,
             BTreeMap::new(),
         )
     }
@@ -2530,15 +2617,12 @@ mod tests {
         RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_observed_turns_per_session: 2,
-                max_observed_bytes_per_session: 16_384,
                 max_active_turn_bytes_per_session: 16_384,
                 max_queued_prompts_per_session: 8,
                 max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
-                max_intent_results: 4_096,
             },
         )
     }
@@ -2554,8 +2638,851 @@ mod tests {
             .unwrap()
     }
 
+    fn accept_and_start_prompt(
+        state: &mut RuntimeState,
+        session_id: &str,
+        incarnation: u64,
+        client_intent_id: &str,
+        payload: &str,
+        prompt: Vec<Value>,
+    ) -> String {
+        let IntentAck::Accepted { operation_id } = state
+            .accept_intent("epoch", 1, client_intent_id.to_string(), payload)
+            .unwrap()
+        else {
+            panic!("a fresh client intent must be accepted");
+        };
+        state
+            .start_prompt(
+                "epoch",
+                session_id,
+                incarnation,
+                operation_id.clone(),
+                prompt,
+            )
+            .unwrap();
+        operation_id
+    }
+
     #[test]
-    fn turn_terminal_event_moves_active_to_observed_exactly_once() {
+    fn in_flight_intent_keeps_fixed_digest_not_full_command() {
+        let mut state = state();
+        let command = format!("sensitive-command-{}", "x".repeat(8_192));
+        let IntentAck::Accepted { operation_id } =
+            state.accept_intent("epoch", 1, "intent", &command).unwrap()
+        else {
+            panic!("fresh intent must be accepted");
+        };
+        let record = state
+            .intents
+            .values()
+            .find(|record| record.operation_id == operation_id)
+            .unwrap();
+
+        let expected: [u8; 32] = Sha256::digest(command.as_bytes()).into();
+        assert_eq!(record.payload_digest, expected);
+        assert_eq!(std::mem::size_of_val(&record.payload_digest), 32);
+    }
+
+    #[test]
+    fn sequential_completed_intents_do_not_grow_intent_maps() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+
+        for index in 0..32 {
+            let IntentAck::Accepted { operation_id } = state
+                .accept_intent(
+                    "epoch",
+                    1,
+                    format!("control-intent-{index}"),
+                    format!("control-payload-{index}"),
+                )
+                .unwrap()
+            else {
+                panic!("fresh control intent must be accepted");
+            };
+            state
+                .start_operation(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    &operation_id,
+                    SessionOperationKind::SetMode,
+                    "setting_mode",
+                )
+                .unwrap();
+            state
+                .complete_control_operation(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    &operation_id,
+                    SessionOperationKind::SetMode,
+                    "current_mode_update",
+                    json!({ "currentModeId": "plan" }),
+                    json!({ "ok": true }),
+                )
+                .unwrap();
+
+            assert!(state.intents.is_empty());
+        }
+    }
+
+    #[test]
+    fn active_turn_folds_only_adjacent_compatible_text_chunks_but_publishes_raw_deltas() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        let before = state.seq();
+        let updates = [
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "answer",
+                "content": { "type": "text", "text": "hello " }
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "answer",
+                "content": { "type": "text", "text": "world" }
+            }),
+            json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought",
+                "content": { "type": "text", "text": "reason " }
+            }),
+            json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought",
+                "content": { "type": "text", "text": "carefully" }
+            }),
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "echo",
+                "content": { "type": "text", "text": "user" }
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "answer",
+                "content": { "type": "text", "text": " later" }
+            }),
+        ];
+        for update in updates.clone() {
+            state
+                .append_turn_update("epoch", "session", incarnation, update)
+                .unwrap();
+        }
+
+        let retained = &state
+            .session("session")
+            .unwrap()
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .updates;
+        assert_eq!(retained.len(), 4);
+        assert_eq!(retained[0]["content"]["text"], "hello world");
+        assert_eq!(retained[1]["content"]["text"], "reason carefully");
+        assert_eq!(retained[2]["content"]["text"], "user");
+        assert_eq!(retained[3]["content"]["text"], " later");
+
+        let published = state
+            .deltas_after(before)
+            .unwrap()
+            .into_iter()
+            .map(|delta| match delta.change {
+                RuntimeChange::TurnUpdateAppended { update, .. } => update,
+                other => panic!("unexpected retained turn delta: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(published, updates);
+    }
+
+    #[test]
+    fn active_turn_deep_merges_tool_updates_at_the_first_position_without_changing_start_kind() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        let before = state.seq();
+        let updates = [
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tool",
+                "status": "pending",
+                "details": { "path": "/first", "nested": { "left": 1 } }
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "between",
+                "content": { "type": "text", "text": "between" }
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tool",
+                "status": "in_progress",
+                "details": { "nested": { "right": 2 } }
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tool",
+                "details": { "path": "/last", "nested": { "left": 3 } }
+            }),
+        ];
+        for update in updates.clone() {
+            state
+                .append_turn_update("epoch", "session", incarnation, update)
+                .unwrap();
+        }
+
+        let retained = &state
+            .session("session")
+            .unwrap()
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .updates;
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0]["sessionUpdate"], "tool_call");
+        assert_eq!(retained[0]["toolCallId"], "tool");
+        assert_eq!(retained[0]["status"], "in_progress");
+        assert_eq!(retained[0]["details"]["path"], "/last");
+        assert_eq!(retained[0]["details"]["nested"]["left"], 3);
+        assert_eq!(retained[0]["details"]["nested"]["right"], 2);
+        assert_eq!(retained[1]["content"]["text"], "between");
+        let published = state
+            .deltas_after(before)
+            .unwrap()
+            .into_iter()
+            .map(|delta| match delta.change {
+                RuntimeChange::TurnUpdateAppended { update, .. } => update,
+                other => panic!("unexpected retained turn delta: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(published, updates);
+    }
+
+    #[test]
+    fn active_turn_replaces_plan_slots_in_place_and_removal_clears_only_its_slot() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        for update in [
+            json!({
+                "sessionUpdate": "plan_update",
+                "plan": { "type": "markdown", "planId": "one", "content": "first" }
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "between",
+                "content": { "type": "text", "text": "between" }
+            }),
+            json!({
+                "sessionUpdate": "plan_update",
+                "plan": { "type": "markdown", "planId": "two", "content": "other" }
+            }),
+            json!({
+                "sessionUpdate": "plan_update",
+                "plan": { "type": "markdown", "planId": "one", "content": "latest" }
+            }),
+        ] {
+            state
+                .append_turn_update("epoch", "session", incarnation, update)
+                .unwrap();
+        }
+        let retained = &state
+            .session("session")
+            .unwrap()
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .updates;
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[0]["plan"]["planId"], "one");
+        assert_eq!(retained[0]["plan"]["content"], "latest");
+        assert_eq!(retained[1]["content"]["text"], "between");
+        assert_eq!(retained[2]["plan"]["planId"], "two");
+
+        for update in [
+            json!({ "sessionUpdate": "plan_removed", "planId": "one" }),
+            json!({
+                "sessionUpdate": "plan",
+                "entries": [{ "content": "legacy one" }]
+            }),
+            json!({
+                "sessionUpdate": "plan",
+                "entries": [{ "content": "legacy latest" }]
+            }),
+        ] {
+            state
+                .append_turn_update("epoch", "session", incarnation, update)
+                .unwrap();
+        }
+
+        let retained = &state
+            .session("session")
+            .unwrap()
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .updates;
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[0]["content"]["text"], "between");
+        assert_eq!(retained[1]["plan"]["planId"], "two");
+        assert_eq!(retained[2]["sessionUpdate"], "plan");
+        assert_eq!(retained[2]["entries"][0]["content"], "legacy latest");
+        assert!(retained.iter().all(|update| {
+            update.get("planId").and_then(Value::as_str) != Some("one")
+                && update
+                    .get("plan")
+                    .and_then(|plan| plan.get("planId"))
+                    .and_then(Value::as_str)
+                    != Some("one")
+        }));
+    }
+
+    #[test]
+    fn rejected_fold_replacements_leave_retained_state_revision_and_deltas_unchanged() {
+        let mut state = RuntimeState::new(
+            "epoch",
+            RuntimeLimits {
+                max_active_turn_bytes_per_session: 512,
+                ..RuntimeLimits::default()
+            },
+        );
+        let incarnation = open(&mut state, "session");
+        state
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool",
+                    "details": { "stable": true }
+                }),
+            )
+            .unwrap();
+        let before_invalid = state.snapshot();
+        assert_eq!(
+            state.append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({ "sessionUpdate": "tool_call_update", "status": "invalid" }),
+            ),
+            Err(RuntimeStateError::OperationMismatch),
+        );
+        assert_eq!(state.snapshot(), before_invalid);
+        assert!(
+            state
+                .deltas_after(before_invalid.through_seq)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            state.append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "plan_update",
+                    "plan": { "type": "markdown", "content": "missing ID" }
+                }),
+            ),
+            Err(RuntimeStateError::OperationMismatch),
+        );
+        assert_eq!(state.snapshot(), before_invalid);
+        assert!(
+            state
+                .deltas_after(before_invalid.through_seq)
+                .unwrap()
+                .is_empty()
+        );
+
+        let before_oversize = state.snapshot();
+        assert_eq!(
+            state.append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tool",
+                    "details": { "oversize": "x".repeat(1_024) }
+                }),
+            ),
+            Err(RuntimeStateError::ResourceLimit),
+        );
+        assert_eq!(state.snapshot(), before_oversize);
+        assert!(
+            state
+                .deltas_after(before_oversize.through_seq)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ten_thousand_terminal_turns_leave_no_folded_updates_or_payload_deltas() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+
+        for index in 0..10_000 {
+            let operation_id = format!("turn-{index}");
+            state
+                .start_prompt("epoch", "session", incarnation, &operation_id, Vec::new())
+                .unwrap();
+            state
+                .append_turn_update(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": operation_id,
+                        "content": { "type": "text", "text": format!("turn-payload-{index}") }
+                    }),
+                )
+                .unwrap();
+            state
+                .complete_prompt(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    &format!("turn-{index}"),
+                    json!({ "stopReason": "end_turn" }),
+                )
+                .unwrap();
+
+            assert!(state.session("session").unwrap().active_turn.is_none());
+        }
+
+        assert!(
+            !serde_json::to_string(&state.delta_journal)
+                .unwrap()
+                .contains("turn-payload-")
+        );
+    }
+
+    fn assert_terminal_turn_payload_was_dropped(
+        state: &RuntimeState,
+        session_id: &str,
+        operation_id: &str,
+        markers: &[&str],
+    ) {
+        let session = state.session(session_id).unwrap();
+        let session_payload = serde_json::to_string(session).unwrap();
+        let active_turn = serde_json::to_string(&session.active_turn).unwrap();
+        let delta_journal = serde_json::to_string(&state.delta_journal).unwrap();
+        let mut retained_by = Vec::new();
+
+        if session.active_turn.is_some() {
+            retained_by.push("active_turn");
+        }
+        if markers
+            .iter()
+            .any(|marker| session_payload.contains(marker))
+        {
+            retained_by.push("session");
+        }
+        if markers.iter().any(|marker| active_turn.contains(marker)) {
+            retained_by.push("active_turn_payload");
+        }
+        if state
+            .intents
+            .values()
+            .any(|intent| intent.operation_id == operation_id)
+        {
+            retained_by.push("intent_record");
+        }
+        if markers.iter().any(|marker| delta_journal.contains(marker)) {
+            retained_by.push("delta_journal");
+        }
+
+        assert!(
+            retained_by.is_empty(),
+            "terminal turn payload is still retained by: {}",
+            retained_by.join(", ")
+        );
+    }
+
+    #[test]
+    fn terminal_response_drops_prompt_updates_indices_and_operation_payload() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let operation_id = accept_and_start_prompt(
+            &mut state,
+            "session",
+            incarnation,
+            "success-client-intent",
+            "success-command-payload-marker",
+            vec![json!({
+                "type": "text",
+                "text": "success-prompt-marker"
+            })],
+        );
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "success-message-id",
+                    "content": { "type": "text", "text": "success-update-marker" }
+                }),
+            )
+            .unwrap();
+        state
+            .complete_prompt(
+                "epoch",
+                "session",
+                incarnation,
+                &operation_id,
+                json!({
+                    "stopReason": "end_turn",
+                    "marker": "success-result-marker"
+                }),
+            )
+            .unwrap();
+
+        assert_terminal_turn_payload_was_dropped(
+            &state,
+            "session",
+            &operation_id,
+            &[
+                "success-command-payload-marker",
+                "success-prompt-marker",
+                "success-update-marker",
+                "success-result-marker",
+            ],
+        );
+    }
+
+    #[test]
+    fn prompt_error_drops_all_turn_payload_after_terminal_delivery() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let operation_id = accept_and_start_prompt(
+            &mut state,
+            "session",
+            incarnation,
+            "error-client-intent",
+            "error-command-payload-marker",
+            vec![json!({ "type": "text", "text": "error-prompt-marker" })],
+        );
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "error-update-marker" }
+                }),
+            )
+            .unwrap();
+        state
+            .fail_prompt(
+                "epoch",
+                "session",
+                incarnation,
+                &operation_id,
+                json!({ "message": "error-result-marker" }),
+            )
+            .unwrap();
+
+        assert_terminal_turn_payload_was_dropped(
+            &state,
+            "session",
+            &operation_id,
+            &[
+                "error-command-payload-marker",
+                "error-prompt-marker",
+                "error-update-marker",
+                "error-result-marker",
+            ],
+        );
+    }
+
+    #[test]
+    fn transport_loss_produces_one_uncertain_terminal_then_drops_the_turn() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let operation_id = accept_and_start_prompt(
+            &mut state,
+            "session",
+            incarnation,
+            "uncertain-client-intent",
+            "uncertain-command-payload-marker",
+            vec![json!({
+                "type": "text",
+                "text": "uncertain-prompt-marker"
+            })],
+        );
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "uncertain-tool-id",
+                    "marker": "uncertain-update-marker"
+                }),
+            )
+            .unwrap();
+        state
+            .mark_prompt_uncertain(
+                "epoch",
+                "session",
+                incarnation,
+                &operation_id,
+                "uncertain-result-marker",
+            )
+            .unwrap();
+
+        assert_terminal_turn_payload_was_dropped(
+            &state,
+            "session",
+            &operation_id,
+            &[
+                "uncertain-command-payload-marker",
+                "uncertain-prompt-marker",
+                "uncertain-update-marker",
+                "uncertain-result-marker",
+            ],
+        );
+    }
+
+    #[test]
+    fn new_turn_can_reuse_prior_message_and_tool_ids() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let first_operation_id = accept_and_start_prompt(
+            &mut state,
+            "session",
+            incarnation,
+            "first-client-intent",
+            "first-command-payload-marker",
+            vec![json!("first-prompt-marker")],
+        );
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "reused-message-id",
+                    "content": { "type": "text", "text": "first-message-marker" }
+                }),
+            )
+            .unwrap();
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "reused-tool-id",
+                    "marker": "first-tool-marker"
+                }),
+            )
+            .unwrap();
+        state
+            .complete_prompt(
+                "epoch",
+                "session",
+                incarnation,
+                &first_operation_id,
+                json!({ "stopReason": "end_turn" }),
+            )
+            .unwrap();
+
+        let second_operation_id = accept_and_start_prompt(
+            &mut state,
+            "session",
+            incarnation,
+            "second-client-intent",
+            "second-command-digest",
+            vec![json!("second prompt")],
+        );
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "reused-message-id",
+                    "content": { "type": "text", "text": "second message" }
+                }),
+            )
+            .unwrap();
+        state
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "reused-tool-id",
+                    "marker": "second tool"
+                }),
+            )
+            .unwrap();
+
+        let session = state.session("session").unwrap();
+        let active = session.active_turn.as_ref().unwrap();
+        assert_eq!(active.operation_id, second_operation_id);
+        assert_eq!(active.updates.len(), 2);
+        let session_payload = serde_json::to_string(session).unwrap();
+        assert!(!session_payload.contains("first-message-marker"));
+        assert!(!session_payload.contains("first-tool-marker"));
+        assert!(
+            !state
+                .intents
+                .values()
+                .any(|intent| intent.operation_id == first_operation_id)
+        );
+    }
+
+    #[test]
+    fn turn_retirement_does_not_release_a_live_terminal() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let operation_id = accept_and_start_prompt(
+            &mut state,
+            "session",
+            incarnation,
+            "resource-client-intent",
+            "resource-command-payload-marker",
+            vec![json!("resource-prompt-marker")],
+        );
+        state
+            .upsert_terminal(
+                "epoch",
+                "session",
+                incarnation,
+                "live-terminal",
+                json!({
+                    "terminalId": "live-terminal",
+                    "output": "live-terminal-output",
+                    "released": false
+                }),
+            )
+            .unwrap();
+        state
+            .upsert_elicitation(
+                "epoch",
+                Some(("session", incarnation)),
+                "url-elicitation",
+                json!({ "mode": "url", "url": "https://example.test/live" }),
+            )
+            .unwrap();
+        state
+            .resolve_elicitation(
+                "epoch",
+                Some(("session", incarnation)),
+                "url-elicitation",
+                Some("live-url-flow"),
+            )
+            .unwrap();
+        state
+            .complete_prompt(
+                "epoch",
+                "session",
+                incarnation,
+                &operation_id,
+                json!({
+                    "stopReason": "end_turn",
+                    "marker": "resource-result-marker"
+                }),
+            )
+            .unwrap();
+
+        let session = state.session("session").unwrap();
+        assert_eq!(
+            session.terminals["live-terminal"]["output"],
+            json!("live-terminal-output")
+        );
+        assert_eq!(
+            session.url_flows["live-url-flow"].status,
+            UrlFlowStatus::Waiting
+        );
+        assert_terminal_turn_payload_was_dropped(
+            &state,
+            "session",
+            &operation_id,
+            &[
+                "resource-command-payload-marker",
+                "resource-prompt-marker",
+                "resource-result-marker",
+            ],
+        );
+    }
+
+    #[test]
+    fn sequential_completed_turns_leave_active_and_completed_payload_bytes_at_zero() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+
+        for index in 0..32 {
+            let marker = format!("sequential-turn-payload-{index}");
+            let operation_id = accept_and_start_prompt(
+                &mut state,
+                "session",
+                incarnation,
+                &format!("sequential-intent-{index}"),
+                &format!("sequential-command-payload-{index}"),
+                vec![json!({ "type": "text", "text": marker })],
+            );
+            state
+                .append_turn_update(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": marker }
+                    }),
+                )
+                .unwrap();
+            state
+                .complete_prompt(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    &operation_id,
+                    json!({ "stopReason": "end_turn", "marker": marker }),
+                )
+                .unwrap();
+        }
+
+        let session = state.session("session").unwrap();
+        assert!(session.active_turn.is_none());
+        assert!(state.intents.is_empty());
+        assert!(
+            !serde_json::to_string(&state.delta_journal)
+                .unwrap()
+                .contains("sequential-turn-payload"),
+            "delivery storage must not retain completed turn payloads"
+        );
+    }
+
+    #[test]
+    fn turn_terminal_event_retires_active_exactly_once() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
@@ -2582,13 +3509,7 @@ mod tests {
 
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
-        assert_eq!(session.observed_turns.len(), 1);
-        assert_eq!(session.observed_turns[0].updates, vec![json!("answer")]);
-        assert_eq!(
-            session.transcript,
-            TranscriptBaseline::Empty,
-            "a live PromptResponse seals bridge-observed history but does not claim Agent persistence"
-        );
+        let settled_seq = state.seq();
         assert_eq!(
             state.complete_prompt(
                 "epoch",
@@ -2599,41 +3520,56 @@ mod tests {
             ),
             Err(RuntimeStateError::NoActiveTurn),
         );
-        assert_eq!(state.session("session").unwrap().observed_turns.len(), 1);
+        assert_eq!(state.seq(), settled_seq);
+        assert!(state.session("session").unwrap().active_turn.is_none());
     }
 
     #[test]
-    fn load_and_resume_have_distinct_history_semantics() {
+    fn new_replay_keeps_control_metadata_without_conversation() {
         let mut state = state();
         state
-            .open_loaded(
+            .open_new_with_replay(
                 "epoch",
-                "loaded",
-                "/loaded",
-                json!({ "sessionId": "loaded" }),
-                vec![json!({ "sessionUpdate": "agent_message_chunk" })],
-            )
-            .unwrap();
-        state
-            .open_resumed(
-                "epoch",
-                "resumed",
-                "/resumed",
-                json!({ "sessionId": "resumed" }),
+                "session",
+                "/session",
+                json!({
+                    "sessionId": "session",
+                    "modes": {
+                        "currentModeId": "plan",
+                        "availableModes": [{ "id": "plan", "name": "Plan" }]
+                    },
+                    "configOptions": [],
+                    "_meta": { "debugPayload": "session-meta-must-not-be-retained" }
+                }),
+                vec![
+                    json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": "conversation-must-not-be-stored"
+                    }),
+                    json!({
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": "plan"
+                    }),
+                ],
             )
             .unwrap();
 
-        assert!(matches!(
-            state.session("loaded").unwrap().transcript,
-            TranscriptBaseline::AgentReplay {
-                turn_boundaries_known: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            state.session("resumed").unwrap().transcript,
-            TranscriptBaseline::HistoryUnavailable
-        ));
+        let session = state.session("session").unwrap();
+        assert_eq!(
+            session.control_state["current_mode_update"]["currentModeId"],
+            "plan"
+        );
+        assert_eq!(session.session["modes"]["currentModeId"], "plan");
+        assert!(
+            !serde_json::to_string(session)
+                .unwrap()
+                .contains("conversation-must-not-be-stored")
+        );
+        assert!(
+            !serde_json::to_string(session)
+                .unwrap()
+                .contains("session-meta-must-not-be-retained")
+        );
     }
 
     #[test]
@@ -2715,7 +3651,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_tombstones_are_bounded_without_evicting_inflight_intents() {
+    fn active_intent_capacity_is_reused_after_retirement() {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
@@ -2724,12 +3660,12 @@ mod tests {
             },
         );
         let IntentAck::Accepted {
-            operation_id: completed,
+            operation_id: retired,
         } = state
             .accept_intent("epoch", 1, "completed", "payload")
             .unwrap()
         else {
-            panic!("completed intent was not accepted")
+            panic!("first intent was not accepted")
         };
         let IntentAck::Accepted {
             operation_id: inflight,
@@ -2739,20 +3675,23 @@ mod tests {
         else {
             panic!("inflight intent was not accepted")
         };
-        state.set_intent_status(&completed, IntentStatus::Failed);
-        state.record_intent_result(&completed, None, IntentStatus::Failed, None);
+        assert_eq!(
+            state.accept_intent("epoch", 2, "replacement", "payload"),
+            Err(RuntimeStateError::ResourceLimit),
+        );
+        state.retire_intent(&retired);
 
         assert!(matches!(
             state.accept_intent("epoch", 2, "replacement", "payload"),
             Ok(IntentAck::Accepted { .. })
         ));
         assert_eq!(state.intents.len(), 2);
-        assert_eq!(state.intent_status(&completed), None);
+        assert_eq!(state.intent_status(&retired), None);
         assert_eq!(state.intent_status(&inflight), Some(IntentStatus::Accepted));
     }
 
     #[test]
-    fn uncertain_intent_tombstones_are_pinned_against_automatic_retry() {
+    fn uncertain_intent_identity_is_retained_without_result_payload() {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
@@ -2769,7 +3708,6 @@ mod tests {
             panic!("uncertain intent was not accepted")
         };
         state.set_intent_status(&uncertain, IntentStatus::Uncertain);
-        state.record_intent_result(&uncertain, None, IntentStatus::Uncertain, None);
 
         assert_eq!(
             state.accept_intent("epoch", 2, "replacement", "payload"),
@@ -2831,7 +3769,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_turn_eviction_never_changes_live_resources() {
+    fn turn_retirement_never_changes_live_resources() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
@@ -2883,9 +3821,8 @@ mod tests {
         }
 
         let session = state.session("session").unwrap();
-        assert_eq!(session.observed_turns.len(), 2);
-        assert_eq!(session.history_gap.as_ref().unwrap().evicted_turns, 1);
         assert!(session.permissions.contains_key("permission"));
+        assert!(session.elicitations.contains_key("elicitation"));
         assert!(session.terminals.contains_key("terminal"));
     }
 
@@ -2894,15 +3831,12 @@ mod tests {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_observed_turns_per_session: 2,
-                max_observed_bytes_per_session: 256,
                 max_active_turn_bytes_per_session: 256,
                 max_queued_prompts_per_session: 8,
                 max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
-                max_intent_results: 4_096,
             },
         );
         let incarnation = open(&mut state, "session");
@@ -3128,10 +4062,11 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(state.intent_status(&third), Some(IntentStatus::Cancelled));
-        assert_eq!(
-            state.snapshot().intent_results[&third].result,
-            Some(json!("bridge_shutdown")),
+        assert_eq!(state.intent_status(&third), None);
+        assert!(
+            !serde_json::to_string(&state.snapshot())
+                .unwrap()
+                .contains("bridge_shutdown")
         );
     }
 
@@ -3190,7 +4125,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_cancels_every_queued_prompt_with_exact_terminal_results() {
+    fn shutdown_retires_every_queued_prompt_without_terminal_results() {
         let mut state = state();
         let first_incarnation = open(&mut state, "first-session");
         let second_incarnation = open(&mut state, "second-session");
@@ -3223,11 +4158,12 @@ mod tests {
                 .values()
                 .all(|session| session.queued_prompts.is_empty())
         );
-        assert_eq!(snapshot.intent_results.len(), 2);
-        assert!(snapshot.intent_results.values().all(|result| {
-            result.status == IntentStatus::Cancelled
-                && result.result == Some(json!("bridge_shutdown"))
-        }));
+        assert!(state.intents.is_empty());
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("bridge_shutdown")
+        );
         assert_eq!(
             state
                 .cancel_all_queued_prompts("epoch", json!("bridge_shutdown"))
@@ -3359,10 +4295,7 @@ mod tests {
 
         let session = state.session("session").unwrap();
         assert_eq!(session.lifecycle, SessionLifecycle::Uncertain);
-        assert!(matches!(
-            session.observed_turns.back().unwrap().outcome,
-            ObservedTurnOutcome::Uncertain { .. }
-        ));
+        assert!(session.active_turn.is_none());
     }
 
     #[test]
@@ -3392,14 +4325,15 @@ mod tests {
         };
         assert_eq!(session.lifecycle, SessionLifecycle::Uncertain);
         assert!(session.active_turn.is_none());
-        assert!(matches!(
-            session.observed_turns.back().unwrap().outcome,
-            ObservedTurnOutcome::Uncertain { .. }
-        ));
+        assert!(
+            !serde_json::to_string(&deltas)
+                .unwrap()
+                .contains("response lost after dispatch")
+        );
     }
 
     #[test]
-    fn prompt_failure_seals_partial_turn_as_failed_not_rejected() {
+    fn prompt_failure_retires_partial_turn_and_operation_payload() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         let IntentAck::Accepted { operation_id } = state
@@ -3430,20 +4364,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            state.intent_status(&operation_id),
-            Some(IntentStatus::Failed)
-        );
+        assert_eq!(state.intent_status(&operation_id), None);
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
-        assert_eq!(
-            session.observed_turns.back().unwrap().updates,
-            vec![json!("partial")]
-        );
-        assert!(matches!(
-            session.observed_turns.back().unwrap().outcome,
-            ObservedTurnOutcome::Failed { .. }
-        ));
         assert_eq!(
             state.append_turn_update("epoch", "session", incarnation, json!("late")),
             Err(RuntimeStateError::NoActiveTurn),
@@ -3451,7 +4374,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_prompt_response_has_a_cancelled_intent_outcome() {
+    fn cancelled_prompt_response_retires_the_intent_outcome() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         let IntentAck::Accepted { operation_id } = state
@@ -3476,10 +4399,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            state.intent_status(&operation_id),
-            Some(IntentStatus::Cancelled)
-        );
+        assert_eq!(state.intent_status(&operation_id), None);
+        assert!(state.session("session").unwrap().active_turn.is_none());
     }
 
     #[test]
@@ -3516,6 +4437,14 @@ mod tests {
     fn permission_response_is_visible_and_exactly_correlated() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
+        let IntentAck::Accepted {
+            operation_id: response_operation,
+        } = state
+            .accept_intent("epoch", 1, "permission-response", "allow-once")
+            .unwrap()
+        else {
+            panic!("permission response intent was not accepted")
+        };
         state
             .upsert_permission(
                 "epoch",
@@ -3533,7 +4462,7 @@ mod tests {
                     "session",
                     incarnation,
                     "permission",
-                    "response-1",
+                    &response_operation,
                 )
                 .unwrap(),
             InteractionResponseStart::Applied,
@@ -3543,7 +4472,7 @@ mod tests {
             state.session("session").unwrap().permissions["permission"]
                 .responding_operation_id
                 .as_deref(),
-            Some("response-1"),
+            Some(response_operation.as_str()),
         );
         assert_eq!(
             state
@@ -3552,7 +4481,7 @@ mod tests {
                     "session",
                     incarnation,
                     "permission",
-                    "response-1",
+                    &response_operation,
                 )
                 .unwrap(),
             InteractionResponseStart::Duplicate,
@@ -3588,12 +4517,13 @@ mod tests {
                     "session",
                     incarnation,
                     "permission",
-                    "response-1",
+                    &response_operation,
                 )
                 .unwrap(),
             InteractionResolution::Applied,
         );
         assert!(state.session("session").unwrap().permissions.is_empty());
+        assert_eq!(state.intent_status(&response_operation), None);
     }
 
     #[test]
@@ -3601,15 +4531,12 @@ mod tests {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_observed_turns_per_session: 2,
-                max_observed_bytes_per_session: 16_384,
                 max_active_turn_bytes_per_session: 16_384,
                 max_queued_prompts_per_session: 8,
                 max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 2,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
-                max_intent_results: 4_096,
             },
         );
         open(&mut state, "a");
@@ -3654,10 +4581,7 @@ mod tests {
         let session = state.session("session").unwrap();
         assert_eq!(session.lifecycle, SessionLifecycle::Closed);
         assert!(session.operation.is_none());
-        assert_eq!(
-            state.snapshot().intent_results["delete-operation"].status,
-            IntentStatus::Failed,
-        );
+        assert_eq!(state.intent_status("delete-operation"), None);
         assert_eq!(
             state.start_prompt("epoch", "session", incarnation, "late", Vec::new()),
             Err(RuntimeStateError::SessionNotActive),
@@ -3692,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_copies_only_stable_history_and_prefers_agent_target_replay() {
+    fn fork_keeps_only_target_control_metadata() {
         let mut state = state();
         let source = open(&mut state, "source");
         state
@@ -3740,13 +4664,12 @@ mod tests {
             )
             .unwrap();
         let derived = state.session("derived").unwrap();
-        assert!(matches!(
-            derived.transcript,
-            TranscriptBaseline::ClientDerivedFork { .. }
-        ));
         assert!(derived.permissions.is_empty());
         assert!(derived.terminals.is_empty());
         assert!(derived.active_turn.is_none());
+        let derived_payload = serde_json::to_string(derived).unwrap();
+        assert!(!derived_payload.contains("Q"));
+        assert!(!derived_payload.contains("A"));
 
         state
             .open_forked(
@@ -3755,13 +4678,28 @@ mod tests {
                 "/replayed",
                 json!({ "sessionId": "replayed" }),
                 ("source", source),
-                Some(vec![json!({ "sessionUpdate": "agent_message_chunk" })]),
+                Some(vec![
+                    json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": "target-conversation"
+                    }),
+                    json!({
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": "plan"
+                    }),
+                ]),
             )
             .unwrap();
-        assert!(matches!(
-            state.session("replayed").unwrap().transcript,
-            TranscriptBaseline::AgentReplay { .. }
-        ));
+        let replayed = state.session("replayed").unwrap();
+        assert_eq!(
+            replayed.control_state["current_mode_update"]["currentModeId"],
+            "plan"
+        );
+        assert!(
+            !serde_json::to_string(replayed)
+                .unwrap()
+                .contains("target-conversation")
+        );
     }
 
     #[test]
@@ -3782,7 +4720,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_operation_identity_cannot_be_reused() {
+    fn retired_operation_identity_can_be_reused() {
         let mut state = state();
         let a = open(&mut state, "a");
         let b = open(&mut state, "b");
@@ -3798,13 +4736,14 @@ mod tests {
                 json!({ "stopReason": "end_turn" }),
             )
             .unwrap();
-        let before = state.snapshot();
-
         assert_eq!(
-            state.start_prompt("epoch", "b", b, "same-operation", Vec::new()),
-            Err(RuntimeStateError::OperationCollision),
+            state
+                .start_prompt("epoch", "b", b, "same-operation", Vec::new())
+                .unwrap(),
+            "same-operation"
         );
-        assert_eq!(state.snapshot(), before);
+        assert!(state.session("a").unwrap().active_turn.is_none());
+        assert!(state.session("b").unwrap().active_turn.is_some());
     }
 
     #[test]
@@ -3836,7 +4775,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_turn_preserves_cancel_request_and_cleans_owned_interactions() {
+    fn sealed_turn_drops_cancel_flag_and_cleans_owned_interactions() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
@@ -3874,7 +4813,7 @@ mod tests {
             .unwrap();
 
         let session = state.session("session").unwrap();
-        assert!(session.observed_turns.back().unwrap().cancel_requested);
+        assert!(session.active_turn.is_none());
         assert!(session.permissions.is_empty());
         assert!(session.elicitations.is_empty());
         assert_eq!(
@@ -3976,9 +4915,17 @@ mod tests {
             TerminalUpsert::Stale,
         );
         assert_eq!(state.seq(), released_seq);
-        assert_eq!(
-            state.session("session").unwrap().terminals["terminal"],
-            json!({ "output": "done", "released": true }),
+        assert!(
+            !state
+                .session("session")
+                .unwrap()
+                .terminals
+                .contains_key("terminal")
+        );
+        assert!(
+            !serde_json::to_string(&state.snapshot())
+                .unwrap()
+                .contains("done")
         );
     }
 
@@ -4044,30 +4991,14 @@ mod tests {
             .close_session("epoch", "session", incarnation, "close")
             .unwrap();
 
-        assert_eq!(state.intent_status(&queued), Some(IntentStatus::Cancelled));
-        assert_eq!(
-            state.intent_status(&queued_second),
-            Some(IntentStatus::Cancelled)
-        );
-        let snapshot = state.snapshot();
-        assert_eq!(
-            snapshot.intent_results[&queued].status,
-            IntentStatus::Cancelled
-        );
-        assert_eq!(
-            snapshot.intent_results[&queued_second].status,
-            IntentStatus::Cancelled
-        );
+        assert_eq!(state.intent_status(&queued), None);
+        assert_eq!(state.intent_status(&queued_second), None);
+        assert_eq!(state.intent_status("close"), None);
         let close_delta = &state.deltas_after(before_close).unwrap()[0];
-        assert_eq!(close_delta.intent_results.len(), 3);
-        assert_eq!(
-            close_delta
-                .intent_results
-                .iter()
-                .filter(|result| result.status == IntentStatus::Cancelled)
-                .count(),
-            2,
-        );
+        assert!(matches!(
+            close_delta.change,
+            RuntimeChange::SessionRemoved { .. }
+        ));
         assert_eq!(
             state.take_effects(),
             vec![RuntimeEffect::ReleaseTerminal {
@@ -4255,19 +5186,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_result_survives_immediate_observed_history_eviction() {
+    fn terminal_result_is_not_retained_after_turn_retirement() {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_observed_turns_per_session: 0,
-                max_observed_bytes_per_session: 0,
                 max_active_turn_bytes_per_session: 16_384,
                 max_queued_prompts_per_session: 8,
                 max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
-                max_intent_results: 4_096,
             },
         );
         let incarnation = open(&mut state, "session");
@@ -4292,13 +5220,15 @@ mod tests {
             )
             .unwrap();
 
-        assert!(state.session("session").unwrap().observed_turns.is_empty());
-        let result = &state.snapshot().intent_results[&operation_id];
-        assert_eq!(result.status, IntentStatus::AgentAcknowledged);
-        assert_eq!(result.session_id.as_deref(), Some("session"));
+        assert!(state.session("session").unwrap().active_turn.is_none());
+        assert_eq!(state.intent_status(&operation_id), None);
         let deltas = state.deltas_after(before).unwrap();
         assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].intent_results[0].operation_id, operation_id,);
+        assert!(
+            !serde_json::to_string(&deltas)
+                .unwrap()
+                .contains("stopReason")
+        );
     }
 
     #[test]
@@ -4320,15 +5250,28 @@ mod tests {
     }
 
     #[test]
-    fn every_successful_session_transition_advances_one_contiguous_revision() {
+    fn terminal_retirement_invalidates_payload_bearing_delta_prefix() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
+        let other_incarnation = open(&mut state, "other");
         let before = state.snapshot();
         state
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
         state
             .append_turn_update("epoch", "session", incarnation, json!("answer"))
+            .unwrap();
+        state
+            .start_prompt(
+                "epoch",
+                "other",
+                other_incarnation,
+                "other-prompt",
+                Vec::new(),
+            )
+            .unwrap();
+        state
+            .append_turn_update("epoch", "other", other_incarnation, json!("other answer"))
             .unwrap();
         state
             .complete_prompt(
@@ -4340,16 +5283,19 @@ mod tests {
             )
             .unwrap();
 
-        let deltas = state.deltas_after(before.through_seq).unwrap();
-        assert_eq!(deltas.len(), 3);
-        for (index, delta) in deltas.iter().enumerate() {
-            assert_eq!(delta.epoch, "epoch");
-            assert_eq!(delta.seq, before.through_seq + index as u64 + 1);
-            assert_eq!(
-                delta.scope_revision,
-                Some(before.sessions["session"].revision + index as u64 + 1),
-            );
-        }
+        assert!(state.deltas_after(before.through_seq).is_none());
+        let suffix = state.deltas_after(before.through_seq + 2).unwrap();
+        assert_eq!(suffix.len(), 3);
+        assert!(suffix.windows(2).all(|pair| pair[0].seq + 1 == pair[1].seq));
+        let settled = state.snapshot();
+        let deltas = state.deltas_after(settled.through_seq - 1).unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].epoch, "epoch");
+        assert_eq!(deltas[0].seq, settled.through_seq);
+        assert_eq!(
+            deltas[0].scope_revision,
+            Some(settled.sessions["session"].revision)
+        );
     }
 
     #[test]
@@ -4450,7 +5396,7 @@ mod tests {
     }
 
     #[test]
-    fn control_success_updates_value_releases_guard_and_reports_result_atomically() {
+    fn control_success_updates_value_and_retires_result_payload_atomically() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
@@ -4485,9 +5431,11 @@ mod tests {
             session.control_state["current_mode_update"]["currentModeId"],
             "plan",
         );
-        assert_eq!(
-            state.deltas_after(before).unwrap()[0].intent_results[0].operation_id,
-            "mode",
+        assert_eq!(state.intent_status("mode"), None);
+        assert!(
+            !serde_json::to_string(&state.deltas_after(before).unwrap())
+                .unwrap()
+                .contains("\"ok\":true")
         );
     }
 
@@ -4512,14 +5460,24 @@ mod tests {
                 json!({ "sessionUpdate": "agent_message_chunk", "content": "partial" }),
             )
             .unwrap();
+        state
+            .append_attachment_candidate(
+                "epoch",
+                "session",
+                incarnation,
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
+            )
+            .unwrap();
 
         assert_eq!(state.seq(), started_seq);
         let attaching = state.session("session").unwrap();
         assert_eq!(attaching.lifecycle, SessionLifecycle::Attaching);
-        assert!(matches!(
-            attaching.transcript,
-            TranscriptBaseline::PendingAttachment
-        ));
+        assert_eq!(attaching.attachment_candidate.len(), 1);
+        assert!(
+            !serde_json::to_string(&attaching.attachment_candidate)
+                .unwrap()
+                .contains("partial")
+        );
         assert!(
             serde_json::to_value(state.snapshot())
                 .unwrap()
@@ -4543,11 +5501,11 @@ mod tests {
         let loaded = state.session("session").unwrap();
         assert_eq!(loaded.lifecycle, SessionLifecycle::Active);
         assert!(loaded.operation.is_none());
-        assert!(matches!(
-            &loaded.transcript,
-            TranscriptBaseline::AgentReplay { entries, .. }
-                if entries.len() == 1 && entries[0]["content"] == "partial"
-        ));
+        assert_eq!(
+            loaded.control_state["current_mode_update"]["currentModeId"],
+            "plan"
+        );
+        assert!(!serde_json::to_string(loaded).unwrap().contains("partial"));
     }
 
     #[test]
@@ -4594,14 +5552,7 @@ mod tests {
                 session.control_state["current_mode_update"]["currentModeId"],
                 "plan"
             );
-            match &session.transcript {
-                TranscriptBaseline::AgentReplay { entries, .. } => {
-                    assert_eq!(entries.len(), 1);
-                    assert_eq!(entries[0]["content"], "history");
-                }
-                TranscriptBaseline::HistoryUnavailable => {}
-                baseline => panic!("unexpected attachment baseline: {baseline:?}"),
-            }
+            assert!(!serde_json::to_string(session).unwrap().contains("history"));
         }
     }
 
@@ -4669,10 +5620,11 @@ mod tests {
                 json!({ "sessionId": "resumed" }),
             )
             .unwrap();
-        assert!(matches!(
-            state.session("resumed").unwrap().transcript,
-            TranscriptBaseline::HistoryUnavailable
-        ));
+        assert!(
+            !serde_json::to_string(state.session("resumed").unwrap())
+                .unwrap()
+                .contains("compatibility update")
+        );
     }
 
     #[test]
@@ -4827,9 +5779,12 @@ mod tests {
             UrlFlowResolution::AlreadyTerminal,
         );
         assert_eq!(state.seq(), completed_seq);
-        assert_eq!(
-            state.session("session").unwrap().url_flows["url-id"].status,
-            UrlFlowStatus::Completed,
+        assert!(
+            !state
+                .session("session")
+                .unwrap()
+                .url_flows
+                .contains_key("url-id")
         );
     }
 
@@ -4872,6 +5827,14 @@ mod tests {
     fn elicitation_response_is_transactional_for_session_and_request_scopes() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
+        let IntentAck::Accepted {
+            operation_id: session_response,
+        } = state
+            .accept_intent("epoch", 1, "session-form-response", "session-form-value")
+            .unwrap()
+        else {
+            panic!("session elicitation response intent was not accepted")
+        };
         state
             .upsert_elicitation(
                 "epoch",
@@ -4886,7 +5849,7 @@ mod tests {
                     "epoch",
                     Some(("session", incarnation)),
                     "session-form",
-                    "response-1",
+                    &session_response,
                 )
                 .unwrap(),
             InteractionResponseStart::Applied,
@@ -4897,7 +5860,7 @@ mod tests {
                     "epoch",
                     Some(("session", incarnation)),
                     "session-form",
-                    "response-1",
+                    &session_response,
                 )
                 .unwrap(),
             InteractionResponseStart::Duplicate,
@@ -4926,28 +5889,37 @@ mod tests {
                 "epoch",
                 Some(("session", incarnation)),
                 "session-form",
-                "response-1",
+                &session_response,
                 Some("url-flow"),
             )
             .unwrap();
         let session = state.session("session").unwrap();
         assert!(!session.elicitations.contains_key("session-form"));
         assert_eq!(session.url_flows["url-flow"].status, UrlFlowStatus::Waiting);
+        assert_eq!(state.intent_status(&session_response), None);
 
         state
             .upsert_elicitation("epoch", None, "request-form", json!({ "mode": "form" }))
             .unwrap();
+        let IntentAck::Accepted {
+            operation_id: request_response,
+        } = state
+            .accept_intent("epoch", 1, "request-form-response", "request-form-value")
+            .unwrap()
+        else {
+            panic!("request elicitation response intent was not accepted")
+        };
         state
-            .begin_elicitation_response("epoch", None, "request-form", "request-response")
+            .begin_elicitation_response("epoch", None, "request-form", &request_response)
             .unwrap();
         assert_eq!(
             state.snapshot().request_elicitations["request-form"]
                 .responding_operation_id
                 .as_deref(),
-            Some("request-response"),
+            Some(request_response.as_str()),
         );
         state
-            .complete_elicitation_response("epoch", None, "request-form", "request-response", None)
+            .complete_elicitation_response("epoch", None, "request-form", &request_response, None)
             .unwrap();
         assert!(
             !state
@@ -4955,5 +5927,449 @@ mod tests {
                 .request_elicitations
                 .contains_key("request-form")
         );
+        assert_eq!(state.intent_status(&request_response), None);
+    }
+
+    #[test]
+    fn same_session_reload_success_does_not_create_a_second_business_session() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .update_control_state(
+                "epoch",
+                "session",
+                incarnation,
+                "current_mode_update",
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "old" }),
+            )
+            .unwrap();
+        state
+            .update_control_state(
+                "epoch",
+                "session",
+                incarnation,
+                "config_option_update",
+                json!({ "sessionUpdate": "config_option_update", "configId": "old-only" }),
+            )
+            .unwrap();
+        let IntentAck::Accepted { operation_id } = state
+            .accept_intent("epoch", 1, "reload-intent", "session/load")
+            .unwrap()
+        else {
+            panic!("reload intent was not accepted")
+        };
+
+        state
+            .start_reload(
+                "epoch",
+                "session",
+                incarnation,
+                &operation_id,
+                SessionOperationKind::Load,
+            )
+            .unwrap();
+        state
+            .append_attachment_candidate(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": "replacement-history-must-not-be-retained"
+                }),
+            )
+            .unwrap();
+        state
+            .append_attachment_candidate(
+                "epoch",
+                "session",
+                incarnation,
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "new" }),
+            )
+            .unwrap();
+
+        let staging = state.session("session").unwrap();
+        assert_eq!(staging.incarnation, incarnation);
+        assert_eq!(staging.session, json!({ "sessionId": "session" }));
+        assert_eq!(
+            staging.control_state["current_mode_update"]["currentModeId"],
+            "old"
+        );
+        assert_eq!(staging.attachment_candidate.len(), 1);
+        let before_complete = state.seq();
+
+        state
+            .complete_reload(
+                "epoch",
+                "session",
+                incarnation,
+                &operation_id,
+                json!({
+                    "modes": {
+                        "currentModeId": "new",
+                        "availableModes": [{ "id": "new", "name": "New" }]
+                    },
+                    "_meta": { "debugPayload": "must-not-survive-reload" }
+                }),
+            )
+            .unwrap();
+
+        let reloaded = state.session("session").unwrap();
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(reloaded.incarnation, incarnation);
+        assert_eq!(reloaded.session["modes"]["currentModeId"], "new");
+        assert!(
+            !serde_json::to_string(reloaded)
+                .unwrap()
+                .contains("must-not-survive-reload")
+        );
+        assert_eq!(
+            reloaded.control_state["current_mode_update"]["currentModeId"],
+            "new"
+        );
+        assert!(!reloaded.control_state.contains_key("config_option_update"));
+        assert!(reloaded.operation.is_none());
+        assert!(reloaded.attachment_candidate.is_empty());
+        assert_eq!(reloaded.attachment_candidate_bytes, 0);
+        assert_eq!(state.intent_status(&operation_id), None);
+        assert_eq!(state.seq(), before_complete + 1);
+        assert!(
+            !serde_json::to_string(&state.snapshot())
+                .unwrap()
+                .contains("replacement-history-must-not-be-retained")
+        );
+    }
+
+    #[test]
+    fn same_session_reload_error_remains_actionable_and_does_not_loop() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .update_control_state(
+                "epoch",
+                "session",
+                incarnation,
+                "current_mode_update",
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "old" }),
+            )
+            .unwrap();
+        let old_session = state.session("session").unwrap().session.clone();
+        let old_controls = state.session("session").unwrap().control_state.clone();
+
+        state
+            .start_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "reload",
+                SessionOperationKind::Load,
+            )
+            .unwrap();
+        state
+            .append_attachment_candidate(
+                "epoch",
+                "session",
+                incarnation,
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "partial" }),
+            )
+            .unwrap();
+        state
+            .fail_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "reload",
+                json!({ "message": "load rejected" }),
+            )
+            .unwrap();
+
+        let session = state.session("session").unwrap();
+        assert_eq!(session.incarnation, incarnation);
+        assert_eq!(session.lifecycle, SessionLifecycle::Active);
+        assert_eq!(session.session, old_session);
+        assert_eq!(session.control_state, old_controls);
+        assert!(session.operation.is_none());
+        assert!(session.attachment_candidate.is_empty());
+        assert_eq!(session.attachment_candidate_bytes, 0);
+        assert_eq!(state.intent_status("reload"), None);
+        assert!(
+            !serde_json::to_string(&state.delta_journal)
+                .unwrap()
+                .contains("load rejected")
+        );
+        state
+            .start_prompt("epoch", "session", incarnation, "next-turn", Vec::new())
+            .unwrap();
+    }
+
+    #[test]
+    fn same_session_reload_rejects_wrong_kind_busy_collision_and_epoch() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let other = open(&mut state, "other");
+        let unchanged = state.snapshot();
+
+        assert_eq!(
+            state.start_reload(
+                "old-epoch",
+                "session",
+                incarnation,
+                "reload",
+                SessionOperationKind::Load,
+            ),
+            Err(RuntimeStateError::EpochMismatch)
+        );
+        assert_eq!(state.snapshot(), unchanged);
+        assert_eq!(
+            state.start_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "reload",
+                SessionOperationKind::Resume,
+            ),
+            Err(RuntimeStateError::OperationMismatch)
+        );
+
+        state
+            .start_prompt("epoch", "other", other, "collision", Vec::new())
+            .unwrap();
+        assert_eq!(
+            state.start_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "collision",
+                SessionOperationKind::Load,
+            ),
+            Err(RuntimeStateError::OperationCollision)
+        );
+        state
+            .start_prompt("epoch", "session", incarnation, "active", Vec::new())
+            .unwrap();
+        assert_eq!(
+            state.start_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "busy",
+                SessionOperationKind::Load,
+            ),
+            Err(RuntimeStateError::BusySession)
+        );
+    }
+
+    #[test]
+    fn same_session_reload_requires_no_queue_operation_interaction_or_live_resource() {
+        fn assert_reload_busy(state: &mut RuntimeState, session_id: &str, incarnation: u64) {
+            assert_eq!(
+                state.start_reload(
+                    "epoch",
+                    session_id,
+                    incarnation,
+                    format!("reload-{session_id}"),
+                    SessionOperationKind::Load,
+                ),
+                Err(RuntimeStateError::BusySession)
+            );
+        }
+
+        let mut state = state();
+
+        let queued = open(&mut state, "queued");
+        state
+            .start_prompt("epoch", "queued", queued, "active", Vec::new())
+            .unwrap();
+        state
+            .enqueue_prompt("epoch", "queued", queued, "queued", Vec::new())
+            .unwrap();
+        state
+            .complete_prompt("epoch", "queued", queued, "active", Value::Null)
+            .unwrap();
+        assert_reload_busy(&mut state, "queued", queued);
+
+        let operation = open(&mut state, "operation");
+        state
+            .start_operation(
+                "epoch",
+                "operation",
+                operation,
+                "mode",
+                SessionOperationKind::SetMode,
+                "setting",
+            )
+            .unwrap();
+        assert_reload_busy(&mut state, "operation", operation);
+
+        let permission = open(&mut state, "permission");
+        state
+            .upsert_permission(
+                "epoch",
+                "permission",
+                permission,
+                "permission",
+                json!({ "question": "allow" }),
+            )
+            .unwrap();
+        assert_reload_busy(&mut state, "permission", permission);
+
+        let elicitation = open(&mut state, "elicitation");
+        state
+            .upsert_elicitation(
+                "epoch",
+                Some(("elicitation", elicitation)),
+                "elicitation",
+                json!({ "mode": "form" }),
+            )
+            .unwrap();
+        assert_reload_busy(&mut state, "elicitation", elicitation);
+
+        let url = open(&mut state, "url");
+        state
+            .upsert_elicitation(
+                "epoch",
+                Some(("url", url)),
+                "url-form",
+                json!({ "mode": "url" }),
+            )
+            .unwrap();
+        state
+            .resolve_elicitation("epoch", Some(("url", url)), "url-form", Some("url-flow"))
+            .unwrap();
+        assert_reload_busy(&mut state, "url", url);
+
+        let terminal = open(&mut state, "terminal");
+        state
+            .upsert_terminal(
+                "epoch",
+                "terminal",
+                terminal,
+                "terminal",
+                json!({ "released": false }),
+            )
+            .unwrap();
+        assert_reload_busy(&mut state, "terminal", terminal);
+    }
+
+    #[test]
+    fn settled_url_flows_are_removed_from_live_state_but_remain_idempotent() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .upsert_elicitation(
+                "epoch",
+                Some(("session", incarnation)),
+                "form",
+                json!({ "mode": "url" }),
+            )
+            .unwrap();
+        state
+            .resolve_elicitation("epoch", Some(("session", incarnation)), "form", Some("url"))
+            .unwrap();
+
+        assert_eq!(
+            state
+                .settle_url_flow(
+                    "epoch",
+                    Some(("session", incarnation)),
+                    "url",
+                    UrlFlowStatus::Completed,
+                )
+                .unwrap(),
+            UrlFlowResolution::Applied
+        );
+        assert!(
+            !state
+                .session("session")
+                .unwrap()
+                .url_flows
+                .contains_key("url")
+        );
+        let settled_seq = state.seq();
+        assert_eq!(
+            state
+                .settle_url_flow(
+                    "epoch",
+                    Some(("session", incarnation)),
+                    "url",
+                    UrlFlowStatus::Cancelled,
+                )
+                .unwrap(),
+            UrlFlowResolution::AlreadyTerminal
+        );
+        assert_eq!(state.seq(), settled_seq);
+
+        state
+            .upsert_elicitation("epoch", None, "request-form", json!({ "mode": "url" }))
+            .unwrap();
+        state
+            .resolve_elicitation("epoch", None, "request-form", Some("request-url"))
+            .unwrap();
+        assert_eq!(
+            state
+                .settle_url_flow("epoch", None, "request-url", UrlFlowStatus::Cancelled)
+                .unwrap(),
+            UrlFlowResolution::Applied
+        );
+        assert!(!state.request_url_flows.contains_key("request-url"));
+        let request_settled_seq = state.seq();
+        assert_eq!(
+            state
+                .settle_url_flow("epoch", None, "request-url", UrlFlowStatus::Completed)
+                .unwrap(),
+            UrlFlowResolution::AlreadyTerminal
+        );
+        assert_eq!(state.seq(), request_settled_seq);
+    }
+
+    #[test]
+    fn released_terminal_is_not_retained_or_resurrected() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .upsert_terminal(
+                "epoch",
+                "session",
+                incarnation,
+                "terminal",
+                json!({ "output": "running", "released": false }),
+            )
+            .unwrap();
+        state
+            .upsert_terminal(
+                "epoch",
+                "session",
+                incarnation,
+                "terminal",
+                json!({ "output": "released-output", "released": true }),
+            )
+            .unwrap();
+
+        assert!(
+            !state
+                .session("session")
+                .unwrap()
+                .terminals
+                .contains_key("terminal")
+        );
+        assert!(
+            !serde_json::to_string(&state.snapshot())
+                .unwrap()
+                .contains("released-output")
+        );
+        let released_seq = state.seq();
+        assert_eq!(
+            state
+                .upsert_terminal(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    "terminal",
+                    json!({ "output": "late", "released": false }),
+                )
+                .unwrap(),
+            TerminalUpsert::Stale
+        );
+        assert_eq!(state.seq(), released_seq);
     }
 }

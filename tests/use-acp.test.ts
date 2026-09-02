@@ -4,6 +4,7 @@ import {
   sendClientCommand,
   shouldReconnectAfterResume,
   startupAttachMethod,
+  startupHistoryStrategy,
 } from "../web/src/lib/use-acp";
 
 describe("browser ACP command transport", () => {
@@ -43,13 +44,78 @@ describe("browser ACP command transport", () => {
     expect(errors).toEqual(["Cannot send session/new: send buffer rejected"]);
   });
 
-  it("chooses only negotiated session restore methods", () => {
-    expect(startupAttachMethod({ loadSession: true })).toBe("session/load");
-    expect(startupAttachMethod({
+  it("loads completed reconnects only when history replay is negotiated", () => {
+    const completedReconnectDecision = (
+      capabilities: Parameters<typeof startupAttachMethod>[0],
+    ) => startupAttachMethod(capabilities, false) ?? "history_unavailable";
+
+    expect(completedReconnectDecision({ loadSession: true })).toBe("session/load");
+    expect(completedReconnectDecision({
       loadSession: false,
       sessionCapabilities: { resume: {} },
-    })).toBe("session/resume");
-    expect(startupAttachMethod({ sessionCapabilities: { list: {} } })).toBeUndefined();
+    })).toBe("history_unavailable");
+    expect(completedReconnectDecision({ sessionCapabilities: { list: {} } }))
+      .toBe("history_unavailable");
+  });
+
+  it("does not issue a history load while an active turn can be restored locally", () => {
+    expect(startupAttachMethod({ loadSession: true }, true) ?? "active_local")
+      .toBe("active_local");
+  });
+
+  it("loads the stored session directly when load exists without session/list", () => {
+    expect(startupHistoryStrategy(
+      { loadSession: true },
+      false,
+      "stored-session",
+    )).toEqual({
+      kind: "direct_load",
+      method: "session/load",
+      sessionId: "stored-session",
+    });
+  });
+
+  it("makes missing load history explicit and never treats resume as replay", () => {
+    expect(startupHistoryStrategy(
+      { sessionCapabilities: { resume: {} } },
+      false,
+      "stored-session",
+    )).toEqual({
+      kind: "history_unavailable",
+      sessionId: "stored-session",
+    });
+    expect(startupHistoryStrategy(
+      { loadSession: true, sessionCapabilities: { list: {} } },
+      false,
+      "stored-session",
+    )).toEqual({
+      kind: "list_then_load",
+      method: "session/load",
+    });
+    expect(startupHistoryStrategy(
+      { loadSession: true, sessionCapabilities: { list: {} } },
+      true,
+      "stored-session",
+    )).toEqual({ kind: "active_local" });
+  });
+
+  it("rejects a command object that tries to upload completed browser history", () => {
+    const send = vi.fn();
+    const errors: string[] = [];
+    const unsafeCommand = {
+      type: "session/load",
+      requestId: "load-saved",
+      sessionId: "saved",
+      history: [{ role: "agent", text: "browser-owned completed answer" }],
+    } as unknown as Parameters<typeof sendClientCommand>[1];
+
+    expect(sendClientCommand(
+      { readyState: 1, send } as unknown as Pick<WebSocket, "readyState" | "send">,
+      unsafeCommand,
+      (message) => errors.push(message),
+    )).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(1);
   });
 
   it("restores the newest timestamped session without depending on Agent ordering", () => {

@@ -21,13 +21,17 @@ use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::bridge;
+use crate::event_queue::{self, EventQueueLimits, EventReceiver, EventSender};
 use crate::options::Options;
-use crate::runtime_cache::RuntimeCache;
-use crate::runtime_state::{RuntimeChange, RuntimeDelta, RuntimeSnapshot};
+use crate::runtime_cache::ActiveRuntimeProjection;
+use crate::runtime_state::{RuntimeChange, RuntimeDelta, RuntimeSnapshot, fold_active_turn_update};
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
 const SUBSCRIBER_QUEUE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
+const MAX_SUBSCRIBERS: usize = 64;
+const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
+const BRIDGE_EVENT_QUEUE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
 
 #[derive(RustEmbed)]
 #[folder = "dist/client/"]
@@ -156,10 +160,13 @@ impl CanonicalProjection {
         };
         match value.get("type").and_then(serde_json::Value::as_str) {
             Some("bridge/internal_runtime_snapshot") => {
-                let snapshot = value
+                let mut snapshot = value
                     .get("value")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<RuntimeSnapshot>(value).ok());
+                if let Some(snapshot) = snapshot.as_mut() {
+                    retire_released_terminals(snapshot);
+                }
                 self.snapshot = snapshot.clone();
                 (
                     true,
@@ -185,16 +192,17 @@ impl CanonicalProjection {
                     self.snapshot = None;
                     return (true, None);
                 }
-                (
-                    true,
-                    Some(
-                        json!({
-                            "type": "bridge/runtime_delta",
-                            "delta": delta,
-                        })
-                        .to_string(),
-                    ),
-                )
+                let public_event = Some(
+                    json!({
+                        "type": "bridge/runtime_delta",
+                        "delta": delta,
+                    })
+                    .to_string(),
+                );
+                if let Some(snapshot) = self.snapshot.as_mut() {
+                    retire_released_terminals(snapshot);
+                }
+                (true, public_event)
             }
             _ => (false, None),
         }
@@ -268,7 +276,10 @@ impl CanonicalProjection {
                 if turn.operation_id != operation_id {
                     return false;
                 }
-                turn.updates.push(update);
+                let Ok(folded) = fold_active_turn_update(&turn.updates, &update) else {
+                    return false;
+                };
+                turn.updates = folded;
                 session.revision = revision;
             }
             RuntimeChange::SessionRemoved {
@@ -285,16 +296,19 @@ impl CanonicalProjection {
                 snapshot.sessions.remove(&session_id);
             }
         }
-        for result in delta.intent_results {
-            snapshot
-                .intent_results
-                .insert(result.operation_id.clone(), result);
-        }
-        for operation_id in delta.evicted_intent_result_ids {
-            snapshot.intent_results.remove(&operation_id);
-        }
         snapshot.through_seq = delta.seq;
         true
+    }
+}
+
+fn retire_released_terminals(snapshot: &mut RuntimeSnapshot) {
+    for session in snapshot.sessions.values_mut() {
+        session.terminals.retain(|_, terminal| {
+            !terminal
+                .get("released")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
     }
 }
 
@@ -305,7 +319,7 @@ struct BridgeHubState {
     cancellation: Option<CancellationToken>,
     subscribers: HashMap<u64, SubscriberSender>,
     bootstrap: BridgeBootstrap,
-    runtime: RuntimeCache,
+    runtime: ActiveRuntimeProjection,
     canonical: CanonicalProjection,
     canonical_resync_pending: bool,
     shutting_down: bool,
@@ -402,8 +416,8 @@ impl SubscriberSender {
 struct BridgeRuntime {
     generation: u64,
     input: mpsc::Receiver<bridge::BridgeInput>,
-    events: mpsc::UnboundedReceiver<String>,
-    event_tx: mpsc::UnboundedSender<String>,
+    events: EventReceiver,
+    event_tx: EventSender,
     cancellation: CancellationToken,
 }
 
@@ -425,12 +439,18 @@ impl BridgeHub {
             } else {
                 state.generation = state.generation.wrapping_add(1).max(1);
                 state.bootstrap = BridgeBootstrap::default();
-                state.runtime = RuntimeCache::default();
+                state.runtime = ActiveRuntimeProjection::default();
                 state.canonical = CanonicalProjection::default();
                 state.canonical_resync_pending = false;
                 let (input_tx, input) = mpsc::channel(256);
-                let (event_tx, events) = mpsc::unbounded_channel();
                 let cancellation = CancellationToken::new();
+                let (event_tx, events) = event_queue::channel(
+                    EventQueueLimits {
+                        max_items: BRIDGE_EVENT_QUEUE_CAPACITY,
+                        max_bytes: BRIDGE_EVENT_QUEUE_BYTE_CAPACITY,
+                    },
+                    cancellation.clone(),
+                );
                 state.input = Some(input_tx);
                 state.cancellation = Some(cancellation.clone());
                 Some(BridgeRuntime {
@@ -454,6 +474,9 @@ impl BridgeHub {
         let (generation, initial_events) = {
             let mut state = self.state.lock().await;
             if state.shutting_down || state.input.is_none() {
+                return None;
+            }
+            if state.subscribers.len() >= MAX_SUBSCRIBERS {
                 return None;
             }
             let mut initial_events = Vec::new();
@@ -547,6 +570,13 @@ impl BridgeHub {
         }
         if is_internal_direct_event(&event) {
             if let Some((subscriber_id, event)) = directed_bridge_event(&event) {
+                {
+                    let mut state = self.state.lock().await;
+                    if state.generation != generation || state.input.is_none() {
+                        return;
+                    }
+                    state.runtime.update(&event);
+                }
                 self.send_to_subscriber(subscriber_id, generation, event)
                     .await;
             }
@@ -559,15 +589,15 @@ impl BridgeHub {
                 return;
             }
             state.bootstrap.update(&event);
-            state.runtime.update(&event);
-            let session_projection = opened_runtime_session_id(&event)
-                .map(|session_id| state.runtime.replay_session_events(&session_id))
+            let event = state.runtime.update_and_normalize(&event);
+            let session_live_suffix = opened_runtime_session_id(&event)
+                .map(|session_id| state.runtime.replay_session_live_suffix(&session_id))
                 .unwrap_or_default();
             let mut failed_subscribers = Vec::new();
             for (&subscriber_id, subscriber) in &state.subscribers {
                 let mut delivered = subscriber.try_send(event.clone()).is_ok();
-                for projection_event in &session_projection {
-                    delivered &= subscriber.try_send(projection_event.clone()).is_ok();
+                for live_event in &session_live_suffix {
+                    delivered &= subscriber.try_send(live_event.clone()).is_ok();
                 }
                 if !delivered {
                     failed_subscribers.push(subscriber_id);
@@ -662,7 +692,7 @@ impl BridgeHub {
 async fn forward_generation_events(
     hub: std::sync::Weak<BridgeHub>,
     generation: u64,
-    mut events: mpsc::UnboundedReceiver<String>,
+    mut events: EventReceiver,
     mut runtime_done: oneshot::Receiver<()>,
 ) {
     loop {
@@ -672,6 +702,7 @@ async fn forward_generation_events(
                 let Some(event) = event else {
                     break;
                 };
+                let (event, _lease) = event.into_parts();
                 let Some(hub) = hub.upgrade() else {
                     return;
                 };
@@ -682,6 +713,7 @@ async fn forward_generation_events(
                 // returns. Drain everything already queued, then ignore any
                 // leaked/late sender from this completed generation.
                 while let Ok(event) = events.try_recv() {
+                    let (event, _lease) = event.into_parts();
                     let Some(hub) = hub.upgrade() else {
                         return;
                     };
@@ -929,7 +961,7 @@ mod tests {
         let mut state = hub.state.lock().await;
         assert!(!state.runtime.replay_events().is_empty());
         assert_eq!(state.canonical.snapshot, Some(canonical.clone()));
-        state.runtime = RuntimeCache::default();
+        state.runtime = ActiveRuntimeProjection::default();
         state.bootstrap = BridgeBootstrap::default();
         assert_eq!(
             state.canonical.snapshot,
@@ -952,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn identifies_session_lifecycle_events_that_require_a_runtime_projection() {
+    fn identifies_session_lifecycle_events_that_may_have_a_live_suffix() {
         assert_eq!(
             opened_runtime_session_id(
                 r#"{"type":"acp/session_created","response":{"sessionId":"created"}}"#
@@ -968,6 +1000,50 @@ mod tests {
         assert_eq!(
             opened_runtime_session_id(r#"{"type":"acp/prompt_complete","sessionId":"done"}"#),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn live_session_open_is_not_followed_by_a_redundant_runtime_snapshot() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let (subscriber_tx, mut subscriber_rx) = SubscriberSender::channel(4);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.subscribers.insert(1, subscriber_tx);
+        }
+
+        hub.publish(
+            1,
+            json!({
+                "type": "acp/session_forked",
+                "requestId": "fork",
+                "sourceSessionId": "source",
+                "cwd": "/workspace",
+                "response": { "sessionId": "fork" },
+                "earlyUpdates": [{
+                    "sessionId": "fork",
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [{ "name": "inspect", "description": "Inspect" }],
+                    },
+                }],
+            })
+            .to_string(),
+        )
+        .await;
+
+        let lifecycle: serde_json::Value =
+            serde_json::from_str(&subscriber_rx.try_recv().unwrap().into_string()).unwrap();
+        assert_eq!(lifecycle["type"], "acp/session_forked");
+        assert!(
+            std::iter::from_fn(|| subscriber_rx.try_recv().ok())
+                .map(QueuedSubscriberEvent::into_string)
+                .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event).ok())
+                .all(|event| event["type"] != "bridge/runtime_session"),
+            "the lifecycle response already carries the session and its atomic early updates"
         );
     }
 
@@ -1028,6 +1104,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_replacement_is_private_and_never_becomes_completed_replay() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let (target_tx, mut target_rx) = SubscriberSender::channel(8);
+        let (other_tx, mut other_rx) = SubscriberSender::channel(8);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.subscribers.insert(42, target_tx);
+            state.subscribers.insert(43, other_tx);
+        }
+
+        for event in [
+            json!({
+                "type": "acp/session_update",
+                "notification": {
+                    "sessionId": "saved",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "loaded",
+                        "content": { "type": "text", "text": "Agent history" },
+                    },
+                },
+            }),
+            json!({
+                "type": "acp/session_attached",
+                "requestId": "load",
+                "method": "load",
+                "sessionId": "saved",
+                "cwd": "/workspace",
+                "response": { "sessionId": "saved" },
+            }),
+        ] {
+            hub.publish(
+                1,
+                json!({
+                    "type": "bridge/internal_direct",
+                    "subscriberId": 42,
+                    "event": event,
+                })
+                .to_string(),
+            )
+            .await;
+        }
+
+        let delivered = std::iter::from_fn(|| target_rx.try_recv().ok())
+            .map(QueuedSubscriberEvent::into_string)
+            .collect::<Vec<_>>();
+        assert_eq!(delivered.len(), 2);
+        assert!(delivered[0].contains("Agent history"));
+        assert!(delivered[1].contains("acp/session_attached"));
+        assert!(
+            other_rx.try_recv().is_err(),
+            "load staging must be private to the browser that requested replacement"
+        );
+
+        let replay = hub.state.lock().await.runtime.replay_events().join("\n");
+        assert!(!replay.contains("Agent history"));
+        assert!(!replay.contains("acp/session_attached"));
+        assert!(!replay.contains("bridge/runtime_session"));
+    }
+
+    #[tokio::test]
+    async fn real_same_session_load_uses_tracked_cwd_and_isolates_other_subscribers() {
+        async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
+            let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge subscriber closed unexpectedly");
+            serde_json::from_str(&queued.into_string()).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut requester = hub.subscribe().await.expect("requester subscription");
+
+        loop {
+            let event = next_event(&mut requester).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+        let mut observer = hub.subscribe().await.expect("observer subscription");
+        observer.initial_events.clear();
+
+        hub.send_command(
+            requester.id,
+            requester.generation,
+            json!({
+                "type": "session/new",
+                "requestId": "new",
+                "cwd": cwd,
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        loop {
+            let event = next_event(&mut requester).await;
+            if event["type"] == "acp/session_created" {
+                assert_eq!(event["response"]["sessionId"], "test-session");
+                break;
+            }
+        }
+        loop {
+            if next_event(&mut observer).await["type"] == "acp/session_created" {
+                break;
+            }
+        }
+
+        // No session/list precedes this request. The bridge must use the cwd
+        // already associated with the tracked session and execute a reload,
+        // not allocate a second business session.
+        hub.send_command(
+            requester.id,
+            requester.generation,
+            json!({
+                "type": "session/load",
+                "requestId": "reload",
+                "sessionId": "test-session",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let mut requester_events = Vec::new();
+        loop {
+            let event = next_event(&mut requester).await;
+            let complete =
+                event["type"] == "acp/session_attached" && event["requestId"] == "reload";
+            requester_events.push(event);
+            if complete {
+                break;
+            }
+        }
+        assert!(requester_events.iter().any(|event| {
+            event["type"] == "acp/session_update"
+                && event["notification"]["update"]["content"]["text"] == "Loaded history."
+        }));
+        let attached = requester_events.last().unwrap();
+        assert_eq!(attached["cwd"], cwd);
+        assert_eq!(attached["sessionId"], "test-session");
+        assert_eq!(
+            attached["response"]["_meta"]["observedSessionCloses"],
+            json!([])
+        );
+
+        let observer_events = std::iter::from_fn(|| observer.events.try_recv().ok())
+            .map(QueuedSubscriberEvent::into_string)
+            .collect::<Vec<_>>();
+        assert!(
+            observer_events.iter().all(|event| {
+                !event.contains("Loaded history.")
+                    && !event.contains("acp/session_attached")
+                    && !event.contains("acp/session_update")
+            }),
+            "load replacement leaked to observer: {observer_events:?}"
+        );
+
+        hub.send_command(
+            requester.id,
+            requester.generation,
+            json!({
+                "type": "session/prompt",
+                "requestId": "after-reload",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        loop {
+            let event = next_event(&mut requester).await;
+            if event["type"] == "acp/prompt_complete" && event["requestId"] == "after-reload" {
+                break;
+            }
+        }
+
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn bridge_completion_finishes_generation_with_a_leaked_event_sender() {
         let hub = test_hub();
         let (input, _commands) = mpsc::channel(1);
@@ -1042,7 +1311,7 @@ mod tests {
         let forwarder = tokio::spawn(forward_generation_events(
             Arc::downgrade(&hub),
             1,
-            event_rx,
+            event_rx.into(),
             done_rx,
         ));
         event_tx
@@ -1099,6 +1368,45 @@ mod tests {
         assert!(hub.state.lock().await.subscribers.contains_key(&42));
     }
 
+    #[test]
+    fn saturated_bridge_event_queue_cancels_the_generation() {
+        let cancellation = CancellationToken::new();
+        let (events, _receiver) = event_queue::channel(
+            EventQueueLimits {
+                max_items: 1,
+                max_bytes: 64,
+            },
+            cancellation.clone(),
+        );
+        events.send("first".to_string()).unwrap();
+        assert_eq!(
+            events.send("second".to_string()),
+            Err(crate::event_queue::EventSendError::Full)
+        );
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn subscriber_count_has_a_hard_global_limit() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+        }
+
+        let mut subscriptions = Vec::with_capacity(MAX_SUBSCRIBERS);
+        for _ in 0..MAX_SUBSCRIBERS {
+            subscriptions.push(hub.subscribe().await.expect("subscriber below hard limit"));
+        }
+        assert!(hub.subscribe().await.is_none());
+
+        let released = subscriptions.pop().unwrap();
+        hub.unsubscribe(released.id, released.generation).await;
+        assert!(hub.subscribe().await.is_some());
+    }
+
     #[tokio::test]
     async fn slow_subscriber_is_evicted_without_blocking_a_healthy_subscriber() {
         let hub = test_hub();
@@ -1132,6 +1440,222 @@ mod tests {
         assert_eq!(
             healthy_rx.try_recv().unwrap().into_string(),
             r#"{"type":"bridge/phase","phase":"ready"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn released_terminal_is_not_replayed_to_a_new_subscriber() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+        }
+        hub.publish(
+            1,
+            json!({
+                "type": "acp/session_created",
+                "cwd": "/workspace",
+                "response": { "sessionId": "session" },
+            })
+            .to_string(),
+        )
+        .await;
+        hub.publish(
+            1,
+            json!({
+                "type": "acp/terminal_state",
+                "terminal": {
+                    "sessionId": "session",
+                    "terminalId": "released-terminal",
+                    "output": "release-only-output",
+                    "truncated": false,
+                    "released": false,
+                },
+            })
+            .to_string(),
+        )
+        .await;
+        hub.publish(
+            1,
+            json!({
+                "type": "acp/terminal_state",
+                "terminal": {
+                    "sessionId": "session",
+                    "terminalId": "released-terminal",
+                    "output": "release-only-output",
+                    "truncated": false,
+                    "released": true,
+                },
+            })
+            .to_string(),
+        )
+        .await;
+
+        let subscription = hub.subscribe().await.unwrap();
+        assert!(
+            subscription.initial_events.iter().all(|event| {
+                serde_json::from_str::<serde_json::Value>(event)
+                    .ok()
+                    .is_none_or(|event| {
+                        event.get("type").and_then(serde_json::Value::as_str)
+                            != Some("acp/terminal_state")
+                            || event["terminal"]["terminalId"] != "released-terminal"
+                    })
+            }),
+            "release must remove terminal runtime output instead of retaining a replay tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_subscriber_receives_no_completed_history() {
+        const COMPLETED_MARKER: &str = "completed-history-must-not-bootstrap";
+
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+        }
+        for event in [
+            json!({
+                "type": "acp/session_created",
+                "cwd": "/workspace",
+                "response": { "sessionId": "session" },
+            }),
+            json!({
+                "type": "acp/prompt_started",
+                "sessionId": "session",
+                "requestId": "prompt",
+            }),
+            json!({
+                "type": "acp/session_update",
+                "notification": {
+                    "sessionId": "session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "text": COMPLETED_MARKER,
+                    },
+                },
+            }),
+            json!({
+                "type": "acp/prompt_complete",
+                "sessionId": "session",
+                "requestId": "prompt",
+                "response": { "stopReason": "end_turn" },
+            }),
+        ] {
+            hub.publish(1, event.to_string()).await;
+        }
+
+        let subscription = hub.subscribe().await.unwrap();
+        assert!(
+            subscription
+                .initial_events
+                .iter()
+                .all(|event| !event.contains(COMPLETED_MARKER)),
+            "ACP is the completed-history authority; Hub bootstrap must contain active state only"
+        );
+        let initial = subscription
+            .initial_events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            initial
+                .iter()
+                .find(|event| event["type"] == "bridge/runtime_replay_started")
+                .unwrap()["sessionCount"],
+            0
+        );
+        assert_eq!(
+            initial
+                .iter()
+                .find(|event| event["type"] == "bridge/runtime_replay_complete")
+                .unwrap()["sessionIds"],
+            json!([])
+        );
+        assert!(
+            initial
+                .iter()
+                .all(|event| event["type"] != "bridge/runtime_session"),
+            "an idle completed session shell would suppress the required session/load flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_does_not_pin_a_completed_turn_in_hub_state() {
+        const COMPLETED_MARKER: &str = "slow-subscriber-completed-turn";
+
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        runtime
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        runtime
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "answer",
+                    "content": { "type": "text", "text": COMPLETED_MARKER },
+                }),
+            )
+            .unwrap();
+        let active = runtime.snapshot();
+        let (slow_tx, _slow_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let slow_queued_bytes = slow_tx.queued_bytes.clone();
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(active.clone());
+            state.subscribers.insert(1, slow_tx);
+        }
+
+        runtime
+            .complete_prompt(
+                "epoch",
+                "session",
+                incarnation,
+                "prompt",
+                json!({ "stopReason": "end_turn" }),
+            )
+            .unwrap();
+        for delta in runtime.deltas_after(active.through_seq).unwrap() {
+            hub.publish(
+                1,
+                json!({
+                    "type": "bridge/internal_runtime_delta",
+                    "value": delta,
+                })
+                .to_string(),
+            )
+            .await;
+        }
+
+        assert!(
+            slow_queued_bytes.load(Ordering::Acquire) > 0,
+            "the subscriber must still be holding the final publication for this test"
+        );
+        let state = hub.state.lock().await;
+        let retained = serde_json::to_string(&state.canonical.snapshot).unwrap();
+        assert!(
+            !retained.contains(COMPLETED_MARKER),
+            "final publication must retire Hub-owned turn state without waiting for a slow subscriber"
         );
     }
 
@@ -1244,9 +1768,49 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                json!({ "sessionUpdate": "agent_message_chunk", "text": "increment" }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "answer",
+                    "content": { "type": "text", "text": "incre" },
+                }),
             )
             .unwrap();
+        runtime
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "answer",
+                    "content": { "type": "text", "text": "ment" },
+                }),
+            )
+            .unwrap();
+        let active_through = runtime.snapshot().through_seq;
+        for delta in runtime.deltas_after(0).unwrap() {
+            assert!(
+                projection.update(
+                    &json!({
+                        "type": "bridge/internal_runtime_delta",
+                        "value": delta,
+                    })
+                    .to_string(),
+                )
+            );
+        }
+        let projected_updates = &projection.snapshot.as_ref().unwrap().sessions["session"]
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .updates;
+        assert_eq!(projected_updates.len(), 1);
+        assert_eq!(projected_updates[0]["content"]["text"], "increment");
+        assert_eq!(
+            projection.snapshot.as_ref().unwrap().sessions["session"],
+            runtime.snapshot().sessions["session"],
+            "raw delta application must retain the same folded active turn as RuntimeState"
+        );
         runtime
             .complete_prompt(
                 "epoch",
@@ -1256,7 +1820,7 @@ mod tests {
                 json!({ "stopReason": "end_turn" }),
             )
             .unwrap();
-        for delta in runtime.deltas_after(0).unwrap() {
+        for delta in runtime.deltas_after(active_through).unwrap() {
             assert!(
                 projection.update(
                     &json!({
@@ -1336,8 +1900,6 @@ mod tests {
                 operation_id: "stale".to_string(),
                 update: json!({ "sessionUpdate": "agent_message_chunk", "text": "late" }),
             },
-            intent_results: Vec::new(),
-            evicted_intent_result_ids: Vec::new(),
         };
 
         let mut direct = CanonicalProjection {
@@ -1387,8 +1949,6 @@ mod tests {
                 session_id: "missing".to_string(),
                 incarnation: 1,
             },
-            intent_results: Vec::new(),
-            evicted_intent_result_ids: Vec::new(),
         };
 
         assert!(
@@ -1431,8 +1991,6 @@ mod tests {
             change: RuntimeChange::SessionUpsert {
                 session: Box::new(jumped),
             },
-            intent_results: Vec::new(),
-            evicted_intent_result_ids: Vec::new(),
         };
 
         assert!(
@@ -1448,14 +2006,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_projection_matches_runtime_intent_result_eviction() {
-        let mut runtime = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_intent_results: 2,
-                ..RuntimeLimits::default()
-            },
-        );
+    fn canonical_projection_tracks_sequential_terminal_retirement() {
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
         let initial = runtime.snapshot();
         let mut projection = CanonicalProjection::default();
         projection.update(
@@ -1465,6 +2017,7 @@ mod tests {
             })
             .to_string(),
         );
+        let mut through_seq = initial.through_seq;
         for index in 0..3 {
             let session_id = format!("session-{index}");
             let operation_id = format!("prompt-{index}");
@@ -1479,6 +2032,18 @@ mod tests {
             runtime
                 .start_prompt("epoch", &session_id, incarnation, &operation_id, Vec::new())
                 .unwrap();
+            let active_through = runtime.snapshot().through_seq;
+            for delta in runtime.deltas_after(through_seq).unwrap() {
+                assert!(
+                    projection.update(
+                        &json!({
+                            "type": "bridge/internal_runtime_delta",
+                            "value": delta,
+                        })
+                        .to_string(),
+                    )
+                );
+            }
             runtime
                 .complete_prompt(
                     "epoch",
@@ -1488,17 +2053,18 @@ mod tests {
                     json!({ "stopReason": "end_turn" }),
                 )
                 .unwrap();
-        }
-        for delta in runtime.deltas_after(0).unwrap() {
-            assert!(
-                projection.update(
-                    &json!({
-                        "type": "bridge/internal_runtime_delta",
-                        "value": delta,
-                    })
-                    .to_string(),
-                )
-            );
+            for delta in runtime.deltas_after(active_through).unwrap() {
+                assert!(
+                    projection.update(
+                        &json!({
+                            "type": "bridge/internal_runtime_delta",
+                            "value": delta,
+                        })
+                        .to_string(),
+                    )
+                );
+            }
+            through_seq = runtime.snapshot().through_seq;
         }
 
         assert_eq!(
@@ -1584,8 +2150,6 @@ mod tests {
                 session_id: "missing".to_string(),
                 incarnation: 1,
             },
-            intent_results: Vec::new(),
-            evicted_intent_result_ids: Vec::new(),
         };
 
         hub.publish(
@@ -1634,8 +2198,6 @@ mod tests {
                             session_id: "missing".to_string(),
                             incarnation: 1,
                         },
-                        intent_results: Vec::new(),
-                        evicted_intent_result_ids: Vec::new(),
                     },
                 })
                 .to_string(),

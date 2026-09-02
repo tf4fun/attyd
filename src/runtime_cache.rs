@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Map, Value, json};
 
 const MAX_RUNTIME_EVENTS_PER_SESSION: usize = 100_000;
@@ -8,9 +10,10 @@ const MAX_RUNTIME_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 const MAX_PENDING_SESSION_EVENTS: usize = 10_000;
 const MAX_GLOBAL_RUNTIME_EVENTS: usize = 1_024;
 const MAX_GLOBAL_RUNTIME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LIVE_TERMINAL_BYTES: usize = 1_000_000;
 
 #[derive(Default)]
-pub(crate) struct RuntimeCache {
+pub(crate) struct ActiveRuntimeProjection {
     sessions: HashMap<String, RuntimeSession>,
     pending_session_events: HashMap<String, VecDeque<String>>,
     pending_session_truncated: HashSet<String>,
@@ -21,6 +24,7 @@ pub(crate) struct RuntimeCache {
     url_elicitation_sessions: HashMap<String, Option<String>>,
     global_events: VecDeque<String>,
     global_event_bytes: usize,
+    terminal_output_bytes: HashMap<(String, String), Vec<u8>>,
     clock: u64,
 }
 
@@ -39,8 +43,19 @@ struct RuntimeSession {
     active_operation: Option<String>,
 }
 
-impl RuntimeCache {
+impl ActiveRuntimeProjection {
     pub(crate) fn update(&mut self, event: &str) {
+        let (_, materialized) = self.normalize_terminal_event(event);
+        self.update_normalized(&materialized);
+    }
+
+    pub(crate) fn update_and_normalize(&mut self, event: &str) -> String {
+        let (public, materialized) = self.normalize_terminal_event(event);
+        self.update_normalized(&materialized);
+        public
+    }
+
+    fn update_normalized(&mut self, event: &str) {
         let Ok(value) = serde_json::from_str::<Value>(event) else {
             return;
         };
@@ -131,6 +146,7 @@ impl RuntimeCache {
                         .insert(request_id.to_string(), session_id.to_string());
                 }
                 if let Some(session) = self.sessions.get_mut(session_id) {
+                    session.clear_turn_events();
                     session.active_prompt = Some(event.to_string());
                 }
                 self.record_session_event(session_id, event);
@@ -153,9 +169,9 @@ impl RuntimeCache {
                 let Some(session_id) = value.get("sessionId").and_then(Value::as_str) else {
                     return;
                 };
-                self.record_session_event(session_id, event);
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session.active_prompt = None;
+                    session.clear_turn_events();
                 }
                 if let Some(request_id) = value.get("requestId").and_then(Value::as_str) {
                     self.prompt_sessions.remove(request_id);
@@ -181,15 +197,35 @@ impl RuntimeCache {
                         .and_then(Value::as_str)
                     && let Some(session) = self.sessions.get_mut(session_id)
                 {
-                    session
-                        .terminal_states
-                        .insert(terminal_id.to_string(), event.to_string());
+                    if value
+                        .get("terminal")
+                        .and_then(|terminal| terminal.get("released"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        session.terminal_states.remove(terminal_id);
+                        self.terminal_output_bytes
+                            .remove(&(session_id.to_string(), terminal_id.to_string()));
+                    } else {
+                        session
+                            .terminal_states
+                            .insert(terminal_id.to_string(), event.to_string());
+                    }
                 } else if let Some(session_id) = value
                     .get("terminal")
                     .and_then(|terminal| terminal.get("sessionId"))
                     .and_then(Value::as_str)
                 {
-                    self.record_session_event(session_id, event);
+                    if value
+                        .get("terminal")
+                        .and_then(|terminal| terminal.get("released"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        self.remove_pending_terminal(session_id, &value);
+                    } else {
+                        self.record_session_event(session_id, event);
+                    }
                 }
             }
             "acp/permission_request" => {
@@ -318,9 +354,9 @@ impl RuntimeCache {
                     return;
                 };
                 if let Some(session_id) = self.prompt_sessions.remove(request_id) {
-                    self.record_session_event(&session_id, event);
                     if let Some(session) = self.sessions.get_mut(&session_id) {
                         session.active_prompt = None;
+                        session.clear_turn_events();
                     }
                 }
                 self.complete_operation(request_id);
@@ -336,8 +372,101 @@ impl RuntimeCache {
         }
     }
 
+    fn normalize_terminal_event(&mut self, event: &str) -> (String, String) {
+        let Ok(mut value) = serde_json::from_str::<Value>(event) else {
+            return (event.to_string(), event.to_string());
+        };
+        if value.get("type").and_then(Value::as_str) != Some("acp/terminal_state") {
+            return (event.to_string(), event.to_string());
+        }
+        let mut public = value.clone();
+        let Some(terminal) = value.get_mut("terminal").and_then(Value::as_object_mut) else {
+            return (event.to_string(), event.to_string());
+        };
+        let Some(session_id) = terminal
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return (event.to_string(), event.to_string());
+        };
+        let Some(terminal_id) = terminal
+            .get("terminalId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return (event.to_string(), event.to_string());
+        };
+        let append = terminal
+            .get("outputAppend")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let fallback_output = terminal
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec();
+        let output = if append {
+            terminal
+                .get("outputBytes")
+                .and_then(Value::as_str)
+                .filter(|encoded| encoded.len() <= MAX_LIVE_TERMINAL_BYTES * 2)
+                .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+                .unwrap_or(fallback_output)
+        } else {
+            fallback_output
+        };
+        let public_output = String::from_utf8_lossy(&output).into_owned();
+        let retained_bytes = terminal
+            .get("retainedBytes")
+            .and_then(Value::as_u64)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or_else(|| {
+                if append {
+                    self.terminal_output_bytes
+                        .get(&(session_id.clone(), terminal_id.clone()))
+                        .map_or(output.len(), |existing| {
+                            existing.len().saturating_add(output.len())
+                        })
+                } else {
+                    output.len()
+                }
+            })
+            .min(MAX_LIVE_TERMINAL_BYTES);
+        let key = (session_id, terminal_id);
+        let buffer = self.terminal_output_bytes.entry(key).or_default();
+        if append {
+            buffer.extend_from_slice(&output);
+        } else {
+            *buffer = output;
+        }
+        if buffer.len() > retained_bytes {
+            buffer.drain(..buffer.len() - retained_bytes);
+        }
+        while buffer.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
+            buffer.remove(0);
+        }
+        if let Some(terminal) = public.get_mut("terminal").and_then(Value::as_object_mut) {
+            terminal.insert("output".to_string(), Value::String(public_output));
+            terminal.remove("outputBytes");
+        }
+        terminal.insert(
+            "output".to_string(),
+            Value::String(String::from_utf8_lossy(buffer).into_owned()),
+        );
+        terminal.remove("outputBytes");
+        terminal.remove("outputAppend");
+        terminal.remove("retainedBytes");
+        (public.to_string(), value.to_string())
+    }
+
     pub(crate) fn replay_events(&self) -> Vec<String> {
-        let mut sessions = self.sessions.iter().collect::<Vec<_>>();
+        let mut sessions = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.has_replayable_state())
+            .collect::<Vec<_>>();
         sessions.sort_by_key(|(_, session)| session.updated_at);
         let mut replay = Vec::new();
         replay.push(
@@ -368,6 +497,13 @@ impl RuntimeCache {
             .get(session_id)
             .map(|session| Self::session_events(session_id, session))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn replay_session_live_suffix(&self, session_id: &str) -> Vec<String> {
+        self.replay_session_events(session_id)
+            .into_iter()
+            .skip(1)
+            .collect()
     }
 
     fn session_events(session_id: &str, session: &RuntimeSession) -> Vec<String> {
@@ -426,8 +562,13 @@ impl RuntimeCache {
     }
 
     fn open_session(&mut self, session_id: &str, cwd: &str, response: &Value) {
-        let mut session = response.as_object().cloned().unwrap_or_else(Map::new);
+        let mut session = Map::new();
         session.insert("sessionId".to_string(), json!(session_id));
+        for key in ["modes", "configOptions"] {
+            if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
+                session.insert(key.to_string(), value.clone());
+            }
+        }
         self.clock = self.clock.wrapping_add(1);
         let mut runtime = RuntimeSession {
             cwd: cwd.to_string(),
@@ -446,7 +587,6 @@ impl RuntimeCache {
         if let Some(pending) = self.pending_session_events.remove(session_id) {
             for event in pending {
                 runtime.observe_liveness(&event);
-                runtime.push(event);
             }
         }
         self.sessions.insert(session_id.to_string(), runtime);
@@ -455,43 +595,12 @@ impl RuntimeCache {
 
     fn open_forked_session(
         &mut self,
-        source_session_id: &str,
+        _source_session_id: &str,
         session_id: &str,
         cwd: &str,
         response: &Value,
     ) {
-        let inherited = self.sessions.get(source_session_id).map(|source| {
-            (
-                source
-                    .events
-                    .iter()
-                    .filter(|event| inheritable_fork_event(event))
-                    .map(|event| rewrite_session_event(event, source_session_id, session_id))
-                    .collect::<VecDeque<_>>(),
-                source.truncated,
-            )
-        });
         self.open_session(session_id, cwd, response);
-        let Some((mut inherited_events, inherited_truncated)) = inherited else {
-            return;
-        };
-        let Some(session) = self.sessions.get_mut(session_id) else {
-            return;
-        };
-        inherited_events.append(&mut session.events);
-        session.events = inherited_events;
-        session.event_bytes = session.events.iter().map(String::len).sum();
-        session.truncated |= inherited_truncated;
-        while session.events.len() > MAX_RUNTIME_EVENTS_PER_SESSION
-            || session.event_bytes > MAX_RUNTIME_BYTES_PER_SESSION
-        {
-            let Some(removed) = session.events.pop_front() else {
-                break;
-            };
-            session.event_bytes = session.event_bytes.saturating_sub(removed.len());
-            session.truncated = true;
-        }
-        self.enforce_total_budget();
     }
 
     fn record_session_value(&mut self, session_id: &str, event: Value) {
@@ -502,8 +611,13 @@ impl RuntimeCache {
         self.clock = self.clock.wrapping_add(1);
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.updated_at = self.clock;
-            session.push(event.to_string());
-            self.enforce_total_budget();
+            if session.active_prompt.is_some() {
+                session.push(event.to_string());
+                self.enforce_total_budget();
+            }
+            return;
+        }
+        if !pending_event_can_be_live(event) {
             return;
         }
         let pending = self
@@ -545,6 +659,37 @@ impl RuntimeCache {
         }
     }
 
+    fn remove_pending_terminal(&mut self, session_id: &str, release: &Value) {
+        let Some(terminal_id) = release
+            .get("terminal")
+            .and_then(|terminal| terminal.get("terminalId"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        self.terminal_output_bytes
+            .remove(&(session_id.to_string(), terminal_id.to_string()));
+        let Some(events) = self.pending_session_events.get_mut(session_id) else {
+            return;
+        };
+        events.retain(|event| {
+            serde_json::from_str::<Value>(event)
+                .ok()
+                .and_then(|event| {
+                    event
+                        .get("terminal")?
+                        .get("terminalId")?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .as_deref()
+                != Some(terminal_id)
+        });
+        if events.is_empty() {
+            self.pending_session_events.remove(session_id);
+        }
+    }
+
     fn remove_session(&mut self, session_id: &str) {
         self.sessions.remove(session_id);
         self.pending_session_events.remove(session_id);
@@ -558,6 +703,8 @@ impl RuntimeCache {
             .retain(|_, value| value.as_deref() != Some(session_id));
         self.url_elicitation_sessions
             .retain(|_, value| value.as_deref() != Some(session_id));
+        self.terminal_output_bytes
+            .retain(|(owner, _), _| owner != session_id);
     }
 
     fn complete_operation(&mut self, request_id: &str) {
@@ -607,6 +754,22 @@ impl RuntimeCache {
 }
 
 impl RuntimeSession {
+    fn has_replayable_state(&self) -> bool {
+        self.active_prompt.is_some()
+            || self.active_operation.is_some()
+            || !self.events.is_empty()
+            || !self.pending_permissions.is_empty()
+            || !self.pending_elicitations.is_empty()
+            || !self.active_url_flows.is_empty()
+            || !self.terminal_states.is_empty()
+    }
+
+    fn clear_turn_events(&mut self) {
+        self.events.clear();
+        self.event_bytes = 0;
+        self.truncated = false;
+    }
+
     fn observe_liveness(&mut self, event: &str) {
         let Ok(value) = serde_json::from_str::<Value>(event) else {
             return;
@@ -683,8 +846,17 @@ impl RuntimeSession {
                     .and_then(|terminal| terminal.get("terminalId"))
                     .and_then(Value::as_str)
                 {
-                    self.terminal_states
-                        .insert(id.to_string(), event.to_string());
+                    if value
+                        .get("terminal")
+                        .and_then(|terminal| terminal.get("released"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        self.terminal_states.remove(id);
+                    } else {
+                        self.terminal_states
+                            .insert(id.to_string(), event.to_string());
+                    }
                 }
             }
             "acp/mode_changed" | "acp/config_changed"
@@ -712,6 +884,33 @@ impl RuntimeSession {
     }
 }
 
+fn pending_event_can_be_live(event: &str) -> bool {
+    serde_json::from_str::<Value>(event)
+        .ok()
+        .and_then(|event| {
+            event
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|kind| {
+            matches!(
+                kind.as_str(),
+                "acp/prompt_started"
+                    | "acp/prompt_complete"
+                    | "bridge/session_operation_started"
+                    | "bridge/error"
+                    | "acp/permission_request"
+                    | "acp/permission_resolved"
+                    | "acp/elicitation_request"
+                    | "acp/elicitation_resolved"
+                    | "acp/elicitation_complete"
+                    | "acp/elicitation_aborted"
+                    | "acp/terminal_state"
+            )
+        })
+}
+
 fn same_request(active: &Option<String>, candidate: &Value) -> bool {
     let Some(candidate_id) = candidate.get("requestId").and_then(Value::as_str) else {
         return false;
@@ -725,27 +924,6 @@ fn same_request(active: &Option<String>, candidate: &Value) -> bool {
     })
 }
 
-fn inheritable_fork_event(event: &str) -> bool {
-    serde_json::from_str::<Value>(event)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .is_some_and(|kind| {
-            matches!(
-                kind.as_str(),
-                "acp/session_update"
-                    | "acp/terminal_state"
-                    | "acp/prompt_started"
-                    | "acp/prompt_complete"
-                    | "bridge/error"
-            )
-        })
-}
-
 fn url_elicitation_id(event: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(event).ok()?;
     let request = value.get("request")?;
@@ -753,33 +931,6 @@ fn url_elicitation_id(event: &str) -> Option<String> {
         .then(|| request.get("elicitationId").and_then(Value::as_str))
         .flatten()
         .map(str::to_string)
-}
-
-fn rewrite_session_event(event: &str, source_session_id: &str, session_id: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<Value>(event) else {
-        return event.to_string();
-    };
-    let Some(kind) = value.get("type").and_then(Value::as_str) else {
-        return event.to_string();
-    };
-    let target = match kind {
-        "acp/session_update" => value.get_mut("notification"),
-        "acp/terminal_state" => value.get_mut("terminal"),
-        "acp/permission_request" | "acp/elicitation_request" => value.get_mut("request"),
-        "acp/prompt_started"
-        | "acp/prompt_complete"
-        | "acp/elicitation_aborted"
-        | "acp/mode_changed"
-        | "acp/config_changed" => Some(&mut value),
-        _ => None,
-    };
-    if let Some(target) = target
-        && target.get("sessionId").and_then(Value::as_str) == Some(source_session_id)
-        && let Some(object) = target.as_object_mut()
-    {
-        object.insert("sessionId".to_string(), json!(session_id));
-    }
-    value.to_string()
 }
 
 #[cfg(test)]
@@ -806,7 +957,7 @@ mod tests {
 
     #[test]
     fn replays_independent_concurrent_session_runtime_state() {
-        let mut cache = RuntimeCache::default();
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/session_created","requestId":"new-a","cwd":"/a","response":{"sessionId":"a"}}"#,
         );
@@ -833,7 +984,7 @@ mod tests {
 
     #[test]
     fn removes_closed_sessions_from_runtime_replay() {
-        let mut cache = RuntimeCache::default();
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/session_created","requestId":"new","cwd":"/a","response":{"sessionId":"a"}}"#,
         );
@@ -844,8 +995,61 @@ mod tests {
     }
 
     #[test]
+    fn completed_idle_session_shell_does_not_suppress_authoritative_reload() {
+        let mut cache = ActiveRuntimeProjection::default();
+        cache.update(
+            r#"{"type":"acp/session_created","requestId":"new","cwd":"/a","response":{"sessionId":"a"}}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/prompt_started","requestId":"prompt","sessionId":"a","prompt":[{"type":"text","text":"hello"}]}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/session_update","notification":{"sessionId":"a","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/prompt_complete","requestId":"prompt","sessionId":"a","response":{"stopReason":"end_turn"}}"#,
+        );
+
+        let replay = cache.replay_events().join("\n");
+        assert!(replay.contains(r#""sessionCount":0"#));
+        assert!(replay.contains(r#""sessionIds":[]"#));
+        assert!(!replay.contains(r#""type":"bridge/runtime_session""#));
+        assert!(!replay.contains("hello"));
+        assert!(!replay.contains("done"));
+    }
+
+    #[test]
+    fn active_projection_retains_only_bounded_session_control_metadata() {
+        let mut cache = ActiveRuntimeProjection::default();
+        cache.update(
+            &json!({
+                "type": "acp/session_created",
+                "cwd": "/workspace",
+                "response": {
+                    "sessionId": "session",
+                    "modes": {
+                        "currentModeId": "build",
+                        "availableModes": [{ "id": "build", "name": "Build" }],
+                    },
+                    "configOptions": [],
+                    "_meta": { "debugPayload": "must-not-be-retained" },
+                },
+            })
+            .to_string(),
+        );
+        cache.update(
+            r#"{"type":"acp/prompt_started","requestId":"prompt","sessionId":"session","prompt":[]}"#,
+        );
+
+        let replay = cache.replay_session_events("session").join("\n");
+        assert!(replay.contains("currentModeId"));
+        assert!(!replay.contains("must-not-be-retained"));
+        assert!(!replay.contains("_meta"));
+    }
+
+    #[test]
     fn replays_connection_scoped_auth_and_mcp_runtime_events() {
-        let mut cache = RuntimeCache::default();
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"bridge/auth_terminal_started","requestId":"auth","methodId":"login"}"#,
         );
@@ -862,8 +1066,8 @@ mod tests {
     }
 
     #[test]
-    fn keeps_url_elicitation_completion_with_its_session() {
-        let mut cache = RuntimeCache::default();
+    fn completed_url_elicitation_is_removed_from_live_replay() {
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/session_created","cwd":"/source","response":{"sessionId":"source"}}"#,
         );
@@ -878,13 +1082,38 @@ mod tests {
         );
 
         let replay = cache.replay_session_events("source").join("\n");
-        assert!(replay.contains("acp/elicitation_complete"));
+        assert!(!replay.contains("acp/elicitation_request"));
+        assert!(!replay.contains("acp/elicitation_resolved"));
+        assert!(!replay.contains("acp/elicitation_complete"));
         assert!(cache.global_events.is_empty());
     }
 
     #[test]
-    fn forks_inherit_rewritten_source_session_runtime_events() {
-        let mut cache = RuntimeCache::default();
+    fn aborted_url_elicitation_is_removed_from_live_replay() {
+        let mut cache = ActiveRuntimeProjection::default();
+        cache.update(
+            r#"{"type":"acp/session_created","cwd":"/source","response":{"sessionId":"source"}}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/elicitation_request","elicitationId":"bridge-url","request":{"sessionId":"source","mode":"url","message":"Connect","elicitationId":"agent-url","url":"https://example.test"}}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/elicitation_resolved","requestId":"accept","elicitationId":"bridge-url","response":{"action":"accept"}}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/elicitation_aborted","elicitationId":"agent-url","sessionId":"source","reason":"session_cancelled"}"#,
+        );
+
+        let replay = cache.replay_session_events("source").join("\n");
+        assert!(!replay.contains("acp/elicitation_request"));
+        assert!(!replay.contains("acp/elicitation_resolved"));
+        assert!(!replay.contains("acp/elicitation_aborted"));
+        assert!(cache.global_events.is_empty());
+    }
+
+    #[test]
+    fn forks_do_not_inherit_source_history_into_live_replay() {
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/session_created","cwd":"/source","response":{"sessionId":"source"}}"#,
         );
@@ -899,7 +1128,7 @@ mod tests {
         );
 
         let replay = cache.replay_session_events("fork").join("\n");
-        assert!(replay.contains("Inherited"));
+        assert!(!replay.contains("Inherited"));
         assert!(replay.contains(r#""sessionId":"fork""#));
         assert!(!replay.contains(r#""sessionId":"source""#));
         assert!(!replay.contains("acp/mode_changed"));
@@ -907,7 +1136,7 @@ mod tests {
 
     #[test]
     fn active_operation_is_replayed_exactly_once() {
-        let mut cache = RuntimeCache::default();
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/session_created","cwd":"/workspace","response":{"sessionId":"session"}}"#,
         );
@@ -925,7 +1154,7 @@ mod tests {
 
     #[test]
     fn pre_open_liveness_events_are_pinned_when_session_commits() {
-        let mut cache = RuntimeCache::default();
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/permission_request","permissionId":"permission","request":{"sessionId":"session","toolCall":{"toolCallId":"tool","title":"Confirm","kind":"other","status":"pending"},"options":[]}}"#,
         );
@@ -946,8 +1175,57 @@ mod tests {
     }
 
     #[test]
+    fn terminal_chunks_merge_once_and_release_drops_all_live_output() {
+        let mut cache = ActiveRuntimeProjection::default();
+        cache.update(
+            r#"{"type":"acp/session_created","cwd":"/workspace","response":{"sessionId":"session"}}"#,
+        );
+        let first = cache.update_and_normalize(
+            r#"{"type":"acp/terminal_state","terminal":{"sessionId":"session","terminalId":"terminal","output":"hel","outputBytes":"aGVs","outputAppend":true,"retainedBytes":3,"truncated":false,"released":false}}"#,
+        );
+        let second = cache.update_and_normalize(
+            r#"{"type":"acp/terminal_state","terminal":{"sessionId":"session","terminalId":"terminal","output":"lo","outputBytes":"bG8=","outputAppend":true,"retainedBytes":5,"truncated":false,"released":false}}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&first).unwrap()["terminal"]["output"],
+            "hel"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&second).unwrap()["terminal"]["output"],
+            "lo"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&second).unwrap()["terminal"]["outputAppend"],
+            true
+        );
+        assert!(
+            cache
+                .replay_session_events("session")
+                .join("\n")
+                .contains("hello")
+        );
+
+        let released = cache.update_and_normalize(
+            r#"{"type":"acp/terminal_state","terminal":{"sessionId":"session","terminalId":"terminal","output":"","outputBytes":"","outputAppend":true,"retainedBytes":5,"truncated":false,"released":true}}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&released).unwrap()["terminal"]["output"],
+            "",
+            "release is an incremental lifecycle event, not a cumulative output replay"
+        );
+        assert!(cache.sessions["session"].terminal_states.is_empty());
+        assert!(cache.terminal_output_bytes.is_empty());
+        assert!(
+            !cache
+                .replay_session_events("session")
+                .join("\n")
+                .contains("hello")
+        );
+    }
+
+    #[test]
     fn active_liveness_projection_survives_complete_history_eviction() {
-        let mut cache = RuntimeCache::default();
+        let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/session_created","cwd":"/workspace","response":{"sessionId":"session"}}"#,
         );

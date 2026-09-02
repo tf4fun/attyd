@@ -139,7 +139,25 @@ export interface ActiveSessionSnapshot {
   usage?: AppState["usage"];
   activePlan?: AppState["activePlan"];
   terminalSnapshots: TerminalSnapshot[];
+  historyStatus?: HistoryStatus;
 }
+
+export type HistoryStatus =
+  | {
+      state: "loading";
+      sessionId: string;
+      requestId: string;
+    }
+  | {
+      state: "available";
+      sessionId: string;
+    }
+  | {
+      state: "unavailable";
+      sessionId?: string;
+      reason: "load_not_supported";
+      message: string;
+    };
 
 export interface SessionTransition {
   kind: "new" | "attach" | "fork" | "close";
@@ -216,6 +234,8 @@ export interface AppState {
   phase: ConnectionPhase;
   socketOpen: boolean;
   runtimeReplaying: boolean;
+  runtimeReplacement?: AppState;
+  sessionLoadReplacement?: AppState;
   transport: AgentTransport;
   command: string[];
   defaultCwd: string;
@@ -232,6 +252,7 @@ export interface AppState {
   authError?: string;
   lastAuthResponse?: AgentAuthResponse;
   session?: NewSessionResponse;
+  historyStatus?: HistoryStatus;
   cachedSessions: Map<string, ActiveSessionSnapshot>;
   attentionSessionIds: string[];
   pendingSessionId?: string;
@@ -276,6 +297,11 @@ export type AppAction =
       fallbackSessionId?: string;
     }
   | { type: "client/error"; message: string }
+  | {
+      type: "history/unavailable";
+      sessionId?: string;
+      reason: Extract<HistoryStatus, { state: "unavailable" }>["reason"];
+    }
   | { type: "permission/respond_start"; permissionId: string; requestId: string }
   | { type: "elicitation/respond_start"; elicitationId: string; requestId: string }
   | {
@@ -371,14 +397,116 @@ export const initialState: AppState = {
   nesSuggestions: [],
 };
 
+function withoutRuntimeReplacement(state: AppState): AppState {
+  return state.runtimeReplacement == null
+    ? state
+    : { ...state, runtimeReplacement: undefined };
+}
+
+function withoutSessionLoadReplacement(state: AppState): AppState {
+  return state.sessionLoadReplacement == null
+    ? state
+    : { ...state, sessionLoadReplacement: undefined };
+}
+
+function historyUnavailableMessage(
+  reason: Extract<HistoryStatus, { state: "unavailable" }>["reason"],
+): string {
+  switch (reason) {
+    case "load_not_supported":
+      return "History unavailable: this Agent does not support loading saved session history.";
+    default:
+      return assertNever(reason, "history unavailable reason");
+  }
+}
+
+function isMatchingSessionLoadUpdate(
+  state: AppState,
+  event: ServerEvent,
+): boolean {
+  const transition = state.sessionTransition;
+  return transition?.kind === "attach" &&
+    event.type === "acp/session_update" &&
+    event.notification.sessionId === transition.targetSessionId;
+}
+
+function isMatchingSessionLoadCommit(
+  state: AppState,
+  event: ServerEvent,
+): event is Extract<ServerEvent, { type: "acp/session_attached" }> {
+  const transition = state.sessionTransition;
+  return transition?.kind === "attach" &&
+    event.type === "acp/session_attached" &&
+    event.requestId === transition.requestId &&
+    event.sessionId === transition.targetSessionId;
+}
+
+function isMatchingSessionLoadFailure(
+  state: AppState,
+  event: ServerEvent,
+): event is Extract<ServerEvent, { type: "bridge/error" }> {
+  return state.sessionTransition?.kind === "attach" &&
+    event.type === "bridge/error" &&
+    event.requestId === state.sessionTransition.requestId;
+}
+
+function isRuntimeReplacementEvent(event: ServerEvent): boolean {
+  switch (event.type) {
+    case "bridge/phase":
+    case "bridge/runtime_session":
+    case "bridge/session_operation_started":
+    case "bridge/error":
+    case "acp/session_created":
+    case "acp/session_attached":
+    case "acp/session_forked":
+    case "acp/session_closed":
+    case "acp/session_deleted":
+    case "acp/session_update":
+    case "acp/terminal_state":
+    case "acp/prompt_started":
+    case "acp/prompt_complete":
+    case "acp/permission_request":
+    case "acp/permission_resolved":
+    case "acp/elicitation_request":
+    case "acp/elicitation_complete":
+    case "acp/elicitation_resolved":
+    case "acp/elicitation_aborted":
+    case "acp/mode_changed":
+    case "acp/config_changed":
+    case "acp/nes_started":
+    case "acp/nes_suggestions":
+    case "acp/nes_suggestion_resolved":
+    case "acp/nes_closed":
+    case "acp/document_opened":
+    case "acp/document_changed":
+    case "acp/document_saved":
+    case "acp/document_focused":
+    case "acp/document_closed":
+      return true;
+    default:
+      return false;
+  }
+}
+
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "socket/open":
-      return { ...state, socketOpen: true };
+      return state.runtimeReplacement == null
+        ? { ...state, socketOpen: true }
+        : {
+            ...state,
+            socketOpen: true,
+            runtimeReplacement: { ...state.runtimeReplacement, socketOpen: true },
+          };
     case "socket/closed":
       return terminateBridgeState(state, "stopped", false);
     case "runtime/replay_complete": {
-      const next = { ...state, runtimeReplaying: false };
+      const next = {
+        ...(state.runtimeReplacement ?? state),
+        runtimeReplaying: false,
+        runtimeReplacement: undefined,
+        sessionLoadReplacement: undefined,
+      };
       const sessionId = action.preferredSessionId != null &&
           next.cachedSessions.has(action.preferredSessionId)
         ? action.preferredSessionId
@@ -393,6 +521,30 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           { id: randomId(), type: "error", message: action.message },
         ],
       };
+    case "history/unavailable": {
+      const message = historyUnavailableMessage(action.reason);
+      const status: HistoryStatus = {
+        state: "unavailable",
+        sessionId: action.sessionId,
+        reason: action.reason,
+        message,
+      };
+      return {
+        ...state,
+        historyStatus: status,
+        timeline: [
+          ...state.timeline.filter((item) =>
+            item.type !== "error" || item.message !== message
+          ),
+          {
+            id: randomId(),
+            type: "error",
+            message,
+            operation: "session/load",
+          },
+        ],
+      };
+    }
     case "permission/respond_start":
       return {
         ...state,
@@ -474,6 +626,28 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const stateWithCachedCurrent = cacheCurrentSession(state);
       if (action.kind === "fork" || action.kind === "close") {
         return { ...stateWithCachedCurrent, sessionTransition: transition };
+      }
+      if (action.kind === "attach" && action.sessionId != null) {
+        const historyStatus: HistoryStatus = {
+          state: "loading",
+          sessionId: action.sessionId,
+          requestId: action.requestId,
+        };
+        const sessionLoadReplacement: AppState = {
+          ...resetActiveSession(stateWithCachedCurrent, action.title ?? undefined),
+          cwd: action.cwd ?? state.defaultCwd,
+          pendingSessionId: action.sessionId,
+          sessionTransition: transition,
+          historyStatus,
+          sessionLoadReplacement: undefined,
+        };
+        return {
+          ...stateWithCachedCurrent,
+          pendingSessionId: action.sessionId,
+          sessionTransition: transition,
+          historyStatus,
+          sessionLoadReplacement,
+        };
       }
       return {
         ...resetActiveSession(stateWithCachedCurrent, action.title ?? undefined),
@@ -606,8 +780,59 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return resetActiveSession(state);
     case "session/activate_cached":
       return activateCachedSession(state, action.sessionId);
-    case "server/event":
-      return reduceServerEvent(state, action.event);
+    case "server/event": {
+      const sessionLoadReplacement = state.sessionLoadReplacement;
+      if (sessionLoadReplacement != null) {
+        if (isMatchingSessionLoadUpdate(state, action.event)) {
+          return {
+            ...state,
+            sessionLoadReplacement: reduceServerEvent(
+              sessionLoadReplacement,
+              action.event,
+            ),
+          };
+        }
+        if (isMatchingSessionLoadCommit(state, action.event)) {
+          const committed = reduceServerEvent(sessionLoadReplacement, action.event);
+          return {
+            ...committed,
+            sessionLoadReplacement: undefined,
+            historyStatus: {
+              state: "available",
+              sessionId: action.event.sessionId,
+            },
+          };
+        }
+        if (isMatchingSessionLoadFailure(state, action.event)) {
+          return reduceServerEvent(
+            withoutSessionLoadReplacement(state),
+            action.event,
+          );
+        }
+      }
+      const replacement = state.runtimeReplacement;
+      if (replacement == null) return reduceServerEvent(state, action.event);
+      if (action.event.type === "bridge/runtime_replay_started") {
+        return reduceServerEvent(withoutRuntimeReplacement(state), action.event);
+      }
+      if (
+        action.event.type === "bridge/phase" &&
+        (action.event.phase === "error" || action.event.phase === "stopped")
+      ) {
+        return reduceServerEvent(withoutRuntimeReplacement(state), action.event);
+      }
+      if (isRuntimeReplacementEvent(action.event)) {
+        return {
+          ...state,
+          runtimeReplacement: reduceServerEvent(replacement, action.event),
+        };
+      }
+      return {
+        ...reduceServerEvent(withoutRuntimeReplacement(state), action.event),
+        runtimeReplaying: true,
+        runtimeReplacement: reduceServerEvent(replacement, action.event),
+      };
+    }
   }
 }
 
@@ -625,14 +850,22 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         mcpServers: event.mcpServers,
       };
     case "bridge/runtime_replay_started": {
-      const reset = resetActiveSession(state);
-      return {
+      const visible = withoutSessionLoadReplacement(withoutRuntimeReplacement(state));
+      const reset = resetActiveSession(visible);
+      const runtimeReplacement: AppState = {
         ...reset,
         runtimeReplaying: true,
         cachedSessions: new Map(),
         attentionSessionIds: [],
         sessions: [],
         backgroundEvents: [],
+      };
+      return {
+        ...visible,
+        phase: visible.phase === "ready" ? "initializing" : visible.phase,
+        runtimeReplaying: true,
+        runtimeReplacement,
+        sessionLoadReplacement: undefined,
       };
     }
     case "bridge/runtime_session":
@@ -1042,6 +1275,10 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         cachedSessions,
         cwd: event.cwd ?? listed?.cwd ?? state.defaultCwd,
         session: { sessionId: event.sessionId, ...event.response },
+        historyStatus: {
+          state: "available",
+          sessionId: event.sessionId,
+        },
         pendingSessionId: undefined,
         sessionTransition: undefined,
         modeId: event.response.modes?.currentModeId,
@@ -2047,6 +2284,9 @@ function terminateBridgeState(
     ...current,
     phase,
     socketOpen,
+    runtimeReplaying: false,
+    runtimeReplacement: undefined,
+    sessionLoadReplacement: undefined,
     cachedSessions: new Map(),
     attentionSessionIds: [],
     running: false,
@@ -2168,6 +2408,7 @@ function resetActiveSession(state: AppState, title?: string): AppState {
     ...state,
     cwd: state.defaultCwd,
     session: undefined,
+    historyStatus: undefined,
     pendingSessionId: undefined,
     sessionTransition: undefined,
     modeId: undefined,
@@ -2437,6 +2678,7 @@ function captureActiveSession(state: AppState): ActiveSessionSnapshot {
     usage: state.usage,
     activePlan: state.activePlan,
     terminalSnapshots: state.terminalSnapshots,
+    historyStatus: state.historyStatus,
   };
 }
 
@@ -2456,6 +2698,7 @@ function rollbackSessionTransition(state: AppState): AppState {
     ],
     pendingSessionId: undefined,
     sessionTransition: undefined,
+    sessionLoadReplacement: undefined,
   };
 }
 
@@ -2567,9 +2810,19 @@ function upsertTerminalSnapshot(
   snapshots: TerminalSnapshot[],
   incoming: TerminalSnapshot,
 ): TerminalSnapshot[] {
+  const previous = snapshots.find(
+    ({ terminalId }) => terminalId === incoming.terminalId,
+  );
+  const output = incoming.outputAppend && previous != null
+    ? previous.output + incoming.output
+    : incoming.output;
+  const retainedOutput = incoming.retainedBytes != null && output.length > incoming.retainedBytes
+    ? output.slice(-incoming.retainedBytes)
+    : output;
+  const merged = { ...incoming, output: retainedOutput };
   return [
     ...snapshots.filter(({ terminalId }) => terminalId !== incoming.terminalId),
-    incoming,
+    merged,
   ].slice(-64);
 }
 

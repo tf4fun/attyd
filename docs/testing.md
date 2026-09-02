@@ -13,10 +13,10 @@ drivers; there is no second backend implementation.
 
 | Layer | Command | Purpose |
 | --- | --- | --- |
-| Frontend and browser contract | `npm test` | 135 reducer, event-envelope, content, prompt-history, search, interaction, accessibility, and adversarial-state cases |
-| Rust backend | `npm run test:rust` | 69 native cases for semantic validation, CLI/MCP configuration, capability negotiation, response bounds, session mutation locks, pagination, filesystem confinement/context, terminal/auth-terminal lifecycle, Agent process I/O, final error relay, and MCP boundaries |
+| Frontend and browser contract | `npm test` | 148 reducer, event-envelope, content, prompt-history, search, interaction, accessibility, load-replacement, and adversarial-state cases |
+| Rust backend | `npm run test:rust` | 207 native cases, including active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, bounded event queues, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
 | Remote ACP transports | `npm run test:remote` | Connects the Rust binary to SDK HTTP/SSE and WebSocket ACP servers; verifies remote capability boundaries and Agent-owned absolute cwd |
-| Rust-hosted black box | `npm run test:ui` | Drives real browser WebSockets, fake ACP Agents, and an MCP provider through the Rust binary; covers 733 bridge events and 328 malformed/binary frames with same-connection recovery |
+| Rust-hosted black box | `npm run test:ui` | Drives real browser WebSockets, fake ACP Agents, and an MCP provider through the Rust binary; covers 900+ bridge events and 328 malformed/binary frames with same-connection recovery |
 | Rust coverage gate | `npm run test:coverage` | Runs native and instrumented real-binary suites and requires at least 85% Rust backend line coverage; requires `cargo-llvm-cov` |
 | Standalone artifact | `npm run test:binary` | Copies only the release executable to an empty directory and verifies embedded HTML, JavaScript, health metadata, and static MIME types |
 | Browser interaction | `npm run test:browser` | Runs the production Rust host with the fake Agent and verifies Zed-style Agent interaction and mobile behavior in Chromium |

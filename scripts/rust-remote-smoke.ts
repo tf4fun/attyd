@@ -146,13 +146,14 @@ for (const transport of ["http", "ws"] as const) {
       (event) => event.type === "bridge/runtime_replay_complete",
     );
     assert.equal(replayComplete.type, "bridge/runtime_replay_complete");
-    assert.deepEqual(replayComplete.sessionIds.sort(), [
-      `${transport}-session-1`,
-      `${transport}-session-2`,
-    ]);
+    assert.deepEqual(replayComplete.sessionIds, [`${transport}-session-1`]);
     assert.ok(replayEvents.some((event) =>
       event.type === "acp/prompt_started" &&
       event.requestId === `${transport}-prompt`
+    ));
+    assert.ok(!replayEvents.some((event) =>
+      event.type === "acp/prompt_complete" &&
+      event.requestId === `${transport}-prompt-concurrent`
     ));
 
     socket.send(JSON.stringify({

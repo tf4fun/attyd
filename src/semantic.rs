@@ -53,6 +53,20 @@ pub struct SessionUpdateSemanticState {
     pub invalid_reason: Option<String>,
 }
 
+impl SessionUpdateSemanticState {
+    /// Retire validation indexes that are meaningful only while a turn is live.
+    /// Session-scoped control state remains available for validating later commands.
+    pub fn retire_turn(&mut self) {
+        self.compactions.clear();
+        self.tool_calls.clear();
+        self.messages.clear();
+        self.plans.clear();
+        self.update_count = 0;
+        self.update_bytes = 0;
+        self.invalid_reason = None;
+    }
+}
+
 #[derive(Clone)]
 struct TrackedCompaction {
     status: String,
@@ -1424,6 +1438,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn retiring_a_turn_releases_semantic_indexes_but_keeps_session_controls() {
+        let mut state = SessionUpdateSemanticState::default();
+        for update in [
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "reusable-message",
+                "content": { "type": "text", "text": "answer" }
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "reusable-tool",
+                "status": "completed"
+            }),
+            json!({
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": "code"
+            }),
+        ] {
+            validate_and_track_session_update(&mut state, &update).unwrap();
+        }
+        assert!(state.update_count > 0);
+        assert!(state.update_bytes > 0);
+
+        state.retire_turn();
+
+        assert_eq!(state.update_count, 0);
+        assert_eq!(state.update_bytes, 0);
+        assert_eq!(state.current_mode_id.as_deref(), Some("code"));
+        for update in [
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "reusable-message",
+                "content": { "type": "text", "text": "next answer" }
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "reusable-tool",
+                "status": "pending"
+            }),
+        ] {
+            validate_and_track_session_update(&mut state, &update).unwrap();
+        }
     }
 
     #[test]

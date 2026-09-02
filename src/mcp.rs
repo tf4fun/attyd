@@ -8,9 +8,12 @@ use agent_client_protocol::{Agent, ConnectionTo, Error, RequestCancellation};
 use serde_json::{Map, Value, json, value::to_raw_value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+#[cfg(test)]
+use tokio::sync::mpsc;
+use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 
+use crate::event_queue::EventSender;
 use crate::mcp_config::AcpMcpProvider;
 
 const MAX_CONNECTIONS: usize = 16;
@@ -31,7 +34,7 @@ pub struct McpManager {
     providers: Arc<HashMap<String, AcpMcpProvider>>,
     connections: Arc<Mutex<HashMap<String, Arc<McpConnection>>>>,
     connect_lock: Arc<Mutex<()>>,
-    events: mpsc::UnboundedSender<String>,
+    events: EventSender,
 }
 
 struct McpConnection {
@@ -46,11 +49,10 @@ struct McpConnection {
 }
 
 impl McpManager {
-    pub fn new(
-        cwd: std::path::PathBuf,
-        providers: Vec<AcpMcpProvider>,
-        events: mpsc::UnboundedSender<String>,
-    ) -> Self {
+    pub fn new<E>(cwd: std::path::PathBuf, providers: Vec<AcpMcpProvider>, events: E) -> Self
+    where
+        E: Into<EventSender>,
+    {
         Self {
             cwd,
             providers: Arc::new(
@@ -61,7 +63,7 @@ impl McpManager {
             ),
             connections: Arc::new(Mutex::new(HashMap::new())),
             connect_lock: Arc::new(Mutex::new(())),
-            events,
+            events: events.into(),
         }
     }
 

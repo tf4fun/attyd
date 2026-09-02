@@ -15,7 +15,20 @@ import { parseServerEvent } from "../../../shared/bridge";
 import { randomId } from "./id";
 import { appReducer, initialState } from "./state";
 
-type SessionAttachCommand = "session/load" | "session/resume";
+type SessionAttachCommand = "session/load";
+
+interface SessionAttachTarget {
+  sessionId: string;
+  cwd?: string;
+  title?: string | null;
+}
+
+export type StartupHistoryStrategy =
+  | { kind: "active_local" }
+  | { kind: "list_then_load"; method: SessionAttachCommand }
+  | { kind: "direct_load"; method: SessionAttachCommand; sessionId: string }
+  | { kind: "history_unavailable"; sessionId: string }
+  | { kind: "none" };
 
 interface StartupState {
   started: boolean;
@@ -106,7 +119,7 @@ export function useAcp() {
     };
 
     const attachStartupSession = (
-      session: SessionInfo,
+      session: SessionAttachTarget,
       method: SessionAttachCommand,
     ) => {
       const requestId = randomId();
@@ -143,6 +156,11 @@ export function useAcp() {
       capabilities: AgentCapabilities | null | undefined,
     ) => {
       const attachMethod = startupAttachMethod(capabilities);
+      const strategy = startupHistoryStrategy(
+        capabilities,
+        false,
+        preferredSessionId,
+      );
       startup.current = {
         ...startup.current,
         started: true,
@@ -152,10 +170,7 @@ export function useAcp() {
         retryAfterAuth: false,
         discoveredSessions: [],
       };
-      if (
-        capabilities?.sessionCapabilities?.list != null &&
-        attachMethod != null
-      ) {
+      if (strategy.kind === "list_then_load") {
         const requestId = randomId();
         startup.current = {
           ...startup.current,
@@ -169,9 +184,20 @@ export function useAcp() {
         }, (message) => dispatch({ type: "client/error", message }))) {
           finishSessionDiscovery();
         }
-      } else {
-        finishSessionDiscovery();
+        return;
       }
+      if (strategy.kind === "direct_load") {
+        attachStartupSession({ sessionId: strategy.sessionId }, strategy.method);
+        return;
+      }
+      if (strategy.kind === "history_unavailable") {
+        dispatch({
+          type: "history/unavailable",
+          sessionId: strategy.sessionId,
+          reason: "load_not_supported",
+        });
+      }
+      finishSessionDiscovery();
     };
 
     const rejectPendingContext = (message: string) => {
@@ -776,10 +802,15 @@ export function useAcp() {
       const capabilities = state.initialized?.agentCapabilities;
       const method = capabilities?.loadSession
         ? "session/load"
-        : capabilities?.sessionCapabilities?.resume != null
-          ? "session/resume"
-          : undefined;
-      if (!method) return;
+        : undefined;
+      if (!method) {
+        dispatch({
+          type: "history/unavailable",
+          sessionId: session.sessionId,
+          reason: "load_not_supported",
+        });
+        return;
+      }
       const requestId = randomId();
       if (transmit({
         type: method,
@@ -919,10 +950,31 @@ export function useAcp() {
 
 export function startupAttachMethod(
   capabilities: AgentCapabilities | null | undefined,
+  activeTurn = false,
 ): SessionAttachCommand | undefined {
+  if (activeTurn) return undefined;
   if (capabilities?.loadSession) return "session/load";
-  if (capabilities?.sessionCapabilities?.resume != null) return "session/resume";
   return undefined;
+}
+
+export function startupHistoryStrategy(
+  capabilities: AgentCapabilities | null | undefined,
+  activeRuntime: boolean,
+  storedSessionId?: string,
+): StartupHistoryStrategy {
+  if (activeRuntime) return { kind: "active_local" };
+  const method = startupAttachMethod(capabilities);
+  if (method == null) {
+    return storedSessionId == null
+      ? { kind: "none" }
+      : { kind: "history_unavailable", sessionId: storedSessionId };
+  }
+  if (capabilities?.sessionCapabilities?.list != null) {
+    return { kind: "list_then_load", method };
+  }
+  return storedSessionId == null
+    ? { kind: "none" }
+    : { kind: "direct_load", method, sessionId: storedSessionId };
 }
 
 export function mostRecentSession(sessions: SessionInfo[]): SessionInfo | undefined {
@@ -974,6 +1026,10 @@ export function sendClientCommand(
   command: ClientCommand,
   onError: (message: string) => void,
 ): boolean {
+  if (Object.hasOwn(command, "history")) {
+    onError(`Cannot send ${command.type}: completed browser history is not a bridge command field`);
+    return false;
+  }
   if (!socket || socket.readyState !== 1) {
     onError(`Cannot send ${command.type}: ACP WebSocket is not open`);
     return false;

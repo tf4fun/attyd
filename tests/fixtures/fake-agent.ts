@@ -8,6 +8,7 @@ const cyclicList = process.argv.includes("--cyclic-list");
 const duplicateListPage = process.argv.includes("--duplicate-list-page");
 const invalidListRefreshOnce = process.argv.includes("--invalid-list-refresh-once");
 const slowLoad = process.argv.includes("--slow-load");
+const failLoadOnce = process.argv.includes("--fail-load-once");
 const invalidLoadModeOnce = process.argv.includes("--invalid-load-mode-once");
 const slowFork = process.argv.includes("--slow-fork");
 const slowClose = process.argv.includes("--slow-close");
@@ -250,6 +251,9 @@ const agent = acp
   .onRequest(acp.methods.agent.session.load, async ({ params, client }) => {
     loadAttempts += 1;
     if (slowLoad) await new Promise((resolve) => setTimeout(resolve, 150));
+    if (failLoadOnce && loadAttempts === 1) {
+      throw new acp.RequestError(-32603, "Synthetic load failure");
+    }
     if (invalidLoadModeOnce && loadAttempts === 1) {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,

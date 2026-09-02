@@ -101,6 +101,12 @@ describe("browser bridge messages", () => {
   it("rejects unknown and malformed commands at the trust boundary", () => {
     expect(() => parseClientCommand('{"type":"process/spawn"}')).toThrow("Unknown");
     expect(() => parseClientCommand(JSON.stringify({
+      type: "session/load",
+      requestId: "load-saved",
+      sessionId: "saved",
+      history: [{ role: "agent", text: "browser-owned completed answer" }],
+    }))).toThrow("completed browser history");
+    expect(() => parseClientCommand(JSON.stringify({
       type: "x".repeat(129),
     }))).toThrow("command type is too long");
     expect(() => parseClientCommand(JSON.stringify({
@@ -271,7 +277,6 @@ describe("browser bridge messages", () => {
         sessions: {},
         requestElicitations: {},
         requestUrlFlows: {},
-        intentResults: {},
       },
     }))).toMatchObject({
       type: "bridge/runtime_snapshot",
@@ -284,8 +289,6 @@ describe("browser bridge messages", () => {
         seq: 8,
         scopeRevision: 1,
         change: { kind: "session_removed", sessionId: "session", incarnation: 1 },
-        intentResults: [],
-        evictedIntentResultIds: [],
       },
     }))).toMatchObject({
       type: "bridge/runtime_delta",
@@ -305,8 +308,6 @@ describe("browser bridge messages", () => {
           operation_id: "operation-1",
           update: { sessionUpdate: "agent_message_chunk" },
         },
-        intentResults: [],
-        evictedIntentResultIds: [],
       },
     }))).toMatchObject({
       type: "bridge/runtime_delta",
@@ -317,13 +318,13 @@ describe("browser bridge messages", () => {
       requestId: "prompt-1",
       operationId: "operation-1",
       disposition: "duplicate",
-      status: "agent_acknowledged",
+      status: "in_flight",
     }))).toEqual({
       type: "bridge/intent_ack",
       requestId: "prompt-1",
       operationId: "operation-1",
       disposition: "duplicate",
-      status: "agent_acknowledged",
+      status: "in_flight",
     });
     expect(parseServerEvent(JSON.stringify({
       type: "bridge/intent_ack",
@@ -531,7 +532,6 @@ describe("browser bridge messages", () => {
         sessions: {},
         requestElicitations: {},
         requestUrlFlows: {},
-        intentResults: {},
       },
     }))).toThrow("throughSeq");
     expect(() => parseServerEvent(JSON.stringify({
@@ -541,8 +541,6 @@ describe("browser bridge messages", () => {
         seq: 1,
         scopeRevision: null,
         change: { kind: "invented" },
-        intentResults: [],
-        evictedIntentResultIds: [],
       },
     }))).toThrow("change kind");
     expect(() => parseServerEvent(JSON.stringify({

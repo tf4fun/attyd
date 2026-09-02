@@ -20,6 +20,7 @@ use crate::auth_terminal::{AuthTerminalManager, validate_method as validate_term
 use crate::elicitation_validation::{
     validate_elicitation_request, validate_elicitation_response_value,
 };
+use crate::event_queue::EventSender;
 use crate::filesystem::WorkspaceFileSystem;
 use crate::mcp::McpManager;
 use crate::mcp_config::{server_name, server_type};
@@ -54,10 +55,11 @@ const MAX_BRIDGE_ERROR_MESSAGE_CHARS: usize = 16_384;
 const MAX_SESSION_LIST_TOTAL_BYTES: usize = 16_000_000;
 const MAX_LISTED_SESSIONS: usize = 10_000;
 const SHUTDOWN_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const TERMINAL_SNAPSHOT_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 struct EventSink {
-    tx: mpsc::UnboundedSender<String>,
+    tx: EventSender,
 }
 
 impl EventSink {
@@ -242,6 +244,24 @@ struct ActiveSession {
     incarnation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachmentReservation {
+    Fresh { cwd: PathBuf },
+    Reload { cwd: PathBuf, incarnation: u64 },
+}
+
+impl AttachmentReservation {
+    fn cwd(&self) -> &PathBuf {
+        match self {
+            Self::Fresh { cwd } | Self::Reload { cwd, .. } => cwd,
+        }
+    }
+
+    fn is_reload(&self) -> bool {
+        matches!(self, Self::Reload { .. })
+    }
+}
+
 struct PendingPermission {
     session_id: String,
     tool_call_id: String,
@@ -277,7 +297,8 @@ struct BridgeState {
     pending_deletions: HashSet<String>,
     pending_creations: usize,
     pending_attachments: HashSet<String>,
-    attachment_updates: HashMap<String, Vec<Value>>,
+    attachment_subscribers: HashMap<String, u64>,
+    attachment_update_counts: HashMap<String, usize>,
     attachment_update_bytes: HashMap<String, usize>,
     early_updates: HashMap<String, Vec<SessionNotification>>,
     early_update_count: usize,
@@ -583,6 +604,7 @@ fn settle_runtime_attachment_request_error(
     incarnation: u64,
     operation_id: &str,
     kind: RuntimeSessionOperationKind,
+    reload: bool,
     error: &Error,
 ) -> Result<(), Error> {
     let epoch = state.runtime.epoch().to_string();
@@ -597,6 +619,17 @@ fn settle_runtime_attachment_request_error(
                 error.message.clone(),
             )
             .map_err(runtime_state_error)
+    } else if reload {
+        state
+            .runtime
+            .fail_reload(
+                &epoch,
+                session_id,
+                incarnation,
+                operation_id,
+                agent_error_value(error),
+            )
+            .map_err(runtime_state_error)
     } else {
         state
             .runtime
@@ -609,6 +642,52 @@ fn settle_runtime_attachment_request_error(
                 agent_error_value(error),
             )
             .map_err(runtime_state_error)
+    }
+}
+
+fn fail_runtime_attachment(
+    state: &mut BridgeState,
+    session_id: &str,
+    incarnation: u64,
+    operation_id: &str,
+    kind: RuntimeSessionOperationKind,
+    reload: bool,
+    error: &Error,
+) -> Result<(), Error> {
+    let epoch = state.runtime.epoch().to_string();
+    if reload {
+        state
+            .runtime
+            .fail_reload(
+                &epoch,
+                session_id,
+                incarnation,
+                operation_id,
+                json!({ "message": error.message.clone(), "data": error.data.clone() }),
+            )
+            .map_err(runtime_state_error)
+    } else {
+        state
+            .runtime
+            .fail_attachment(
+                &epoch,
+                session_id,
+                incarnation,
+                operation_id,
+                kind,
+                json!({ "message": error.message.clone(), "data": error.data.clone() }),
+            )
+            .map_err(runtime_state_error)
+    }
+}
+
+fn clear_attachment_tracking(state: &mut BridgeState, session_id: &str, clear_validation: bool) {
+    state.pending_attachments.remove(session_id);
+    state.attachment_subscribers.remove(session_id);
+    state.attachment_update_counts.remove(session_id);
+    state.attachment_update_bytes.remove(session_id);
+    if clear_validation {
+        state.session_updates.remove(session_id);
     }
 }
 
@@ -713,6 +792,7 @@ fn can_close_rejected_chat_session(state: &BridgeState, session_id: &str) -> boo
 
 #[derive(Clone)]
 struct CommandContext {
+    subscriber_id: u64,
     options: Arc<Options>,
     state: Arc<Mutex<BridgeState>>,
     sink: EventSink,
@@ -739,7 +819,7 @@ pub(crate) enum BridgeInput {
 pub async fn run_with_cancellation(
     options: Arc<Options>,
     commands: mpsc::Receiver<BridgeInput>,
-    events: mpsc::UnboundedSender<String>,
+    events: EventSender,
     cancellation: CancellationToken,
 ) {
     let sink = EventSink { tx: events };
@@ -764,7 +844,7 @@ pub async fn run_with_cancellation(
             let config = AcpAgentConfig::new(&options.command[0])
                 .args(options.command.iter().skip(1).cloned());
             let debug_sink = sink.clone();
-            let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+            let (fatal_tx, mut fatal_rx) = mpsc::channel(1);
             let agent = BoundedAcpAgent::new(config)
                 .on_stderr(move |chunk| {
                     debug_sink.send(json!({
@@ -773,7 +853,7 @@ pub async fn run_with_cancellation(
                     }));
                 })
                 .on_fatal(move |error| {
-                    let _ = fatal_tx.send(error);
+                    let _ = fatal_tx.try_send(error);
                 });
             let connection = run_connection(
                 agent,
@@ -854,7 +934,8 @@ where
         })
         .transpose()?
         .map(Arc::new);
-    let (terminal_snapshot_tx, mut terminal_snapshot_rx) = mpsc::unbounded_channel();
+    let (terminal_snapshot_tx, mut terminal_snapshot_rx) =
+        mpsc::channel(TERMINAL_SNAPSHOT_QUEUE_CAPACITY);
     let terminals = filesystem.clone().map(|filesystem| {
         TerminalManager::new_with_snapshots(filesystem, sink.tx.clone(), Some(terminal_snapshot_tx))
     });
@@ -1538,6 +1619,7 @@ where
                 let prompt_start =
                     (operation == "session/prompt").then(|| prompt_lifecycle.register_start());
                 let context = CommandContext {
+                    subscriber_id,
                     options: options.clone(),
                     state: state.clone(),
                     sink: sink.clone(),
@@ -1829,6 +1911,11 @@ async fn handle_session_update(
     sink: &EventSink,
     terminals: Option<&TerminalManager>,
 ) {
+    enum Delivery {
+        None,
+        Broadcast,
+        Direct(u64),
+    }
     if let Err(error) = ensure_relay_size(&notification, "session update") {
         sink.acp_error(error, None, Some("session/update"));
         return;
@@ -1890,7 +1977,9 @@ async fn handle_session_update(
             };
             if let Err(error) = result {
                 let mut state = state.lock().await;
-                if !state.active_sessions.contains_key(&session_id)
+                let attachment = state.pending_attachments.contains(&session_id);
+                let attachment_subscriber = state.attachment_subscribers.get(&session_id).copied();
+                if (!state.active_sessions.contains_key(&session_id) || attachment)
                     && let Some(validation) = state.session_updates.get_mut(&session_id)
                 {
                     validation.invalid_reason.get_or_insert_with(|| {
@@ -1901,7 +1990,11 @@ async fn handle_session_update(
                     });
                 }
                 drop(state);
-                sink.acp_error(error, None, Some("session/update"));
+                if let Some(subscriber_id) = attachment_subscriber {
+                    sink.acp_error_to(subscriber_id, error, None, Some("session/update"));
+                } else {
+                    sink.acp_error(error, None, Some("session/update"));
+                }
                 return;
             }
         }
@@ -1916,6 +2009,7 @@ async fn handle_session_update(
             return;
         }
         let late_canonical_conversation = active
+            && !attachment
             && is_conversation_update(&update)
             && state
                 .active_sessions
@@ -1928,9 +2022,12 @@ async fn handle_session_update(
         if late_canonical_conversation {
             return;
         }
+        let attachment_subscriber = attachment
+            .then(|| state.attachment_subscribers.get(&session_id).copied())
+            .flatten();
         let validation = state.session_updates.entry(session_id.clone()).or_default();
         let result = if let Err(message) = validate_and_track_session_update(validation, &update) {
-            if !active {
+            if !active || attachment {
                 validation.invalid_reason.get_or_insert(message.clone());
             }
             Err(semantic_error(message))
@@ -1941,9 +2038,10 @@ async fn handle_session_update(
                 .copied()
                 .unwrap_or(0);
             let replay_len = state
-                .attachment_updates
+                .attachment_update_counts
                 .get(&session_id)
-                .map_or(0, Vec::len);
+                .copied()
+                .unwrap_or(0);
             let update_bytes = serialized_value_len(&update);
             if replay_len >= MAX_EARLY_UPDATES
                 || replay_bytes.saturating_add(update_bytes) > MAX_EARLY_UPDATE_BYTES
@@ -1972,15 +2070,17 @@ async fn handle_session_update(
                 match runtime_result {
                     Ok(()) => {
                         state
-                            .attachment_updates
-                            .entry(session_id.clone())
-                            .or_default()
-                            .push(update.clone());
+                            .attachment_update_counts
+                            .insert(session_id.clone(), replay_len.saturating_add(1));
                         state.attachment_update_bytes.insert(
                             session_id.clone(),
                             replay_bytes.saturating_add(update_bytes),
                         );
-                        Ok(true)
+                        Ok(state
+                            .attachment_subscribers
+                            .get(&session_id)
+                            .copied()
+                            .map_or(Delivery::Broadcast, Delivery::Direct))
                     }
                     Err(error) => Err(error),
                 }
@@ -2015,7 +2115,7 @@ async fn handle_session_update(
                     .push(notification.clone());
                 state.early_update_count += 1;
                 state.early_update_bytes += notification_bytes;
-                Ok(false)
+                Ok(Delivery::None)
             }
         } else {
             let incarnation = state
@@ -2060,24 +2160,31 @@ async fn handle_session_update(
                     if let Some(session) = state.active_sessions.get_mut(&session_id) {
                         apply_legacy_control_update(session, &update);
                     }
-                    Ok(true)
+                    Ok(Delivery::Broadcast)
                 }
             } else {
                 if let Some(session) = state.active_sessions.get_mut(&session_id) {
                     apply_legacy_control_update(session, &update);
                 }
-                Ok(true)
+                Ok(Delivery::Broadcast)
             }
         };
         flush_runtime(&mut state, sink);
-        result
+        (result, attachment_subscriber)
     };
     match outcome {
-        Ok(true) => {
+        (Ok(Delivery::Broadcast), _) => {
             sink.send(json!({ "type": "acp/session_update", "notification": notification }));
         }
-        Ok(false) => {}
-        Err(error) => sink.acp_error(error, None, Some("session/update")),
+        (Ok(Delivery::Direct(subscriber_id)), _) => sink.send_to(
+            subscriber_id,
+            json!({ "type": "acp/session_update", "notification": notification }),
+        ),
+        (Ok(Delivery::None), _) => {}
+        (Err(error), Some(subscriber_id)) => {
+            sink.acp_error_to(subscriber_id, error, None, Some("session/update"));
+        }
+        (Err(error), None) => sink.acp_error(error, None, Some("session/update")),
     }
 }
 
@@ -2238,6 +2345,7 @@ async fn handle_command(
     mut prompt_start: Option<PromptStartGuard>,
 ) -> Result<(), Error> {
     let CommandContext {
+        subscriber_id,
         options,
         state,
         sink,
@@ -2454,25 +2562,48 @@ async fn handle_command(
             let request_id = string_field(&command, "requestId")?.to_string();
             let session_id = string_field(&command, "sessionId")?.to_string();
             require_agent_method(operation, &state).await?;
-            let cwd = reserve_attachment(&session_id, &state).await?;
             let attachment_kind = if operation == "session/load" {
                 RuntimeSessionOperationKind::Load
             } else {
                 RuntimeSessionOperationKind::Resume
             };
+            let reservation = reserve_attachment(&session_id, attachment_kind, &state).await?;
+            let cwd = reservation.cwd().clone();
+            let reload = reservation.is_reload();
+            state
+                .lock()
+                .await
+                .attachment_subscribers
+                .insert(session_id.clone(), subscriber_id);
             let attachment_incarnation = {
                 let mut state = state.lock().await;
                 let epoch = state.runtime.epoch().to_string();
-                let incarnation = state
-                    .runtime
-                    .start_attachment(
+                let started = match reservation {
+                    AttachmentReservation::Fresh { .. } => state.runtime.start_attachment(
                         &epoch,
                         session_id.clone(),
                         cwd.to_string_lossy(),
                         request_id.clone(),
                         attachment_kind,
-                    )
-                    .map_err(runtime_state_error)?;
+                    ),
+                    AttachmentReservation::Reload { incarnation, .. } => state
+                        .runtime
+                        .start_reload(
+                            &epoch,
+                            &session_id,
+                            incarnation,
+                            request_id.clone(),
+                            attachment_kind,
+                        )
+                        .map(|()| incarnation),
+                };
+                let incarnation = match started {
+                    Ok(incarnation) => incarnation,
+                    Err(error) => {
+                        clear_attachment_tracking(&mut state, &session_id, false);
+                        return Err(runtime_state_error(error));
+                    }
+                };
                 flush_runtime(&mut state, &sink);
                 incarnation
             };
@@ -2511,70 +2642,84 @@ async fn handle_command(
                         attachment_incarnation,
                         &request_id,
                         attachment_kind,
+                        reload,
                         &error,
                     )?;
-                    state.pending_attachments.remove(&session_id);
-                    state.session_updates.remove(&session_id);
-                    state.attachment_updates.remove(&session_id);
-                    state.attachment_update_bytes.remove(&session_id);
+                    clear_attachment_tracking(&mut state, &session_id, true);
                     return Err(error);
                 }
             };
             if let Err(error) = ensure_relay_size(&response, "session attachment response") {
-                let epoch = state.runtime.epoch().to_string();
-                state
-                    .runtime
-                    .fail_attachment(
-                        &epoch,
+                fail_runtime_attachment(
+                    &mut state,
+                    &session_id,
+                    attachment_incarnation,
+                    &request_id,
+                    attachment_kind,
+                    reload,
+                    &error,
+                )?;
+                clear_attachment_tracking(&mut state, &session_id, true);
+                return Err(error);
+            }
+            let tracked = if reload {
+                let result = response_controls(&response).and_then(|(modes, config_options)| {
+                    let validation = state.session_updates.get(&session_id).ok_or_else(|| {
+                        runtime_state_error("missing same-session reload validation state")
+                    })?;
+                    if let Some(reason) = &validation.invalid_reason {
+                        return Err(semantic_error(format!(
+                            "Agent session replay was invalid: {reason}"
+                        )));
+                    }
+                    let active = state.active_sessions.get(&session_id).ok_or_else(|| {
+                        runtime_state_error("same-session reload lost its active session")
+                    })?;
+                    if active.incarnation != attachment_incarnation {
+                        return Err(runtime_state_error(
+                            "same-session reload incarnation changed before commit",
+                        ));
+                    }
+                    Ok((modes, config_options))
+                });
+                result.map(Some)
+            } else {
+                track_session(
+                    &mut state,
+                    &session_id,
+                    cwd.clone(),
+                    &response,
+                    Some(&session_id),
+                )
+                .map(|_| None)
+            };
+            let replacement_controls = match tracked {
+                Ok(controls) => controls,
+                Err(error) => {
+                    fail_runtime_attachment(
+                        &mut state,
                         &session_id,
                         attachment_incarnation,
                         &request_id,
                         attachment_kind,
-                        json!({ "message": error.message.clone(), "data": error.data.clone() }),
-                    )
-                    .map_err(runtime_state_error)?;
-                state.pending_attachments.remove(&session_id);
-                state.session_updates.remove(&session_id);
-                state.attachment_updates.remove(&session_id);
-                state.attachment_update_bytes.remove(&session_id);
-                return Err(error);
-            }
-            if let Err(error) = track_session(
-                &mut state,
-                &session_id,
-                cwd.clone(),
-                &response,
-                Some(&session_id),
-            ) {
-                let epoch = state.runtime.epoch().to_string();
-                state
-                    .runtime
-                    .fail_attachment(
-                        &epoch,
-                        &session_id,
-                        attachment_incarnation,
-                        &request_id,
-                        attachment_kind,
-                        json!({ "message": error.message.clone(), "data": error.data.clone() }),
-                    )
-                    .map_err(runtime_state_error)?;
-                state.pending_attachments.remove(&session_id);
-                state.session_updates.remove(&session_id);
-                state.attachment_updates.remove(&session_id);
-                state.attachment_update_bytes.remove(&session_id);
-                return Err(error);
-            }
-            state.pending_attachments.remove(&session_id);
-            let replay = state
-                .attachment_updates
-                .remove(&session_id)
-                .unwrap_or_default();
-            state.attachment_update_bytes.remove(&session_id);
-            let _legacy_replay = replay;
+                        reload,
+                        &error,
+                    )?;
+                    clear_attachment_tracking(&mut state, &session_id, true);
+                    return Err(error);
+                }
+            };
             let epoch = state.runtime.epoch().to_string();
-            state
-                .runtime
-                .complete_attachment(
+            let completed = if reload {
+                state.runtime.complete_reload(
+                    &epoch,
+                    &session_id,
+                    attachment_incarnation,
+                    &request_id,
+                    response.clone(),
+                )
+            } else {
+                state.runtime.complete_attachment(
                     &epoch,
                     &session_id,
                     attachment_incarnation,
@@ -2582,17 +2727,43 @@ async fn handle_command(
                     attachment_kind,
                     response.clone(),
                 )
-                .map_err(runtime_state_error)?;
-            set_active_incarnation(&mut state, &session_id, attachment_incarnation);
+            };
+            if let Err(error) = completed {
+                clear_attachment_tracking(&mut state, &session_id, true);
+                return Err(runtime_state_error(error));
+            }
+            if let Some((modes, config_options)) = replacement_controls {
+                let active = state
+                    .active_sessions
+                    .get_mut(&session_id)
+                    .expect("same-session reload was validated above");
+                active.modes = modes;
+                active.config_options = config_options;
+            } else {
+                set_active_incarnation(&mut state, &session_id, attachment_incarnation);
+            }
+            if let Some(validation) = state.session_updates.get_mut(&session_id) {
+                validation.retire_turn();
+            }
+            state.pending_attachments.remove(&session_id);
+            let attachment_subscriber = state
+                .attachment_subscribers
+                .remove(&session_id)
+                .unwrap_or(subscriber_id);
+            state.attachment_update_counts.remove(&session_id);
+            state.attachment_update_bytes.remove(&session_id);
             drop(state);
-            sink.send(json!({
-                "type": "acp/session_attached",
-                "requestId": request_id,
-                "method": if operation == "session/load" { "load" } else { "resume" },
-                "sessionId": session_id,
-                "cwd": cwd,
-                "response": response,
-            }));
+            sink.send_to(
+                attachment_subscriber,
+                json!({
+                    "type": "acp/session_attached",
+                    "requestId": request_id,
+                    "method": if operation == "session/load" { "load" } else { "resume" },
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "response": response,
+                }),
+            );
         }
         "session/fork" => {
             let request_id = string_field(&command, "requestId")?.to_string();
@@ -3886,8 +4057,9 @@ fn local_additional_directories(options: &Options) -> Vec<PathBuf> {
 
 async fn reserve_attachment(
     session_id: &str,
+    kind: RuntimeSessionOperationKind,
     state: &Arc<Mutex<BridgeState>>,
-) -> Result<PathBuf, Error> {
+) -> Result<AttachmentReservation, Error> {
     let mut state = state.lock().await;
     if state.pending_closes.contains(session_id) {
         return Err(Error::invalid_request().data("session close cleanup is still running"));
@@ -3895,38 +4067,63 @@ async fn reserve_attachment(
     if state.pending_deletions.contains(session_id) {
         return Err(Error::invalid_request().data("session deletion is already running"));
     }
-    if state.active_sessions.contains_key(session_id) {
-        return Err(
-            Error::invalid_request().data(format!("session is already active: {session_id}"))
-        );
-    }
-    let listed = state.listed_sessions.get(session_id).ok_or_else(|| {
-        Error::invalid_params().data(format!(
-            "session was not returned by session/list: {session_id}"
-        ))
-    })?;
-    let cwd = listed.cwd.clone();
-    if state.active_sessions.len() + state.pending_creations + state.pending_attachments.len()
-        >= MAX_TRACKED_SESSIONS
-    {
-        return Err(semantic_error(format!(
-            "Active session limit reached ({MAX_TRACKED_SESSIONS})"
-        )));
-    }
+    let tracked = state.active_sessions.get(session_id).map(|session| {
+        let runtime = state.runtime.session(session_id);
+        let idle = runtime.is_some_and(|runtime| {
+            runtime.active_turn.is_none()
+                && runtime.queued_prompts.is_empty()
+                && runtime.operation.is_none()
+                && runtime.lifecycle == SessionLifecycle::Active
+        });
+        (session.cwd.clone(), session.incarnation, idle)
+    });
+    let reservation = match tracked {
+        Some((cwd, incarnation, true)) => {
+            if kind != RuntimeSessionOperationKind::Load {
+                return Err(Error::invalid_request()
+                    .data("an active tracked session can only be reloaded with session/load"));
+            }
+            AttachmentReservation::Reload { cwd, incarnation }
+        }
+        Some(_) => {
+            return Err(Error::invalid_request()
+                .data("session/load requires the tracked session to be idle"));
+        }
+        None => {
+            let listed = state.listed_sessions.get(session_id).ok_or_else(|| {
+                Error::invalid_params().data(format!(
+                    "session was not returned by session/list: {session_id}"
+                ))
+            })?;
+            if state.active_sessions.len()
+                + state.pending_creations
+                + state.pending_attachments.len()
+                >= MAX_TRACKED_SESSIONS
+            {
+                return Err(semantic_error(format!(
+                    "Active session limit reached ({MAX_TRACKED_SESSIONS})"
+                )));
+            }
+            AttachmentReservation::Fresh {
+                cwd: listed.cwd.clone(),
+            }
+        }
+    };
     if !state.pending_attachments.insert(session_id.to_string()) {
         return Err(Error::invalid_request().data("session attachment is already running"));
     }
-    state.session_updates.insert(
-        session_id.to_string(),
-        SessionUpdateSemanticState::default(),
-    );
     state
-        .attachment_updates
-        .insert(session_id.to_string(), Vec::new());
+        .session_updates
+        .entry(session_id.to_string())
+        .or_default()
+        .retire_turn();
+    state
+        .attachment_update_counts
+        .insert(session_id.to_string(), 0);
     state
         .attachment_update_bytes
         .insert(session_id.to_string(), 0);
-    Ok(cwd)
+    Ok(reservation)
 }
 
 fn reserve_session_operation(
@@ -3940,6 +4137,7 @@ fn reserve_session_operation(
         );
     }
     if state.prompts.contains(session_id)
+        || state.pending_attachments.contains(session_id)
         || state.pending_forks.contains(session_id)
         || state.pending_closes.contains(session_id)
         || state.pending_controls.contains(session_id)
@@ -3975,6 +4173,9 @@ fn release_session_operation(
 
 fn finish_prompt_operation(state: &mut BridgeState, session_id: &str, lifecycle: &PromptLifecycle) {
     release_session_operation(state, session_id, SessionOperation::Prompt);
+    if let Some(validation) = state.session_updates.get_mut(session_id) {
+        validation.retire_turn();
+    }
     // Notify only after the exclusion guard is gone. A shutdown waiter that
     // wakes on this edge must observe the terminal prompt state instead of
     // sleeping again with no later notification.
@@ -4329,7 +4530,7 @@ mod tests {
         tokio::spawn(run_with_cancellation(
             Arc::new(options),
             command_rx,
-            event_tx,
+            event_tx.into(),
             CancellationToken::new(),
         ));
 
@@ -4376,7 +4577,7 @@ mod tests {
         let bridge = tokio::spawn(run_with_cancellation(
             Arc::new(options),
             command_rx,
-            event_tx,
+            event_tx.into(),
             cancellation.clone(),
         ));
 
@@ -4512,6 +4713,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_same_session_load_rolls_back_and_following_prompt_runs() {
+        async fn next_event(events: &mut mpsc::UnboundedReceiver<String>) -> Value {
+            let raw = tokio::time::timeout(Duration::from_secs(10), events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge stopped unexpectedly");
+            serde_json::from_str(&raw).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--fail-load-once",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let (commands, command_rx) = mpsc::channel(16);
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let bridge = tokio::spawn(run_with_cancellation(
+            Arc::new(options),
+            command_rx,
+            event_tx.into(),
+            cancellation.clone(),
+        ));
+
+        loop {
+            let event = next_event(&mut events).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+        commands
+            .send(BridgeInput::Command {
+                subscriber_id: 7,
+                raw: json!({
+                    "type": "session/new",
+                    "requestId": "new",
+                    "cwd": cwd,
+                })
+                .to_string(),
+            })
+            .await
+            .unwrap();
+        loop {
+            if next_event(&mut events).await["type"] == "acp/session_created" {
+                break;
+            }
+        }
+
+        commands
+            .send(BridgeInput::Command {
+                subscriber_id: 7,
+                raw: json!({
+                    "type": "session/load",
+                    "requestId": "reload",
+                    "sessionId": "test-session",
+                })
+                .to_string(),
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            assert_ne!(
+                event["type"], "acp/session_attached",
+                "a rejected load must not commit replacement state"
+            );
+            if event["type"] == "bridge/internal_direct"
+                && event["event"]["type"] == "bridge/error"
+                && event["event"]["requestId"] == "reload"
+            {
+                assert!(
+                    event["event"]
+                        .to_string()
+                        .contains("Synthetic load failure")
+                );
+                break;
+            }
+        }
+
+        commands
+            .send(BridgeInput::Command {
+                subscriber_id: 7,
+                raw: json!({
+                    "type": "session/prompt",
+                    "requestId": "after-rejected-load",
+                    "sessionId": "test-session",
+                    "prompt": [{ "type": "text", "text": "message-actions-flow" }],
+                })
+                .to_string(),
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event["type"] == "acp/prompt_complete" && event["requestId"] == "after-rejected-load"
+            {
+                break;
+            }
+        }
+
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge did not stop")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_cancels_queued_prompt_before_stopped_without_dispatching_it() {
         let cwd = env!("CARGO_MANIFEST_DIR");
         let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
@@ -4528,7 +4849,7 @@ mod tests {
         let bridge = tokio::spawn(run_with_cancellation(
             Arc::new(options),
             command_rx,
-            event_tx,
+            event_tx.into(),
             cancellation.clone(),
         ));
 
@@ -4615,7 +4936,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let queued_operation_id = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event: Value = serde_json::from_str(
                     &events
@@ -4628,10 +4949,7 @@ mod tests {
                     && event["event"]["type"] == "bridge/intent_ack"
                     && event["event"]["requestId"] == "queued"
                 {
-                    break event["event"]["operationId"]
-                        .as_str()
-                        .expect("accepted intent has an operation ID")
-                        .to_string();
+                    break;
                 }
             }
         })
@@ -4639,7 +4957,6 @@ mod tests {
         .expect("queued prompt was not accepted");
 
         cancellation.cancel();
-        let mut queued_cancelled = false;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event: Value = serde_json::from_str(
@@ -4653,23 +4970,7 @@ mod tests {
                     !(event["type"] == "acp/prompt_started" && event["requestId"] == "queued"),
                     "a queued prompt must not be dispatched after shutdown begins"
                 );
-                if event["type"] == "bridge/internal_runtime_delta"
-                    && event["value"]["intentResults"]
-                        .as_array()
-                        .is_some_and(|results| {
-                            results.iter().any(|result| {
-                                result["operationId"] == queued_operation_id
-                                    && result["status"] == "cancelled"
-                            })
-                        })
-                {
-                    queued_cancelled = true;
-                }
                 if event["type"] == "bridge/phase" && event["phase"] == "stopped" {
-                    assert!(
-                        queued_cancelled,
-                        "the accepted queued intent must be terminal before stopped"
-                    );
                     break;
                 }
             }
@@ -4719,7 +5020,7 @@ mod tests {
     #[test]
     fn requester_error_is_wrapped_for_direct_delivery() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
 
         sink.error_to(
             42,
@@ -4738,7 +5039,7 @@ mod tests {
     #[test]
     fn failed_interaction_delivery_is_never_reported_as_resolved() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let success = json!({
             "type": "acp/elicitation_resolved",
             "elicitationId": "elicitation",
@@ -4769,7 +5070,7 @@ mod tests {
             ..BridgeState::default()
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let notification: SessionNotification = serde_json::from_value(json!({
             "sessionId": "new-session",
             "update": {
@@ -4819,7 +5120,7 @@ mod tests {
             },
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let invalid: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -4891,7 +5192,7 @@ mod tests {
         bridge_state.published_runtime_seq = bridge_state.runtime.seq();
         let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let answer: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -4979,7 +5280,7 @@ mod tests {
         let before = bridge_state.runtime.snapshot();
         let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let late: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -5023,14 +5324,14 @@ mod tests {
             .pending_attachments
             .insert("session".to_string());
         bridge_state
-            .attachment_updates
-            .insert("session".to_string(), Vec::new());
+            .attachment_update_counts
+            .insert("session".to_string(), 0);
         bridge_state
             .attachment_update_bytes
             .insert("session".to_string(), 0);
         let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let replay: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -5059,10 +5360,6 @@ mod tests {
                 }),
             },
         ));
-        assert!(matches!(
-            state.runtime.session("session").unwrap().transcript,
-            crate::runtime_state::TranscriptBaseline::PendingAttachment
-        ));
         assert!(
             !serde_json::to_string(&state.runtime.snapshot())
                 .unwrap()
@@ -5079,11 +5376,12 @@ mod tests {
                 json!({ "sessionId": "session" }),
             )
             .unwrap();
-        assert!(matches!(
-            &state.runtime.session("session").unwrap().transcript,
-            crate::runtime_state::TranscriptBaseline::AgentReplay { entries, .. }
-                if entries.len() == 1
-        ));
+        assert!(
+            !serde_json::to_string(&state.runtime.snapshot())
+                .unwrap()
+                .contains("candidate"),
+            "successful load replay is transient browser delivery, not bridge history",
+        );
         assert!(
             state
                 .runtime
@@ -5101,13 +5399,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_same_session_reload_update_is_private_and_poisoned_for_rollback() {
+        let mut bridge_state = BridgeState::default();
+        let epoch = bridge_state.runtime.epoch().to_string();
+        let incarnation = bridge_state
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        bridge_state
+            .runtime
+            .start_reload(
+                &epoch,
+                "session",
+                incarnation,
+                "load",
+                RuntimeSessionOperationKind::Load,
+            )
+            .unwrap();
+        bridge_state.active_sessions.insert(
+            "session".to_string(),
+            ActiveSession {
+                cwd: PathBuf::from("/workspace"),
+                modes: None,
+                config_options: Value::Array(Vec::new()),
+                incarnation,
+            },
+        );
+        bridge_state
+            .pending_attachments
+            .insert("session".to_string());
+        bridge_state
+            .attachment_subscribers
+            .insert("session".to_string(), 42);
+        bridge_state
+            .attachment_update_counts
+            .insert("session".to_string(), 0);
+        bridge_state
+            .attachment_update_bytes
+            .insert("session".to_string(), 0);
+        let state = Arc::new(Mutex::new(bridge_state));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink { tx: tx.into() };
+        let invalid: SessionNotification = serde_json::from_value(json!({
+            "sessionId": "session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "invalid-loaded-answer",
+                "content": { "type": "image", "data": "AA==", "mimeType": "text/html" }
+            }
+        }))
+        .unwrap();
+
+        handle_session_update(invalid, &state, &sink, None).await;
+
+        let state = state.lock().await;
+        assert!(
+            state.session_updates["session"].invalid_reason.is_some(),
+            "invalid replacement input must force the later load response to roll back"
+        );
+        assert_eq!(
+            state.runtime.session("session").unwrap().incarnation,
+            incarnation
+        );
+        drop(state);
+        let envelopes = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+            .collect::<Vec<_>>();
+        let envelope = envelopes
+            .iter()
+            .find(|event| event["type"] == "bridge/internal_direct")
+            .expect("invalid reload update error was not routed to its requester");
+        assert_eq!(envelope["type"], "bridge/internal_direct");
+        assert_eq!(envelope["subscriberId"], 42);
+        assert_eq!(envelope["event"]["type"], "bridge/error");
+        assert!(
+            envelopes.iter().all(|event| {
+                !matches!(
+                    event["type"].as_str(),
+                    Some("bridge/error" | "acp/session_update")
+                )
+            }),
+            "invalid reload update escaped the private delivery path"
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_early_updates_prevent_session_commit_and_clear_cleanly() {
         let state = Arc::new(Mutex::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let invalid: SessionNotification = serde_json::from_value(json!({
             "sessionId": "new-session",
             "update": {
@@ -5153,7 +5541,7 @@ mod tests {
     #[test]
     fn bounds_structured_acp_errors_before_browser_relay() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         sink.acp_error(
             Error::internal_error()
                 .data(json!({ "payload": "x".repeat(MAX_BRIDGE_ERROR_DATA_BYTES + 1) })),
@@ -5179,7 +5567,7 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         sink.send(json!({ "padding": "x".repeat(MAX_BRIDGE_MESSAGE_BYTES) }));
         let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(event["type"], "bridge/error");
@@ -5241,10 +5629,18 @@ mod tests {
             session_info("saved", "/agent/workspace"),
         );
         assert_eq!(
-            reserve_attachment("saved", &state).await.unwrap(),
-            PathBuf::from("/agent/workspace")
+            reserve_attachment("saved", RuntimeSessionOperationKind::Load, &state)
+                .await
+                .unwrap(),
+            AttachmentReservation::Fresh {
+                cwd: PathBuf::from("/agent/workspace")
+            }
         );
-        assert!(reserve_attachment("saved", &state).await.is_err());
+        assert!(
+            reserve_attachment("saved", RuntimeSessionOperationKind::Load, &state)
+                .await
+                .is_err()
+        );
 
         let mut locked = state.lock().await;
         locked.pending_attachments.clear();
@@ -5258,8 +5654,54 @@ mod tests {
             },
         );
         drop(locked);
-        assert!(reserve_attachment("saved", &state).await.is_err());
-        assert!(reserve_attachment("unknown", &state).await.is_err());
+        assert!(
+            reserve_attachment("saved", RuntimeSessionOperationKind::Load, &state)
+                .await
+                .is_err()
+        );
+        assert!(
+            reserve_attachment("unknown", RuntimeSessionOperationKind::Load, &state)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reserves_an_idle_tracked_session_for_best_effort_authoritative_reload() {
+        let mut bridge = BridgeState::default();
+        let epoch = bridge.runtime.epoch().to_string();
+        let incarnation = bridge
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/agent/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        bridge.active_sessions.insert(
+            "session".to_string(),
+            ActiveSession {
+                cwd: PathBuf::from("/agent/workspace"),
+                modes: None,
+                config_options: Value::Array(Vec::new()),
+                incarnation,
+            },
+        );
+        let state = Arc::new(Mutex::new(bridge));
+
+        let reservation = reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
+            .await
+            .expect("an idle tracked session must reach the Agent's session/load implementation");
+
+        assert_eq!(
+            reservation,
+            AttachmentReservation::Reload {
+                cwd: PathBuf::from("/agent/workspace"),
+                incarnation,
+            }
+        );
+        assert!(state.lock().await.pending_attachments.contains("session"));
     }
 
     #[test]
@@ -5360,7 +5802,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_browser_intent_retry_after_reconnect_is_not_redispatched() {
+    fn completed_browser_intent_is_not_locally_deduplicated_after_retirement() {
         let mut state = BridgeState::default();
         let epoch = state.runtime.epoch().to_string();
         let incarnation = state
@@ -5406,13 +5848,11 @@ mod tests {
             .unwrap();
 
         let replay = admit_browser_intent(&mut state, 2, "stable-intent", &command).unwrap();
-        assert_eq!(
-            replay,
-            IntentAck::Duplicate {
-                operation_id,
-                status: crate::runtime_state::IntentStatus::AgentAcknowledged,
-            }
-        );
+        let replay_operation_id = match replay {
+            IntentAck::Accepted { operation_id } => operation_id,
+            other => panic!("retired intent must be admitted as new work, got {other:?}"),
+        };
+        assert_ne!(replay_operation_id, operation_id);
     }
 
     #[tokio::test]
@@ -5461,7 +5901,7 @@ mod tests {
         };
         let incarnation = state.lock().await.active_sessions["session"].incarnation;
         let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         let lifecycle = Arc::new(PromptLifecycle::default());
         let cancellation = CancellationToken::new();
         let mut claimed = wait_for_queued_prompt_dispatch(
@@ -5822,7 +6262,7 @@ mod tests {
                 .unwrap();
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        apply_runtime_effects(&state, &EventSink { tx }, None).await;
+        apply_runtime_effects(&state, &EventSink { tx: tx.into() }, None).await;
 
         assert!(matches!(
             permission_receiver.await.unwrap().outcome,
@@ -5905,7 +6345,7 @@ mod tests {
             .start_delete(&epoch, "session", incarnation, "delete")
             .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         flush_runtime(&mut state, &sink);
         while rx.try_recv().is_ok() {}
 
@@ -5934,7 +6374,9 @@ mod tests {
             );
         }
 
-        let error = reserve_attachment("session", &state).await.unwrap_err();
+        let error = reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("close cleanup"));
         assert!(!state.lock().await.pending_attachments.contains("session"));
     }
@@ -6061,6 +6503,8 @@ mod tests {
             uncertain.runtime.session("uncertain").unwrap().lifecycle,
             SessionLifecycle::Uncertain
         );
+        let uncertain_session = uncertain.runtime.session("uncertain").unwrap();
+        assert!(uncertain_session.active_turn.is_none());
 
         let mut failed = BridgeState::default();
         let epoch = failed.runtime.epoch().to_string();
@@ -6089,17 +6533,8 @@ mod tests {
             failed.runtime.session("failed").unwrap().lifecycle,
             SessionLifecycle::Active
         );
-        assert!(matches!(
-            failed
-                .runtime
-                .session("failed")
-                .unwrap()
-                .observed_turns
-                .back()
-                .unwrap()
-                .outcome,
-            crate::runtime_state::ObservedTurnOutcome::Failed { .. }
-        ));
+        let failed_session = failed.runtime.session("failed").unwrap();
+        assert!(failed_session.active_turn.is_none());
     }
 
     #[tokio::test]
@@ -6233,7 +6668,7 @@ mod tests {
             );
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         cancel_interactions("session", "session_cancelled", &state, &sink).await;
 
         assert!(matches!(
@@ -6253,9 +6688,9 @@ mod tests {
         let runtime_session = runtime.sessions.get("session").unwrap();
         assert!(runtime_session.permissions.is_empty());
         assert!(runtime_session.elicitations.is_empty());
-        assert_eq!(
-            runtime_session.url_flows["session-url"].status,
-            UrlFlowStatus::Cancelled
+        assert!(
+            !runtime_session.url_flows.contains_key("session-url"),
+            "a terminal URL flow must be removed instead of retained as completed state"
         );
         assert!(
             runtime
@@ -6296,7 +6731,7 @@ mod tests {
             ..BridgeState::default()
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
+        let sink = EventSink { tx: tx.into() };
         for index in 0..(MAX_EARLY_UPDATES + 16) {
             let notification: SessionNotification = serde_json::from_value(json!({
                 "sessionId": "new-session",

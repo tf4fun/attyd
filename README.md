@@ -30,7 +30,7 @@ The first implementation includes:
 - one Bridge-owned ACP upstream connection per attyd process; browser WebSocket connections are disposable subscribers, while stdio mode launches one Agent process for the Bridge lifetime;
 - ACP v1 `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/set_mode`, and `session/set_config_option`, with request-scoped prompt/control acknowledgements, serialized Agent updates, and bounded transactional replay of creation notifications that arrive before `session/new` returns;
 - ACP v1 Agent-owned `authenticate` plus capability-gated `logout`, with bounded advertised methods, request-scoped acknowledgements, Zed External Agent-style sign-in UI, raw response inspection, and automatic retry of the original session restoration path after `auth_required`; stable terminal authentication is also negotiated and rendered as an embedded xterm PTY that reproduces the configured Agent invocation, appends only its advertised bounded args/environment overrides, supports input/resize/cancel, and reconnects the Agent after a zero exit;
-- capability-gated `session/list`, `session/load`, `session/resume`, `session/close`, and `session/delete`, with bounded pagination, exact last-thread restoration on browser reconnect (falling back to the most recently updated session), transactional replay/switching/closing, and the Agent remaining the source of truth; the cwd sent with stdio discovery is a request filter rather than a client-enforced invariant, while every Agent-returned session retains its own portable absolute cwd; already-open threads switch locally like Zed instead of issuing a duplicate `session/load`; mobile resume performs a bounded browser-bridge ping/pong probe and a terminal connection state exposes an explicit reconnect action over the disabled composer;
+- capability-gated `session/list`, `session/load`, `session/resume`, `session/close`, and `session/delete`, with bounded pagination and the Agent remaining the only completed-history authority; an active reconnect restores only the current in-memory turn, while an idle completed reconnect performs a best-effort transactional `session/load` or reports `HistoryUnavailable`; the cwd sent with stdio discovery is a request filter rather than a client-enforced invariant, while every Agent-returned session retains its own portable absolute cwd; same-page thread switching may reuse that page's disposable view, but the Rust host keeps no completed thread cache; mobile resume performs a bounded browser-bridge ping/pong probe and a terminal connection state exposes an explicit reconnect action over the disabled composer;
 - capability-gated experimental `session/fork`, preserving inherited visible context during a transactional switch while locking source-session mutations until the matching Agent response;
 - a New thread workspace prompt that pre-fills attyd's startup cwd for stdio and intentionally starts blank for remote transports; remote absolute paths are sent only as ACP session cwd, while load/resume/fork keep the cwd owned by that Agent session;
 - static, capability-negotiated stdio `additionalDirectories` and MCP server definitions on every created, loaded, or resumed session;
@@ -178,7 +178,7 @@ Rust host (single executable)
   │    ├─ NDJSON/stdin+stdout ── local ACP v1 Agent
   │    ├─ POST + SSE ────────── remote ACP v1 Agent
   │    └─ WebSocket ─────────── remote ACP v1 Agent
-  ├─ bounded in-memory ACP v1 runtime replay, keyed by sessionId
+  ├─ bounded active-turn runtime, keyed by sessionId (no completed-history cache)
   ├─ stdio-only Agent terminal-auth PTY ── configured Agent command + advertised args/env
   ├─ permission / elicitation rendezvous
   ├─ configured-root filesystem implementation
@@ -193,15 +193,17 @@ There are two deliberately separate protocols:
 
 This separation keeps process execution, files, and terminal handles on the trusted host while allowing the UI to reconnect or evolve independently.
 
-The Agent remains the only durable authority. The Rust Bridge keeps a bounded, non-persistent
-runtime journal only for sessions currently open in that ACP connection, including active turns,
-streamed updates, terminal snapshots, permissions, and elicitations. Losing or reloading a browser
-does not cancel those turns: a new subscriber atomically receives the runtime projection before live
-events. Exiting attyd discards the journal; when the Agent advertises replay, the next process
-reconstructs history through its `session/list` plus `session/load`/`session/resume` capabilities.
-An Agent without those methods cannot be recovered across a Bridge restart without adding durable
-client storage, which attyd deliberately does not do. Different `sessionId`s may run concurrently;
-prompt and mutation exclusion remains per session, not global.
+The Agent remains the only completed-history authority. The Rust Bridge keeps one bounded active
+turn per prompting session plus queued work, small control metadata, and live resources such as
+permissions, elicitations and unreleased terminals. At the turn's terminal transition it drops all
+prompt, message, thought, tool and response content instead of moving it into a runtime journal.
+Losing a browser does not cancel an active turn: a new subscriber atomically receives that active
+projection before live events. After retirement, reconnect performs `session/load` when advertised
+or reports `HistoryUnavailable`; `session/resume` is not treated as history replay. An Agent without
+load cannot restore completed history, which attyd accepts rather than adding client storage.
+Different `sessionId`s may run concurrently; prompt/load/mutation exclusion remains per session, not
+global. See [the active-turn runtime contract](docs/active-turn-runtime.md) and its
+[TDD plan](docs/active-turn-runtime-tests.md).
 
 The repository keeps the executable as a conventional Rust binary crate while separating the
 build-time web application clearly:

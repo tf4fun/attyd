@@ -3,7 +3,8 @@
 This is the acceptance ledger for moving ACP lifecycle ownership from the browser into the Rust
 bridge. The bridge is a complete, long-lived ACP v1 client. A browser is a disposable view that
 sends user intents and renders versioned business state; it does not infer whether an ACP turn,
-interaction, or session mutation is active.
+interaction, or session mutation is active. [active-turn-runtime.md](active-turn-runtime.md) is the
+normative retention and recovery contract: the bridge never stores completed conversation history.
 
 The test plan was adversarially reviewed from three independent angles: ACP protocol coverage,
 concurrency and lifecycle faults, and model/property testing. A checked item is not complete merely
@@ -11,25 +12,30 @@ because a similarly named UI test exists. It must pass at the layer named below.
 
 ## Product boundary
 
-The Agent remains the only durable authority. The bridge owns non-persistent runtime state for the
-life of one ACP connection. Browser state is only a projection.
+The Agent is the only completed-history authority. The bridge owns non-persistent state only for
+active turns, accepted queued work, live ACP resources, control/lifecycle metadata and transient
+delivery. Browser state is a disposable projection.
 
 ```text
-Agent durable state  ->  Bridge canonical runtime  ->  Subscriber projection
-                              |                              |
-                         ACP requests                  user intents
+Agent completed history --load--> Subscriber replacement projection
+          ^                             ^
+          |                             |
+          `---- Bridge active runtime --'
+                 (no completed turns)
 ```
 
 The browser may own an unsent composer draft and purely visual preferences such as disclosure,
 selection, and scroll position. Once an intent is accepted, its lifecycle belongs to the bridge.
 This includes submitted prompts, queued follow-up prompts, permission and elicitation responses,
 session mutations, and close-before-delete transactions. Disconnecting every browser must not
-cancel or abandon any of them.
+cancel or abandon accepted active work. After a turn retires, the bridge no longer owns its content;
+a later browser obtains Agent replay through `session/load` or receives `HistoryUnavailable`.
 
 The browser-facing protocol will be versioned business semantics:
 
-- an atomic `generation + revision` snapshot;
+- an atomic active-turn `generation + revision` snapshot;
 - ordered deltas with exact `fromRevision -> toRevision` continuity;
+- transactional session replacement generations for `session/load`;
 - requester-directed intent acceptance/rejection;
 - bounded debug payloads that preserve ACP data but are never the sole source of liveness state.
 
@@ -43,40 +49,35 @@ indistinguishable from a valid early update for the new turn; correctness at tha
 the Agent to finish sending a turn's notifications before its PromptResponse. This is an explicit
 protocol ambiguity, not a state the bridge can safely guess from payload shape or timing.
 
-### Materialized state and revisioned replication
+### Active materialization and transactional replacement
 
-The database-replication analogy applies only to an atomic snapshot, a connection epoch, a global
-sequence watermark, and ordered catch-up deltas. The bridge does not implement a second checkpoint
-store or a crash-safe WAL. Each business entity has exactly one materialized representation:
+The replication analogy applies only while a turn or live resource exists. The bridge does not
+implement a checkpoint store, completed-history replica, or crash-safe WAL:
 
 ```text
-Agent authority, observable according to negotiated capabilities
-  `- Bridge runtime
-       |- AgentReplay transcript baseline, or HistoryUnavailable
-       |- BridgeObserved completed/failed turns
-       |- one ActiveTurn per session
-       |- session state, interactions, resources and control operation
-       `- bounded raw diagnostics + bounded delta catch-up journal
-            `- Browser replica: snapshot(epoch, seq) + continuous deltas
+Bridge runtime
+|- one normalized ActiveTurn per prompting session
+|- bounded queued prompts
+|- live interactions, URL flows, terminals and MCP operations
+|- bounded control/lifecycle metadata
+`- bounded active snapshot and load-delivery transactions
 ```
 
-`session/load` closes one atomic Agent replay transaction, but ACP v1 supplies no durable turn IDs,
-historical PromptResponses, stop reasons, or formal turn boundaries. The result is therefore an
-ordered `AgentReplay` baseline whose internal turn boundaries may be unknown. `session/resume`
-explicitly does not replay previous messages and produces `HistoryUnavailable`, not an empty or
-authoritative transcript.
+A PromptResponse, prompt error, or transport loss drives the active turn through one terminal
+delivery transition. After the Hub has committed an owned terminal event and any active-snapshot
+leases have ended, the bridge drops all turn content. Sending cancel remains nonterminal until one
+of those terminal conditions occurs.
 
-A live PromptResponse seals a `BridgeObserved` turn; it does not acknowledge Agent persistence. A
-prompt error seals a failed partial observed turn. Sending cancel is nonterminal: the active turn
-remains `CancelRequested` until PromptResponse, an error, or transport loss makes it cancelled,
-failed, or uncertain. A later Agent load may replace any prior Bridge-observed presentation because
-the Agent remains authoritative.
+An active browser reconnect snapshots the current normalized turn and catches up from a revision
+barrier without an Agent request. An idle completed reconnect performs a single-flight
+`session/load` only when advertised; otherwise it reports `HistoryUnavailable`. Replay is streamed as
+a transactional browser replacement generation and is never installed as bridge session history.
+ACP v1 supplies no replay watermark, durable turn IDs, historical PromptResponses, stop reasons, or
+formal turn boundaries, so the browser renders exactly what the Agent replays and no more.
 
 Mode/config/session metadata, auth, close/delete, MCP, interactions, URL flows, and terminals are
-separate materialized planes. They share the same global ordering but are not embedded in a turn.
-Completed observed turns may be evicted as whole units; active state and resources are never evicted
-with raw diagnostics. The bridge writes no durable data. Browser reconnect restores from the live
-bridge without an Agent RPC; a new bridge/ACP epoch rebuilds only through negotiated Agent methods.
+separate live planes. They are removed at their own protocol terminal point. In particular, a live
+terminal may outlive a turn, while a released terminal is not retained to improve future history.
 
 The replication identity is `(epoch, globalSeq)`. Epoch identifies one ACP connection lifetime and
 must not repeat across process restarts. Each activation of a session ID also receives an
@@ -105,20 +106,17 @@ SessionRuntime
 |- authoritative cwd, metadata, modes, config, commands, usage
 |- operation: Idle | Prompting | Cancelling | Forking | Closing
 |              | Deleting | SettingMode | SettingConfig
-|- transcript baseline: AgentReplay | ClientDerivedFork | HistoryUnavailable
-|- BridgeObserved completed/failed turns
 |- one active normalized turn and bridge-owned follow-up queue
 |- pending/responding permissions and elicitations
 |- accepted URL flows
-|- latest terminal resources
+|- live terminal resources
 `- bounded raw debug references
 ```
 
-Completed request tombstones may be retained in a bounded set to enforce idempotency. They are not
-part of unbounded user history. `Uncertain` tombstones are pinned: forgetting one could blindly
-repeat an Agent mutation, so admission fails when capacity contains only non-evictable records.
-Forked sessions may inherit a normalized completed-history snapshot, but never inherit an active
-turn, responder, terminal handle, or source mutation.
+Small completed request tombstones may be retained in a bounded set only to enforce idempotency; they
+contain no prompt, response, transcript, tool, thought or terminal payload. `Uncertain` tombstones
+are pinned metadata because forgetting one could blindly repeat an Agent mutation. Fork results are
+rebuilt from the Agent response/replay and never copy bridge history or live resources.
 
 ## Non-negotiable invariants
 
@@ -128,10 +126,11 @@ Tests and implementation comments refer to these identifiers.
   incarnation cannot mutate the current runtime.
 - **I02 Revision continuity:** a delta applies only when `fromRevision` equals the subscriber's
   current revision. A gap, duplicate, or reordering requests a new snapshot.
-- **I03 Replay equivalence:** Snapshot@N followed by deltas N+1..M equals canonical State@M.
-- **I03a Materialized-turn ownership:** a live turn exists in exactly one place. Its terminal event
-  atomically moves it from active state to one Bridge-observed completed/failed record without
-  claiming Agent durability.
+- **I03 Replay equivalence:** ActiveSnapshot@N followed by active deltas N+1..M equals the active
+  normalized turn at M.
+- **I03a Active-turn retirement:** a live turn exists in exactly one materialized representation.
+  Its terminal event atomically makes it unavailable to new active snapshots, then retirement drops
+  every turn payload after existing snapshot leases end.
 - **I04 Replay idempotency:** applying a snapshot or terminal delta twice cannot duplicate a turn,
   operation, interaction, tool, or message.
 - **I05 Request isolation:** in-flight operation identity is bridge-owned and globally unique within
@@ -140,12 +139,13 @@ Tests and implementation comments refer to these identifiers.
   sessions may progress concurrently.
 - **I07 Liveness pinning:** active turns, queued accepted prompts, pending/responding interactions,
   URL flows, current MCP connections, and latest terminals cannot be evicted with debug history.
-- **I08 Complete-history eviction:** completed history is evicted only at complete semantic-object or
-  turn boundaries, never as a suffix containing half a tool/message/turn.
+- **I08 No completed history:** after retirement, the bridge contains no completed prompt, response,
+  message, thought, tool, terminal-output, transcript or Agent-replay payload for that turn.
 - **I09 Durable authority:** a new bridge generation rebuilds durable history only through Agent ACP
   methods, never from a browser cache.
-- **I10 Observer independence:** subscribe, disconnect, reconnect, slowness, or absence of subscribers
-  cannot change the Agent request trace.
+- **I10 Narrow observer independence:** active subscribe/disconnect/slowness cannot alter Agent work.
+  An idle completed reconnect may issue at most one capability-gated, rate-limited `session/load` and
+  never prompt, cancel, close, restart or automatically retry the Agent.
 - **I11 Exact terminal outcome:** every accepted intent reaches exactly one success, failure,
   cancellation, or explicit uncertain state.
 - **I12 Scope isolation:** unknown, pending-open, closed, or different-session updates never pollute
@@ -167,8 +167,11 @@ Tests and implementation comments refer to these identifiers.
   kind can settle an operation. Stale or requester-local rejection errors are diagnostics only.
 - **I21 Honest uncertainty:** after a non-idempotent request may have reached the Agent, loss of its
   terminal response produces `Uncertain`; the bridge must not report failure or automatically retry.
-- **I22 Single representation:** business state is materialized once. Dropping every raw diagnostic
-  and catch-up delta leaves the canonical projection unchanged.
+- **I22 Single active representation:** active business state is materialized once. Dropping raw
+  diagnostics leaves it unchanged; retirement removes it rather than moving it into completed state.
+- **I23 Honest history availability:** completed reconnect either commits one successful Agent load
+  replacement or reports a precise unavailable/rejected/invalid/oversized/uncertain result. It never
+  presents bridge-derived or partial replay as complete history.
 
 ## Test layers and harnesses
 
@@ -206,43 +209,54 @@ and terminal outcomes are broadcast.
 ```text
 Intent -> IntentAck(accepted | duplicate | rejected | uncertain)
 
-SnapshotBegin(epoch, snapshotId, throughSeq)
-  SessionSnapshot(sessionId, incarnation, sessionRevision, materializedState)*
-  ControlSnapshot(...)
-SnapshotEnd(epoch, snapshotId, throughSeq)
+ActiveSnapshotBegin(epoch, sessionId, turnKey, snapshotId, throughSeq)
+  ActiveSnapshotChunk(...)*
+  LiveResourceSnapshot(...)*
+ActiveSnapshotEnd(epoch, sessionId, turnKey, snapshotId, throughSeq)
 
-Delta(epoch, seq, scope, scopeRevision, stableEntityId, upsert | remove)
-IntentResult(epoch, seq, bridgeOperationId, status, result?)
+ActiveDelta(epoch, sessionId, turnKey, seq, stableEntityId, append | upsert | remove)
+TurnTerminal(epoch, sessionId, turnKey, finalSeq, status, result?)
+
+ReplaceBegin(sessionId, loadGeneration)
+  ReplaceEvent(sessionId, loadGeneration, event)*
+ReplaceCommit(sessionId, loadGeneration) | ReplaceFailed(reason)
+HistoryUnavailable(sessionId, reason)
 ```
 
-Snapshot capture and subscriber registration share one state-actor transaction. Serialization occurs
-outside the actor from an immutable projection while a bounded catch-up queue retains deltas after
-`throughSeq`. Its first live delta is exactly `throughSeq + 1`; overflow disconnects that subscriber
-and requires a fresh snapshot. A browser ignores `seq <= lastSeq`, applies only `lastSeq + 1`, and
-resyncs on a gap. Epoch changes discard all prior runtime state.
-
-The bounded delta journal supports only same-epoch catch-up. If `afterSeq` is no longer retained, the
-bridge sends a full snapshot. It is not a source of canonical state or crash recovery.
+Active snapshot capture and subscriber registration share one session-actor transaction. A bounded
+catch-up queue retains only active deltas after `throughSeq`; its first live delta is exactly
+`throughSeq + 1`. Overflow or timeout disconnects that subscriber and releases its snapshot lease.
+After `TurnTerminal` linearizes, no new active snapshot is available and all active catch-up payload
+is retired. Completed reconnect starts a transactional Agent replacement or reports
+`HistoryUnavailable`; there is no completed delta journal or full-session bridge snapshot.
 
 ## Implementation checkpoint
 
-The canonical Rust runtime and Hub stream are active in shadow mode. Legacy ACP-shaped browser
-events remain the UI source of truth until the adapter and transport gates are complete. The current
-checkpoint is proven by the following production-state tests, not by mocks of the React reducer:
+The P0 active-turn-only backend and transactional browser load replacement are production-wired.
+ACP-shaped live events still drive ordinary incremental rendering, while the canonical snapshot/
+delta stream supplies the bounded active reconnect proof. The current checkpoint is proven by the
+following production-state tests, not only by React reducer mocks:
 
-- epoch-global intent idempotency across subscriber reconnect, payload collision detection, bounded
-  terminal tombstones, and pinned `Uncertain` tombstones;
-- atomic load/resume/fork/close/delete/control and prompt terminal transitions, session incarnation
-  rejection, independent concurrent sessions, queued prompt retention, and exact cleanup effects;
+- live intents retain a fixed digest only; definite terminal outcomes retire them and `Uncertain`
+  retains identity without result payload;
+- prompt terminal transitions remove prompt/update payload and the payload-bearing delta prefix;
+  the 10,000-turn regression leaves no completed payload marker;
+- active text, tool-call and plan updates fold semantically while raw incremental deltas remain
+  linear, and the Hub applies the identical fold;
+- new attachment and same-session load have separate atomic transactions; a same-session load keeps
+  its incarnation, uses the tracked Agent cwd, rolls back on rejection and routes replay only to the
+  requesting subscriber;
+- atomic fork/close/delete/control and prompt transitions, session incarnation rejection,
+  independent concurrent sessions, queued prompt retention, and exact cleanup effects;
 - transactional permission and form/URL elicitation response state, monotonic URL/terminal state,
-  and request/session scope separation;
+  immediate terminal-resource removal, and request/session scope separation;
 - snapshot plus contiguous delta equivalence, atomic subscriber bootstrap, two-subscriber equality,
-  event-count plus 8 MiB byte-bounded slow-subscriber eviction, gap detection, and single-flight
-  replacement snapshots;
+  event-count plus byte-bounded bridge/subscriber queues, bounded subscriber count, gap detection,
+  and single-flight replacement snapshots;
 - constant-size `turn_update_appended` deltas for constant-size streaming chunks, avoiding cumulative
   active-tail retransmission;
-- the production `session/prompt` command entry uses canonical admission, assigns a bridge operation
-  ID, and returns the existing outcome rather than redispatching a completed intent after reconnect.
+- completed session history, load replay, released terminal output, resolved URL payload and arbitrary
+  session `_meta` are absent from retained bridge state.
 - production prompt follow-ups are bridge-owned, bounded, claimed in FIFO order, survive browser
   disappearance, dispatch only after the prior PromptResponse, cannot be bypassed during the
   handoff window, and become terminal before bridge shutdown completes;
@@ -301,25 +315,21 @@ These tests are written first and must pass before the browser protocol is switc
 
 ### Snapshot, replay, and retention
 
-- [ ] `active_operation_is_replayed_exactly_once` (L1, I04)
-- [ ] `replaying_same_snapshot_is_idempotent` (L1, I04)
-- [ ] `replay_plus_suffix_equals_uninterrupted_fold` (L1, I03)
-- [ ] `snapshot_plus_live_deltas_equals_uninterrupted_fold` (L1, I03)
-- [ ] `turn_terminal_event_moves_active_to_observed_exactly_once` (L1, I03a/I11)
-- [ ] `prompt_response_does_not_claim_agent_persistence` (L1, I03a/I09)
-- [ ] `load_response_atomically_establishes_agent_replay_baseline` (L1/L2, I03/I19)
-- [ ] `load_replay_does_not_invent_turn_boundaries_or_stop_reasons` (L1/L2, I09)
+- [ ] `active_snapshot_plus_suffix_equals_uninterrupted_fold` (L1/L3, I03)
+- [ ] `terminal_response_retires_active_payload_without_observed_history` (L1, I03a/I08)
+- [ ] `retired_session_contains_no_completed_conversation_payload` (L1, I08/I22)
+- [ ] `completed_reconnect_loads_once_or_reports_history_unavailable` (L2/L3, I23)
+- [ ] `load_replay_is_transactional_and_never_enters_bridge_history` (L1/L2, I08/I19/I23)
+- [ ] `same_session_reload_rejection_has_no_local_fallback_or_retry` (L2, I10/I14/I23)
 - [ ] `resume_marks_history_unavailable_instead_of_empty` (L1/L2, I09)
 - [ ] `cancel_request_is_nonterminal_until_prompt_settles` (L1/L2, I11)
 - [ ] `transport_loss_after_possible_agent_commit_becomes_uncertain` (L1/L2, I21)
-- [ ] `dropping_all_raw_debug_does_not_change_business_projection` (L1, I22)
-- [ ] `full_snapshot_equals_each_thread_projection` (L1, I03)
+- [ ] `dropping_all_raw_debug_does_not_change_active_projection` (L1, I22)
 - [ ] `pre_open_updates_interactions_and_terminals_fold_into_open_session` (L1, I19)
-- [ ] `active_turn_interactions_url_flow_and_terminal_survive_eviction` (L1, I07)
-- [ ] `completed_history_is_evicted_only_on_turn_boundaries` (L1, I08)
+- [ ] `turn_retirement_preserves_only_still_live_resources` (L1, I07/I08)
 - [ ] `closed_session_late_update_cannot_resurrect_runtime` (L1, I12/I13)
 - [ ] `creation_ghost_updates_clear_when_last_creation_settles` (L1, I19)
-- [ ] `fork_does_not_copy_live_resources_or_duplicate_agent_replay` (L1/L2, I07/I19)
+- [ ] `fork_never_copies_bridge_completed_history_or_live_resources` (L1/L2, I07/I09)
 
 ### Interaction lifecycle
 
@@ -427,7 +437,9 @@ filesystem, terminal, Agent-process, and terminal-auth capabilities may differ.
 
 - [ ] `transport_matrix_two_sessions_run_concurrently`
 - [ ] `transport_matrix_browser_disconnect_preserves_turn`
-- [ ] `transport_matrix_reconnect_restores_running_and_completed_turns`
+- [ ] `transport_matrix_active_reconnect_restores_only_the_running_turn`
+- [ ] `transport_matrix_completed_reconnect_loads_or_reports_history_unavailable`
+- [ ] `transport_matrix_turn_retirement_leaves_no_backend_history`
 - [ ] `transport_matrix_close_delete_is_linearizable`
 - [ ] `transport_matrix_eof_settles_all_operations`
 - [ ] `transport_matrix_late_old_generation_response_is_ignored`
@@ -444,12 +456,13 @@ steps with approximately 25% turn/update, 20% interaction, 15% mutation, 10% lif
 duplicate/stale/failure, 10% subscriber churn, and 10% capacity pressure.
 
 - [ ] `model_matches_production_transition_for_every_generated_action`
-- [ ] `reconnect_after_every_trace_prefix_is_observationally_equivalent`
+- [ ] `active_reconnect_after_every_active_prefix_is_observationally_equivalent`
+- [ ] `completed_reconnect_after_every_terminal_prefix_is_load_or_unavailable`
 - [ ] `subscriber_stutter_invariance`
 - [ ] `distinct_session_permutation_invariance`
 - [ ] `same_session_agent_trace_is_linearizable`
 - [ ] `duplicate_retry_never_executes_mutation_twice`
-- [ ] `bounded_history_preserves_live_projection`
+- [ ] `turn_retirement_preserves_live_projection_and_erases_conversation`
 - [ ] `no_operation_or_resource_survives_closed_deleted_session`
 - [ ] `fault_at_every_await_boundary_preserves_invariants`
 - [ ] `cleanup_leaves_no_responder_waiter_task_or_process`
@@ -478,30 +491,32 @@ injectable or alpha-renamed so shrinking remains deterministic.
 2. **Adapter gate:** every ACP method/update ledger row is classified and L2 success/error/cancel is green.
 3. **Hub gate:** revision, snapshot cut, direct result routing, bounded subscribers, and shutdown tests are green.
 4. **Transport gate:** the stdio/HTTP/WS P1 matrix is green and Goose canary passes.
-5. **Frontend switch gate:** only after gates 1-4, replace the browser reducer with snapshot/delta rendering.
-6. **Removal gate:** remove legacy raw-event reconstruction only after equivalent browser behavior and reconnect tests pass.
+5. **Frontend switch gate:** only after gates 1-4, replace browser reconstruction with active
+   snapshot/delta and transactional load replacement rendering.
+6. **Removal gate:** prove terminal retirement and load/`HistoryUnavailable` behavior, then delete all
+   completed RuntimeState, canonical, delivery-projection, delta-journal and cumulative terminal
+   paths while preserving their bounded active-only equivalents.
 
 Coverage percentage is secondary. Acceptance requires 100% classification of ACP methods,
 `SessionUpdate` variants and `ContentBlock` variants; success/error/cancel/reconnect coverage for every
 state transition; all replay-prefix properties green; bounded slow-subscriber behavior; and the
 multi-session/request-collision/close-delete adversarial cases green.
 
-## Open switch gates in the current implementation
+## Remaining gates after the P0 switch
 
 These are intentionally explicit; a green pure-state test is not treated as end-to-end proof:
 
-- canonical admission is wired only for `session/prompt`; new/load/resume/fork/close/delete/control
-  and interaction responses still need the same epoch-global intent entry contract;
-- prompt queues are production-wired and shutdown ordering is covered through a real stdio Agent,
-  but the close/active-limit fault matrix still needs transport-level tests;
-- canonical subscriber live queues and in-flight WebSocket sends are event-count and aggregate-byte
-  bounded, but initial snapshot/replay serialization and the internal bridge-to-Hub channel still
-  need an explicit global memory bound;
-- the canonical browser stream remains shadow-only; React still reconstructs business state from
-  legacy ACP events;
+- canonical snapshot/delta remains a shadow verifier in React; active browser reconstruction still
+  uses the bounded `ActiveRuntimeProjection`, so a later simplification can remove one active-only
+  representation after terminal-output snapshot semantics move to the canonical stream;
+- same-session load is single-flight per session, but reconnect waiters do not yet join an existing
+  load or use a rate limiter;
+- prompt queues and stdio shutdown ordering are production-wired, but the complete close/active-limit
+  fault matrix still needs transport-level tests;
 - L4 transport equivalence and the pinned Goose compatibility canary must pass before the frontend
-  authority switch;
+  canonical authority switch;
 - the independent reference-model/property suite and await-boundary fault injection harness remain
-  to be implemented.
+  to be implemented;
+- production logical-memory counters and long-running RSS/FD/task soak gates remain follow-up work.
 
 These are migration gates, not reasons to weaken the invariants above.
