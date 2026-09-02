@@ -74,6 +74,10 @@ try {
   ));
   const resumeEvents = await exerciseResumeWebSocket(webSocketUrl);
   assert.ok(resumeEvents.some((event) =>
+    event.type === "bridge/runtime_replay_complete" &&
+    event.sessionIds.includes("saved-session")
+  ));
+  assert.ok(resumeEvents.some((event) =>
     event.type === "acp/session_attached" &&
     event.requestId === "ui-resume-session" &&
     event.method === "resume" &&
@@ -993,6 +997,28 @@ async function exerciseResumeWebSocket(url: string): Promise<ServerEvent[]> {
 
   try {
     await waitForSmokeEvent(events, (event) => event.type === "acp/initialized");
+    const replay = await waitForSmokeEvent(events, (event) =>
+      event.type === "bridge/runtime_replay_complete"
+    );
+    assert.equal(replay.type, "bridge/runtime_replay_complete");
+    assert.ok(replay.sessionIds.includes("saved-session"));
+    assert.ok(replay.sessionIds.includes("test-session"));
+    socket.send(JSON.stringify({
+      type: "session/close",
+      requestId: "ui-resume-close-test",
+      sessionId: "test-session",
+    }));
+    await waitForSmokeEvent(events, (event) =>
+      event.type === "acp/session_closed" && event.requestId === "ui-resume-close-test"
+    );
+    socket.send(JSON.stringify({
+      type: "session/close",
+      requestId: "ui-resume-close",
+      sessionId: "saved-session",
+    }));
+    await waitForSmokeEvent(events, (event) =>
+      event.type === "acp/session_closed" && event.requestId === "ui-resume-close"
+    );
     socket.send(JSON.stringify({ type: "session/list", requestId: "ui-resume-list" }));
     await waitForSmokeEvent(events, (event) =>
       event.type === "acp/sessions_listed" && event.requestId === "ui-resume-list"
@@ -1038,7 +1064,23 @@ function exerciseWebSocket(url: string): Promise<{
         sessionId,
         blocks,
       });
-      assert.deepEqual(state.pendingPrompt, { requestId, sessionId, blocks });
+      assert.deepEqual(state.pendingPrompt, { requestId, sessionId, blocks }, JSON.stringify({
+        requestId,
+        sessionId,
+        currentSessionId: state.session?.sessionId,
+        running: state.running,
+        sessionTransition: state.sessionTransition,
+        pendingSessionControl: state.pendingSessionControl,
+        recentEvents: events.slice(-40).map((event) => ({
+          type: event.type,
+          requestId: "requestId" in event ? event.requestId : undefined,
+          sessionId: "sessionId" in event
+            ? event.sessionId
+            : event.type === "acp/session_update"
+              ? event.notification.sessionId
+              : undefined,
+        })),
+      }));
       socket.send(JSON.stringify({
         type: "session/prompt",
         requestId,
@@ -1103,7 +1145,14 @@ function exerciseWebSocket(url: string): Promise<{
           kind: "config",
           requestId: "ui-smoke-config",
           sessionId: sourceSessionId,
-        });
+        }, JSON.stringify({
+          sessionId: state.session?.sessionId,
+          sourceSessionId,
+          running: state.running,
+          pendingPrompt: state.pendingPrompt,
+          sessionTransition: state.sessionTransition,
+          pendingSessionControl: state.pendingSessionControl,
+        }));
         socket.send(JSON.stringify({
           type: "session/set_config_option",
           requestId: "ui-smoke-config",
@@ -1171,13 +1220,21 @@ function exerciseWebSocket(url: string): Promise<{
         }));
         return;
       }
-      if (event.type === "acp/prompt_complete" && event.requestId === "ui-smoke-form") {
+      if (
+        event.type === "acp/prompt_complete" &&
+        event.requestId === "ui-smoke-form" &&
+        event.sessionId === sourceSessionId
+      ) {
         assert.equal(state.pendingPrompt, undefined);
         assert.ok(sourceSessionId);
         sendVisiblePrompt("ui-smoke-url", sourceSessionId, "url-flow");
         return;
       }
-      if (event.type === "acp/prompt_complete" && event.requestId === "ui-smoke-url") {
+      if (
+        event.type === "acp/prompt_complete" &&
+        event.requestId === "ui-smoke-url" &&
+        event.sessionId === sourceSessionId
+      ) {
         assert.equal(state.pendingPrompt, undefined);
         assert.ok(sourceSessionId);
         const visibleTimeline = state.timeline;

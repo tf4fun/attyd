@@ -1,8 +1,36 @@
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import {
+  expect,
+  test as baseTest,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
+
+const test = baseTest.extend<{ isolatedAttydUrl: string }>({
+  isolatedAttydUrl: async ({}, use) => {
+    const cwd = process.cwd();
+    const server = await startRustTestServer({
+      cwd,
+      command: [
+        process.execPath,
+        "--import",
+        "tsx",
+        join(cwd, "tests/fixtures/fake-agent.ts"),
+        "--early-new-updates",
+        "--early-fork-updates",
+      ],
+    });
+    try {
+      await use(`http://127.0.0.1:${server.port}`);
+    } finally {
+      await server.close();
+    }
+  },
+  baseURL: async ({ isolatedAttydUrl }, use) => use(isolatedAttydUrl),
+});
 
 test("drives permission and form ACP interactions with real focus restoration", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
@@ -323,6 +351,37 @@ test("switches between already-open ACP threads without loading them twice", asy
   )).toBeLessThan(3);
   await expect(page.getByText("Loaded history.", { exact: true })).toHaveCount(1);
   await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
+});
+
+test("runs different ACP sessions concurrently without treating running as a global lock", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+
+  const composer = page.locator('textarea[role="combobox"]');
+  await composer.fill("disconnect-cancel-flow");
+  await composer.press("Enter");
+  await expect(page.getByRole("button", { name: "Stop current turn" })).toBeVisible();
+
+  const sidebar = page.getByRole("complementary", { name: "Application sidebar" });
+  const earlier = sidebar.locator(".session-open").filter({ hasText: "Earlier Agent thread" });
+  await expect(earlier).toBeEnabled();
+  await earlier.click();
+  await expect(page.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
+  await expect(composer).toBeEnabled();
+
+  await composer.fill("usage-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
+
+  const saved = sidebar.locator(".session-open").filter({ hasText: "Saved ACP session" });
+  await saved.click();
+  await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Stop current turn" })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: "Delete Saved ACP session" })).toBeDisabled();
+  await page.getByRole("button", { name: "Stop current turn" }).click();
+  await expect(composer).toBeEnabled();
   expect(browserErrors).toEqual([]);
 });
 
@@ -649,6 +708,37 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
     expect(Math.abs(disclosureHeights[0] - disclosureHeights[1])).toBeLessThanOrEqual(1);
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   }
+  expect(browserErrors).toEqual([]);
+});
+
+test("uses one visual language for structured tool input and Markdown tool output", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/");
+
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("tool-content-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Formatted tool content complete.", { exact: true })).toBeVisible();
+
+  const tool = page.locator(".tool-card").filter({ hasText: "Inspect formatted tool output" });
+  await expect(tool).toHaveAttribute("data-tool-status", "completed");
+  await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
+
+  const input = tool.locator(".tool-input > .structured-data");
+  const output = tool.locator(".tool-output .structured-markdown");
+  await expect(input).toBeVisible();
+  await expect(output).toBeVisible();
+  await expect(output.locator("strong")).toHaveText("2 matches");
+  await expect(output.locator("li")).toHaveText(["package.json", "Cargo.toml"]);
+  expect(await Promise.all([input, output].map((locator) => locator.evaluate((element) => ({
+    background: getComputedStyle(element).backgroundColor,
+    border: getComputedStyle(element).borderColor,
+    radius: getComputedStyle(element).borderRadius,
+  }))))).toEqual([
+    { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)", radius: "6px" },
+    { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)", radius: "6px" },
+  ]);
   expect(browserErrors).toEqual([]);
 });
 
@@ -1060,7 +1150,7 @@ test("offers an explicit reconnect over the composer after the ACP connection st
   expect(browserErrors).toEqual([]);
 });
 
-test("cancels an active prompt without terminating the stdio Agent", async ({ browser, page }) => {
+test("keeps an active stdio prompt alive across browser reconnect", async ({ browser, page }) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-disconnect-cancel-"));
   const marker = join(temporaryDirectory, "lifecycle.txt");
   const processMarker = join(temporaryDirectory, "agent.pid");
@@ -1090,13 +1180,19 @@ test("cancels an active prompt without terminating the stdio Agent", async ({ br
     await expect.poll(() => readMarker(marker)).toBe("prompt");
 
     await page.close();
-    await expect.poll(() => readMarker(marker)).toBe("cancel");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await readMarker(marker)).toBe("prompt");
 
     const reconnected = await browser.newPage();
     try {
       await reconnected.goto(`http://127.0.0.1:${server.port}`);
-      await expect(reconnected.locator('textarea[role="combobox"]')).toBeEnabled();
+      await expect(reconnected.getByText("disconnect-cancel-flow", { exact: true })).toBeVisible();
+      const stop = reconnected.getByRole("button", { name: "Stop current turn" });
+      await expect(stop).toBeVisible();
       await expect.poll(() => readMarker(processMarker)).toBe(agentPid);
+      await stop.click();
+      await expect.poll(() => readMarker(marker)).toBe("cancel");
+      await expect(reconnected.locator('textarea[role="combobox"]')).toBeEnabled();
     } finally {
       await reconnected.close();
     }

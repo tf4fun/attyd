@@ -6,6 +6,8 @@ mod filesystem;
 mod mcp;
 mod mcp_config;
 mod options;
+mod runtime_cache;
+mod runtime_state;
 mod semantic;
 mod server;
 mod terminal;

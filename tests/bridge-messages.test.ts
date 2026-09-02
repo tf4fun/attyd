@@ -235,6 +235,101 @@ describe("browser bridge messages", () => {
       mcpServers: [],
     }))).toMatchObject({ type: "bridge/hello", transport: "ws", cwd: "" });
     expect(parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_replay_started",
+      sessionCount: 1,
+    }))).toEqual({ type: "bridge/runtime_replay_started", sessionCount: 1 });
+    expect(parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_session",
+      sessionId: "session",
+      cwd: "/workspace",
+      session: { sessionId: "session" },
+      truncated: false,
+    }))).toMatchObject({ type: "bridge/runtime_session", sessionId: "session" });
+    expect(parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_replay_complete",
+      sessionIds: ["session"],
+    }))).toEqual({ type: "bridge/runtime_replay_complete", sessionIds: ["session"] });
+    expect(parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_snapshot",
+      snapshot: {
+        epoch: "epoch-1",
+        throughSeq: 7,
+        connectionRevision: 1,
+        sessions: {},
+        requestElicitations: {},
+        requestUrlFlows: {},
+        intentResults: {},
+      },
+    }))).toMatchObject({
+      type: "bridge/runtime_snapshot",
+      snapshot: { epoch: "epoch-1", throughSeq: 7 },
+    });
+    expect(parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_delta",
+      delta: {
+        epoch: "epoch-1",
+        seq: 8,
+        scopeRevision: 1,
+        change: { kind: "session_removed", sessionId: "session", incarnation: 1 },
+        intentResults: [],
+        evictedIntentResultIds: [],
+      },
+    }))).toMatchObject({
+      type: "bridge/runtime_delta",
+      delta: { epoch: "epoch-1", seq: 8 },
+    });
+    expect(parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_delta",
+      delta: {
+        epoch: "epoch-1",
+        seq: 9,
+        scopeRevision: 2,
+        change: {
+          kind: "turn_update_appended",
+          session_id: "session",
+          incarnation: 1,
+          revision: 2,
+          operation_id: "operation-1",
+          update: { sessionUpdate: "agent_message_chunk" },
+        },
+        intentResults: [],
+        evictedIntentResultIds: [],
+      },
+    }))).toMatchObject({
+      type: "bridge/runtime_delta",
+      delta: { seq: 9, change: { kind: "turn_update_appended" } },
+    });
+    expect(parseServerEvent(JSON.stringify({
+      type: "bridge/intent_ack",
+      requestId: "prompt-1",
+      operationId: "operation-1",
+      disposition: "duplicate",
+      status: "agent_acknowledged",
+    }))).toEqual({
+      type: "bridge/intent_ack",
+      requestId: "prompt-1",
+      operationId: "operation-1",
+      disposition: "duplicate",
+      status: "agent_acknowledged",
+    });
+    expect(parseServerEvent(JSON.stringify({
+      type: "bridge/intent_ack",
+      requestId: "prompt-2",
+      operationId: "operation-2",
+      disposition: "accepted",
+      status: "accepted",
+    }))).toMatchObject({
+      disposition: "accepted",
+      status: "accepted",
+    });
+    expect(() => parseServerEvent(JSON.stringify({
+      type: "bridge/intent_ack",
+      requestId: "prompt-1",
+      operationId: "operation-1",
+      disposition: "duplicate",
+      status: "completed",
+    }))).toThrow("status");
+    expect(parseServerEvent(JSON.stringify({
       type: "acp/authenticated",
       requestId: "auth",
       methodId: "agent-login",
@@ -326,6 +421,12 @@ describe("browser bridge messages", () => {
       reason: "session_closed",
     }))).toMatchObject({ type: "acp/elicitation_aborted" });
     expect(parseServerEvent(JSON.stringify({
+      type: "acp/prompt_started",
+      requestId: "prompt",
+      sessionId: "session",
+      prompt: [{ type: "text", text: "Continue" }],
+    }))).toMatchObject({ type: "acp/prompt_started", sessionId: "session" });
+    expect(parseServerEvent(JSON.stringify({
       type: "acp/prompt_complete",
       requestId: "prompt",
       sessionId: "session",
@@ -399,6 +500,29 @@ describe("browser bridge messages", () => {
 
     expect(() => parseServerEvent("null")).toThrow("object with a type");
     expect(() => parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_snapshot",
+      snapshot: {
+        epoch: "epoch",
+        throughSeq: -1,
+        connectionRevision: 0,
+        sessions: {},
+        requestElicitations: {},
+        requestUrlFlows: {},
+        intentResults: {},
+      },
+    }))).toThrow("throughSeq");
+    expect(() => parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_delta",
+      delta: {
+        epoch: "epoch",
+        seq: 1,
+        scopeRevision: null,
+        change: { kind: "invented" },
+        intentResults: [],
+        evictedIntentResultIds: [],
+      },
+    }))).toThrow("change kind");
+    expect(() => parseServerEvent(JSON.stringify({
       type: "bridge/error",
       message: "bad code",
       code: 1.5,
@@ -426,6 +550,13 @@ describe("browser bridge messages", () => {
       exitCode: 0,
     }))).toThrow("status is invalid");
     expect(() => parseServerEvent('{"type":"acp/invented"}')).toThrow("Unknown server");
+    expect(() => parseServerEvent(JSON.stringify({
+      type: "bridge/runtime_session",
+      sessionId: "session",
+      cwd: "/workspace",
+      session: { sessionId: "different" },
+      truncated: false,
+    }))).toThrow("sessionId mismatch");
     expect(() => parseServerEvent(JSON.stringify({
       type: "acp/session_update",
       notification: { sessionId: "session" },

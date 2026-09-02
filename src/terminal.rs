@@ -14,6 +14,12 @@ use uuid::Uuid;
 
 use crate::filesystem::WorkspaceFileSystem;
 
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalSnapshot {
+    pub incarnation: u64,
+    pub value: serde_json::Value,
+}
+
 pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 1_000_000;
 const DEFAULT_TERMINAL_OUTPUT_BYTES: usize = 200_000;
 const MAX_TERMINALS: usize = 32;
@@ -29,11 +35,13 @@ pub struct TerminalManager {
     filesystem: Arc<WorkspaceFileSystem>,
     terminals: Arc<Mutex<HashMap<String, Arc<Terminal>>>>,
     events: mpsc::UnboundedSender<String>,
+    snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
 }
 
 struct Terminal {
     id: String,
     session_id: String,
+    incarnation: u64,
     output_limit: usize,
     state: Mutex<TerminalState>,
     changed: Notify,
@@ -53,16 +61,33 @@ impl TerminalManager {
         filesystem: Arc<WorkspaceFileSystem>,
         events: mpsc::UnboundedSender<String>,
     ) -> Self {
+        Self::new_with_snapshots(filesystem, events, None)
+    }
+
+    pub fn new_with_snapshots(
+        filesystem: Arc<WorkspaceFileSystem>,
+        events: mpsc::UnboundedSender<String>,
+        snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
+    ) -> Self {
         Self {
             filesystem,
             terminals: Arc::new(Mutex::new(HashMap::new())),
             events,
+            snapshots,
         }
     }
 
     pub async fn create(
         &self,
         request: CreateTerminalRequest,
+    ) -> Result<CreateTerminalResponse, Error> {
+        self.create_for_incarnation(request, 0).await
+    }
+
+    pub(crate) async fn create_for_incarnation(
+        &self,
+        request: CreateTerminalRequest,
+        incarnation: u64,
     ) -> Result<CreateTerminalResponse, Error> {
         validate_create_request(&request)?;
         if self.terminals.lock().await.len() >= MAX_TERMINALS {
@@ -95,6 +120,7 @@ impl TerminalManager {
         let terminal = Arc::new(Terminal {
             id: id.clone(),
             session_id: request.session_id.0.to_string(),
+            incarnation,
             output_limit,
             state: Mutex::new(TerminalState::default()),
             changed: Notify::new(),
@@ -298,20 +324,27 @@ impl TerminalManager {
 
     async fn emit_snapshot(&self, terminal: &Terminal) {
         let state = terminal.state.lock().await;
+        let snapshot = json!({
+            "sessionId": terminal.session_id,
+            "terminalId": terminal.id,
+            "output": String::from_utf8_lossy(&state.output),
+            "truncated": state.truncated,
+            "exitStatus": state.exit_status,
+            "released": state.released,
+        });
         let _ = self.events.send(
             json!({
                 "type": "acp/terminal_state",
-                "terminal": {
-                    "sessionId": terminal.session_id,
-                    "terminalId": terminal.id,
-                    "output": String::from_utf8_lossy(&state.output),
-                    "truncated": state.truncated,
-                    "exitStatus": state.exit_status,
-                    "released": state.released,
-                }
+                "terminal": snapshot,
             })
             .to_string(),
         );
+        if let Some(snapshots) = &self.snapshots {
+            let _ = snapshots.send(TerminalSnapshot {
+                incarnation: terminal.incarnation,
+                value: snapshot,
+            });
+        }
     }
 }
 

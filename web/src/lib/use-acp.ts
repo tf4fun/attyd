@@ -19,6 +19,11 @@ type SessionAttachCommand = "session/load" | "session/resume";
 
 interface StartupState {
   started: boolean;
+  initialized?: boolean;
+  runtimeRestored?: boolean;
+  runtimeSessionCount?: number;
+  runtimeAuthPending?: boolean;
+  runtimeListRequestId?: string;
   capabilities?: AgentCapabilities | null;
   listRequestId?: string;
   attachRequestId?: string;
@@ -44,20 +49,17 @@ type PendingContextRequest =
     };
 
 const CONTEXT_REQUEST_TIMEOUT_MS = 8_000;
-export const RESUME_RECONNECT_AFTER_MS = 1_000;
 export const RESUME_PROBE_TIMEOUT_MS = 2_500;
 const WEB_SOCKET_OPEN = 1;
 const WEB_SOCKET_CONNECTING = 0;
 const LAST_SESSION_STORAGE_KEY = "attyd:last-session-id";
 
 export function shouldReconnectAfterResume(
-  hiddenAt: number | undefined,
-  now: number,
+  _hiddenAt: number | undefined,
+  _now: number,
   socketReadyState: number,
 ): boolean {
-  return socketReadyState !== WEB_SOCKET_OPEN || (
-    hiddenAt != null && now - hiddenAt >= RESUME_RECONNECT_AFTER_MS
-  );
+  return socketReadyState !== WEB_SOCKET_OPEN;
 }
 
 export function useAcp() {
@@ -68,7 +70,7 @@ export function useAcp() {
   const reconnectRef = useRef<() => void>(() => window.location.reload());
   const pendingContextRequests = useRef(new Map<string, PendingContextRequest>());
   const pendingSessionRequests = useRef(new Map<string, {
-    kind: "new" | "attach" | "fork" | "close" | "delete-close" | "delete";
+    kind: "new" | "attach" | "fork" | "close" | "delete";
     sessionId?: string;
   }>());
   const transmit = useCallback((command: ClientCommand) =>
@@ -219,10 +221,11 @@ export function useAcp() {
         probeConnection();
       }
     };
-    const handlePageShow = (event: PageTransitionEvent) => {
-      if (event.persisted || shouldReconnectAfterResume(hiddenAt, Date.now(), socket.readyState)) {
+    const handlePageShow = (_event: PageTransitionEvent) => {
+      if (shouldReconnectAfterResume(hiddenAt, Date.now(), socket.readyState)) {
         reconnectByReload();
       } else {
+        hiddenAt = undefined;
         probeConnection();
       }
     };
@@ -291,52 +294,51 @@ export function useAcp() {
         }
       }
       dispatch({ type: "server/event", event });
-      if (event.type === "acp/permission_request") {
-        storeSessionId(event.request.sessionId);
-      } else if (
-        event.type === "acp/elicitation_request" &&
-        "sessionId" in event.request &&
-        typeof event.request.sessionId === "string"
-      ) {
-        storeSessionId(event.request.sessionId);
+      if (event.type === "bridge/auth_terminal_started") {
+        startup.current = {
+          ...startup.current,
+          runtimeAuthPending: true,
+          authRequestId: event.requestId,
+        };
+      }
+      if (event.type === "bridge/runtime_replay_complete") {
+        const preferred = preferredSessionId != null &&
+            event.sessionIds.includes(preferredSessionId)
+          ? preferredSessionId
+          : undefined;
+        const fallback = event.sessionIds.at(-1);
+        const selected = preferred ?? fallback;
+        if (selected != null) storeSessionId(selected);
+        startup.current = {
+          ...startup.current,
+          started: event.sessionIds.length > 0,
+          runtimeRestored: true,
+          runtimeSessionCount: event.sessionIds.length,
+        };
+        dispatch({
+          type: "runtime/replay_complete",
+          preferredSessionId: preferred,
+          fallbackSessionId: fallback,
+        });
+        return;
       }
       const pendingSession = "requestId" in event && typeof event.requestId === "string"
         ? pendingSessionRequests.current.get(event.requestId)
         : undefined;
-      if (event.type === "acp/session_created" && pendingSession?.kind === "new") {
-        storeSessionId(event.response.sessionId);
-        pendingSessionRequests.current.delete(event.requestId);
-      } else if (event.type === "acp/session_attached" && pendingSession?.kind === "attach") {
-        storeSessionId(event.sessionId);
-        pendingSessionRequests.current.delete(event.requestId);
-      } else if (event.type === "acp/session_forked" && pendingSession?.kind === "fork") {
-        storeSessionId(event.response.sessionId);
-        pendingSessionRequests.current.delete(event.requestId);
-      } else if (event.type === "acp/session_closed" && pendingSession?.kind === "delete-close") {
-        if (readStoredSessionId() === event.sessionId) storeSessionId(undefined);
-        pendingSessionRequests.current.delete(event.requestId);
-        const deleteRequestId = randomId();
-        if (sendClientCommand(socket, {
-          type: "session/delete",
-          requestId: deleteRequestId,
-          sessionId: event.sessionId,
-        }, (message) => dispatch({ type: "client/error", message }))) {
-          pendingSessionRequests.current.set(deleteRequestId, {
-            kind: "delete",
-            sessionId: event.sessionId,
-          });
-          dispatch({
-            type: "session/delete_continue",
-            closeRequestId: event.requestId,
-            requestId: deleteRequestId,
-            sessionId: event.sessionId,
-          });
-        } else {
-          dispatch({
-            type: "session/delete_cancel",
-            requestId: event.requestId,
-            sessionId: event.sessionId,
-          });
+      if (event.type === "acp/session_created") {
+        if (pendingSession?.kind === "new") {
+          storeSessionId(event.response.sessionId);
+          pendingSessionRequests.current.delete(event.requestId);
+        }
+      } else if (event.type === "acp/session_attached") {
+        if (pendingSession?.kind === "attach") {
+          storeSessionId(event.sessionId);
+          pendingSessionRequests.current.delete(event.requestId);
+        }
+      } else if (event.type === "acp/session_forked") {
+        if (pendingSession?.kind === "fork") {
+          storeSessionId(event.response.sessionId);
+          pendingSessionRequests.current.delete(event.requestId);
         }
       } else if (
         (event.type === "acp/session_closed" || event.type === "acp/session_deleted") &&
@@ -349,8 +351,7 @@ export function useAcp() {
       }
       if (
         event.type === "bridge/auth_terminal_exited" &&
-        event.status === "succeeded" &&
-        event.requestId === startup.current.authRequestId
+        event.status === "succeeded"
       ) {
         startup.current = {
           ...startup.current,
@@ -360,9 +361,81 @@ export function useAcp() {
         terminalReloadTimer.current = setTimeout(() => window.location.reload(), 350);
         return;
       }
+      if (
+        event.type === "bridge/auth_terminal_exited" &&
+        startup.current.runtimeAuthPending &&
+        event.requestId === startup.current.authRequestId
+      ) {
+        const shouldDiscover = startup.current.initialized === true &&
+          (startup.current.runtimeSessionCount ?? 0) === 0;
+        const capabilities = startup.current.capabilities;
+        startup.current = {
+          ...startup.current,
+          runtimeAuthPending: false,
+          authRequestId: undefined,
+        };
+        if (shouldDiscover) startSessionDiscovery(capabilities);
+        return;
+      }
+      if (event.type === "acp/initialized" && startup.current.runtimeRestored) {
+        const capabilities = event.response.agentCapabilities;
+        if (startup.current.runtimeAuthPending) {
+          startup.current = {
+            ...startup.current,
+            initialized: true,
+            capabilities,
+            runtimeRestored: false,
+          };
+          return;
+        }
+        if ((startup.current.runtimeSessionCount ?? 0) === 0) {
+          startup.current = {
+            ...startup.current,
+            initialized: true,
+            capabilities,
+            runtimeRestored: false,
+          };
+          startSessionDiscovery(capabilities);
+          return;
+        }
+        const requestId = capabilities?.sessionCapabilities?.list != null
+          ? randomId()
+          : undefined;
+        startup.current = {
+          ...startup.current,
+          initialized: true,
+          capabilities,
+          runtimeRestored: false,
+          runtimeListRequestId: requestId,
+        };
+        if (requestId != null) {
+          if (!sendClientCommand(socket, {
+            type: "session/list",
+            requestId,
+          }, (message) => dispatch({ type: "client/error", message }))) {
+            startup.current = { ...startup.current, runtimeListRequestId: undefined };
+          }
+        }
+        return;
+      }
       if (event.type === "acp/initialized" && !startup.current.started) {
         const capabilities = event.response.agentCapabilities;
+        startup.current = { ...startup.current, initialized: true, capabilities };
         startSessionDiscovery(capabilities);
+        return;
+      }
+      if (
+        event.type === "acp/sessions_listed" &&
+        event.requestId === startup.current.runtimeListRequestId
+      ) {
+        startup.current = { ...startup.current, runtimeListRequestId: undefined };
+        return;
+      }
+      if (
+        event.type === "bridge/error" &&
+        event.requestId === startup.current.runtimeListRequestId
+      ) {
+        startup.current = { ...startup.current, runtimeListRequestId: undefined };
         return;
       }
       if (
@@ -544,7 +617,14 @@ export function useAcp() {
 
   const prompt = useCallback(
     (blocks: ContentBlock[]) => {
-      if (!state.session) return false;
+      if (
+        !state.session ||
+        state.running ||
+        state.pendingPrompt != null ||
+        state.sessionTransition != null ||
+        state.pendingSessionControl != null ||
+        state.runtimeOperation != null
+      ) return false;
       const requestId = randomId();
       const sessionId = state.session.sessionId;
       if (!transmit({
@@ -556,7 +636,7 @@ export function useAcp() {
       dispatch({ type: "user/prompt", requestId, sessionId, blocks });
       return true;
     },
-    [state.session, transmit],
+    [state, transmit],
   );
 
   const cancel = useCallback(() => {
@@ -569,7 +649,7 @@ export function useAcp() {
 
   const setMode = useCallback(
     (modeId: string) => {
-      if (!state.session) return;
+      if (!state.session || state.running || state.pendingSessionControl || state.runtimeOperation) return;
       const requestId = randomId();
       if (!transmit({
         type: "session/set_mode",
@@ -584,12 +664,12 @@ export function useAcp() {
         sessionId: state.session.sessionId,
       });
     },
-    [state.session, transmit],
+    [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, transmit],
   );
 
   const setConfig = useCallback(
     (configId: string, value: string | boolean) => {
-      if (!state.session) return;
+      if (!state.session || state.running || state.pendingSessionControl || state.runtimeOperation) return;
       const requestId = randomId();
       if (!transmit({
         type: "session/set_config_option",
@@ -605,7 +685,7 @@ export function useAcp() {
         sessionId: state.session.sessionId,
       });
     },
-    [state.session, transmit],
+    [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, transmit],
   );
 
   const respondPermission = useCallback(
@@ -724,7 +804,7 @@ export function useAcp() {
   );
 
   const closeSession = useCallback(() => {
-    if (!state.session) return;
+    if (!state.session || state.running || state.sessionTransition || state.pendingSessionControl || state.runtimeOperation) return;
     const requestId = randomId();
     if (!transmit({
       type: "session/close",
@@ -741,10 +821,10 @@ export function useAcp() {
       requestId,
       sessionId: state.session.sessionId,
     });
-  }, [state.session, transmit]);
+  }, [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, state.sessionTransition, transmit]);
 
   const forkSession = useCallback(() => {
-    if (!state.session) return;
+    if (!state.session || state.running || state.sessionTransition || state.pendingSessionControl || state.runtimeOperation) return;
     const requestId = randomId();
     if (!transmit({
       type: "session/fork",
@@ -761,21 +841,24 @@ export function useAcp() {
       requestId,
       sessionId: state.session.sessionId,
     });
-  }, [state.session, transmit]);
+  }, [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, state.sessionTransition, transmit]);
 
   const deleteSession = useCallback((sessionId: string) => {
     if (state.pendingSessionDeletions.some((pending) => pending.sessionId === sessionId)) return;
-    const isOpen = state.session?.sessionId === sessionId || state.cachedSessions.has(sessionId);
-    const closeFirst = isOpen &&
-      state.initialized?.agentCapabilities?.sessionCapabilities?.close != null;
+    if (
+      (state.session?.sessionId === sessionId && state.running) ||
+      state.cachedSessions.get(sessionId)?.running ||
+      (state.session?.sessionId === sessionId && state.runtimeOperation != null) ||
+      state.cachedSessions.get(sessionId)?.runtimeOperation != null
+    ) return;
     const requestId = randomId();
     if (!transmit({
-      type: closeFirst ? "session/close" : "session/delete",
+      type: "session/delete",
       requestId,
       sessionId,
     })) return;
     pendingSessionRequests.current.set(requestId, {
-      kind: closeFirst ? "delete-close" : "delete",
+      kind: "delete",
       sessionId,
     });
     if (state.session?.sessionId === sessionId && readStoredSessionId() === sessionId) {
@@ -785,9 +868,9 @@ export function useAcp() {
       type: "session/delete_start",
       requestId,
       sessionId,
-      stage: closeFirst ? "closing" : "deleting",
+      stage: "deleting",
     });
-  }, [state.cachedSessions, state.initialized, state.pendingSessionDeletions, state.session, transmit]);
+  }, [state.cachedSessions, state.pendingSessionDeletions, state.running, state.runtimeOperation, state.session, transmit]);
 
   const respondElicitation = useCallback(
     (elicitationId: string, response: CreateElicitationResponse) => {

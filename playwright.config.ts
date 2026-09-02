@@ -13,16 +13,9 @@ export default defineConfig({
   timeout: 30_000,
   expect: { timeout: 8_000 },
   use: {
-    baseURL: "http://127.0.0.1:7332",
     channel: localChannel,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-  },
-  webServer: {
-    command: "npm run test:browser:serve -- 7332",
-    url: "http://127.0.0.1:7332/api/health",
-    reuseExistingServer: !process.env.CI,
-    timeout: 30_000,
   },
   projects: [{
     name: "chromium",

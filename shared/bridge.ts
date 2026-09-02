@@ -40,6 +40,8 @@ const MAX_BRIDGE_PATH_LENGTH = 16_384;
 const MAX_BRIDGE_LANGUAGE_ID_LENGTH = 256;
 const MAX_NES_SUGGESTIONS = 100;
 const MAX_NES_EDITS = 10_000;
+const MAX_RUNTIME_SESSIONS = 10_000;
+const MAX_RUNTIME_INTENT_RESULTS = 4_096;
 
 export interface NesDocumentState {
   sessionId: string;
@@ -73,6 +75,34 @@ export interface WorkspaceContextAttachment {
   block: Extract<ContentBlock, { type: "resource" }>;
 }
 
+export interface CanonicalRuntimeSnapshot {
+  epoch: string;
+  throughSeq: number;
+  connectionRevision: number;
+  sessions: Record<string, unknown>;
+  requestElicitations: Record<string, unknown>;
+  requestUrlFlows: Record<string, unknown>;
+  intentResults: Record<string, unknown>;
+}
+
+export interface CanonicalRuntimeDelta {
+  epoch: string;
+  seq: number;
+  scopeRevision: number | null;
+  change: Record<string, unknown>;
+  intentResults: unknown[];
+  evictedIntentResultIds: string[];
+}
+
+export type CanonicalIntentStatus =
+  | "accepted"
+  | "in_flight"
+  | "agent_acknowledged"
+  | "failed"
+  | "rejected"
+  | "cancelled"
+  | "uncertain";
+
 export type ConnectionPhase =
   | "starting"
   | "initializing"
@@ -84,6 +114,13 @@ export type ElicitationAbortReason =
   | "session_cancelled"
   | "session_closed"
   | "nes_closed";
+
+export type SessionRuntimeOperation =
+  | "fork"
+  | "close"
+  | "delete"
+  | "mode"
+  | "config";
 
 export type ClientCommand =
   | { type: "bridge/ping"; nonce: string }
@@ -239,6 +276,30 @@ export type ServerEvent =
       additionalDirectories: string[];
       mcpServers: Array<{ name: string; type: "stdio" | "http" | "sse" | "acp" }>;
     }
+  | { type: "bridge/runtime_replay_started"; sessionCount: number }
+  | {
+      type: "bridge/runtime_session";
+      sessionId: string;
+      cwd: string;
+      session: NewSessionResponse;
+      truncated: boolean;
+    }
+  | { type: "bridge/runtime_replay_complete"; sessionIds: string[] }
+  | { type: "bridge/runtime_snapshot"; snapshot: CanonicalRuntimeSnapshot }
+  | { type: "bridge/runtime_delta"; delta: CanonicalRuntimeDelta }
+  | {
+      type: "bridge/intent_ack";
+      requestId: string;
+      operationId: string;
+      disposition: "accepted" | "duplicate";
+      status: CanonicalIntentStatus;
+    }
+  | {
+      type: "bridge/session_operation_started";
+      requestId: string;
+      sessionId: string;
+      operation: SessionRuntimeOperation;
+    }
   | { type: "bridge/phase"; phase: ConnectionPhase }
   | { type: "bridge/pong"; nonce: string }
   | { type: "bridge/stderr"; chunk: string }
@@ -332,6 +393,12 @@ export type ServerEvent =
     }
   | { type: "acp/session_update"; notification: SessionNotification }
   | { type: "acp/terminal_state"; terminal: TerminalSnapshot }
+  | {
+      type: "acp/prompt_started";
+      requestId: string;
+      sessionId: string;
+      prompt: ContentBlock[];
+    }
   | {
       type: "acp/prompt_complete";
       requestId: string;
@@ -450,6 +517,13 @@ export type ServerEvent =
 
 const SERVER_EVENT_TYPES = {
   "bridge/hello": true,
+  "bridge/runtime_replay_started": true,
+  "bridge/runtime_session": true,
+  "bridge/runtime_replay_complete": true,
+  "bridge/runtime_snapshot": true,
+  "bridge/runtime_delta": true,
+  "bridge/intent_ack": true,
+  "bridge/session_operation_started": true,
   "bridge/phase": true,
   "bridge/pong": true,
   "bridge/stderr": true,
@@ -470,6 +544,7 @@ const SERVER_EVENT_TYPES = {
   "acp/session_deleted": true,
   "acp/session_update": true,
   "acp/terminal_state": true,
+  "acp/prompt_started": true,
   "acp/prompt_complete": true,
   "acp/permission_request": true,
   "acp/permission_resolved": true,
@@ -519,6 +594,141 @@ function validateServerEventEnvelope(
       if (typeof value.readOnly !== "boolean") throw new Error("bridge/hello requires readOnly");
       requireStringArray(value.additionalDirectories, "bridge/hello additionalDirectories");
       requireArray(value.mcpServers, "bridge/hello mcpServers");
+      return;
+    case "bridge/runtime_replay_started":
+      if (
+        !Number.isSafeInteger(value.sessionCount) ||
+        Number(value.sessionCount) < 0 ||
+        Number(value.sessionCount) > MAX_RUNTIME_SESSIONS
+      ) {
+        throw new Error("bridge/runtime_replay_started sessionCount is invalid");
+      }
+      return;
+    case "bridge/runtime_session": {
+      requireBridgeIdentifier(value, "sessionId");
+      requireBoundedString(value, "cwd", MAX_BRIDGE_PATH_LENGTH);
+      if (value.cwd !== "") {
+        validateOptionalWorkspacePath(value.cwd, "bridge/runtime_session cwd");
+      }
+      const session = requireRecordValue(
+        value.session,
+        "bridge/runtime_session session",
+      );
+      requireStringValue(session.sessionId, "bridge/runtime_session session sessionId");
+      if (session.sessionId !== value.sessionId) {
+        throw new Error("bridge/runtime_session sessionId mismatch");
+      }
+      if (typeof value.truncated !== "boolean") {
+        throw new Error("bridge/runtime_session requires truncated");
+      }
+      return;
+    }
+    case "bridge/runtime_replay_complete":
+      requireStringArray(value.sessionIds, "bridge/runtime_replay_complete sessionIds");
+      if (value.sessionIds.length > MAX_RUNTIME_SESSIONS) {
+        throw new Error("bridge/runtime_replay_complete has too many sessions");
+      }
+      return;
+    case "bridge/runtime_snapshot": {
+      const snapshot = requireRecordValue(
+        value.snapshot,
+        "bridge/runtime_snapshot snapshot",
+      );
+      validateCanonicalRuntimeIdentity(snapshot, "bridge/runtime_snapshot");
+      requireNonNegativeSafeInteger(
+        snapshot.throughSeq,
+        "bridge/runtime_snapshot throughSeq",
+      );
+      requireNonNegativeSafeInteger(
+        snapshot.connectionRevision,
+        "bridge/runtime_snapshot connectionRevision",
+      );
+      requireBoundedRecord(
+        snapshot.sessions,
+        MAX_RUNTIME_SESSIONS,
+        "bridge/runtime_snapshot sessions",
+      );
+      requireBoundedRecord(
+        snapshot.requestElicitations,
+        MAX_RUNTIME_INTENT_RESULTS,
+        "bridge/runtime_snapshot requestElicitations",
+      );
+      requireBoundedRecord(
+        snapshot.requestUrlFlows,
+        MAX_RUNTIME_INTENT_RESULTS,
+        "bridge/runtime_snapshot requestUrlFlows",
+      );
+      requireBoundedRecord(
+        snapshot.intentResults,
+        MAX_RUNTIME_INTENT_RESULTS,
+        "bridge/runtime_snapshot intentResults",
+      );
+      return;
+    }
+    case "bridge/runtime_delta": {
+      const delta = requireRecordValue(value.delta, "bridge/runtime_delta delta");
+      validateCanonicalRuntimeIdentity(delta, "bridge/runtime_delta");
+      requireNonNegativeSafeInteger(delta.seq, "bridge/runtime_delta seq");
+      if (delta.scopeRevision !== null) {
+        requireNonNegativeSafeInteger(
+          delta.scopeRevision,
+          "bridge/runtime_delta scopeRevision",
+        );
+      }
+      const change = requireRecordValue(delta.change, "bridge/runtime_delta change");
+      requireEnum(
+        change.kind,
+        [
+          "connection_upsert",
+          "session_upsert",
+          "turn_update_appended",
+          "session_removed",
+        ],
+        "bridge/runtime_delta change kind",
+      );
+      requireArray(delta.intentResults, "bridge/runtime_delta intentResults");
+      if (delta.intentResults.length > MAX_RUNTIME_INTENT_RESULTS) {
+        throw new Error("bridge/runtime_delta has too many intent results");
+      }
+      requireStringArray(
+        delta.evictedIntentResultIds,
+        "bridge/runtime_delta evictedIntentResultIds",
+      );
+      if (delta.evictedIntentResultIds.length > MAX_RUNTIME_INTENT_RESULTS) {
+        throw new Error("bridge/runtime_delta has too many evicted intent results");
+      }
+      return;
+    }
+    case "bridge/intent_ack":
+      requireBridgeIdentifier(value, "requestId");
+      requireBridgeIdentifier(value, "operationId");
+      requireEnum(
+        value.disposition,
+        ["accepted", "duplicate"],
+        "bridge/intent_ack disposition",
+      );
+      requireEnum(
+        value.status,
+        [
+          "accepted",
+          "in_flight",
+          "agent_acknowledged",
+          "failed",
+          "rejected",
+          "cancelled",
+          "uncertain",
+        ],
+        "bridge/intent_ack status",
+      );
+      return;
+    case "bridge/session_operation_started":
+      requireBridgeIdentifier(value, "requestId");
+      requireBridgeIdentifier(value, "sessionId");
+      requireEnum(
+        value.operation,
+        ["fork", "close", "delete", "mode", "config"],
+        "bridge/session_operation_started operation",
+      );
       return;
     case "bridge/phase":
       requireEnum(value.phase, ["starting", "initializing", "ready", "stopped", "error"], "bridge/phase phase");
@@ -719,6 +929,12 @@ function validateServerEventEnvelope(
       }
       return;
     }
+    case "acp/prompt_started":
+      requireString(value, "requestId");
+      requireString(value, "sessionId");
+      requireArray(value.prompt, "acp/prompt_started prompt");
+      validatePrompt(value.prompt);
+      return;
     case "acp/prompt_complete": {
       requireString(value, "requestId");
       requireString(value, "sessionId");
@@ -980,6 +1196,27 @@ function requireArray(value: unknown, label: string): asserts value is unknown[]
 function requireStringArray(value: unknown, label: string): asserts value is string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     throw new Error(`${label} must be a string array`);
+  }
+}
+
+function validateCanonicalRuntimeIdentity(
+  value: Record<string, unknown>,
+  label: string,
+): void {
+  requireBoundedString(value, "epoch", MAX_BRIDGE_IDENTIFIER_LENGTH);
+  if (value.epoch === "") throw new Error(`${label} epoch must not be empty`);
+}
+
+function requireNonNegativeSafeInteger(value: unknown, label: string): void {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+}
+
+function requireBoundedRecord(value: unknown, limit: number, label: string): void {
+  if (!isRecord(value)) throw new Error(`${label} must be an object`);
+  if (Object.keys(value).length > limit) {
+    throw new Error(`${label} exceeds ${limit} entries`);
   }
 }
 

@@ -383,6 +383,45 @@ describe("ACP UI state", () => {
     expect(state.timeline).toEqual([]);
   });
 
+  it("reconstructs an in-flight terminal authentication from Bridge runtime events", () => {
+    let state = appReducer(initialState, event({
+      type: "bridge/runtime_replay_started",
+      sessionCount: 0,
+    }));
+    state = appReducer(state, event({
+      type: "bridge/auth_terminal_started",
+      requestId: "terminal-auth",
+      methodId: "terminal-login",
+    }));
+    state = appReducer(state, event({
+      type: "bridge/auth_terminal_output",
+      requestId: "terminal-auth",
+      data: "Enter code: ",
+    }));
+    state = appReducer(state, event({
+      type: "bridge/runtime_replay_complete",
+      sessionIds: [],
+    }));
+    state = appReducer(state, { type: "runtime/replay_complete" });
+    state = appReducer(state, event({
+      type: "acp/initialized",
+      response: {
+        protocolVersion: 1,
+        authMethods: [{ id: "terminal-login", name: "Terminal login" }],
+      },
+    }));
+
+    expect(state.pendingAuth).toEqual({
+      kind: "terminal",
+      requestId: "terminal-auth",
+      methodId: "terminal-login",
+    });
+    expect(state.authTerminal).toMatchObject({
+      status: "running",
+      output: "Enter code: ",
+    });
+  });
+
   it("tracks ephemeral MCP connections and bounds raw transport activity", () => {
     let state = appReducer(initialState, event({
       type: "acp/mcp_connection",
@@ -521,7 +560,7 @@ describe("ACP UI state", () => {
     expect(state.configOptions[1]).toMatchObject({ id: "model", currentValue: "agent-default" });
   });
 
-  it("isolates lifecycle and control acknowledgements without exact pending transactions", () => {
+  it("accepts Bridge-owned lifecycle events while isolating unmatched controls", () => {
     const active = {
       ...initialState,
       session: { sessionId: "current" },
@@ -583,11 +622,15 @@ describe("ACP UI state", () => {
       (state, acknowledgement) => appReducer(state, event(acknowledgement)),
       active,
     );
-    expect(isolated.session).toEqual(active.session);
-    expect(isolated.modeId).toBe("build");
-    expect(isolated.configOptions).toEqual(active.configOptions);
-    expect(isolated.sessions).toEqual(active.sessions);
-    expect(isolated.backgroundEvents).toEqual(acknowledgements);
+    expect(isolated.session).toBeUndefined();
+    expect(isolated.modeId).toBeUndefined();
+    expect(isolated.configOptions).toEqual([]);
+    expect(isolated.sessions.map(({ sessionId }) => sessionId).sort())
+      .toEqual(["created", "forked"]);
+    expect(isolated.cachedSessions.has("created")).toBe(true);
+    expect(isolated.cachedSessions.has("forked")).toBe(true);
+    expect(isolated.cachedSessions.has("saved")).toBe(false);
+    expect(isolated.backgroundEvents).toEqual(acknowledgements.slice(-2));
 
     const pendingAttach = appReducer(isolated, {
       type: "session/transition_start",
@@ -699,9 +742,17 @@ describe("ACP UI state", () => {
     expect(committed.configOptions).toEqual([
       expect.objectContaining({ id: "verbose", currentValue: true }),
     ]);
+
+    const recovered = appReducer(active, event({
+      type: "acp/mode_changed",
+      requestId: "mode-from-disconnected-browser",
+      sessionId: "controls",
+      modeId: "plan",
+    }));
+    expect(recovered.modeId).toBe("plan");
   });
 
-  it("settles permission and elicitation responses only for their exact browser request", () => {
+  it("settles authoritative interactions globally while correlating response errors exactly", () => {
     const active = {
       ...initialState,
       session: { sessionId: "session" },
@@ -736,15 +787,23 @@ describe("ACP UI state", () => {
     expect(state.permissions[0].responseRequestId).toBe("permission-response");
     expect(state.elicitations[0].responseRequestId).toBe("form-response");
 
-    state = appReducer(state, event({
+    const responding = state;
+    const unrelated = appReducer(responding, event({
       type: "acp/permission_resolved",
-      permissionId: "permission",
+      permissionId: "unknown-permission",
       requestId: "stale-response",
     }));
-    expect(state.permissions).toHaveLength(1);
-    expect(state.backgroundEvents).toHaveLength(1);
+    expect(unrelated.permissions).toHaveLength(1);
+    expect(unrelated.backgroundEvents).toHaveLength(1);
 
-    state = appReducer(state, event({
+    const resolvedElsewhere = appReducer(responding, event({
+      type: "acp/permission_resolved",
+      permissionId: "permission",
+      requestId: "another-browser-response",
+    }));
+    expect(resolvedElsewhere.permissions).toEqual([]);
+
+    state = appReducer(responding, event({
       type: "bridge/error",
       requestId: "permission-response",
       operation: "permission/respond",
@@ -1114,6 +1173,119 @@ describe("ACP UI state", () => {
     expect(JSON.stringify(state.timeline)).toContain("Second answer");
     expect(JSON.stringify(state.timeline)).toContain("Late background update");
     expect(state.cachedSessions.has("first")).toBe(true);
+  });
+
+  it("replays and independently tracks concurrent in-memory session turns", () => {
+    let state = appReducer(initialState, event({
+      type: "bridge/runtime_replay_started",
+      sessionCount: 2,
+    }));
+    for (const [sessionId, cwd] of [["first", "/workspace/first"], ["second", "/workspace/second"]]) {
+      state = appReducer(state, event({
+        type: "bridge/runtime_session",
+        sessionId,
+        cwd,
+        session: { sessionId },
+        truncated: false,
+      }));
+      state = appReducer(state, event({
+        type: "acp/prompt_started",
+        requestId: `${sessionId}-prompt`,
+        sessionId,
+        prompt: [{ type: "text", text: `Prompt ${sessionId}` }],
+      }));
+      state = appReducer(state, event({
+        type: "acp/session_update",
+        notification: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            messageId: `${sessionId}-answer`,
+            content: { type: "text", text: `Streaming ${sessionId}` },
+          },
+        },
+      }));
+    }
+    state = appReducer(state, event({
+      type: "bridge/runtime_replay_complete",
+      sessionIds: ["first", "second"],
+    }));
+    state = appReducer(state, {
+      type: "runtime/replay_complete",
+      preferredSessionId: "first",
+      fallbackSessionId: "second",
+    });
+
+    expect(state.session?.sessionId).toBe("first");
+    expect(state.running).toBe(true);
+    expect(JSON.stringify(state.timeline)).toContain("Streaming first");
+    expect(state.cachedSessions.get("second")?.running).toBe(true);
+
+    state = appReducer(state, { type: "session/activate_cached", sessionId: "second" });
+    expect(state.session?.sessionId).toBe("second");
+    expect(state.running).toBe(true);
+    expect(JSON.stringify(state.timeline)).toContain("Streaming second");
+
+    state = appReducer(state, event({
+      type: "acp/prompt_complete",
+      requestId: "first-prompt",
+      sessionId: "first",
+      response: { stopReason: "end_turn" },
+    }));
+    expect(state.running).toBe(true);
+    expect(state.cachedSessions.get("first")?.running).toBe(false);
+    expect(state.cachedSessions.get("first")?.timeline.at(-1)).toMatchObject({ type: "stop" });
+  });
+
+  it("caches background interactions without recursing while another session transitions", () => {
+    const background = {
+      cwd: "/workspace/background",
+      session: { sessionId: "background" },
+      availableCommands: [],
+      configOptions: [],
+      timeline: [],
+      permissions: [],
+      elicitations: [],
+      running: true,
+      terminalSnapshots: [],
+    };
+    let state = appReducer({
+      ...initialState,
+      session: { sessionId: "current" },
+      cwd: "/workspace/current",
+      cachedSessions: new Map([["background", background]]),
+    }, {
+      type: "session/transition_start",
+      kind: "new",
+      requestId: "new-current",
+      cwd: "/workspace/new",
+    });
+
+    state = appReducer(state, event({
+      type: "acp/permission_request",
+      permissionId: "background-permission",
+      request: {
+        sessionId: "background",
+        toolCall: { toolCallId: "background-tool", title: "Background tool" },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      },
+    }));
+    state = appReducer(state, event({
+      type: "acp/elicitation_request",
+      elicitationId: "background-form",
+      request: {
+        sessionId: "background",
+        mode: "form",
+        message: "Background input",
+        requestedSchema: { type: "object", properties: {} },
+      },
+    }));
+
+    expect(state.sessionTransition?.requestId).toBe("new-current");
+    expect(state.cachedSessions.get("background")?.permissions)
+      .toHaveLength(1);
+    expect(state.cachedSessions.get("background")?.elicitations)
+      .toHaveLength(1);
   });
 
   it("commits replayed state only when the matching session transition succeeds", () => {
@@ -1492,22 +1664,23 @@ describe("ACP UI state", () => {
     expect(pending.timeline).toEqual(active.timeline);
     expect(pending.sessionTransition?.kind).toBe("close");
 
-    const stale = appReducer(pending, event({
+    const closedElsewhere = appReducer(pending, event({
       type: "acp/session_closed",
-      requestId: "close-stale",
+      requestId: "close-from-another-browser",
       sessionId: "closing",
     }));
-    expect(stale.session?.sessionId).toBe("closing");
-    expect(stale.backgroundEvents).toHaveLength(1);
+    expect(closedElsewhere.session).toBeUndefined();
+    expect(closedElsewhere.timeline).toEqual([]);
+    expect(closedElsewhere.sessionTransition).toBeUndefined();
 
-    const committed = appReducer(stale, event({
+    const repeated = appReducer(closedElsewhere, event({
       type: "acp/session_closed",
       requestId: "close-current",
       sessionId: "closing",
     }));
-    expect(committed.session).toBeUndefined();
-    expect(committed.timeline).toEqual([]);
-    expect(committed.sessionTransition).toBeUndefined();
+    expect(repeated.session).toBeUndefined();
+    expect(repeated.timeline).toEqual([]);
+    expect(repeated.sessionTransition).toBeUndefined();
 
     const failed = appReducer(pending, event({
       type: "bridge/error",
@@ -1525,7 +1698,7 @@ describe("ACP UI state", () => {
     expect(failed.sessionTransition).toBeUndefined();
   });
 
-  it("commits only matching session deletions and unlocks failures", () => {
+  it("commits authoritative session deletions globally and unlocks failures", () => {
     const listed = {
       ...initialState,
       sessions: [{
@@ -1544,14 +1717,13 @@ describe("ACP UI state", () => {
       { requestId: "delete-current", sessionId: "saved", stage: "deleting" },
     ]);
 
-    const stale = appReducer(pending, event({
+    const deletedElsewhere = appReducer(pending, event({
       type: "acp/session_deleted",
-      requestId: "delete-stale",
+      requestId: "delete-from-another-browser",
       sessionId: "saved",
     }));
-    expect(stale.sessions).toEqual(listed.sessions);
-    expect(stale.pendingSessionDeletions).toEqual(pending.pendingSessionDeletions);
-    expect(stale.backgroundEvents).toHaveLength(1);
+    expect(deletedElsewhere.sessions).toEqual([]);
+    expect(deletedElsewhere.pendingSessionDeletions).toEqual([]);
 
     const failed = appReducer(pending, event({
       type: "bridge/error",
@@ -2206,12 +2378,19 @@ describe("ACP UI state", () => {
     expect(stopped.running).toBe(false);
     expect(stopped.pendingPrompt).toBeUndefined();
 
-    const blockedTransition = appReducer(running, {
+    const concurrentTransition = appReducer(running, {
       type: "session/transition_start",
       kind: "new",
       requestId: "new-during-prompt",
     });
-    expect(blockedTransition).toBe(running);
+    expect(concurrentTransition.session).toBeUndefined();
+    expect(concurrentTransition.sessionTransition).toMatchObject({
+      kind: "new",
+      requestId: "new-during-prompt",
+    });
+    expect(concurrentTransition.cachedSessions.get("current")?.running).toBe(true);
+    expect(concurrentTransition.cachedSessions.get("current")?.pendingPrompt)
+      .toEqual(running.pendingPrompt);
   });
 
   it("isolates late events from a non-current session", () => {

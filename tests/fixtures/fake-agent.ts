@@ -1140,6 +1140,35 @@ const agent = acp
       });
       return { stopReason: "end_turn" };
     }
+    if (promptText.includes("tool-content-flow")) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "formatted-tool-content",
+          title: "Inspect formatted tool output",
+          kind: "read",
+          status: "completed",
+          rawInput: { query: "dependencies", path: "/workspace" },
+          content: [{
+            type: "content",
+            content: {
+              type: "text",
+              text: "**2 matches**\n\n- `package.json`\n- `Cargo.toml`",
+            },
+          }],
+        },
+      });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "tool-content-answer",
+          content: { type: "text", text: "Formatted tool content complete." },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (promptText.includes("activity-flow")) {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,

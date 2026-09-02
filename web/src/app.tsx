@@ -345,7 +345,7 @@ export default function App() {
   const changingControl = state.pendingSessionControl != null;
   const authBlocksCurrent = state.authStatus === "required" || state.pendingAuth != null;
   const authBlocksNewSession = authBlocksCurrent || state.authStatus === "logged_out";
-  const ready = state.phase === "ready" && state.session != null && !transitioning && !changingControl && !authBlocksCurrent;
+  const ready = state.phase === "ready" && state.session != null && !transitioning && !changingControl && state.runtimeOperation == null && !authBlocksCurrent;
   const deletingCurrentSession = state.pendingSessionDeletions.some(
     ({ sessionId }) => sessionId === state.session?.sessionId,
   );
@@ -465,7 +465,7 @@ export default function App() {
           ref={newThreadButton}
           className="new-session"
           aria-label="New thread"
-          disabled={state.phase !== "ready" || state.running || transitioning || changingControl || authBlocksNewSession || queuedPrompts.length > 0}
+          disabled={state.phase !== "ready" || transitioning || changingControl || authBlocksNewSession || queuedPrompts.length > 0}
           onClick={() => {
             setSidebarOpen(false);
             setNewThreadOpen(true);
@@ -483,8 +483,17 @@ export default function App() {
           canAttach={Boolean(agentCapabilities?.loadSession || sessionCapabilities?.resume != null)}
           canDelete={sessionCapabilities?.delete != null}
           deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
+          busySessionIds={[
+            ...((state.running || state.runtimeOperation != null) && state.session != null
+              ? [state.session.sessionId]
+              : []),
+            ...[...state.cachedSessions.entries()]
+              .filter(([, snapshot]) => snapshot.running || snapshot.runtimeOperation != null)
+              .map(([sessionId]) => sessionId),
+          ]}
+          attentionSessionIds={state.attentionSessionIds}
           openSessionIds={[...state.cachedSessions.keys()]}
-          disabled={state.running || transitioning || changingControl || authBlocksCurrent || queuedPrompts.length > 0}
+          disabled={transitioning || changingControl || authBlocksCurrent || queuedPrompts.length > 0}
           onAttach={(session) => {
             attachSession(session);
             closeMobileSidebar();
@@ -862,7 +871,7 @@ export default function App() {
         <NewSessionDialog
           transport={state.transport}
           defaultCwd={state.defaultCwd}
-          disabled={transitioning || state.running || state.phase !== "ready"}
+          disabled={transitioning || state.phase !== "ready"}
           onCancel={closeNewThread}
           onCreate={(cwd) => {
             if (!newSession(cwd)) return false;

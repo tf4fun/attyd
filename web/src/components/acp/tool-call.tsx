@@ -210,7 +210,9 @@ function ToolContentView({
   content: ToolCallContent;
   terminalSnapshots: TerminalSnapshot[];
 }) {
-  if (content.type === "content") return <ContentBlockView block={content.content} />;
+  if (content.type === "content") {
+    return <ContentBlockView block={content.content} presentation="tool" />;
+  }
   if (content.type === "terminal") {
     const snapshot = terminalSnapshots.find(
       ({ terminalId }) => terminalId === content.terminalId,

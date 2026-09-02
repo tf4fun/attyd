@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -15,14 +15,19 @@ use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
 use serde_json::json;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::bridge;
 use crate::options::Options;
+use crate::runtime_cache::RuntimeCache;
+use crate::runtime_state::{RuntimeChange, RuntimeDelta, RuntimeSnapshot};
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
+const SUBSCRIBER_QUEUE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
 
 #[derive(RustEmbed)]
 #[folder = "dist/client/"]
@@ -67,12 +72,20 @@ impl BridgeBootstrap {
         }
     }
 
-    fn events(&self) -> impl Iterator<Item = &String> {
-        self.hello
+    fn hello_event(&self) -> Option<&String> {
+        self.hello.as_ref()
+    }
+
+    fn events_after_runtime(&self) -> impl Iterator<Item = &String> {
+        self.initialized
             .iter()
-            .chain(self.initialized.iter())
             .chain(self.error.iter().filter(|_| self.terminal_error))
             .chain(self.phase.iter())
+    }
+
+    #[cfg(test)]
+    fn events(&self) -> impl Iterator<Item = &String> {
+        self.hello.iter().chain(self.events_after_runtime())
     }
 }
 
@@ -86,12 +99,219 @@ fn terminal_auth_succeeded(event: &str) -> bool {
         })
 }
 
+fn opened_runtime_session_id(event: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    match value.get("type").and_then(serde_json::Value::as_str)? {
+        "acp/session_created" | "acp/session_forked" => value
+            .get("response")?
+            .get("sessionId")?
+            .as_str()
+            .map(str::to_string),
+        "acp/session_attached" => value.get("sessionId")?.as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+fn is_internal_direct_event(event: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(event)
+        .ok()
+        .and_then(|value| value.get("type").cloned())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .as_deref()
+        == Some("bridge/internal_direct")
+}
+
+fn is_internal_runtime_event(event: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(event)
+        .ok()
+        .and_then(|value| value.get("type").cloned())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .is_some_and(|kind| {
+            matches!(
+                kind.as_str(),
+                "bridge/internal_runtime_snapshot" | "bridge/internal_runtime_delta"
+            )
+        })
+}
+
+fn directed_bridge_event(event: &str) -> Option<(u64, String)> {
+    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("bridge/internal_direct") {
+        return None;
+    }
+    let subscriber_id = value.get("subscriberId")?.as_u64()?;
+    let event = value.get("event")?;
+    Some((subscriber_id, event.to_string()))
+}
+
+#[derive(Default)]
+struct CanonicalProjection {
+    snapshot: Option<RuntimeSnapshot>,
+}
+
+impl CanonicalProjection {
+    fn update(&mut self, event: &str) -> bool {
+        self.update_with_public_event(event).0
+    }
+
+    fn update_with_public_event(&mut self, event: &str) -> (bool, Option<String>) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(event) else {
+            return (false, None);
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("bridge/internal_runtime_snapshot") => {
+                let snapshot = value
+                    .get("value")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<RuntimeSnapshot>(value).ok());
+                self.snapshot = snapshot.clone();
+                (
+                    true,
+                    snapshot.map(|snapshot| {
+                        json!({
+                            "type": "bridge/runtime_snapshot",
+                            "snapshot": snapshot,
+                        })
+                        .to_string()
+                    }),
+                )
+            }
+            Some("bridge/internal_runtime_delta") => {
+                let delta = value
+                    .get("value")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<RuntimeDelta>(value).ok());
+                let Some(delta) = delta else {
+                    self.snapshot = None;
+                    return (true, None);
+                };
+                if !self.apply_delta(delta.clone()) {
+                    self.snapshot = None;
+                    return (true, None);
+                }
+                (
+                    true,
+                    Some(
+                        json!({
+                            "type": "bridge/runtime_delta",
+                            "delta": delta,
+                        })
+                        .to_string(),
+                    ),
+                )
+            }
+            _ => (false, None),
+        }
+    }
+
+    fn apply_delta(&mut self, delta: RuntimeDelta) -> bool {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return false;
+        };
+        if delta.epoch != snapshot.epoch || delta.seq != snapshot.through_seq.saturating_add(1) {
+            return false;
+        }
+        match delta.change {
+            RuntimeChange::ConnectionUpsert {
+                request_elicitations,
+                request_url_flows,
+            } => {
+                let Some(revision) = delta.scope_revision else {
+                    return false;
+                };
+                if revision != snapshot.connection_revision.saturating_add(1) {
+                    return false;
+                }
+                snapshot.connection_revision = revision;
+                snapshot.request_elicitations = request_elicitations;
+                snapshot.request_url_flows = request_url_flows;
+            }
+            RuntimeChange::SessionUpsert { session } => {
+                if delta.scope_revision != Some(session.revision) {
+                    return false;
+                }
+                match snapshot.sessions.get(&session.session_id) {
+                    Some(current) if current.incarnation == session.incarnation => {
+                        if session.revision != current.revision.saturating_add(1) {
+                            return false;
+                        }
+                    }
+                    Some(current)
+                        if current.lifecycle == crate::runtime_state::SessionLifecycle::Closed
+                            && session.incarnation != current.incarnation
+                            && session.revision == 1 => {}
+                    Some(_) => return false,
+                    None if session.revision == 1 => {}
+                    None => return false,
+                }
+                snapshot
+                    .sessions
+                    .insert(session.session_id.clone(), session);
+            }
+            RuntimeChange::TurnUpdateAppended {
+                session_id,
+                incarnation,
+                revision,
+                operation_id,
+                update,
+            } => {
+                if delta.scope_revision != Some(revision) {
+                    return false;
+                }
+                let Some(session) = snapshot.sessions.get_mut(&session_id) else {
+                    return false;
+                };
+                if session.incarnation != incarnation
+                    || revision != session.revision.saturating_add(1)
+                {
+                    return false;
+                }
+                let Some(turn) = session.active_turn.as_mut() else {
+                    return false;
+                };
+                if turn.operation_id != operation_id {
+                    return false;
+                }
+                turn.updates.push(update);
+                session.revision = revision;
+            }
+            RuntimeChange::SessionRemoved {
+                session_id,
+                incarnation,
+            } => {
+                if snapshot
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.incarnation != incarnation)
+                {
+                    return false;
+                }
+                snapshot.sessions.remove(&session_id);
+            }
+        }
+        for result in delta.intent_results {
+            snapshot
+                .intent_results
+                .insert(result.operation_id.clone(), result);
+        }
+        for operation_id in delta.evicted_intent_result_ids {
+            snapshot.intent_results.remove(&operation_id);
+        }
+        snapshot.through_seq = delta.seq;
+        true
+    }
+}
+
 #[derive(Default)]
 struct BridgeHubState {
     generation: u64,
     input: Option<mpsc::Sender<bridge::BridgeInput>>,
-    subscribers: HashMap<u64, mpsc::UnboundedSender<String>>,
+    cancellation: Option<CancellationToken>,
+    subscribers: HashMap<u64, SubscriberSender>,
     bootstrap: BridgeBootstrap,
+    runtime: RuntimeCache,
+    canonical: CanonicalProjection,
+    canonical_resync_pending: bool,
     shutting_down: bool,
 }
 
@@ -105,7 +325,86 @@ struct BridgeHub {
 struct BridgeSubscription {
     id: u64,
     generation: u64,
-    events: mpsc::UnboundedReceiver<String>,
+    initial_events: Vec<String>,
+    events: mpsc::Receiver<QueuedSubscriberEvent>,
+}
+
+#[derive(Clone)]
+struct SubscriberSender {
+    tx: mpsc::Sender<QueuedSubscriberEvent>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+struct QueuedSubscriberEvent {
+    event: String,
+    queued_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+struct SubscriberByteLease {
+    queued_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl QueuedSubscriberEvent {
+    fn into_inflight(mut self) -> (String, SubscriberByteLease) {
+        let event = std::mem::take(&mut self.event);
+        let bytes = std::mem::take(&mut self.bytes);
+        (
+            event,
+            SubscriberByteLease {
+                queued_bytes: self.queued_bytes.clone(),
+                bytes,
+            },
+        )
+    }
+
+    fn into_string(mut self) -> String {
+        std::mem::take(&mut self.event)
+    }
+}
+
+impl Drop for QueuedSubscriberEvent {
+    fn drop(&mut self) {
+        self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+impl Drop for SubscriberByteLease {
+    fn drop(&mut self) {
+        self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+impl SubscriberSender {
+    fn channel(capacity: usize) -> (Self, mpsc::Receiver<QueuedSubscriberEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+            rx,
+        )
+    }
+
+    fn try_send(&self, event: String) -> Result<(), ()> {
+        let bytes = event.len();
+        self.queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= SUBSCRIBER_QUEUE_BYTE_CAPACITY)
+            })
+            .map_err(|_| ())?;
+        self.tx
+            .try_send(QueuedSubscriberEvent {
+                event,
+                queued_bytes: self.queued_bytes.clone(),
+                bytes,
+            })
+            .map_err(|_| ())
+    }
 }
 
 struct BridgeRuntime {
@@ -113,6 +412,7 @@ struct BridgeRuntime {
     input: mpsc::Receiver<bridge::BridgeInput>,
     events: mpsc::UnboundedReceiver<String>,
     event_tx: mpsc::UnboundedSender<String>,
+    cancellation: CancellationToken,
 }
 
 impl BridgeHub {
@@ -133,14 +433,20 @@ impl BridgeHub {
             } else {
                 state.generation = state.generation.wrapping_add(1).max(1);
                 state.bootstrap = BridgeBootstrap::default();
+                state.runtime = RuntimeCache::default();
+                state.canonical = CanonicalProjection::default();
+                state.canonical_resync_pending = false;
                 let (input_tx, input) = mpsc::channel(256);
                 let (event_tx, events) = mpsc::unbounded_channel();
+                let cancellation = CancellationToken::new();
                 state.input = Some(input_tx);
+                state.cancellation = Some(cancellation.clone());
                 Some(BridgeRuntime {
                     generation: state.generation,
                     input,
                     events,
                     event_tx,
+                    cancellation,
                 })
             }
         };
@@ -152,21 +458,34 @@ impl BridgeHub {
     async fn subscribe(self: &Arc<Self>) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let generation = {
+        let (event_tx, event_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (generation, initial_events) = {
             let mut state = self.state.lock().await;
             if state.shutting_down || state.input.is_none() {
                 return None;
             }
-            for event in state.bootstrap.events() {
-                let _ = event_tx.send(event.clone());
+            let mut initial_events = Vec::new();
+            if let Some(event) = state.bootstrap.hello_event() {
+                initial_events.push(event.clone());
             }
+            if let Some(snapshot) = &state.canonical.snapshot {
+                initial_events.push(
+                    json!({
+                        "type": "bridge/runtime_snapshot",
+                        "snapshot": snapshot,
+                    })
+                    .to_string(),
+                );
+            }
+            initial_events.extend(state.runtime.replay_events());
+            initial_events.extend(state.bootstrap.events_after_runtime().cloned());
             state.subscribers.insert(id, event_tx);
-            state.generation
+            (state.generation, initial_events)
         };
         Some(BridgeSubscription {
             id,
             generation,
+            initial_events,
             events: event_rx,
         })
     }
@@ -175,29 +494,72 @@ impl BridgeHub {
         let BridgeRuntime {
             generation,
             input,
-            mut events,
+            events,
             event_tx,
+            cancellation,
         } = runtime;
         let options = self.options.clone();
+        let (runtime_done_tx, runtime_done_rx) = oneshot::channel();
         tokio::spawn(async move {
-            bridge::run(options, input, event_tx).await;
+            bridge::run_with_cancellation(options, input, event_tx, cancellation).await;
+            let _ = runtime_done_tx.send(());
         });
 
         let hub = Arc::downgrade(self);
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                let Some(hub) = hub.upgrade() else {
-                    return;
-                };
-                hub.publish(generation, event).await;
-            }
-            if let Some(hub) = hub.upgrade() {
-                hub.finish_generation(generation).await;
-            }
-        });
+        tokio::spawn(forward_generation_events(
+            hub,
+            generation,
+            events,
+            runtime_done_rx,
+        ));
     }
 
     async fn publish(&self, generation: u64, event: String) {
+        if is_internal_runtime_event(&event) {
+            let snapshot_request = {
+                let mut state = self.state.lock().await;
+                if state.generation != generation || state.input.is_none() {
+                    return;
+                }
+                let (recognized, public_event) = state.canonical.update_with_public_event(&event);
+                if state.canonical.snapshot.is_some() {
+                    state.canonical_resync_pending = false;
+                }
+                if let Some(public_event) = public_event {
+                    let mut failed_subscribers = Vec::new();
+                    for (&subscriber_id, subscriber) in &state.subscribers {
+                        if subscriber.try_send(public_event.clone()).is_err() {
+                            failed_subscribers.push(subscriber_id);
+                        }
+                    }
+                    for subscriber_id in failed_subscribers {
+                        state.subscribers.remove(&subscriber_id);
+                    }
+                }
+                if recognized
+                    && state.canonical.snapshot.is_none()
+                    && !state.canonical_resync_pending
+                {
+                    state.canonical_resync_pending = true;
+                    state.input.clone()
+                } else {
+                    None
+                }
+            };
+            if let Some(input) = snapshot_request {
+                let _ = input
+                    .send(bridge::BridgeInput::RuntimeSnapshotRequest)
+                    .await;
+            }
+            return;
+        }
+        if is_internal_direct_event(&event) {
+            if let Some((subscriber_id, event)) = directed_bridge_event(&event) {
+                self.send_to_subscriber(subscriber_id, generation, event)
+                    .await;
+            }
+            return;
+        }
         let restart = terminal_auth_succeeded(&event);
         let input = {
             let mut state = self.state.lock().await;
@@ -205,13 +567,27 @@ impl BridgeHub {
                 return;
             }
             state.bootstrap.update(&event);
-            for subscriber in state.subscribers.values() {
-                let _ = subscriber.send(event.clone());
+            state.runtime.update(&event);
+            let session_projection = opened_runtime_session_id(&event)
+                .map(|session_id| state.runtime.replay_session_events(&session_id))
+                .unwrap_or_default();
+            let mut failed_subscribers = Vec::new();
+            for (&subscriber_id, subscriber) in &state.subscribers {
+                let mut delivered = subscriber.try_send(event.clone()).is_ok();
+                for projection_event in &session_projection {
+                    delivered &= subscriber.try_send(projection_event.clone()).is_ok();
+                }
+                if !delivered {
+                    failed_subscribers.push(subscriber_id);
+                }
             }
-            restart.then(|| state.input.clone()).flatten()
+            for subscriber_id in failed_subscribers {
+                state.subscribers.remove(&subscriber_id);
+            }
+            restart.then(|| state.cancellation.clone()).flatten()
         };
-        if let Some(input) = input {
-            let _ = input.send(bridge::BridgeInput::Restart).await;
+        if let Some(cancellation) = input {
+            cancellation.cancel();
         }
     }
 
@@ -222,6 +598,7 @@ impl BridgeHub {
                 return;
             }
             state.input = None;
+            state.cancellation = None;
             std::mem::take(&mut state.subscribers)
         };
         drop(subscribers);
@@ -242,46 +619,41 @@ impl BridgeHub {
             state.input.clone().ok_or(())?
         };
         input
-            .send(bridge::BridgeInput::Command(command))
+            .send(bridge::BridgeInput::Command {
+                subscriber_id,
+                raw: command,
+            })
             .await
             .map_err(|_| ())
     }
 
     async fn send_to_subscriber(&self, subscriber_id: u64, generation: u64, event: String) {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         if state.generation == generation
             && let Some(sender) = state.subscribers.get(&subscriber_id)
+            && sender.try_send(event).is_err()
         {
-            let _ = sender.send(event);
+            state.subscribers.remove(&subscriber_id);
         }
     }
 
     async fn unsubscribe(&self, subscriber_id: u64, generation: u64) {
-        let input = {
-            let mut state = self.state.lock().await;
-            if state.generation != generation
-                || state.subscribers.remove(&subscriber_id).is_none()
-                || !state.subscribers.is_empty()
-            {
-                return;
-            }
-            state.input.clone()
-        };
-        if let Some(input) = input {
-            let _ = input.send(bridge::BridgeInput::SubscribersGone).await;
+        let mut state = self.state.lock().await;
+        if state.generation == generation {
+            state.subscribers.remove(&subscriber_id);
         }
     }
 
     async fn shutdown(&self) {
-        let input = {
+        let cancellation = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
-            state.input.clone()
+            state.cancellation.clone()
         };
-        let Some(input) = input else {
+        let Some(cancellation) = cancellation else {
             return;
         };
-        let _ = input.send(bridge::BridgeInput::Shutdown).await;
+        cancellation.cancel();
         let wait = async {
             loop {
                 let stopped = self.stopped.notified();
@@ -292,6 +664,43 @@ impl BridgeHub {
             }
         };
         let _ = tokio::time::timeout(BRIDGE_SHUTDOWN_GRACE_PERIOD, wait).await;
+    }
+}
+
+async fn forward_generation_events(
+    hub: std::sync::Weak<BridgeHub>,
+    generation: u64,
+    mut events: mpsc::UnboundedReceiver<String>,
+    mut runtime_done: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            event = events.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                let Some(hub) = hub.upgrade() else {
+                    return;
+                };
+                hub.publish(generation, event).await;
+            }
+            _ = &mut runtime_done => {
+                // run_with_cancellation emits its terminal phase before it
+                // returns. Drain everything already queued, then ignore any
+                // leaked/late sender from this completed generation.
+                while let Ok(event) = events.try_recv() {
+                    let Some(hub) = hub.upgrade() else {
+                        return;
+                    };
+                    hub.publish(generation, event).await;
+                }
+                break;
+            }
+        }
+    }
+    if let Some(hub) = hub.upgrade() {
+        hub.finish_generation(generation).await;
     }
 }
 
@@ -380,9 +789,16 @@ async fn serve_websocket(socket: WebSocket, bridge: Arc<BridgeHub>) {
     let BridgeSubscription {
         id,
         generation,
+        initial_events,
         mut events,
     } = subscription;
     let (mut writer, mut reader) = socket.split();
+    for event in initial_events {
+        if writer.send(Message::Text(event.into())).await.is_err() {
+            bridge.unsubscribe(id, generation).await;
+            return;
+        }
+    }
     tokio::select! {
         _ = async {
             while let Some(message) = reader.next().await {
@@ -413,7 +829,10 @@ async fn serve_websocket(socket: WebSocket, bridge: Arc<BridgeHub>) {
         } => {},
         _ = async {
             while let Some(event) = events.recv().await {
-                if writer.send(Message::Text(event.into())).await.is_err() {
+                let (event, lease) = event.into_inflight();
+                let result = writer.send(Message::Text(event.into())).await;
+                drop(lease);
+                if result.is_err() {
                     break;
                 }
             }
@@ -447,6 +866,13 @@ async fn static_asset(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_state::{RuntimeLimits, RuntimeState};
+    use clap::Parser;
+
+    fn test_hub() -> Arc<BridgeHub> {
+        let options = Options::try_parse_from(["attyd", "--", "fake-agent"]).unwrap();
+        BridgeHub::new(Arc::new(options))
+    }
 
     #[test]
     fn bootstrap_replays_connection_state_without_transient_command_errors() {
@@ -465,6 +891,49 @@ mod tests {
         assert!(events.iter().any(|event| event.contains("Agent exited")));
     }
 
+    #[tokio::test]
+    async fn dropping_legacy_and_debug_state_does_not_change_canonical_projection() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        let canonical = runtime.snapshot();
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(canonical.clone());
+        }
+        hub.publish(
+            1,
+            json!({
+                "type": "acp/session_created",
+                "cwd": "/legacy",
+                "response": { "sessionId": "legacy-session" },
+            })
+            .to_string(),
+        )
+        .await;
+
+        let mut state = hub.state.lock().await;
+        assert!(!state.runtime.replay_events().is_empty());
+        assert_eq!(state.canonical.snapshot, Some(canonical.clone()));
+        state.runtime = RuntimeCache::default();
+        state.bootstrap = BridgeBootstrap::default();
+        assert_eq!(
+            state.canonical.snapshot,
+            Some(canonical),
+            "raw/legacy retention is not a materialized business-state dependency"
+        );
+    }
+
     #[test]
     fn restarts_only_after_successful_terminal_authentication() {
         assert!(terminal_auth_succeeded(
@@ -476,5 +945,835 @@ mod tests {
         assert!(!terminal_auth_succeeded(
             r#"{"type":"acp/authenticated","status":"succeeded"}"#
         ));
+    }
+
+    #[test]
+    fn identifies_session_lifecycle_events_that_require_a_runtime_projection() {
+        assert_eq!(
+            opened_runtime_session_id(
+                r#"{"type":"acp/session_created","response":{"sessionId":"created"}}"#
+            ),
+            Some("created".to_string())
+        );
+        assert_eq!(
+            opened_runtime_session_id(
+                r#"{"type":"acp/session_attached","sessionId":"attached","response":{}}"#
+            ),
+            Some("attached".to_string())
+        );
+        assert_eq!(
+            opened_runtime_session_id(r#"{"type":"acp/prompt_complete","sessionId":"done"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn internal_direct_event_is_unwrapped_without_becoming_public_state() {
+        let event = r#"{"type":"bridge/internal_direct","subscriberId":42,"event":{"type":"bridge/error","requestId":"request","message":"collision"}}"#;
+
+        let (subscriber_id, direct) = directed_bridge_event(event).unwrap();
+        assert_eq!(subscriber_id, 42);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&direct).unwrap(),
+            json!({
+                "type": "bridge/error",
+                "requestId": "request",
+                "message": "collision",
+            }),
+        );
+        assert!(directed_bridge_event(r#"{"type":"bridge/phase","phase":"ready"}"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn directed_event_reaches_only_the_requesting_subscriber() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let (target_tx, mut target_rx) = SubscriberSender::channel(4);
+        let (other_tx, mut other_rx) = SubscriberSender::channel(4);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.subscribers.insert(42, target_tx);
+            state.subscribers.insert(43, other_tx);
+        }
+
+        hub.publish(
+            1,
+            r#"{"type":"bridge/internal_direct","subscriberId":42,"event":{"type":"bridge/error","message":"collision"}}"#.to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &target_rx.try_recv().unwrap().into_string(),
+            )
+            .unwrap(),
+            json!({ "type": "bridge/error", "message": "collision" }),
+        );
+        assert!(other_rx.try_recv().is_err());
+        assert!(
+            hub.state
+                .lock()
+                .await
+                .runtime
+                .replay_events()
+                .iter()
+                .all(|event| !event.contains("collision"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_completion_finishes_generation_with_a_leaked_event_sender() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+        }
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let leaked_sender = event_tx.clone();
+        let (done_tx, done_rx) = oneshot::channel();
+        let forwarder = tokio::spawn(forward_generation_events(
+            Arc::downgrade(&hub),
+            1,
+            event_rx,
+            done_rx,
+        ));
+        event_tx
+            .send(r#"{"type":"bridge/phase","phase":"stopped"}"#.to_string())
+            .unwrap();
+        done_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(100), forwarder)
+            .await
+            .expect("generation completion still depended on event channel EOF")
+            .unwrap();
+        let state = hub.state.lock().await;
+        assert!(state.input.is_none());
+        assert_eq!(
+            state
+                .bootstrap
+                .phase
+                .as_deref()
+                .and_then(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+                .and_then(|event| event["phase"].as_str().map(str::to_string))
+                .as_deref(),
+            Some("stopped"),
+            "terminal events queued before runtime completion must be drained first"
+        );
+        drop(state);
+        assert!(
+            leaked_sender
+                .send(r#"{"type":"bridge/phase","phase":"ready"}"#.to_string())
+                .is_err(),
+            "late senders from a completed generation must be disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_generation_commands_and_direct_events_are_rejected() {
+        let hub = test_hub();
+        let (input, mut commands) = mpsc::channel(1);
+        let (subscriber, mut events) = SubscriberSender::channel(1);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 2;
+            state.input = Some(input);
+            state.subscribers.insert(42, subscriber);
+        }
+
+        assert!(
+            hub.send_command(42, 1, r#"{"type":"bridge/ping"}"#.to_string())
+                .await
+                .is_err()
+        );
+        assert!(commands.try_recv().is_err());
+        hub.send_to_subscriber(42, 1, "stale".to_string()).await;
+        assert!(events.try_recv().is_err());
+        assert!(hub.state.lock().await.subscribers.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_is_evicted_without_blocking_a_healthy_subscriber() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let (slow_tx, _slow_rx) = SubscriberSender::channel(1);
+        let (healthy_tx, mut healthy_rx) = SubscriberSender::channel(4);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.subscribers.insert(1, slow_tx);
+            state.subscribers.insert(2, healthy_tx);
+        }
+
+        hub.publish(
+            1,
+            r#"{"type":"bridge/phase","phase":"starting"}"#.to_string(),
+        )
+        .await;
+        hub.publish(1, r#"{"type":"bridge/phase","phase":"ready"}"#.to_string())
+            .await;
+
+        let state = hub.state.lock().await;
+        assert!(!state.subscribers.contains_key(&1));
+        assert!(state.subscribers.contains_key(&2));
+        drop(state);
+        assert_eq!(
+            healthy_rx.try_recv().unwrap().into_string(),
+            r#"{"type":"bridge/phase","phase":"starting"}"#
+        );
+        assert_eq!(
+            healthy_rx.try_recv().unwrap().into_string(),
+            r#"{"type":"bridge/phase","phase":"ready"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_backlog_is_bounded_by_bytes_not_only_event_count() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let (subscriber_tx, _subscriber_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.subscribers.insert(1, subscriber_tx);
+        }
+        let large_event = json!({
+            "type": "bridge/stderr",
+            "chunk": "x".repeat(SUBSCRIBER_QUEUE_BYTE_CAPACITY / 2 + 1),
+        })
+        .to_string();
+
+        hub.publish(1, large_event.clone()).await;
+        assert!(hub.state.lock().await.subscribers.contains_key(&1));
+        hub.publish(1, large_event).await;
+        assert!(
+            !hub.state.lock().await.subscribers.contains_key(&1),
+            "a few large events must not bypass subscriber memory bounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_byte_accounting_releases_on_receive_and_failed_send() {
+        let (sender, mut receiver) = SubscriberSender::channel(1);
+        sender.try_send("first".to_string()).unwrap();
+        assert_eq!(sender.queued_bytes.load(Ordering::Acquire), 5);
+        assert!(sender.try_send("overflow".to_string()).is_err());
+        assert_eq!(
+            sender.queued_bytes.load(Ordering::Acquire),
+            5,
+            "event-count rejection must roll back its byte reservation"
+        );
+
+        let (event, lease) = receiver.recv().await.unwrap().into_inflight();
+        assert_eq!(event, "first");
+        assert_eq!(
+            sender.queued_bytes.load(Ordering::Acquire),
+            5,
+            "the byte lease must remain charged while WebSocket send is in flight"
+        );
+        drop(lease);
+        assert_eq!(sender.queued_bytes.load(Ordering::Acquire), 0);
+        drop(receiver);
+        assert!(sender.try_send("closed".to_string()).is_err());
+        assert_eq!(
+            sender.queued_bytes.load(Ordering::Acquire),
+            0,
+            "closed-channel rejection must roll back its byte reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_byte_ledgers_are_independent_and_release_on_receiver_drop() {
+        let (first, first_rx) = SubscriberSender::channel(2);
+        let (second, mut second_rx) = SubscriberSender::channel(2);
+        first.try_send("first".to_string()).unwrap();
+        second.try_send("second".to_string()).unwrap();
+        assert_eq!(first.queued_bytes.load(Ordering::Acquire), 5);
+        assert_eq!(second.queued_bytes.load(Ordering::Acquire), 6);
+
+        drop(first_rx);
+        assert_eq!(
+            first.queued_bytes.load(Ordering::Acquire),
+            0,
+            "dropping a subscriber receiver must release every queued lease"
+        );
+        assert_eq!(
+            second.queued_bytes.load(Ordering::Acquire),
+            6,
+            "one subscriber's teardown must not alter another subscriber's ledger"
+        );
+        assert_eq!(second_rx.recv().await.unwrap().into_string(), "second");
+        assert_eq!(second.queued_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn canonical_projection_folds_typed_snapshot_and_contiguous_deltas() {
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut projection = CanonicalProjection::default();
+        assert!(
+            projection.update(
+                &json!({
+                    "type": "bridge/internal_runtime_snapshot",
+                    "value": runtime.snapshot(),
+                })
+                .to_string(),
+            )
+        );
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        runtime
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        runtime
+            .append_turn_update(
+                "epoch",
+                "session",
+                incarnation,
+                json!({ "sessionUpdate": "agent_message_chunk", "text": "increment" }),
+            )
+            .unwrap();
+        runtime
+            .complete_prompt(
+                "epoch",
+                "session",
+                incarnation,
+                "prompt",
+                json!({ "stopReason": "end_turn" }),
+            )
+            .unwrap();
+        for delta in runtime.deltas_after(0).unwrap() {
+            assert!(
+                projection.update(
+                    &json!({
+                        "type": "bridge/internal_runtime_delta",
+                        "value": delta,
+                    })
+                    .to_string(),
+                )
+            );
+        }
+
+        assert_eq!(
+            serde_json::to_value(projection.snapshot.unwrap()).unwrap(),
+            serde_json::to_value(runtime.snapshot()).unwrap()
+        );
+    }
+
+    #[test]
+    fn replaying_the_same_canonical_snapshot_is_idempotent() {
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        runtime
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        let event = json!({
+            "type": "bridge/internal_runtime_snapshot",
+            "value": runtime.snapshot(),
+        })
+        .to_string();
+        let mut projection = CanonicalProjection::default();
+
+        assert!(projection.update(&event));
+        let once = projection.snapshot.clone();
+        assert!(projection.update(&event));
+        assert_eq!(projection.snapshot, once);
+        assert_eq!(
+            projection.snapshot.as_ref().unwrap().sessions["session"]
+                .active_turn
+                .iter()
+                .count(),
+            1,
+            "snapshot replay must replace state rather than duplicate live entities"
+        );
+    }
+
+    #[test]
+    fn stale_turn_update_operation_forces_resnapshot_without_partial_mutation() {
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        runtime
+            .start_prompt("epoch", "session", incarnation, "current", Vec::new())
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        let revision = snapshot.sessions["session"].revision + 1;
+        let stale = RuntimeDelta {
+            epoch: "epoch".to_string(),
+            seq: snapshot.through_seq + 1,
+            scope_revision: Some(revision),
+            change: RuntimeChange::TurnUpdateAppended {
+                session_id: "session".to_string(),
+                incarnation,
+                revision,
+                operation_id: "stale".to_string(),
+                update: json!({ "sessionUpdate": "agent_message_chunk", "text": "late" }),
+            },
+            intent_results: Vec::new(),
+            evicted_intent_result_ids: Vec::new(),
+        };
+
+        let mut direct = CanonicalProjection {
+            snapshot: Some(snapshot.clone()),
+        };
+        assert!(!direct.apply_delta(stale.clone()));
+        assert_eq!(
+            direct.snapshot,
+            Some(snapshot.clone()),
+            "a rejected delta must not partially mutate the materialized projection"
+        );
+
+        let mut public = CanonicalProjection {
+            snapshot: Some(snapshot),
+        };
+        assert!(
+            public.update(
+                &json!({
+                    "type": "bridge/internal_runtime_delta",
+                    "value": stale,
+                })
+                .to_string(),
+            )
+        );
+        assert!(
+            public.snapshot.is_none(),
+            "the Hub must request a replacement snapshot after an invalid turn delta"
+        );
+    }
+
+    #[test]
+    fn canonical_projection_discards_a_gapped_delta_stream() {
+        let runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut projection = CanonicalProjection::default();
+        projection.update(
+            &json!({
+                "type": "bridge/internal_runtime_snapshot",
+                "value": runtime.snapshot(),
+            })
+            .to_string(),
+        );
+        let gap = RuntimeDelta {
+            epoch: "epoch".to_string(),
+            seq: 2,
+            scope_revision: None,
+            change: RuntimeChange::SessionRemoved {
+                session_id: "missing".to_string(),
+                incarnation: 1,
+            },
+            intent_results: Vec::new(),
+            evicted_intent_result_ids: Vec::new(),
+        };
+
+        assert!(
+            projection.update(
+                &json!({
+                    "type": "bridge/internal_runtime_delta",
+                    "value": gap,
+                })
+                .to_string(),
+            )
+        );
+        assert!(projection.snapshot.is_none());
+    }
+
+    #[test]
+    fn canonical_projection_rejects_a_session_revision_jump() {
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        let mut projection = CanonicalProjection::default();
+        projection.update(
+            &json!({
+                "type": "bridge/internal_runtime_snapshot",
+                "value": runtime.snapshot(),
+            })
+            .to_string(),
+        );
+        let mut jumped = runtime.session("session").unwrap().clone();
+        jumped.revision += 2;
+        let delta = RuntimeDelta {
+            epoch: "epoch".to_string(),
+            seq: runtime.seq() + 1,
+            scope_revision: Some(jumped.revision),
+            change: RuntimeChange::SessionUpsert { session: jumped },
+            intent_results: Vec::new(),
+            evicted_intent_result_ids: Vec::new(),
+        };
+
+        assert!(
+            projection.update(
+                &json!({
+                    "type": "bridge/internal_runtime_delta",
+                    "value": delta,
+                })
+                .to_string(),
+            )
+        );
+        assert!(projection.snapshot.is_none());
+    }
+
+    #[test]
+    fn canonical_projection_matches_runtime_intent_result_eviction() {
+        let mut runtime = RuntimeState::new(
+            "epoch",
+            RuntimeLimits {
+                max_intent_results: 2,
+                ..RuntimeLimits::default()
+            },
+        );
+        let initial = runtime.snapshot();
+        let mut projection = CanonicalProjection::default();
+        projection.update(
+            &json!({
+                "type": "bridge/internal_runtime_snapshot",
+                "value": initial,
+            })
+            .to_string(),
+        );
+        for index in 0..3 {
+            let session_id = format!("session-{index}");
+            let operation_id = format!("prompt-{index}");
+            let incarnation = runtime
+                .open_new(
+                    "epoch",
+                    session_id.clone(),
+                    "/workspace",
+                    json!({ "sessionId": session_id }),
+                )
+                .unwrap();
+            runtime
+                .start_prompt("epoch", &session_id, incarnation, &operation_id, Vec::new())
+                .unwrap();
+            runtime
+                .complete_prompt(
+                    "epoch",
+                    &session_id,
+                    incarnation,
+                    &operation_id,
+                    json!({ "stopReason": "end_turn" }),
+                )
+                .unwrap();
+        }
+        for delta in runtime.deltas_after(0).unwrap() {
+            assert!(
+                projection.update(
+                    &json!({
+                        "type": "bridge/internal_runtime_delta",
+                        "value": delta,
+                    })
+                    .to_string(),
+                )
+            );
+        }
+
+        assert_eq!(
+            serde_json::to_value(projection.snapshot.unwrap()).unwrap(),
+            serde_json::to_value(runtime.snapshot()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_bootstrap_contains_atomic_canonical_snapshot_and_suffix() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let initial = runtime.snapshot();
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(initial.clone());
+        }
+
+        let mut subscription = hub.subscribe().await.unwrap();
+        let snapshot_event = subscription
+            .initial_events
+            .iter()
+            .find_map(|event| {
+                let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+                (value.get("type")?.as_str()? == "bridge/runtime_snapshot").then_some(value)
+            })
+            .expect("canonical snapshot must be part of the atomic bootstrap");
+        assert_eq!(snapshot_event["snapshot"]["epoch"], initial.epoch);
+        assert_eq!(
+            snapshot_event["snapshot"]["throughSeq"],
+            initial.through_seq,
+        );
+
+        runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        let delta = runtime.deltas_after(initial.through_seq).unwrap()[0].clone();
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/internal_runtime_delta",
+                "value": delta,
+            })
+            .to_string(),
+        )
+        .await;
+
+        let delta_event =
+            tokio::time::timeout(Duration::from_millis(100), subscription.events.recv())
+                .await
+                .expect("canonical suffix was not delivered")
+                .expect("subscriber was disconnected before its suffix");
+        let delta_event: serde_json::Value =
+            serde_json::from_str(&delta_event.into_string()).unwrap();
+        assert_eq!(delta_event["type"], "bridge/runtime_delta");
+        assert_eq!(delta_event["delta"]["seq"], initial.through_seq + 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_gap_requests_a_fresh_bridge_snapshot() {
+        let hub = test_hub();
+        let (input, mut commands) = mpsc::channel(1);
+        let runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(runtime.snapshot());
+        }
+        let gap = RuntimeDelta {
+            epoch: "epoch".to_string(),
+            seq: 2,
+            scope_revision: None,
+            change: RuntimeChange::SessionRemoved {
+                session_id: "missing".to_string(),
+                incarnation: 1,
+            },
+            intent_results: Vec::new(),
+            evicted_intent_result_ids: Vec::new(),
+        };
+
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/internal_runtime_delta",
+                "value": gap,
+            })
+            .to_string(),
+        )
+        .await;
+
+        let command = tokio::time::timeout(Duration::from_millis(100), commands.recv())
+            .await
+            .expect("hub did not request a replacement snapshot")
+            .expect("bridge input closed before resync");
+        assert!(matches!(
+            command,
+            bridge::BridgeInput::RuntimeSnapshotRequest
+        ));
+    }
+
+    #[tokio::test]
+    async fn gap_resnapshot_is_single_flight_and_reestablishes_contiguous_suffix() {
+        let hub = test_hub();
+        let (input, mut commands) = mpsc::channel(8);
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(runtime.snapshot());
+        }
+        let mut subscription = hub.subscribe().await.unwrap();
+
+        for seq in [2, 3] {
+            hub.publish(
+                1,
+                json!({
+                    "type": "bridge/internal_runtime_delta",
+                    "value": RuntimeDelta {
+                        epoch: "epoch".to_string(),
+                        seq,
+                        scope_revision: None,
+                        change: RuntimeChange::SessionRemoved {
+                            session_id: "missing".to_string(),
+                            incarnation: 1,
+                        },
+                        intent_results: Vec::new(),
+                        evicted_intent_result_ids: Vec::new(),
+                    },
+                })
+                .to_string(),
+            )
+            .await;
+        }
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            bridge::BridgeInput::RuntimeSnapshotRequest
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "only one replacement snapshot may be in flight"
+        );
+
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/internal_runtime_snapshot",
+                "value": runtime.snapshot(),
+            })
+            .to_string(),
+        )
+        .await;
+        let replacement = subscription.events.recv().await.unwrap();
+        let replacement: serde_json::Value =
+            serde_json::from_str(&replacement.into_string()).unwrap();
+        assert_eq!(replacement["type"], "bridge/runtime_snapshot");
+        assert_eq!(replacement["snapshot"]["throughSeq"], 1);
+
+        runtime
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        let suffix = runtime.deltas_after(1).unwrap().remove(0);
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/internal_runtime_delta",
+                "value": suffix,
+            })
+            .to_string(),
+        )
+        .await;
+        let suffix = subscription.events.recv().await.unwrap();
+        let suffix: serde_json::Value = serde_json::from_str(&suffix.into_string()).unwrap();
+        assert_eq!(suffix["type"], "bridge/runtime_delta");
+        assert_eq!(suffix["delta"]["seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn two_subscribers_receive_the_same_canonical_revision_and_state() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(runtime.snapshot());
+        }
+        let mut first = hub.subscribe().await.unwrap();
+        let mut second = hub.subscribe().await.unwrap();
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        runtime
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+
+        for delta in runtime.deltas_after(0).unwrap() {
+            hub.publish(
+                1,
+                json!({
+                    "type": "bridge/internal_runtime_delta",
+                    "value": delta,
+                })
+                .to_string(),
+            )
+            .await;
+        }
+
+        for expected_seq in 1..=runtime.seq() {
+            let first_event = first.events.recv().await.unwrap().into_string();
+            let second_event = second.events.recv().await.unwrap().into_string();
+            assert_eq!(first_event, second_event);
+            let event: serde_json::Value = serde_json::from_str(&first_event).unwrap();
+            assert_eq!(event["delta"]["seq"], expected_seq);
+        }
+        let canonical = hub.state.lock().await.canonical.snapshot.clone().unwrap();
+        assert_eq!(
+            serde_json::to_value(canonical).unwrap(),
+            serde_json::to_value(runtime.snapshot()).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_bypasses_a_saturated_command_queue() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        input
+            .send(bridge::BridgeInput::Command {
+                subscriber_id: 1,
+                raw: "queued".to_string(),
+            })
+            .await
+            .unwrap();
+        let input_probe = input.clone();
+        let cancellation = CancellationToken::new();
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.cancellation = Some(cancellation.clone());
+        }
+        let shutdown = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.shutdown().await })
+        };
+
+        tokio::time::timeout(Duration::from_millis(100), cancellation.cancelled())
+            .await
+            .expect("shutdown was blocked behind the command queue");
+        assert!(
+            input_probe
+                .try_send(bridge::BridgeInput::Command {
+                    subscriber_id: 1,
+                    raw: "still-full".to_string(),
+                })
+                .is_err()
+        );
+        hub.finish_generation(1).await;
+        shutdown.await.unwrap();
     }
 }

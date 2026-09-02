@@ -1,5 +1,10 @@
 # Verification
 
+The bridge-first state-machine migration and its executable acceptance ledger are documented in
+[`bridge-state-machine-tdd.md`](bridge-state-machine-tdd.md). That ledger is authoritative for ACP
+lifecycle, reconnect, concurrency, and subscriber correctness; browser tests validate only the
+projection after the bridge gates pass.
+
 The production host and every host-level integration harness run the Rust backend. TypeScript is
 used only for the browser application, shared browser protocol types, test Agents, and test
 drivers; there is no second backend implementation.

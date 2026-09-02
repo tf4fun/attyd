@@ -15,7 +15,9 @@ import type { ServerEvent } from "../shared/bridge.js";
 for (const transport of ["http", "ws"] as const) {
   let initializedCapabilities: acp.ClientCapabilities | undefined;
   let createdCwd: string | undefined;
+  let sessionCount = 0;
   let promptStarted = false;
+  let concurrentPromptCompleted = false;
   let cancellationObserved = false;
   let finishPrompt: (() => void) | undefined;
   const agent = acp
@@ -30,9 +32,14 @@ for (const transport of ["http", "ws"] as const) {
     })
     .onRequest(acp.methods.agent.session.new, ({ params }) => {
       createdCwd = params.cwd;
-      return { sessionId: `${transport}-session` };
+      sessionCount += 1;
+      return { sessionId: `${transport}-session-${sessionCount}` };
     })
-    .onRequest(acp.methods.agent.session.prompt, async () => {
+    .onRequest(acp.methods.agent.session.prompt, async ({ params }) => {
+      if (params.sessionId === `${transport}-session-2`) {
+        concurrentPromptCompleted = true;
+        return { stopReason: "end_turn" };
+      }
       promptStarted = true;
       await new Promise<void>((resolve) => { finishPrompt = resolve; });
       return { stopReason: "cancelled" };
@@ -45,7 +52,7 @@ for (const transport of ["http", "ws"] as const) {
   const remote = await startRemoteAgent(agent);
   const endpoint = `${transport === "http" ? "http" : "ws"}://127.0.0.1:${remote.port}/acp`;
   const host = await startRustHost(transport, endpoint);
-  const socket = new WebSocket(`ws://127.0.0.1:${host.port}/ws`);
+  let socket = new WebSocket(`ws://127.0.0.1:${host.port}/ws`);
   const events: ServerEvent[] = [];
   socket.on("message", (data) => events.push(JSON.parse(data.toString()) as ServerEvent));
 
@@ -84,20 +91,77 @@ for (const transport of ["http", "ws"] as const) {
     );
     assert.equal(created.type, "acp/session_created");
     assert.equal(created.cwd, "/home/agent/project");
-    assert.equal(created.response.sessionId, `${transport}-session`);
+    assert.equal(created.response.sessionId, `${transport}-session-1`);
     assert.equal(createdCwd, "/home/agent/project");
 
     socket.send(JSON.stringify({
       type: "session/prompt",
       requestId: `${transport}-prompt`,
-      sessionId: `${transport}-session`,
-      prompt: [{ type: "text", text: "cancel me when the browser disconnects" }],
+      sessionId: `${transport}-session-1`,
+      prompt: [{ type: "text", text: "keep running while the browser reconnects" }],
     }));
     await waitUntil(() => promptStarted, `${transport} prompt to start`);
+
+    socket.send(JSON.stringify({
+      type: "session/new",
+      requestId: `${transport}-new-concurrent`,
+      cwd: "/home/agent/other-project",
+    }));
+    const concurrentCreated = await waitFor(events, (event) =>
+      event.type === "acp/session_created" &&
+      event.requestId === `${transport}-new-concurrent`
+    );
+    assert.equal(concurrentCreated.type, "acp/session_created");
+    assert.equal(concurrentCreated.response.sessionId, `${transport}-session-2`);
+    socket.send(JSON.stringify({
+      type: "session/prompt",
+      requestId: `${transport}-prompt-concurrent`,
+      sessionId: `${transport}-session-2`,
+      prompt: [{ type: "text", text: "run alongside the first session" }],
+    }));
+    await waitUntil(
+      () => concurrentPromptCompleted,
+      `${transport} concurrent session prompt`,
+    );
+    await waitFor(events, (event) =>
+      event.type === "acp/prompt_complete" &&
+      event.requestId === `${transport}-prompt-concurrent`
+    );
+
     socket.terminate();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(cancellationObserved, false);
+
+    socket = new WebSocket(`ws://127.0.0.1:${host.port}/ws`);
+    const replayEvents: ServerEvent[] = [];
+    socket.on("message", (data) => {
+      replayEvents.push(JSON.parse(data.toString()) as ServerEvent);
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    const replayComplete = await waitFor(
+      replayEvents,
+      (event) => event.type === "bridge/runtime_replay_complete",
+    );
+    assert.equal(replayComplete.type, "bridge/runtime_replay_complete");
+    assert.deepEqual(replayComplete.sessionIds.sort(), [
+      `${transport}-session-1`,
+      `${transport}-session-2`,
+    ]);
+    assert.ok(replayEvents.some((event) =>
+      event.type === "acp/prompt_started" &&
+      event.requestId === `${transport}-prompt`
+    ));
+
+    socket.send(JSON.stringify({
+      type: "session/cancel",
+      sessionId: `${transport}-session-1`,
+    }));
     await waitUntil(
       () => cancellationObserved,
-      `${transport} disconnect cancellation`,
+      `${transport} explicit cancellation after reconnect`,
     );
   } finally {
     if (socket.readyState !== WebSocket.CLOSED) socket.terminate();

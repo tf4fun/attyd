@@ -94,6 +94,10 @@ button { color: inherit; }
 .session-open strong, .session-open small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-open strong { font-size: 10px; font-weight: 600; }
 .session-open small { color: var(--muted); font: 8px var(--mono); }
+.session-attention {
+  width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%;
+  background: #b57a2a; box-shadow: 0 0 0 2px #f4eadb;
+}
 .session-open:hover:not(:disabled) { background: #e7e7e2; }
 .session-open:disabled { cursor: default; opacity: .7; }
 .session-delete {
@@ -441,6 +445,33 @@ button { color: inherit; }
 }
 .structured-scalar > code { display: block; padding: 7px 8px; }
 .structured-scalar > pre { padding: 7px 8px; }
+.structured-markdown > .markdown {
+  min-width: 0;
+  padding: 7px 8px;
+  color: #50504c;
+  font: 9px/1.55 var(--mono);
+  overflow-wrap: anywhere;
+}
+.structured-markdown .markdown p { margin: .35em 0; }
+.structured-markdown .markdown h1,
+.structured-markdown .markdown h2,
+.structured-markdown .markdown h3 {
+  margin: .65em 0 .35em;
+  font-size: 1em;
+  line-height: 1.45;
+}
+.structured-markdown .markdown ul,
+.structured-markdown .markdown ol { margin: .35em 0; padding-left: 18px; }
+.structured-markdown .markdown pre {
+  max-height: 280px;
+  margin: 6px 0;
+  padding: 7px 8px;
+  border-color: #deded8;
+  background: #efefeb;
+  color: #50504c;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .locations { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 8px; }
 .locations code { padding: 3px 5px; border-radius: 4px; background: #e8e8e3; color: #5c5c57; font: 9px var(--mono); }
 .terminal-embed { overflow: hidden; margin: 7px 0; border-radius: 6px; background: #222220; color: #d8ff54; font: 9px var(--mono); }

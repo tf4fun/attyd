@@ -376,6 +376,13 @@ describe("ACP UI component contract", () => {
             locations: [{ path: "/workspace/fixture.ts", line: 0 }],
             content: [
               {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: "**literal tool output**\n\n- first result",
+                },
+              },
+              {
                 type: "diff",
                 path: "/workspace/fixture.ts",
                 oldText: "before",
@@ -416,6 +423,9 @@ describe("ACP UI component contract", () => {
     expect(html).toContain("command output");
     expect(html).toContain("exit 0");
     expect(html).toContain("Earlier output was truncated.");
+    expect(html).toContain('<div class="structured-scalar structured-markdown">');
+    expect(html).toContain("<strong>literal tool output</strong>");
+    expect(html).toContain("<li>first result</li>");
     expect(html).toContain('data-tool-status="completed"');
     expect(html).toContain('data-live="false"');
     expect(html).toContain('aria-label="Tool status: Completed"');

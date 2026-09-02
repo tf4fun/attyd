@@ -65,9 +65,9 @@ describe("browser ACP command transport", () => {
     expect(mostRecentSession([])).toBeUndefined();
   });
 
-  it("reconnects a stale socket or a page returning from mobile suspension", () => {
+  it("probes healthy resumed sockets and reconnects only closed sockets", () => {
     expect(shouldReconnectAfterResume(undefined, 10_000, 3)).toBe(true);
-    expect(shouldReconnectAfterResume(1_000, 2_000, 1)).toBe(true);
+    expect(shouldReconnectAfterResume(1_000, 20_000, 1)).toBe(false);
     expect(shouldReconnectAfterResume(1_500, 2_000, 1)).toBe(false);
     expect(shouldReconnectAfterResume(undefined, 2_000, 1)).toBe(false);
   });

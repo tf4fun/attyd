@@ -16,6 +16,8 @@ export function SessionHistory({
   canAttach,
   canDelete,
   deletingSessionIds,
+  busySessionIds = [],
+  attentionSessionIds = [],
   openSessionIds = [],
   disabled,
   onAttach,
@@ -31,6 +33,8 @@ export function SessionHistory({
   canAttach: boolean;
   canDelete: boolean;
   deletingSessionIds: string[];
+  busySessionIds?: string[];
+  attentionSessionIds?: string[];
   openSessionIds?: string[];
   disabled: boolean;
   onAttach: (session: SessionInfo) => void;
@@ -114,6 +118,8 @@ export function SessionHistory({
             <SessionRow
               session={activeSession}
               active
+              busy={busySessionIds.includes(activeSession.sessionId)}
+              attention={attentionSessionIds.includes(activeSession.sessionId)}
               deleting={deletingSessionIds.includes(activeSession.sessionId)}
               disabled={disabled}
               canAttach={canAttach}
@@ -131,6 +137,8 @@ export function SessionHistory({
                 key={session.sessionId}
                 session={session}
                 active={false}
+                busy={busySessionIds.includes(session.sessionId)}
+                attention={attentionSessionIds.includes(session.sessionId)}
                 deleting={deletingSessionIds.includes(session.sessionId)}
                 open={openSessionIds.includes(session.sessionId)}
                 disabled={disabled}
@@ -164,6 +172,8 @@ export function SessionHistory({
 function SessionRow({
   session,
   active,
+  busy,
+  attention,
   deleting,
   open = false,
   disabled,
@@ -174,6 +184,8 @@ function SessionRow({
 }: {
   session: SessionInfo;
   active: boolean;
+  busy: boolean;
+  attention: boolean;
   deleting: boolean;
   open?: boolean;
   disabled: boolean;
@@ -184,13 +196,13 @@ function SessionRow({
 }) {
   const title = session.title || shortId(session.sessionId);
   return (
-    <div className={`session-row ${active ? "active current-thread" : ""}`}>
+    <div className={`session-row ${active ? "active current-thread" : ""} ${attention ? "attention" : ""}`}>
       <button
         type="button"
         className="session-open"
-        disabled={disabled || active || deleting || !canAttach}
+        disabled={disabled || active || deleting || (!open && !canAttach)}
         aria-current={active ? "page" : undefined}
-        title={active || canAttach ? session.sessionId : "Agent can list sessions but cannot load or resume them"}
+        title={active || open || canAttach ? session.sessionId : "Agent can list sessions but cannot load or resume them"}
         onClick={() => onAttach(session)}
       >
         <History size={13} />
@@ -200,14 +212,21 @@ function SessionRow({
             ? `${shortId(session.sessionId)} · active`
             : `${formatSessionDate(session.updatedAt)}${open ? " · open" : ""}`}</small>
         </span>
+        {attention ? (
+          <i className="session-attention" aria-label="Agent input required" title="Agent input required" />
+        ) : null}
       </button>
       {canDelete ? (
         <button
           type="button"
           className="session-delete"
-          disabled={disabled || deleting}
+          disabled={disabled || busy || deleting}
           aria-label={`${deleting ? "Deleting" : "Delete"} ${title}`}
-          title={open || active ? "Close and delete this thread" : undefined}
+          title={busy
+            ? "Stop this thread before deleting it"
+            : open || active
+              ? "Close and delete this thread"
+              : undefined}
           onClick={() => onDelete(session.sessionId)}
         >
           <Trash2 size={12} />

@@ -24,6 +24,7 @@ import type {
   ConnectionPhase,
   NesDocumentState,
   ServerEvent,
+  SessionRuntimeOperation,
   TerminalSnapshot,
 } from "../../../shared/bridge";
 import { assertNever } from "../../../shared/exhaustive";
@@ -133,6 +134,7 @@ export interface ActiveSessionSnapshot {
   running: boolean;
   agentActivity?: AgentActivity;
   pendingPrompt?: PendingPrompt;
+  runtimeOperation?: { requestId: string; operation: SessionRuntimeOperation };
   title?: string;
   usage?: AppState["usage"];
   activePlan?: AppState["activePlan"];
@@ -213,6 +215,7 @@ export interface PendingNesSuggestion {
 export interface AppState {
   phase: ConnectionPhase;
   socketOpen: boolean;
+  runtimeReplaying: boolean;
   transport: AgentTransport;
   command: string[];
   defaultCwd: string;
@@ -230,11 +233,13 @@ export interface AppState {
   lastAuthResponse?: AgentAuthResponse;
   session?: NewSessionResponse;
   cachedSessions: Map<string, ActiveSessionSnapshot>;
+  attentionSessionIds: string[];
   pendingSessionId?: string;
   sessionTransition?: SessionTransition;
   pendingSessionDeletions: PendingSessionDeletion[];
   pendingSessionControl?: PendingSessionControl;
   pendingPrompt?: PendingPrompt;
+  runtimeOperation?: { requestId: string; operation: SessionRuntimeOperation };
   sessions: SessionInfo[];
   nextSessionCursor?: string | null;
   availableCommands: AvailableCommand[];
@@ -265,6 +270,11 @@ export interface AppState {
 export type AppAction =
   | { type: "socket/open" }
   | { type: "socket/closed" }
+  | {
+      type: "runtime/replay_complete";
+      preferredSessionId?: string;
+      fallbackSessionId?: string;
+    }
   | { type: "client/error"; message: string }
   | { type: "permission/respond_start"; permissionId: string; requestId: string }
   | { type: "elicitation/respond_start"; elicitationId: string; requestId: string }
@@ -332,6 +342,7 @@ export type AppAction =
 export const initialState: AppState = {
   phase: "starting",
   socketOpen: false,
+  runtimeReplaying: false,
   transport: "stdio",
   command: [],
   defaultCwd: "",
@@ -342,6 +353,7 @@ export const initialState: AppState = {
   mcpActivity: [],
   readOnly: false,
   cachedSessions: new Map(),
+  attentionSessionIds: [],
   sessions: [],
   pendingSessionDeletions: [],
   availableCommands: [],
@@ -365,6 +377,14 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, socketOpen: true };
     case "socket/closed":
       return terminateBridgeState(state, "stopped", false);
+    case "runtime/replay_complete": {
+      const next = { ...state, runtimeReplaying: false };
+      const sessionId = action.preferredSessionId != null &&
+          next.cachedSessions.has(action.preferredSessionId)
+        ? action.preferredSessionId
+        : action.fallbackSessionId;
+      return sessionId == null ? next : activateCachedSession(next, sessionId);
+    }
     case "client/error":
       return {
         ...state,
@@ -418,34 +438,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       ) return state;
       return { ...state, authTerminal: undefined };
     case "user/prompt":
-      if (
-        state.session?.sessionId !== action.sessionId ||
-        state.running ||
-        state.pendingPrompt != null ||
-        state.sessionTransition != null ||
-        state.pendingSessionControl != null
-      ) return state;
-      return {
-        ...state,
-        running: true,
-        agentActivity: { kind: "waiting" },
-        pendingPrompt: {
-          requestId: action.requestId,
-          sessionId: action.sessionId,
-          blocks: action.blocks,
-        },
-        activePlan: planWithoutCompletedEntries(state.activePlan),
-        timeline: [
-          ...state.timeline,
-          {
-            id: randomId(),
-            type: "message",
-            role: "user",
-            blocks: action.blocks,
-            raw: [],
-          },
-        ],
-      };
+      return startPrompt(state, action.requestId, action.sessionId, action.blocks);
     case "elicitation/dismiss_flow":
       return {
         ...state,
@@ -457,12 +450,17 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       if (
         state.sessionTransition ||
         state.pendingSessionControl ||
-        state.pendingPrompt ||
-        state.running
+        state.runtimeOperation
       ) return state;
       if (
         (action.kind === "fork" || action.kind === "close") &&
-        (state.session == null || action.sessionId !== state.session.sessionId)
+        (
+          state.session == null ||
+          action.sessionId !== state.session.sessionId ||
+          state.running ||
+          state.pendingPrompt != null ||
+          state.runtimeOperation != null
+        )
       ) return state;
       const transition: SessionTransition = {
         kind: action.kind,
@@ -533,6 +531,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         state.pendingSessionControl != null ||
         state.sessionTransition != null ||
         state.running ||
+        state.runtimeOperation != null ||
         state.session?.sessionId !== action.sessionId
       ) return state;
       return {
@@ -625,6 +624,52 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         additionalDirectories: event.additionalDirectories,
         mcpServers: event.mcpServers,
       };
+    case "bridge/runtime_replay_started": {
+      const reset = resetActiveSession(state);
+      return {
+        ...reset,
+        runtimeReplaying: true,
+        cachedSessions: new Map(),
+        attentionSessionIds: [],
+        sessions: [],
+        backgroundEvents: [],
+      };
+    }
+    case "bridge/runtime_session":
+      return cacheRuntimeSession(state, event);
+    case "bridge/runtime_replay_complete":
+      // useAcp supplies the browser's preferred session ID when it handles
+      // this marker and dispatches runtime/replay_complete.
+      return state;
+    case "bridge/runtime_snapshot":
+    case "bridge/runtime_delta":
+    case "bridge/intent_ack":
+      // The canonical stream is running in shadow mode until the backend
+      // state-machine and transport gates are complete. Legacy ACP events
+      // remain the renderer's source during this migration phase.
+      return state;
+    case "bridge/session_operation_started":
+      if (isCurrentSession(state, event.sessionId)) {
+        return {
+          ...state,
+          runtimeOperation: {
+            requestId: event.requestId,
+            operation: event.operation,
+          },
+        };
+      }
+      return updateCachedSession(
+        state,
+        event.sessionId,
+        (cached) => ({
+          ...cached,
+          runtimeOperation: {
+            requestId: event.requestId,
+            operation: event.operation,
+          },
+        }),
+        event,
+      );
     case "bridge/pong":
       // Liveness probes are consumed by useAcp before reducer dispatch. Keep
       // this harmless for callers that replay every validated server event.
@@ -645,6 +690,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       // Request-scoped context responses are consumed by useAcp before dispatch.
       return state;
     case "bridge/error": {
+      state = clearRuntimeOperation(state, event.requestId);
       if (
         event.requestId != null &&
         state.pendingAuth?.requestId === event.requestId
@@ -682,29 +728,51 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         const pending = state.permissions.find(
           ({ responseRequestId }) => responseRequestId === event.requestId,
         );
-        if (!pending) return appendBackgroundEvent(state, event);
-        return {
-          ...state,
-          permissions: state.permissions.map((item) =>
-            item.permissionId === pending.permissionId
-              ? { ...item, responseRequestId: undefined, responseError: event.message }
-              : item
-          ),
-        };
+        if (pending) {
+          return failPermissionResponse(state, pending.permissionId, event.message);
+        }
+        for (const [sessionId, snapshot] of state.cachedSessions) {
+          const cached = snapshot.permissions.find(
+            ({ responseRequestId }) => responseRequestId === event.requestId,
+          );
+          if (!cached) continue;
+          return updateCachedSession(
+            state,
+            sessionId,
+            (cachedState) => failPermissionResponse(
+              cachedState,
+              cached.permissionId,
+              event.message,
+            ),
+            event,
+          );
+        }
+        return appendBackgroundEvent(state, event);
       }
       if (event.requestId != null && event.operation === "elicitation/respond") {
         const pending = state.elicitations.find(
           ({ responseRequestId }) => responseRequestId === event.requestId,
         );
-        if (!pending) return appendBackgroundEvent(state, event);
-        return {
-          ...state,
-          elicitations: state.elicitations.map((item) =>
-            item.elicitationId === pending.elicitationId
-              ? { ...item, responseRequestId: undefined, responseError: event.message }
-              : item
-          ),
-        };
+        if (pending) {
+          return failElicitationResponse(state, pending.elicitationId, event.message);
+        }
+        for (const [sessionId, snapshot] of state.cachedSessions) {
+          const cached = snapshot.elicitations.find(
+            ({ responseRequestId }) => responseRequestId === event.requestId,
+          );
+          if (!cached) continue;
+          return updateCachedSession(
+            state,
+            sessionId,
+            (cachedState) => failElicitationResponse(
+              cachedState,
+              cached.elicitationId,
+              event.message,
+            ),
+            event,
+          );
+        }
+        return appendBackgroundEvent(state, event);
       }
       if (isAuthenticationRequired(state, event)) {
         return settleAuthenticationRequired(state, event.requestId);
@@ -759,17 +827,18 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
           event.operation === "session/prompt" &&
           state.pendingPrompt?.requestId === event.requestId
         ) {
-          const retryBlocks = state.pendingPrompt.blocks;
-          return {
-            ...state,
-            running: false,
-            agentActivity: undefined,
-            pendingPrompt: undefined,
-            timeline: [
-              ...state.timeline,
-              errorTimelineItem(event, retryBlocks),
-            ],
-          };
+          return failPrompt(state, event);
+        }
+        if (event.operation === "session/prompt") {
+          for (const [sessionId, snapshot] of state.cachedSessions) {
+            if (snapshot.pendingPrompt?.requestId !== event.requestId) continue;
+            return updateCachedSession(
+              state,
+              sessionId,
+              (cached) => failPrompt(cached, event),
+              event,
+            );
+          }
         }
         if (state.pendingSessionControl?.requestId === event.requestId) {
           return {
@@ -806,22 +875,31 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       };
     }
     case "acp/initialized":
+      const preserveRuntimeAuth = state.pendingAuth != null ||
+        state.authTerminal != null ||
+        state.authStatus === "authenticated" ||
+        state.authStatus === "logged_out";
       return {
         ...state,
         initialized: event.response,
-        authStatus: (event.response.authMethods?.length ?? 0) > 0
-          ? "available"
-          : undefined,
-        pendingAuth: undefined,
-        authTerminal: undefined,
-        authError: undefined,
-        lastAuthResponse: undefined,
+        authStatus: preserveRuntimeAuth
+          ? state.authStatus
+          : (event.response.authMethods?.length ?? 0) > 0
+            ? "available"
+            : undefined,
+        pendingAuth: preserveRuntimeAuth ? state.pendingAuth : undefined,
+        authTerminal: preserveRuntimeAuth ? state.authTerminal : undefined,
+        authError: preserveRuntimeAuth ? state.authError : undefined,
+        lastAuthResponse: preserveRuntimeAuth ? state.lastAuthResponse : undefined,
       };
     case "acp/authenticated":
       if (
-        state.pendingAuth?.kind !== "authenticate" ||
-        state.pendingAuth.requestId !== event.requestId ||
-        state.pendingAuth.methodId !== event.methodId
+        state.pendingAuth != null &&
+        (
+          state.pendingAuth.kind !== "authenticate" ||
+          state.pendingAuth.requestId !== event.requestId ||
+          state.pendingAuth.methodId !== event.methodId
+        )
       ) return appendBackgroundEvent(state, event);
       return {
         ...state,
@@ -831,6 +909,25 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         lastAuthResponse: { kind: "authenticate", response: event.response },
       };
     case "bridge/auth_terminal_started":
+      if (state.pendingAuth == null) {
+        return {
+          ...state,
+          authStatus: "required",
+          pendingAuth: {
+            kind: "terminal",
+            requestId: event.requestId,
+            methodId: event.methodId,
+          },
+          authTerminal: {
+            requestId: event.requestId,
+            methodId: event.methodId,
+            status: "running",
+            output: "",
+            truncated: false,
+          },
+          authError: undefined,
+        };
+      }
       if (
         state.pendingAuth?.kind !== "terminal" ||
         state.pendingAuth.requestId !== event.requestId ||
@@ -868,8 +965,11 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       };
     case "acp/logged_out":
       if (
-        state.pendingAuth?.kind !== "logout" ||
-        state.pendingAuth.requestId !== event.requestId
+        state.pendingAuth != null &&
+        (
+          state.pendingAuth.kind !== "logout" ||
+          state.pendingAuth.requestId !== event.requestId
+        )
       ) return appendBackgroundEvent(state, event);
       return {
         ...state,
@@ -883,7 +983,15 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         state.sessionTransition?.kind !== "new" ||
         state.sessionTransition.requestId !== event.requestId
       ) {
-        return appendBackgroundEvent(state, event);
+        if (state.sessionTransition?.kind === "new") {
+          return appendBackgroundEvent(state, event);
+        }
+        return openObservedSession(
+          state,
+          event.response,
+          event.cwd,
+          event.earlyUpdates,
+        );
       }
       return applyEarlySessionUpdates({
         ...state,
@@ -894,7 +1002,12 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         modeId: event.response.modes?.currentModeId,
         configOptions: event.response.configOptions ?? [],
       }, event.response, event.earlyUpdates);
-    case "acp/sessions_listed":
+    case "acp/sessions_listed": {
+      const listedActive = state.session == null
+        ? undefined
+        : event.response.sessions.find(
+            ({ sessionId }) => sessionId === state.session?.sessionId,
+          );
       return {
         ...state,
         sessions: event.cursor
@@ -904,14 +1017,22 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
               event.response.sessions,
             ),
         nextSessionCursor: event.response.nextCursor,
+        title: state.title ?? listedActive?.title ?? undefined,
       };
+    }
     case "acp/session_attached": {
       if (
         state.sessionTransition?.kind !== "attach" ||
         state.sessionTransition.requestId !== event.requestId ||
         state.sessionTransition.targetSessionId !== event.sessionId
       ) {
-        return appendBackgroundEvent(state, event);
+        if (state.sessionTransition?.kind === "attach") {
+          return appendBackgroundEvent(state, event);
+        }
+        return openObservedSession(state, {
+          ...event.response,
+          sessionId: event.sessionId,
+        }, event.cwd);
       }
       const listed = state.sessions.find(({ sessionId }) => sessionId === event.sessionId);
       const cachedSessions = new Map(state.cachedSessions);
@@ -928,67 +1049,43 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         title: state.title ?? listed?.title ?? undefined,
       };
     }
-    case "acp/session_forked":
+    case "acp/session_forked": {
+      const settled = clearRuntimeOperation(state, event.requestId);
       if (
-        !isCurrentSession(state, event.sourceSessionId) ||
-        state.sessionTransition?.kind !== "fork" ||
-        state.sessionTransition.requestId !== event.requestId ||
-        state.sessionTransition.targetSessionId !== event.sourceSessionId
+        !isCurrentSession(settled, event.sourceSessionId) ||
+        settled.sessionTransition?.kind !== "fork" ||
+        settled.sessionTransition.requestId !== event.requestId ||
+        settled.sessionTransition.targetSessionId !== event.sourceSessionId
       ) {
-        return appendBackgroundEvent(state, event);
+        if (settled.sessionTransition?.kind === "fork") {
+          return appendBackgroundEvent(settled, event);
+        }
+        return openObservedSession(
+          settled,
+          event.response,
+          event.cwd,
+          event.earlyUpdates,
+        );
       }
       return applyEarlySessionUpdates({
-        ...state,
-        cwd: event.cwd ?? state.cwd,
+        ...settled,
+        cwd: event.cwd ?? settled.cwd,
         session: event.response,
         pendingSessionId: undefined,
         sessionTransition: undefined,
         modeId: event.response.modes?.currentModeId,
         configOptions: event.response.configOptions ?? [],
         permissions: [],
-        elicitations: requestScopedElicitations(state.elicitations),
+        elicitations: requestScopedElicitations(settled.elicitations),
         running: false,
         agentActivity: undefined,
         pendingPrompt: undefined,
       }, event.response, event.earlyUpdates);
-    case "acp/session_closed":
-      if (state.pendingSessionDeletions.some(
-        ({ requestId, sessionId, stage }) =>
-          requestId === event.requestId &&
-          sessionId === event.sessionId &&
-          stage === "closing",
-      )) {
-        const next = state.session?.sessionId === event.sessionId
-          ? resetActiveSession(state)
-          : state;
-        return removeCachedSession(next, event.sessionId);
-      }
-      if (
-        state.session?.sessionId !== event.sessionId ||
-        state.sessionTransition?.kind !== "close" ||
-        state.sessionTransition.requestId !== event.requestId ||
-        state.sessionTransition.targetSessionId !== event.sessionId
-      ) return appendBackgroundEvent(state, event);
-      return resetActiveSession(removeCachedSession(state, event.sessionId));
-    case "acp/session_deleted": {
-      const pendingDeletion = state.pendingSessionDeletions.find(
-        ({ requestId, sessionId, stage }) =>
-          requestId === event.requestId &&
-          sessionId === event.sessionId &&
-          stage === "deleting",
-      );
-      if (!pendingDeletion) return appendBackgroundEvent(state, event);
-      return {
-        ...(state.session?.sessionId === event.sessionId
-          ? resetActiveSession(state)
-          : state),
-        cachedSessions: withoutCachedSession(state.cachedSessions, event.sessionId),
-        sessions: state.sessions.filter(({ sessionId }) => sessionId !== event.sessionId),
-        pendingSessionDeletions: state.pendingSessionDeletions.filter(
-          ({ requestId }) => requestId !== event.requestId,
-        ),
-      };
     }
+    case "acp/session_closed":
+      return removeAuthoritativeSessionRuntime(state, event.sessionId, false);
+    case "acp/session_deleted":
+      return removeAuthoritativeSessionRuntime(state, event.sessionId, true);
     case "acp/session_update":
       if (isCurrentSession(state, event.notification.sessionId)) {
         return reduceSessionUpdate(state, event.notification);
@@ -1021,37 +1118,40 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         }),
         event,
       );
-    case "acp/prompt_complete":
-      if (
-        !isCurrentSession(state, event.sessionId) ||
-        state.pendingPrompt?.requestId !== event.requestId ||
-        state.pendingPrompt.sessionId !== event.sessionId
-      ) {
-        return appendBackgroundEvent(state, event);
+    case "acp/prompt_started":
+      if (isCurrentSession(state, event.sessionId)) {
+        return startPrompt(state, event.requestId, event.sessionId, event.prompt);
       }
-      const completedPlan = event.response.stopReason !== "cancelled" &&
-        isCompletedLegacyPlan(state.activePlan)
-        ? state.activePlan
-        : undefined;
-      return {
-        ...state,
-        running: false,
-        agentActivity: undefined,
-        pendingPrompt: undefined,
-        activePlan: completedPlan ? undefined : state.activePlan,
-        timeline: [
-          ...state.timeline,
-          ...(completedPlan ? [completedPlan] : []),
-          { id: randomId(), type: "stop", response: event.response },
-        ],
-      };
+      return updateCachedSession(
+        state,
+        event.sessionId,
+        (cached) => startPrompt(
+          cached,
+          event.requestId,
+          event.sessionId,
+          event.prompt,
+        ),
+        event,
+      );
+    case "acp/prompt_complete":
+      if (isCurrentSession(state, event.sessionId)) {
+        return completePrompt(state, event);
+      }
+      return updateCachedSession(
+        state,
+        event.sessionId,
+        (cached) => completePrompt(cached, event),
+        event,
+      );
     case "acp/permission_request": {
       if (!isCurrentSession(state, event.request.sessionId)) {
         if (state.cachedSessions.has(event.request.sessionId)) {
-          return reduceServerEvent(
-            activateCachedSession(state, event.request.sessionId),
+          return markSessionAttention(updateCachedSession(
+            state,
+            event.request.sessionId,
+            (cached) => reduceServerEvent(cached, event),
             event,
-          );
+          ), event.request.sessionId);
         }
         return appendBackgroundEvent(state, event);
       }
@@ -1065,7 +1165,9 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         ...state,
         timeline,
         permissions: [
-          ...state.permissions,
+          ...state.permissions.filter(
+            ({ permissionId }) => permissionId !== event.permissionId,
+          ),
           { permissionId: event.permissionId, request: event.request },
         ],
       };
@@ -1074,29 +1176,40 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       const pending = state.permissions.find(
         ({ permissionId }) => permissionId === event.permissionId,
       );
-      if (
-        !pending ||
-        (event.requestId != null && pending.responseRequestId !== event.requestId)
-      ) return appendBackgroundEvent(state, event);
-      return {
-        ...state,
-        permissions: state.permissions.filter(
-          ({ permissionId }) => permissionId !== event.permissionId,
-        ),
-      };
+      if (pending) return removePermission(state, event.permissionId);
+      for (const [sessionId, snapshot] of state.cachedSessions) {
+        const cachedPending = snapshot.permissions.find(
+          ({ permissionId }) => permissionId === event.permissionId,
+        );
+        if (!cachedPending) continue;
+        return clearSessionAttentionIfSettled(updateCachedSession(
+          state,
+          sessionId,
+          (cached) => removePermission(cached, event.permissionId),
+          event,
+        ), sessionId);
+      }
+      return appendBackgroundEvent(state, event);
     }
     case "acp/elicitation_request": {
       const scopedSessionId = elicitationSessionId(event.request);
       if (scopedSessionId != null && !isCurrentSession(state, scopedSessionId)) {
         if (state.cachedSessions.has(scopedSessionId)) {
-          return reduceServerEvent(activateCachedSession(state, scopedSessionId), event);
+          return markSessionAttention(updateCachedSession(
+            state,
+            scopedSessionId,
+            (cached) => reduceServerEvent(cached, event),
+            event,
+          ), scopedSessionId);
         }
         return appendBackgroundEvent(state, event);
       }
       return {
         ...state,
         elicitations: [
-          ...state.elicitations,
+          ...state.elicitations.filter(
+            ({ elicitationId }) => elicitationId !== event.elicitationId,
+          ),
           { elicitationId: event.elicitationId, request: event.request },
         ],
       };
@@ -1107,11 +1220,24 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       const pending = state.elicitations.find(
         ({ elicitationId }) => elicitationId === event.elicitationId,
       );
-      if (
-        !pending ||
-        (event.requestId != null && pending.responseRequestId !== event.requestId)
-      ) return appendBackgroundEvent(state, event);
-      return resolveElicitation(state, event.elicitationId, event.response);
+      if (pending) return resolveElicitation(state, event.elicitationId, event.response);
+      for (const [sessionId, snapshot] of state.cachedSessions) {
+        const cachedPending = snapshot.elicitations.find(
+          ({ elicitationId }) => elicitationId === event.elicitationId,
+        );
+        if (!cachedPending) continue;
+        return clearSessionAttentionIfSettled(updateCachedSession(
+          state,
+          sessionId,
+          (cached) => resolveElicitation(
+            cached,
+            event.elicitationId,
+            event.response,
+          ),
+          event,
+        ), sessionId);
+      }
+      return appendBackgroundEvent(state, event);
     }
     case "acp/elicitation_aborted": {
       const flow = state.externalFlows.find(
@@ -1128,19 +1254,54 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       );
     }
     case "acp/mode_changed":
+      if (!isCurrentSession(state, event.sessionId)) {
+        return updateCachedSession(
+          state,
+          event.sessionId,
+          (cached) => ({
+            ...cached,
+            modeId: event.modeId,
+            runtimeOperation: undefined,
+          }),
+          event,
+        );
+      }
       if (
-        !isCurrentSession(state, event.sessionId) ||
+        !state.runtimeReplaying &&
+        state.pendingSessionControl != null &&
+        (
         state.pendingSessionControl?.kind !== "mode" ||
         state.pendingSessionControl.requestId !== event.requestId ||
         state.pendingSessionControl.sessionId !== event.sessionId
+        )
       ) return appendBackgroundEvent(state, event);
-      return { ...state, modeId: event.modeId, pendingSessionControl: undefined };
+      return {
+        ...state,
+        modeId: event.modeId,
+        pendingSessionControl: undefined,
+        runtimeOperation: undefined,
+      };
     case "acp/config_changed":
+      if (!isCurrentSession(state, event.sessionId)) {
+        return updateCachedSession(
+          state,
+          event.sessionId,
+          (cached) => ({
+            ...cached,
+            configOptions: event.response.configOptions,
+            runtimeOperation: undefined,
+          }),
+          event,
+        );
+      }
       if (
-        !isCurrentSession(state, event.sessionId) ||
+        !state.runtimeReplaying &&
+        state.pendingSessionControl != null &&
+        (
         state.pendingSessionControl?.kind !== "config" ||
         state.pendingSessionControl.requestId !== event.requestId ||
         state.pendingSessionControl.sessionId !== event.sessionId
+        )
       ) {
         return appendBackgroundEvent(state, event);
       }
@@ -1148,6 +1309,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         ...state,
         configOptions: event.response.configOptions,
         pendingSessionControl: undefined,
+        runtimeOperation: undefined,
       };
     case "acp/mcp_connection":
       return {
@@ -1291,6 +1453,86 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
   }
 
   return assertNever(event, "attyd server event reducer");
+}
+
+function startPrompt(
+  state: AppState,
+  requestId: string,
+  sessionId: string,
+  blocks: ContentBlock[],
+): AppState {
+  if (state.pendingPrompt?.requestId === requestId) return state;
+  if (
+    state.session?.sessionId !== sessionId ||
+    state.running ||
+    state.pendingPrompt != null ||
+    state.sessionTransition != null ||
+    state.pendingSessionControl != null ||
+    state.runtimeOperation != null
+  ) return state;
+  return {
+    ...state,
+    running: true,
+    agentActivity: { kind: "waiting" },
+    pendingPrompt: { requestId, sessionId, blocks },
+    activePlan: planWithoutCompletedEntries(state.activePlan),
+    timeline: [
+      ...state.timeline,
+      {
+        id: randomId(),
+        type: "message",
+        role: "user",
+        blocks,
+        raw: [],
+      },
+    ],
+  };
+}
+
+function completePrompt(
+  state: AppState,
+  event: Extract<ServerEvent, { type: "acp/prompt_complete" }>,
+): AppState {
+  if (
+    state.session?.sessionId !== event.sessionId ||
+    state.pendingPrompt?.requestId !== event.requestId ||
+    state.pendingPrompt.sessionId !== event.sessionId
+  ) return appendBackgroundEvent(state, event);
+  const completedPlan = event.response.stopReason !== "cancelled" &&
+    isCompletedLegacyPlan(state.activePlan)
+    ? state.activePlan
+    : undefined;
+  return {
+    ...state,
+    running: false,
+    agentActivity: undefined,
+    pendingPrompt: undefined,
+    activePlan: completedPlan ? undefined : state.activePlan,
+    timeline: [
+      ...state.timeline,
+      ...(completedPlan ? [completedPlan] : []),
+      { id: randomId(), type: "stop", response: event.response },
+    ],
+  };
+}
+
+function failPrompt(
+  state: AppState,
+  event: Extract<ServerEvent, { type: "bridge/error" }>,
+): AppState {
+  const pendingPrompt = state.pendingPrompt;
+  if (pendingPrompt == null || pendingPrompt.requestId !== event.requestId) return state;
+  const retryBlocks = pendingPrompt.blocks;
+  return {
+    ...state,
+    running: false,
+    agentActivity: undefined,
+    pendingPrompt: undefined,
+    timeline: [
+      ...state.timeline,
+      errorTimelineItem(event, retryBlocks),
+    ],
+  };
 }
 
 function reduceSessionUpdate(
@@ -1806,6 +2048,7 @@ function terminateBridgeState(
     phase,
     socketOpen,
     cachedSessions: new Map(),
+    attentionSessionIds: [],
     running: false,
     agentActivity: undefined,
     mcpConnections: [],
@@ -1824,6 +2067,7 @@ function terminateBridgeState(
             : current.authTerminal.status,
         },
     pendingPrompt: undefined,
+    runtimeOperation: undefined,
     nesSessionId: undefined,
     nesDocuments: [],
     nesDrafts: {},
@@ -1877,6 +2121,23 @@ function settleAuthenticationRequired(
       pendingPrompt: undefined,
     };
   }
+  if (requestId != null) {
+    for (const [sessionId, snapshot] of next.cachedSessions) {
+      if (snapshot.pendingPrompt?.requestId !== requestId) continue;
+      next = updateCachedSession(
+        next,
+        sessionId,
+        (cached) => ({
+          ...cached,
+          running: false,
+          agentActivity: undefined,
+          pendingPrompt: undefined,
+        }),
+        { type: "auth_required", requestId },
+      );
+      break;
+    }
+  }
   if (requestId != null && requestId === next.pendingSessionControl?.requestId) {
     next = { ...next, pendingSessionControl: undefined };
   }
@@ -1921,6 +2182,7 @@ function resetActiveSession(state: AppState, title?: string): AppState {
     agentActivity: undefined,
     pendingSessionControl: undefined,
     pendingPrompt: undefined,
+    runtimeOperation: undefined,
     title,
     usage: undefined,
     activePlan: undefined,
@@ -1946,16 +2208,100 @@ function cacheCurrentSession(state: AppState): AppState {
   };
 }
 
+function cacheRuntimeSession(
+  state: AppState,
+  event: Extract<ServerEvent, { type: "bridge/runtime_session" }>,
+): AppState {
+  const snapshot = runtimeSessionSnapshot(state, event);
+  const sessions = mergeSessions(state.sessions, [{
+    sessionId: event.sessionId,
+    cwd: snapshot.cwd,
+  }]);
+  if (state.session?.sessionId === event.sessionId) {
+    const title = state.title;
+    const reset = resetActiveSession(state);
+    return {
+      ...reset,
+      ...snapshot,
+      title: snapshot.title ?? title,
+      cachedSessions: withoutCachedSession(
+        state.cachedSessions,
+        event.sessionId,
+      ),
+      sessions,
+      elicitations: [
+        ...snapshot.elicitations,
+        ...requestScopedElicitations(state.elicitations),
+      ],
+    };
+  }
+  const cachedSessions = new Map(state.cachedSessions);
+  cachedSessions.set(event.sessionId, snapshot);
+  return {
+    ...state,
+    cachedSessions,
+    sessions,
+  };
+}
+
+function runtimeSessionSnapshot(
+  state: AppState,
+  event: Extract<ServerEvent, { type: "bridge/runtime_session" }>,
+): ActiveSessionSnapshot {
+  return {
+    cwd: event.cwd || state.defaultCwd,
+    session: event.session,
+    availableCommands: [],
+    modeId: event.session.modes?.currentModeId,
+    configOptions: event.session.configOptions ?? [],
+    timeline: event.truncated
+      ? [{
+          id: randomId(),
+          type: "error",
+          message: "Earlier in-memory runtime events were omitted because the replay limit was reached",
+        }]
+      : [],
+    permissions: [],
+    elicitations: [],
+    running: false,
+    terminalSnapshots: [],
+  };
+}
+
+function openObservedSession(
+  state: AppState,
+  response: NewSessionResponse | ForkSessionResponse,
+  cwd?: string,
+  earlyUpdates?: SessionNotification[],
+): AppState {
+  const sessionId = response.sessionId;
+  let next = cacheRuntimeSession(state, {
+    type: "bridge/runtime_session",
+    sessionId,
+    cwd: cwd ?? state.defaultCwd,
+    session: response,
+    truncated: false,
+  });
+  for (const notification of earlyUpdates ?? []) {
+    next = reduceServerEvent(next, {
+      type: "acp/session_update",
+      notification,
+    });
+  }
+  return state.session == null && state.sessionTransition == null
+    ? activateCachedSession(next, sessionId)
+    : next;
+}
+
 function activateCachedSession(state: AppState, sessionId: string): AppState {
   if (
     state.session?.sessionId === sessionId ||
-    state.running ||
-    state.pendingPrompt != null ||
     state.sessionTransition != null ||
     state.pendingSessionControl != null
   ) return state;
   const snapshot = state.cachedSessions.get(sessionId);
   if (!snapshot?.session) return state;
+  const listed = state.sessions.find((session) => session.sessionId === sessionId);
 
   const withCurrentCached = cacheCurrentSession(state);
   const cachedSessions = new Map(withCurrentCached.cachedSessions);
@@ -1964,9 +2310,13 @@ function activateCachedSession(state: AppState, sessionId: string): AppState {
     ...withCurrentCached,
     ...snapshot,
     cachedSessions,
+    attentionSessionIds: state.attentionSessionIds.filter(
+      (candidate) => candidate !== sessionId,
+    ),
     pendingSessionId: undefined,
     sessionTransition: undefined,
     pendingSessionControl: undefined,
+    title: snapshot.title ?? listed?.title ?? undefined,
     elicitations: [
       ...snapshot.elicitations,
       ...requestScopedElicitations(state.elicitations),
@@ -1989,6 +2339,9 @@ function updateCachedSession(
     ...state,
     // session_info_update also updates the Agent-owned history row.
     sessions: updated.sessions,
+    // URL elicitations are connection-level UI state even when their request
+    // and response are replayed through a cached session snapshot.
+    externalFlows: updated.externalFlows,
     cachedSessions,
   };
 }
@@ -1997,6 +2350,61 @@ function removeCachedSession(state: AppState, sessionId: string): AppState {
   return {
     ...state,
     cachedSessions: withoutCachedSession(state.cachedSessions, sessionId),
+    attentionSessionIds: state.attentionSessionIds.filter(
+      (candidate) => candidate !== sessionId,
+    ),
+  };
+}
+
+function clearRuntimeOperation(
+  state: AppState,
+  requestId: string | undefined,
+): AppState {
+  if (requestId == null) return state;
+  let changed = false;
+  let next = state;
+  if (state.runtimeOperation?.requestId === requestId) {
+    next = { ...next, runtimeOperation: undefined };
+    changed = true;
+  }
+  const cachedSessions = new Map(next.cachedSessions);
+  for (const [sessionId, snapshot] of cachedSessions) {
+    if (snapshot.runtimeOperation?.requestId !== requestId) continue;
+    cachedSessions.set(sessionId, { ...snapshot, runtimeOperation: undefined });
+    changed = true;
+  }
+  return changed ? { ...next, cachedSessions } : state;
+}
+
+function removeAuthoritativeSessionRuntime(
+  state: AppState,
+  sessionId: string,
+  deleted: boolean,
+): AppState {
+  let next = state;
+  if (next.sessionTransition?.targetSessionId === sessionId) {
+    next = rollbackSessionTransition(next);
+  }
+  if (next.session?.sessionId === sessionId) {
+    next = resetActiveSession(next);
+  } else if (next.sessionTransition?.backup.session?.sessionId === sessionId) {
+    next = {
+      ...next,
+      sessionTransition: {
+        ...next.sessionTransition,
+        backup: captureActiveSession(resetActiveSession(next)),
+      },
+    };
+  }
+  next = removeCachedSession(next, sessionId);
+  return {
+    ...next,
+    sessions: deleted
+      ? next.sessions.filter((session) => session.sessionId !== sessionId)
+      : next.sessions,
+    pendingSessionDeletions: deleted
+      ? next.pendingSessionDeletions.filter((pending) => pending.sessionId !== sessionId)
+      : next.pendingSessionDeletions,
   };
 }
 
@@ -2024,6 +2432,7 @@ function captureActiveSession(state: AppState): ActiveSessionSnapshot {
     running: state.running,
     agentActivity: state.agentActivity,
     pendingPrompt: state.pendingPrompt,
+    runtimeOperation: state.runtimeOperation,
     title: state.title,
     usage: state.usage,
     activePlan: state.activePlan,
@@ -2062,6 +2471,67 @@ function requestScopedElicitations(
   elicitations: PendingElicitation[],
 ): PendingElicitation[] {
   return elicitations.filter(({ request }) => elicitationSessionId(request) == null);
+}
+
+function removePermission(state: AppState, permissionId: string): AppState {
+  return {
+    ...state,
+    permissions: state.permissions.filter(
+      (permission) => permission.permissionId !== permissionId,
+    ),
+  };
+}
+
+function failPermissionResponse(
+  state: AppState,
+  permissionId: string,
+  message: string,
+): AppState {
+  return {
+    ...state,
+    permissions: state.permissions.map((permission) =>
+      permission.permissionId === permissionId
+        ? { ...permission, responseRequestId: undefined, responseError: message }
+        : permission
+    ),
+  };
+}
+
+function failElicitationResponse(
+  state: AppState,
+  elicitationId: string,
+  message: string,
+): AppState {
+  return {
+    ...state,
+    elicitations: state.elicitations.map((elicitation) =>
+      elicitation.elicitationId === elicitationId
+        ? { ...elicitation, responseRequestId: undefined, responseError: message }
+        : elicitation
+    ),
+  };
+}
+
+function markSessionAttention(state: AppState, sessionId: string): AppState {
+  return state.attentionSessionIds.includes(sessionId)
+    ? state
+    : {
+        ...state,
+        attentionSessionIds: [...state.attentionSessionIds, sessionId].slice(-32),
+      };
+}
+
+function clearSessionAttentionIfSettled(state: AppState, sessionId: string): AppState {
+  const session = state.cachedSessions.get(sessionId);
+  if ((session?.permissions.length ?? 0) > 0 || (session?.elicitations.length ?? 0) > 0) {
+    return state;
+  }
+  return {
+    ...state,
+    attentionSessionIds: state.attentionSessionIds.filter(
+      (candidate) => candidate !== sessionId,
+    ),
+  };
 }
 
 function isCurrentSession(state: AppState, sessionId: string): boolean {

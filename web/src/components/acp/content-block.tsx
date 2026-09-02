@@ -26,14 +26,28 @@ export function ContentBlocks({ blocks }: { blocks: ContentBlock[] }) {
   );
 }
 
-export function ContentBlockView({ block }: { block: ContentBlock }) {
+export function ContentBlockView({
+  block,
+  presentation = "message",
+}: {
+  block: ContentBlock;
+  presentation?: "message" | "tool";
+}) {
   switch (block.type) {
     case "text":
       return (
         <ContentBlockFrame block={block}>
-          <div className="markdown">
-            <Markdown remarkPlugins={[remarkGfm]}>{block.text}</Markdown>
-          </div>
+          {presentation === "tool" ? (
+            <div className="structured-scalar structured-markdown">
+              <div className="markdown">
+                <Markdown remarkPlugins={[remarkGfm]}>{block.text}</Markdown>
+              </div>
+            </div>
+          ) : (
+            <div className="markdown">
+              <Markdown remarkPlugins={[remarkGfm]}>{block.text}</Markdown>
+            </div>
+          )}
         </ContentBlockFrame>
       );
     case "image": {
