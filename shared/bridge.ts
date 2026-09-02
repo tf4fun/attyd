@@ -741,7 +741,7 @@ function validateServerEventEnvelope(
       return;
     case "bridge/context_search_result": {
       requireBridgeIdentifier(value, "requestId");
-      requireBoundedString(value, "query", 256);
+      requireBoundedStringAllowEmpty(value, "query", 256);
       requireArray(value.matches, "bridge/context_search_result matches");
       if (value.matches.length > 24) {
         throw new Error("bridge/context_search_result exceeds 24 matches");
@@ -1270,7 +1270,7 @@ export function parseClientCommand(raw: string): ClientCommand {
       break;
     case "context/search":
       requireBridgeIdentifier(value, "requestId");
-      requireBoundedString(value, "query", 256);
+      requireBoundedStringAllowEmpty(value, "query", 256);
       break;
     case "context/read":
       requireBridgeIdentifier(value, "requestId");
@@ -1544,6 +1544,19 @@ function requireBoundedString(
     `${String(value.type ?? "message")} ${key}`,
     maximum,
   );
+}
+
+function requireBoundedStringAllowEmpty(
+  value: Record<string, unknown>,
+  key: string,
+  maximum: number,
+): void {
+  const candidate = value[key];
+  const label = `${String(value.type ?? "message")} ${key}`;
+  requireStringValue(candidate, label);
+  if (candidate.length > maximum) {
+    throw new Error(`${label} exceeds ${maximum} characters`);
+  }
 }
 
 function requireBoundedStringValue(

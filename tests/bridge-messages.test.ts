@@ -52,6 +52,15 @@ describe("browser bridge messages", () => {
       query: "src app",
     });
     expect(parseClientCommand(JSON.stringify({
+      type: "context/search",
+      requestId: "context-search-all",
+      query: "",
+    }))).toEqual({
+      type: "context/search",
+      requestId: "context-search-all",
+      query: "",
+    });
+    expect(parseClientCommand(JSON.stringify({
       type: "context/read",
       requestId: "context-read",
       sessionId: "session",
@@ -134,6 +143,10 @@ describe("browser bridge messages", () => {
       requestId: "x",
       query: "x".repeat(257),
     }))).toThrow("query exceeds 256 characters");
+    expect(() => parseClientCommand(JSON.stringify({
+      type: "context/search",
+      requestId: "x",
+    }))).toThrow("query must be a string");
     expect(() => parseClientCommand(JSON.stringify({
       type: "context/read",
       requestId: "x",
@@ -386,6 +399,16 @@ describe("browser bridge messages", () => {
       matches: [{ name: "app.tsx" }],
     });
     expect(parseServerEvent(JSON.stringify({
+      type: "bridge/context_search_result",
+      requestId: "context-search-all",
+      query: "",
+      matches: [],
+    }))).toMatchObject({
+      type: "bridge/context_search_result",
+      query: "",
+      matches: [],
+    });
+    expect(parseServerEvent(JSON.stringify({
       type: "bridge/context_attached",
       requestId: "context-read",
       sessionId: "session",
@@ -549,6 +572,11 @@ describe("browser bridge messages", () => {
       status: "invented",
       exitCode: 0,
     }))).toThrow("status is invalid");
+    expect(() => parseServerEvent(JSON.stringify({
+      type: "bridge/context_search_result",
+      requestId: "context-search",
+      matches: [],
+    }))).toThrow("query must be a string");
     expect(() => parseServerEvent('{"type":"acp/invented"}')).toThrow("Unknown server");
     expect(() => parseServerEvent(JSON.stringify({
       type: "bridge/runtime_session",
