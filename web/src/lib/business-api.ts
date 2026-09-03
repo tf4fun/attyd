@@ -3,6 +3,7 @@ import type {
   CreateElicitationRequest,
   InitializeResponse,
   NewSessionResponse,
+  PromptResponse,
   RequestPermissionRequest,
   SessionInfo,
   SessionUpdate,
@@ -123,6 +124,35 @@ export type SessionBusinessEvent =
         update?: SessionUpdate;
         [key: string]: unknown;
       };
+    }
+  | {
+      type: "bridge/session_turn_complete";
+      bridgeEpoch: string;
+      sessionId: string;
+      sessionIncarnation: number;
+      viewRevision: number;
+      historyRevision: string | null;
+      phase: SessionSyncPhase;
+      operationId: string;
+      clientIntentId: string;
+      response: PromptResponse;
+    }
+  | {
+      type: "bridge/session_turn_failed";
+      bridgeEpoch: string;
+      sessionId: string;
+      sessionIncarnation: number;
+      viewRevision: number;
+      historyRevision: string | null;
+      phase: SessionSyncPhase;
+      operationId: string;
+      clientIntentId: string;
+      prompt: ContentBlock[];
+      error: {
+        code?: number;
+        message: string;
+        data?: unknown;
+      };
     };
 
 export interface SessionListResult {
@@ -198,6 +228,28 @@ export function parseGlobalBusinessEvent(raw: string): GlobalBusinessEvent {
 
 export function parseSessionBusinessEvent(raw: string): SessionBusinessEvent {
   const value = parseEventObject(raw);
+  if (
+    value.type === "bridge/session_turn_complete" ||
+    value.type === "bridge/session_turn_failed"
+  ) {
+    if (
+      typeof value.bridgeEpoch !== "string" ||
+      typeof value.sessionId !== "string" ||
+      !Number.isSafeInteger(value.sessionIncarnation) ||
+      !Number.isSafeInteger(value.viewRevision) ||
+      (value.historyRevision !== null && typeof value.historyRevision !== "string") ||
+      !isSessionSyncPhase(value.phase) ||
+      typeof value.operationId !== "string" ||
+      typeof value.clientIntentId !== "string" ||
+      (value.type === "bridge/session_turn_complete" && !isRecord(value.response)) ||
+      (value.type === "bridge/session_turn_failed" &&
+        (!Array.isArray(value.prompt) || !isRecord(value.error) ||
+          typeof value.error.message !== "string"))
+    ) {
+      throw new Error("Session turn event has an invalid payload");
+    }
+    return value as unknown as SessionBusinessEvent;
+  }
   if (value.type !== "bridge/session_reset" && value.type !== "bridge/session_delta") {
     throw new Error(`Unknown session event: ${value.type}`);
   }
@@ -241,4 +293,9 @@ function parseEventObject(raw: string): Record<string, unknown> & { type: string
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isSessionSyncPhase(value: unknown): value is SessionSyncPhase {
+  return value === "cold" || value === "loading" || value === "ready" ||
+    value === "running" || value === "reconciling" || value === "blocked";
 }

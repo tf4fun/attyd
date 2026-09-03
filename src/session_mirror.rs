@@ -6,8 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::history_cache::{
-    HistoryCache, HistoryCacheError, HistoryCacheLimits, HistorySnapshot, SessionKey,
-    normalize_history_updates,
+    HistoryCache, HistoryCacheError, HistorySnapshot, SessionKey, normalize_history_updates,
 };
 use crate::runtime_state::fold_active_turn_update;
 
@@ -121,7 +120,6 @@ pub(crate) enum MirrorError {
     IdempotencyConflict,
     OperationMismatch,
     InconsistentHistory,
-    OverlayLimit,
     History(HistoryCacheError),
 }
 
@@ -141,19 +139,17 @@ pub(crate) struct SessionMirror {
     next_operation: u64,
     sessions: HashMap<String, MirrorSessionState>,
     history: HistoryCache,
-    limits: HistoryCacheLimits,
     overlay_bytes: usize,
 }
 
 impl SessionMirror {
-    pub(crate) fn new(epoch: impl Into<String>, history_limits: HistoryCacheLimits) -> Self {
+    pub(crate) fn new(epoch: impl Into<String>) -> Self {
         let epoch = epoch.into();
         Self {
-            history: HistoryCache::new(epoch.clone(), history_limits),
+            history: HistoryCache::new(epoch.clone()),
             epoch,
             next_operation: 0,
             sessions: HashMap::new(),
-            limits: history_limits,
             overlay_bytes: 0,
         }
     }
@@ -255,11 +251,10 @@ impl SessionMirror {
         {
             return Err(MirrorError::OperationMismatch);
         }
-        self.history.append_candidate_with_reserved(
+        self.history.append_candidate(
             &SessionKey::new(session_id, incarnation),
             attempt_id,
             update,
-            self.overlay_bytes,
         )?;
         Ok(())
     }
@@ -464,7 +459,6 @@ impl SessionMirror {
         let mut overlay = overlay;
         overlay.operation_id = operation_id.clone();
         let overlay_bytes = serialized_len(&overlay);
-        self.reserve_overlay_growth(0, overlay_bytes, overlay.updates.len())?;
         let session = self
             .sessions
             .get_mut(session_id)
@@ -502,7 +496,6 @@ impl SessionMirror {
         candidate.updates = fold_active_turn_update(&turn.updates, &update)
             .map_err(|_| MirrorError::InconsistentHistory)?;
         let candidate_bytes = serialized_len(&candidate);
-        self.reserve_overlay_growth(old_bytes, candidate_bytes, candidate.updates.len())?;
         let session = self
             .sessions
             .get_mut(session_id)
@@ -539,7 +532,6 @@ impl SessionMirror {
         let mut candidate = turn.clone();
         candidate.terminal = Some(terminal);
         let candidate_bytes = serialized_len(&candidate);
-        self.reserve_overlay_growth(old_bytes, candidate_bytes, candidate.updates.len())?;
         let session = self
             .sessions
             .get_mut(session_id)
@@ -591,11 +583,9 @@ impl SessionMirror {
             })
             .collect::<Vec<_>>();
         suffix.extend(turn.updates.iter().cloned());
-        let snapshot = self.history.append_committed_updates(
-            &SessionKey::new(session_id, incarnation),
-            &suffix,
-            self.overlay_bytes.saturating_sub(active_overlay_bytes),
-        )?;
+        let snapshot = self
+            .history
+            .append_committed_updates(&SessionKey::new(session_id, incarnation), &suffix)?;
 
         let session = self
             .sessions
@@ -762,30 +752,6 @@ impl SessionMirror {
             .remove(&SessionKey::new(session_id, incarnation));
     }
 
-    fn reserve_overlay_growth(
-        &self,
-        previous_bytes: usize,
-        next_bytes: usize,
-        update_count: usize,
-    ) -> Result<(), MirrorError> {
-        if update_count > self.limits.max_snapshot_updates
-            || next_bytes > self.limits.max_snapshot_bytes
-        {
-            return Err(MirrorError::OverlayLimit);
-        }
-        let history = self.history.stats();
-        let total = history
-            .snapshot_bytes
-            .checked_add(history.candidate_bytes)
-            .and_then(|total| total.checked_add(self.overlay_bytes))
-            .and_then(|total| total.checked_sub(previous_bytes))
-            .and_then(|total| total.checked_add(next_bytes));
-        if total.is_none_or(|total| total > self.limits.max_total_bytes) {
-            return Err(MirrorError::OverlayLimit);
-        }
-        Ok(())
-    }
-
     fn remove_existing_session(&mut self, session_id: &str) {
         if let Some(previous) = self.sessions.remove(session_id) {
             self.overlay_bytes = self
@@ -926,14 +892,7 @@ mod tests {
     use serde_json::json;
 
     fn mirror() -> SessionMirror {
-        SessionMirror::new(
-            "epoch",
-            HistoryCacheLimits {
-                max_snapshot_updates: 32,
-                max_snapshot_bytes: 8_192,
-                max_total_bytes: 32_768,
-            },
-        )
+        SessionMirror::new("epoch")
     }
 
     fn load_initial(mirror: &mut SessionMirror, session_id: &str, incarnation: u64) {
@@ -1704,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_limit_rejection_is_transactional_and_accounting_is_released() {
+    fn overlay_accounting_does_not_reject_a_large_valid_turn() {
         let mut mirror = mirror();
         mirror.register_new("session", 1);
         let revision = mirror.history_revision("session", 1).unwrap().to_string();
@@ -1715,11 +1674,8 @@ mod tests {
             TurnAdmission::Accepted { operation_id } => operation_id,
             _ => unreachable!(),
         };
-        let before_bytes = mirror.overlay_bytes;
-        let before_turn = mirror.state("session").unwrap().active_turn.clone();
-
-        assert_eq!(
-            mirror.append_turn_update(
+        mirror
+            .append_turn_update(
                 "session",
                 1,
                 &operation,
@@ -1727,11 +1683,20 @@ mod tests {
                     "sessionUpdate": "agent_message_chunk",
                     "content": { "type": "text", "text": "x".repeat(9_000) }
                 }),
-            ),
-            Err(MirrorError::OverlayLimit)
+            )
+            .unwrap();
+        assert!(mirror.overlay_bytes > 8_192);
+        assert_eq!(
+            mirror
+                .state("session")
+                .unwrap()
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .updates
+                .len(),
+            1
         );
-        assert_eq!(mirror.overlay_bytes, before_bytes);
-        assert_eq!(mirror.state("session").unwrap().active_turn, before_turn);
 
         mirror.abort_turn("session", 1, &operation).unwrap();
         assert_eq!(mirror.overlay_bytes, 0);

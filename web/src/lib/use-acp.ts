@@ -16,6 +16,7 @@ import {
   type StartTurnResult,
   type WorkspaceContextAttachment,
   type WorkspaceContextMatch,
+  ApiError,
   parseGlobalBusinessEvent,
   parseSessionBusinessEvent,
   requestJson,
@@ -36,12 +37,32 @@ export function useAcp() {
   const sessionEventsRef = useRef<EventSource | undefined>(undefined);
   const activeSessionIdRef = useRef<string | undefined>(undefined);
   const sessionViewRef = useRef<BridgeSessionView | undefined>(undefined);
+  const promptAdmissionsRef = useRef(new Map<string, {
+    requestId: string;
+    baseRevision: string;
+  }>());
   const refreshInFlightRef = useRef(false);
   const refreshPendingRef = useRef(false);
+  const initialSelectionPendingRef = useRef(false);
   const reconnectRef = useRef<() => void>(() => undefined);
   const refreshSessionRef = useRef<(sessionId: string) => void>(() => undefined);
 
   const reportError = useCallback((error: unknown) => {
+    if (error instanceof ApiError) {
+      const body = error.body;
+      if (isRecord(body) && typeof body.code === "number") {
+        dispatch({
+          type: "server/event",
+          event: {
+            type: "bridge/error",
+            message: typeof body.message === "string" ? body.message : error.message,
+            code: body.code,
+            data: body.data,
+          },
+        });
+        return;
+      }
+    }
     dispatch({
       type: "client/error",
       message: error instanceof Error ? error.message : String(error),
@@ -67,6 +88,14 @@ export function useAcp() {
   const hydrateSession = useCallback((view: BridgeSessionView) => {
     if (activeSessionIdRef.current !== view.sessionId) return;
     const current = sessionViewRef.current;
+    const admission = promptAdmissionsRef.current.get(view.sessionId);
+    if (admission != null) {
+      const reflectsAdmission =
+        view.activeTurn?.clientIntentId === admission.requestId ||
+        (view.phase === "ready" && view.historyRevision !== admission.baseRevision);
+      if (!reflectsAdmission && view.phase === "ready") return;
+      if (reflectsAdmission) promptAdmissionsRef.current.delete(view.sessionId);
+    }
     if (
       current != null &&
       current.sessionId === view.sessionId &&
@@ -124,6 +153,24 @@ export function useAcp() {
         return;
       }
       if (activeSessionIdRef.current !== event.sessionId) return;
+      if (event.type === "bridge/session_turn_complete") {
+        clearMatchingPromptAdmission(promptAdmissionsRef.current, event);
+        if (!advanceSessionViewToTurnOutcome(sessionViewRef, event)) {
+          refreshSessionRef.current(sessionId);
+          return;
+        }
+        dispatch({ type: "bridge/turn_complete", event });
+        return;
+      }
+      if (event.type === "bridge/session_turn_failed") {
+        clearMatchingPromptAdmission(promptAdmissionsRef.current, event);
+        if (!advanceSessionViewToTurnOutcome(sessionViewRef, event)) {
+          refreshSessionRef.current(sessionId);
+          return;
+        }
+        dispatch({ type: "bridge/turn_failed", event });
+        return;
+      }
       const current = sessionViewRef.current;
       if (event.type === "bridge/session_reset") {
         if (
@@ -203,6 +250,7 @@ export function useAcp() {
   }, []);
 
   const refreshRuntime = useCallback(async (selectInitialSession: boolean) => {
+    if (selectInitialSession) initialSelectionPendingRef.current = true;
     try {
       const runtime = await requestJson<RuntimeView>("/api/v1/runtime");
       dispatch({ type: "socket/open" });
@@ -214,8 +262,18 @@ export function useAcp() {
       if (runtime.phase != null) dispatch({ type: "server/event", event: runtime.phase });
       else if (!runtime.connected) dispatch({ type: "socket/closed" });
 
+      if (!runtime.connected || runtime.phase?.phase !== "ready") return;
+
       const listed = await refreshSessionList();
-      if (!selectInitialSession || activeSessionIdRef.current != null) return;
+      const activeSessionId = activeSessionIdRef.current;
+      if (activeSessionId != null) {
+        initialSelectionPendingRef.current = false;
+        connectSessionEvents(activeSessionId);
+        refreshSessionRef.current(activeSessionId);
+        return;
+      }
+      if (!initialSelectionPendingRef.current) return;
+      initialSelectionPendingRef.current = false;
       const stored = readStoredSessionId();
       const selected = stored == null
         ? mostRecentSession(listed.sessions)
@@ -223,20 +281,31 @@ export function useAcp() {
           { sessionId: stored, cwd: "" };
       if (selected != null) activateSession(selected, false);
     } catch (error) {
-      dispatch({ type: "socket/closed" });
+      // A ready Agent can reject a business request (notably session/list
+      // with auth-required) while the REST/SSE connection remains healthy.
+      // Only transport/server failures make the browser connection stale.
+      if (!(error instanceof ApiError) || error.status >= 500) {
+        dispatch({ type: "socket/closed" });
+      }
       reportError(error);
     }
-  }, [activateSession, refreshSessionList, reportError]);
+  }, [activateSession, connectSessionEvents, refreshSessionList, reportError]);
 
   const handleGlobalEvent = useCallback((event: GlobalBusinessEvent) => {
     switch (event.type) {
       case "bridge/connection":
+        if (event.phase === "stopped" || event.phase === "error") {
+          promptAdmissionsRef.current.clear();
+        }
         dispatch({
           type: "server/event",
           event: { type: "bridge/phase", phase: event.phase },
         });
-        if (event.phase === "ready" && activeSessionIdRef.current != null) {
-          refreshSessionRef.current(activeSessionIdRef.current);
+        if (event.phase === "ready") {
+          if (stateRef.current.authTerminal?.status === "succeeded") {
+            dispatch({ type: "auth/dismiss_terminal" });
+          }
+          void refreshRuntime(false);
         }
         return;
       case "bridge/connection_error":
@@ -249,11 +318,12 @@ export function useAcp() {
             data: event.data,
           },
         });
+        void refreshRuntime(false);
         return;
       default:
         dispatch({ type: "server/event", event: event as ServerEvent });
     }
-  }, []);
+  }, [refreshRuntime]);
 
   const connectGlobalEvents = useCallback(() => {
     globalEventsRef.current?.close();
@@ -280,11 +350,6 @@ export function useAcp() {
     const reconnectStreams = () => {
       if (disposed) return;
       connectGlobalEvents();
-      const sessionId = activeSessionIdRef.current;
-      if (sessionId != null) {
-        connectSessionEvents(sessionId);
-        refreshSessionRef.current(sessionId);
-      }
     };
     reconnectRef.current = reconnectStreams;
     connectGlobalEvents();
@@ -292,18 +357,21 @@ export function useAcp() {
 
     const recoverClosedStreams = () => {
       if (
+        stateRef.current.phase === "stopped" || stateRef.current.phase === "error" ||
         globalEventsRef.current?.readyState === EventSource.CLOSED ||
         (activeSessionIdRef.current != null &&
           sessionEventsRef.current?.readyState === EventSource.CLOSED)
       ) reconnectStreams();
     };
     window.addEventListener("online", recoverClosedStreams);
+    window.addEventListener("focus", recoverClosedStreams);
     window.addEventListener("pageshow", recoverClosedStreams);
     document.addEventListener("visibilitychange", recoverClosedStreams);
     return () => {
       disposed = true;
       reconnectRef.current = () => undefined;
       window.removeEventListener("online", recoverClosedStreams);
+      window.removeEventListener("focus", recoverClosedStreams);
       window.removeEventListener("pageshow", recoverClosedStreams);
       document.removeEventListener("visibilitychange", recoverClosedStreams);
       globalEventsRef.current?.close();
@@ -341,18 +409,48 @@ export function useAcp() {
     ) return false;
     const requestId = randomId();
     const sessionId = current.session.sessionId;
+    promptAdmissionsRef.current.set(sessionId, {
+      requestId,
+      baseRevision: view.historyRevision,
+    });
     dispatch({ type: "user/prompt", requestId, sessionId, blocks });
-    void requestJson<StartTurnResult>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
-      {
-        method: "POST",
-        headers: {
-          "If-Match": strongEtag(view.historyRevision),
-          "Idempotency-Key": requestId,
+    void (async () => {
+      // A reset token can settle the visible turn before its authoritative
+      // session GET completes. Resolve the append point immediately before
+      // admission so a queued prompt never reuses the preceding revision.
+      const latest = await requestJson<BridgeSessionView>(
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+      );
+      if (
+        latest.sessionId !== sessionId || latest.phase !== "ready" ||
+        latest.historyRevision == null
+      ) {
+        throw new Error("The ACP session is not ready to accept this prompt");
+      }
+      const admission = promptAdmissionsRef.current.get(sessionId);
+      if (admission?.requestId === requestId) {
+        promptAdmissionsRef.current.set(sessionId, {
+          ...admission,
+          baseRevision: latest.historyRevision,
+        });
+      }
+      if (activeSessionIdRef.current === sessionId) sessionViewRef.current = latest;
+      return requestJson<StartTurnResult>(
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
+        {
+          method: "POST",
+          headers: {
+            "If-Match": strongEtag(latest.historyRevision),
+            "Idempotency-Key": requestId,
+          },
+          body: JSON.stringify({ prompt: blocks }),
         },
-        body: JSON.stringify({ prompt: blocks }),
-      },
-    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+      );
+    })().then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+      const admission = promptAdmissionsRef.current.get(sessionId);
+      if (admission?.requestId === requestId) {
+        promptAdmissionsRef.current.delete(sessionId);
+      }
       reportRequestError(error, requestId, "session/prompt");
       refreshSessionRef.current(sessionId);
     });
@@ -603,6 +701,43 @@ export function mostRecentSession(sessions: SessionInfo[]): SessionInfo | undefi
   return selected;
 }
 
+function advanceSessionViewToTurnOutcome(
+  sessionViewRef: { current: BridgeSessionView | undefined },
+  event: Extract<SessionBusinessEvent, {
+    type: "bridge/session_turn_complete" | "bridge/session_turn_failed";
+  }>,
+): boolean {
+  const current = sessionViewRef.current;
+  if (
+    current == null || current.sessionId !== event.sessionId ||
+    current.bridgeEpoch !== event.bridgeEpoch ||
+    current.sessionIncarnation !== event.sessionIncarnation ||
+    (current.activeTurn != null &&
+      current.activeTurn.operationId !== event.operationId &&
+      current.activeTurn.clientIntentId !== event.clientIntentId) ||
+    event.viewRevision < current.viewRevision
+  ) return false;
+  sessionViewRef.current = {
+    ...current,
+    viewRevision: event.viewRevision,
+    historyRevision: event.historyRevision,
+    phase: event.phase,
+    activeTurn: event.phase === "ready" ? null : current.activeTurn,
+  };
+  return true;
+}
+
+function clearMatchingPromptAdmission(
+  admissions: Map<string, { requestId: string }>,
+  event: Extract<SessionBusinessEvent, {
+    type: "bridge/session_turn_complete" | "bridge/session_turn_failed";
+  }>,
+): void {
+  if (admissions.get(event.sessionId)?.requestId === event.clientIntentId) {
+    admissions.delete(event.sessionId);
+  }
+}
+
 function readStoredSessionId(): string | undefined {
   try {
     return localStorage.getItem(LAST_SESSION_STORAGE_KEY) ?? undefined;
@@ -618,4 +753,8 @@ function storeSessionId(sessionId: string | undefined): void {
   } catch {
     // Private browsing can deny storage while the live REST/SSE session remains usable.
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

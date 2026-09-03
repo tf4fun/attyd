@@ -534,6 +534,10 @@ fn business_session_event(event: &str) -> Option<(String, Arc<str>)> {
             let reset = session_reset_value(&session_id, value.get("view")?)?;
             Some((session_id, Arc::from(reset.to_string())))
         }
+        "bridge/session_turn_complete" | "bridge/session_turn_failed" => {
+            let session_id = value.get("sessionId")?.as_str()?.to_string();
+            Some((session_id, Arc::from(event)))
+        }
         _ => None,
     }
 }
@@ -873,23 +877,27 @@ impl BridgeHub {
     async fn business_request(
         &self,
         command: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, bridge::BridgeRequestError> {
         let input = {
             let state = self.state.lock().await;
             state
                 .input
                 .clone()
-                .ok_or_else(|| "bridge is not ready".to_string())?
+                .ok_or_else(|| bridge::BridgeRequestError::internal("bridge is not ready"))?
         };
         let (response, result) = oneshot::channel();
         input
             .send(bridge::BridgeInput::BusinessRequest { command, response })
             .await
-            .map_err(|_| "bridge stopped before accepting the request".to_string())?;
+            .map_err(|_| {
+                bridge::BridgeRequestError::internal("bridge stopped before accepting the request")
+            })?;
         tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
             .await
-            .map_err(|_| "bridge request timed out".to_string())?
-            .map_err(|_| "bridge stopped before answering the request".to_string())?
+            .map_err(|_| bridge::BridgeRequestError::internal("bridge request timed out"))?
+            .map_err(|_| {
+                bridge::BridgeRequestError::internal("bridge stopped before answering the request")
+            })?
     }
 
     async fn runtime_info(&self) -> serde_json::Value {
@@ -1566,15 +1574,24 @@ fn api_bad_request(message: &str) -> Response {
         .into_response()
 }
 
-fn business_error(message: String) -> Response {
+fn business_error(error: bridge::BridgeRequestError) -> Response {
+    let display = error
+        .data
+        .as_ref()
+        .map_or_else(|| error.message.clone(), serde_json::Value::to_string);
     (
         StatusCode::CONFLICT,
-        axum::Json(json!({ "error": message })),
+        axum::Json(json!({
+            "error": display,
+            "message": error.message,
+            "code": error.code,
+            "data": error.data,
+        })),
     )
         .into_response()
 }
 
-fn business_response(result: Result<serde_json::Value, String>) -> Response {
+fn business_response(result: Result<serde_json::Value, bridge::BridgeRequestError>) -> Response {
     match result {
         Ok(value) => axum::Json(value).into_response(),
         Err(message) => business_error(message),
@@ -1828,7 +1845,12 @@ fn session_event_id(event: &str) -> Option<String> {
     };
     if !matches!(
         event.get("type").and_then(serde_json::Value::as_str),
-        Some("bridge/session_reset" | "bridge/session_delta")
+        Some(
+            "bridge/session_reset"
+                | "bridge/session_delta"
+                | "bridge/session_turn_complete"
+                | "bridge/session_turn_failed"
+        )
     ) {
         return None;
     }
@@ -1933,8 +1955,19 @@ mod tests {
             },
         })
         .to_string();
+        let turn_complete = json!({
+            "type": "bridge/session_turn_complete",
+            "sessionId": "wanted",
+            "operationId": "turn-1",
+            "response": { "stopReason": "end_turn" },
+        })
+        .to_string();
 
         assert!(session_event_matches(&reset, "wanted"));
+        let (_, relayed_turn) =
+            business_session_event(&turn_complete).expect("turn outcome is session business data");
+        assert!(session_event_matches(&relayed_turn, "wanted"));
+        assert_eq!(session_event_cursor(&relayed_turn), None);
         assert!(!session_event_matches(&other, "wanted"));
         assert!(!session_event_matches(&runtime, "wanted"));
         assert_eq!(session_event_cursor(&reset).as_deref(), Some("epoch:3:9"));

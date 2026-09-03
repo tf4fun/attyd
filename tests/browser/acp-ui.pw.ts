@@ -657,7 +657,8 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   await expect(toolDebug).toBeVisible();
   await expect(toolDebug).toContainText("activity-tool");
   await expect(toolDebug).toContainText("Message events");
-  await expect(toolDebug.locator("pre")).toContainText("tool_call_update");
+  await expect(toolDebug.locator("pre")).toContainText('"sessionUpdate": "tool_call"');
+  await expect(toolDebug.locator("pre")).toContainText('"status": "completed"');
   await expect(toolDebug.locator(".raw-json")).toHaveCount(0);
   await expect(
     thinking.locator(":scope > .thinking-header")
@@ -1141,10 +1142,7 @@ test("offers an explicit reconnect over the composer after the ACP connection st
   await expect(recovery).toBeVisible();
   await expect(recovery).toContainText("Agent connection unavailable");
   await expect(composer).toBeDisabled();
-  await Promise.all([
-    page.waitForEvent("domcontentloaded"),
-    recovery.getByRole("button", { name: "Reconnect" }).click(),
-  ]);
+  await recovery.getByRole("button", { name: "Reconnect" }).click();
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
   expect(browserErrors).toEqual([]);
@@ -1212,9 +1210,7 @@ test("reconnects a stale mobile-style socket after a focus liveness probe", asyn
   await composer.press("Enter");
   await expect(page.locator(".composer-reconnect")).toBeVisible();
 
-  const reloaded = page.waitForEvent("domcontentloaded");
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await reloaded;
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
   expect(browserErrors).toEqual([]);
@@ -1231,7 +1227,7 @@ test("recovers startup through Agent-owned ACP authentication", async ({ page })
       "--auth-required",
     ],
   });
-  const browserErrors = collectBrowserErrors(page);
+  const browserErrors = collectBrowserErrors(page, [409]);
 
   try {
     await page.goto(`http://127.0.0.1:${authServer.port}`);
@@ -1286,7 +1282,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
       "--terminal-auth-required",
     ],
   });
-  const browserErrors = collectBrowserErrors(page);
+  const browserErrors = collectBrowserErrors(page, [409]);
 
   try {
     await page.goto(`http://127.0.0.1:${authServer.port}`);
@@ -1319,10 +1315,16 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   }
 });
 
-function collectBrowserErrors(page: Page): string[] {
+function collectBrowserErrors(page: Page, expectedHttpStatuses: number[] = []): string[] {
   const errors: string[] = [];
   page.on("console", (message) => {
-    if (message.type() === "error") errors.push(message.text());
+    if (message.type() !== "error") return;
+    const text = message.text();
+    if (
+      text.startsWith("Failed to load resource: the server responded with a status of") &&
+      expectedHttpStatuses.some((status) => text.includes(`status of ${status} (`))
+    ) return;
+    errors.push(text);
   });
   page.on("pageerror", (error) => errors.push(error.message));
   return errors;

@@ -82,6 +82,7 @@ let configuredMcpServers: acp.McpServer[] = [];
 const observedNesRejects: acp.RejectNesNotification[] = [];
 const observedNesEvents: string[] = [];
 const observedSessionCloses: string[] = [];
+const deletedSessions = new Set<string>();
 const observedMcpNotifications: acp.MessageMcpNotification[] = [];
 let closeAttempts = 0;
 let deleteAttempts = 0;
@@ -247,7 +248,7 @@ const agent = acp
           title: "Earlier Agent thread",
           updatedAt: "2026-08-20T08:00:00.000Z",
         },
-      ],
+      ].filter(({ sessionId }) => !deletedSessions.has(sessionId)),
     };
   })
   .onRequest(acp.methods.agent.session.load, async ({ params, client }) => {
@@ -383,6 +384,8 @@ const agent = acp
     if (failDeleteOnce && deleteAttempts === 1) {
       throw new acp.RequestError(-32603, "Synthetic delete failure");
     }
+    deletedSessions.add(params.sessionId);
+    sessionHistory.delete(params.sessionId);
     return {};
   })
   .onRequest(acp.methods.agent.session.new, async ({ params, client }) => {
@@ -618,18 +621,24 @@ const agent = acp
               };
               const update = candidate.update as unknown as Record<string, unknown>;
               const content = update.content as Record<string, unknown> | undefined;
-              const persistableAgentText =
-                update.sessionUpdate === "agent_message_chunk" &&
-                content?.type === "text" &&
-                typeof content.text === "string";
+              const persistableMessage =
+                (update.sessionUpdate === "agent_message_chunk" ||
+                  update.sessionUpdate === "agent_thought_chunk") &&
+                content?.type === "text" && typeof content.text === "string";
               const persistableTool =
                 (update.sessionUpdate === "tool_call" ||
                   update.sessionUpdate === "tool_call_update") &&
                 typeof update.toolCallId === "string" &&
                 update.toolCallId.length > 0;
+              const persistableSessionState =
+                update.sessionUpdate === "available_commands_update" ||
+                update.sessionUpdate === "usage_update" ||
+                update.sessionUpdate === "plan" ||
+                update.sessionUpdate === "compaction_update" ||
+                update.sessionUpdate === "compaction_summary_chunk";
               if (
                 candidate.sessionId === params.sessionId &&
-                (persistableAgentText || persistableTool)
+                (persistableMessage || persistableTool || persistableSessionState)
               ) {
                 history.push(candidate.update);
               }
@@ -641,10 +650,10 @@ const agent = acp
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    for (const [index, content] of params.prompt.entries()) {
+    for (const content of params.prompt) {
       history.push({
         sessionUpdate: "user_message_chunk",
-        messageId: `prompt-${requestId}-${index}`,
+        messageId: `prompt-${requestId}`,
         content,
       });
     }

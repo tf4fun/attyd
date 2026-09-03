@@ -1100,11 +1100,11 @@ describe("ACP interactive UI contract", () => {
     document.body.append(previous);
     previous.focus();
     const onPermission = vi.fn();
-
-    await render(root, (
+    const permission = (responding = false) => (
       <PermissionCard
         pending={{
           permissionId: "permission",
+          responseRequestId: responding ? "response" : undefined,
           request: {
             sessionId: "session",
             toolCall: { toolCallId: "tool", title: "Inspect workspace" },
@@ -1116,13 +1116,17 @@ describe("ACP interactive UI contract", () => {
         }}
         onRespond={onPermission}
       />
-    ));
+    );
+
+    await render(root, permission());
     expect(document.activeElement?.textContent).toBe("Allow once");
     await click(buttonWithText(container, "Allow once"));
     expect(onPermission).toHaveBeenCalledWith({
       outcome: "selected",
       optionId: "allow",
     });
+    await render(root, permission(true));
+    expect(buttonWithText(container, "Allow once").disabled).toBe(true);
     await render(root, <></>);
     expect(document.activeElement).toBe(previous);
 

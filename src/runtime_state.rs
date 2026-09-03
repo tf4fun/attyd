@@ -7,7 +7,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuntimeLimits {
-    pub max_active_turn_bytes_per_session: usize,
     pub max_delta_events: usize,
     pub max_delta_bytes: usize,
     pub max_intent_records: usize,
@@ -16,7 +15,6 @@ pub(crate) struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_active_turn_bytes_per_session: 32 * 1024 * 1024,
             max_delta_events: 4_096,
             max_delta_bytes: 16 * 1024 * 1024,
             max_intent_records: 4_096,
@@ -805,9 +803,6 @@ impl RuntimeState {
             updates: Vec::new(),
             cancel_requested: false,
         };
-        if serialized_len(&active_turn) > self.limits.max_active_turn_bytes_per_session {
-            return Err(RuntimeStateError::ResourceLimit);
-        }
         let session = self.require_session_mut(session_id, incarnation)?;
         if session.lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive);
@@ -829,20 +824,14 @@ impl RuntimeState {
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let max_active_bytes = self.limits.max_active_turn_bytes_per_session;
         let session = self.require_session_mut(session_id, incarnation)?;
         let turn = session
             .active_turn
             .as_mut()
             .ok_or(RuntimeStateError::NoActiveTurn)?;
         let folded_updates = fold_active_turn_update(&turn.updates, &update)?;
-        let mut candidate = turn.clone();
-        candidate.updates = folded_updates;
-        if serialized_len(&candidate) > max_active_bytes {
-            return Err(RuntimeStateError::ResourceLimit);
-        }
         let operation_id = turn.operation_id.clone();
-        turn.updates = candidate.updates;
+        turn.updates = folded_updates;
         self.commit_turn_update(session_id, incarnation, operation_id, update);
         Ok(())
     }
@@ -2444,7 +2433,6 @@ mod tests {
         RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_active_turn_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
@@ -2771,14 +2759,8 @@ mod tests {
     }
 
     #[test]
-    fn rejected_fold_replacements_leave_retained_state_revision_and_deltas_unchanged() {
-        let mut state = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_active_turn_bytes_per_session: 512,
-                ..RuntimeLimits::default()
-            },
-        );
+    fn invalid_fold_replacements_are_transactional_and_large_valid_merge_commits() {
+        let mut state = state();
         let incarnation = open(&mut state, "session");
         state
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
@@ -2833,9 +2815,9 @@ mod tests {
                 .is_empty()
         );
 
-        let before_oversize = state.snapshot();
-        assert_eq!(
-            state.append_turn_update(
+        let before_large = state.snapshot();
+        state
+            .append_turn_update(
                 "epoch",
                 "session",
                 incarnation,
@@ -2844,15 +2826,12 @@ mod tests {
                     "toolCallId": "tool",
                     "details": { "oversize": "x".repeat(1_024) }
                 }),
-            ),
-            Err(RuntimeStateError::ResourceLimit),
-        );
-        assert_eq!(state.snapshot(), before_oversize);
-        assert!(
-            state
-                .deltas_after(before_oversize.through_seq)
-                .unwrap()
-                .is_empty()
+            )
+            .unwrap();
+        assert_ne!(state.snapshot(), before_large);
+        assert_eq!(
+            state.deltas_after(before_large.through_seq).unwrap().len(),
+            1
         );
     }
 
@@ -3652,11 +3631,10 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_has_a_hard_byte_limit_without_losing_cancellability() {
+    fn active_turn_accounting_does_not_reject_a_large_valid_update() {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_active_turn_bytes_per_session: 256,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
@@ -3666,18 +3644,25 @@ mod tests {
         state
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
-        let before_rejection = state.snapshot();
-
-        assert_eq!(
-            state.append_turn_update(
+        state
+            .append_turn_update(
                 "epoch",
                 "session",
                 incarnation,
                 json!({ "content": "x".repeat(512) }),
-            ),
-            Err(RuntimeStateError::ResourceLimit),
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .session("session")
+                .unwrap()
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .updates
+                .len(),
+            1
         );
-        assert_eq!(state.snapshot(), before_rejection);
         state
             .request_cancel("epoch", "session", incarnation)
             .unwrap();
@@ -4014,7 +3999,6 @@ mod tests {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_active_turn_bytes_per_session: 16_384,
                 max_delta_events: 2,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
@@ -4635,7 +4619,6 @@ mod tests {
         let mut state = RuntimeState::new(
             "epoch",
             RuntimeLimits {
-                max_active_turn_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,

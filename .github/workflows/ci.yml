@@ -65,7 +65,7 @@ jobs:
         run: npm run test:rust
       - name: Test remote ACP transports
         run: npm run test:remote
-      - name: Test Rust-hosted bridge
+      - name: Test Rust-hosted REST/SSE bridge
         run: node --import tsx scripts/ui-smoke.ts
 
   browser:

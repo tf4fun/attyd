@@ -97,7 +97,6 @@ export default function App() {
   const mobileMenu = useRef<HTMLButtonElement>(null);
   const newThreadButton = useRef<HTMLButtonElement>(null);
   const sidebarClose = useRef<HTMLButtonElement>(null);
-  const previousRunning = useRef(false);
   const lastPositionedSession = useRef<string | undefined>(undefined);
   const followLatestOnViewport = useRef(false);
   const followLatestContent = useRef(true);
@@ -323,7 +322,6 @@ export default function App() {
     setQueuePaused(false);
     setReviewOpen(false);
     setThreadSearchOpen(false);
-    previousRunning.current = false;
   }, [state.session?.sessionId]);
 
   useEffect(() => {
@@ -331,7 +329,6 @@ export default function App() {
     setQueuedPrompts([]);
     setQueueError(undefined);
     setQueuePaused(false);
-    previousRunning.current = false;
   }, [state.phase]);
 
   const agent = state.initialized?.agentInfo;
@@ -346,6 +343,9 @@ export default function App() {
   const authBlocksCurrent = state.authStatus === "required" || state.pendingAuth != null;
   const authBlocksNewSession = authBlocksCurrent || state.authStatus === "logged_out";
   const ready = state.phase === "ready" && state.sessionSyncPhase === "ready" && state.session != null && !transitioning && !changingControl && state.runtimeOperation == null && !authBlocksCurrent;
+  const composerAvailable = state.phase === "ready" && state.session != null &&
+    !transitioning && !changingControl && state.runtimeOperation == null && !authBlocksCurrent &&
+    (state.sessionSyncPhase === "ready" || state.running);
   const deletingCurrentSession = state.pendingSessionDeletions.some(
     ({ sessionId }) => sessionId === state.session?.sessionId,
   );
@@ -385,9 +385,7 @@ export default function App() {
   }, [reviewChanges.fileCount]);
 
   useEffect(() => {
-    const turnFinished = previousRunning.current && !state.running;
-    previousRunning.current = state.running;
-    if (!turnFinished || !ready || queuePaused || queuedPrompts.length === 0) return;
+    if (!ready || state.running || queuePaused || queuedPrompts.length === 0) return;
     const next = queuedPrompts[0];
     if (next.sessionId !== state.session?.sessionId) {
       setQueuedPrompts((current) => current.filter(({ id }) => id !== next.id));
@@ -791,7 +789,7 @@ export default function App() {
               prompts={queuedPrompts}
               error={queueError}
               paused={queuePaused}
-              canSendNow={ready && state.running}
+              canSendNow={composerAvailable && state.running}
               onEdit={(queued) => {
                 setQueuedPrompts((current) => current.filter(({ id }) => id !== queued.id));
                 setQueueError(undefined);
@@ -825,7 +823,7 @@ export default function App() {
             />
             <PromptComposer
               key={state.session?.sessionId ?? "no-session"}
-              disabled={!ready}
+              disabled={!composerAvailable}
               running={state.running}
               capabilities={agentCapabilities?.promptCapabilities}
               commands={state.availableCommands}

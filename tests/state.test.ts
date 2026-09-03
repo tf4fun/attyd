@@ -7,6 +7,174 @@ function event(value: ServerEvent) {
 }
 
 describe("ACP UI state", () => {
+  it("renders bridge-owned terminal turn outcomes exactly once", () => {
+    const base: AppState = {
+      ...initialState,
+      phase: "ready",
+      session: { sessionId: "session" },
+      running: true,
+      pendingPrompt: {
+        requestId: "browser-intent-id",
+        blocks: [{ type: "text", text: "Retry me" }],
+      },
+    };
+    const failure = {
+      type: "bridge/turn_failed" as const,
+      event: {
+        type: "bridge/session_turn_failed" as const,
+        bridgeEpoch: "epoch",
+        sessionId: "session",
+        sessionIncarnation: 1,
+        viewRevision: 3,
+        historyRevision: "epoch:1:3",
+        phase: "ready" as const,
+        operationId: "turn-1",
+        clientIntentId: "browser-intent-id",
+        prompt: [{ type: "text" as const, text: "Retry me" }],
+        error: {
+          code: -32603,
+          message: "Synthetic failure",
+          data: { retry: true },
+        },
+      },
+    };
+    const failed = appReducer(base, failure);
+    expect(failed.timeline).toEqual([expect.objectContaining({
+      id: "bridge-turn-outcome:turn-1",
+      type: "error",
+      code: -32603,
+      retryBlocks: [{ type: "text", text: "Retry me" }],
+    })]);
+    expect(failed.running).toBe(false);
+    expect(failed.pendingPrompt).toBeUndefined();
+    expect(appReducer(failed, failure)).toBe(failed);
+
+    const hydrated = appReducer(failed, {
+      type: "bridge/session_hydrate",
+      view: {
+        bridgeEpoch: "epoch",
+        sessionId: "session",
+        sessionIncarnation: 1,
+        viewRevision: 3,
+        historyRevision: "epoch:1:3",
+        phase: "ready",
+        syncError: null,
+        timeline: [],
+        activeTurn: null,
+        workspace: { cwd: "/workspace", session: {} },
+        controls: {},
+        interactions: { permissions: {}, elicitations: {}, urlFlows: {} },
+        operation: null,
+        terminals: {},
+      },
+    });
+    expect(hydrated.timeline).toEqual([expect.objectContaining({
+      id: "bridge-turn-outcome:turn-1",
+      type: "error",
+    })]);
+
+    const completed = appReducer(hydrated, {
+      type: "bridge/turn_complete",
+      event: {
+        type: "bridge/session_turn_complete",
+        bridgeEpoch: "epoch",
+        sessionId: "session",
+        sessionIncarnation: 1,
+        viewRevision: 4,
+        historyRevision: "epoch:1:4",
+        phase: "ready",
+        operationId: "turn-2",
+        clientIntentId: "browser-intent-id-2",
+        response: { stopReason: "end_turn" },
+      },
+    });
+    expect(completed.timeline.at(-1)).toEqual({
+      id: "bridge-turn-outcome:turn-2",
+      type: "stop",
+      response: { stopReason: "end_turn" },
+    });
+  });
+
+  it("does not let a late prior-turn outcome settle the active turn", () => {
+    const active: AppState = {
+      ...initialState,
+      phase: "ready",
+      session: { sessionId: "session" },
+      sessionSyncPhase: "running",
+      running: true,
+      pendingPrompt: {
+        requestId: "intent-2",
+        sessionId: "session",
+        blocks: [{ type: "text", text: "Second turn" }],
+      },
+    };
+    const next = appReducer(active, {
+      type: "bridge/turn_complete",
+      event: {
+        type: "bridge/session_turn_complete",
+        bridgeEpoch: "epoch",
+        sessionId: "session",
+        sessionIncarnation: 1,
+        viewRevision: 7,
+        historyRevision: "epoch:1:3",
+        phase: "ready",
+        operationId: "turn-1",
+        clientIntentId: "intent-1",
+        response: { stopReason: "end_turn" },
+      },
+    });
+
+    expect(next.running).toBe(true);
+    expect(next.sessionSyncPhase).toBe("running");
+    expect(next.pendingPrompt?.requestId).toBe("intent-2");
+    expect(next.timeline.at(-1)).toMatchObject({
+      id: "bridge-turn-outcome:turn-1",
+      type: "stop",
+    });
+  });
+
+  it("turns a bridge-owned ACP auth failure into a sign-in state", () => {
+    const state = appReducer({
+      ...initialState,
+      phase: "ready",
+      initialized: {
+        protocolVersion: 1,
+        authMethods: [{ id: "agent-login", name: "Agent login" }],
+      },
+      session: { sessionId: "session" },
+      sessionSyncPhase: "running",
+      running: true,
+      pendingPrompt: {
+        requestId: "intent",
+        sessionId: "session",
+        blocks: [{ type: "text", text: "Continue" }],
+      },
+    }, {
+      type: "bridge/turn_failed",
+      event: {
+        type: "bridge/session_turn_failed",
+        bridgeEpoch: "epoch",
+        sessionId: "session",
+        sessionIncarnation: 1,
+        viewRevision: 7,
+        historyRevision: "epoch:1:3",
+        phase: "blocked",
+        operationId: "turn-1",
+        clientIntentId: "intent",
+        prompt: [{ type: "text", text: "Continue" }],
+        error: { code: -32_000, message: "Authentication required" },
+      },
+    });
+
+    expect(state.authStatus).toBe("required");
+    expect(state.running).toBe(false);
+    expect(state.timeline.at(-1)).toMatchObject({
+      type: "error",
+      code: -32_000,
+      message: "Authentication required",
+    });
+  });
+
   it("tracks a remote session workspace and clears it when the thread closes", () => {
     let state = appReducer(initialState, event({
       type: "bridge/hello",

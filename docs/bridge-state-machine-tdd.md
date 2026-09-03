@@ -67,7 +67,8 @@ and revision metadata; observers access the shared snapshot through the history 
 | any live | close/delete/shutdown | closing/closed | capability-gated lifecycle I/O |
 
 Same-session prompt, load, close, delete, fork and config mutations are mutually exclusive.
-Different sessions may progress concurrently under global memory and request budgets.
+Different sessions may progress concurrently under request, transport and delivery backpressure
+bounds.
 
 ## Append contract
 
@@ -101,7 +102,7 @@ Prompt terminal delivery and history checkpoint are separate transitions. With l
 1. preserve the completed overlay;
 2. enter Reconciling and exclude new same-session mutations;
 3. collect a load replay in a private candidate;
-4. validate semantic structure, limits, generation and history consistency;
+4. validate semantic structure, generation and history consistency;
 5. atomically swap the shared baseline and advance history revision;
 6. clear the overlay/candidate exactly once;
 7. publish one coherent replacement and enter Ready.
@@ -111,7 +112,7 @@ single-flight and delayed. A lost load outcome is drained or isolated by a conne
 change before another request starts because ACP updates do not carry their originating load ID.
 
 Without load support, steps 3-5 are replaced by one local transaction: fold the accepted prompt and
-validated overlay onto the prior in-memory baseline, enforce all history budgets, install a new
+validated overlay onto the prior in-memory baseline, verify history consistency, install a new
 revision, then clear the overlay. It sends no Agent request. This projection survives browser
 replacement but not bridge replacement; Cold history remains unavailable.
 
@@ -147,8 +148,10 @@ history, invents missing Agent data or silently treats a partial replay as autho
 
 - One installed `Arc<HistorySnapshot>` per materialized session.
 - At most one overlay and one candidate per session.
-- Old baseline + overlay + candidate peak bytes are all reserved before growth.
-- Per-session and global limits cover baselines, candidates, overlays, live resources and delivery.
+- Old baseline + overlay + candidate peak bytes are accounted throughout reconciliation.
+- Protocol-valid baseline, candidate and overlay growth has no bridge-defined cumulative cap.
+- Wire values, live resources and subscriber delivery retain their independent safety and
+  backpressure limits.
 - Pressure eviction selects only unobserved Ready sessions with no live resource or operation.
 - Running, Reconciling, observed and interaction-bearing sessions are pinned.
 - Close/delete/generation shutdown drops baselines, candidates and retry tasks.

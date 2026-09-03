@@ -13,20 +13,20 @@ drivers; there is no second backend implementation.
 
 | Layer | Command | Purpose |
 | --- | --- | --- |
-| Frontend and browser contract | `npm test` | 148 reducer, event-envelope, content, prompt-history, search, interaction, accessibility, load-replacement, and adversarial-state cases |
-| Rust backend | `npm run test:rust` | 207 native cases, including active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, bounded event queues, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
+| Frontend and browser contract | `npm test` | 146 reducer, event-envelope, content, prompt-history, search, interaction, accessibility, load-replacement, and adversarial-state cases |
+| Rust backend | `npm run test:rust` | 242 native cases, including active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, bounded event queues, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
 | Remote ACP transports | `npm run test:remote` | Connects the Rust binary to SDK HTTP/SSE and WebSocket ACP servers; verifies remote capability boundaries and Agent-owned absolute cwd |
-| Rust-hosted black box | `npm run test:ui` | Drives real browser WebSockets, fake ACP Agents, and an MCP provider through the Rust binary; covers 900+ bridge events and 328 malformed/binary frames with same-connection recovery |
+| Rust-hosted black box | `npm run test:ui` | Exercises the production binary's embedded bundle and REST/session-SSE API with a real stdio ACP fixture, revision-guarded prompt completion, history reload, and deletion |
 | Rust coverage gate | `npm run test:coverage` | Runs native and instrumented real-binary suites and requires at least 85% Rust backend line coverage; requires `cargo-llvm-cov` |
 | Standalone artifact | `npm run test:binary` | Copies only the release executable to an empty directory and verifies embedded HTML, JavaScript, health metadata, and static MIME types |
 | Browser interaction | `npm run test:browser` | Runs the production Rust host with the fake Agent and verifies Zed-style Agent interaction and mobile behavior in Chromium |
 | Real Agent | `npm run test:goose` | Runs Goose ACP v1 recovery and a deterministic local prompt/tool lifecycle through the Rust host without a real provider key |
 
 `npm run check` runs type checking, frontend/shared tests, and the production client build. CI
-runs the frontend, Rust backend, and Chromium browser suites as independent parallel jobs. Each
-Rust unit, remote-transport, Rust-hosted black-box, release-build, and standalone-binary layer is
-also a separate backend step, so failures identify their layer directly. The slower coverage and
-Goose suites remain separate.
+runs the frontend, Rust backend, and Chromium browser suites as independent parallel jobs. Rust
+unit, remote-transport, REST/SSE host-smoke, release-build, and standalone-binary checks remain
+separate steps so failures identify their layer directly. The slower coverage and Goose suites
+remain separate.
 
 ## Backend migration status
 
@@ -47,16 +47,16 @@ infrastructure; they are upstream peers or drivers, not an attyd backend.
 
 We select behavior, not Zed implementation code:
 
-- Zed's `test_load_session_replays_notifications_sent_before_response` maps to the attachment
-  half of `scripts/ui-smoke.ts`: history updates sent before `session/load` returns must appear in
-  the restored thread.
+- Zed's `test_load_session_replays_notifications_sent_before_response` maps to the Rust bridge
+  attachment tests: history updates sent before `session/load` returns must appear in the restored
+  thread.
 - Zed's `client_capabilities_include_elicitation_without_acp_beta` maps to the Rust capability
   test: form and URL elicitation are advertised without editor/NES support.
 - Zed's missing-thread handling maps to the Rust early/late routing test: updates are buffered only
   while a matching session can still be allocated, and late unknown/closed-session updates never
   leak into the visible thread.
-- Zed's session-list work-directory tests map to the black-box assertion that an Agent-owned cwd
-  returned by `session/list` is retained when history is loaded.
+- Zed's session-list work-directory tests map to the REST/SSE black-box assertion that an
+  Agent-owned cwd returned by `session/list` is retained when history is loaded.
 
 The source reference is Zed's
 [`crates/agent_servers/src/acp.rs`](https://github.com/zed-industries/zed/blob/main/crates/agent_servers/src/acp.rs).

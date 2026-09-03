@@ -28,7 +28,11 @@ import type {
   TerminalSnapshot,
 } from "../../../shared/bridge";
 import { assertNever } from "../../../shared/exhaustive";
-import type { BridgeSessionView, SessionSyncPhase } from "./business-api";
+import type {
+  BridgeSessionView,
+  SessionBusinessEvent,
+  SessionSyncPhase,
+} from "./business-api";
 import { randomId } from "./id";
 
 export interface AssistantMessageChunk {
@@ -295,6 +299,14 @@ export type AppAction =
   | { type: "socket/closed" }
   | { type: "bridge/session_hydrate"; view: BridgeSessionView }
   | {
+      type: "bridge/turn_complete";
+      event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_complete" }>;
+    }
+  | {
+      type: "bridge/turn_failed";
+      event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_failed" }>;
+    }
+  | {
       type: "runtime/replay_complete";
       preferredSessionId?: string;
       fallbackSessionId?: string;
@@ -505,6 +517,10 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return terminateBridgeState(state, "stopped", false);
     case "bridge/session_hydrate":
       return hydrateBridgeSession(state, action.view);
+    case "bridge/turn_complete":
+      return applyBridgeTurnComplete(state, action.event);
+    case "bridge/turn_failed":
+      return applyBridgeTurnFailure(state, action.event);
     case "runtime/replay_complete": {
       const next = {
         ...(state.runtimeReplacement ?? state),
@@ -2437,6 +2453,12 @@ function resetActiveSession(state: AppState, title?: string): AppState {
 }
 
 function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppState {
+  const priorTimeline = state.session?.sessionId === view.sessionId
+    ? state.timeline
+    : state.cachedSessions.get(view.sessionId)?.timeline ?? [];
+  const priorTurnOutcomes = priorTimeline.filter(({ id }) =>
+    id.startsWith("bridge-turn-outcome:")
+  );
   const cached = cacheCurrentSession(state);
   const listed = cached.sessions.find(({ sessionId }) => sessionId === view.sessionId);
   const session: NewSessionResponse = {
@@ -2523,7 +2545,88 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
       ],
     };
   }
+  if (priorTurnOutcomes.length > 0) {
+    const rebuiltIds = new Set(next.timeline.map(({ id }) => id));
+    next = {
+      ...next,
+      timeline: [
+        ...next.timeline,
+        ...priorTurnOutcomes.filter(({ id }) => !rebuiltIds.has(id)),
+      ],
+    };
+  }
   return next;
+}
+
+function applyBridgeTurnComplete(
+  state: AppState,
+  event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_complete" }>,
+): AppState {
+  const outcomeId = `bridge-turn-outcome:${event.operationId}`;
+  if (
+    state.session?.sessionId !== event.sessionId ||
+    state.timeline.some(({ id }) => id === outcomeId)
+  ) return state;
+  const ownsActivePrompt = state.pendingPrompt == null ||
+    state.pendingPrompt.requestId === event.clientIntentId ||
+    state.pendingPrompt.requestId === event.operationId;
+  if (!ownsActivePrompt) {
+    return {
+      ...state,
+      timeline: [
+        ...state.timeline,
+        { id: outcomeId, type: "stop", response: event.response },
+      ],
+    };
+  }
+  return {
+    ...state,
+    running: false,
+    sessionSyncPhase: event.phase,
+    agentActivity: undefined,
+    pendingPrompt: undefined,
+    timeline: [
+      ...state.timeline,
+      { id: outcomeId, type: "stop", response: event.response },
+    ],
+  };
+}
+
+function applyBridgeTurnFailure(
+  state: AppState,
+  event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_failed" }>,
+): AppState {
+  const outcomeId = `bridge-turn-outcome:${event.operationId}`;
+  if (
+    state.session?.sessionId !== event.sessionId ||
+    state.timeline.some(({ id }) => id === outcomeId)
+  ) return state;
+  const error = {
+    id: outcomeId,
+    type: "error" as const,
+    message: event.error.message,
+    requestId: event.operationId,
+    operation: "session/prompt" as const,
+    code: event.error.code,
+    data: event.error.data,
+    retryBlocks: event.prompt,
+  };
+  const ownsActivePrompt = state.pendingPrompt == null ||
+    state.pendingPrompt.requestId === event.clientIntentId ||
+    state.pendingPrompt.requestId === event.operationId;
+  const next = !ownsActivePrompt
+    ? { ...state, timeline: [...state.timeline, error] }
+    : {
+        ...state,
+        running: false,
+        sessionSyncPhase: event.phase,
+        agentActivity: undefined,
+        pendingPrompt: undefined,
+        timeline: [...state.timeline, error],
+      };
+  return event.error.code === -32_000 && (state.initialized?.authMethods?.length ?? 0) > 0
+    ? settleAuthenticationRequired(next, event.clientIntentId)
+    : next;
 }
 
 function bridgeOperationKind(kind: string): SessionRuntimeOperation {

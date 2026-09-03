@@ -4,7 +4,7 @@ This is the executable acceptance plan for
 [active-turn-runtime.md](active-turn-runtime.md). The production transition is not complete until
 the old active-only assertions have been replaced and every P0 test below is green.
 
-Tests use deterministic barriers, paused time and injectable byte limits. Timing sleeps and RSS
+Tests use deterministic barriers, paused time and logical byte accounting. Timing sleeps and RSS
 alone are not correctness evidence.
 
 ## Layers
@@ -93,9 +93,9 @@ alone are not correctness evidence.
 - `history_snapshot_is_shared_not_cloned_by_runtime_delta`
 - `many_observers_hold_shared_baseline_payloads`
 - `baseline_overlay_candidate_peak_is_fully_accounted`
-- `candidate_reservation_failure_is_transactional`
-- `per_session_and_global_history_limits_are_enforced`
-- `active_overlay_has_a_global_not_only_per_session_limit`
+- `candidate_growth_is_accounted_without_admission_rejection`
+- `large_protocol_valid_history_is_not_rejected_by_cache_accounting`
+- `large_protocol_valid_active_overlay_is_not_rejected`
 - `pressure_evicts_least_recent_unobserved_ready_baseline`
 - `observed_running_reconciling_and_live_resource_sessions_are_pinned`
 - `evicted_session_next_observer_starts_one_load`

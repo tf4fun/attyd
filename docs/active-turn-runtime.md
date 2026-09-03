@@ -106,8 +106,8 @@ baseline. Concurrent observers join the same load and never see a partial candid
 
 A transient load failure retries with bounded exponential backoff and jitter. A retry begins only
 after the prior request has definitively terminated; if its outcome is uncertain the connection
-must be drained or replaced first. Unsupported, not-found, authorization, invalid replay and hard
-resource-limit failures become visible `Blocked` states rather than hot retry loops.
+must be drained or replaced first. Unsupported, not-found, authorization and invalid replay
+failures become visible `Blocked` states rather than hot retry loops.
 
 If the Agent does not advertise load, a Cold historical session cannot be materialized. This does
 not affect a new or already materialized no-load session whose baseline is still in bridge memory.
@@ -170,7 +170,6 @@ overlay into the existing in-memory baseline.
 Replay is built in a separately accounted candidate. Before commit the bridge validates:
 
 - ACP structural and semantic validity;
-- item and byte limits;
 - session identity and current attempt/connection generation;
 - the configured stable-prefix/append rule;
 - visibility of the completed accepted prompt/turn.
@@ -180,10 +179,10 @@ overlay and candidate, and changes the phase to `Ready`. Even an identical repla
 revision so the consumed append slot cannot be reused.
 
 The no-load transaction folds synthetic `user_message_chunk` updates for the accepted prompt and
-the already validated active updates onto the prior baseline. Limit, phase, incarnation and
-operation checks complete before replacement. Failure preserves the prior baseline and completed
-overlay and exposes `Blocked`; success advances the same opaque revision/idempotency ledger used by
-the load-backed path.
+the already validated active updates onto the prior baseline. Phase, incarnation, operation and
+history-consistency checks complete before replacement. Failure preserves the prior baseline and
+completed overlay and exposes `Blocked`; success advances the same opaque revision/idempotency
+ledger used by the load-backed path.
 
 On retryable failure, only the candidate is dropped. The old baseline and completed overlay remain
 visible while a single retry task backs off. No prompt, load, close, delete, fork or config mutation
@@ -207,18 +206,26 @@ The implementation uses an independent store:
 ```text
 HistoryCache<SessionKey, Arc<HistorySnapshot>>
 RuntimeState { phase, historyRevision, overlay, live resources, ... }
-LoadTransaction { candidate, byte reservation, attempt }
+LoadTransaction { candidate, byte accounting, attempt }
 ```
 
-Budgets cover per-session and global baseline bytes, overlay bytes, candidate bytes, shared snapshot
-delivery, subscribers and all live-resource classes. Reconciliation peak memory includes the old
-baseline, completed overlay and candidate simultaneously. A candidate that cannot reserve capacity
-fails without truncating or modifying the current view.
+Baseline, overlay and candidate bytes are accounted for diagnostics and regression tests, but their
+cumulative size is not an admission rule. A protocol-valid Agent history or turn is never rejected
+because it crossed a bridge-defined conversation budget. Reconciliation peak memory includes the
+old baseline, completed overlay and candidate simultaneously; this cost is proportional to the
+history the Agent exposes. Single-value wire safety, bounded delivery queues and live-resource
+concurrency limits remain separate from conversation retention.
 
-Pressure-triggered LRU may evict only a load-backed `Ready` session with no observers, operation,
-interaction or live resource. `Loading`, `Running`, `Reconciling`, observed and no-load sessions
-are pinned. Eviction keeps only a small Cold handle; the next observation performs one load. Close,
-delete and bridge shutdown release baselines, candidates and retry tasks.
+In practice the Agent/model context window and available process memory bound useful history, but
+the bridge does not infer that context window or reinterpret it as an ACP admission rule. Resource
+sizing and session lifecycle remain deployment/user concerns unless a future ACP capability makes
+them explicit.
+
+If cache eviction is added later, it may evict only a load-backed `Ready` session with no observers,
+operation, interaction or live resource. `Loading`, `Running`, `Reconciling`, observed and no-load
+sessions must remain pinned. Eviction would keep only a small Cold handle so the next observation
+can perform one load. The current implementation releases baselines and candidates on close,
+delete and bridge shutdown.
 
 ## Browser API direction
 
@@ -253,7 +260,8 @@ surface never owns ACP lifecycle semantics, history folding or reconnect decisio
 - **H09 Observer independence:** subscriber lifecycle cannot affect Agent work.
 - **H10 Generation isolation:** old epoch/incarnation/attempt events cannot mutate current state.
 - **H11 Live-resource independence:** baseline replacement cannot retire unrelated live resources.
-- **H12 Bounded memory:** baseline, overlay, candidate and delivery are byte-accounted globally.
+- **H12 Faithful retention:** baseline, overlay and candidate are byte-accounted but have no
+  bridge-defined cumulative admission cap.
 - **H13 Safe eviction:** only unobserved Ready baselines are evictable.
 - **H14 Honest uncertainty:** lost non-idempotent outcomes are never blindly redispatched.
 - **H15 No persistence:** bridge history state disappears with the bridge process.

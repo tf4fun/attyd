@@ -22,7 +22,6 @@ use crate::elicitation_validation::{
 };
 use crate::event_queue::EventSender;
 use crate::filesystem::WorkspaceFileSystem;
-use crate::history_cache::HistoryCacheLimits;
 use crate::mcp::McpManager;
 use crate::mcp_config::{server_name, server_type};
 use crate::options::{Options, Transport};
@@ -333,7 +332,7 @@ fn session_mirror(state: &mut BridgeState) -> &mut SessionMirror {
     let epoch = state.runtime.epoch().to_string();
     state
         .session_mirror
-        .get_or_insert_with(|| SessionMirror::new(epoch, HistoryCacheLimits::default()))
+        .get_or_insert_with(|| SessionMirror::new(epoch))
 }
 
 fn session_view_value(
@@ -381,6 +380,41 @@ fn session_delta_value(
     }))
 }
 
+fn session_turn_outcome_value(
+    state: &mut BridgeState,
+    event_type: &str,
+    session_id: &str,
+    incarnation: u64,
+    operation_id: &str,
+    extra: Value,
+) -> Result<Value, Error> {
+    let bridge_epoch = state.runtime.epoch().to_string();
+    let session = state
+        .session_mirror
+        .as_ref()
+        .and_then(|mirror| mirror.state(session_id))
+        .filter(|session| session.incarnation == incarnation)
+        .ok_or_else(|| Error::internal_error().data("missing turn outcome projection"))?;
+    let mut event = json!({
+        "type": event_type,
+        "bridgeEpoch": bridge_epoch,
+        "sessionId": session_id,
+        "sessionIncarnation": session.incarnation,
+        "viewRevision": session.view_revision,
+        "historyRevision": session.history_revision,
+        "phase": session.phase,
+        "operationId": operation_id,
+    });
+    let Some(event_fields) = event.as_object_mut() else {
+        return Err(Error::internal_error().data("turn outcome must be an object"));
+    };
+    let Some(extra_fields) = extra.as_object() else {
+        return Err(Error::internal_error().data("turn outcome fields must be an object"));
+    };
+    event_fields.extend(extra_fields.clone());
+    Ok(event)
+}
+
 fn advance_session_delta(
     state: &mut BridgeState,
     session_id: &str,
@@ -410,9 +444,6 @@ fn mirror_error(error: MirrorError) -> Error {
         }
         MirrorError::InconsistentHistory => {
             Error::invalid_request().data("session history is inconsistent with the completed turn")
-        }
-        MirrorError::OverlayLimit => {
-            Error::invalid_request().data("active turn exceeds the bridge memory budget")
         }
         MirrorError::History(error) => {
             Error::invalid_request().data(format!("history cache rejected snapshot: {error:?}"))
@@ -971,8 +1002,36 @@ pub(crate) enum BridgeInput {
     },
     BusinessRequest {
         command: Value,
-        response: oneshot::Sender<Result<Value, String>>,
+        response: oneshot::Sender<Result<Value, BridgeRequestError>>,
     },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BridgeRequestError {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl BridgeRequestError {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: None,
+            data: None,
+        }
+    }
+
+    fn from_acp(error: &Error) -> Self {
+        Self {
+            message: error.message.clone(),
+            code: Some(i32::from(error.code)),
+            data: error.data.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -982,11 +1041,11 @@ struct TurnResponder {
 
 #[derive(Clone)]
 struct BusinessResponder {
-    sender: Arc<std::sync::Mutex<Option<oneshot::Sender<Result<Value, String>>>>>,
+    sender: Arc<std::sync::Mutex<Option<oneshot::Sender<Result<Value, BridgeRequestError>>>>>,
 }
 
 impl BusinessResponder {
-    fn new(sender: oneshot::Sender<Result<Value, String>>) -> Self {
+    fn new(sender: oneshot::Sender<Result<Value, BridgeRequestError>>) -> Self {
         Self {
             sender: Arc::new(std::sync::Mutex::new(Some(sender))),
         }
@@ -1010,11 +1069,7 @@ impl BusinessResponder {
             .expect("business responder poisoned")
             .take()
         {
-            let message = error
-                .data
-                .as_ref()
-                .map_or_else(|| error.message.clone(), Value::to_string);
-            let _ = sender.send(Err(message));
+            let _ = sender.send(Err(BridgeRequestError::from_acp(error)));
         }
     }
 }
@@ -3995,6 +4050,7 @@ async fn handle_command(
                 "sessionId": session_id,
                 "prompt": prompt,
             }));
+            let prompt_for_outcome = prompt.clone();
             let request = connection.send_request(PromptRequest::new(session_id.clone(), prompt));
             if let Some(prompt_start) = prompt_start.as_mut() {
                 prompt_start.finish();
@@ -4020,6 +4076,19 @@ async fn handle_command(
                                 error.message.clone(),
                             )
                             .map_err(mirror_error)?;
+                        let outcome = session_turn_outcome_value(
+                            &mut state,
+                            "bridge/session_turn_failed",
+                            &session_id,
+                            incarnation,
+                            &mirror_operation_id,
+                            json!({
+                            "clientIntentId": client_intent_id,
+                            "prompt": prompt_for_outcome,
+                            "error": agent_error_value(&error),
+                            }),
+                        )?;
+                        sink.send(outcome);
                         finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
                         return Err(error);
                     }
@@ -4060,6 +4129,20 @@ async fn handle_command(
                             "failed to reconcile history after an Agent prompt error"
                         );
                     }
+                    let outcome = session_turn_outcome_value(
+                        &mut state,
+                        "bridge/session_turn_failed",
+                        &session_id,
+                        incarnation,
+                        &mirror_operation_id,
+                        json!({
+                        "clientIntentId": client_intent_id,
+                        "prompt": prompt_for_outcome,
+                        "error": agent_error_value(&error),
+                        }),
+                    )?;
+                    drop(state);
+                    sink.send(outcome);
                     return Err(error);
                 }
             };
@@ -4114,6 +4197,20 @@ async fn handle_command(
                         "failed to reconcile history after an invalid prompt response"
                     );
                 }
+                let outcome = session_turn_outcome_value(
+                    &mut state,
+                    "bridge/session_turn_failed",
+                    &session_id,
+                    incarnation,
+                    &mirror_operation_id,
+                    json!({
+                    "clientIntentId": client_intent_id,
+                    "prompt": prompt_for_outcome,
+                    "error": agent_error_value(&error),
+                    }),
+                )?;
+                drop(state);
+                sink.send(outcome);
                 return Err(error);
             }
             let reconciling_view = {
@@ -4162,6 +4259,21 @@ async fn handle_command(
                 finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
             }
             reconciliation?;
+            let outcome = {
+                let mut state = state.lock().await;
+                session_turn_outcome_value(
+                    &mut state,
+                    "bridge/session_turn_complete",
+                    &session_id,
+                    incarnation,
+                    &mirror_operation_id,
+                    json!({
+                        "clientIntentId": client_intent_id,
+                        "response": response,
+                    }),
+                )?
+            };
+            sink.send(outcome);
             sink.send(json!({
                 "type": "acp/prompt_complete",
                 "requestId": request_id,

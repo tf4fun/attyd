@@ -17,10 +17,11 @@ export function useInteractionFocus<T extends HTMLElement>(
   const container = useRef<T>(null);
 
   useEffect(() => {
+    const mountedContainer = container.current;
     const previous = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : undefined;
-    container.current?.querySelector<HTMLElement>(selector)?.focus();
+    mountedContainer?.querySelector<HTMLElement>(selector)?.focus();
 
     return () => {
       if (
@@ -32,7 +33,7 @@ export function useInteractionFocus<T extends HTMLElement>(
       if (
         active == null ||
         active === document.body ||
-        container.current?.contains(active)
+        mountedContainer?.contains(active)
       ) {
         previous.focus();
       }

@@ -50,6 +50,34 @@ describe("browser REST and SSE transport", () => {
       sessionIncarnation: 1,
       viewRevision: "7",
     }))).toThrow("invalid identity or revision");
+    expect(parseSessionBusinessEvent(JSON.stringify({
+      type: "bridge/session_turn_failed",
+      bridgeEpoch: "epoch",
+      sessionId: "session",
+      sessionIncarnation: 2,
+      viewRevision: 8,
+      historyRevision: "epoch:2:8",
+      phase: "ready",
+      operationId: "turn-1",
+      clientIntentId: "intent-1",
+      prompt: [{ type: "text", text: "Retry me" }],
+      error: { code: -32603, message: "Agent failed", data: { retry: true } },
+    }))).toMatchObject({
+      type: "bridge/session_turn_failed",
+      error: { code: -32603 },
+    });
+    expect(() => parseSessionBusinessEvent(JSON.stringify({
+      type: "bridge/session_turn_complete",
+      bridgeEpoch: "epoch",
+      sessionId: "session",
+      sessionIncarnation: 2,
+      viewRevision: 8,
+      historyRevision: "epoch:2:8",
+      phase: "ready",
+      operationId: "turn-1",
+      clientIntentId: "intent-1",
+      response: "invalid",
+    }))).toThrow("invalid payload");
   });
 
   it("restores the newest timestamped session without depending on Agent ordering", () => {

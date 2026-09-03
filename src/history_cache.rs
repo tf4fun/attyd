@@ -49,33 +49,15 @@ impl HistorySnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HistoryCacheLimits {
-    pub max_snapshot_updates: usize,
-    pub max_snapshot_bytes: usize,
-    pub max_total_bytes: usize,
-}
-
-impl Default for HistoryCacheLimits {
-    fn default() -> Self {
-        Self {
-            max_snapshot_updates: 100_000,
-            max_snapshot_bytes: 32 * 1024 * 1024,
-            max_total_bytes: 128 * 1024 * 1024,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HistoryCacheError {
     CandidateExists,
     CandidateMissing,
     AttemptMismatch,
     InvalidReplay,
-    SnapshotLimit,
-    GlobalLimit,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HistoryCacheStats {
     pub snapshots: usize,
@@ -106,11 +88,10 @@ pub(crate) struct HistoryCache {
     candidates: HashMap<SessionKey, LoadCandidate>,
     snapshot_bytes: usize,
     candidate_bytes: usize,
-    limits: HistoryCacheLimits,
 }
 
 impl HistoryCache {
-    pub(crate) fn new(epoch: impl Into<String>, limits: HistoryCacheLimits) -> Self {
+    pub(crate) fn new(epoch: impl Into<String>) -> Self {
         Self {
             epoch: epoch.into(),
             next_generation: 0,
@@ -119,7 +100,6 @@ impl HistoryCache {
             candidates: HashMap::new(),
             snapshot_bytes: 0,
             candidate_bytes: 0,
-            limits,
         }
     }
 
@@ -176,22 +156,11 @@ impl HistoryCache {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn append_candidate(
         &mut self,
         key: &SessionKey,
         attempt_id: &str,
         update: Value,
-    ) -> Result<(), HistoryCacheError> {
-        self.append_candidate_with_reserved(key, attempt_id, update, 0)
-    }
-
-    pub(crate) fn append_candidate_with_reserved(
-        &mut self,
-        key: &SessionKey,
-        attempt_id: &str,
-        update: Value,
-        externally_reserved_bytes: usize,
     ) -> Result<(), HistoryCacheError> {
         let candidate = self
             .candidates
@@ -213,23 +182,6 @@ impl HistoryCache {
         let bytes = serde_json::to_vec(&updates)
             .map(|value| value.len())
             .unwrap_or(usize::MAX);
-        if updates.len() > self.limits.max_snapshot_updates
-            || bytes > self.limits.max_snapshot_bytes
-        {
-            self.poison_candidate(key, attempt_id, HistoryCacheError::SnapshotLimit)?;
-            return Err(HistoryCacheError::SnapshotLimit);
-        }
-        if self
-            .snapshot_bytes
-            .checked_add(self.candidate_bytes)
-            .and_then(|total| total.checked_add(externally_reserved_bytes))
-            .and_then(|total| total.checked_sub(candidate.bytes))
-            .and_then(|total| total.checked_add(bytes))
-            .is_none_or(|next| next > self.limits.max_total_bytes)
-        {
-            self.poison_candidate(key, attempt_id, HistoryCacheError::GlobalLimit)?;
-            return Err(HistoryCacheError::GlobalLimit);
-        }
         let candidate = self
             .candidates
             .get_mut(key)
@@ -289,7 +241,6 @@ impl HistoryCache {
         &mut self,
         key: &SessionKey,
         suffix: &[Value],
-        externally_reserved_bytes: usize,
     ) -> Result<Arc<HistorySnapshot>, HistoryCacheError> {
         let previous = self
             .entries
@@ -305,21 +256,6 @@ impl HistoryCache {
         let bytes = serde_json::to_vec(&updates)
             .map(|value| value.len())
             .unwrap_or(usize::MAX);
-        if updates.len() > self.limits.max_snapshot_updates
-            || bytes > self.limits.max_snapshot_bytes
-        {
-            return Err(HistoryCacheError::SnapshotLimit);
-        }
-        if self
-            .snapshot_bytes
-            .checked_add(self.candidate_bytes)
-            .and_then(|total| total.checked_add(externally_reserved_bytes))
-            .and_then(|total| total.checked_sub(previous.bytes()))
-            .and_then(|total| total.checked_add(bytes))
-            .is_none_or(|next| next > self.limits.max_total_bytes)
-        {
-            return Err(HistoryCacheError::GlobalLimit);
-        }
         Ok(self.install_snapshot(key.clone(), updates, bytes))
     }
 
@@ -382,6 +318,7 @@ impl HistoryCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> HistoryCacheStats {
         HistoryCacheStats {
             snapshots: self.entries.len(),
@@ -505,18 +442,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn limits() -> HistoryCacheLimits {
-        HistoryCacheLimits {
-            max_snapshot_updates: 3,
-            max_snapshot_bytes: 256,
-            max_total_bytes: 512,
-        }
-    }
-
     #[test]
     fn valid_candidate_atomically_replaces_the_baseline_and_advances_revision() {
         let key = SessionKey::new("session", 7);
-        let mut cache = HistoryCache::new("epoch", limits());
+        let mut cache = HistoryCache::new("epoch");
         let old = cache.install_empty(key.clone());
         cache.begin_candidate(key.clone(), "load-1").unwrap();
         cache
@@ -534,7 +463,7 @@ mod tests {
     #[test]
     fn failed_candidate_preserves_the_installed_baseline() {
         let key = SessionKey::new("session", 1);
-        let mut cache = HistoryCache::new("epoch", limits());
+        let mut cache = HistoryCache::new("epoch");
         cache.begin_candidate(key.clone(), "initial").unwrap();
         cache
             .append_candidate(&key, "initial", json!({ "message": "stable" }))
@@ -551,37 +480,29 @@ mod tests {
     }
 
     #[test]
-    fn rejected_committed_suffix_does_not_replace_the_baseline() {
+    fn committed_suffix_is_not_rejected_by_accounting_watermarks() {
         let key = SessionKey::new("session", 1);
-        let mut cache = HistoryCache::new(
-            "epoch",
-            HistoryCacheLimits {
-                max_snapshot_updates: 8,
-                max_snapshot_bytes: 32,
-                max_total_bytes: 64,
-            },
-        );
+        let mut cache = HistoryCache::new("epoch");
         let stable = cache.install_empty(key.clone());
 
-        assert!(matches!(
-            cache.append_committed_updates(
+        let committed = cache
+            .append_committed_updates(
                 &key,
                 &[json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": { "type": "text", "text": "too large for the cache" }
                 })],
-                0,
-            ),
-            Err(HistoryCacheError::SnapshotLimit)
-        ));
-        assert!(Arc::ptr_eq(cache.peek(&key).unwrap(), &stable));
-        assert_eq!(cache.stats().snapshot_bytes, stable.bytes());
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&committed, &stable));
+        assert!(committed.bytes() > 32);
+        assert_eq!(cache.stats().snapshot_bytes, committed.bytes());
     }
 
     #[test]
     fn identical_replay_still_gets_a_new_opaque_revision() {
         let key = SessionKey::new("session", 2);
-        let mut cache = HistoryCache::new("epoch", limits());
+        let mut cache = HistoryCache::new("epoch");
         for attempt in ["first", "second"] {
             cache.begin_candidate(key.clone(), attempt).unwrap();
             cache
@@ -599,7 +520,7 @@ mod tests {
     #[test]
     fn wrong_attempt_cannot_append_commit_or_abort_a_candidate() {
         let key = SessionKey::new("session", 1);
-        let mut cache = HistoryCache::new("epoch", limits());
+        let mut cache = HistoryCache::new("epoch");
         cache.begin_candidate(key.clone(), "current").unwrap();
 
         assert_eq!(
@@ -618,38 +539,9 @@ mod tests {
     }
 
     #[test]
-    fn limits_poison_the_candidate_without_changing_accounting() {
-        let key = SessionKey::new("session", 1);
-        let mut cache = HistoryCache::new(
-            "epoch",
-            HistoryCacheLimits {
-                max_snapshot_updates: 1,
-                max_snapshot_bytes: 16,
-                max_total_bytes: 16,
-            },
-        );
-        cache.begin_candidate(key.clone(), "load").unwrap();
-        assert_eq!(
-            cache.append_candidate(&key, "load", json!({ "tooLarge": "payload" })),
-            Err(HistoryCacheError::SnapshotLimit)
-        );
-        assert_eq!(cache.stats().candidate_bytes, 0);
-        assert!(matches!(
-            cache.commit_candidate(&key, "load"),
-            Err(HistoryCacheError::SnapshotLimit)
-        ));
-        assert_eq!(
-            cache.append_candidate(&key, "load", json!({})),
-            Err(HistoryCacheError::SnapshotLimit)
-        );
-        cache.abort_candidate(&key, "load").unwrap();
-        assert_eq!(cache.stats().candidates, 0);
-    }
-
-    #[test]
     fn snapshots_are_shared_between_observers() {
         let key = SessionKey::new("session", 1);
-        let mut cache = HistoryCache::new("epoch", limits());
+        let mut cache = HistoryCache::new("epoch");
         cache.install_empty(key.clone());
 
         let left = cache.snapshot(&key).unwrap();
@@ -663,7 +555,7 @@ mod tests {
     fn lru_evicts_only_eligible_unobserved_snapshots() {
         let a = SessionKey::new("a", 1);
         let b = SessionKey::new("b", 2);
-        let mut cache = HistoryCache::new("epoch", limits());
+        let mut cache = HistoryCache::new("epoch");
         cache.install_empty(a.clone());
         cache.install_empty(b.clone());
         cache.set_observed(&a, true);
@@ -675,29 +567,16 @@ mod tests {
     }
 
     #[test]
-    fn external_overlay_reservation_participates_in_global_candidate_limit() {
+    fn candidate_accounting_tracks_growth_without_becoming_an_admission_limit() {
         let key = SessionKey::new("session", 1);
-        let mut cache = HistoryCache::new(
-            "epoch",
-            HistoryCacheLimits {
-                max_snapshot_updates: 8,
-                max_snapshot_bytes: 512,
-                max_total_bytes: 64,
-            },
-        );
+        let mut cache = HistoryCache::new("epoch");
         cache.install_empty(key.clone());
         cache.begin_candidate(key.clone(), "load").unwrap();
 
-        assert_eq!(
-            cache.append_candidate_with_reserved(
-                &key,
-                "load",
-                json!({ "message": "candidate" }),
-                48,
-            ),
-            Err(HistoryCacheError::GlobalLimit)
-        );
-        assert_eq!(cache.stats().candidate_bytes, 0);
+        cache
+            .append_candidate(&key, "load", json!({ "message": "candidate" }))
+            .unwrap();
+        assert!(cache.stats().candidate_bytes > 0);
         assert!(cache.peek(&key).unwrap().updates().is_empty());
     }
 }

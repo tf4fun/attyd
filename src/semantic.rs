@@ -29,8 +29,6 @@ const MAX_TOOL_CALLS: usize = 10_000;
 const MAX_MESSAGES: usize = 10_000;
 const MAX_PLANS: usize = 1_000;
 const MAX_COMPACTION_SUMMARY_BYTES: usize = 3_000_000;
-const MAX_SESSION_UPDATES: usize = 100_000;
-const MAX_SESSION_UPDATE_BYTES: usize = 128_000_000;
 const MAX_SESSION_TITLE_LENGTH: usize = 16_384;
 const MAX_TOOL_PATH_LENGTH: usize = 16_384;
 const MAX_TOOL_LABEL_LENGTH: usize = 16_384;
@@ -452,21 +450,10 @@ pub fn validate_and_track_session_update(
             "Agent session update exceeds {MAX_UPDATE_BYTES} bytes"
         ));
     }
-    if state.update_count >= MAX_SESSION_UPDATES {
-        return Err(format!(
-            "Agent exceeded {MAX_SESSION_UPDATES} updates in one session"
-        ));
-    }
-    if state.update_bytes.saturating_add(update_bytes) > MAX_SESSION_UPDATE_BYTES {
-        return Err(format!(
-            "Agent session updates exceed {MAX_SESSION_UPDATE_BYTES} cumulative bytes"
-        ));
-    }
-
     let mut next = state.clone();
     validate_session_update_payload(&mut next, update)?;
-    next.update_count += 1;
-    next.update_bytes += update_bytes;
+    next.update_count = next.update_count.saturating_add(1);
+    next.update_bytes = next.update_bytes.saturating_add(update_bytes);
     *state = next;
     Ok(())
 }
@@ -1409,35 +1396,33 @@ mod tests {
     }
 
     #[test]
-    fn enforces_cumulative_update_budgets() {
+    fn cumulative_update_accounting_does_not_reject_valid_updates() {
         let mut count_limited = SessionUpdateSemanticState {
-            update_count: MAX_SESSION_UPDATES,
+            update_count: 100_000,
             ..SessionUpdateSemanticState::default()
         };
-        assert!(
-            validate_and_track_session_update(
-                &mut count_limited,
-                &json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": "too many" }
-                }),
-            )
-            .is_err()
-        );
+        validate_and_track_session_update(
+            &mut count_limited,
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "too many" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(count_limited.update_count, 100_001);
         let mut byte_limited = SessionUpdateSemanticState {
-            update_bytes: MAX_SESSION_UPDATE_BYTES - 1,
+            update_bytes: 127_999_999,
             ..SessionUpdateSemanticState::default()
         };
-        assert!(
-            validate_and_track_session_update(
-                &mut byte_limited,
-                &json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": "over budget" }
-                }),
-            )
-            .is_err()
-        );
+        validate_and_track_session_update(
+            &mut byte_limited,
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "over budget" }
+            }),
+        )
+        .unwrap();
+        assert!(byte_limited.update_bytes > 128_000_000);
     }
 
     #[test]

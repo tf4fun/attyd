@@ -9,8 +9,30 @@ import {
   createNodeWebSocketUpgradeHandler,
 } from "@agentclientprotocol/sdk/experimental/node";
 import { AcpServer } from "@agentclientprotocol/sdk/experimental/server";
-import WebSocket, { WebSocketServer } from "ws";
-import type { ServerEvent } from "../shared/bridge.js";
+import { WebSocketServer } from "ws";
+
+interface RuntimeView {
+  connected: boolean;
+  phase?: { phase?: string } | null;
+}
+
+interface SessionView {
+  historyRevision: string | null;
+  phase: string;
+  timeline: unknown[];
+  activeTurn: { operationId: string; prompt: unknown[] } | null;
+}
+
+interface CreatedSession {
+  sessionId: string;
+  cwd?: string;
+  view: SessionView;
+}
+
+interface StartedTurn {
+  operationId: string;
+  disposition: "accepted" | "duplicate";
+}
 
 for (const transport of ["http", "ws"] as const) {
   let initializedCapabilities: acp.ClientCapabilities | undefined;
@@ -52,17 +74,15 @@ for (const transport of ["http", "ws"] as const) {
   const remote = await startRemoteAgent(agent);
   const endpoint = `${transport === "http" ? "http" : "ws"}://127.0.0.1:${remote.port}/acp`;
   const host = await startRustHost(transport, endpoint);
-  let socket = new WebSocket(`ws://127.0.0.1:${host.port}/ws`);
-  const events: ServerEvent[] = [];
-  socket.on("message", (data) => events.push(JSON.parse(data.toString()) as ServerEvent));
+  const origin = `http://127.0.0.1:${host.port}`;
+  let observer: AbortController | undefined;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      socket.once("open", () => resolve());
-      socket.once("error", reject);
-    });
-    await waitFor(events, (event) => event.type === "acp/initialized");
-    await waitFor(events, (event) => event.type === "bridge/phase" && event.phase === "ready");
+    await waitForValue(
+      () => getJson<RuntimeView>(`${origin}/api/v1/runtime`),
+      (runtime) => runtime.connected && runtime.phase?.phase === "ready",
+      `${transport} runtime initialization`,
+    );
     assert.equal(initializedCapabilities?.terminal, false);
     assert.deepEqual(initializedCapabilities?.fs, {
       readTextFile: false,
@@ -70,108 +90,106 @@ for (const transport of ["http", "ws"] as const) {
     });
     assert.equal(initializedCapabilities?.auth?.terminal, false);
 
-    socket.send(JSON.stringify({
-      type: "session/new",
-      requestId: `${transport}-missing-cwd`,
-    }));
-    const error = await waitFor(events, (event) =>
-      event.type === "bridge/error" && event.requestId === `${transport}-missing-cwd`
+    const missingCwd = await fetch(`${origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(missingCwd.status, 409);
+    assert.match(
+      JSON.stringify(await missingCwd.json()),
+      /requires an absolute Agent workspace/u,
     );
-    assert.equal(error.type, "bridge/error");
-    assert.equal(error.code, -32_602);
-    assert.match(JSON.stringify(error.data), /requires an absolute Agent workspace/u);
 
-    socket.send(JSON.stringify({
-      type: "session/new",
-      requestId: `${transport}-new`,
-      cwd: "/home/agent/project",
-    }));
-    const created = await waitFor(events, (event) =>
-      event.type === "acp/session_created" && event.requestId === `${transport}-new`
+    const created = await postJson<CreatedSession>(
+      `${origin}/api/v1/sessions`,
+      { cwd: "/home/agent/project" },
+      201,
     );
-    assert.equal(created.type, "acp/session_created");
     assert.equal(created.cwd, "/home/agent/project");
-    assert.equal(created.response.sessionId, `${transport}-session-1`);
+    assert.equal(created.sessionId, `${transport}-session-1`);
     assert.equal(createdCwd, "/home/agent/project");
+    assert.ok(created.view.historyRevision);
 
-    socket.send(JSON.stringify({
-      type: "session/prompt",
-      requestId: `${transport}-prompt`,
-      sessionId: `${transport}-session-1`,
-      prompt: [{ type: "text", text: "keep running while the browser reconnects" }],
-    }));
+    observer = new AbortController();
+    const observed = await fetch(
+      `${origin}/api/v1/sessions/${encodeURIComponent(created.sessionId)}/events`,
+      { signal: observer.signal },
+    );
+    assert.equal(observed.status, 200);
+    await observed.body?.getReader().read();
+
+    const firstTurn = await postTurn(
+      origin,
+      created.sessionId,
+      created.view.historyRevision,
+      `${transport}-prompt`,
+      "keep running while the browser reconnects",
+    );
+    assert.equal(firstTurn.disposition, "accepted");
     await waitUntil(() => promptStarted, `${transport} prompt to start`);
 
-    socket.send(JSON.stringify({
-      type: "session/new",
-      requestId: `${transport}-new-concurrent`,
-      cwd: "/home/agent/other-project",
-    }));
-    const concurrentCreated = await waitFor(events, (event) =>
-      event.type === "acp/session_created" &&
-      event.requestId === `${transport}-new-concurrent`
+    const concurrentCreated = await postJson<CreatedSession>(
+      `${origin}/api/v1/sessions`,
+      { cwd: "/home/agent/other-project" },
+      201,
     );
-    assert.equal(concurrentCreated.type, "acp/session_created");
-    assert.equal(concurrentCreated.response.sessionId, `${transport}-session-2`);
-    socket.send(JSON.stringify({
-      type: "session/prompt",
-      requestId: `${transport}-prompt-concurrent`,
-      sessionId: `${transport}-session-2`,
-      prompt: [{ type: "text", text: "run alongside the first session" }],
-    }));
+    assert.equal(concurrentCreated.sessionId, `${transport}-session-2`);
+    assert.ok(concurrentCreated.view.historyRevision);
+    await postTurn(
+      origin,
+      concurrentCreated.sessionId,
+      concurrentCreated.view.historyRevision,
+      `${transport}-prompt-concurrent`,
+      "run alongside the first session",
+    );
     await waitUntil(
       () => concurrentPromptCompleted,
       `${transport} concurrent session prompt`,
     );
-    await waitFor(events, (event) =>
-      event.type === "acp/prompt_complete" &&
-      event.requestId === `${transport}-prompt-concurrent`
+    await waitForValue(
+      () => getSession(origin, concurrentCreated.sessionId),
+      (view) => view.phase === "ready" && view.activeTurn == null,
+      `${transport} concurrent turn reconciliation`,
     );
 
-    socket.terminate();
+    observer.abort();
+    observer = undefined;
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(cancellationObserved, false);
 
-    socket = new WebSocket(`ws://127.0.0.1:${host.port}/ws`);
-    const replayEvents: ServerEvent[] = [];
-    socket.on("message", (data) => {
-      replayEvents.push(JSON.parse(data.toString()) as ServerEvent);
-    });
-    await new Promise<void>((resolve, reject) => {
-      socket.once("open", () => resolve());
-      socket.once("error", reject);
-    });
-    const replayComplete = await waitFor(
-      replayEvents,
-      (event) => event.type === "bridge/runtime_replay_complete",
+    const restored = await waitForValue(
+      () => getSession(origin, created.sessionId),
+      (view) => view.phase === "running" && view.activeTurn != null,
+      `${transport} active turn restoration`,
     );
-    assert.equal(replayComplete.type, "bridge/runtime_replay_complete");
-    assert.deepEqual(replayComplete.sessionIds, [`${transport}-session-1`]);
-    assert.ok(replayEvents.some((event) =>
-      event.type === "acp/prompt_started" &&
-      event.requestId === `${transport}-prompt`
-    ));
-    assert.ok(!replayEvents.some((event) =>
-      event.type === "acp/prompt_complete" &&
-      event.requestId === `${transport}-prompt-concurrent`
-    ));
+    assert.equal(restored.activeTurn?.operationId, firstTurn.operationId);
+    assert.deepEqual(restored.activeTurn?.prompt, [{
+      type: "text",
+      text: "keep running while the browser reconnects",
+    }]);
 
-    socket.send(JSON.stringify({
-      type: "session/cancel",
-      sessionId: `${transport}-session-1`,
-    }));
+    await postJson(
+      `${origin}/api/v1/sessions/${encodeURIComponent(created.sessionId)}/turns/${encodeURIComponent(firstTurn.operationId)}/cancel`,
+      undefined,
+    );
     await waitUntil(
       () => cancellationObserved,
       `${transport} explicit cancellation after reconnect`,
     );
+    await waitForValue(
+      () => getSession(origin, created.sessionId),
+      (view) => view.phase === "ready" && view.activeTurn == null,
+      `${transport} cancelled turn reconciliation`,
+    );
   } finally {
-    if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+    observer?.abort();
     await host.close();
     await remote.close();
   }
 }
 
-console.log("Rust remote ACP smoke passed (HTTP/SSE and WebSocket)");
+console.log("Rust remote ACP smoke passed (HTTP/SSE and WebSocket Agent transports)");
 
 async function startRemoteAgent(agent: ReturnType<typeof acp.agent>): Promise<{
   port: number;
@@ -249,17 +267,72 @@ async function startRustHost(
   };
 }
 
-async function waitFor(
-  events: ServerEvent[],
-  predicate: (event: ServerEvent) => boolean,
-): Promise<ServerEvent> {
+async function getJson<T>(url: string): Promise<T> {
+  const response = await fetch(url);
+  assert.equal(response.status, 200, `${url} returned ${response.status}`);
+  return await response.json() as T;
+}
+
+async function postJson<T = unknown>(
+  url: string,
+  body?: unknown,
+  expectedStatus = 200,
+  headers: Record<string, string> = {},
+): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: body === undefined
+      ? headers
+      : { "content-type": "application/json", ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  assert.equal(
+    response.status,
+    expectedStatus,
+    `${url} returned ${response.status}: ${text}`,
+  );
+  return (text === "" ? undefined : JSON.parse(text)) as T;
+}
+
+async function getSession(origin: string, sessionId: string): Promise<SessionView> {
+  return await getJson<SessionView>(
+    `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+  );
+}
+
+async function postTurn(
+  origin: string,
+  sessionId: string,
+  historyRevision: string | null,
+  intentId: string,
+  text: string,
+): Promise<StartedTurn> {
+  assert.ok(historyRevision, "a new session must expose a history revision");
+  return await postJson<StartedTurn>(
+    `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
+    { prompt: [{ type: "text", text }] },
+    202,
+    {
+      "If-Match": `"${historyRevision}"`,
+      "Idempotency-Key": intentId,
+    },
+  );
+}
+
+async function waitForValue<T>(
+  read: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  label: string,
+): Promise<T> {
   const deadline = Date.now() + 10_000;
+  let latest: T | undefined;
   while (Date.now() < deadline) {
-    const event = events.find(predicate);
-    if (event) return event;
+    latest = await read();
+    if (predicate(latest)) return latest;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error(`Timed out waiting for remote event: ${JSON.stringify(events)}`);
+  throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(latest)}`);
 }
 
 async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
