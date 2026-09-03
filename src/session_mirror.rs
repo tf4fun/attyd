@@ -510,6 +510,62 @@ impl SessionMirror {
         Ok(())
     }
 
+    pub(crate) fn retain_terminal_output(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        terminal_id: &str,
+        terminal: &Value,
+    ) -> Result<bool, MirrorError> {
+        let session = self.require_session(session_id, incarnation)?;
+        if !matches!(
+            session.phase,
+            MirrorPhase::Running | MirrorPhase::Reconciling
+        ) {
+            return Ok(false);
+        }
+        let Some(turn) = session.active_turn.as_ref() else {
+            return Ok(false);
+        };
+        let old_bytes = session.active_overlay_bytes;
+        let mut candidate = turn.clone();
+        let mut changed = false;
+        for update in &mut candidate.updates {
+            if update.get("rawOutput").is_some() || !references_terminal(update, terminal_id) {
+                continue;
+            }
+            let Some(update) = update.as_object_mut() else {
+                continue;
+            };
+            update.insert(
+                "rawOutput".to_string(),
+                serde_json::json!({
+                    "terminalId": terminal_id,
+                    "output": terminal.get("output").cloned().unwrap_or(Value::String(String::new())),
+                    "truncated": terminal.get("truncated").cloned().unwrap_or(Value::Bool(false)),
+                    "exitStatus": terminal.get("exitStatus").cloned().unwrap_or(Value::Null),
+                }),
+            );
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let candidate_bytes = serialized_len(&candidate);
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .expect("session was validated above");
+        session.active_turn = Some(candidate);
+        session.active_overlay_bytes = candidate_bytes;
+        self.overlay_bytes = self
+            .overlay_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(candidate_bytes);
+        session.view_revision = next_revision(session.view_revision);
+        Ok(true)
+    }
+
     pub(crate) fn complete_turn(
         &mut self,
         session_id: &str,
@@ -579,6 +635,11 @@ impl SessionMirror {
                 serde_json::json!({
                     "sessionUpdate": "user_message_chunk",
                     "content": content,
+                    "_meta": {
+                        "attyd": {
+                            "turnOperationId": turn.operation_id,
+                        }
+                    },
                 })
             })
             .collect::<Vec<_>>();
@@ -803,6 +864,18 @@ fn serialized_len(value: &impl Serialize) -> usize {
 
 fn next_revision(current: u64) -> u64 {
     current.wrapping_add(1).max(1)
+}
+
+fn references_terminal(update: &Value, terminal_id: &str) -> bool {
+    update
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("terminal")
+                    && item.get("terminalId").and_then(Value::as_str) == Some(terminal_id)
+            })
+        })
 }
 
 fn replay_suffix_starts_with_prompt(updates: &[Value], prompt: &[Value]) -> bool {
@@ -1105,7 +1178,15 @@ mod tests {
         assert_eq!(
             next.updates(),
             &[
-                user_update("next"),
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": { "type": "text", "text": "next" },
+                    "_meta": {
+                        "attyd": {
+                            "turnOperationId": operation,
+                        }
+                    },
+                }),
                 json!({
                     "sessionUpdate": "agent_message_chunk",
                     "messageId": "answer",
@@ -1122,6 +1203,83 @@ mod tests {
             mirror.start_turn("session", 1, next.revision(), "intent", prompt),
             Ok(TurnAdmission::Duplicate { operation_id }) if operation_id == operation
         ));
+    }
+
+    #[test]
+    fn released_terminal_output_is_retained_in_its_active_tool_before_commit() {
+        let mut mirror = mirror();
+        mirror.register_new("session", 1);
+        let revision = mirror
+            .view("session", 1)
+            .unwrap()
+            .baseline
+            .revision()
+            .to_string();
+        let operation = match mirror
+            .start_turn("session", 1, &revision, "intent", text_prompt("run"))
+            .unwrap()
+        {
+            TurnAdmission::Accepted { operation_id } => operation_id,
+            _ => unreachable!(),
+        };
+        mirror
+            .append_turn_update(
+                "session",
+                1,
+                &operation,
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool",
+                    "title": "shell",
+                    "status": "completed",
+                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            mirror
+                .retain_terminal_output(
+                    "session",
+                    1,
+                    "terminal",
+                    &json!({
+                        "output": "tool output",
+                        "truncated": false,
+                        "exitStatus": { "exitCode": 0 },
+                        "released": true,
+                    }),
+                )
+                .unwrap()
+        );
+        assert!(
+            !mirror
+                .retain_terminal_output(
+                    "session",
+                    1,
+                    "terminal",
+                    &json!({ "output": "must not overwrite Agent output" }),
+                )
+                .unwrap()
+        );
+        mirror
+            .complete_turn(
+                "session",
+                1,
+                &operation,
+                json!({ "stopReason": "end_turn" }),
+            )
+            .unwrap();
+        let committed = mirror
+            .commit_completed_turn_from_memory("session", 1, &operation)
+            .unwrap();
+        let tool = committed
+            .updates()
+            .iter()
+            .find(|update| update["sessionUpdate"] == "tool_call")
+            .unwrap();
+        assert_eq!(tool["rawOutput"]["output"], "tool output");
+        assert_eq!(tool["rawOutput"]["exitStatus"]["exitCode"], 0);
     }
 
     #[test]

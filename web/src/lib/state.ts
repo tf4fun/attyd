@@ -50,6 +50,7 @@ export type TimelineItem =
       role: "user" | "protocol-user";
       blocks: ContentBlock[];
       messageId?: string | null;
+      turnOperationId?: string;
       raw: unknown[];
     }
   | {
@@ -1814,11 +1815,15 @@ function reduceSessionUpdate(
       "messageId" in update
         ? update.messageId
         : undefined;
+    const turnOperationId = role === "protocol-user"
+      ? bridgeTurnOperationId(update)
+      : undefined;
     const timeline = appendContent(
       state.timeline,
       role,
       update.content,
       messageId,
+      turnOperationId,
       notification,
     );
     const activeChunk = role === "thought"
@@ -2124,10 +2129,11 @@ function appendContent(
   role: "agent" | "thought" | "protocol-user",
   block: ContentBlock,
   messageId: string | null | undefined,
+  turnOperationId: string | undefined,
   raw: unknown,
 ): TimelineItem[] {
   return role === "protocol-user"
-    ? appendProtocolUserContent(timeline, block, messageId, raw)
+    ? appendProtocolUserContent(timeline, block, messageId, turnOperationId, raw)
     : appendAssistantContent(timeline, role, block, messageId, raw);
 }
 
@@ -2135,6 +2141,7 @@ function appendProtocolUserContent(
   timeline: TimelineItem[],
   block: ContentBlock,
   messageId: string | null | undefined,
+  turnOperationId: string | undefined,
   raw: unknown,
 ): TimelineItem[] {
   const last = timeline.at(-1);
@@ -2153,6 +2160,7 @@ function appendProtocolUserContent(
     next[next.length - 1] = {
       ...last,
       messageId: last.messageId ?? messageId,
+      turnOperationId: last.turnOperationId ?? turnOperationId,
       raw: [raw],
     };
     return next;
@@ -2161,12 +2169,14 @@ function appendProtocolUserContent(
   if (
     last?.type === "message" &&
     last.role === "protocol-user" &&
-    canMergeMessageIds(last.messageId, messageId)
+    canMergeMessageIds(last.messageId, messageId) &&
+    canMergeTurnOperationIds(last.turnOperationId, turnOperationId)
   ) {
     const next = [...timeline];
     next[next.length - 1] = {
       ...last,
       messageId: last.messageId ?? messageId,
+      turnOperationId: last.turnOperationId ?? turnOperationId,
       blocks: mergeTextBlock(last.blocks, block),
       raw: [...last.raw, raw],
     };
@@ -2181,6 +2191,7 @@ function appendProtocolUserContent(
       role: "protocol-user",
       blocks: [block],
       messageId,
+      turnOperationId,
       raw: [raw],
     },
   ];
@@ -2243,6 +2254,25 @@ function canMergeMessageIds(
   incoming: string | null | undefined,
 ): boolean {
   return existing == null || incoming == null || existing === incoming;
+}
+
+function canMergeTurnOperationIds(
+  existing: string | undefined,
+  incoming: string | undefined,
+): boolean {
+  return existing == null && incoming == null || existing === incoming;
+}
+
+function bridgeTurnOperationId(update: SessionUpdate): string | undefined {
+  const metadata = "_meta" in update ? update._meta : undefined;
+  if (!isStateRecord(metadata) || !isStateRecord(metadata.attyd)) return undefined;
+  return typeof metadata.attyd.turnOperationId === "string"
+    ? metadata.attyd.turnOperationId
+    : undefined;
+}
+
+function isStateRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
 function lastAssistantChunk(

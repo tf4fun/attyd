@@ -190,6 +190,15 @@ fn opened_runtime_session_id(event: &str) -> Option<String> {
     }
 }
 
+fn terminal_session_id(event: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("bridge/session_turn_complete" | "bridge/session_turn_failed")
+    )
+    .then(|| value.get("sessionId")?.as_str().map(str::to_string))?
+}
+
 fn is_internal_direct_event(event: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(event)
         .ok()
@@ -742,13 +751,14 @@ impl BridgeHub {
             return;
         }
         let restart = terminal_auth_succeeded(&event);
-        let input = {
+        let (restart_input, idle_retire) = {
             let mut state = self.state.lock().await;
             if state.generation != generation || state.input.is_none() {
                 return;
             }
             state.bootstrap.update(&event);
             let event = state.runtime.update_and_normalize(&event);
+            let terminal_session_id = terminal_session_id(&event);
             let session_live_suffix = opened_runtime_session_id(&event)
                 .map(|session_id| state.runtime.replay_session_live_suffix(&session_id))
                 .unwrap_or_default()
@@ -773,9 +783,25 @@ impl BridgeHub {
             for live_event in session_live_suffix {
                 publish_to_session_subscribers(&mut state, live_event);
             }
-            restart.then(|| state.cancellation.clone()).flatten()
+            let idle_retire = terminal_session_id
+                .filter(|session_id| {
+                    !state
+                        .session_subscribers
+                        .values()
+                        .any(|(subscribed_session_id, _)| subscribed_session_id == session_id)
+                })
+                .and_then(|session_id| state.input.clone().map(|input| (input, session_id)));
+            (
+                restart.then(|| state.cancellation.clone()).flatten(),
+                idle_retire,
+            )
         };
-        if let Some(cancellation) = input {
+        if let Some((input, session_id)) = idle_retire {
+            let _ = input
+                .send(bridge::BridgeInput::RetireIdleSession { session_id })
+                .await;
+        }
+        if let Some(cancellation) = restart_input {
             cancellation.cancel();
         }
     }
@@ -2096,6 +2122,79 @@ mod tests {
         assert!(hub.state.lock().await.session_subscribers.is_empty());
     }
 
+    #[tokio::test]
+    async fn completed_turn_retires_only_when_its_session_has_no_subscriber() {
+        let hub = test_hub();
+        let (input, mut commands) = mpsc::channel(4);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+        }
+        let subscription = hub
+            .subscribe_session("observed".to_string())
+            .await
+            .expect("session subscription");
+
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/session_turn_complete",
+                "sessionId": "observed",
+                "operationId": "observed-turn",
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), commands.recv())
+                .await
+                .is_err(),
+            "an observed session must remain in bridge memory"
+        );
+
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/session_turn_complete",
+                "sessionId": "unobserved",
+                "operationId": "unobserved-turn",
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(matches!(
+            commands.recv().await,
+            Some(bridge::BridgeInput::RetireIdleSession { session_id })
+                if session_id == "unobserved"
+        ));
+
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/session_turn_failed",
+                "sessionId": "failed-unobserved",
+                "operationId": "failed-turn",
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(matches!(
+            commands.recv().await,
+            Some(bridge::BridgeInput::RetireIdleSession { session_id })
+                if session_id == "failed-unobserved"
+        ));
+
+        hub.unsubscribe(subscription.id, subscription.generation)
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), commands.recv())
+                .await
+                .is_err(),
+            "disconnecting after completion must not retroactively retire the session"
+        );
+    }
+
     #[test]
     fn bootstrap_replays_connection_state_without_transient_command_errors() {
         let mut bootstrap = BridgeBootstrap::default();
@@ -2519,7 +2618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscriber_disconnect_does_not_cancel_running_turn_and_reconnect_reads_result() {
+    async fn session_subscriber_disconnect_keeps_running_turn_then_reloads_after_idle_close() {
         async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
             let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
                 .await
@@ -2538,7 +2637,7 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut browser = hub.subscribe().await.expect("browser subscription");
+        let mut browser = hub.subscribe().await.expect("test observer subscription");
 
         loop {
             let event = next_event(&mut browser).await;
@@ -2546,28 +2645,29 @@ mod tests {
                 break;
             }
         }
-        let created = hub
-            .business_request(json!({
-                "type": "session/new",
-                "requestId": "new-before-disconnect",
-                "cwd": cwd,
-            }))
-            .await
-            .expect("business session creation");
-        assert_eq!(created["sessionId"], "test-session");
-        assert_eq!(created["view"]["session"]["phase"], "ready");
+        hub.business_request(json!({
+            "type": "session/list",
+            "requestId": "list-before-disconnect",
+        }))
+        .await
+        .expect("business session list");
 
         let initial = hub
-            .session_view("test-session".to_string())
+            .session_view("saved-session".to_string())
             .await
-            .expect("new session view");
+            .expect("saved session view");
+        let initial_incarnation = initial["session"]["incarnation"].as_u64().unwrap();
+        let session_stream = hub
+            .subscribe_session("saved-session".to_string())
+            .await
+            .expect("session subscription");
         let revision = initial["session"]["historyRevision"]
             .as_str()
             .expect("new session revision")
             .to_string();
         let accepted = hub
             .start_turn(
-                "test-session".to_string(),
+                "saved-session".to_string(),
                 revision.clone(),
                 "turn-before-disconnect".to_string(),
                 vec![json!({ "type": "text", "text": "stream-follow-flow" })],
@@ -2576,28 +2676,36 @@ mod tests {
             .expect("turn admission");
         assert_eq!(accepted["disposition"], "accepted");
 
-        hub.unsubscribe(browser.id, browser.generation).await;
-        drop(browser);
+        hub.unsubscribe(session_stream.id, session_stream.generation)
+            .await;
+        drop(session_stream);
 
-        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let view = hub
-                    .session_view("test-session".to_string())
-                    .await
-                    .expect("running session remains queryable without subscribers");
-                if view["session"]["phase"] == "ready"
-                    && view["session"]["historyRevision"] != revision
-                {
-                    break view;
+                let event = next_event(&mut browser).await;
+                if event["type"] == "acp/session_closed" && event["sessionId"] == "saved-session" {
+                    break;
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the Agent turn and reconciliation must finish after disconnect");
-        assert!(completed["session"]["activeTurn"].is_null());
+        .expect("the completed unobserved session was not closed");
+
+        let reconnected = hub
+            .subscribe_session("saved-session".to_string())
+            .await
+            .expect("reconnected session subscription");
+        let reloaded = hub
+            .session_view("saved-session".to_string())
+            .await
+            .expect("reconnected browser reloads Agent history");
+        assert!(reloaded["session"]["activeTurn"].is_null());
         assert!(
-            completed["baseline"]["updates"]
+            reloaded["session"]["incarnation"].as_u64().unwrap() > initial_incarnation,
+            "a new observation after idle close must create a fresh materialization"
+        );
+        assert!(
+            reloaded["baseline"]["updates"]
                 .as_array()
                 .is_some_and(|updates| updates.iter().any(|update| {
                     update["sessionUpdate"] == "agent_message_chunk"
@@ -2606,19 +2714,9 @@ mod tests {
                             .is_some_and(|text| text.contains("Stream follow complete."))
                 }))
         );
-
-        let reconnected = hub.subscribe().await.expect("reconnected subscription");
-        let reloaded = hub
-            .session_view("test-session".to_string())
-            .await
-            .expect("reconnected browser reads bridge projection");
-        assert_eq!(
-            reloaded["session"]["historyRevision"],
-            completed["session"]["historyRevision"]
-        );
-        assert_eq!(reloaded["baseline"], completed["baseline"]);
         hub.unsubscribe(reconnected.id, reconnected.generation)
             .await;
+        hub.unsubscribe(browser.id, browser.generation).await;
         hub.shutdown().await;
     }
 
@@ -2963,7 +3061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_reconcile_failure_blocks_without_hot_retry() {
+    async fn post_turn_does_not_reload_an_observed_session() {
         async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
             let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
                 .await
@@ -3005,33 +3103,41 @@ mod tests {
             }))
             .await
             .unwrap();
+        let session_stream = hub
+            .subscribe_session("test-session".to_string())
+            .await
+            .expect("session subscription");
+        let initial_revision = created["view"]["session"]["historyRevision"]
+            .as_str()
+            .unwrap()
+            .to_string();
         hub.start_turn(
             "test-session".to_string(),
-            created["view"]["session"]["historyRevision"]
-                .as_str()
-                .unwrap()
-                .to_string(),
+            initial_revision.clone(),
             "invalid-reconcile-turn".to_string(),
             vec![json!({ "type": "text", "text": "message-actions-flow" })],
         )
         .await
         .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let blocked = hub.session_view("test-session".to_string()).await.unwrap();
-        assert_eq!(
-            blocked["session"]["phase"], "blocked",
-            "invalid authoritative replay must block the session: {blocked}"
-        );
-        assert!(blocked["session"]["activeTurn"].is_object());
-        assert!(blocked["session"]["syncError"].is_string());
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = hub.session_view("test-session".to_string()).await.unwrap();
+                if view["session"]["phase"] == "ready"
+                    && view["session"]["historyRevision"] != initial_revision
+                {
+                    break view;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observed turn did not commit its in-memory history");
+        assert!(completed["session"]["activeTurn"].is_null());
+        assert!(completed["session"]["syncError"].is_null());
 
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(
-            hub.session_view("test-session".to_string()).await.unwrap()["session"]["phase"],
-            "blocked",
-            "a deterministic replay error must not enter a hot retry loop"
-        );
+        hub.unsubscribe(session_stream.id, session_stream.generation)
+            .await;
         hub.unsubscribe(observer.id, observer.generation).await;
         hub.shutdown().await;
     }

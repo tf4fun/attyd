@@ -30,7 +30,7 @@ The first implementation includes:
 - one Bridge-owned ACP upstream connection per attyd process; browser REST/SSE connections are disposable views, while stdio mode launches one Agent process for the Bridge lifetime;
 - ACP v1 `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/set_mode`, and `session/set_config_option`, with request-scoped prompt/control acknowledgements, serialized Agent updates, and bounded transactional replay of creation notifications that arrive before `session/new` returns;
 - ACP v1 Agent-owned `authenticate` plus capability-gated `logout`, with bounded advertised methods, request-scoped acknowledgements, Zed External Agent-style sign-in UI, raw response inspection, and automatic retry of the original session restoration path after `auth_required`; stable terminal authentication is also negotiated and rendered as an embedded xterm PTY that reproduces the configured Agent invocation, appends only its advertised bounded args/environment overrides, supports input/resize/cancel, and reconnects the Agent after a zero exit;
-- capability-gated `session/list`, `session/load`, `session/resume`, `session/close`, and `session/delete`, with bounded pagination and the Agent remaining the only completed-history authority; an active reconnect restores only the current in-memory turn, while an idle completed reconnect performs a best-effort transactional `session/load` or reports `HistoryUnavailable`; the cwd sent with stdio discovery is a request filter rather than a client-enforced invariant, while every Agent-returned session retains its own portable absolute cwd; same-page thread switching may reuse that page's disposable view, but the Rust host keeps no completed thread cache; mobile resume performs a bounded browser-bridge ping/pong probe and a terminal connection state exposes an explicit reconnect action over the disabled composer;
+- capability-gated `session/list`, `session/load`, `session/resume`, `session/close`, and `session/delete`, with bounded pagination and the Agent remaining the only persistent completed-history authority; cold observation loads once, while an open session uses its in-memory baseline plus active turn and never reloads after a prompt; if a terminal turn is committed with no session SSE subscriber, attyd closes and releases that session when the Agent supports close, so its next observation follows the cold-load path; the cwd sent with stdio discovery is a request filter rather than a client-enforced invariant, while every Agent-returned session retains its own portable absolute cwd; mobile resume performs a bounded browser-bridge ping/pong probe and a terminal connection state exposes an explicit reconnect action over the disabled composer;
 - capability-gated experimental `session/fork`, preserving inherited visible context during a transactional switch while locking source-session mutations until the matching Agent response;
 - a New thread workspace prompt that pre-fills attyd's startup cwd for stdio and intentionally starts blank for remote transports; remote absolute paths are sent only as ACP session cwd, while load/resume/fork keep the cwd owned by that Agent session;
 - static, capability-negotiated stdio `additionalDirectories` and MCP server definitions on every created, loaded, or resumed session;
@@ -198,9 +198,11 @@ The Agent remains the only persistent completed-history authority. The Rust Brid
 in-memory baseline, one active turn per prompting session, small control metadata, and live
 resources such as permissions, elicitations and unreleased terminals. Losing a browser does not
 cancel an active turn: a new subscriber atomically receives the baseline plus active projection
-before live events. After each terminal turn, `session/load` replaces the baseline when advertised;
-otherwise the exact accepted prompt and observed updates are atomically appended in memory. That
-no-load history survives browser reconnects but intentionally disappears with the bridge process.
+before live events. Every terminal turn atomically appends the exact accepted prompt and observed
+updates to that in-memory baseline without issuing `session/load`. If the turn completes with no
+subscriber for its session, the Bridge closes and releases it when possible; the next subscriber
+then performs a fresh cold load from the Agent. Otherwise the in-memory projection survives browser
+reconnects but intentionally disappears with the Bridge process.
 Protocol-valid conversation history is byte-accounted but is not rejected by a bridge-defined
 cumulative memory cap; transport values, live resources and delivery backpressure keep their
 independent safety limits.

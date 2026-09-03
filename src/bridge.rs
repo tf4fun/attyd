@@ -898,6 +898,19 @@ fn apply_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) 
     if live_session_incarnation(state, &session_id) != Some(snapshot.incarnation) {
         return false;
     }
+    if snapshot
+        .value
+        .get("released")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let _ = session_mirror(state).retain_terminal_output(
+            &session_id,
+            snapshot.incarnation,
+            &terminal_id,
+            &snapshot.value,
+        );
+    }
     let epoch = state.runtime.epoch().to_string();
     state
         .runtime
@@ -992,6 +1005,9 @@ pub(crate) enum BridgeInput {
     SessionViewRequest {
         session_id: String,
         response: oneshot::Sender<Result<Value, String>>,
+    },
+    RetireIdleSession {
+        session_id: String,
     },
     TurnRequest {
         session_id: String,
@@ -1786,11 +1802,24 @@ where
         .on_receive_request(
             {
                 let terminals = terminals.clone();
+                let state = state.clone();
+                let sink = sink.clone();
                 async move |request: ReleaseTerminalRequest, responder, connection| {
                     let terminals = terminals.clone();
+                    let state = state.clone();
+                    let sink = sink.clone();
                     connection.spawn(async move {
                         let result = match terminals {
-                            Some(terminals) => terminals.release(request).await,
+                            Some(terminals) => match terminals.release_with_snapshot(request).await {
+                                Ok((response, snapshot)) => {
+                                    let mut state = state.lock().await;
+                                    if apply_terminal_snapshot(&mut state, snapshot) {
+                                        flush_runtime(&mut state, &sink);
+                                    }
+                                    Ok(response)
+                                }
+                                Err(error) => Err(error),
+                            },
                             None => Err(Error::method_not_found()
                                 .data("terminal methods are unavailable for remote transports")),
                         };
@@ -1905,6 +1934,38 @@ where
                         state.published_runtime_seq = snapshot.through_seq;
                         sink.internal_typed("bridge/internal_runtime_snapshot", snapshot);
                         continue;
+                    }
+                    Some(BridgeInput::RetireIdleSession { session_id }) => {
+                        let ready = {
+                            let state = state.lock().await;
+                            state
+                                .active_sessions
+                                .get(&session_id)
+                                .is_some_and(|session| {
+                                    state
+                                        .session_mirror
+                                        .as_ref()
+                                        .and_then(|mirror| mirror.state(&session_id))
+                                        .is_some_and(|mirror| {
+                                            mirror.incarnation == session.incarnation
+                                                && mirror.phase == MirrorPhase::Ready
+                                        })
+                                })
+                        };
+                        if !ready {
+                            continue;
+                        }
+                        (
+                            0,
+                            json!({
+                                "type": "session/close",
+                                "requestId": format!("bridge-idle-close-{}", Uuid::new_v4()),
+                                "sessionId": session_id,
+                            })
+                            .to_string(),
+                            None,
+                            None,
+                        )
                     }
                     Some(BridgeInput::SessionViewRequest {
                         session_id,
@@ -4109,12 +4170,9 @@ async fn handle_command(
                         "sessionId": session_id,
                         "view": reconciling_view,
                     }));
-                    let reconciliation = settle_completed_turn_history(
-                        &connection,
-                        &options,
+                    let commit = commit_completed_turn_history(
                         &bridge_state,
                         &sink,
-                        &cancellation,
                         &session_id,
                         incarnation,
                         &mirror_operation_id,
@@ -4122,11 +4180,11 @@ async fn handle_command(
                     .await;
                     let mut state = bridge_state.lock().await;
                     finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
-                    if let Err(sync_error) = reconciliation {
+                    if let Err(sync_error) = commit {
                         tracing::warn!(
                             session_id,
                             error = ?sync_error,
-                            "failed to reconcile history after an Agent prompt error"
+                            "failed to commit history after an Agent prompt error"
                         );
                     }
                     let outcome = session_turn_outcome_value(
@@ -4177,12 +4235,9 @@ async fn handle_command(
                     "sessionId": session_id,
                     "view": reconciling_view,
                 }));
-                let reconciliation = settle_completed_turn_history(
-                    &connection,
-                    &options,
+                let commit = commit_completed_turn_history(
                     &bridge_state,
                     &sink,
-                    &cancellation,
                     &session_id,
                     incarnation,
                     &mirror_operation_id,
@@ -4190,11 +4245,11 @@ async fn handle_command(
                 .await;
                 let mut state = state.lock().await;
                 finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
-                if let Err(sync_error) = reconciliation {
+                if let Err(sync_error) = commit {
                     tracing::warn!(
                         session_id,
                         error = ?sync_error,
-                        "failed to reconcile history after an invalid prompt response"
+                        "failed to commit history after an invalid prompt response"
                     );
                 }
                 let outcome = session_turn_outcome_value(
@@ -4243,12 +4298,9 @@ async fn handle_command(
                 "sessionId": session_id,
                 "view": reconciling_view,
             }));
-            let reconciliation = settle_completed_turn_history(
-                &connection,
-                &options,
+            let commit = commit_completed_turn_history(
                 &bridge_state,
                 &sink,
-                &cancellation,
                 &session_id,
                 incarnation,
                 &mirror_operation_id,
@@ -4258,7 +4310,7 @@ async fn handle_command(
                 let mut state = state.lock().await;
                 finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
             }
-            reconciliation?;
+            commit?;
             let outcome = {
                 let mut state = state.lock().await;
                 session_turn_outcome_value(
@@ -4941,36 +4993,13 @@ fn retryable_reconcile_error(error: &Error) -> bool {
     !matches!(i32::from(error.code), -32600 | -32601 | -32602 | -32002)
 }
 
-async fn settle_completed_turn_history(
-    connection: &ConnectionTo<Agent>,
-    options: &Options,
+async fn commit_completed_turn_history(
     state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
-    cancellation: &CancellationToken,
     session_id: &str,
     incarnation: u64,
     operation_id: &str,
 ) -> Result<(), Error> {
-    let supports_load = state
-        .lock()
-        .await
-        .agent_capabilities
-        .as_ref()
-        .ok_or_else(|| Error::internal_error().data("Agent capabilities are unavailable"))?
-        .load_session;
-    if supports_load {
-        return synchronize_authoritative_history(
-            connection,
-            options,
-            state,
-            sink,
-            cancellation,
-            session_id,
-            incarnation,
-        )
-        .await;
-    }
-
     let (result, view) = {
         let mut state = state.lock().await;
         let result = session_mirror(&mut state)
@@ -6136,7 +6165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_turn_retries_internal_load_and_publishes_authoritative_revision() {
+    async fn terminal_turn_with_load_support_commits_observed_history_without_reloading() {
         let cwd = env!("CARGO_MANIFEST_DIR");
         let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
         let fixture = fixture.to_string_lossy().into_owned();
@@ -6217,7 +6246,7 @@ mod tests {
             .unwrap();
 
         let mut prompt_starts = 0;
-        let mut saw_retry = false;
+        let mut saw_post_turn_load = false;
         let successor = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
@@ -6226,9 +6255,9 @@ mod tests {
                 }
                 if event["type"] == "bridge/session_sync"
                     && event["sessionId"] == "test-session"
-                    && event["phase"] == "retrying"
+                    && matches!(event["phase"].as_str(), Some("loading" | "retrying"))
                 {
-                    saw_retry = true;
+                    saw_post_turn_load = true;
                 }
                 if event["type"] == "bridge/session_view"
                     && event["sessionId"] == "test-session"
@@ -6245,10 +6274,13 @@ mod tests {
             }
         })
         .await
-        .expect("reconciliation did not publish a successor view");
+        .expect("in-memory commit did not publish a successor view");
 
-        assert!(saw_retry, "transient session/load failure was not retried");
-        assert_eq!(prompt_starts, 1, "reconciliation redispatched the prompt");
+        assert!(
+            !saw_post_turn_load,
+            "a completed turn must stay in memory instead of issuing session/load"
+        );
+        assert_eq!(prompt_starts, 1, "history commit redispatched the prompt");
         assert_ne!(successor, initial_revision);
 
         cancellation.cancel();

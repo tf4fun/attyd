@@ -9,7 +9,7 @@ matrix is [active-turn-runtime-tests.md](active-turn-runtime-tests.md).
 ```text
 Agent durable history
         |
-        | session/load when advertised; otherwise observed live turns only
+        | session/load only on cold materialization
         v
 Bridge immutable baseline + one active/reconciling overlay + live resources
         |
@@ -19,7 +19,7 @@ Disposable browser presentation
 ```
 
 The bridge is the complete ACP client. Browser commands are business intents; ACP request lifetime,
-update routing, permission/elicitation responders, cancellation, load replay and reconciliation are
+update routing, permission/elicitation responders, cancellation, cold-load replay and turn commit are
 owned by the bridge after command acceptance. Unsent drafts and queued prompts remain browser-local.
 The bridge remains memory-only and the Agent remains the sole persistent authority.
 
@@ -60,10 +60,9 @@ and revision metadata; observers access the shared snapshot through the history 
 | Ready | valid append CAS | Running | one `session/prompt` |
 | Ready | stale CAS/duplicate slot | Ready | none |
 | Running | observer churn | Running | none |
-| Running | PromptResponse | Reconciling | load if advertised; otherwise none |
-| Reconciling | observer churn/load failure | Reconciling | none or delayed single retry |
-| Reconciling | valid candidate commit | Ready | none |
-| Reconciling | no-load local promotion | Ready | none |
+| Running | PromptResponse | Reconciling | none |
+| Reconciling | atomic local promotion | Ready | none |
+| Ready after completion | no session subscriber | closing/closed | capability-gated `session/close` |
 | any live | close/delete/shutdown | closing/closed | capability-gated lifecycle I/O |
 
 Same-session prompt, load, close, delete, fork and config mutations are mutually exclusive.
@@ -89,32 +88,31 @@ consumed slot, or any stale epoch/incarnation/revision is rejected before Agent 
 
 The Bridge accepts turn submission only while Ready. The browser may still offer queued prompts
 while Running or Reconciling, but those items are only a local send buffer. After the prior Turn is
-reconciled, the browser receives the new history revision and submits the queue head as an ordinary
+committed, the browser receives the new history revision and submits the queue head as an ordinary
 CAS-protected turn. Until that moment the Bridge has not accepted it and owns no queued payload.
 
 This keeps queue semantics independent of ACP: page disposal may discard unsent queue items, and
 two pages with queued items compete for the next append slot through the normal history CAS.
 
-## Reconciliation contract
+## Turn-commit contract
 
-Prompt terminal delivery and history checkpoint are separate transitions. With load support:
+Prompt terminal delivery and history checkpoint are separate transitions for every Agent:
 
 1. preserve the completed overlay;
 2. enter Reconciling and exclude new same-session mutations;
-3. collect a load replay in a private candidate;
-4. validate semantic structure, generation and history consistency;
-5. atomically swap the shared baseline and advance history revision;
-6. clear the overlay/candidate exactly once;
-7. publish one coherent replacement and enter Ready.
+3. fold the accepted prompt and validated overlay onto the prior in-memory baseline;
+4. atomically swap the shared baseline and advance history revision;
+5. clear the overlay exactly once;
+6. publish one coherent replacement and enter Ready.
 
-Failure before step 5 cannot alter the installed baseline or completed overlay. Retries are
-single-flight and delayed. A lost load outcome is drained or isolated by a connection generation
-change before another request starts because ACP updates do not carry their originating load ID.
+Failure before step 4 cannot alter the installed baseline or completed overlay. This path sends no
+Agent request and is identical whether or not the Agent advertises load. The projection survives
+browser replacement but not bridge replacement; Cold history remains unavailable without load.
 
-Without load support, steps 3-5 are replaced by one local transaction: fold the accepted prompt and
-validated overlay onto the prior in-memory baseline, verify history consistency, install a new
-revision, then clear the overlay. It sends no Agent request. This projection survives browser
-replacement but not bridge replacement; Cold history remains unavailable.
+After a terminal turn commit is published, zero session-specific subscribers schedules a
+capability-gated upstream close. A successful close releases the projection, making the next
+observer cold-load from the Agent. Subscriber loss while Running never cancels or closes the turn.
+If close is unavailable or fails, the projection remains in memory.
 
 ## Observer contract
 
@@ -132,13 +130,11 @@ every subscriber queue.
 
 The following are explicit compatibility rules, not heuristics:
 
-- `loadSession` is preferred for cold recovery and persistent-authority reconciliation;
+- `loadSession` is used for cold recovery, never routine post-turn synchronization;
 - without load, only new/already materialized sessions are recoverable and history ends with the
   bridge process;
-- replay is complete, repeatable and read-after-turn consistent;
 - all prompt updates precede PromptResponse;
 - one bridge is the sole writer to a materialized Agent session;
-- repeated same-session load works on the Agent connection;
 - bridge crash recovery provides at-most-once caution, not exactly-once resubmission.
 
 Violation produces a visible incompatible/blocked/uncertain state. The bridge never uploads browser
@@ -148,11 +144,12 @@ history, invents missing Agent data or silently treats a partial replay as autho
 
 - One installed `Arc<HistorySnapshot>` per materialized session.
 - At most one overlay and one candidate per session.
-- Old baseline + overlay + candidate peak bytes are accounted throughout reconciliation.
+- Old baseline + overlay bytes are accounted throughout normal turn commit; a candidate exists only
+  for load/attachment transactions.
 - Protocol-valid baseline, candidate and overlay growth has no bridge-defined cumulative cap.
 - Wire values, live resources and subscriber delivery retain their independent safety and
   backpressure limits.
-- Pressure eviction selects only unobserved Ready sessions with no live resource or operation.
+- Successful completion with no session subscriber closes and releases the session when supported.
 - Running, Reconciling, observed and interaction-bearing sessions are pinned.
 - Close/delete/generation shutdown drops baselines, candidates and retry tasks.
 - No history payload is persisted.

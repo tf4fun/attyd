@@ -246,6 +246,39 @@ describe("ACP UI state", () => {
     });
   });
 
+  it("keeps identical bridge-memory prompts in separate turn entries", () => {
+    let state: AppState = { ...initialState, session: { sessionId: "session" } };
+    for (const turnOperationId of ["turn-1", "turn-2"]) {
+      state = appReducer(state, event({
+        type: "acp/session_update",
+        notification: {
+          sessionId: "session",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "text", text: "same prompt" },
+            _meta: { attyd: { turnOperationId } },
+          },
+        },
+      }));
+    }
+
+    expect(state.timeline).toHaveLength(2);
+    expect(state.timeline).toEqual([
+      expect.objectContaining({
+        type: "message",
+        role: "protocol-user",
+        blocks: [{ type: "text", text: "same prompt" }],
+        turnOperationId: "turn-1",
+      }),
+      expect.objectContaining({
+        type: "message",
+        role: "protocol-user",
+        blocks: [{ type: "text", text: "same prompt" }],
+        turnOperationId: "turn-2",
+      }),
+    ]);
+  });
+
   it("replaces a failed session page instead of restoring its previous error", () => {
     let state: AppState = {
       ...initialState,

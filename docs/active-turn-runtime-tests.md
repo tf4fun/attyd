@@ -12,7 +12,7 @@ alone are not correctness evidence.
 | Layer | Subject | Harness |
 | --- | --- | --- |
 | L1 | HistoryCache, session actor, folding, CAS and accounting | pure Rust state/reference model |
-| L2 | ACP prompt/load orchestration and retry | scripted Agent with request/notification barriers |
+| L2 | ACP prompt, cold-load and idle-close orchestration | scripted Agent with request/notification barriers |
 | L3 | snapshot cut, suffix, Hub backpressure and shared payloads | in-memory observers |
 | L4 | stdio, HTTP/SSE and WebSocket Agent transports | production binary fixtures |
 | L5 | browser business commands and SSE rendering | reducer/component/Playwright |
@@ -59,25 +59,21 @@ alone are not correctness evidence.
 - `reconcile_commit_observer_sees_old_or_new_generation_not_both`
 - `slow_or_disconnected_observer_never_cancels_agent_work`
 
-### Reconciliation
+### Turn commit and idle release
 
 - `prompt_terminal_retains_overlay_and_enters_reconciling`
-- `prompt_terminal_triggers_exactly_one_internal_load`
-- `same_session_prompt_and_load_never_overlap`
-- `load_candidate_is_not_broadcast_before_commit`
-- `retryable_load_failure_keeps_baseline_and_completed_overlay`
-- `retry_is_singleflight_backed_off_and_bounded`
-- `retry_waits_for_prior_load_request_to_terminate`
-- `deterministic_load_failure_enters_blocked_without_hot_loop`
-- `stale_replay_or_missing_completed_turn_does_not_commit`
-- `successful_retry_atomically_swaps_baseline_then_drops_overlay`
+- `prompt_terminal_performs_zero_internal_loads_even_when_load_is_advertised`
+- `post_turn_invalid_load_fixture_is_never_invoked`
 - `successful_commit_always_advances_history_revision`
 - `next_prompt_is_blocked_until_reconciliation_commits`
 - `different_sessions_reconcile_independently`
-- `no_load_terminal_atomically_promotes_prompt_and_overlay`
-- `no_load_second_turn_preserves_the_first_turn_baseline`
-- `rejected_no_load_promotion_preserves_baseline_and_completed_overlay`
-- `no_load_terminal_performs_zero_session_load_requests`
+- `terminal_atomically_promotes_prompt_and_overlay`
+- `second_turn_preserves_the_first_turn_baseline`
+- `rejected_local_promotion_preserves_baseline_and_completed_overlay`
+- `observed_completion_keeps_the_session_in_memory`
+- `subscriber_loss_while_running_does_not_close_or_cancel`
+- `unobserved_completion_closes_then_next_observer_cold_loads`
+- `idle_close_failure_keeps_the_in_memory_projection`
 
 ### Live resources
 
@@ -92,13 +88,13 @@ alone are not correctness evidence.
 
 - `history_snapshot_is_shared_not_cloned_by_runtime_delta`
 - `many_observers_hold_shared_baseline_payloads`
-- `baseline_overlay_candidate_peak_is_fully_accounted`
+- `baseline_overlay_peak_is_fully_accounted`
 - `candidate_growth_is_accounted_without_admission_rejection`
 - `large_protocol_valid_history_is_not_rejected_by_cache_accounting`
 - `large_protocol_valid_active_overlay_is_not_rejected`
-- `pressure_evicts_least_recent_unobserved_ready_baseline`
+- `unobserved_completion_releases_baseline_after_successful_close`
 - `observed_running_reconciling_and_live_resource_sessions_are_pinned`
-- `evicted_session_next_observer_starts_one_load`
+- `released_session_next_observer_starts_one_load`
 - `close_delete_and_shutdown_release_cache_candidate_and_retry_task`
 - `ten_thousand_turns_keep_one_baseline_and_zero_retired_overlays`
 
@@ -115,29 +111,28 @@ alone are not correctness evidence.
 
 ### Transport and Agent compatibility
 
-Run the common prompt-terminal-reconcile and retry cases over stdio, remote HTTP/SSE and WebSocket.
+Run the common prompt-terminal-commit and idle-close cases over stdio, remote HTTP/SSE and WebSocket.
 
-- `transport_matrix_terminal_reconciles_before_next_prompt`
-- `transport_matrix_browser_disconnect_does_not_affect_prompt_or_load`
+- `transport_matrix_terminal_commits_before_next_prompt`
+- `transport_matrix_browser_disconnect_does_not_cancel_prompt`
 - `transport_matrix_lost_prompt_response_is_uncertain_not_redispatched`
-- `transport_matrix_lost_load_response_never_overlaps_retry`
 - `transport_matrix_two_sessions_progress_independently`
-- `goose_repeated_same_session_load_is_read_after_turn_consistent`
-- `goose_replay_contains_the_just_completed_prompt_and_agent_output`
+- `goose_tool_turn_commits_without_post_turn_load`
+- `goose_idle_close_then_cold_load_contains_the_completed_turn`
 - `no_load_transport_matrix_reconnects_from_bridge_memory`
 
 ## Consistency oracle
 
-The load validator records canonical item count and digest, but does not use either as the browser
-revision. For a normal append-only turn the candidate must preserve the prior baseline and contain
-the accepted prompt plus its completed result. Without load, the corresponding oracle is the old
-baseline plus normalized `user_message_chunk` values synthesized from the accepted prompt plus the
-validated overlay. Compaction and future protocol replacement semantics require an explicit typed
-rule; they cannot silently bypass either oracle.
+The cold-load validator records canonical item count and digest, but does not use either as the
+browser revision. For every observed turn, the commit oracle is the old baseline plus normalized
+`user_message_chunk` values synthesized from the accepted prompt plus the validated overlay.
+Compaction and future protocol replacement semantics require an explicit typed rule; they cannot
+silently bypass that oracle.
 
-An Agent replay may repartition text chunks while remaining semantically equal. Tests compare the
-normalized conversation/tool/plan model, not raw JSON chunk boundaries. Optional message IDs are
-not assumed stable across loads.
+An Agent replay may repartition text chunks or persist tool content differently from its live wire
+form. Post-turn commit therefore never compares live output with a second replay. Cold-load tests
+still compare the normalized conversation/tool/plan model, not raw JSON chunk boundaries, and do
+not assume optional message IDs are stable.
 
 ## Retry harness
 
@@ -184,7 +179,7 @@ zero-history assertion, and queued-prompt automatic dispatch must be replaced by
 
 1. Specification and red-test names land before production changes.
 2. L1 HistoryCache/state tests pass without browser code.
-3. L2 reconciliation and fault tests pass with exact Agent call counts.
+3. L2 cold-load, turn-commit and idle-close tests pass with exact Agent call counts.
 4. L3 observation and memory-sharing tests pass.
 5. L4 transport matrix and Goose canary pass.
 6. L5 switches the browser from ACP-shaped lifecycle inference to business snapshots/commands.

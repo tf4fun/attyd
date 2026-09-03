@@ -198,6 +198,15 @@ impl TerminalManager {
         &self,
         request: ReleaseTerminalRequest,
     ) -> Result<ReleaseTerminalResponse, Error> {
+        self.release_with_snapshot(request)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    pub(crate) async fn release_with_snapshot(
+        &self,
+        request: ReleaseTerminalRequest,
+    ) -> Result<(ReleaseTerminalResponse, TerminalSnapshot), Error> {
         let terminal = self
             .require(&request.terminal_id.0, &request.session_id.0)
             .await?;
@@ -205,9 +214,23 @@ impl TerminalManager {
         Self::abort_readers(&terminal).await;
         terminal.state.lock().await.released = true;
         self.emit_snapshot(&terminal).await;
+        let snapshot = {
+            let state = terminal.state.lock().await;
+            TerminalSnapshot {
+                incarnation: terminal.incarnation,
+                value: json!({
+                    "sessionId": terminal.session_id,
+                    "terminalId": terminal.id,
+                    "output": String::from_utf8_lossy(&state.output),
+                    "truncated": state.truncated,
+                    "exitStatus": state.exit_status,
+                    "released": true,
+                }),
+            }
+        };
         self.terminals.lock().await.remove(terminal.id.as_str());
         terminal.changed.notify_waiters();
-        Ok(ReleaseTerminalResponse::new())
+        Ok((ReleaseTerminalResponse::new(), snapshot))
     }
 
     pub async fn release_session(&self, session_id: &str) {
@@ -650,13 +673,16 @@ mod tests {
                 .await
                 .is_err()
         );
-        terminals
-            .release(ReleaseTerminalRequest::new(
+        let (_, retained) = terminals
+            .release_with_snapshot(ReleaseTerminalRequest::new(
                 "owner",
                 created.terminal_id.clone(),
             ))
             .await
             .unwrap();
+        assert_eq!(retained.value["output"], "ok");
+        assert_eq!(retained.value["exitStatus"]["exitCode"], 0);
+        assert_eq!(retained.value["released"], true);
         assert!(
             terminals
                 .output(output_request("owner", &created.terminal_id))
