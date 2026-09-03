@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -7,18 +8,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{StatusCode, Uri, header};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use futures::{SinkExt, StreamExt};
+use axum::routing::{get, post};
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 use crate::bridge;
 use crate::event_queue::{self, EventQueueLimits, EventReceiver, EventSender};
@@ -32,6 +34,7 @@ const SUBSCRIBER_QUEUE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
 const MAX_SUBSCRIBERS: usize = 64;
 const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
 const BRIDGE_EVENT_QUEUE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
+const BRIDGE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(RustEmbed)]
 #[folder = "dist/client/"]
@@ -40,6 +43,77 @@ struct ClientAssets;
 #[derive(Clone)]
 struct AppState {
     bridge: Arc<BridgeHub>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StartTurnBody {
+    prompt: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListSessionsQuery {
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateSessionBody {
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InteractionResponseBody {
+    kind: String,
+    outcome: Option<serde_json::Value>,
+    response: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetModeBody {
+    mode_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetConfigBody {
+    value: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextSearchQuery {
+    query: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextReadBody {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthTerminalStartBody {
+    method_id: String,
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthTerminalInputBody {
+    data: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthTerminalResizeBody {
+    cols: u16,
+    rows: u16,
 }
 
 #[derive(Default)]
@@ -318,6 +392,7 @@ struct BridgeHubState {
     input: Option<mpsc::Sender<bridge::BridgeInput>>,
     cancellation: Option<CancellationToken>,
     subscribers: HashMap<u64, SubscriberSender>,
+    session_subscribers: HashMap<u64, (String, SubscriberSender)>,
     bootstrap: BridgeBootstrap,
     runtime: ActiveRuntimeProjection,
     canonical: CanonicalProjection,
@@ -339,6 +414,25 @@ struct BridgeSubscription {
     events: mpsc::Receiver<QueuedSubscriberEvent>,
 }
 
+struct SubscriptionGuard {
+    bridge: Arc<BridgeHub>,
+    id: u64,
+    generation: u64,
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        let bridge = self.bridge.clone();
+        let id = self.id;
+        let generation = self.generation;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                bridge.unsubscribe(id, generation).await;
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SubscriberSender {
     tx: mpsc::Sender<QueuedSubscriberEvent>,
@@ -346,37 +440,23 @@ struct SubscriberSender {
 }
 
 struct QueuedSubscriberEvent {
-    event: String,
-    queued_bytes: Arc<AtomicUsize>,
-    bytes: usize,
-}
-
-struct SubscriberByteLease {
+    event: Arc<str>,
     queued_bytes: Arc<AtomicUsize>,
     bytes: usize,
 }
 
 impl QueuedSubscriberEvent {
-    fn into_inflight(mut self) -> (String, SubscriberByteLease) {
-        let event = std::mem::take(&mut self.event);
-        let bytes = std::mem::take(&mut self.bytes);
-        (
-            event,
-            SubscriberByteLease {
-                queued_bytes: self.queued_bytes.clone(),
-                bytes,
-            },
-        )
+    #[cfg(test)]
+    fn into_arc(mut self) -> Arc<str> {
+        std::mem::replace(&mut self.event, Arc::from(""))
+    }
+
+    fn into_string(mut self) -> String {
+        std::mem::replace(&mut self.event, Arc::from("")).to_string()
     }
 }
 
 impl Drop for QueuedSubscriberEvent {
-    fn drop(&mut self) {
-        self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
-    }
-}
-
-impl Drop for SubscriberByteLease {
     fn drop(&mut self) {
         self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
     }
@@ -394,7 +474,8 @@ impl SubscriberSender {
         )
     }
 
-    fn try_send(&self, event: String) -> Result<(), ()> {
+    fn try_send(&self, event: impl Into<Arc<str>>) -> Result<(), ()> {
+        let event = event.into();
         let bytes = event.len();
         self.queued_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -411,6 +492,63 @@ impl SubscriberSender {
             })
             .map_err(|_| ())
     }
+}
+
+fn publish_shared_event(state: &mut BridgeHubState, event: Arc<str>) {
+    let mut failed = Vec::new();
+    for (&subscriber_id, subscriber) in &state.subscribers {
+        if subscriber.try_send(event.clone()).is_err() {
+            failed.push(subscriber_id);
+        }
+    }
+    for subscriber_id in failed {
+        state.subscribers.remove(&subscriber_id);
+    }
+    publish_to_session_subscribers(state, event);
+}
+
+fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
+    let Some((event_session_id, event)) = business_session_event(&event) else {
+        return;
+    };
+    let mut failed = Vec::new();
+    for (&subscriber_id, (session_id, subscriber)) in &state.session_subscribers {
+        if session_id == &event_session_id && subscriber.try_send(event.clone()).is_err() {
+            failed.push(subscriber_id);
+        }
+    }
+    for subscriber_id in failed {
+        state.session_subscribers.remove(&subscriber_id);
+    }
+}
+
+fn business_session_event(event: &str) -> Option<(String, Arc<str>)> {
+    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    match value.get("type").and_then(serde_json::Value::as_str)? {
+        "bridge/session_delta" => {
+            let session_id = value.get("sessionId")?.as_str()?.to_string();
+            Some((session_id, Arc::from(event)))
+        }
+        "bridge/session_view" => {
+            let session_id = value.get("sessionId")?.as_str()?.to_string();
+            let reset = session_reset_value(&session_id, value.get("view")?)?;
+            Some((session_id, Arc::from(reset.to_string())))
+        }
+        _ => None,
+    }
+}
+
+fn session_reset_value(session_id: &str, view: &serde_json::Value) -> Option<serde_json::Value> {
+    Some(json!({
+        "type": "bridge/session_reset",
+        "bridgeEpoch": view.get("bridgeEpoch")?.as_str()?,
+        "sessionId": session_id,
+        "sessionIncarnation": view.pointer("/session/incarnation")?.as_u64()?,
+        "viewRevision": view.pointer("/session/viewRevision")?.as_u64()?,
+        "historyRevision": view.pointer("/session/historyRevision").cloned().unwrap_or(serde_json::Value::Null),
+        "phase": view.pointer("/session/phase").cloned().unwrap_or(serde_json::Value::Null),
+        "syncError": view.pointer("/session/syncError").cloned().unwrap_or(serde_json::Value::Null),
+    }))
 }
 
 struct BridgeRuntime {
@@ -476,7 +614,7 @@ impl BridgeHub {
             if state.shutting_down || state.input.is_none() {
                 return None;
             }
-            if state.subscribers.len() >= MAX_SUBSCRIBERS {
+            if state.subscribers.len() + state.session_subscribers.len() >= MAX_SUBSCRIBERS {
                 return None;
             }
             let mut initial_events = Vec::new();
@@ -501,6 +639,30 @@ impl BridgeHub {
             id,
             generation,
             initial_events,
+            events: event_rx,
+        })
+    }
+
+    async fn subscribe_session(self: &Arc<Self>, session_id: String) -> Option<BridgeSubscription> {
+        self.ensure_runtime().await;
+        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
+        let (event_tx, event_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let generation = {
+            let mut state = self.state.lock().await;
+            if state.shutting_down || state.input.is_none() {
+                return None;
+            }
+            if state.subscribers.len() + state.session_subscribers.len() >= MAX_SUBSCRIBERS {
+                return None;
+            }
+            let generation = state.generation;
+            state.session_subscribers.insert(id, (session_id, event_tx));
+            generation
+        };
+        Some(BridgeSubscription {
+            id,
+            generation,
+            initial_events: Vec::new(),
             events: event_rx,
         })
     }
@@ -541,15 +703,8 @@ impl BridgeHub {
                     state.canonical_resync_pending = false;
                 }
                 if let Some(public_event) = public_event {
-                    let mut failed_subscribers = Vec::new();
-                    for (&subscriber_id, subscriber) in &state.subscribers {
-                        if subscriber.try_send(public_event.clone()).is_err() {
-                            failed_subscribers.push(subscriber_id);
-                        }
-                    }
-                    for subscriber_id in failed_subscribers {
-                        state.subscribers.remove(&subscriber_id);
-                    }
+                    let public_event: Arc<str> = public_event.into();
+                    publish_shared_event(&mut state, public_event);
                 }
                 if recognized
                     && state.canonical.snapshot.is_none()
@@ -592,7 +747,11 @@ impl BridgeHub {
             let event = state.runtime.update_and_normalize(&event);
             let session_live_suffix = opened_runtime_session_id(&event)
                 .map(|session_id| state.runtime.replay_session_live_suffix(&session_id))
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .map(Arc::<str>::from)
+                .collect::<Vec<_>>();
+            let event: Arc<str> = event.into();
             let mut failed_subscribers = Vec::new();
             for (&subscriber_id, subscriber) in &state.subscribers {
                 let mut delivered = subscriber.try_send(event.clone()).is_ok();
@@ -606,6 +765,10 @@ impl BridgeHub {
             for subscriber_id in failed_subscribers {
                 state.subscribers.remove(&subscriber_id);
             }
+            publish_to_session_subscribers(&mut state, event);
+            for live_event in session_live_suffix {
+                publish_to_session_subscribers(&mut state, live_event);
+            }
             restart.then(|| state.cancellation.clone()).flatten()
         };
         if let Some(cancellation) = input {
@@ -614,19 +777,24 @@ impl BridgeHub {
     }
 
     async fn finish_generation(&self, generation: u64) {
-        let subscribers = {
+        let (subscribers, session_subscribers) = {
             let mut state = self.state.lock().await;
             if state.generation != generation {
                 return;
             }
             state.input = None;
             state.cancellation = None;
-            std::mem::take(&mut state.subscribers)
+            (
+                std::mem::take(&mut state.subscribers),
+                std::mem::take(&mut state.session_subscribers),
+            )
         };
         drop(subscribers);
+        drop(session_subscribers);
         self.stopped.notify_waiters();
     }
 
+    #[cfg(test)]
     async fn send_command(
         &self,
         subscriber_id: u64,
@@ -649,11 +817,103 @@ impl BridgeHub {
             .map_err(|_| ())
     }
 
+    async fn session_view(&self, session_id: String) -> Result<serde_json::Value, String> {
+        let input = {
+            let state = self.state.lock().await;
+            state
+                .input
+                .clone()
+                .ok_or_else(|| "bridge is not ready".to_string())?
+        };
+        let (response, result) = oneshot::channel();
+        input
+            .send(bridge::BridgeInput::SessionViewRequest {
+                session_id,
+                response,
+            })
+            .await
+            .map_err(|_| "bridge stopped before accepting the query".to_string())?;
+        tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
+            .await
+            .map_err(|_| "bridge session query timed out".to_string())?
+            .map_err(|_| "bridge stopped before answering the query".to_string())?
+    }
+
+    async fn start_turn(
+        &self,
+        session_id: String,
+        history_revision: String,
+        client_intent_id: String,
+        prompt: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let input = {
+            let state = self.state.lock().await;
+            state
+                .input
+                .clone()
+                .ok_or_else(|| "bridge is not ready".to_string())?
+        };
+        let (response, result) = oneshot::channel();
+        input
+            .send(bridge::BridgeInput::TurnRequest {
+                session_id,
+                history_revision,
+                client_intent_id,
+                prompt,
+                response,
+            })
+            .await
+            .map_err(|_| "bridge stopped before accepting the turn".to_string())?;
+        tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
+            .await
+            .map_err(|_| "bridge turn admission timed out".to_string())?
+            .map_err(|_| "bridge stopped before admitting the turn".to_string())?
+    }
+
+    async fn business_request(
+        &self,
+        command: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let input = {
+            let state = self.state.lock().await;
+            state
+                .input
+                .clone()
+                .ok_or_else(|| "bridge is not ready".to_string())?
+        };
+        let (response, result) = oneshot::channel();
+        input
+            .send(bridge::BridgeInput::BusinessRequest { command, response })
+            .await
+            .map_err(|_| "bridge stopped before accepting the request".to_string())?;
+        tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
+            .await
+            .map_err(|_| "bridge request timed out".to_string())?
+            .map_err(|_| "bridge stopped before answering the request".to_string())?
+    }
+
+    async fn runtime_info(&self) -> serde_json::Value {
+        let state = self.state.lock().await;
+        let parse = |event: &Option<String>| {
+            event
+                .as_deref()
+                .and_then(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+        };
+        json!({
+            "generation": state.generation,
+            "connected": state.input.is_some(),
+            "hello": parse(&state.bootstrap.hello),
+            "initialized": parse(&state.bootstrap.initialized),
+            "phase": parse(&state.bootstrap.phase),
+            "error": parse(&state.bootstrap.error),
+        })
+    }
+
     async fn send_to_subscriber(&self, subscriber_id: u64, generation: u64, event: String) {
         let mut state = self.state.lock().await;
         if state.generation == generation
             && let Some(sender) = state.subscribers.get(&subscriber_id)
-            && sender.try_send(event).is_err()
+            && sender.try_send(Arc::<str>::from(event)).is_err()
         {
             state.subscribers.remove(&subscriber_id);
         }
@@ -663,6 +923,7 @@ impl BridgeHub {
         let mut state = self.state.lock().await;
         if state.generation == generation {
             state.subscribers.remove(&subscriber_id);
+            state.session_subscribers.remove(&subscriber_id);
         }
     }
 
@@ -740,7 +1001,53 @@ pub async fn serve(options: Options) -> Result<()> {
     bridge.ensure_runtime().await;
     let app = Router::new()
         .route("/api/health", get(health))
-        .route("/ws", get(websocket))
+        .route("/api/v1/runtime", get(get_runtime))
+        .route("/api/v1/events", get(global_events))
+        .route("/api/v1/auth/{method_id}", post(authenticate))
+        .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/auth/terminal", post(start_auth_terminal))
+        .route(
+            "/api/v1/auth/terminal/{request_id}/input",
+            post(write_auth_terminal),
+        )
+        .route(
+            "/api/v1/auth/terminal/{request_id}/resize",
+            post(resize_auth_terminal),
+        )
+        .route(
+            "/api/v1/auth/terminal/{request_id}/cancel",
+            post(cancel_auth_terminal),
+        )
+        .route("/api/v1/context/search", get(search_context))
+        .route(
+            "/api/v1/sessions/{session_id}/context/read",
+            post(read_context),
+        )
+        .route("/api/v1/sessions", get(list_sessions).post(create_session))
+        .route(
+            "/api/v1/sessions/{session_id}",
+            get(get_session_view).delete(delete_session),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/turns",
+            post(start_session_turn),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/turns/{operation_id}/cancel",
+            post(cancel_session_turn),
+        )
+        .route("/api/v1/sessions/{session_id}/fork", post(fork_session))
+        .route("/api/v1/sessions/{session_id}/close", post(close_session))
+        .route("/api/v1/sessions/{session_id}/mode", post(set_session_mode))
+        .route(
+            "/api/v1/sessions/{session_id}/configuration/{config_id}",
+            post(set_session_config),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/interactions/{interaction_id}/response",
+            post(respond_to_interaction),
+        )
+        .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(get(static_asset))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -801,68 +1108,754 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({ "ok": true, "protocol": "acp/v1", "backend": "rust" }))
 }
 
-async fn websocket(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.max_message_size(bridge::MAX_BRIDGE_MESSAGE_BYTES)
-        .on_upgrade(move |socket| serve_websocket(socket, state.bridge))
+async fn get_runtime(State(state): State<AppState>) -> Response {
+    let mut response = axum::Json(state.bridge.runtime_info().await).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
-async fn serve_websocket(socket: WebSocket, bridge: Arc<BridgeHub>) {
-    let Some(subscription) = bridge.subscribe().await else {
-        return;
-    };
-    let BridgeSubscription {
-        id,
-        generation,
-        initial_events,
-        mut events,
-    } = subscription;
-    let (mut writer, mut reader) = socket.split();
-    for event in initial_events {
-        if writer.send(Message::Text(event.into())).await.is_err() {
-            bridge.unsubscribe(id, generation).await;
-            return;
+fn global_business_event(event: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    match value.get("type").and_then(serde_json::Value::as_str)? {
+        "bridge/phase" => Some(
+            json!({
+                "type": "bridge/connection",
+                "phase": value.get("phase"),
+            })
+            .to_string(),
+        ),
+        "acp/authenticated"
+        | "acp/logged_out"
+        | "bridge/auth_terminal_started"
+        | "bridge/auth_terminal_output"
+        | "bridge/auth_terminal_exited" => Some(event.to_string()),
+        "bridge/error" if value.get("requestId").is_none() && value.get("operation").is_none() => {
+            Some(
+                json!({
+                    "type": "bridge/connection_error",
+                    "message": value.get("message"),
+                    "code": value.get("code"),
+                    "data": value.get("data"),
+                })
+                .to_string(),
+            )
         }
+        _ => None,
     }
-    tokio::select! {
-        _ = async {
-            while let Some(message) = reader.next().await {
-                match message {
-                    Ok(Message::Text(text)) => {
-                        if bridge
-                            .send_command(id, generation, text.to_string())
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    Ok(Message::Binary(_)) => {
-                        bridge.send_to_subscriber(
-                            id,
-                            generation,
-                            json!({
-                                "type": "bridge/error",
-                                "message": "WebSocket commands must use text frames",
-                            }).to_string(),
-                        ).await;
-                    }
-                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                }
+}
+
+async fn global_events(State(state): State<AppState>) -> Response {
+    let Some(subscription) = state.bridge.subscribe().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let guard = SubscriptionGuard {
+        bridge: state.bridge,
+        id: subscription.id,
+        generation: subscription.generation,
+    };
+    let stream = futures::stream::unfold(
+        (
+            subscription.initial_events.into_iter(),
+            subscription.events,
+            guard,
+        ),
+        |(mut bootstrap, mut events, guard)| async move {
+            loop {
+                let event = if let Some(event) = bootstrap.next() {
+                    event
+                } else {
+                    events.recv().await?.into_string()
+                };
+                let Some(event) = global_business_event(&event) else {
+                    continue;
+                };
+                return Some((
+                    Ok::<_, Infallible>(SseEvent::default().data(event)),
+                    (bootstrap, events, guard),
+                ));
             }
-        } => {},
-        _ = async {
-            while let Some(event) = events.recv().await {
-                let (event, lease) = event.into_inflight();
-                let result = writer.send(Message::Text(event.into())).await;
-                drop(lease);
-                if result.is_err() {
-                    break;
-                }
-            }
-        } => {},
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn authenticate(Path(method_id): Path<String>, State(state): State<AppState>) -> Response {
+    if !valid_api_identifier(&method_id) {
+        return api_bad_request("invalid authentication method ID");
     }
-    bridge.unsubscribe(id, generation).await;
+    let request_id = format!("api-auth-{}", Uuid::new_v4());
+    match state
+        .bridge
+        .business_request(json!({
+            "type": "auth/authenticate",
+            "requestId": request_id,
+            "methodId": method_id,
+        }))
+        .await
+    {
+        Ok(response) => axum::Json(json!({
+            "requestId": request_id,
+            "response": response,
+        }))
+        .into_response(),
+        Err(message) => business_error(message),
+    }
+}
+
+async fn logout(State(state): State<AppState>) -> Response {
+    let request_id = format!("api-logout-{}", Uuid::new_v4());
+    match state
+        .bridge
+        .business_request(json!({
+            "type": "auth/logout",
+            "requestId": request_id,
+        }))
+        .await
+    {
+        Ok(response) => axum::Json(json!({
+            "requestId": request_id,
+            "response": response,
+        }))
+        .into_response(),
+        Err(message) => business_error(message),
+    }
+}
+
+async fn start_auth_terminal(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<AuthTerminalStartBody>,
+) -> Response {
+    if !valid_api_identifier(&body.method_id) || body.cols == 0 || body.rows == 0 {
+        return api_bad_request("invalid terminal authentication parameters");
+    }
+    let request_id = format!("api-terminal-{}", Uuid::new_v4());
+    match state
+        .bridge
+        .business_request(json!({
+            "type": "auth/terminal_start",
+            "requestId": request_id,
+            "methodId": body.method_id,
+            "cols": body.cols,
+            "rows": body.rows,
+        }))
+        .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            axum::Json(json!({ "requestId": request_id })),
+        )
+            .into_response(),
+        Err(message) => business_error(message),
+    }
+}
+
+async fn write_auth_terminal(
+    Path(request_id): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<AuthTerminalInputBody>,
+) -> Response {
+    if !valid_api_identifier(&request_id) {
+        return api_bad_request("invalid terminal request ID");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "auth/terminal_input",
+                "requestId": request_id,
+                "data": body.data,
+            }))
+            .await,
+    )
+}
+
+async fn resize_auth_terminal(
+    Path(request_id): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<AuthTerminalResizeBody>,
+) -> Response {
+    if !valid_api_identifier(&request_id) || body.cols == 0 || body.rows == 0 {
+        return api_bad_request("invalid terminal resize parameters");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "auth/terminal_resize",
+                "requestId": request_id,
+                "cols": body.cols,
+                "rows": body.rows,
+            }))
+            .await,
+    )
+}
+
+async fn cancel_auth_terminal(
+    Path(request_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if !valid_api_identifier(&request_id) {
+        return api_bad_request("invalid terminal request ID");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "auth/terminal_cancel",
+                "requestId": request_id,
+            }))
+            .await,
+    )
+}
+
+async fn search_context(
+    State(state): State<AppState>,
+    Query(query): Query<ContextSearchQuery>,
+) -> Response {
+    if query.query.encode_utf16().count() > 256 {
+        return api_bad_request("context query is too long");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "context/search",
+                "requestId": format!("api-context-search-{}", Uuid::new_v4()),
+                "query": query.query,
+            }))
+            .await,
+    )
+}
+
+async fn read_context(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<ContextReadBody>,
+) -> Response {
+    if !valid_api_identifier(&session_id) || body.path.is_empty() || body.path.len() > 16_384 {
+        return api_bad_request("invalid session ID or context path");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "context/read",
+                "requestId": format!("api-context-read-{}", Uuid::new_v4()),
+                "sessionId": session_id,
+                "path": body.path,
+            }))
+            .await,
+    )
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<ListSessionsQuery>,
+) -> Response {
+    let mut command = json!({
+        "type": "session/list",
+        "requestId": format!("api-list-{}", Uuid::new_v4()),
+    });
+    if let Some(cursor) = query.cursor {
+        command["cursor"] = json!(cursor);
+    }
+    business_response(state.bridge.business_request(command).await)
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<CreateSessionBody>,
+) -> Response {
+    let mut command = json!({
+        "type": "session/new",
+        "requestId": format!("api-new-{}", Uuid::new_v4()),
+    });
+    if let Some(cwd) = body.cwd {
+        command["cwd"] = json!(cwd);
+    }
+    match state.bridge.business_request(command).await {
+        Ok(value) => match normalize_embedded_session_view(value) {
+            Some(value) => (StatusCode::CREATED, axum::Json(value)).into_response(),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({ "error": "bridge returned an invalid created session" })),
+            )
+                .into_response(),
+        },
+        Err(message) => business_error(message),
+    }
+}
+
+async fn delete_session(Path(session_id): Path<String>, State(state): State<AppState>) -> Response {
+    if !valid_api_identifier(&session_id) {
+        return api_bad_request("invalid session ID");
+    }
+    let command = json!({
+        "type": "session/delete",
+        "requestId": format!("api-delete-{}", Uuid::new_v4()),
+        "sessionId": session_id,
+    });
+    match state.bridge.business_request(command).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(message) => business_error(message),
+    }
+}
+
+async fn cancel_session_turn(
+    Path((session_id, operation_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    if !valid_api_identifier(&session_id) || !valid_api_identifier(&operation_id) {
+        return api_bad_request("invalid session or operation ID");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "session/cancel",
+                "sessionId": session_id,
+                "expectedOperationId": operation_id,
+            }))
+            .await,
+    )
+}
+
+async fn fork_session(Path(session_id): Path<String>, State(state): State<AppState>) -> Response {
+    if !valid_api_identifier(&session_id) {
+        return api_bad_request("invalid session ID");
+    }
+    match state
+        .bridge
+        .business_request(json!({
+            "type": "session/fork",
+            "requestId": format!("api-fork-{}", Uuid::new_v4()),
+            "sessionId": session_id,
+        }))
+        .await
+    {
+        Ok(value) => match normalize_embedded_session_view(value) {
+            Some(value) => (StatusCode::CREATED, axum::Json(value)).into_response(),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({ "error": "bridge returned an invalid forked session" })),
+            )
+                .into_response(),
+        },
+        Err(message) => business_error(message),
+    }
+}
+
+async fn close_session(Path(session_id): Path<String>, State(state): State<AppState>) -> Response {
+    if !valid_api_identifier(&session_id) {
+        return api_bad_request("invalid session ID");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "session/close",
+                "requestId": format!("api-close-{}", Uuid::new_v4()),
+                "sessionId": session_id,
+            }))
+            .await,
+    )
+}
+
+async fn set_session_mode(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SetModeBody>,
+) -> Response {
+    if !valid_api_identifier(&session_id) || !valid_api_identifier(&body.mode_id) {
+        return api_bad_request("invalid session or mode ID");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "session/set_mode",
+                "requestId": format!("api-mode-{}", Uuid::new_v4()),
+                "sessionId": session_id,
+                "modeId": body.mode_id,
+            }))
+            .await,
+    )
+}
+
+async fn set_session_config(
+    Path((session_id, config_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SetConfigBody>,
+) -> Response {
+    if !valid_api_identifier(&session_id) || !valid_api_identifier(&config_id) {
+        return api_bad_request("invalid session or configuration ID");
+    }
+    if !matches!(
+        body.value,
+        serde_json::Value::String(_) | serde_json::Value::Bool(_)
+    ) {
+        return api_bad_request("configuration value must be a string or boolean");
+    }
+    business_response(
+        state
+            .bridge
+            .business_request(json!({
+                "type": "session/set_config_option",
+                "requestId": format!("api-config-{}", Uuid::new_v4()),
+                "sessionId": session_id,
+                "configId": config_id,
+                "value": body.value,
+            }))
+            .await,
+    )
+}
+
+async fn respond_to_interaction(
+    Path((session_id, interaction_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<InteractionResponseBody>,
+) -> Response {
+    if !valid_api_identifier(&session_id) || !valid_api_identifier(&interaction_id) {
+        return api_bad_request("invalid session or interaction ID");
+    }
+    let request_id = format!("api-interaction-{}", Uuid::new_v4());
+    let command = match body.kind.as_str() {
+        "permission" => {
+            let Some(outcome) = body.outcome else {
+                return api_bad_request("permission response requires outcome");
+            };
+            json!({
+                "type": "permission/respond",
+                "requestId": request_id,
+                "sessionId": session_id,
+                "permissionId": interaction_id,
+                "outcome": outcome,
+            })
+        }
+        "elicitation" => {
+            let Some(response) = body.response else {
+                return api_bad_request("elicitation response requires response");
+            };
+            json!({
+                "type": "elicitation/respond",
+                "requestId": request_id,
+                "sessionId": session_id,
+                "elicitationId": interaction_id,
+                "response": response,
+            })
+        }
+        _ => return api_bad_request("interaction kind must be permission or elicitation"),
+    };
+    business_response(state.bridge.business_request(command).await)
+}
+
+fn valid_api_identifier(value: &str) -> bool {
+    !value.is_empty() && value.encode_utf16().count() <= 1_024
+}
+
+fn api_bad_request(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({ "error": message })),
+    )
+        .into_response()
+}
+
+fn business_error(message: String) -> Response {
+    (
+        StatusCode::CONFLICT,
+        axum::Json(json!({ "error": message })),
+    )
+        .into_response()
+}
+
+fn business_response(result: Result<serde_json::Value, String>) -> Response {
+    match result {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(message) => business_error(message),
+    }
+}
+
+fn business_session_view(view: &serde_json::Value) -> Option<serde_json::Value> {
+    let session = view.get("session")?;
+    let live = view.get("live").unwrap_or(&serde_json::Value::Null);
+    Some(json!({
+        "bridgeEpoch": view.get("bridgeEpoch")?,
+        "sessionId": session.get("sessionId")?,
+        "sessionIncarnation": session.get("incarnation")?,
+        "viewRevision": session.get("viewRevision")?,
+        "historyRevision": session.get("historyRevision").cloned().unwrap_or(serde_json::Value::Null),
+        "phase": session.get("phase")?,
+        "syncError": session.get("syncError").cloned().unwrap_or(serde_json::Value::Null),
+        "timeline": view.pointer("/baseline/updates").cloned().unwrap_or_else(|| json!([])),
+        "activeTurn": session.get("activeTurn").cloned().unwrap_or(serde_json::Value::Null),
+        "workspace": {
+            "cwd": live.get("cwd").cloned().unwrap_or(serde_json::Value::Null),
+            "session": live.get("session").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "controls": live.get("controlState").cloned().unwrap_or_else(|| json!({})),
+        "interactions": {
+            "permissions": live.get("permissions").cloned().unwrap_or_else(|| json!({})),
+            "elicitations": live.get("elicitations").cloned().unwrap_or_else(|| json!({})),
+            "urlFlows": live.get("urlFlows").cloned().unwrap_or_else(|| json!({})),
+        },
+        "operation": live.get("operation").cloned().unwrap_or(serde_json::Value::Null),
+        "terminals": live.get("terminals").cloned().unwrap_or_else(|| json!({})),
+    }))
+}
+
+fn normalize_embedded_session_view(mut value: serde_json::Value) -> Option<serde_json::Value> {
+    let view = business_session_view(value.get("view")?)?;
+    value["view"] = view;
+    Some(value)
+}
+
+async fn get_session_view(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "error": "invalid session ID" })),
+        )
+            .into_response();
+    }
+    match state.bridge.session_view(session_id).await {
+        Ok(view) => {
+            let revision = view
+                .pointer("/session/historyRevision")
+                .and_then(serde_json::Value::as_str)
+                .map(|revision| format!("\"{revision}\""));
+            let Some(view) = business_session_view(&view) else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({ "error": "bridge returned an invalid session view" })),
+                )
+                    .into_response();
+            };
+            let mut response = axum::Json(view).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            if let Some(revision) = revision
+                && let Ok(revision) = axum::http::HeaderValue::from_str(&revision)
+            {
+                response.headers_mut().insert(header::ETAG, revision);
+            }
+            response
+        }
+        Err(message) if message == "session is not materialized" => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({ "error": message })),
+        )
+            .into_response(),
+        Err(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+async fn start_session_turn(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<StartTurnBody>,
+) -> Response {
+    if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "error": "invalid session ID" })),
+        )
+            .into_response();
+    }
+    let Some(history_revision) = headers
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_strong_etag)
+    else {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            axum::Json(
+                json!({ "error": "If-Match with the current history revision is required" }),
+            ),
+        )
+            .into_response();
+    };
+    let Some(client_intent_id) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.encode_utf16().count() <= 1_024)
+        .map(str::to_string)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "error": "a bounded Idempotency-Key is required" })),
+        )
+            .into_response();
+    };
+    if body.prompt.is_empty() || body.prompt.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "error": "prompt must contain between 1 and 64 content blocks" })),
+        )
+            .into_response();
+    }
+    match state
+        .bridge
+        .start_turn(session_id, history_revision, client_intent_id, body.prompt)
+        .await
+    {
+        Ok(ack) => (StatusCode::ACCEPTED, axum::Json(ack)).into_response(),
+        Err(message) => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_strong_etag(value: &str) -> Option<String> {
+    if value.starts_with("W/") || value.len() < 2 {
+        return None;
+    }
+    value
+        .strip_prefix('"')?
+        .strip_suffix('"')
+        .filter(|value| !value.is_empty() && value.len() <= 4_096)
+        .map(str::to_string)
+}
+
+async fn session_events(Path(session_id): Path<String>, State(state): State<AppState>) -> Response {
+    if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(subscription) = state.bridge.subscribe_session(session_id.clone()).await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let initial = match state.bridge.session_view(session_id.clone()).await {
+        Ok(view) => match session_reset_value(&session_id, &view) {
+            Some(reset) => reset.to_string(),
+            None => {
+                state
+                    .bridge
+                    .unsubscribe(subscription.id, subscription.generation)
+                    .await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
+        Err(_) => {
+            state
+                .bridge
+                .unsubscribe(subscription.id, subscription.generation)
+                .await;
+            return StatusCode::CONFLICT.into_response();
+        }
+    };
+    let guard = SubscriptionGuard {
+        bridge: state.bridge,
+        id: subscription.id,
+        generation: subscription.generation,
+    };
+    let initial_position = session_event_position(&initial);
+    let stream = futures::stream::unfold(
+        (
+            Some(initial),
+            subscription.initial_events.into_iter(),
+            subscription.events,
+            session_id,
+            initial_position,
+            guard,
+        ),
+        |(mut initial, mut bootstrap, mut events, session_id, mut position, guard)| async move {
+            loop {
+                let is_initial = initial.is_some();
+                let event = if let Some(initial_event) = initial.take() {
+                    initial_event
+                } else if let Some(event) = bootstrap.next() {
+                    event
+                } else {
+                    let event = events.recv().await?;
+                    event.into_string()
+                };
+                if !session_event_matches(&event, &session_id) {
+                    continue;
+                }
+                let next_position = session_event_position(&event);
+                if !is_initial
+                    && let (Some(current), Some(next)) = (&position, &next_position)
+                    && current.0 == next.0
+                    && current.1 == next.1
+                    && next.2 <= current.2
+                {
+                    continue;
+                }
+                if next_position.is_some() {
+                    position = next_position;
+                }
+                let id = session_event_cursor(&event);
+                let mut outgoing = SseEvent::default().data(event);
+                if let Some(id) = id {
+                    outgoing = outgoing.id(id);
+                }
+                return Some((
+                    Ok::<_, Infallible>(outgoing),
+                    (initial, bootstrap, events, session_id, position, guard),
+                ));
+            }
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn session_event_matches(event: &str, session_id: &str) -> bool {
+    session_event_id(event).as_deref() == Some(session_id)
+}
+
+fn session_event_id(event: &str) -> Option<String> {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(event) else {
+        return None;
+    };
+    if !matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some("bridge/session_reset" | "bridge/session_delta")
+    ) {
+        return None;
+    }
+    event
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn session_event_cursor(event: &str) -> Option<String> {
+    let (epoch, incarnation, revision) = session_event_position(event)?;
+    Some(format!("{epoch}:{incarnation}:{revision}"))
+}
+
+fn session_event_position(event: &str) -> Option<(String, u64, u64)> {
+    let event = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    if !matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some("bridge/session_reset" | "bridge/session_delta")
+    ) {
+        return None;
+    }
+    Some((
+        event.get("bridgeEpoch")?.as_str()?.to_string(),
+        event.get("sessionIncarnation")?.as_u64()?,
+        event.get("viewRevision")?.as_u64()?,
+    ))
 }
 
 async fn static_asset(uri: Uri) -> Response {
@@ -899,15 +1892,175 @@ mod tests {
         }
     }
 
-    impl QueuedSubscriberEvent {
-        fn into_string(mut self) -> String {
-            std::mem::take(&mut self.event)
-        }
-    }
-
     fn test_hub() -> Arc<BridgeHub> {
         let options = Options::try_parse_from(["attyd", "--", "fake-agent"]).unwrap();
         BridgeHub::new(Arc::new(options))
+    }
+
+    #[test]
+    fn turn_append_requires_a_strong_bounded_history_etag() {
+        assert_eq!(
+            parse_strong_etag("\"epoch:1:7\""),
+            Some("epoch:1:7".to_string())
+        );
+        assert_eq!(parse_strong_etag("W/\"epoch:1:7\""), None);
+        assert_eq!(parse_strong_etag("epoch:1:7"), None);
+        assert_eq!(parse_strong_etag("\"\""), None);
+    }
+
+    #[test]
+    fn session_sse_accepts_only_business_events_and_uses_reset_cursor() {
+        let reset = json!({
+            "type": "bridge/session_reset",
+            "bridgeEpoch": "epoch",
+            "sessionId": "wanted",
+            "sessionIncarnation": 3,
+            "viewRevision": 9,
+        })
+        .to_string();
+        let other = json!({
+            "type": "acp/session_update",
+            "notification": { "sessionId": "other", "update": {} },
+        })
+        .to_string();
+        let runtime = json!({
+            "type": "bridge/runtime_delta",
+            "delta": {
+                "change": {
+                    "kind": "session_upsert",
+                    "session": { "sessionId": "wanted" },
+                },
+            },
+        })
+        .to_string();
+
+        assert!(session_event_matches(&reset, "wanted"));
+        assert!(!session_event_matches(&other, "wanted"));
+        assert!(!session_event_matches(&runtime, "wanted"));
+        assert_eq!(session_event_cursor(&reset).as_deref(), Some("epoch:3:9"));
+    }
+
+    #[test]
+    fn full_session_views_are_reduced_to_reset_tokens_for_sse() {
+        let full = json!({
+            "type": "bridge/session_view",
+            "sessionId": "wanted",
+            "view": {
+                "bridgeEpoch": "epoch",
+                "session": {
+                    "incarnation": 3,
+                    "viewRevision": 9,
+                    "historyRevision": "history-9",
+                    "phase": "ready",
+                    "syncError": null,
+                },
+                "baseline": { "updates": [{ "large": "payload" }] },
+            },
+        })
+        .to_string();
+        let (_, event) = business_session_event(&full).expect("session view becomes reset");
+        let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+
+        assert_eq!(event["type"], "bridge/session_reset");
+        assert_eq!(event["historyRevision"], "history-9");
+        assert!(event.get("baseline").is_none());
+    }
+
+    #[test]
+    fn rest_session_view_is_a_business_projection_without_legacy_runtime_envelopes() {
+        let internal = json!({
+            "bridgeEpoch": "epoch",
+            "session": {
+                "sessionId": "session",
+                "incarnation": 2,
+                "viewRevision": 7,
+                "historyRevision": "history-7",
+                "phase": "running",
+                "syncError": null,
+                "activeTurn": { "operationId": "turn", "updates": [] },
+            },
+            "baseline": {
+                "updates": [{ "sessionUpdate": "agent_message_chunk" }],
+                "bytes": 42,
+                "digest": "debug-only",
+            },
+            "live": {
+                "cwd": "/workspace",
+                "session": { "title": "Agent session" },
+                "controlState": { "current_mode_update": { "currentModeId": "plan" } },
+                "permissions": { "permission": { "request": {} } },
+                "elicitations": {},
+                "urlFlows": {},
+                "terminals": {},
+            },
+        });
+        let view = business_session_view(&internal).expect("valid internal projection");
+
+        assert_eq!(view["sessionId"], "session");
+        assert_eq!(view["timeline"].as_array().unwrap().len(), 1);
+        assert_eq!(view["activeTurn"]["operationId"], "turn");
+        assert_eq!(view["workspace"]["cwd"], "/workspace");
+        assert!(view.get("baseline").is_none());
+        assert!(view.get("live").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_subscription_does_not_queue_unrelated_session_traffic() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+        }
+        let mut subscription = hub
+            .subscribe_session("wanted".to_string())
+            .await
+            .expect("session subscription");
+
+        for index in 0..SUBSCRIBER_QUEUE_CAPACITY * 2 {
+            hub.publish(
+                1,
+                json!({
+                    "type": "bridge/session_delta",
+                    "bridgeEpoch": "epoch",
+                    "sessionId": "other",
+                    "sessionIncarnation": 1,
+                    "fromRevision": index,
+                    "viewRevision": index + 1,
+                    "change": { "kind": "noise" },
+                })
+                .to_string(),
+            )
+            .await;
+        }
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/session_delta",
+                "bridgeEpoch": "epoch",
+                "sessionId": "wanted",
+                "sessionIncarnation": 1,
+                "fromRevision": 0,
+                "viewRevision": 1,
+                "change": { "kind": "visible" },
+            })
+            .to_string(),
+        )
+        .await;
+
+        let event = tokio::time::timeout(Duration::from_millis(100), subscription.events.recv())
+            .await
+            .expect("wanted event was not routed")
+            .expect("session subscription was evicted by unrelated traffic");
+        let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+        assert_eq!(event["sessionId"], "wanted");
+        assert_eq!(event["change"]["kind"], "visible");
+        assert!(subscription.events.try_recv().is_err());
+
+        hub.unsubscribe(subscription.id, subscription.generation)
+            .await;
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
     }
 
     #[test]
@@ -1222,6 +2375,13 @@ mod tests {
                 break;
             }
         }
+        let queried = hub
+            .session_view("test-session".to_string())
+            .await
+            .expect("materialized session view query");
+        assert_eq!(queried["session"]["phase"], "ready");
+        assert!(queried["session"]["historyRevision"].is_string());
+        assert_eq!(queried["baseline"]["updates"], json!([]));
 
         // No session/list precedes this request. The bridge must use the cwd
         // already associated with the tracked session and execute a reload,
@@ -1266,33 +2426,580 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             observer_events.iter().all(|event| {
-                !event.contains("Loaded history.")
-                    && !event.contains("acp/session_attached")
-                    && !event.contains("acp/session_update")
+                !event.contains("acp/session_attached") && !event.contains("acp/session_update")
             }),
-            "load replacement leaked to observer: {observer_events:?}"
+            "private load staging leaked to observer: {observer_events:?}"
+        );
+        assert!(
+            observer_events.iter().any(|event| {
+                let event: serde_json::Value = serde_json::from_str(event).unwrap();
+                event["type"] == "bridge/session_view"
+                    && event["view"]["baseline"]["updates"]
+                        .as_array()
+                        .is_some_and(|updates| {
+                            updates
+                                .iter()
+                                .any(|update| update["content"]["text"] == "Loaded history.")
+                        })
+            }),
+            "the committed authoritative view was not broadcast: {observer_events:?}"
         );
 
-        hub.send_command(
-            requester.id,
-            requester.generation,
-            json!({
-                "type": "session/prompt",
-                "requestId": "after-reload",
-                "sessionId": "test-session",
-                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
+        let refreshed = hub
+            .session_view("test-session".to_string())
+            .await
+            .expect("refreshed session view");
+        let revision = refreshed["session"]["historyRevision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let prompt = vec![json!({ "type": "text", "text": "message-actions-flow" })];
+        let accepted = hub
+            .start_turn(
+                "test-session".to_string(),
+                revision.clone(),
+                "rest-turn".to_string(),
+                prompt.clone(),
+            )
+            .await
+            .expect("REST turn admission");
+        assert_eq!(accepted["disposition"], "accepted");
+        let duplicate = hub
+            .start_turn(
+                "test-session".to_string(),
+                revision,
+                "rest-turn".to_string(),
+                prompt,
+            )
+            .await
+            .expect("idempotent REST retry");
+        assert_eq!(duplicate["disposition"], "duplicate");
+        assert_eq!(duplicate["operationId"], accepted["operationId"]);
         loop {
             let event = next_event(&mut requester).await;
-            if event["type"] == "acp/prompt_complete" && event["requestId"] == "after-reload" {
+            if event["type"] == "acp/prompt_complete" && event["requestId"] == "rest-turn" {
                 break;
             }
         }
 
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_disconnect_does_not_cancel_running_turn_and_reconnect_reads_result() {
+        async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
+            let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge subscriber closed unexpectedly");
+            serde_json::from_str(&queued.into_string()).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut browser = hub.subscribe().await.expect("browser subscription");
+
+        loop {
+            let event = next_event(&mut browser).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+        let created = hub
+            .business_request(json!({
+                "type": "session/new",
+                "requestId": "new-before-disconnect",
+                "cwd": cwd,
+            }))
+            .await
+            .expect("business session creation");
+        assert_eq!(created["sessionId"], "test-session");
+        assert_eq!(created["view"]["session"]["phase"], "ready");
+
+        let initial = hub
+            .session_view("test-session".to_string())
+            .await
+            .expect("new session view");
+        let revision = initial["session"]["historyRevision"]
+            .as_str()
+            .expect("new session revision")
+            .to_string();
+        let accepted = hub
+            .start_turn(
+                "test-session".to_string(),
+                revision.clone(),
+                "turn-before-disconnect".to_string(),
+                vec![json!({ "type": "text", "text": "stream-follow-flow" })],
+            )
+            .await
+            .expect("turn admission");
+        assert_eq!(accepted["disposition"], "accepted");
+
+        hub.unsubscribe(browser.id, browser.generation).await;
+        drop(browser);
+
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = hub
+                    .session_view("test-session".to_string())
+                    .await
+                    .expect("running session remains queryable without subscribers");
+                if view["session"]["phase"] == "ready"
+                    && view["session"]["historyRevision"] != revision
+                {
+                    break view;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Agent turn and reconciliation must finish after disconnect");
+        assert!(completed["session"]["activeTurn"].is_null());
+        assert!(
+            completed["baseline"]["updates"]
+                .as_array()
+                .is_some_and(|updates| updates.iter().any(|update| {
+                    update["sessionUpdate"] == "agent_message_chunk"
+                        && update["content"]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("Stream follow complete."))
+                }))
+        );
+
+        let reconnected = hub.subscribe().await.expect("reconnected subscription");
+        let reloaded = hub
+            .session_view("test-session".to_string())
+            .await
+            .expect("reconnected browser reads bridge projection");
+        assert_eq!(
+            reloaded["session"]["historyRevision"],
+            completed["session"]["historyRevision"]
+        );
+        assert_eq!(reloaded["baseline"], completed["baseline"]);
+        hub.unsubscribe(reconnected.id, reconnected.generation)
+            .await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn agent_error_after_dispatch_reconciles_persisted_output_without_redispatch() {
+        async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
+            let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge subscriber closed unexpectedly");
+            serde_json::from_str(&queued.into_string()).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut browser = hub.subscribe().await.expect("browser subscription");
+        loop {
+            let event = next_event(&mut browser).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+        let created = hub
+            .business_request(json!({
+                "type": "session/new",
+                "requestId": "new-before-error",
+                "cwd": cwd,
+            }))
+            .await
+            .expect("business session creation");
+        let revision = created["view"]["session"]["historyRevision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let prompt = vec![json!({ "type": "text", "text": "error-after-output-flow" })];
+        let accepted = hub
+            .start_turn(
+                "test-session".to_string(),
+                revision.clone(),
+                "error-after-output-intent".to_string(),
+                prompt.clone(),
+            )
+            .await
+            .expect("turn is accepted before the Agent completes it");
+        assert_eq!(accepted["disposition"], "accepted");
+
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = hub
+                    .session_view("test-session".to_string())
+                    .await
+                    .expect("session remains observable after the Agent error");
+                if view["session"]["phase"] == "ready"
+                    && view["session"]["historyRevision"] != revision
+                {
+                    break view;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the errored turn did not reconcile");
+        assert!(
+            completed["baseline"]["updates"]
+                .as_array()
+                .is_some_and(|updates| updates.iter().any(|update| {
+                    update["content"]["text"] == "Output persisted before the Agent error."
+                }))
+        );
+
+        let duplicate = hub
+            .start_turn(
+                "test-session".to_string(),
+                completed["session"]["historyRevision"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                "error-after-output-intent".to_string(),
+                prompt,
+            )
+            .await
+            .expect("repeating the same accepted intent must not redispatch");
+        assert_eq!(duplicate["disposition"], "duplicate");
+        assert_eq!(duplicate["operationId"], accepted["operationId"]);
+
+        hub.unsubscribe(browser.id, browser.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_observers_join_one_retrying_materialization() {
+        async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
+            let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge subscriber closed unexpectedly");
+            serde_json::from_str(&queued.into_string()).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--slow-load",
+            "--fail-load-once",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut browser = hub.subscribe().await.expect("browser subscription");
+        loop {
+            let event = next_event(&mut browser).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+        let listed = hub
+            .business_request(json!({
+                "type": "session/list",
+                "requestId": "list-before-observe",
+            }))
+            .await
+            .expect("business session listing");
+        assert!(listed["sessions"].as_array().is_some_and(|sessions| {
+            sessions
+                .iter()
+                .any(|session| session["sessionId"] == "saved-session")
+        }));
+
+        let first = hub.session_view("saved-session".to_string());
+        let second = hub.session_view("saved-session".to_string());
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first observer joins materialization");
+        let second = second.expect("second observer joins materialization");
+
+        assert_eq!(first["session"]["phase"], "ready");
+        assert_eq!(first["session"], second["session"]);
+        assert_eq!(first["baseline"], second["baseline"]);
+        assert!(
+            first["baseline"]["updates"]
+                .as_array()
+                .is_some_and(|updates| updates
+                    .iter()
+                    .any(|update| { update["content"]["text"] == "Loaded history." }))
+        );
+        hub.unsubscribe(browser.id, browser.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deterministic_cold_materialization_failure_is_sticky_for_observers() {
+        async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
+            let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge subscriber closed unexpectedly");
+            serde_json::from_str(&queued.into_string()).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--fail-load-always",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut browser = hub.subscribe().await.expect("browser subscription");
+        loop {
+            let event = next_event(&mut browser).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+        hub.business_request(json!({
+            "type": "session/list",
+            "requestId": "list-before-failed-observe",
+        }))
+        .await
+        .expect("business session listing");
+
+        let first = hub.session_view("saved-session".to_string()).await;
+        assert!(
+            first.is_err(),
+            "the initiating observer receives the load error"
+        );
+        for _ in 0..3 {
+            let blocked = hub
+                .session_view("saved-session".to_string())
+                .await
+                .expect("later observers read the sticky blocked projection");
+            assert_eq!(blocked["session"]["phase"], "blocked");
+            assert!(
+                blocked["session"]["syncError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("deterministic load failure"))
+            );
+            assert!(blocked["session"]["historyRevision"].is_null());
+        }
+
+        hub.unsubscribe(browser.id, browser.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn different_sessions_run_and_reconcile_independently() {
+        async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
+            let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge subscriber closed unexpectedly");
+            serde_json::from_str(&queued.into_string()).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--race-new",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut observer = hub.subscribe().await.expect("observer subscription");
+        loop {
+            let event = next_event(&mut observer).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+
+        let first = hub
+            .business_request(json!({
+                "type": "session/new",
+                "requestId": "new-one",
+                "cwd": cwd,
+            }))
+            .await
+            .expect("first session");
+        let second = hub
+            .business_request(json!({
+                "type": "session/new",
+                "requestId": "new-two",
+                "cwd": cwd,
+            }))
+            .await
+            .expect("second session");
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let second_id = second["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(first_id, second_id);
+
+        hub.start_turn(
+            first_id.clone(),
+            first["view"]["session"]["historyRevision"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            "long-turn".to_string(),
+            vec![json!({ "type": "text", "text": "stream-follow-flow" })],
+        )
+        .await
+        .expect("long turn admission");
+        hub.start_turn(
+            second_id.clone(),
+            second["view"]["session"]["historyRevision"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            "short-turn".to_string(),
+            vec![json!({ "type": "text", "text": "message-actions-flow" })],
+        )
+        .await
+        .expect("short turn admission");
+
+        let short_completed = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let view = hub.session_view(second_id.clone()).await.unwrap();
+                if view["session"]["phase"] == "ready" {
+                    break view;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("short session was serialized behind an unrelated long session");
+        assert!(short_completed["session"]["activeTurn"].is_null());
+        let long_during_short_completion = hub.session_view(first_id.clone()).await.unwrap();
+        assert!(matches!(
+            long_during_short_completion["session"]["phase"].as_str(),
+            Some("running" | "reconciling")
+        ));
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if hub.session_view(first_id.clone()).await.unwrap()["session"]["phase"] == "ready"
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("long session did not finish");
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deterministic_reconcile_failure_blocks_without_hot_retry() {
+        async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
+            let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge subscriber closed unexpectedly");
+            serde_json::from_str(&queued.into_string()).expect("bridge event must be JSON")
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--invalid-load-mode-once",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut observer = hub.subscribe().await.expect("observer subscription");
+        loop {
+            let event = next_event(&mut observer).await;
+            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                break;
+            }
+        }
+        let created = hub
+            .business_request(json!({
+                "type": "session/new",
+                "requestId": "new-before-invalid-reconcile",
+                "cwd": cwd,
+            }))
+            .await
+            .unwrap();
+        hub.start_turn(
+            "test-session".to_string(),
+            created["view"]["session"]["historyRevision"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            "invalid-reconcile-turn".to_string(),
+            vec![json!({ "type": "text", "text": "message-actions-flow" })],
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let blocked = hub.session_view("test-session".to_string()).await.unwrap();
+        assert_eq!(
+            blocked["session"]["phase"], "blocked",
+            "invalid authoritative replay must block the session: {blocked}"
+        );
+        assert!(blocked["session"]["activeTurn"].is_object());
+        assert!(blocked["session"]["syncError"].is_string());
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            hub.session_view("test-session".to_string()).await.unwrap()["session"]["phase"],
+            "blocked",
+            "a deterministic replay error must not enter a hot retry loop"
+        );
+        hub.unsubscribe(observer.id, observer.generation).await;
         hub.shutdown().await;
     }
 
@@ -1697,15 +3404,13 @@ mod tests {
             "event-count rejection must roll back its byte reservation"
         );
 
-        let (event, lease) = receiver.recv().await.unwrap().into_inflight();
-        assert_eq!(event, "first");
+        let event = receiver.recv().await.unwrap().into_arc();
+        assert_eq!(event.as_ref(), "first");
         assert_eq!(
             sender.queued_bytes.load(Ordering::Acquire),
-            5,
-            "the byte lease must remain charged while WebSocket send is in flight"
+            0,
+            "dequeueing an SSE event must release its queue reservation"
         );
-        drop(lease);
-        assert_eq!(sender.queued_bytes.load(Ordering::Acquire), 0);
         drop(receiver);
         assert!(sender.try_send("closed".to_string()).is_err());
         assert_eq!(
@@ -1713,6 +3418,21 @@ mod tests {
             0,
             "closed-channel rejection must roll back its byte reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn broadcast_payload_is_shared_across_subscriber_backlogs() {
+        let (first, mut first_rx) = SubscriberSender::channel(1);
+        let (second, mut second_rx) = SubscriberSender::channel(1);
+        let payload: Arc<str> = Arc::from("authoritative baseline");
+
+        first.try_send(payload.clone()).unwrap();
+        second.try_send(payload.clone()).unwrap();
+        let first_payload = first_rx.recv().await.unwrap().into_arc();
+        let second_payload = second_rx.recv().await.unwrap().into_arc();
+
+        assert!(Arc::ptr_eq(&payload, &first_payload));
+        assert!(Arc::ptr_eq(&first_payload, &second_payload));
     }
 
     #[tokio::test]

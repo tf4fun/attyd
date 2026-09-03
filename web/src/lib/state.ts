@@ -28,6 +28,7 @@ import type {
   TerminalSnapshot,
 } from "../../../shared/bridge";
 import { assertNever } from "../../../shared/exhaustive";
+import type { BridgeSessionView, SessionSyncPhase } from "./business-api";
 import { randomId } from "./id";
 
 export interface AssistantMessageChunk {
@@ -274,6 +275,7 @@ export interface AppState {
   backgroundEvents: unknown[];
   stderr: string;
   running: boolean;
+  sessionSyncPhase?: SessionSyncPhase;
   agentActivity?: AgentActivity;
   title?: string;
   usage?: { used: number; size: number; cost?: { amount: number; currency: string } | null };
@@ -291,6 +293,7 @@ export interface AppState {
 export type AppAction =
   | { type: "socket/open" }
   | { type: "socket/closed" }
+  | { type: "bridge/session_hydrate"; view: BridgeSessionView }
   | {
       type: "runtime/replay_complete";
       preferredSessionId?: string;
@@ -500,6 +503,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           };
     case "socket/closed":
       return terminateBridgeState(state, "stopped", false);
+    case "bridge/session_hydrate":
+      return hydrateBridgeSession(state, action.view);
     case "runtime/replay_complete": {
       const next = {
         ...(state.runtimeReplacement ?? state),
@@ -2420,6 +2425,7 @@ function resetActiveSession(state: AppState, title?: string): AppState {
     elicitations: requestScopedElicitations(state.elicitations),
     externalFlows: state.externalFlows,
     running: false,
+    sessionSyncPhase: undefined,
     agentActivity: undefined,
     pendingSessionControl: undefined,
     pendingPrompt: undefined,
@@ -2428,6 +2434,113 @@ function resetActiveSession(state: AppState, title?: string): AppState {
     usage: undefined,
     activePlan: undefined,
   };
+}
+
+function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppState {
+  const cached = cacheCurrentSession(state);
+  const listed = cached.sessions.find(({ sessionId }) => sessionId === view.sessionId);
+  const session: NewSessionResponse = {
+    ...(view.workspace.session ?? {}),
+    sessionId: view.sessionId,
+  };
+  let next: AppState = {
+    ...resetActiveSession(cached, listed?.title ?? undefined),
+    cachedSessions: withoutCachedSession(cached.cachedSessions, view.sessionId),
+    cwd: view.workspace.cwd ?? listed?.cwd ?? cached.defaultCwd,
+    session,
+    historyStatus: view.historyRevision == null
+      ? {
+          state: "loading",
+          sessionId: view.sessionId,
+          requestId: `bridge:${view.sessionIncarnation}:${view.viewRevision}`,
+        }
+      : { state: "available", sessionId: view.sessionId },
+    sessionSyncPhase: view.phase,
+    modeId: session.modes?.currentModeId,
+    configOptions: session.configOptions ?? [],
+    permissions: Object.values(view.interactions.permissions).map((pending) => ({
+      permissionId: pending.interactionId,
+      request: pending.request,
+    })),
+    elicitations: Object.values(view.interactions.elicitations).map((pending) => ({
+      elicitationId: pending.interactionId,
+      request: pending.request,
+    })),
+    externalFlows: Object.values(view.interactions.urlFlows).map((flow) => ({
+      elicitationId: flow.elicitationId,
+      sessionId: elicitationSessionId(flow.request),
+      url: flow.request.mode === "url" && "url" in flow.request &&
+          typeof flow.request.url === "string"
+        ? flow.request.url
+        : undefined,
+      message: flow.request.message,
+      status: flow.status,
+    })),
+    terminalSnapshots: Object.values(view.terminals),
+    runtimeOperation: view.operation == null
+      ? undefined
+      : {
+          requestId: view.operation.operationId,
+          operation: bridgeOperationKind(view.operation.kind),
+        },
+  };
+
+  for (const update of view.timeline) {
+    next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
+  }
+  for (const update of Object.values(view.controls)) {
+    next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
+  }
+  if (view.activeTurn != null) {
+    next = startPrompt(
+      next,
+      view.activeTurn.operationId,
+      view.sessionId,
+      view.activeTurn.prompt,
+    );
+    for (const update of view.activeTurn.updates) {
+      next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
+    }
+    if (view.phase !== "running") {
+      next = {
+        ...next,
+        running: view.phase === "reconciling",
+        agentActivity: undefined,
+        pendingPrompt: view.phase === "reconciling" ? next.pendingPrompt : undefined,
+      };
+    }
+  }
+  if (view.syncError != null && view.phase === "blocked") {
+    next = {
+      ...next,
+      timeline: [
+        ...next.timeline,
+        {
+          id: randomId(),
+          type: "error",
+          message: `Session synchronization failed: ${view.syncError}`,
+        },
+      ],
+    };
+  }
+  return next;
+}
+
+function bridgeOperationKind(kind: string): SessionRuntimeOperation {
+  switch (kind) {
+    case "fork":
+    case "close":
+    case "delete":
+    case "mode":
+    case "config":
+      return kind;
+    case "set_mode":
+      return "mode";
+    case "set_config":
+      return "config";
+    default:
+      return "close";
+  }
 }
 
 function cacheCurrentSession(state: AppState): AppState {

@@ -1,246 +1,272 @@
-# Active-turn-only bridge runtime
+# Authoritative-history bridge runtime
 
-This document defines the target runtime and recovery contract for attyd. It supersedes any earlier
-design that kept completed conversation history in the Rust bridge.
+This document defines attyd's runtime and recovery contract. It supersedes the earlier
+active-turn-only design.
 
 ## Decision
 
-The ACP Agent is the only authority for completed session history. The bridge is an in-memory ACP
-client runtime, not a session store, presentation cache, checkpoint database, or write-ahead log.
+The ACP Agent is the only persistent authority for session history. The bridge is a disposable,
+in-memory ACP client and read-through projection. The browser is a presentation layer and never
+supplies history to the bridge or talks ACP directly.
 
-The bridge retains only:
+For every materialized session the bridge owns:
 
-- one active turn per active session;
-- bounded prompts accepted behind that active turn;
-- live ACP resources whose protocol lifecycle has not ended;
-- bounded session identity, cwd, capability, control, lifecycle and operation metadata;
-- bounded transient delivery state for active-turn snapshots and `session/load` replay.
+- one immutable baseline produced by the most recent successful `session/load`, or by atomically
+  committing observed turns when the Agent does not advertise load;
+- at most one active or completed-but-not-yet-reconciled turn overlay;
+- live permission, elicitation, URL, terminal, MCP and control state;
+- bounded idempotency and revision metadata that contains no conversation payload;
+- at most one staged load candidate.
 
-The bridge never retains a completed turn, transcript, Agent replay, completed terminal output, or
-completed debug history after the turn's terminal transition has retired. This rule applies whether
-or not the Agent supports `session/load`.
+Closing the bridge discards all of this state. Restarting reconstructs an idle session only through
+the Agent. No browser state, local database, temporary file or mmap file is a recovery source.
 
-The browser may retain the conversation it has rendered for the lifetime of the page. That state is
-a disposable view and is never accepted by the bridge as session authority.
+## Agent compatibility profile
 
-## Deliberate product consequences
+`loadSession` is preferred but is not required for a newly created, continuously materialized
+session. With load, the Agent replay remains the persistent authority and replaces the bridge
+baseline after every terminal turn. Without load, the bridge skips reconciliation I/O and
+atomically promotes the exact accepted prompt plus observed turn updates into its in-memory
+baseline.
 
-This design intentionally accepts the limits of the connected ACP Agent:
+The no-load mode is deliberately process-local. It supports subsequent turns and browser
+reconnects while the same bridge process retains the session, but it cannot cold-materialize old
+history or recover it after bridge restart. The bridge does not create a database, browser-backed
+history, temporary persistence or a private protocol extension to hide that ACP limitation.
 
-- If `loadSession` is advertised, reopening an idle completed session performs `session/load` and
-  replaces the browser view with exactly the replay the Agent supplies.
-- If `loadSession` is absent, reopening completed history produces `HistoryUnavailable`.
-- `session/resume` does not substitute for replay.
-- An Agent may reject a repeated load of a session that is already active on the ACP connection. The
-  bridge reports that error and does not emulate load, restart the Agent, or reconstruct history.
-- Reloaded history may omit thoughts, terminal output, debug metadata, turn boundaries, stop reasons,
-  or any other content the Agent did not persist. The bridge does not fill those gaps.
-- Browser reconnect may cause one capability-gated, single-flight `session/load`; observer reconnect
-  is no longer required to leave the Agent request trace unchanged.
+While a session is materialized by a bridge, that bridge is assumed to be its only writer. ACP v1
+provides no revision or lease that can prevent a different ACP client from concurrently appending to
+the same Agent session. A replay that violates the recorded prefix/append contract blocks the
+session instead of being guessed into a valid state.
 
-These are protocol/Agent limitations, not reasons to create a second session database in attyd.
+The Agent must emit all updates belonging to a prompt before its `PromptResponse`. ACP v1 does not
+correlate `session/update` with a prompt or load request, so late same-session conversation updates
+cannot be attributed safely.
 
-## Runtime ownership
+## Ownership
 
 ```text
 ACP Agent
-`- sole completed-history authority
+`- sole persistent history authority
 
 Bridge process
-|- bounded connection and session control metadata
-|- ActiveTurn[session_id]                  (zero or one per session)
-|- bounded queued prompts
-|- LiveResourceStore                       (terminal/interaction/URL/MCP)
-|- bounded typed delivery queues
-`- transient LoadTransaction               (zero or one per session)
+|- HistoryCache: SessionKey -> Arc<HistorySnapshot>
+|- ActiveOverlay: zero or one per session
+|- LoadCandidate: zero or one per session
+|- LiveResourceStore
+|- bounded intent/revision metadata
+`- bounded shared subscriber delivery
 
-Browser page
-`- disposable rendered projection
+Browser
+|- rendered projection
+|- unsent draft, queued prompts and visual preferences
+`- user intents carrying bridge revisions
 ```
 
-An active payload has one materialized business representation. Raw diagnostics may exist in a
-small independent ring, but dropping that ring cannot affect liveness, folding, reconnect, cancel,
-or terminal delivery.
+The baseline is a cache, not a second persistent authority. A load-backed baseline is derived from
+`session/load`; a no-load baseline is derived only from prompts accepted by this bridge and ACP
+updates it directly observed. Neither is persisted. Only a load-backed baseline is freely
+evictable, because evicting a no-load baseline would make a live session unrecoverable.
 
-## Per-session state machine
+## Session state machine
 
 ```text
-IdleLoadable | IdleUnavailable
-        | prompt admitted
-        v
-Active(turn_key, revision, normalized_turn)
-        | PromptResponse, prompt error, or transport loss
-        v
-Sealing
-        | Hub commits owned terminal event
-        v
-FinalCommittedPendingRetire
-        | active snapshot leases are cancelled or released
-        v
-IdleLoadable | IdleUnavailable
+Cold
+  | first observe/open
+  v
+Loading -------------------------------> Blocked
+  | valid load                              ^
+  v                                         | deterministic incompatibility
+Ready(Bn, Hn)                               |
+  | prompt(If-Match: Hn)                    |
+  v                                         |
+Running(Bn + live overlay)                  |
+  | PromptResponse / terminal error         |
+  v                                         |
+Reconciling(Bn + completed overlay) --------+
+  | load: valid current candidate
+  | no load: atomic local overlay promotion
+  v
+Ready(Bn+1, Hn+1)
 ```
 
-`turn_key` is `(epoch, session_id, incarnation, operation_id)`. Every update, cancel, terminal
-outcome, reconnect snapshot, and late-event check uses the entire key. A session actor serializes
-these transitions; no ACP callback, terminal reader, subscriber task, or command handler mutates an
-active turn independently.
+`Bn` is an immutable Agent replay. `Hn` is an opaque bridge history revision containing bridge
+epoch, session incarnation and a monotonic generation. It is not a message count, ACP message ID or
+content hash. A canonical replay digest and item count may be stored separately for consistency
+checks.
 
-The transition from `Active` to `FinalCommittedPendingRetire` is the linearization boundary between
-the two reconnect modes:
+New sessions start in `Ready(empty, H0)`. Sessions discovered by `session/list` stay `Cold` until
+selected; attyd does not load every listed session at process startup.
 
-- a reconnect registered before the boundary obtains an expiring active-snapshot lease;
-- a reconnect registered after the boundary must load or receive `HistoryUnavailable`;
-- no reconnect can observe or combine both representations.
+### Initial materialization
 
-The Hub terminal event must own its small payload. It cannot borrow a slice or reference from the
-active turn. A slow subscriber is evicted under the existing byte budget and never pins turn
-retirement. Once all snapshot leases have ended, retirement drops the complete active turn,
-semantic indexes, prompt payload, terminal response/error payload, and turn-scoped diagnostics.
+The first observer of a Cold session starts one single-flight load. Replay updates are validated and
+staged privately. Only a successful response and valid complete candidate atomically install a
+baseline. Concurrent observers join the same load and never see a partial candidate.
 
-## Active-turn folding
+A transient load failure retries with bounded exponential backoff and jitter. A retry begins only
+after the prior request has definitively terminated; if its outcome is uncertain the connection
+must be drained or replaced first. Unsupported, not-found, authorization, invalid replay and hard
+resource-limit failures become visible `Blocked` states rather than hot retry loops.
 
-ACP updates are normalized once in the active turn and published as bounded typed increments.
-There is no cumulative session snapshot and no completed `SessionUpsert`.
+If the Agent does not advertise load, a Cold historical session cannot be materialized. This does
+not affect a new or already materialized no-load session whose baseline is still in bridge memory.
 
-Updates have explicit merge semantics:
+### Turn admission and idempotency
 
-| Update class | Fold rule |
-| --- | --- |
-| user/agent/thought text chunks | append in ACP order; adjacent compatible chunks may be concatenated |
-| tool call start/update | fold by tool-call ID while preserving first-appearance order and patch semantics |
-| plan/config/mode/usage/session info | latest valid semantic value by stable key |
-| compaction | apply its replacement/removal semantics; never infer missing history |
-| permission/elicitation/URL flow | live-resource state transition, not conversation history |
-| terminal output | append delta in the terminal live-resource store; never publish cumulative output per read |
-| unknown valid ACP data | bounded diagnostics only |
-
-Coalescing occurs before enqueueing. Append data can coalesce only when order is preserved. Keyed
-state can coalesce only after partial patches have been folded into a complete entity. Final/control
-traffic has reserved queue capacity and cannot be starved by bulk text or terminal output.
-
-## Active reconnect
-
-An active reconnect must not call the Agent. Snapshot capture and suffix registration form one
-session-actor operation:
-
-1. capture a normalized active snapshot through revision `r`;
-2. register the subscriber for increments starting at `r + 1`;
-3. stream the snapshot in bounded chunks;
-4. buffer only the bounded suffix produced during the snapshot;
-5. release the suffix in order after the snapshot completes.
-
-Snapshot timeout, suffix overflow, disconnect, or slow delivery cancels the snapshot lease and
-disconnects that subscriber. It does not cancel the Agent turn. A subscriber retries from the
-current state and may cross the terminal boundary into load/`HistoryUnavailable`.
-
-## Completed reconnect and load
-
-An idle reconnect follows the negotiated capability exactly:
+The browser appends a turn with two independent guards:
 
 ```text
-loadSession = false  -> HistoryUnavailable
-loadSession = true   -> single-flight Reloading operation
+Idempotency-Key: clientIntentId
+If-Match: historyRevision
 ```
 
-`Reloading` is mutually exclusive with prompt, close, delete, fork, mode/config mutation and another
-load for that session. Reconnect flapping joins the same operation and is rate-limited; it cannot
-create an unbounded sequence of Agent requests.
+Inside one session actor transaction the bridge verifies that the session is `Ready`, the history
+revision matches, and the append slot is unused; it then records the fixed-size intent identity and
+payload digest, transitions to `Running`, and only then dispatches `session/prompt`.
 
-A load is a transient replacement transaction, not retained history:
+- Same key and same digest returns the existing operation without another Agent request.
+- Same key and different digest is an idempotency conflict.
+- A different key for a consumed or stale revision is rejected.
+- A new bridge epoch rejects all revisions from a previous process lifetime.
+- Bridge crash after possible Agent dispatch is `Uncertain`; exactly-once across an unpersisted
+  bridge restart is intentionally not promised.
 
-1. send `replace_begin(load_generation)` to the requesting browser view;
-2. relay replay updates through byte/count-bounded delivery using that generation;
-3. do not install replay into bridge session state;
-4. on a valid successful response, send `replace_commit` and discard all transient replay state;
-5. on Agent error, invalid replay, transport loss, delivery failure, or resource overflow, send a
-   precise failure/`HistoryUnavailable`, discard the transaction, and expose no partial replacement;
-6. if the ACP request can no longer be cancelled, continue draining its messages to the terminal
-   response while discarding them so the connection remains usable.
+Queued prompts are a browser send buffer, not ACP state and not accepted Bridge work. While a
+session is `Running` or `Reconciling`, the browser may keep and edit local queued prompts but does
+not send them to the Bridge. After reconciliation commits, the Bridge publishes the new
+`historyRevision`; the browser takes the queue head, attaches that new revision and submits it as an
+ordinary turn. Only that submission transfers lifecycle ownership to the Bridge.
 
-The browser stages replay by generation and swaps its rendered session only on `replace_commit`.
-This browser staging is disposable rendering state, not bridge or Agent authority. A new prompt is
-not admitted until replay delivery terminates, preventing old replay from appearing after new live
-output.
+Consequently no queue append cursor or speculative Agent-history position is required. If the page
+closes before dispatch, its unsent queue disappears like an unsent composer draft. Two pages may
+have independent local queues; the normal history CAS ensures that at most one can consume the new
+append slot, and the loser must refresh before retrying.
 
-Repeated load of an already active Agent session is best effort because ACP v1 does not provide a
-read-only snapshot or reload idempotency guarantee. Rejection is surfaced; the bridge does not
-automatically close, reconnect, or retry. Agent-specific compatibility, including Goose, is a
-release gate rather than hidden protocol emulation.
+### Active delivery and observers
 
-## Terminal and other live resources
+Prompt input and normalized ACP updates are folded once into the active overlay. Browser disconnect,
+backgrounding, slow delivery, refresh and observer count do not cancel Agent work or call load.
 
-A live resource may outlive the turn that created or referenced it. It is not completed history.
+An observer registered during `Running` or `Reconciling` receives one coherent view:
 
-- A terminal remains live until `terminal/release`, session close/delete, or connection shutdown.
-- Terminal output is stored once in a bounded rolling buffer and sent as output increments.
-- Exit without release remains live because the Agent may still request output or release it.
-- Release immediately removes the output and metadata; a future Agent replay containing only its
-  terminal ID renders `output unavailable`.
-- Pending permission, elicitation, accepted URL flow, MCP call, responder and waiter each have an
-  explicit terminal transition and are removed at that point.
-- Turn completion removes only turn-scoped state. It cannot remove a resource whose ACP lifecycle is
-  still live.
+```text
+immutable baseline + current overlay + independent live resources
+```
 
-Every live-resource class has both count and aggregate-byte limits. Terminal, MCP and auth processes
-also require process-group termination, reader cancellation, saved join handles and bounded cleanup.
+Snapshot capture and suffix registration are one actor operation. Each snapshot/delta carries
+bridge epoch, session incarnation and view revision. A continuous cursor receives the bounded
+suffix; an old epoch, gap, reordering or expired suffix receives a reset snapshot. Crossing a
+reconciliation commit yields either old baseline plus overlay or the new baseline, never a mixture.
 
-## Memory and queue bounds
+### Reconciliation
 
-The initial implementation remains entirely in memory. File-backed or mmap storage is deliberately
-deferred until measurements show that a single bounded active representation is still too large.
+A terminal Prompt result does not immediately retire its overlay. It transitions the session to
+`Reconciling` and selects one of two commit paths from the immutable initialized capability set.
+With load support, it starts one bridge-owned `session/load`; that load is not associated with a
+browser or observer. Without load support, it performs no Agent I/O and promotes the completed
+overlay into the existing in-memory baseline.
 
-Hard limits are required for:
+Replay is built in a separately accounted candidate. Before commit the bridge validates:
 
-- active-turn bytes and event/entity count per session;
-- aggregate active-turn bytes across all sessions;
-- queued prompt count and bytes per session and globally;
-- live-resource count and bytes by class and globally;
-- bridge-to-Hub, Hub-to-subscriber and SDK-facing queue items and bytes;
-- simultaneous large-event processing bytes;
-- active snapshot count, suffix bytes and deadline;
-- concurrent load count and replay delivery bytes.
+- ACP structural and semantic validity;
+- item and byte limits;
+- session identity and current attempt/connection generation;
+- the configured stable-prefix/append rule;
+- visibility of the completed accepted prompt/turn.
 
-Admission reserves global capacity before dispatching a prompt or load. Capacity exhaustion causes
-backpressure, a precise rejection, or an explicit uncertain/truncated terminal path; it never causes
-an unbounded enqueue or silent semantic loss.
+On success, one atomic transaction swaps the baseline, advances `historyRevision`, removes the
+overlay and candidate, and changes the phase to `Ready`. Even an identical replay advances the
+revision so the consumed append slot cannot be reused.
 
-After warm-up, repeated completed turns must return logical retained bytes to the same bounded
-baseline. The allocator may keep anonymous pages at a high-water mark, but RSS must plateau rather
-than grow with completed-turn count.
+The no-load transaction folds synthetic `user_message_chunk` updates for the accepted prompt and
+the already validated active updates onto the prior baseline. Limit, phase, incarnation and
+operation checks complete before replacement. Failure preserves the prior baseline and completed
+overlay and exposes `Blocked`; success advances the same opaque revision/idempotency ledger used by
+the load-backed path.
 
-## Removal ledger
+On retryable failure, only the candidate is dropped. The old baseline and completed overlay remain
+visible while a single retry task backs off. No prompt, load, close, delete, fork or config mutation
+may overlap that same-session reconciliation.
 
-The completed-history paths from the previous implementation have been removed:
+## Live resources
 
-- `SessionRuntime.transcript`, `observed_turns`, history gaps and replay baselines no longer exist;
-- completed intent results/tombstones no longer exist; a live intent stores only a fixed SHA-256
-  digest and identity, and terminal intents are retired;
-- prompt terminal transitions remove the active prompt, folded updates and every payload-bearing
-  delta prefix before publishing the idle session revision;
-- the Hub's canonical projection contains only the bounded active runtime and control metadata;
-- the browser delivery projection filters idle session shells and retains only active-turn/live
-  resource events; it is named `ActiveRuntimeProjection` to make that boundary explicit;
-- load replay is requester-private transient delivery and is never inserted into either projection;
-- terminal output is published incrementally and retained only in a bounded live-terminal buffer;
-  release deletes that buffer and its metadata immediately;
-- session responses retained by the bridge are reduced to `sessionId`, `modes` and
-  `configOptions`; arbitrary Agent `_meta` payloads remain one-shot protocol output.
+Permission and elicitation state needed by an active turn is part of the live projection, but live
+resources are not assumed to be history. A terminal, accepted URL flow or MCP operation may outlive
+the turn that introduced it and is retained until its own protocol terminal transition. Baseline
+commit clears only the reconciled overlay and turn-scoped interactions.
 
-The remaining canonical snapshot/delta and active delivery projection are active-reconnect
-mechanisms, not completed-history fallbacks. Neither may make an idle session locally replayable.
+## Memory model
 
-## TDD gates
+History must not be embedded in `SessionRuntime`, canonical deltas, raw event journals or one String
+per subscriber. Existing runtime snapshots clone sessions on every mutation, so embedding complete
+history there would multiply memory and serialization work.
 
-1. **Specification gate:** this authority, retention, reconnect and resource contract is reflected in
-   the state-machine ledger and ACP coverage documentation.
-2. **Red-test gate:** deterministic unit/integration tests fail against every old retention path and
-   cumulative terminal path before production behavior changes.
-3. **State gate:** active folding, terminal retirement, active reconnect and load/
-   `HistoryUnavailable` transitions pass with injected small limits.
-4. **Bound gate:** byte/count limits, slow consumers, reconnect storms and multiple sessions plateau
-   under deterministic fault injection.
-5. **Protocol gate:** stdio, HTTP/SSE and WS fixtures plus the Goose canary pass the same contract.
-6. **Browser gate:** replacement generations commit/rollback atomically and active reconnect equals
-   uninterrupted rendering.
-7. **Removal gate:** all completed-history/cache code is deleted, then the complete suite and soak
-   tests pass without compatibility fallback.
+The implementation uses an independent store:
+
+```text
+HistoryCache<SessionKey, Arc<HistorySnapshot>>
+RuntimeState { phase, historyRevision, overlay, live resources, ... }
+LoadTransaction { candidate, byte reservation, attempt }
+```
+
+Budgets cover per-session and global baseline bytes, overlay bytes, candidate bytes, shared snapshot
+delivery, subscribers and all live-resource classes. Reconciliation peak memory includes the old
+baseline, completed overlay and candidate simultaneously. A candidate that cannot reserve capacity
+fails without truncating or modifying the current view.
+
+Pressure-triggered LRU may evict only a load-backed `Ready` session with no observers, operation,
+interaction or live resource. `Loading`, `Running`, `Reconciling`, observed and no-load sessions
+are pinned. Eviction keeps only a small Cold handle; the next observation performs one load. Close,
+delete and bridge shutdown release baselines, candidates and retry tasks.
+
+## Browser API direction
+
+The browser-facing surface is business semantics, independent of ACP transport details:
+
+```text
+GET  /api/v1/sessions/:id
+GET  /api/v1/sessions/:id/events       (SSE)
+POST /api/v1/sessions/:id/turns
+POST /api/v1/sessions/:id/turns/:turn/cancel
+POST /api/v1/sessions/:id/interactions/:interaction/response
+```
+
+A view includes `bridgeEpoch`, `sessionIncarnation`, `historyRevision`, `viewRevision`, phase,
+baseline, active overlay, live resources and any synchronization error. HTTP command acknowledgement
+and SSE delivery may race; stable intent/entity IDs make either order converge.
+
+The removed raw browser WebSocket protocol is not a compatibility fallback. The business REST/SSE
+surface never owns ACP lifecycle semantics, history folding or reconnect decisions.
+
+## Non-negotiable invariants
+
+- **H01 Authority:** a load-backed baseline comes from one successful Agent load; a no-load
+  baseline contains only prior bridge memory plus the exact accepted prompt and observed updates.
+- **H02 Atomicity:** a candidate is either installed in full or never visible.
+- **H03 Single overlay:** one session has at most one running/reconciling turn.
+- **H04 No active load:** observers never cause load during Running or Reconciling.
+- **H05 Reconcile retention:** terminal output remains in the overlay until baseline commit.
+- **H06 CAS:** one history revision admits at most one distinct turn append.
+- **H07 Idempotency:** one intent key/digest dispatches at most once per bridge epoch.
+- **H08 Per-session exclusion:** load, prompt and session mutations never overlap for one session.
+- **H09 Observer independence:** subscriber lifecycle cannot affect Agent work.
+- **H10 Generation isolation:** old epoch/incarnation/attempt events cannot mutate current state.
+- **H11 Live-resource independence:** baseline replacement cannot retire unrelated live resources.
+- **H12 Bounded memory:** baseline, overlay, candidate and delivery are byte-accounted globally.
+- **H13 Safe eviction:** only unobserved Ready baselines are evictable.
+- **H14 Honest uncertainty:** lost non-idempotent outcomes are never blindly redispatched.
+- **H15 No persistence:** bridge history state disappears with the bridge process.
+
+## Delivery order
+
+Implementation follows TDD in this order:
+
+1. replace the old active-only specification and tests;
+2. introduce the independent shared HistoryCache and pure state transitions;
+3. retain completed overlay and implement single-flight reconciliation;
+4. expose coherent baseline-plus-overlay snapshots to observers;
+5. enforce CAS/idempotency and move unsent queued prompts entirely into the browser;
+6. move browser reads and commands to the business API/SSE surface;
+7. remove the old requester-private load replacement and active-only projection paths;
+8. pass transport, browser, fault-injection, memory and Goose compatibility gates.

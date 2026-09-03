@@ -4,6 +4,7 @@ mod bridge;
 mod elicitation_validation;
 mod event_queue;
 mod filesystem;
+mod history_cache;
 mod mcp;
 mod mcp_config;
 mod options;
@@ -11,6 +12,7 @@ mod runtime_cache;
 mod runtime_state;
 mod semantic;
 mod server;
+mod session_mirror;
 mod terminal;
 
 use anyhow::Result;

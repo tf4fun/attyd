@@ -1,921 +1,561 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import type {
-  AgentCapabilities,
   ContentBlock,
   CreateElicitationResponse,
   RequestPermissionResponse,
   SessionInfo,
 } from "@agentclientprotocol/sdk";
-import type { ClientCommand, ServerEvent } from "../../../shared/bridge";
-import type {
-  WorkspaceContextAttachment,
-  WorkspaceContextMatch,
-} from "../../../shared/bridge";
-import { parseServerEvent } from "../../../shared/bridge";
+import type { ServerEvent } from "../../../shared/bridge";
+import {
+  type BridgeSessionView,
+  type CreatedSessionResult,
+  type GlobalBusinessEvent,
+  type RuntimeView,
+  type SessionBusinessEvent,
+  type SessionListResult,
+  type StartTurnResult,
+  type WorkspaceContextAttachment,
+  type WorkspaceContextMatch,
+  parseGlobalBusinessEvent,
+  parseSessionBusinessEvent,
+  requestJson,
+  strongEtag,
+  workspaceContextSearchPath,
+} from "./business-api";
 import { randomId } from "./id";
 import { appReducer, initialState } from "./state";
 
-type SessionAttachCommand = "session/load";
-
-interface SessionAttachTarget {
-  sessionId: string;
-  cwd?: string;
-  title?: string | null;
-}
-
-export type StartupHistoryStrategy =
-  | { kind: "active_local" }
-  | { kind: "list_then_load"; method: SessionAttachCommand }
-  | { kind: "direct_load"; method: SessionAttachCommand; sessionId: string }
-  | { kind: "history_unavailable"; sessionId: string }
-  | { kind: "none" };
-
-interface StartupState {
-  started: boolean;
-  initialized?: boolean;
-  runtimeRestored?: boolean;
-  runtimeSessionCount?: number;
-  runtimeAuthPending?: boolean;
-  runtimeListRequestId?: string;
-  capabilities?: AgentCapabilities | null;
-  listRequestId?: string;
-  attachRequestId?: string;
-  sessionRequestId?: string;
-  attachMethod?: SessionAttachCommand;
-  authRequestId?: string;
-  retryAfterAuth?: boolean;
-  discoveredSessions?: SessionInfo[];
-}
-
-type PendingContextRequest =
-  | {
-      kind: "search";
-      timer: ReturnType<typeof setTimeout>;
-      resolve: (matches: WorkspaceContextMatch[]) => void;
-      reject: (error: Error) => void;
-    }
-  | {
-      kind: "read";
-      timer: ReturnType<typeof setTimeout>;
-      resolve: (attachment: WorkspaceContextAttachment) => void;
-      reject: (error: Error) => void;
-    };
-
-const CONTEXT_REQUEST_TIMEOUT_MS = 8_000;
-export const RESUME_PROBE_TIMEOUT_MS = 2_500;
-const WEB_SOCKET_OPEN = 1;
-const WEB_SOCKET_CONNECTING = 0;
 const LAST_SESSION_STORAGE_KEY = "attyd:last-session-id";
-
-export function shouldReconnectAfterResume(
-  _hiddenAt: number | undefined,
-  _now: number,
-  socketReadyState: number,
-): boolean {
-  return socketReadyState !== WEB_SOCKET_OPEN;
-}
 
 export function useAcp() {
   const [state, dispatch] = useReducer(appReducer, initialState);
-  const socketRef = useRef<WebSocket | undefined>(undefined);
-  const startup = useRef<StartupState>({ started: false });
-  const terminalReloadTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const reconnectRef = useRef<() => void>(() => window.location.reload());
-  const pendingContextRequests = useRef(new Map<string, PendingContextRequest>());
-  const pendingSessionRequests = useRef(new Map<string, {
-    kind: "new" | "attach" | "fork" | "close" | "delete";
-    sessionId?: string;
-  }>());
-  const transmit = useCallback((command: ClientCommand) =>
-    sendClientCommand(socketRef.current, command, (message) => {
-      dispatch({ type: "client/error", message });
-    }), []);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  const globalEventsRef = useRef<EventSource | undefined>(undefined);
+  const sessionEventsRef = useRef<EventSource | undefined>(undefined);
+  const activeSessionIdRef = useRef<string | undefined>(undefined);
+  const sessionViewRef = useRef<BridgeSessionView | undefined>(undefined);
+  const refreshInFlightRef = useRef(false);
+  const refreshPendingRef = useRef(false);
+  const reconnectRef = useRef<() => void>(() => undefined);
+  const refreshSessionRef = useRef<(sessionId: string) => void>(() => undefined);
+
+  const reportError = useCallback((error: unknown) => {
+    dispatch({
+      type: "client/error",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }, []);
+
+  const reportRequestError = useCallback((
+    error: unknown,
+    requestId: string,
+    operation: Extract<ServerEvent, { type: "bridge/error" }>["operation"],
+  ) => {
+    dispatch({
+      type: "server/event",
+      event: {
+        type: "bridge/error",
+        requestId,
+        operation,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }, []);
+
+  const hydrateSession = useCallback((view: BridgeSessionView) => {
+    if (activeSessionIdRef.current !== view.sessionId) return;
+    const current = sessionViewRef.current;
+    if (
+      current != null &&
+      current.sessionId === view.sessionId &&
+      current.bridgeEpoch === view.bridgeEpoch &&
+      current.sessionIncarnation === view.sessionIncarnation &&
+      view.viewRevision < current.viewRevision
+    ) return;
+    sessionViewRef.current = view;
+    storeSessionId(view.sessionId);
+    dispatch({ type: "bridge/session_hydrate", view });
+  }, []);
+
+  const refreshSession = useCallback((sessionId: string) => {
+    if (activeSessionIdRef.current !== sessionId) return;
+    if (refreshInFlightRef.current) {
+      refreshPendingRef.current = true;
+      return;
+    }
+    refreshInFlightRef.current = true;
+    void (async () => {
+      try {
+        do {
+          refreshPendingRef.current = false;
+          const view = await requestJson<BridgeSessionView>(
+            `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+          );
+          if (activeSessionIdRef.current !== sessionId) return;
+          hydrateSession(view);
+        } while (refreshPendingRef.current && activeSessionIdRef.current === sessionId);
+      } catch (error) {
+        if (activeSessionIdRef.current === sessionId) reportError(error);
+      } finally {
+        refreshInFlightRef.current = false;
+        if (refreshPendingRef.current && activeSessionIdRef.current === sessionId) {
+          refreshPendingRef.current = false;
+          refreshSessionRef.current(sessionId);
+        }
+      }
+    })();
+  }, [hydrateSession, reportError]);
+  refreshSessionRef.current = refreshSession;
+
+  const connectSessionEvents = useCallback((sessionId: string) => {
+    sessionEventsRef.current?.close();
+    const source = new EventSource(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/events`,
+    );
+    sessionEventsRef.current = source;
+    source.onmessage = ({ data }) => {
+      let event: SessionBusinessEvent;
+      try {
+        event = parseSessionBusinessEvent(String(data));
+      } catch (error) {
+        reportError(error);
+        return;
+      }
+      if (activeSessionIdRef.current !== event.sessionId) return;
+      const current = sessionViewRef.current;
+      if (event.type === "bridge/session_reset") {
+        if (
+          current == null ||
+          current.bridgeEpoch !== event.bridgeEpoch ||
+          current.sessionIncarnation !== event.sessionIncarnation ||
+          current.viewRevision !== event.viewRevision
+        ) {
+          refreshSessionRef.current(sessionId);
+        }
+        return;
+      }
+      if (
+        current == null ||
+        current.bridgeEpoch !== event.bridgeEpoch ||
+        current.sessionIncarnation !== event.sessionIncarnation ||
+        current.viewRevision !== event.fromRevision
+      ) {
+        refreshSessionRef.current(sessionId);
+        return;
+      }
+      sessionViewRef.current = { ...current, viewRevision: event.viewRevision };
+      if (event.change.kind === "turn_update" && event.change.update != null) {
+        dispatch({
+          type: "server/event",
+          event: {
+            type: "acp/session_update",
+            notification: { sessionId, update: event.change.update },
+          },
+        });
+      } else {
+        refreshSessionRef.current(sessionId);
+      }
+    };
+    source.onerror = () => {
+      // Native EventSource retry plus the server reset token repairs missed deltas.
+    };
+  }, [reportError]);
+
+  const activateSession = useCallback((session: SessionInfo, transition = true) => {
+    if (activeSessionIdRef.current === session.sessionId && sessionViewRef.current != null) {
+      refreshSessionRef.current(session.sessionId);
+      return;
+    }
+    const requestId = randomId();
+    activeSessionIdRef.current = session.sessionId;
+    sessionViewRef.current = undefined;
+    refreshPendingRef.current = false;
+    sessionEventsRef.current?.close();
+    if (transition) {
+      dispatch({
+        type: "session/transition_start",
+        kind: "attach",
+        requestId,
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        title: session.title,
+      });
+    }
+    connectSessionEvents(session.sessionId);
+    refreshSessionRef.current(session.sessionId);
+  }, [connectSessionEvents]);
+
+  const refreshSessionList = useCallback(async (cursor?: string) => {
+    const suffix = cursor == null ? "" : `?${new URLSearchParams({ cursor })}`;
+    const response = await requestJson<SessionListResult>(`/api/v1/sessions${suffix}`);
+    dispatch({
+      type: "server/event",
+      event: {
+        type: "acp/sessions_listed",
+        requestId: randomId(),
+        cursor,
+        response,
+      },
+    });
+    return response;
+  }, []);
+
+  const refreshRuntime = useCallback(async (selectInitialSession: boolean) => {
+    try {
+      const runtime = await requestJson<RuntimeView>("/api/v1/runtime");
+      dispatch({ type: "socket/open" });
+      if (runtime.hello != null) dispatch({ type: "server/event", event: runtime.hello });
+      if (runtime.initialized != null) {
+        dispatch({ type: "server/event", event: runtime.initialized });
+      }
+      if (runtime.error != null) dispatch({ type: "server/event", event: runtime.error });
+      if (runtime.phase != null) dispatch({ type: "server/event", event: runtime.phase });
+      else if (!runtime.connected) dispatch({ type: "socket/closed" });
+
+      const listed = await refreshSessionList();
+      if (!selectInitialSession || activeSessionIdRef.current != null) return;
+      const stored = readStoredSessionId();
+      const selected = stored == null
+        ? mostRecentSession(listed.sessions)
+        : listed.sessions.find(({ sessionId }) => sessionId === stored) ??
+          { sessionId: stored, cwd: "" };
+      if (selected != null) activateSession(selected, false);
+    } catch (error) {
+      dispatch({ type: "socket/closed" });
+      reportError(error);
+    }
+  }, [activateSession, refreshSessionList, reportError]);
+
+  const handleGlobalEvent = useCallback((event: GlobalBusinessEvent) => {
+    switch (event.type) {
+      case "bridge/connection":
+        dispatch({
+          type: "server/event",
+          event: { type: "bridge/phase", phase: event.phase },
+        });
+        if (event.phase === "ready" && activeSessionIdRef.current != null) {
+          refreshSessionRef.current(activeSessionIdRef.current);
+        }
+        return;
+      case "bridge/connection_error":
+        dispatch({
+          type: "server/event",
+          event: {
+            type: "bridge/error",
+            message: event.message,
+            code: event.code,
+            data: event.data,
+          },
+        });
+        return;
+      default:
+        dispatch({ type: "server/event", event: event as ServerEvent });
+    }
+  }, []);
+
+  const connectGlobalEvents = useCallback(() => {
+    globalEventsRef.current?.close();
+    const source = new EventSource("/api/v1/events");
+    globalEventsRef.current = source;
+    source.onopen = () => {
+      dispatch({ type: "socket/open" });
+      void refreshRuntime(false);
+    };
+    source.onmessage = ({ data }) => {
+      try {
+        handleGlobalEvent(parseGlobalBusinessEvent(String(data)));
+      } catch (error) {
+        reportError(error);
+      }
+    };
+    source.onerror = () => dispatch({ type: "socket/closed" });
+  }, [handleGlobalEvent, refreshRuntime, reportError]);
+
   const reconnect = useCallback(() => reconnectRef.current(), []);
 
   useEffect(() => {
-    startup.current = {
-      started: false,
-      discoveredSessions: [],
-    };
-    const preferredSessionId = readStoredSessionId();
-    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${location.host}/ws`);
-    socketRef.current = socket;
-    let hiddenAt: number | undefined;
-    let reconnecting = false;
-    let resumeProbe: {
-      nonce: string;
-      timer: ReturnType<typeof setTimeout>;
-    } | undefined;
-
-    const finishSessionDiscovery = () => {
-      startup.current = {
-        ...startup.current,
-        started: true,
-        listRequestId: undefined,
-        attachRequestId: undefined,
-        sessionRequestId: undefined,
-      };
-    };
-
-    const attachStartupSession = (
-      session: SessionAttachTarget,
-      method: SessionAttachCommand,
-    ) => {
-      const requestId = randomId();
-      startup.current = {
-        ...startup.current,
-        started: true,
-        listRequestId: undefined,
-        attachRequestId: requestId,
-        sessionRequestId: undefined,
-      };
-      if (sendClientCommand(socket, {
-        type: method,
-        requestId,
-        sessionId: session.sessionId,
-      }, (message) => dispatch({ type: "client/error", message }))) {
-        pendingSessionRequests.current.set(requestId, {
-          kind: "attach",
-          sessionId: session.sessionId,
-        });
-        dispatch({
-          type: "session/transition_start",
-          kind: "attach",
-          requestId,
-          sessionId: session.sessionId,
-          cwd: session.cwd,
-          title: session.title,
-        });
-      } else {
-        finishSessionDiscovery();
+    let disposed = false;
+    const reconnectStreams = () => {
+      if (disposed) return;
+      connectGlobalEvents();
+      const sessionId = activeSessionIdRef.current;
+      if (sessionId != null) {
+        connectSessionEvents(sessionId);
+        refreshSessionRef.current(sessionId);
       }
     };
+    reconnectRef.current = reconnectStreams;
+    connectGlobalEvents();
+    void refreshRuntime(true);
 
-    const startSessionDiscovery = (
-      capabilities: AgentCapabilities | null | undefined,
-    ) => {
-      const attachMethod = startupAttachMethod(capabilities);
-      const strategy = startupHistoryStrategy(
-        capabilities,
-        false,
-        preferredSessionId,
-      );
-      startup.current = {
-        ...startup.current,
-        started: true,
-        capabilities,
-        attachMethod,
-        authRequestId: undefined,
-        retryAfterAuth: false,
-        discoveredSessions: [],
-      };
-      if (strategy.kind === "list_then_load") {
-        const requestId = randomId();
-        startup.current = {
-          ...startup.current,
-          listRequestId: requestId,
-          attachRequestId: undefined,
-          sessionRequestId: undefined,
-        };
-        if (!sendClientCommand(socket, {
-          type: "session/list",
-          requestId,
-        }, (message) => dispatch({ type: "client/error", message }))) {
-          finishSessionDiscovery();
-        }
-        return;
-      }
-      if (strategy.kind === "direct_load") {
-        attachStartupSession({ sessionId: strategy.sessionId }, strategy.method);
-        return;
-      }
-      if (strategy.kind === "history_unavailable") {
-        dispatch({
-          type: "history/unavailable",
-          sessionId: strategy.sessionId,
-          reason: "load_not_supported",
-        });
-      }
-      finishSessionDiscovery();
+    const recoverClosedStreams = () => {
+      if (
+        globalEventsRef.current?.readyState === EventSource.CLOSED ||
+        (activeSessionIdRef.current != null &&
+          sessionEventsRef.current?.readyState === EventSource.CLOSED)
+      ) reconnectStreams();
     };
-
-    const rejectPendingContext = (message: string) => {
-      for (const pending of pendingContextRequests.current.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error(message));
-      }
-      pendingContextRequests.current.clear();
-    };
-
-    const reconnectByReload = () => {
-      if (reconnecting) return;
-      reconnecting = true;
-      if (resumeProbe) clearTimeout(resumeProbe.timer);
-      resumeProbe = undefined;
-      rejectPendingContext("ACP connection is restarting after the page resumed");
-      socket.close();
-      window.location.reload();
-    };
-    reconnectRef.current = reconnectByReload;
-
-    const probeConnection = () => {
-      if (reconnecting) return;
-      if (socket.readyState === WEB_SOCKET_CONNECTING) return;
-      if (socket.readyState !== WebSocket.OPEN) {
-        reconnectByReload();
-        return;
-      }
-      if (resumeProbe) clearTimeout(resumeProbe.timer);
-      const nonce = randomId();
-      if (!sendClientCommand(socket, { type: "bridge/ping", nonce }, reconnectByReload)) return;
-      resumeProbe = {
-        nonce,
-        timer: setTimeout(reconnectByReload, RESUME_PROBE_TIMEOUT_MS),
-      };
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "hidden") {
-        hiddenAt = Date.now();
-        return;
-      }
-      if (shouldReconnectAfterResume(hiddenAt, Date.now(), socket.readyState)) {
-        reconnectByReload();
-      } else {
-        hiddenAt = undefined;
-        probeConnection();
-      }
-    };
-    const handlePageShow = (_event: PageTransitionEvent) => {
-      if (shouldReconnectAfterResume(hiddenAt, Date.now(), socket.readyState)) {
-        reconnectByReload();
-      } else {
-        hiddenAt = undefined;
-        probeConnection();
-      }
-    };
-    const handlePageHide = () => { hiddenAt = Date.now(); };
-    const handleOnline = () => probeConnection();
-    // Some mobile browsers resume with neither a fresh pageshow nor a reliable
-    // visibility transition. A focus-time round trip catches sockets that are
-    // still reported OPEN locally but no longer reach the server.
-    const handleFocus = () => probeConnection();
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("pageshow", handlePageShow);
-    window.addEventListener("pagehide", handlePageHide);
-    window.addEventListener("online", handleOnline);
-    window.addEventListener("focus", handleFocus);
-
-    socket.addEventListener("open", () => dispatch({ type: "socket/open" }));
-    socket.addEventListener("close", () => {
-      rejectPendingContext("ACP WebSocket closed while preparing workspace context");
-      dispatch({ type: "socket/closed" });
-    });
-    socket.addEventListener("message", ({ data }) => {
-      let event: ServerEvent;
-      try {
-        event = parseServerEvent(String(data));
-      } catch (error) {
-        dispatch({
-          type: "client/error",
-          message: `Invalid server event: ${error instanceof Error ? error.message : String(error)}`,
-        });
-        return;
-      }
-      if (event.type === "bridge/pong") {
-        if (resumeProbe?.nonce === event.nonce) {
-          clearTimeout(resumeProbe.timer);
-          resumeProbe = undefined;
-        }
-        return;
-      }
-      if (
-        event.type === "bridge/context_search_result" ||
-        event.type === "bridge/context_attached"
-      ) {
-        const pending = pendingContextRequests.current.get(event.requestId);
-        if (
-          (event.type === "bridge/context_search_result" && pending?.kind === "search") ||
-          (event.type === "bridge/context_attached" && pending?.kind === "read")
-        ) {
-          clearTimeout(pending.timer);
-          pendingContextRequests.current.delete(event.requestId);
-          if (event.type === "bridge/context_search_result" && pending.kind === "search") {
-            pending.resolve(event.matches);
-          } else if (event.type === "bridge/context_attached" && pending.kind === "read") {
-            pending.resolve(event.attachment);
-          }
-        }
-        return;
-      }
-      if (event.type === "bridge/error" && event.requestId) {
-        const pending = pendingContextRequests.current.get(event.requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          pendingContextRequests.current.delete(event.requestId);
-          pending.reject(new Error(event.message));
-          return;
-        }
-      }
-      dispatch({ type: "server/event", event });
-      if (event.type === "bridge/auth_terminal_started") {
-        startup.current = {
-          ...startup.current,
-          runtimeAuthPending: true,
-          authRequestId: event.requestId,
-        };
-      }
-      if (event.type === "bridge/runtime_replay_complete") {
-        const preferred = preferredSessionId != null &&
-            event.sessionIds.includes(preferredSessionId)
-          ? preferredSessionId
-          : undefined;
-        const fallback = event.sessionIds.at(-1);
-        const selected = preferred ?? fallback;
-        if (selected != null) storeSessionId(selected);
-        startup.current = {
-          ...startup.current,
-          started: event.sessionIds.length > 0,
-          runtimeRestored: true,
-          runtimeSessionCount: event.sessionIds.length,
-        };
-        dispatch({
-          type: "runtime/replay_complete",
-          preferredSessionId: preferred,
-          fallbackSessionId: fallback,
-        });
-        return;
-      }
-      const pendingSession = "requestId" in event && typeof event.requestId === "string"
-        ? pendingSessionRequests.current.get(event.requestId)
-        : undefined;
-      if (event.type === "acp/session_created") {
-        if (pendingSession?.kind === "new") {
-          storeSessionId(event.response.sessionId);
-          pendingSessionRequests.current.delete(event.requestId);
-        }
-      } else if (event.type === "acp/session_attached") {
-        if (pendingSession?.kind === "attach") {
-          storeSessionId(event.sessionId);
-          pendingSessionRequests.current.delete(event.requestId);
-        }
-      } else if (event.type === "acp/session_forked") {
-        if (pendingSession?.kind === "fork") {
-          storeSessionId(event.response.sessionId);
-          pendingSessionRequests.current.delete(event.requestId);
-        }
-      } else if (
-        (event.type === "acp/session_closed" || event.type === "acp/session_deleted") &&
-        (pendingSession?.kind === "close" || pendingSession?.kind === "delete")
-      ) {
-        if (readStoredSessionId() === event.sessionId) storeSessionId(undefined);
-        pendingSessionRequests.current.delete(event.requestId);
-      } else if (event.type === "bridge/error" && event.requestId) {
-        pendingSessionRequests.current.delete(event.requestId);
-      }
-      if (
-        event.type === "bridge/auth_terminal_exited" &&
-        event.status === "succeeded"
-      ) {
-        startup.current = {
-          ...startup.current,
-          authRequestId: undefined,
-          retryAfterAuth: false,
-        };
-        terminalReloadTimer.current = setTimeout(() => window.location.reload(), 350);
-        return;
-      }
-      if (
-        event.type === "bridge/auth_terminal_exited" &&
-        startup.current.runtimeAuthPending &&
-        event.requestId === startup.current.authRequestId
-      ) {
-        const shouldDiscover = startup.current.initialized === true &&
-          (startup.current.runtimeSessionCount ?? 0) === 0;
-        const capabilities = startup.current.capabilities;
-        startup.current = {
-          ...startup.current,
-          runtimeAuthPending: false,
-          authRequestId: undefined,
-        };
-        if (shouldDiscover) startSessionDiscovery(capabilities);
-        return;
-      }
-      if (event.type === "acp/initialized" && startup.current.runtimeRestored) {
-        const capabilities = event.response.agentCapabilities;
-        if (startup.current.runtimeAuthPending) {
-          startup.current = {
-            ...startup.current,
-            initialized: true,
-            capabilities,
-            runtimeRestored: false,
-          };
-          return;
-        }
-        if ((startup.current.runtimeSessionCount ?? 0) === 0) {
-          startup.current = {
-            ...startup.current,
-            initialized: true,
-            capabilities,
-            runtimeRestored: false,
-          };
-          startSessionDiscovery(capabilities);
-          return;
-        }
-        const requestId = capabilities?.sessionCapabilities?.list != null
-          ? randomId()
-          : undefined;
-        startup.current = {
-          ...startup.current,
-          initialized: true,
-          capabilities,
-          runtimeRestored: false,
-          runtimeListRequestId: requestId,
-        };
-        if (requestId != null) {
-          if (!sendClientCommand(socket, {
-            type: "session/list",
-            requestId,
-          }, (message) => dispatch({ type: "client/error", message }))) {
-            startup.current = { ...startup.current, runtimeListRequestId: undefined };
-          }
-        }
-        return;
-      }
-      if (event.type === "acp/initialized" && !startup.current.started) {
-        const capabilities = event.response.agentCapabilities;
-        startup.current = { ...startup.current, initialized: true, capabilities };
-        startSessionDiscovery(capabilities);
-        return;
-      }
-      if (
-        event.type === "acp/sessions_listed" &&
-        event.requestId === startup.current.runtimeListRequestId
-      ) {
-        startup.current = { ...startup.current, runtimeListRequestId: undefined };
-        return;
-      }
-      if (
-        event.type === "bridge/error" &&
-        event.requestId === startup.current.runtimeListRequestId
-      ) {
-        startup.current = { ...startup.current, runtimeListRequestId: undefined };
-        return;
-      }
-      if (
-        event.type === "acp/sessions_listed" &&
-        event.requestId === startup.current.listRequestId
-      ) {
-        const discovered = mergeDiscoveredSessions(
-          startup.current.discoveredSessions ?? [],
-          event.response.sessions,
-        );
-        startup.current = { ...startup.current, discoveredSessions: discovered };
-        const method = startup.current.attachMethod;
-        const preferred = preferredSessionId == null
-          ? undefined
-          : discovered.find(({ sessionId }) => sessionId === preferredSessionId);
-        if (preferred && method) {
-          attachStartupSession(preferred, method);
-          return;
-        }
-        if (preferredSessionId && event.response.nextCursor) {
-          const requestId = randomId();
-          startup.current = { ...startup.current, listRequestId: requestId };
-          if (!sendClientCommand(socket, {
-            type: "session/list",
-            requestId,
-            cursor: event.response.nextCursor,
-          }, (message) => dispatch({ type: "client/error", message }))) {
-            finishSessionDiscovery();
-          }
-          return;
-        }
-        const session = mostRecentSession(discovered);
-        if (session && method) attachStartupSession(session, method);
-        else finishSessionDiscovery();
-        return;
-      }
-      if (
-        event.type === "bridge/error" &&
-        (event.requestId === startup.current.listRequestId ||
-          event.requestId === startup.current.attachRequestId ||
-          event.requestId === startup.current.sessionRequestId)
-      ) {
-        if (event.code === -32_000) {
-          startup.current = {
-            ...startup.current,
-            listRequestId: undefined,
-            attachRequestId: undefined,
-            sessionRequestId: undefined,
-            retryAfterAuth: true,
-          };
-          return;
-        }
-        if (event.requestId === startup.current.sessionRequestId) return;
-        finishSessionDiscovery();
-        return;
-      }
-      if (
-        event.type === "acp/authenticated" &&
-        event.requestId === startup.current.authRequestId
-      ) {
-        const retry = startup.current.retryAfterAuth === true;
-        const capabilities = startup.current.capabilities;
-        startup.current = {
-          ...startup.current,
-          authRequestId: undefined,
-          retryAfterAuth: false,
-        };
-        if (retry) startSessionDiscovery(capabilities);
-        return;
-      }
-      if (
-        event.type === "bridge/error" &&
-        event.requestId === startup.current.authRequestId
-      ) {
-        if (
-          event.operation === "auth/terminal_input" ||
-          event.operation === "auth/terminal_resize" ||
-          event.operation === "auth/terminal_cancel"
-        ) return;
-        startup.current = {
-          ...startup.current,
-          authRequestId: undefined,
-          retryAfterAuth: false,
-        };
-        return;
-      }
-      if (
-        (event.type === "acp/session_attached" || event.type === "acp/session_created") &&
-        (event.requestId === startup.current.attachRequestId ||
-          event.requestId === startup.current.sessionRequestId)
-      ) {
-        startup.current = {
-          ...startup.current,
-          started: true,
-          listRequestId: undefined,
-          attachRequestId: undefined,
-          sessionRequestId: undefined,
-          retryAfterAuth: false,
-        };
-        return;
-      }
-    });
-
+    window.addEventListener("online", recoverClosedStreams);
+    window.addEventListener("pageshow", recoverClosedStreams);
+    document.addEventListener("visibilitychange", recoverClosedStreams);
     return () => {
-      if (terminalReloadTimer.current != null) clearTimeout(terminalReloadTimer.current);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("pageshow", handlePageShow);
-      window.removeEventListener("pagehide", handlePageHide);
-      window.removeEventListener("online", handleOnline);
-      window.removeEventListener("focus", handleFocus);
-      if (resumeProbe) clearTimeout(resumeProbe.timer);
-      reconnectRef.current = () => window.location.reload();
-      rejectPendingContext("Workspace context request was cancelled");
-      pendingSessionRequests.current.clear();
-      socketRef.current = undefined;
-      socket.close();
+      disposed = true;
+      reconnectRef.current = () => undefined;
+      window.removeEventListener("online", recoverClosedStreams);
+      window.removeEventListener("pageshow", recoverClosedStreams);
+      document.removeEventListener("visibilitychange", recoverClosedStreams);
+      globalEventsRef.current?.close();
+      sessionEventsRef.current?.close();
     };
+  }, [connectGlobalEvents, connectSessionEvents, refreshRuntime]);
+
+  const searchWorkspaceContext = useCallback(async (query: string) => {
+    const response = await requestJson<{ matches: WorkspaceContextMatch[] }>(
+      workspaceContextSearchPath(query),
+    );
+    return response.matches;
   }, []);
 
-  const searchWorkspaceContext = useCallback((query: string) =>
-    new Promise<WorkspaceContextMatch[]>((resolve, reject) => {
-      const requestId = randomId();
-      const timer = setTimeout(() => {
-        pendingContextRequests.current.delete(requestId);
-        reject(new Error("Workspace context search timed out"));
-      }, CONTEXT_REQUEST_TIMEOUT_MS);
-      pendingContextRequests.current.set(requestId, {
-        kind: "search",
-        timer,
-        resolve,
-        reject,
-      });
-      if (!sendClientCommand(socketRef.current, {
-        type: "context/search",
-        requestId,
-        query,
-      }, (message) => {
-        clearTimeout(timer);
-        pendingContextRequests.current.delete(requestId);
-        reject(new Error(message));
-      })) {
-        clearTimeout(timer);
-        pendingContextRequests.current.delete(requestId);
-      }
-    }), []);
+  const readWorkspaceContext = useCallback(async (path: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) {
+      throw new Error("Wait for an active ACP session before adding workspace context");
+    }
+    const response = await requestJson<{ attachment: WorkspaceContextAttachment }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/context/read`,
+      { method: "POST", body: JSON.stringify({ path }) },
+    );
+    return response.attachment;
+  }, []);
 
-  const readWorkspaceContext = useCallback((path: string) =>
-    new Promise<WorkspaceContextAttachment>((resolve, reject) => {
-      const sessionId = state.session?.sessionId;
-      if (!sessionId) {
-        reject(new Error("Wait for an active ACP session before adding workspace context"));
-        return;
-      }
-      const requestId = randomId();
-      const timer = setTimeout(() => {
-        pendingContextRequests.current.delete(requestId);
-        reject(new Error("Workspace context read timed out"));
-      }, CONTEXT_REQUEST_TIMEOUT_MS);
-      pendingContextRequests.current.set(requestId, {
-        kind: "read",
-        timer,
-        resolve,
-        reject,
-      });
-      if (!sendClientCommand(socketRef.current, {
-        type: "context/read",
-        requestId,
-        sessionId,
-        path,
-      }, (message) => {
-        clearTimeout(timer);
-        pendingContextRequests.current.delete(requestId);
-        reject(new Error(message));
-      })) {
-        clearTimeout(timer);
-        pendingContextRequests.current.delete(requestId);
-      }
-    }), [state.session?.sessionId]);
-
-  const prompt = useCallback(
-    (blocks: ContentBlock[]) => {
-      if (
-        !state.session ||
-        state.running ||
-        state.pendingPrompt != null ||
-        state.sessionTransition != null ||
-        state.pendingSessionControl != null ||
-        state.runtimeOperation != null
-      ) return false;
-      const requestId = randomId();
-      const sessionId = state.session.sessionId;
-      if (!transmit({
-        type: "session/prompt",
-        requestId,
-        sessionId,
-        prompt: blocks,
-      })) return false;
-      dispatch({ type: "user/prompt", requestId, sessionId, blocks });
-      return true;
-    },
-    [state, transmit],
-  );
+  const prompt = useCallback((blocks: ContentBlock[]) => {
+    const current = stateRef.current;
+    const view = sessionViewRef.current;
+    if (
+      current.session == null || current.running || current.pendingPrompt != null ||
+      current.sessionTransition != null || current.pendingSessionControl != null ||
+      current.runtimeOperation != null || view == null || view.phase !== "ready" ||
+      view.historyRevision == null
+    ) return false;
+    const requestId = randomId();
+    const sessionId = current.session.sessionId;
+    dispatch({ type: "user/prompt", requestId, sessionId, blocks });
+    void requestJson<StartTurnResult>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
+      {
+        method: "POST",
+        headers: {
+          "If-Match": strongEtag(view.historyRevision),
+          "Idempotency-Key": requestId,
+        },
+        body: JSON.stringify({ prompt: blocks }),
+      },
+    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+      reportRequestError(error, requestId, "session/prompt");
+      refreshSessionRef.current(sessionId);
+    });
+    return true;
+  }, [reportRequestError]);
 
   const cancel = useCallback(() => {
-    if (!state.session) return;
-    transmit({
-      type: "session/cancel",
-      sessionId: state.session.sessionId,
+    const view = sessionViewRef.current;
+    if (view?.activeTurn == null || view.phase !== "running") return;
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(view.sessionId)}/turns/${encodeURIComponent(view.activeTurn.operationId)}/cancel`,
+      { method: "POST" },
+    ).then(() => refreshSessionRef.current(view.sessionId)).catch(reportError);
+  }, [reportError]);
+
+  const setMode = useCallback((modeId: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || sessionViewRef.current?.phase !== "ready") return;
+    const requestId = randomId();
+    dispatch({ type: "session/control_start", kind: "mode", requestId, sessionId });
+    void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/mode`, {
+      method: "POST",
+      body: JSON.stringify({ modeId }),
+    }).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+      reportRequestError(error, requestId, "session/set_mode");
     });
-  }, [state.session, transmit]);
+  }, [reportRequestError]);
 
-  const setMode = useCallback(
-    (modeId: string) => {
-      if (!state.session || state.running || state.pendingSessionControl || state.runtimeOperation) return;
-      const requestId = randomId();
-      if (!transmit({
-        type: "session/set_mode",
-        requestId,
-        sessionId: state.session.sessionId,
-        modeId,
-      })) return;
-      dispatch({
-        type: "session/control_start",
-        kind: "mode",
-        requestId,
-        sessionId: state.session.sessionId,
-      });
-    },
-    [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, transmit],
-  );
+  const setConfig = useCallback((configId: string, value: string | boolean) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || sessionViewRef.current?.phase !== "ready") return;
+    const requestId = randomId();
+    dispatch({ type: "session/control_start", kind: "config", requestId, sessionId });
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/configuration/${encodeURIComponent(configId)}`,
+      { method: "POST", body: JSON.stringify({ value }) },
+    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+      reportRequestError(error, requestId, "session/set_config_option");
+    });
+  }, [reportRequestError]);
 
-  const setConfig = useCallback(
-    (configId: string, value: string | boolean) => {
-      if (!state.session || state.running || state.pendingSessionControl || state.runtimeOperation) return;
-      const requestId = randomId();
-      if (!transmit({
-        type: "session/set_config_option",
-        requestId,
-        sessionId: state.session.sessionId,
-        configId,
-        value,
-      })) return;
-      dispatch({
-        type: "session/control_start",
-        kind: "config",
-        requestId,
-        sessionId: state.session.sessionId,
-      });
-    },
-    [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, transmit],
-  );
+  const respondPermission = useCallback((
+    permissionId: string,
+    outcome: RequestPermissionResponse["outcome"],
+  ) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) return;
+    const requestId = randomId();
+    dispatch({ type: "permission/respond_start", permissionId, requestId });
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(permissionId)}/response`,
+      { method: "POST", body: JSON.stringify({ kind: "permission", outcome }) },
+    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+      reportRequestError(error, requestId, "permission/respond");
+    });
+  }, [reportRequestError]);
 
-  const respondPermission = useCallback(
-    (permissionId: string, outcome: RequestPermissionResponse["outcome"]) => {
-      const requestId = randomId();
-      if (!transmit({
-        type: "permission/respond",
-        requestId,
-        permissionId,
-        outcome,
-      })) return;
-      dispatch({ type: "permission/respond_start", permissionId, requestId });
-    },
-    [transmit],
-  );
+  const respondElicitation = useCallback((
+    elicitationId: string,
+    response: CreateElicitationResponse,
+  ) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) return;
+    const requestId = randomId();
+    dispatch({ type: "elicitation/respond_start", elicitationId, requestId });
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(elicitationId)}/response`,
+      { method: "POST", body: JSON.stringify({ kind: "elicitation", response }) },
+    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+      reportRequestError(error, requestId, "elicitation/respond");
+    });
+  }, [reportRequestError]);
 
   const authenticate = useCallback((methodId: string) => {
-    const requestId = randomId();
-    const method = state.initialized?.authMethods?.find((candidate) => candidate.id === methodId);
+    const method = stateRef.current.initialized?.authMethods?.find(({ id }) => id === methodId);
     const terminal = method != null && "type" in method && method.type === "terminal";
-    if (!transmit(terminal
-      ? { type: "auth/terminal_start", requestId, methodId, cols: 80, rows: 24 }
-      : { type: "auth/authenticate", requestId, methodId })) return;
-    startup.current = {
-      ...startup.current,
-      authRequestId: requestId,
-      retryAfterAuth: state.session == null,
-    };
-    dispatch({
-      type: "auth/start",
-      kind: terminal ? "terminal" : "authenticate",
-      requestId,
-      methodId,
-    });
-  }, [state.initialized?.authMethods, state.session, transmit]);
+    if (terminal) {
+      void requestJson("/api/v1/auth/terminal", {
+        method: "POST",
+        body: JSON.stringify({ methodId, cols: 80, rows: 24 }),
+      }).catch(reportError);
+      return;
+    }
+    void requestJson<{ requestId: string; response: unknown }>(
+      `/api/v1/auth/${encodeURIComponent(methodId)}`,
+      { method: "POST" },
+    ).then(({ requestId, response }) => {
+      handleGlobalEvent({ type: "acp/authenticated", requestId, methodId, response });
+      void refreshRuntime(false);
+    }).catch(reportError);
+  }, [handleGlobalEvent, refreshRuntime, reportError]);
 
   const writeAuthTerminal = useCallback((requestId: string, data: string) => {
-    transmit({ type: "auth/terminal_input", requestId, data });
-  }, [transmit]);
+    void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/input`, {
+      method: "POST",
+      body: JSON.stringify({ data }),
+    }).catch(reportError);
+  }, [reportError]);
 
   const resizeAuthTerminal = useCallback((requestId: string, cols: number, rows: number) => {
-    transmit({ type: "auth/terminal_resize", requestId, cols, rows });
-  }, [transmit]);
+    void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/resize`, {
+      method: "POST",
+      body: JSON.stringify({ cols, rows }),
+    }).catch(reportError);
+  }, [reportError]);
 
   const cancelAuthTerminal = useCallback((requestId: string) => {
-    transmit({ type: "auth/terminal_cancel", requestId });
-  }, [transmit]);
+    void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/cancel`, {
+      method: "POST",
+    }).catch(reportError);
+  }, [reportError]);
 
-  const dismissAuthTerminal = useCallback(() => {
-    dispatch({ type: "auth/dismiss_terminal" });
-  }, []);
+  const dismissAuthTerminal = useCallback(() => dispatch({ type: "auth/dismiss_terminal" }), []);
 
   const logout = useCallback(() => {
-    const requestId = randomId();
-    if (!transmit({ type: "auth/logout", requestId })) return;
-    startup.current = { ...startup.current, authRequestId: requestId };
-    dispatch({ type: "auth/start", kind: "logout", requestId });
-  }, [transmit]);
+    void requestJson<{ requestId: string; response: unknown }>("/api/v1/auth/logout", {
+      method: "POST",
+    }).then(({ requestId, response }) => {
+      handleGlobalEvent({ type: "acp/logged_out", requestId, response });
+    }).catch(reportError);
+  }, [handleGlobalEvent, reportError]);
 
   const newSession = useCallback((cwd: string): boolean => {
+    if (stateRef.current.phase !== "ready") return false;
     const requestId = randomId();
-    if (!transmit({
-      type: "session/new",
-      requestId,
-      cwd,
-    })) return false;
-    pendingSessionRequests.current.set(requestId, { kind: "new" });
     dispatch({ type: "session/transition_start", kind: "new", requestId, cwd });
+    void requestJson<CreatedSessionResult>("/api/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ cwd }),
+    }).then((created) => {
+      activeSessionIdRef.current = created.sessionId;
+      sessionViewRef.current = undefined;
+      sessionEventsRef.current?.close();
+      connectSessionEvents(created.sessionId);
+      hydrateSession(created.view);
+      void refreshSessionList();
+    }).catch((error) => reportRequestError(error, requestId, "session/new"));
     return true;
-  }, [transmit]);
+  }, [connectSessionEvents, hydrateSession, refreshSessionList, reportRequestError]);
 
   const listSessions = useCallback((cursor?: string) => {
-    transmit({
-      type: "session/list",
-      requestId: randomId(),
-      cursor,
-    });
-  }, [transmit]);
+    void refreshSessionList(cursor).catch(reportError);
+  }, [refreshSessionList, reportError]);
 
-  const attachSession = useCallback(
-    (session: SessionInfo) => {
-      if (state.session?.sessionId === session.sessionId) return;
-      if (state.cachedSessions.has(session.sessionId)) {
-        dispatch({ type: "session/activate_cached", sessionId: session.sessionId });
-        storeSessionId(session.sessionId);
-        return;
-      }
-      const capabilities = state.initialized?.agentCapabilities;
-      const method = capabilities?.loadSession
-        ? "session/load"
-        : undefined;
-      if (!method) {
-        dispatch({
-          type: "history/unavailable",
-          sessionId: session.sessionId,
-          reason: "load_not_supported",
-        });
-        return;
-      }
-      const requestId = randomId();
-      if (transmit({
-        type: method,
-        requestId,
-        sessionId: session.sessionId,
-      })) {
-        pendingSessionRequests.current.set(requestId, {
-          kind: "attach",
-          sessionId: session.sessionId,
-        });
-        dispatch({
-          type: "session/transition_start",
-          kind: "attach",
-          requestId,
-          sessionId: session.sessionId,
-          cwd: session.cwd,
-          title: session.title,
-        });
-      }
-    },
-    [state.cachedSessions, state.initialized, state.session?.sessionId, transmit],
-  );
+  const attachSession = useCallback((session: SessionInfo) => activateSession(session), [activateSession]);
 
   const closeSession = useCallback(() => {
-    if (!state.session || state.running || state.sessionTransition || state.pendingSessionControl || state.runtimeOperation) return;
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || stateRef.current.running) return;
     const requestId = randomId();
-    if (!transmit({
-      type: "session/close",
-      requestId,
-      sessionId: state.session.sessionId,
-    })) return;
-    pendingSessionRequests.current.set(requestId, {
-      kind: "close",
-      sessionId: state.session.sessionId,
-    });
-    dispatch({
-      type: "session/transition_start",
-      kind: "close",
-      requestId,
-      sessionId: state.session.sessionId,
-    });
-  }, [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, state.sessionTransition, transmit]);
+    dispatch({ type: "session/transition_start", kind: "close", requestId, sessionId });
+    void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/close`, {
+      method: "POST",
+    }).then(() => {
+      sessionEventsRef.current?.close();
+      activeSessionIdRef.current = undefined;
+      sessionViewRef.current = undefined;
+      storeSessionId(undefined);
+      dispatch({ type: "session/reset" });
+      void refreshSessionList();
+    }).catch((error) => reportRequestError(error, requestId, "session/close"));
+  }, [refreshSessionList, reportRequestError]);
 
   const forkSession = useCallback(() => {
-    if (!state.session || state.running || state.sessionTransition || state.pendingSessionControl || state.runtimeOperation) return;
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || stateRef.current.running) return;
     const requestId = randomId();
-    if (!transmit({
-      type: "session/fork",
-      requestId,
-      sessionId: state.session.sessionId,
-    })) return;
-    pendingSessionRequests.current.set(requestId, {
-      kind: "fork",
-      sessionId: state.session.sessionId,
-    });
-    dispatch({
-      type: "session/transition_start",
-      kind: "fork",
-      requestId,
-      sessionId: state.session.sessionId,
-    });
-  }, [state.pendingSessionControl, state.running, state.runtimeOperation, state.session, state.sessionTransition, transmit]);
+    dispatch({ type: "session/transition_start", kind: "fork", requestId, sessionId });
+    void requestJson<CreatedSessionResult>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/fork`,
+      { method: "POST" },
+    ).then((forked) => {
+      activeSessionIdRef.current = forked.sessionId;
+      sessionViewRef.current = undefined;
+      sessionEventsRef.current?.close();
+      connectSessionEvents(forked.sessionId);
+      hydrateSession(forked.view);
+      void refreshSessionList();
+    }).catch((error) => reportRequestError(error, requestId, "session/fork"));
+  }, [connectSessionEvents, hydrateSession, refreshSessionList, reportRequestError]);
 
   const deleteSession = useCallback((sessionId: string) => {
-    if (state.pendingSessionDeletions.some((pending) => pending.sessionId === sessionId)) return;
-    if (
-      (state.session?.sessionId === sessionId && state.running) ||
-      state.cachedSessions.get(sessionId)?.running ||
-      (state.session?.sessionId === sessionId && state.runtimeOperation != null) ||
-      state.cachedSessions.get(sessionId)?.runtimeOperation != null
-    ) return;
-    const requestId = randomId();
-    if (!transmit({
-      type: "session/delete",
-      requestId,
-      sessionId,
-    })) return;
-    pendingSessionRequests.current.set(requestId, {
-      kind: "delete",
-      sessionId,
-    });
-    if (state.session?.sessionId === sessionId && readStoredSessionId() === sessionId) {
-      storeSessionId(undefined);
+    if (stateRef.current.pendingSessionDeletions.some((pending) => pending.sessionId === sessionId)) {
+      return;
     }
-    dispatch({
-      type: "session/delete_start",
-      requestId,
-      sessionId,
-      stage: "deleting",
-    });
-  }, [state.cachedSessions, state.pendingSessionDeletions, state.running, state.runtimeOperation, state.session, transmit]);
-
-  const respondElicitation = useCallback(
-    (elicitationId: string, response: CreateElicitationResponse) => {
-      const requestId = randomId();
-      if (!transmit({
-        type: "elicitation/respond",
-        requestId,
-        elicitationId,
-        response,
-      })) return;
-      dispatch({ type: "elicitation/respond_start", elicitationId, requestId });
-    },
-    [transmit],
-  );
+    const requestId = randomId();
+    dispatch({ type: "session/delete_start", requestId, sessionId, stage: "deleting" });
+    void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    }).then(() => {
+      if (activeSessionIdRef.current === sessionId) {
+        sessionEventsRef.current?.close();
+        activeSessionIdRef.current = undefined;
+        sessionViewRef.current = undefined;
+        storeSessionId(undefined);
+      }
+      dispatch({
+        type: "server/event",
+        event: { type: "acp/session_deleted", requestId, sessionId },
+      });
+      void refreshSessionList();
+    }).catch((error) => reportRequestError(error, requestId, "session/delete"));
+  }, [refreshSessionList, reportRequestError]);
 
   const dismissExternalFlow = useCallback((elicitationId: string) => {
     dispatch({ type: "elicitation/dismiss_flow", elicitationId });
@@ -948,64 +588,24 @@ export function useAcp() {
   };
 }
 
-export function startupAttachMethod(
-  capabilities: AgentCapabilities | null | undefined,
-  activeTurn = false,
-): SessionAttachCommand | undefined {
-  if (activeTurn) return undefined;
-  if (capabilities?.loadSession) return "session/load";
-  return undefined;
-}
-
-export function startupHistoryStrategy(
-  capabilities: AgentCapabilities | null | undefined,
-  activeRuntime: boolean,
-  storedSessionId?: string,
-): StartupHistoryStrategy {
-  if (activeRuntime) return { kind: "active_local" };
-  const method = startupAttachMethod(capabilities);
-  if (method == null) {
-    return storedSessionId == null
-      ? { kind: "none" }
-      : { kind: "history_unavailable", sessionId: storedSessionId };
-  }
-  if (capabilities?.sessionCapabilities?.list != null) {
-    return { kind: "list_then_load", method };
-  }
-  return storedSessionId == null
-    ? { kind: "none" }
-    : { kind: "direct_load", method, sessionId: storedSessionId };
-}
-
 export function mostRecentSession(sessions: SessionInfo[]): SessionInfo | undefined {
-  let best: SessionInfo | undefined;
-  let bestTimestamp = Number.NEGATIVE_INFINITY;
+  let selected: SessionInfo | undefined;
+  let selectedTime = Number.NEGATIVE_INFINITY;
   for (const session of sessions) {
-    const timestamp = typeof session.updatedAt === "string"
-      ? Date.parse(session.updatedAt)
-      : Number.NaN;
-    const comparable = Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
-    if (!best || comparable > bestTimestamp) {
-      best = session;
-      bestTimestamp = comparable;
+    const time = session.updatedAt == null
+      ? Number.NEGATIVE_INFINITY
+      : Date.parse(session.updatedAt);
+    if (selected == null || time > selectedTime) {
+      selected = session;
+      selectedTime = Number.isNaN(time) ? Number.NEGATIVE_INFINITY : time;
     }
   }
-  return best;
-}
-
-function mergeDiscoveredSessions(
-  current: SessionInfo[],
-  incoming: SessionInfo[],
-): SessionInfo[] {
-  const sessions = new Map(current.map((session) => [session.sessionId, session]));
-  for (const session of incoming) sessions.set(session.sessionId, session);
-  return [...sessions.values()];
+  return selected;
 }
 
 function readStoredSessionId(): string | undefined {
   try {
-    const value = window.localStorage.getItem(LAST_SESSION_STORAGE_KEY);
-    return value || undefined;
+    return localStorage.getItem(LAST_SESSION_STORAGE_KEY) ?? undefined;
   } catch {
     return undefined;
   }
@@ -1013,34 +613,9 @@ function readStoredSessionId(): string | undefined {
 
 function storeSessionId(sessionId: string | undefined): void {
   try {
-    if (sessionId) window.localStorage.setItem(LAST_SESSION_STORAGE_KEY, sessionId);
-    else window.localStorage.removeItem(LAST_SESSION_STORAGE_KEY);
+    if (sessionId == null) localStorage.removeItem(LAST_SESSION_STORAGE_KEY);
+    else localStorage.setItem(LAST_SESSION_STORAGE_KEY, sessionId);
   } catch {
-    // Storage can be unavailable in privacy modes; session discovery still
-    // falls back to the Agent's most recently updated thread.
-  }
-}
-
-export function sendClientCommand(
-  socket: Pick<WebSocket, "readyState" | "send"> | undefined,
-  command: ClientCommand,
-  onError: (message: string) => void,
-): boolean {
-  if (Object.hasOwn(command, "history")) {
-    onError(`Cannot send ${command.type}: completed browser history is not a bridge command field`);
-    return false;
-  }
-  if (!socket || socket.readyState !== 1) {
-    onError(`Cannot send ${command.type}: ACP WebSocket is not open`);
-    return false;
-  }
-  try {
-    socket.send(JSON.stringify(command));
-    return true;
-  } catch (error) {
-    onError(
-      `Cannot send ${command.type}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return false;
+    // Private browsing can deny storage while the live REST/SSE session remains usable.
   }
 }

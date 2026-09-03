@@ -171,14 +171,14 @@ Startup fails before opening a session when the Agent does not advertise the cap
 
 ```text
 Browser / React + TypeScript
-  │  typed attyd WebSocket events
+  │  business REST commands + SSE projections
   ▼
 Rust host (single executable)
   ├─ ACP client and capability negotiation
   │    ├─ NDJSON/stdin+stdout ── local ACP v1 Agent
   │    ├─ POST + SSE ────────── remote ACP v1 Agent
   │    └─ WebSocket ─────────── remote ACP v1 Agent
-  ├─ bounded active-turn runtime, keyed by sessionId (no completed-history cache)
+  ├─ bounded in-memory baseline + one active turn, keyed by sessionId
   ├─ stdio-only Agent terminal-auth PTY ── configured Agent command + advertised args/env
   ├─ permission / elicitation rendezvous
   ├─ configured-root filesystem implementation
@@ -189,18 +189,18 @@ Rust host (single executable)
 There are two deliberately separate protocols:
 
 1. ACP between the attyd host and the agent. The official `agent-client-protocol` Rust SDK owns its wire schema and transport.
-2. A small typed WebSocket bridge between the host and browser. Its events carry original ACP values rather than inventing a second agent abstraction.
+2. A small business REST/SSE API between the host and browser. It exposes coherent session views
+   and user intents while keeping ACP request and recovery semantics inside the Rust bridge.
 
 This separation keeps process execution, files, and terminal handles on the trusted host while allowing the UI to reconnect or evolve independently.
 
-The Agent remains the only completed-history authority. The Rust Bridge keeps one bounded active
-turn per prompting session plus queued work, small control metadata, and live resources such as
-permissions, elicitations and unreleased terminals. At the turn's terminal transition it drops all
-prompt, message, thought, tool and response content instead of moving it into a runtime journal.
-Losing a browser does not cancel an active turn: a new subscriber atomically receives that active
-projection before live events. After retirement, reconnect performs `session/load` when advertised
-or reports `HistoryUnavailable`; `session/resume` is not treated as history replay. An Agent without
-load cannot restore completed history, which attyd accepts rather than adding client storage.
+The Agent remains the only persistent completed-history authority. The Rust Bridge keeps a bounded
+in-memory baseline, one active turn per prompting session, small control metadata, and live
+resources such as permissions, elicitations and unreleased terminals. Losing a browser does not
+cancel an active turn: a new subscriber atomically receives the baseline plus active projection
+before live events. After each terminal turn, `session/load` replaces the baseline when advertised;
+otherwise the exact accepted prompt and observed updates are atomically appended in memory. That
+no-load history survives browser reconnects but intentionally disappears with the bridge process.
 Different `sessionId`s may run concurrently; prompt/load/mutation exclusion remains per session, not
 global. See [the active-turn runtime contract](docs/active-turn-runtime.md) and its
 [TDD plan](docs/active-turn-runtime-tests.md).

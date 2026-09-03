@@ -345,7 +345,7 @@ export default function App() {
   const changingControl = state.pendingSessionControl != null;
   const authBlocksCurrent = state.authStatus === "required" || state.pendingAuth != null;
   const authBlocksNewSession = authBlocksCurrent || state.authStatus === "logged_out";
-  const ready = state.phase === "ready" && state.session != null && !transitioning && !changingControl && state.runtimeOperation == null && !authBlocksCurrent;
+  const ready = state.phase === "ready" && state.sessionSyncPhase === "ready" && state.session != null && !transitioning && !changingControl && state.runtimeOperation == null && !authBlocksCurrent;
   const deletingCurrentSession = state.pendingSessionDeletions.some(
     ({ sessionId }) => sessionId === state.session?.sessionId,
   );

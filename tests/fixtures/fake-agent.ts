@@ -9,6 +9,7 @@ const duplicateListPage = process.argv.includes("--duplicate-list-page");
 const invalidListRefreshOnce = process.argv.includes("--invalid-list-refresh-once");
 const slowLoad = process.argv.includes("--slow-load");
 const failLoadOnce = process.argv.includes("--fail-load-once");
+const failLoadAlways = process.argv.includes("--fail-load-always");
 const invalidLoadModeOnce = process.argv.includes("--invalid-load-mode-once");
 const slowFork = process.argv.includes("--slow-fork");
 const slowClose = process.argv.includes("--slow-close");
@@ -96,6 +97,7 @@ let authenticated = terminalAuthRequired
   ? terminalAuthFile != null && existsSync(terminalAuthFile)
   : !authRequiredAtStart;
 const structuredErrorAttempts = new Map<string, number>();
+const sessionHistory = new Map<string, acp.SessionUpdate[]>();
 let finishDisconnectPrompt: (() => void) | undefined;
 
 const agent = acp
@@ -254,6 +256,9 @@ const agent = acp
     if (failLoadOnce && loadAttempts === 1) {
       throw new acp.RequestError(-32603, "Synthetic load failure");
     }
+    if (failLoadAlways) {
+      throw new acp.RequestError(-32002, "Synthetic deterministic load failure");
+    }
     if (invalidLoadModeOnce && loadAttempts === 1) {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
@@ -280,14 +285,21 @@ const agent = acp
         ],
       },
     });
-    await client.notify(acp.methods.client.session.update, {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
+    let history = sessionHistory.get(params.sessionId);
+    if (history == null || history.length === 0) {
+      history = [{
+        sessionUpdate: "agent_message_chunk" as const,
         messageId: "loaded-message",
-        content: { type: "text", text: "Loaded history." },
-      },
-    });
+        content: { type: "text" as const, text: "Loaded history." },
+      }];
+      sessionHistory.set(params.sessionId, history);
+    }
+    for (const update of history) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update,
+      });
+    }
     return {
       modes: {
         currentModeId: "plan",
@@ -296,7 +308,10 @@ const agent = acp
       configOptions: [
         { type: "boolean", id: "verbose", name: "Verbose", currentValue: true },
       ],
-      _meta: { observedSessionCloses: [...observedSessionCloses] },
+      _meta: {
+        observedSessionCloses: [...observedSessionCloses],
+        loadAttempts,
+      },
     };
   })
   .onRequest(acp.methods.agent.session.resume, () => ({
@@ -379,6 +394,7 @@ const agent = acp
     }
     configuredMcpServers = params.mcpServers;
     const sessionId = raceNew ? `test-session-${attempt}` : "test-session";
+    sessionHistory.set(sessionId, []);
     if (invalidEarlyContentOnce && attempt === 1) {
       await client.notify(acp.methods.client.session.update, {
         sessionId,
@@ -583,6 +599,56 @@ const agent = acp
       .filter((block) => block.type === "text")
       .map((block) => block.text)
       .join("\n");
+    const history = sessionHistory.get(params.sessionId) ?? [];
+    const upstreamClient = client;
+    client = new Proxy(upstreamClient, {
+      get(target, property) {
+        if (property === "notify") {
+          return async (method: unknown, notification: unknown) => {
+            if (
+              method === acp.methods.client.session.update &&
+              typeof notification === "object" &&
+              notification !== null &&
+              "sessionId" in notification &&
+              "update" in notification
+            ) {
+              const candidate = notification as {
+                sessionId: string;
+                update: acp.SessionUpdate;
+              };
+              const update = candidate.update as unknown as Record<string, unknown>;
+              const content = update.content as Record<string, unknown> | undefined;
+              const persistableAgentText =
+                update.sessionUpdate === "agent_message_chunk" &&
+                content?.type === "text" &&
+                typeof content.text === "string";
+              const persistableTool =
+                (update.sessionUpdate === "tool_call" ||
+                  update.sessionUpdate === "tool_call_update") &&
+                typeof update.toolCallId === "string" &&
+                update.toolCallId.length > 0;
+              if (
+                candidate.sessionId === params.sessionId &&
+                (persistableAgentText || persistableTool)
+              ) {
+                history.push(candidate.update);
+              }
+            }
+            return Reflect.apply(target.notify, target, [method, notification]);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    for (const [index, content] of params.prompt.entries()) {
+      history.push({
+        sessionUpdate: "user_message_chunk",
+        messageId: `prompt-${requestId}-${index}`,
+        content,
+      });
+    }
+    sessionHistory.set(params.sessionId, history);
     if (promptText.includes("disconnect-flow")) {
       setTimeout(() => process.exit(0), 25);
       await new Promise(() => {});
@@ -619,6 +685,17 @@ const agent = acp
         hint: "Configure the Agent provider",
         padding: "x".repeat(20_000),
       });
+    }
+    if (promptText.includes("error-after-output-flow")) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "error-after-output",
+          content: { type: "text", text: "Output persisted before the Agent error." },
+        },
+      });
+      throw new acp.RequestError(-32603, "Synthetic error after persisted output");
     }
     if (promptText.includes("oversized-error-data-flow")) {
       throw new acp.RequestError(-32603, "Oversized structured failure", {
@@ -1121,26 +1198,28 @@ const agent = acp
     }
     if (promptText.includes("stream-follow-flow")) {
       for (let index = 1; index <= 20; index += 1) {
+        const update = {
+          sessionUpdate: "agent_message_chunk" as const,
+          messageId: "stream-follow-answer",
+          content: {
+            type: "text" as const,
+            text: `Streamed paragraph ${index}: ${"follow the latest Agent output without competing scroll animations. ".repeat(3)}\n\n`,
+          },
+        };
         await client.notify(acp.methods.client.session.update, {
           sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            messageId: "stream-follow-answer",
-            content: {
-              type: "text",
-              text: `Streamed paragraph ${index}: ${"follow the latest Agent output without competing scroll animations. ".repeat(3)}\n\n`,
-            },
-          },
+          update,
         });
         await new Promise((resolve) => setTimeout(resolve, 30));
       }
+      const finalUpdate = {
+        sessionUpdate: "agent_message_chunk" as const,
+        messageId: "stream-follow-answer",
+        content: { type: "text" as const, text: "Stream follow complete." },
+      };
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "stream-follow-answer",
-          content: { type: "text", text: "Stream follow complete." },
-        },
+        update: finalUpdate,
       });
       return { stopReason: "end_turn" };
     }

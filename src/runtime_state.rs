@@ -8,8 +8,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuntimeLimits {
     pub max_active_turn_bytes_per_session: usize,
-    pub max_queued_prompts_per_session: usize,
-    pub max_queued_prompt_bytes_per_session: usize,
     pub max_delta_events: usize,
     pub max_delta_bytes: usize,
     pub max_intent_records: usize,
@@ -19,8 +17,6 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             max_active_turn_bytes_per_session: 32 * 1024 * 1024,
-            max_queued_prompts_per_session: 32,
-            max_queued_prompt_bytes_per_session: 8 * 1024 * 1024,
             max_delta_events: 4_096,
             max_delta_bytes: 16 * 1024 * 1024,
             max_intent_records: 4_096,
@@ -50,14 +46,11 @@ pub(crate) struct SessionRuntime {
     pub control_state: BTreeMap<String, Value>,
     pub lifecycle: SessionLifecycle,
     pub active_turn: Option<ActiveTurn>,
-    pub queued_prompts: VecDeque<QueuedPrompt>,
     pub operation: Option<SessionOperationState>,
     pub permissions: BTreeMap<String, PendingInteraction>,
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
-    #[serde(skip)]
-    queued_prompt_bytes: usize,
     #[serde(skip)]
     resolved_permissions: VecDeque<String>,
     #[serde(skip)]
@@ -92,13 +85,6 @@ pub(crate) struct ActiveTurn {
     pub prompt: Vec<Value>,
     pub updates: Vec<Value>,
     pub cancel_requested: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct QueuedPrompt {
-    pub operation_id: String,
-    pub prompt: Vec<Value>,
 }
 
 struct TurnTerminal {
@@ -495,7 +481,6 @@ impl RuntimeState {
                 control_state: BTreeMap::new(),
                 lifecycle: SessionLifecycle::Attaching,
                 active_turn: None,
-                queued_prompts: VecDeque::new(),
                 operation: Some(SessionOperationState {
                     operation_id: operation_id.clone(),
                     kind,
@@ -506,7 +491,6 @@ impl RuntimeState {
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
-                queued_prompt_bytes: 0,
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
                 resolved_url_flows: VecDeque::new(),
@@ -541,7 +525,6 @@ impl RuntimeState {
             return Err(RuntimeStateError::SessionNotActive);
         }
         if session.active_turn.is_some()
-            || !session.queued_prompts.is_empty()
             || session.operation.is_some()
             || !session.permissions.is_empty()
             || !session.elicitations.is_empty()
@@ -784,13 +767,11 @@ impl RuntimeState {
                 control_state,
                 lifecycle: SessionLifecycle::Active,
                 active_turn: None,
-                queued_prompts: VecDeque::new(),
                 operation: None,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
-                queued_prompt_bytes: 0,
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
                 resolved_url_flows: VecDeque::new(),
@@ -831,179 +812,13 @@ impl RuntimeState {
         if session.lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive);
         }
-        if session.active_turn.is_some()
-            || !session.queued_prompts.is_empty()
-            || session.operation.is_some()
-        {
+        if session.active_turn.is_some() || session.operation.is_some() {
             return Err(RuntimeStateError::BusySession);
         }
         session.active_turn = Some(active_turn);
         self.set_intent_status(&operation_id, IntentStatus::InFlight);
         self.commit_session(session_id);
         Ok(turn_id)
-    }
-
-    pub(crate) fn enqueue_prompt(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        operation_id: impl Into<String>,
-        prompt: Vec<Value>,
-    ) -> Result<(), RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let operation_id = operation_id.into();
-        if self.operation_in_use(&operation_id) {
-            return Err(RuntimeStateError::OperationCollision);
-        }
-        let queued = QueuedPrompt {
-            operation_id: operation_id.clone(),
-            prompt,
-        };
-        let queued_bytes = serialized_len(&queued);
-        let max_queued_prompts = self.limits.max_queued_prompts_per_session;
-        let max_queued_bytes = self.limits.max_queued_prompt_bytes_per_session;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session.lifecycle != SessionLifecycle::Active {
-            return Err(RuntimeStateError::SessionNotActive);
-        }
-        if session.queued_prompts.len() >= max_queued_prompts
-            || session.queued_prompt_bytes.saturating_add(queued_bytes) > max_queued_bytes
-        {
-            return Err(RuntimeStateError::ResourceLimit);
-        }
-        session.queued_prompts.push_back(queued);
-        session.queued_prompt_bytes = session.queued_prompt_bytes.saturating_add(queued_bytes);
-        self.set_intent_status(&operation_id, IntentStatus::Accepted);
-        self.commit_session(session_id);
-        Ok(())
-    }
-
-    pub(crate) fn start_next_queued_prompt(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<Option<String>, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let max_active_bytes = self.limits.max_active_turn_bytes_per_session;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session.lifecycle != SessionLifecycle::Active {
-            return Err(RuntimeStateError::SessionNotActive);
-        }
-        if session.active_turn.is_some() || session.operation.is_some() {
-            return Err(RuntimeStateError::BusySession);
-        }
-        let Some(next) = session.queued_prompts.front() else {
-            return Ok(None);
-        };
-        let candidate = ActiveTurn {
-            turn_id: next.operation_id.clone(),
-            operation_id: next.operation_id.clone(),
-            prompt: next.prompt.clone(),
-            updates: Vec::new(),
-            cancel_requested: false,
-        };
-        if serialized_len(&candidate) > max_active_bytes {
-            return Err(RuntimeStateError::ResourceLimit);
-        }
-        let queued = session
-            .queued_prompts
-            .pop_front()
-            .expect("queued prompt was checked above");
-        session.queued_prompt_bytes = session
-            .queued_prompt_bytes
-            .saturating_sub(serialized_len(&queued));
-        let operation_id = queued.operation_id.clone();
-        session.active_turn = Some(candidate);
-        self.set_intent_status(&operation_id, IntentStatus::InFlight);
-        self.commit_session(session_id);
-        Ok(Some(operation_id))
-    }
-
-    pub(crate) fn start_expected_queued_prompt(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        expected_operation_id: &str,
-    ) -> Result<bool, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let is_front = self
-            .require_session(session_id, incarnation)?
-            .queued_prompts
-            .front()
-            .is_some_and(|queued| queued.operation_id == expected_operation_id);
-        if !is_front {
-            return Ok(false);
-        }
-        Ok(self
-            .start_next_queued_prompt(expected_epoch, session_id, incarnation)?
-            .is_some())
-    }
-
-    pub(crate) fn cancel_queued_prompt(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        operation_id: &str,
-        _reason: Value,
-    ) -> Result<bool, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let removed = {
-            let session = self.require_session_mut(session_id, incarnation)?;
-            let Some(position) = session
-                .queued_prompts
-                .iter()
-                .position(|queued| queued.operation_id == operation_id)
-            else {
-                return Ok(false);
-            };
-            let queued = session
-                .queued_prompts
-                .remove(position)
-                .expect("queued prompt position was checked above");
-            session.queued_prompt_bytes = session
-                .queued_prompt_bytes
-                .saturating_sub(serialized_len(&queued));
-            queued
-        };
-        self.retire_intent(operation_id);
-        self.commit_session(session_id);
-        drop(removed);
-        Ok(true)
-    }
-
-    pub(crate) fn cancel_all_queued_prompts(
-        &mut self,
-        expected_epoch: &str,
-        reason: Value,
-    ) -> Result<usize, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let queued = self
-            .sessions
-            .values()
-            .flat_map(|session| {
-                session.queued_prompts.iter().map(|prompt| {
-                    (
-                        session.session_id.clone(),
-                        session.incarnation,
-                        prompt.operation_id.clone(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        for (session_id, incarnation, operation_id) in &queued {
-            self.cancel_queued_prompt(
-                expected_epoch,
-                session_id,
-                *incarnation,
-                operation_id,
-                reason.clone(),
-            )?;
-        }
-        Ok(queued.len())
     }
 
     pub(crate) fn append_turn_update(
@@ -1055,6 +870,27 @@ impl RuntimeState {
             return Ok(());
         }
         session.control_state.insert(key, update);
+        self.commit_session(session_id);
+        Ok(())
+    }
+
+    pub(crate) fn synchronize_loaded_session(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        response: Value,
+        replay: Vec<Value>,
+    ) -> Result<(), RuntimeStateError> {
+        self.require_epoch(expected_epoch)?;
+        let response = retain_session_metadata(session_id, response);
+        let controls = extract_control_state(replay);
+        let session = self.require_session_mut(session_id, incarnation)?;
+        if session.lifecycle != SessionLifecycle::Active || session.active_turn.is_some() {
+            return Err(RuntimeStateError::BusySession);
+        }
+        session.session = response;
+        session.control_state = controls;
         self.commit_session(session_id);
         Ok(())
     }
@@ -2062,10 +1898,6 @@ impl RuntimeState {
                 .as_ref()
                 .is_some_and(|turn| turn.operation_id == operation_id)
                 || session
-                    .queued_prompts
-                    .iter()
-                    .any(|prompt| prompt.operation_id == operation_id)
-                || session
                     .operation
                     .as_ref()
                     .is_some_and(|operation| operation.operation_id == operation_id)
@@ -2322,12 +2154,7 @@ fn drain_session_liveness(
     session_id: &str,
     session: &mut SessionRuntime,
 ) -> (Vec<String>, Vec<RuntimeEffect>) {
-    let mut operation_ids = session
-        .queued_prompts
-        .drain(..)
-        .map(|prompt| prompt.operation_id)
-        .collect::<Vec<_>>();
-    session.queued_prompt_bytes = 0;
+    let mut operation_ids = Vec::new();
     let permissions = std::mem::take(&mut session.permissions);
     operation_ids.extend(
         permissions
@@ -2618,8 +2445,6 @@ mod tests {
             "epoch",
             RuntimeLimits {
                 max_active_turn_bytes_per_session: 16_384,
-                max_queued_prompts_per_session: 8,
-                max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
@@ -3832,8 +3657,6 @@ mod tests {
             "epoch",
             RuntimeLimits {
                 max_active_turn_bytes_per_session: 256,
-                max_queued_prompts_per_session: 8,
-                max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
@@ -3934,346 +3757,6 @@ mod tests {
             .unwrap();
         assert!(state.session("a").unwrap().active_turn.is_some());
         assert!(state.session("b").unwrap().active_turn.is_none());
-    }
-
-    #[test]
-    fn accepted_queued_prompt_survives_without_a_subscriber_owner() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state
-            .start_prompt("epoch", "session", incarnation, "first", Vec::new())
-            .unwrap();
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "second",
-                vec![json!("follow up")],
-            )
-            .unwrap();
-        state
-            .complete_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "first",
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-
-        assert_eq!(
-            state
-                .start_next_queued_prompt("epoch", "session", incarnation)
-                .unwrap(),
-            Some("second".to_string()),
-        );
-        assert_eq!(
-            state
-                .session("session")
-                .unwrap()
-                .active_turn
-                .as_ref()
-                .unwrap()
-                .prompt,
-            vec![json!("follow up")],
-        );
-    }
-
-    #[test]
-    fn queued_prompt_claim_is_fifo_and_shutdown_cancellation_is_terminal() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state
-            .start_prompt("epoch", "session", incarnation, "first", Vec::new())
-            .unwrap();
-        let second = match state
-            .accept_intent("epoch", 1, "second-client", "second-payload")
-            .unwrap()
-        {
-            IntentAck::Accepted { operation_id } => operation_id,
-            other => panic!("second intent was not accepted: {other:?}"),
-        };
-        let third = match state
-            .accept_intent("epoch", 1, "third-client", "third-payload")
-            .unwrap()
-        {
-            IntentAck::Accepted { operation_id } => operation_id,
-            other => panic!("third intent was not accepted: {other:?}"),
-        };
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                &second,
-                vec![json!("second")],
-            )
-            .unwrap();
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                &third,
-                vec![json!("third")],
-            )
-            .unwrap();
-        state
-            .complete_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "first",
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        let before_out_of_order_claim = state.snapshot();
-
-        assert!(
-            !state
-                .start_expected_queued_prompt("epoch", "session", incarnation, &third)
-                .unwrap()
-        );
-        assert_eq!(state.snapshot(), before_out_of_order_claim);
-        assert!(
-            state
-                .start_expected_queued_prompt("epoch", "session", incarnation, &second)
-                .unwrap()
-        );
-        assert_eq!(
-            state
-                .session("session")
-                .unwrap()
-                .active_turn
-                .as_ref()
-                .unwrap()
-                .operation_id,
-            second,
-        );
-        assert!(
-            state
-                .cancel_queued_prompt(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    &third,
-                    json!("bridge_shutdown"),
-                )
-                .unwrap()
-        );
-        assert_eq!(state.intent_status(&third), None);
-        assert!(
-            !serde_json::to_string(&state.snapshot())
-                .unwrap()
-                .contains("bridge_shutdown")
-        );
-    }
-
-    #[test]
-    fn new_prompt_at_handoff_cannot_bypass_an_existing_queue() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state
-            .start_prompt("epoch", "session", incarnation, "first", Vec::new())
-            .unwrap();
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "second",
-                vec![json!("second")],
-            )
-            .unwrap();
-        state
-            .complete_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "first",
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        let handoff = state.snapshot();
-
-        assert_eq!(
-            state.start_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "new-arrival",
-                vec![json!("must wait")],
-            ),
-            Err(RuntimeStateError::BusySession),
-        );
-        assert_eq!(state.snapshot(), handoff);
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "new-arrival",
-                vec![json!("must wait")],
-            )
-            .unwrap();
-        assert!(
-            state
-                .start_expected_queued_prompt("epoch", "session", incarnation, "second")
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn shutdown_retires_every_queued_prompt_without_terminal_results() {
-        let mut state = state();
-        let first_incarnation = open(&mut state, "first-session");
-        let second_incarnation = open(&mut state, "second-session");
-        for (intent_id, session_id, incarnation) in [
-            ("first-queued", "first-session", first_incarnation),
-            ("second-queued", "second-session", second_incarnation),
-        ] {
-            let operation_id = match state
-                .accept_intent("epoch", 1, intent_id, format!("payload-{intent_id}"))
-                .unwrap()
-            {
-                IntentAck::Accepted { operation_id } => operation_id,
-                other => panic!("unexpected admission: {other:?}"),
-            };
-            state
-                .enqueue_prompt("epoch", session_id, incarnation, operation_id, Vec::new())
-                .unwrap();
-        }
-
-        assert_eq!(
-            state
-                .cancel_all_queued_prompts("epoch", json!("bridge_shutdown"))
-                .unwrap(),
-            2
-        );
-        let snapshot = state.snapshot();
-        assert!(
-            snapshot
-                .sessions
-                .values()
-                .all(|session| session.queued_prompts.is_empty())
-        );
-        assert!(state.intents.is_empty());
-        assert!(
-            !serde_json::to_string(&snapshot)
-                .unwrap()
-                .contains("bridge_shutdown")
-        );
-        assert_eq!(
-            state
-                .cancel_all_queued_prompts("epoch", json!("bridge_shutdown"))
-                .unwrap(),
-            0,
-            "shutdown cancellation must be idempotent after the queue is terminal"
-        );
-    }
-
-    #[test]
-    fn queued_prompt_admission_has_count_and_byte_limits_without_partial_mutation() {
-        let mut count_limited = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_queued_prompts_per_session: 1,
-                max_queued_prompt_bytes_per_session: 16_384,
-                ..RuntimeLimits::default()
-            },
-        );
-        let incarnation = open(&mut count_limited, "session");
-        count_limited
-            .start_prompt("epoch", "session", incarnation, "active", Vec::new())
-            .unwrap();
-        count_limited
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "queued-1",
-                vec![json!("first")],
-            )
-            .unwrap();
-        let before_rejection = count_limited.snapshot();
-        assert_eq!(
-            count_limited.enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "queued-2",
-                vec![json!("second")],
-            ),
-            Err(RuntimeStateError::ResourceLimit),
-        );
-        assert_eq!(count_limited.snapshot(), before_rejection);
-
-        let mut byte_limited = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_queued_prompts_per_session: 8,
-                max_queued_prompt_bytes_per_session: 64,
-                ..RuntimeLimits::default()
-            },
-        );
-        let incarnation = open(&mut byte_limited, "session");
-        byte_limited
-            .start_prompt("epoch", "session", incarnation, "active", Vec::new())
-            .unwrap();
-        let before_rejection = byte_limited.snapshot();
-        assert_eq!(
-            byte_limited.enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "oversized",
-                vec![json!("x".repeat(128))],
-            ),
-            Err(RuntimeStateError::ResourceLimit),
-        );
-        assert_eq!(byte_limited.snapshot(), before_rejection);
-    }
-
-    #[test]
-    fn queued_prompt_is_rechecked_against_the_active_turn_limit_before_dispatch() {
-        let mut state = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_active_turn_bytes_per_session: 256,
-                max_queued_prompt_bytes_per_session: 16_384,
-                ..RuntimeLimits::default()
-            },
-        );
-        let incarnation = open(&mut state, "session");
-        state
-            .start_prompt("epoch", "session", incarnation, "active", Vec::new())
-            .unwrap();
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "oversized-queued",
-                vec![json!("x".repeat(512))],
-            )
-            .unwrap();
-        state
-            .complete_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "active",
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        let before_rejection = state.snapshot();
-
-        assert_eq!(
-            state.start_next_queued_prompt("epoch", "session", incarnation),
-            Err(RuntimeStateError::ResourceLimit),
-        );
-        assert_eq!(state.snapshot(), before_rejection);
     }
 
     #[test]
@@ -4532,8 +4015,6 @@ mod tests {
             "epoch",
             RuntimeLimits {
                 max_active_turn_bytes_per_session: 16_384,
-                max_queued_prompts_per_session: 8,
-                max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 2,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
@@ -4930,43 +4411,9 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_session_cancels_queued_intents_and_releases_resources_once() {
+    fn closing_a_session_releases_resources_once() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let IntentAck::Accepted {
-            operation_id: queued,
-        } = state
-            .accept_intent("epoch", 1, "queued", "payload")
-            .unwrap()
-        else {
-            panic!("queued intent was not accepted")
-        };
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                &queued,
-                vec![json!("later")],
-            )
-            .unwrap();
-        let IntentAck::Accepted {
-            operation_id: queued_second,
-        } = state
-            .accept_intent("epoch", 2, "queued-second", "payload")
-            .unwrap()
-        else {
-            panic!("second queued intent was not accepted")
-        };
-        state
-            .enqueue_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                &queued_second,
-                vec![json!("even later")],
-            )
-            .unwrap();
         state
             .upsert_terminal(
                 "epoch",
@@ -4991,8 +4438,6 @@ mod tests {
             .close_session("epoch", "session", incarnation, "close")
             .unwrap();
 
-        assert_eq!(state.intent_status(&queued), None);
-        assert_eq!(state.intent_status(&queued_second), None);
         assert_eq!(state.intent_status("close"), None);
         let close_delta = &state.deltas_after(before_close).unwrap()[0];
         assert!(matches!(
@@ -5191,8 +4636,6 @@ mod tests {
             "epoch",
             RuntimeLimits {
                 max_active_turn_bytes_per_session: 16_384,
-                max_queued_prompts_per_session: 8,
-                max_queued_prompt_bytes_per_session: 16_384,
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
                 max_intent_records: 4_096,
@@ -6160,7 +5603,7 @@ mod tests {
     }
 
     #[test]
-    fn same_session_reload_requires_no_queue_operation_interaction_or_live_resource() {
+    fn same_session_reload_requires_no_operation_interaction_or_live_resource() {
         fn assert_reload_busy(state: &mut RuntimeState, session_id: &str, incarnation: u64) {
             assert_eq!(
                 state.start_reload(
@@ -6175,18 +5618,6 @@ mod tests {
         }
 
         let mut state = state();
-
-        let queued = open(&mut state, "queued");
-        state
-            .start_prompt("epoch", "queued", queued, "active", Vec::new())
-            .unwrap();
-        state
-            .enqueue_prompt("epoch", "queued", queued, "queued", Vec::new())
-            .unwrap();
-        state
-            .complete_prompt("epoch", "queued", queued, "active", Value::Null)
-            .unwrap();
-        assert_reload_busy(&mut state, "queued", queued);
 
         let operation = open(&mut state, "operation");
         state
@@ -6371,5 +5802,40 @@ mod tests {
             TerminalUpsert::Stale
         );
         assert_eq!(state.seq(), released_seq);
+    }
+
+    #[test]
+    fn authoritative_load_replaces_controls_without_retiring_live_resources() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .upsert_terminal(
+                "epoch",
+                "session",
+                incarnation,
+                "terminal",
+                json!({ "output": "running", "released": false }),
+            )
+            .unwrap();
+        state
+            .synchronize_loaded_session(
+                "epoch",
+                "session",
+                incarnation,
+                json!({ "modes": { "currentModeId": "plan" } }),
+                vec![json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{ "name": "inspect" }],
+                })],
+            )
+            .unwrap();
+
+        let session = state.session("session").unwrap();
+        assert!(
+            session
+                .control_state
+                .contains_key("available_commands_update")
+        );
+        assert!(session.terminals.contains_key("terminal"));
     }
 }
