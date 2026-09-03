@@ -36,6 +36,14 @@ pub(crate) struct TurnOverlay {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct CompletedTurnOutcome {
+    pub operation_id: String,
+    pub after_update: usize,
+    pub response: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct MirrorSessionState {
     pub session_id: String,
     pub incarnation: u64,
@@ -43,6 +51,7 @@ pub(crate) struct MirrorSessionState {
     pub history_revision: Option<String>,
     pub phase: MirrorPhase,
     pub active_turn: Option<TurnOverlay>,
+    pub turn_outcomes: Vec<CompletedTurnOutcome>,
     pub sync_error: Option<String>,
     #[serde(skip)]
     active_payload_digest: Option<[u8; 32]>,
@@ -168,6 +177,7 @@ impl SessionMirror {
                 history_revision: None,
                 phase: MirrorPhase::Cold,
                 active_turn: None,
+                turn_outcomes: Vec::new(),
                 sync_error: None,
                 active_payload_digest: None,
                 recent_consumptions: VecDeque::new(),
@@ -192,6 +202,7 @@ impl SessionMirror {
                 history_revision: Some(snapshot.revision().to_string()),
                 phase: MirrorPhase::Ready,
                 active_turn: None,
+                turn_outcomes: Vec::new(),
                 sync_error: None,
                 active_payload_digest: None,
                 recent_consumptions: VecDeque::new(),
@@ -297,6 +308,7 @@ impl SessionMirror {
         {
             return Err(MirrorError::OperationMismatch);
         }
+        let load_phase = session.phase;
         let key = SessionKey::new(session_id, incarnation);
         if session.phase == MirrorPhase::Reconciling {
             let prior = self
@@ -331,11 +343,27 @@ impl SessionMirror {
                 turn.operation_id.clone(),
             )
         });
+        let completed_outcome = session.active_turn.as_ref().and_then(|turn| {
+            prompt_response(turn.terminal.as_ref()?).map(|response| CompletedTurnOutcome {
+                operation_id: turn.operation_id.clone(),
+                after_update: 0,
+                response: response.clone(),
+            })
+        });
         let snapshot = self.history.commit_candidate(&key, attempt_id)?;
+        let after_update = snapshot.updates().len();
         let session = self
             .sessions
             .get_mut(session_id)
             .expect("session was validated above");
+        if load_phase == MirrorPhase::Loading {
+            // A fresh authoritative replay has no historical PromptResponse data.
+            // Do not retain outcome offsets from the baseline it replaced.
+            session.turn_outcomes.clear();
+        } else if let Some(mut outcome) = completed_outcome {
+            outcome.after_update = after_update;
+            session.turn_outcomes.push(outcome);
+        }
         if let (Some(consumed_revision), Some((client_intent_id, payload_digest, operation_id))) =
             (previous_revision, active)
         {
@@ -627,6 +655,15 @@ impl SessionMirror {
             .active_payload_digest
             .ok_or(MirrorError::InconsistentHistory)?;
         let active_overlay_bytes = session.active_overlay_bytes;
+        let completed_outcome = turn
+            .terminal
+            .as_ref()
+            .and_then(prompt_response)
+            .map(|response| CompletedTurnOutcome {
+                operation_id: turn.operation_id.clone(),
+                after_update: 0,
+                response: response.clone(),
+            });
         let mut suffix = turn
             .prompt
             .iter()
@@ -647,11 +684,16 @@ impl SessionMirror {
         let snapshot = self
             .history
             .append_committed_updates(&SessionKey::new(session_id, incarnation), &suffix)?;
+        let after_update = snapshot.updates().len();
 
         let session = self
             .sessions
             .get_mut(session_id)
             .expect("session was validated above");
+        if let Some(mut outcome) = completed_outcome {
+            outcome.after_update = after_update;
+            session.turn_outcomes.push(outcome);
+        }
         session.consumed_intents.insert(&turn.client_intent_id);
         session.recent_consumptions.push_back(LastConsumption {
             operation_id: turn.operation_id,
@@ -860,6 +902,13 @@ fn payload_digest(prompt: &[Value]) -> [u8; 32] {
 
 fn serialized_len(value: &impl Serialize) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |value| value.len())
+}
+
+fn prompt_response(value: &Value) -> Option<&Value> {
+    value
+        .get("stopReason")
+        .and_then(Value::as_str)
+        .map(|_| value)
 }
 
 fn next_revision(current: u64) -> u64 {
@@ -1199,10 +1248,70 @@ mod tests {
         assert_eq!(state.phase, MirrorPhase::Ready);
         assert!(state.active_turn.is_none());
         assert_eq!(state.history_revision.as_deref(), Some(next.revision()));
+        assert_eq!(state.turn_outcomes.len(), 1);
+        assert_eq!(state.turn_outcomes[0].operation_id, operation);
+        assert_eq!(state.turn_outcomes[0].after_update, 2);
+        assert_eq!(
+            state.turn_outcomes[0].response,
+            json!({ "stopReason": "end_turn" })
+        );
         assert!(matches!(
             mirror.start_turn("session", 1, next.revision(), "intent", prompt),
             Ok(TurnAdmission::Duplicate { operation_id }) if operation_id == operation
         ));
+
+        let second_operation = match mirror
+            .start_turn(
+                "session",
+                1,
+                next.revision(),
+                "second-intent",
+                text_prompt("again"),
+            )
+            .unwrap()
+        {
+            TurnAdmission::Accepted { operation_id } => operation_id,
+            _ => unreachable!(),
+        };
+        mirror
+            .append_turn_update(
+                "session",
+                1,
+                &second_operation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "second-answer",
+                    "content": { "type": "text", "text": "done" }
+                }),
+            )
+            .unwrap();
+        mirror
+            .complete_turn(
+                "session",
+                1,
+                &second_operation,
+                json!({ "stopReason": "max_tokens" }),
+            )
+            .unwrap();
+        let final_snapshot = mirror
+            .commit_completed_turn_from_memory("session", 1, &second_operation)
+            .unwrap();
+        let state = mirror.state("session").unwrap();
+        assert_eq!(state.turn_outcomes.len(), 2);
+        assert_eq!(state.turn_outcomes[0].after_update, 2);
+        assert_eq!(state.turn_outcomes[1].after_update, 4);
+        assert_eq!(final_snapshot.updates().len(), 4);
+        let view = mirror.view_value("session", 1).unwrap();
+        assert_eq!(view["session"]["turnOutcomes"].as_array().unwrap().len(), 2);
+
+        mirror.begin_load("session", 1, "fresh-load").unwrap();
+        for update in final_snapshot.updates() {
+            mirror
+                .append_load_update("session", 1, "fresh-load", update.clone())
+                .unwrap();
+        }
+        mirror.commit_load("session", 1, "fresh-load").unwrap();
+        assert!(mirror.state("session").unwrap().turn_outcomes.is_empty());
     }
 
     #[test]

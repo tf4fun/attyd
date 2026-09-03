@@ -7,7 +7,7 @@ function event(value: ServerEvent) {
 }
 
 describe("ACP UI state", () => {
-  it("renders bridge-owned terminal turn outcomes exactly once", () => {
+  it("rebuilds bridge-owned turn outcomes at their persisted turn boundaries", () => {
     const base: AppState = {
       ...initialState,
       phase: "ready",
@@ -93,6 +93,87 @@ describe("ACP UI state", () => {
       type: "stop",
       response: { stopReason: "end_turn" },
     });
+
+    const reopenedView = {
+      bridgeEpoch: "epoch",
+      sessionId: "session",
+      sessionIncarnation: 1,
+      viewRevision: 5,
+      historyRevision: "epoch:1:5",
+      phase: "ready" as const,
+      syncError: null,
+      timeline: [
+        {
+          sessionUpdate: "user_message_chunk" as const,
+          content: { type: "text" as const, text: "First" },
+          _meta: { attyd: { turnOperationId: "turn-1" } },
+        },
+        {
+          sessionUpdate: "agent_message_chunk" as const,
+          messageId: "answer-1",
+          content: { type: "text" as const, text: "One" },
+        },
+        {
+          sessionUpdate: "user_message_chunk" as const,
+          content: { type: "text" as const, text: "Second" },
+          _meta: { attyd: { turnOperationId: "turn-2" } },
+        },
+        {
+          sessionUpdate: "agent_message_chunk" as const,
+          messageId: "answer-2",
+          content: { type: "text" as const, text: "Two" },
+        },
+      ],
+      turnOutcomes: [
+        {
+          operationId: "turn-1",
+          afterUpdate: 2,
+          response: { stopReason: "end_turn" as const },
+        },
+        {
+          operationId: "turn-2",
+          afterUpdate: 4,
+          response: {
+            stopReason: "max_tokens" as const,
+            usage: { totalTokens: 21, inputTokens: 13, outputTokens: 8 },
+          },
+        },
+      ],
+      activeTurn: null,
+      workspace: { cwd: "/workspace", session: {} },
+      controls: {},
+      interactions: { permissions: {}, elicitations: {}, urlFlows: {} },
+      operation: null,
+      terminals: {},
+    };
+    const reopened = appReducer(initialState, {
+      type: "bridge/session_hydrate",
+      view: reopenedView,
+    });
+    expect(reopened.timeline.map((item) =>
+      item.type === "stop" ? `stop:${item.response.stopReason}` : item.type
+    )).toEqual([
+      "message",
+      "assistant",
+      "stop:end_turn",
+      "message",
+      "assistant",
+      "stop:max_tokens",
+    ]);
+    const rehydrated = appReducer(reopened, {
+      type: "bridge/session_hydrate",
+      view: reopenedView,
+    });
+    expect(rehydrated.timeline.map((item) =>
+      item.type === "stop" ? `${item.id}:${item.response.stopReason}` : item.type
+    )).toEqual([
+      "message",
+      "assistant",
+      "bridge-turn-outcome:turn-1:end_turn",
+      "message",
+      "assistant",
+      "bridge-turn-outcome:turn-2:max_tokens",
+    ]);
   });
 
   it("does not let a late prior-turn outcome settle the active turn", () => {

@@ -1636,6 +1636,7 @@ fn business_session_view(view: &serde_json::Value) -> Option<serde_json::Value> 
         "phase": session.get("phase")?,
         "syncError": session.get("syncError").cloned().unwrap_or(serde_json::Value::Null),
         "timeline": view.pointer("/baseline/updates").cloned().unwrap_or_else(|| json!([])),
+        "turnOutcomes": session.get("turnOutcomes").cloned().unwrap_or_else(|| json!([])),
         "activeTurn": session.get("activeTurn").cloned().unwrap_or(serde_json::Value::Null),
         "workspace": {
             "cwd": live.get("cwd").cloned().unwrap_or(serde_json::Value::Null),
@@ -2037,6 +2038,11 @@ mod tests {
                 "phase": "running",
                 "syncError": null,
                 "activeTurn": { "operationId": "turn", "updates": [] },
+                "turnOutcomes": [{
+                    "operationId": "prior-turn",
+                    "afterUpdate": 1,
+                    "response": { "stopReason": "end_turn" },
+                }],
             },
             "baseline": {
                 "updates": [{ "sessionUpdate": "agent_message_chunk" }],
@@ -2057,6 +2063,7 @@ mod tests {
 
         assert_eq!(view["sessionId"], "session");
         assert_eq!(view["timeline"].as_array().unwrap().len(), 1);
+        assert_eq!(view["turnOutcomes"][0]["operationId"], "prior-turn");
         assert_eq!(view["activeTurn"]["operationId"], "turn");
         assert_eq!(view["workspace"]["cwd"], "/workspace");
         assert!(view.get("baseline").is_none());

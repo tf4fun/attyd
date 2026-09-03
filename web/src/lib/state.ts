@@ -2486,8 +2486,8 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
   const priorTimeline = state.session?.sessionId === view.sessionId
     ? state.timeline
     : state.cachedSessions.get(view.sessionId)?.timeline ?? [];
-  const priorTurnOutcomes = priorTimeline.filter(({ id }) =>
-    id.startsWith("bridge-turn-outcome:")
+  const priorTurnFailures = priorTimeline.filter((item) =>
+    item.type === "error" && item.id.startsWith("bridge-turn-outcome:")
   );
   const cached = cacheCurrentSession(state);
   const listed = cached.sessions.find(({ sessionId }) => sessionId === view.sessionId);
@@ -2537,8 +2537,24 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
         },
   };
 
-  for (const update of view.timeline) {
+  const outcomesByOffset = new Map<number, NonNullable<BridgeSessionView["turnOutcomes"]>>();
+  for (const outcome of view.turnOutcomes ?? []) {
+    if (!Number.isSafeInteger(outcome.afterUpdate) || outcome.afterUpdate <= 0) continue;
+    const outcomes = outcomesByOffset.get(outcome.afterUpdate) ?? [];
+    outcomes.push(outcome);
+    outcomesByOffset.set(outcome.afterUpdate, outcomes);
+  }
+  for (const [index, update] of view.timeline.entries()) {
     next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
+    for (const outcome of outcomesByOffset.get(index + 1) ?? []) {
+      const id = `bridge-turn-outcome:${outcome.operationId}`;
+      if (!next.timeline.some((item) => item.id === id)) {
+        next = {
+          ...next,
+          timeline: [...next.timeline, { id, type: "stop", response: outcome.response }],
+        };
+      }
+    }
   }
   for (const update of Object.values(view.controls)) {
     next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
@@ -2575,13 +2591,13 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
       ],
     };
   }
-  if (priorTurnOutcomes.length > 0) {
+  if (priorTurnFailures.length > 0) {
     const rebuiltIds = new Set(next.timeline.map(({ id }) => id));
     next = {
       ...next,
       timeline: [
         ...next.timeline,
-        ...priorTurnOutcomes.filter(({ id }) => !rebuiltIds.has(id)),
+        ...priorTurnFailures.filter(({ id }) => !rebuiltIds.has(id)),
       ],
     };
   }

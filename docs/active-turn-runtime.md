@@ -13,6 +13,7 @@ For every materialized session the bridge owns:
 
 - one immutable baseline produced by initial materialization and atomically extended with every
   turn observed by this bridge;
+- process-local `PromptResponse` boundaries for turns completed while that baseline is retained;
 - at most one active or completed-but-not-yet-committed turn overlay;
 - live permission, elicitation, URL, terminal, MCP and control state;
 - bounded idempotency and revision metadata that contains no conversation payload;
@@ -27,6 +28,11 @@ the Agent. No browser state, local database, temporary file or mmap file is a re
 created, continuously materialized session. The bridge deliberately performs no post-turn load.
 It atomically promotes the exact accepted prompt plus observed turn updates into its in-memory
 baseline for every Agent, including Agents that advertise load.
+
+ACP `loadSession` replays session updates but not each historical `PromptResponse`. Accordingly,
+turn-completion markers and their token usage are retained and positioned correctly while the
+Bridge projection lives, but disappear after that projection is released and cold-loaded again.
+The Bridge does not infer or fabricate missing stop reasons or usage.
 
 Every materialized projection is deliberately process-local. It supports subsequent turns and
 browser reconnects while the same bridge process retains the session. An Agent without load cannot
@@ -172,15 +178,17 @@ A terminal Prompt result does not immediately retire its overlay. It transitions
 synthetic `user_message_chunk` updates for the accepted prompt and the already validated active
 updates onto the prior baseline. Phase, incarnation, operation and history-consistency checks
 complete before replacement. Failure preserves the prior baseline and completed overlay and
-exposes `Blocked`; success advances the opaque revision/idempotency ledger, clears the overlay and
-publishes `Ready`. Even an empty or textually identical result advances the revision so the consumed
-append slot cannot be reused.
+exposes `Blocked`; success advances the opaque revision/idempotency ledger, records the
+`PromptResponse` at the committed update boundary, clears the overlay and publishes `Ready`. Even
+an empty or textually identical result advances the revision so the consumed append slot cannot be
+reused.
 
 After the completion event is delivered, the Hub checks session-specific subscribers. With at
 least one subscriber, the Ready projection remains in memory and accepts the next turn. With none,
 it requests `session/close`; the running turn was never cancelled merely because its subscriber
-left. A successful close drops the baseline, overlay metadata and live resources. A later observer
-therefore follows the normal Cold load path and receives a fresh Agent-authoritative replay.
+left. A successful close drops the baseline, completion boundaries, overlay metadata and live
+resources. A later observer therefore follows the normal Cold load path and receives a fresh
+Agent-authoritative replay without historical completion markers.
 
 ## Live resources
 

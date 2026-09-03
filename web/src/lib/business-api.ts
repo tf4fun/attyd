@@ -32,6 +32,12 @@ export interface BridgeTurnOverlay {
   terminal: unknown | null;
 }
 
+export interface BridgeTurnOutcome {
+  operationId: string;
+  afterUpdate: number;
+  response: PromptResponse;
+}
+
 interface PendingInteraction<T> {
   interactionId: string;
   request: T;
@@ -48,6 +54,7 @@ export interface BridgeSessionView {
   phase: SessionSyncPhase;
   syncError: string | null;
   timeline: SessionUpdate[];
+  turnOutcomes?: BridgeTurnOutcome[];
   activeTurn: BridgeTurnOverlay | null;
   workspace: {
     cwd: string | null;

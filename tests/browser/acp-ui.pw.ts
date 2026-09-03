@@ -1129,6 +1129,29 @@ test("restores the latest Agent session instead of creating an empty thread on r
   expect(browserErrors).toEqual([]);
 });
 
+test("keeps completed turn markers at their original boundaries across reload", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/");
+
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("context-window-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Context usage updated.", { exact: true })).toBeVisible();
+  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(1);
+
+  await composer.fill("usage-flow");
+  await composer.press("Enter");
+  await expect(page.locator('.turn-stop[data-stop-reason="max_tokens"]')).toHaveCount(1);
+  await expectTurnMarkerOrder(page);
+
+  await page.reload();
+  await expect(page.getByText("Context usage updated.", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-stop")).toHaveCount(2);
+  await expectTurnMarkerOrder(page);
+  expect(browserErrors).toEqual([]);
+});
+
 test("offers an explicit reconnect over the composer after the ACP connection stops", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");
@@ -1314,6 +1337,28 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function expectTurnMarkerOrder(page: Page): Promise<void> {
+  const entries = await page.locator("[data-thread-entry]").evaluateAll((elements) =>
+    elements.map((element) => {
+      if (element.classList.contains("turn-stop")) {
+        return `stop:${element.getAttribute("data-stop-reason")}`;
+      }
+      const role = element.getAttribute("data-thread-role");
+      const content = element.querySelector<HTMLElement>("[data-thread-searchable]")
+        ?.textContent?.trim();
+      return role == null ? "other" : `${role}:${content ?? ""}`;
+    })
+  );
+  const firstAnswer = entries.indexOf("agent:Context usage updated.");
+  const firstStop = entries.indexOf("stop:end_turn");
+  const secondPrompt = entries.indexOf("user:usage-flow");
+  const secondStop = entries.indexOf("stop:max_tokens");
+  expect(firstAnswer).toBeGreaterThanOrEqual(0);
+  expect(firstStop).toBeGreaterThan(firstAnswer);
+  expect(secondPrompt).toBeGreaterThan(firstStop);
+  expect(secondStop).toBeGreaterThan(secondPrompt);
+}
 
 function collectBrowserErrors(page: Page, expectedHttpStatuses: number[] = []): string[] {
   const errors: string[] = [];
