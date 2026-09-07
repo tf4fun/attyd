@@ -2349,6 +2349,7 @@ mod tests {
             .subscribe_session("observed".to_string())
             .await
             .expect("session subscription");
+        let global_subscription = hub.subscribe().await.expect("global subscription");
 
         hub.publish(
             1,
@@ -2361,10 +2362,23 @@ mod tests {
         )
         .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(25), commands.recv())
-                .await
-                .is_err(),
+            commands.try_recv().is_err(),
             "an observed session must remain in bridge memory"
+        );
+
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/session_turn_failed",
+                "sessionId": "observed",
+                "operationId": "observed-failed-turn",
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(
+            commands.try_recv().is_err(),
+            "an observed session must remain available after a failed turn"
         );
 
         hub.publish(
@@ -2402,11 +2416,11 @@ mod tests {
         hub.unsubscribe(subscription.id, subscription.generation)
             .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(25), commands.recv())
-                .await
-                .is_err(),
+            commands.try_recv().is_err(),
             "disconnecting after completion must not retroactively retire the session"
         );
+        hub.unsubscribe(global_subscription.id, global_subscription.generation)
+            .await;
     }
 
     #[test]
@@ -2930,6 +2944,10 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        let session_stream = hub
+            .subscribe_session("test-session".to_string())
+            .await
+            .expect("session subscription");
         let prompt = vec![json!({ "type": "text", "text": "message-actions-flow" })];
         let accepted = hub
             .start_turn(
@@ -2959,6 +2977,8 @@ mod tests {
             }
         }
 
+        hub.unsubscribe(session_stream.id, session_stream.generation)
+            .await;
         hub.shutdown().await;
     }
 
@@ -3104,6 +3124,12 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        // Global events do not pin a session after turn completion. Model the
+        // session page's SSE subscription so the duplicate targets the same incarnation.
+        let mut session_stream = hub
+            .subscribe_session("test-session".to_string())
+            .await
+            .expect("session subscription");
         let prompt = vec![json!({ "type": "text", "text": "error-after-output-flow" })];
         let accepted = hub
             .start_turn(
@@ -3116,22 +3142,33 @@ mod tests {
             .expect("turn is accepted before the Agent completes it");
         assert_eq!(accepted["disposition"], "accepted");
 
-        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let view = hub
-                    .session_view("test-session".to_string())
-                    .await
-                    .expect("session remains observable after the Agent error");
-                if view["session"]["phase"] == "ready"
-                    && view["session"]["historyRevision"] != revision
+                let event = next_event(&mut session_stream).await;
+                if event["type"] == "bridge/session_turn_failed"
+                    && event["operationId"] == accepted["operationId"]
                 {
-                    break view;
+                    break event;
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the errored turn did not reconcile");
+        .expect("the errored turn did not publish its terminal outcome");
+        assert_eq!(failed["phase"], "ready");
+        assert_ne!(failed["historyRevision"], revision);
+        let completed = hub
+            .session_view("test-session".to_string())
+            .await
+            .expect("session remains observable after the Agent error");
+        assert_eq!(completed["session"]["phase"], "ready");
+        assert_eq!(
+            completed["session"]["historyRevision"],
+            failed["historyRevision"]
+        );
+        assert_eq!(
+            completed["session"]["incarnation"], created["view"]["session"]["incarnation"],
+            "the observed session must not close and rematerialize after the error"
+        );
         assert!(
             completed["baseline"]["updates"]
                 .as_array()
@@ -3155,6 +3192,8 @@ mod tests {
         assert_eq!(duplicate["disposition"], "duplicate");
         assert_eq!(duplicate["operationId"], accepted["operationId"]);
 
+        hub.unsubscribe(session_stream.id, session_stream.generation)
+            .await;
         hub.unsubscribe(browser.id, browser.generation).await;
         hub.shutdown().await;
     }
@@ -3348,6 +3387,14 @@ mod tests {
         let first_id = first["sessionId"].as_str().unwrap().to_string();
         let second_id = second["sessionId"].as_str().unwrap().to_string();
         assert_ne!(first_id, second_id);
+        let first_stream = hub
+            .subscribe_session(first_id.clone())
+            .await
+            .expect("first session subscription");
+        let second_stream = hub
+            .subscribe_session(second_id.clone())
+            .await
+            .expect("second session subscription");
 
         hub.start_turn(
             first_id.clone(),
@@ -3401,6 +3448,10 @@ mod tests {
         })
         .await
         .expect("long session did not finish");
+        hub.unsubscribe(first_stream.id, first_stream.generation)
+            .await;
+        hub.unsubscribe(second_stream.id, second_stream.generation)
+            .await;
         hub.unsubscribe(observer.id, observer.generation).await;
         hub.shutdown().await;
     }
