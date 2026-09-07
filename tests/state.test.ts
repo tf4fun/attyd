@@ -7,6 +7,40 @@ function event(value: ServerEvent) {
 }
 
 describe("ACP UI state", () => {
+  it("keeps the active project's cwd when connection metadata refreshes", () => {
+    const state = appReducer({
+      ...initialState, session: { sessionId: "other" }, cwd: "/projects/other",
+    }, event({
+      type: "bridge/hello", transport: "stdio", command: ["goose", "acp"],
+      cwd: "/projects/default", readOnly: false, additionalDirectories: [], mcpServers: [],
+    }));
+    expect(state.defaultCwd).toBe("/projects/default");
+    expect(state.cwd).toBe("/projects/other");
+  });
+
+  it("keeps an unlisted running session available when navigating to projects", () => {
+    const active: AppState = {
+      ...initialState,
+      session: { sessionId: "new-session" },
+      cwd: "/workspace/project",
+      title: "Work in progress",
+      running: true,
+      pendingPrompt: { requestId: "in-flight", blocks: [{ type: "text", text: "Continue" }] },
+    };
+    const projects = appReducer(active, { type: "session/deselect" });
+    expect(projects.session).toBeUndefined();
+    expect(projects.running).toBe(false);
+    expect(projects.sessions).toEqual([{
+      sessionId: "new-session", cwd: "/workspace/project", title: "Work in progress",
+    }]);
+    expect(projects.cachedSessions.get("new-session")).toMatchObject({
+      running: true, cwd: "/workspace/project", pendingPrompt: active.pendingPrompt,
+    });
+    const restored = appReducer(projects, { type: "session/activate_cached", sessionId: "new-session" });
+    expect(restored.running).toBe(true);
+    expect(restored.pendingPrompt).toEqual(active.pendingPrompt);
+  });
+
   it("rebuilds bridge-owned turn outcomes at their persisted turn boundaries", () => {
     const base: AppState = {
       ...initialState,
@@ -1958,6 +1992,71 @@ describe("ACP UI state", () => {
       expect(item.call).toMatchObject({ title: "Read file", kind: "read", status: "completed" });
       expect(item.raw).toHaveLength(2);
     }
+  });
+
+  it("preserves earlier diffs when a later turn reuses a tool call ID", () => {
+    let state: AppState = { ...initialState, session: { sessionId: "s1" } };
+    const create = (newText: string) => event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "reused",
+          title: "Edit file",
+          status: "pending",
+          content: [{ type: "diff", path: "app.ts", oldText: null, newText }],
+        },
+      },
+    });
+    state = appReducer(state, create("first turn"));
+    const firstTool = state.timeline[0];
+    state = {
+      ...state,
+      timeline: [
+        ...state.timeline,
+        { id: "stop", type: "stop", response: { stopReason: "end_turn" } },
+        { id: "next", type: "message", role: "user", blocks: [{ type: "text", text: "Continue" }], raw: [] },
+      ],
+    };
+    state = appReducer(state, create("second turn"));
+    state = appReducer(state, event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "s1",
+        update: { sessionUpdate: "tool_call_update", toolCallId: "reused", status: "completed" },
+      },
+    }));
+
+    const tools = state.timeline.filter((item) => item.type === "tool");
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toBe(firstTool);
+    expect(tools[0].id).not.toBe(tools[1].id);
+    expect(tools[1].call).toMatchObject({
+      status: "completed",
+      content: [{ type: "diff", newText: "second turn" }],
+    });
+    expect(tools[1].raw).toHaveLength(2);
+  });
+
+  it("does not apply a new turn's unknown tool update to a previous turn", () => {
+    const state = appReducer({
+      ...initialState,
+      session: { sessionId: "s1" },
+      timeline: [
+        { id: "old-tool", type: "tool", call: { toolCallId: "reused", title: "Previous edit" }, raw: [] },
+        { id: "new-prompt", type: "message", role: "protocol-user", blocks: [], raw: [] },
+      ],
+    }, event({
+      type: "acp/session_update",
+      notification: {
+        sessionId: "s1",
+        update: { sessionUpdate: "tool_call_update", toolCallId: "reused", status: "completed" },
+      },
+    }));
+
+    expect(state.timeline[0]).toMatchObject({ call: { title: "Previous edit" } });
+    expect(state.timeline.at(-1)).toMatchObject({ call: { title: "Tool call not found", status: "failed" } });
   });
 
   it("renders a failed placeholder for a tool update without a creation", () => {

@@ -83,6 +83,7 @@ const observedNesRejects: acp.RejectNesNotification[] = [];
 const observedNesEvents: string[] = [];
 const observedSessionCloses: string[] = [];
 const deletedSessions = new Set<string>();
+const crossWorkspaceSessions = process.argv.includes("--cross-workspace-sessions");
 const observedMcpNotifications: acp.MessageMcpNotification[] = [];
 let closeAttempts = 0;
 let deleteAttempts = 0;
@@ -204,6 +205,21 @@ const agent = acp
   .onRequest(acp.methods.agent.session.list, ({ params }) => {
     requireAuthentication();
     listAttempts += 1;
+    if (process.argv.includes("--empty-session-list")) return { sessions: [] };
+    if (crossWorkspaceSessions) {
+      const sessions = [
+        { sessionId: "saved-session", cwd: process.cwd(), title: "Saved ACP session" },
+        { sessionId: "earlier-session", cwd: "/other-workspace", title: "Earlier Agent thread" },
+      ].filter((session) =>
+        !deletedSessions.has(session.sessionId) &&
+        (params.cwd == null || session.cwd === params.cwd),
+      );
+      const offset = params.cursor == null ? 0 : 1;
+      return {
+        sessions: sessions.slice(offset, offset + 1),
+        nextCursor: sessions.length > offset + 1 ? "workspace-page-2" : undefined,
+      };
+    }
     if (cyclicList) {
       const page = params.cursor === "cursor-a" ? 2 : params.cursor === "cursor-b" ? 3 : 1;
       return {
@@ -252,6 +268,9 @@ const agent = acp
     };
   })
   .onRequest(acp.methods.agent.session.load, async ({ params, client }) => {
+    if (crossWorkspaceSessions && params.sessionId === "earlier-session" && params.cwd !== "/other-workspace") {
+      throw acp.RequestError.invalidParams(undefined, "Load must retain the session's workspace");
+    }
     loadAttempts += 1;
     if (slowLoad) await new Promise((resolve) => setTimeout(resolve, 150));
     if (failLoadOnce && loadAttempts === 1) {

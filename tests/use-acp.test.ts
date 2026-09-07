@@ -1,11 +1,17 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment happy-dom
+
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   parseGlobalBusinessEvent,
   parseSessionBusinessEvent,
   strongEtag,
   workspaceContextSearchPath,
+  type BridgeSessionView,
 } from "../web/src/lib/business-api";
-import { mostRecentSession } from "../web/src/lib/use-acp";
+import { projectPath, sessionPath } from "../web/src/lib/session-route";
+import { useAcp } from "../web/src/lib/use-acp";
 
 describe("browser REST and SSE transport", () => {
   it("encodes the authoritative history revision as a strong If-Match value", () => {
@@ -80,16 +86,269 @@ describe("browser REST and SSE transport", () => {
     }))).toThrow("invalid payload");
   });
 
-  it("restores the newest timestamped session without depending on Agent ordering", () => {
-    expect(mostRecentSession([
-      { sessionId: "older", cwd: "/workspace", updatedAt: "2026-08-20T00:00:00Z" },
-      { sessionId: "newest", cwd: "/workspace", updatedAt: "2026-08-30T00:00:00Z" },
-      { sessionId: "undated", cwd: "/workspace" },
-    ])?.sessionId).toBe("newest");
-    expect(mostRecentSession([
-      { sessionId: "first", cwd: "/workspace" },
-      { sessionId: "second", cwd: "/workspace" },
-    ])?.sessionId).toBe("first");
-    expect(mostRecentSession([])).toBeUndefined();
+});
+
+describe("project navigation", () => {
+  let root: Root;
+  let container: HTMLDivElement;
+  let acp: ReturnType<typeof useAcp>;
+  let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
+
+  class TestEventSource {
+    static CLOSED = 2;
+    static instances: TestEventSource[] = [];
+    readyState = 1;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: { data: string }) => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor(readonly url: string) { TestEventSource.instances.push(this); }
+    close() { this.readyState = TestEventSource.CLOSED; }
+  }
+
+  function Harness() {
+    acp = useAcp();
+    return null;
+  }
+
+  function sessionView(sessionId: string, cwd = "/work/alpha"): BridgeSessionView {
+    return {
+      bridgeEpoch: "epoch", sessionId, sessionIncarnation: 1, viewRevision: 1,
+      historyRevision: "epoch:1:1", phase: "ready", syncError: null,
+      timeline: [], activeTurn: null, workspace: { cwd, session: {} },
+      controls: {}, interactions: { permissions: {}, elicitations: {}, urlFlows: {} },
+      operation: null, terminals: {},
+    };
+  }
+
+  const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+  const list = [
+    { sessionId: "alpha-one", cwd: "/work/alpha", title: "Alpha one" },
+    { sessionId: "beta-one", cwd: "/work/beta", title: "Beta one" },
+    { sessionId: "alpha-two", cwd: "/work/alpha", title: "Alpha two" },
+  ];
+  const defaultFetch: typeof fetch = async (input, init) => {
+    const path = String(input);
+    if (path === "/api/v1/runtime") return response({
+      connected: true, generation: 1, hello: null, initialized: null,
+      error: null, phase: { type: "bridge/phase", phase: "ready" },
+    });
+    if (path === "/api/v1/sessions") {
+      if (init?.method === "POST") return response({ sessionId: "created", view: sessionView("created") });
+      return response({ sessions: list.slice(0, 2), nextCursor: "more" });
+    }
+    if (path === "/api/v1/sessions?cursor=more") return response({ sessions: list.slice(2) });
+    if (path.startsWith("/api/v1/sessions/")) {
+      const id = decodeURIComponent(path.slice("/api/v1/sessions/".length));
+      if (id === "missing") return response({ error: "Missing session", code: "session_not_found" }, 404);
+      if (id.endsWith("/fork")) return response({ sessionId: "forked", view: sessionView("forked") });
+      return response(sessionView(id, list.find(({ sessionId }) => sessionId === id)?.cwd));
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  };
+
+  async function mount(path: string) {
+    window.history.replaceState(null, "", path);
+    await act(async () => root.render(createElement(Harness)));
+  }
+
+  async function restore(path: string) {
+    await act(async () => {
+      window.history.replaceState(null, "", path);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+  }
+
+  beforeEach(() => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    TestEventSource.instances = [];
+    vi.stubGlobal("EventSource", TestEventSource);
+    fetchMock = vi.fn(defaultFetch);
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+    window.history.replaceState(null, "", "/");
+    vi.unstubAllGlobals();
+  });
+
+  it("loads every project list page without opening a conversation", async () => {
+    await mount(projectPath("/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+    expect(acp.state.session).toBeUndefined();
+    expect(acp.state.sessions).toHaveLength(3);
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/api/v1/runtime", "/api/v1/sessions", "/api/v1/sessions?cursor=more",
+    ]);
+    expect(window.location.pathname).toBe(projectPath("/work/alpha"));
+  });
+
+  it("canonicalizes legacy and mismatched project links using the Agent workspace", async () => {
+    await mount("/sessions/alpha-two");
+    expect(acp.state.session?.sessionId).toBe("alpha-two");
+    expect(acp.projectCwd).toBe("/work/alpha");
+    expect(window.location.pathname).toBe(sessionPath("alpha-two", "/work/alpha"));
+    await restore(sessionPath("beta-one", "/work/wrong"));
+    expect(acp.projectCwd).toBe("/work/beta");
+    expect(acp.state.cwd).toBe("/work/beta");
+    expect(window.location.pathname).toBe(sessionPath("beta-one", "/work/beta"));
+  });
+
+  it("tracks home, project and session navigation without selecting project sessions", async () => {
+    await mount("/");
+    await act(async () => acp.openProject("/work/alpha"));
+    expect(window.location.pathname).toBe(projectPath("/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+    expect(acp.state.session).toBeUndefined();
+    await act(async () => acp.attachSession(list[0]));
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    await restore(projectPath("/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+    expect(acp.state.session).toBeUndefined();
+    expect(acp.state.cachedSessions.has("alpha-one")).toBe(true);
+    await restore("/");
+    expect(acp.projectCwd).toBeUndefined();
+    expect(acp.state.session).toBeUndefined();
+  });
+
+  it("returns missing and malformed session links home", async () => {
+    await mount(sessionPath("missing", "/work/alpha"));
+    expect(window.location.pathname).toBe("/");
+    expect(acp.projectCwd).toBeUndefined();
+    expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
+    await restore("/projects/%2Fwork/sessions/%");
+    expect(window.location.pathname).toBe("/");
+    expect(acp.state.session).toBeUndefined();
+  });
+
+  it("keeps direct empty projects open and creates and forks nested session routes", async () => {
+    await mount(projectPath("/work/empty"));
+    expect(window.location.pathname).toBe(projectPath("/work/empty"));
+    expect(acp.state.session).toBeUndefined();
+    await act(async () => { expect(acp.newSession("/work/alpha")).toBe(true); });
+    expect(window.location.pathname).toBe(sessionPath("created", "/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+    expect(acp.state.sessions).toHaveLength(3);
+    await act(async () => acp.forkSession());
+    expect(window.location.pathname).toBe(sessionPath("forked", "/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+  });
+
+  it("does not let delayed creation override a later project navigation", async () => {
+    let finishCreation!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/sessions" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => { finishCreation = resolve; });
+      }
+      return defaultFetch(input, init);
+    });
+    await mount(projectPath("/work/alpha"));
+    await act(async () => { acp.newSession("/work/alpha"); });
+    await act(async () => acp.openProject("/work/beta"));
+    await act(async () => finishCreation(response({ sessionId: "created", view: sessionView("created") })));
+    expect(window.location.pathname).toBe(projectPath("/work/beta"));
+    expect(acp.projectCwd).toBe("/work/beta");
+    expect(acp.state.session).toBeUndefined();
+  });
+
+  it.each(["running", "ready"] as const)("restores a background prompt that is %s after browsing its project", async (returnPhase) => {
+    let intentId: string | null = null;
+    let admitted = false;
+    let completed = false;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/sessions/alpha-one/turns") {
+        admitted = true;
+        intentId = new Headers(init?.headers).get("Idempotency-Key");
+        return response({ operationId: "turn-1", disposition: "accepted", status: "running" });
+      }
+      if (String(input) === "/api/v1/sessions/alpha-one" && admitted) {
+        const view = sessionView("alpha-one");
+        view.viewRevision = completed ? 3 : 2;
+        view.phase = completed ? "ready" : "running";
+        if (completed) {
+          view.historyRevision = "epoch:1:3";
+          view.timeline = [
+            { sessionUpdate: "user_message_chunk", content: { type: "text", text: "Keep working" } },
+            { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Completed" } },
+          ];
+          view.turnOutcomes = [{ operationId: "turn-1", afterUpdate: 2, response: { stopReason: "end_turn" } }];
+        } else {
+          view.activeTurn = {
+            operationId: "turn-1", clientIntentId: intentId!,
+            prompt: [{ type: "text", text: "Keep working" }], updates: [], terminal: null,
+          };
+        }
+        return response(view);
+      }
+      return defaultFetch(input, init);
+    });
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    await act(async () => { expect(acp.prompt([{ type: "text", text: "Keep working" }])).toBe(true); });
+    expect(acp.state.running).toBe(true);
+    const previousStream = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    await act(async () => acp.openProject("/work/alpha"));
+    expect(previousStream.readyState).toBe(TestEventSource.CLOSED);
+    expect(acp.state.session).toBeUndefined();
+    expect(acp.state.cachedSessions.get("alpha-one")?.running).toBe(true);
+    completed = returnPhase === "ready";
+    await restore(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(acp.state.running).toBe(returnPhase === "running");
+    expect(acp.state.sessionSyncPhase).toBe(returnPhase);
+    expect(acp.state.timeline.filter((item) => item.type === "message" &&
+      (item.role === "user" || item.role === "protocol-user"))).toHaveLength(1);
+    const restoredStream = TestEventSource.instances.filter(({ url }) => url.endsWith("alpha-one/events")).at(-1)!;
+    expect(restoredStream).not.toBe(previousStream);
+    expect(restoredStream.readyState).not.toBe(TestEventSource.CLOSED);
+    if (returnPhase === "running") {
+      await act(async () => restoredStream.onmessage?.({ data: JSON.stringify({
+        type: "bridge/session_turn_complete", bridgeEpoch: "epoch", sessionId: "alpha-one",
+        sessionIncarnation: 1, viewRevision: 3, historyRevision: "epoch:1:3", phase: "ready",
+        operationId: "turn-1", clientIntentId: intentId, response: { stopReason: "end_turn" },
+      }) }));
+      expect(acp.state.running).toBe(false);
+      expect(acp.state.timeline.at(-1)?.type).toBe("stop");
+    }
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).endsWith("/cancel"))).toHaveLength(0);
+  });
+
+  it("does not open a session after late pagination completes following navigation home", async () => {
+    let finishPage!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/sessions?cursor=more") {
+        return new Promise<Response>((resolve) => { finishPage = resolve; });
+      }
+      return defaultFetch(input, init);
+    });
+    await mount(sessionPath("alpha-two", "/work/alpha"));
+    await act(async () => acp.goHome());
+    await act(async () => finishPage(response({ sessions: list.slice(2) })));
+    expect(window.location.pathname).toBe("/");
+    expect(acp.projectCwd).toBeUndefined();
+    expect(acp.state.session).toBeUndefined();
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/v1/sessions/alpha-two")).toBe(false);
+  });
+
+  it("lets the newer popstate win over an in-flight project's paginated discovery", async () => {
+    let finishPage!: (value: Response) => void;
+    let held = false;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/sessions?cursor=more" && !held) {
+        held = true;
+        return new Promise<Response>((resolve) => { finishPage = resolve; });
+      }
+      return defaultFetch(input, init);
+    });
+    await mount(projectPath("/work/alpha"));
+    await restore(sessionPath("beta-one", "/work/beta"));
+    await act(async () => finishPage(response({ sessions: list.slice(2) })));
+    expect(window.location.pathname).toBe(sessionPath("beta-one", "/work/beta"));
+    expect(acp.projectCwd).toBe("/work/beta");
+    expect(acp.state.session?.sessionId).toBe("beta-one");
   });
 });

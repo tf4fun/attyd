@@ -57,6 +57,7 @@ export function ThreadSearchBar({
   contentVersion,
   terminalVersion,
   focusRequest,
+  onNavigate,
   onClose,
 }: {
   rootRef: RefObject<HTMLElement | null>;
@@ -64,6 +65,7 @@ export function ThreadSearchBar({
   contentVersion: unknown;
   terminalVersion: unknown;
   focusRequest: number;
+  onNavigate?: () => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -118,9 +120,10 @@ export function ThreadSearchBar({
     setLimited(result.limited);
     applyActiveMatch(result.matches, nextIndex);
     if (nextIndex != null && previousMatch == null) {
+      onNavigate?.();
       scrollToEntry(result.matches[nextIndex]?.entry);
     }
-  }, [applyActiveMatch, options, query, rootRef]);
+  }, [applyActiveMatch, onNavigate, options, query, rootRef]);
 
   useEffect(() => {
     const config = `${query}\u0000${Number(options.caseSensitive)}${Number(options.wholeWord)}${Number(options.regex)}`;
@@ -162,6 +165,7 @@ export function ThreadSearchBar({
     activeIndexRef.current = next;
     setActiveIndex(next);
     applyActiveMatch(currentMatches, next);
+    onNavigate?.();
     scrollToEntry(currentMatches[next]?.entry);
     input.current?.focus();
   };

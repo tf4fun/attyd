@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collectReviewChanges } from "../web/src/lib/review-changes";
+import { collectReviewChanges, collectTurnReviewChanges } from "../web/src/lib/review-changes";
 import type { TimelineItem } from "../web/src/lib/state";
 
 describe("ACP change review aggregation", () => {
@@ -54,6 +54,68 @@ describe("ACP change review aggregation", () => {
     expect(diff.truncated).toBe(true);
   });
 });
+
+describe("turn-scoped ACP change reviews", () => {
+  it("keeps edits to the same file in separate turns and leaves unmodified turns empty", () => {
+    const turns = collectTurnReviewChanges([
+      prompt("first"),
+      tool("first-edit", "/workspace/a.ts", "one", "two"),
+      { id: "first-stop", type: "stop", response: { stopReason: "end_turn" } },
+      prompt("second"),
+      tool("second-edit", "/workspace/a.ts", "two", "three\nfour"),
+      { id: "second-stop", type: "stop", response: { stopReason: "cancelled" } },
+      prompt("third"),
+    ]);
+
+    expect(turns.map(({ id }) => id)).toEqual(["first", "second", "third"]);
+    expect(turns.map(({ summary }) => summary.diffCount)).toEqual([1, 1, 0]);
+    expect(turns[0].summary.files[0].diffs[0].newText).toBe("two");
+    expect(turns[1].summary.files[0].diffs[0].newText).toBe("three\nfour");
+    expect(turns[1].items.at(-1)?.id).toBe("second-stop");
+  });
+
+  it("separates loaded prompts even when their history has no turn outcomes", () => {
+    const turns = collectTurnReviewChanges([
+      { ...prompt("loaded-first"), role: "protocol-user" },
+      tool("first-edit", "/workspace/a.ts", null, "one"),
+      { ...prompt("loaded-second"), role: "protocol-user" },
+      tool("second-edit", "/workspace/b.ts", null, "two"),
+    ]);
+
+    expect(turns.map(({ id }) => id)).toEqual(["loaded-first", "loaded-second"]);
+    expect(turns.map(({ summary }) => summary.files.map(({ path }) => path)))
+      .toEqual([["/workspace/a.ts"], ["/workspace/b.ts"]]);
+  });
+
+  it("keeps user chunks from the same operation together", () => {
+    const turns = collectTurnReviewChanges([
+      { ...prompt("first-chunk"), turnOperationId: "operation-one" },
+      { ...prompt("second-chunk"), turnOperationId: "operation-one" },
+      tool("edit", "/workspace/a.ts", null, "one"),
+      { ...prompt("next-prompt"), turnOperationId: "operation-two" },
+    ]);
+
+    expect(turns.map(({ id }) => id)).toEqual(["first-chunk", "next-prompt"]);
+    expect(turns[0].items.map(({ id }) => id)).toEqual(["first-chunk", "second-chunk", "edit"]);
+  });
+
+  it("uses outcomes and prompt failures as boundaries when user messages are absent", () => {
+    const turns = collectTurnReviewChanges([
+      tool("first-edit", "/workspace/a.ts", null, "one"),
+      { id: "stop", type: "stop", response: { stopReason: "end_turn" } },
+      tool("second-edit", "/workspace/b.ts", null, "two"),
+      { id: "failure", type: "error", operation: "session/prompt", message: "Turn failed" },
+      tool("third-edit", "/workspace/c.ts", null, "three"),
+    ]);
+
+    expect(turns.map(({ summary }) => summary.diffCount)).toEqual([1, 1, 1]);
+    expect(turns[1].items.at(-1)?.id).toBe("failure");
+  });
+});
+
+function prompt(id: string): Extract<TimelineItem, { type: "message" }> {
+  return { id, type: "message", role: "user", blocks: [{ type: "text", text: id }], raw: [] };
+}
 
 function tool(
   toolCallId: string,

@@ -12,6 +12,7 @@ import { QueuedPrompts, type QueuedPrompt } from "../web/src/components/acp/queu
 import { SessionControls } from "../web/src/components/acp/session-controls";
 import { ChangeReview } from "../web/src/components/acp/change-review";
 import { collectReviewChanges } from "../web/src/lib/review-changes";
+import type { TimelineItem } from "../web/src/lib/state";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
@@ -61,6 +62,75 @@ describe("ACP interactive UI contract", () => {
     expect(trigger.getAttribute("aria-expanded")).toBe("true");
     expect(container.querySelector(".change-review-panel")?.textContent).toContain("old");
     expect(container.querySelector(".change-review-panel")?.textContent).toContain("new");
+  });
+
+  it("keeps each turn's change review beside its messages with independent persistent disclosure", async () => {
+    const timeline: TimelineItem[] = [
+      { id: "first", type: "message", role: "user", blocks: [{ type: "text", text: "First edit" }], raw: [] },
+      {
+        id: "first-tool",
+        type: "tool",
+        call: {
+          toolCallId: "edit",
+          title: "Edit app",
+          content: [{ type: "diff", path: "app.ts", oldText: "one", newText: "two" }],
+        },
+        raw: [],
+      },
+    ];
+    await render(root, <Conversation timeline={timeline} />);
+    const firstReview = requireElement<HTMLElement>(container.querySelector(".change-review"));
+    const firstTrigger = requireElement<HTMLButtonElement>(firstReview.querySelector(".change-review-trigger"));
+    await click(firstTrigger);
+    expect(firstTrigger.getAttribute("aria-expanded")).toBe("true");
+
+    const laterTimeline: TimelineItem[] = [
+      ...timeline,
+      { id: "first-stop", type: "stop", response: { stopReason: "end_turn" } },
+      { id: "second", type: "message", role: "user", blocks: [{ type: "text", text: "Second edit" }], raw: [] },
+      {
+        id: "second-tool",
+        type: "tool",
+        call: {
+          toolCallId: "edit",
+          title: "Edit app again",
+          content: [{ type: "diff", path: "app.ts", oldText: "two", newText: "three\nfour" }],
+        },
+        raw: [],
+      },
+      { id: "second-stop", type: "stop", response: { stopReason: "end_turn" } },
+      { id: "third", type: "message", role: "user", blocks: [{ type: "text", text: "Explain only" }], raw: [] },
+    ];
+    await render(root, <Conversation timeline={laterTimeline} />);
+    const reviews = container.querySelectorAll<HTMLElement>(".change-review");
+    expect(reviews).toHaveLength(2);
+    expect(reviews[0]).toBe(firstReview);
+    expect(firstTrigger.getAttribute("aria-expanded")).toBe("true");
+    expect(firstReview.previousElementSibling?.getAttribute("data-thread-entry-id")).toBe("first-stop");
+    expect(firstReview.nextElementSibling?.getAttribute("data-thread-entry-id")).toBe("second");
+    expect(reviews[1].nextElementSibling?.getAttribute("data-thread-entry-id")).toBe("third");
+    expect(firstReview.querySelector(".change-review-lines")?.textContent).not.toContain("three");
+
+    const secondTrigger = requireElement<HTMLButtonElement>(reviews[1].querySelector(".change-review-trigger"));
+    expect(secondTrigger.getAttribute("aria-expanded")).toBe("false");
+    await click(secondTrigger);
+    expect(reviews[1].querySelector(".change-review-lines")?.textContent).toContain("three");
+    expect(firstTrigger.getAttribute("aria-controls")).not.toBe(secondTrigger.getAttribute("aria-controls"));
+    for (const review of reviews) {
+      expect(review.querySelector(".change-review-panel")?.id)
+        .toBe(review.querySelector(".change-review-trigger")?.getAttribute("aria-controls"));
+    }
+    await click(firstTrigger);
+    expect(secondTrigger.getAttribute("aria-expanded")).toBe("true");
+
+    await render(root, <Conversation timeline={laterTimeline.map((item) => item.type === "message"
+      ? { ...item, id: `rehydrated:${item.id}`, role: "protocol-user" }
+      : item)} />);
+    const rehydratedReviews = container.querySelectorAll(".change-review");
+    expect(rehydratedReviews[0]).toBe(firstReview);
+    expect(rehydratedReviews[1]).toBe(reviews[1]);
+    expect(firstTrigger.getAttribute("aria-expanded")).toBe("false");
+    expect(secondTrigger.getAttribute("aria-expanded")).toBe("true");
   });
 
   it("auto-expands live thinking, collapses on the next ACP phase, and remains inspectable", async () => {

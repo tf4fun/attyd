@@ -8,6 +8,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
+import { projectPath, sessionPath } from "../../web/src/lib/session-route";
 
 const test = baseTest.extend<{ isolatedAttydUrl: string }>({
   isolatedAttydUrl: async ({}, use) => {
@@ -34,7 +35,7 @@ const test = baseTest.extend<{ isolatedAttydUrl: string }>({
 
 test("drives permission and form ACP interactions with real focus restoration", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -83,7 +84,7 @@ test("drives permission and form ACP interactions with real focus restoration", 
 
 test("queues ACP follow-ups and uses session cancel for Send now", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -120,7 +121,7 @@ test("queues ACP follow-ups and uses session cancel for Send now", async ({ page
 
 test("keeps queued ACP work paused after Stop and resumes it after a new message", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -148,7 +149,7 @@ test("keeps queued ACP work paused after Stop and resumes it after a new message
 
 test("pastes and drops negotiated ACP context into the Zed-style composer", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
   const editor = page.locator('textarea[role="combobox"]');
   await expect(editor).toBeEnabled();
 
@@ -218,7 +219,7 @@ test("pastes and drops negotiated ACP context into the Zed-style composer", asyn
 test("adds a workspace file through a Zed-style @ mention", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
   const editor = page.locator('textarea[role="combobox"]');
   await expect(editor).toBeEnabled();
 
@@ -245,7 +246,7 @@ test("adds a workspace file through a Zed-style @ mention", async ({ page }) => 
 
 test("renders structured ACP errors and retries the exact failed prompt", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
   await expect(page.getByRole("button", { name: "NES" })).toHaveCount(0);
@@ -269,80 +270,154 @@ test("renders structured ACP errors and retries the exact failed prompt", async 
   expect(browserErrors).toEqual([]);
 });
 
-test("keeps the mobile sidebar bounded and restores focus after Escape", async ({ page }) => {
+test("keeps mobile session and Agent popovers bounded and restores focus after Escape", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
   await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  await expectFullWidthMain(page);
 
-  const open = page.getByRole("button", { name: "Open sidebar" });
-  await open.click();
-  const sidebar = page.getByRole("complementary", { name: "Application sidebar" });
-  const close = page.getByRole("button", { name: "Close sidebar" });
-  await expect(sidebar).toHaveClass(/sidebar-open/);
-  await expect(close).toBeFocused();
+  const trigger = page.getByRole("button", { name: "Switch project session", exact: true });
+  const picker = await openSessionPicker(page);
+  await expect(picker).toHaveAttribute("open", "");
+  await expectWithinViewport(picker.locator(".session-history"), 390);
   await page.keyboard.press("Escape");
-  await expect(sidebar).not.toHaveClass(/sidebar-open/);
-  await expect(open).toBeFocused();
+  await expect(picker).not.toHaveAttribute("open", "");
+  await expect(trigger).toBeFocused();
+
+  const settings = page.getByRole("button", { name: "Agent settings", exact: true });
+  await settings.click();
+  await expect(page.locator(".agent-details")).toHaveAttribute("open", "");
+  await expectWithinViewport(page.locator(".agent-details-body"), 390);
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".agent-details")).not.toHaveAttribute("open", "");
+  await expect(settings).toBeFocused();
+
+  await settings.press("Enter");
+  await expect(page.locator(".agent-details")).toHaveAttribute("open", "");
+  const newThread = page.getByRole("button", { name: "New thread", exact: true });
+  await newThread.focus();
+  await newThread.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "New thread", exact: true });
+  await expect(dialog).toBeVisible();
+  await expect(page.locator(".agent-details")).not.toHaveAttribute("open", "");
+  const headerCovered = await newThread.evaluate((button) => {
+    const bounds = button.getBoundingClientRect();
+    return document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)
+      ?.closest(".new-thread-overlay") != null;
+  });
+  expect(headerCovered).toBe(true);
+  await dialog.getByRole("button", { name: "Cancel new thread" }).click();
+  await expect(newThread).toBeFocused();
+
+  for (const viewport of [
+    { width: 390, height: 400 },
+    { width: 667, height: 375 },
+    { width: 850, height: 300 },
+  ]) {
+    const expectUsablePanel = async (panel: Locator) => {
+      await expect(panel).toBeVisible();
+      await expectWithinViewport(panel, viewport.width);
+      await expect.poll(() => panel.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        return bounds.top >= 0 && bounds.bottom <= window.innerHeight + 1 && bounds.height > 0;
+      })).toBe(true);
+    };
+    await page.setViewportSize({ width: viewport.width, height: 844 });
+    await openSessionPicker(page);
+    await page.setViewportSize(viewport);
+    await expect(picker).toHaveAttribute("open", "");
+    await expectUsablePanel(picker.locator(".session-switcher-panel"));
+    const lastSession = picker.locator(".session-open").last();
+    await lastSession.scrollIntoViewIfNeeded();
+    await expect(lastSession).toBeInViewport({ ratio: 0.98 });
+
+    await settings.click();
+    await expect(picker).not.toHaveAttribute("open", "");
+    const settingsPanel = page.locator(".agent-details-body");
+    await expectUsablePanel(settingsPanel);
+    const capabilities = settingsPanel.locator("summary").filter({ hasText: "Capabilities" });
+    await capabilities.scrollIntoViewIfNeeded();
+    await expect(capabilities).toBeInViewport({ ratio: 0.98 });
+    await capabilities.click();
+    await expectUsablePanel(settingsPanel);
+
+    const actions = page.getByRole("button", { name: "Thread actions", exact: true });
+    await actions.click();
+    await expect(page.locator(".agent-details")).not.toHaveAttribute("open", "");
+    const actionsPanel = page.locator(".thread-actions > div");
+    await expectUsablePanel(actionsPanel);
+    const lastAction = actionsPanel.getByRole("button", { name: "Delete thread", exact: true });
+    await lastAction.scrollIntoViewIfNeeded();
+    await expect(lastAction).toBeInViewport({ ratio: 0.98 });
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".thread-actions")).not.toHaveAttribute("open", "");
+    await expect(actions).toBeFocused();
+  }
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   expect(browserErrors).toEqual([]);
 });
 
-test("filters only Agent-reported threads in the Zed-style sidebar", async ({ page }) => {
+test("filters only project sessions in the session switcher", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
   await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
 
-  const sidebar = page.getByRole("complementary", { name: "Application sidebar" });
-  const filter = sidebar.getByRole("searchbox", { name: "Filter loaded Agent threads" });
+  const picker = await openSessionPicker(page);
+  const filter = picker.getByRole("searchbox", { name: "Filter loaded Agent threads" });
   await expect(filter).toBeVisible();
-  await expect(sidebar.locator(".session-filter-status")).toHaveText("2 loaded threads");
-  await expect(sidebar.getByRole("heading", { name: "Current" })).toBeVisible();
-  await expect(sidebar.getByText("Earlier Agent thread", { exact: true })).toBeVisible();
-  const currentThread = sidebar.locator('[aria-current="page"]');
+  await expect(picker.locator(".session-filter-status")).toHaveText("2 loaded threads");
+  const workspaceGroup = picker.locator(".session-group").filter({
+    has: page.getByRole("heading", { name: process.cwd(), exact: true }),
+  });
+  await expect(workspaceGroup.locator(".session-group-label"))
+    .toHaveAttribute("title", process.cwd());
+  await expect(picker.locator(".session-group-label")).toHaveCount(1);
+  await expect(workspaceGroup.locator('[aria-current="page"]')).toBeVisible();
+  await expect(picker.getByText("Earlier Agent thread", { exact: true })).toBeVisible();
+  const currentThread = picker.locator('[aria-current="page"]');
 
   await filter.fill("ear agent");
-  await expect(sidebar.locator(".session-filter-status")).toHaveText("1 of 2 loaded threads");
-  await expect(sidebar.getByText("Earlier Agent thread", { exact: true })).toBeVisible();
+  await expect(picker.locator(".session-filter-status")).toHaveText("1 of 2 loaded threads");
+  await expect(picker.getByText("Earlier Agent thread", { exact: true })).toBeVisible();
   await expect(currentThread).toBeHidden();
   await filter.press("Escape");
   await expect(filter).toHaveValue("");
-  await expect(sidebar.locator('[aria-current="page"]')).toBeVisible();
+  await expect(picker).toHaveAttribute("open", "");
+  await expect(picker.locator('[aria-current="page"]')).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("button", { name: "Open sidebar" }).click();
-  await expect(sidebar).toHaveClass(/sidebar-open/);
   await expect(filter).toBeVisible();
-  await expect.poll(async () => (await sidebar.boundingBox())?.x ?? -1).toBeGreaterThanOrEqual(-1);
-  const bounds = await sidebar.boundingBox();
-  expect(bounds).not.toBeNull();
-  expect(bounds!.x).toBeGreaterThanOrEqual(0);
-  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+  await expectWithinViewport(picker.locator(".session-history"), 390);
+  await expectFullWidthMain(page);
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   expect(browserErrors).toEqual([]);
 });
 
 test("switches between already-open ACP threads without loading them twice", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
-  const sidebar = page.getByRole("complementary", { name: "Application sidebar" });
+  const picker = page.locator(".session-switcher");
   const thread = page.getByRole("region", { name: "Conversation thread" });
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await page.addStyleTag({ content: ".conversation-wrap{min-height:1500px!important}" });
 
-  await sidebar.locator(".session-open")
+  await openSessionPicker(page);
+  await picker.locator(".session-open")
     .filter({ hasText: "Earlier Agent thread" })
     .click();
   await expect(page.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
   await expect.poll(() => thread.evaluate((element) =>
     element.scrollHeight - element.clientHeight - element.scrollTop
   )).toBeLessThan(3);
-  await expect(sidebar.locator(".session-open").filter({ hasText: "Saved ACP session" }))
-    .toContainText("open");
+  await expect(picker).not.toHaveAttribute("open", "");
+  await openSessionPicker(page);
+  await expect(picker.locator(".session-open").filter({ hasText: "Saved ACP session" }))
+    .not.toContainText(/\bopen\b/iu);
 
   await thread.evaluate((element) => { element.scrollTop = 0; });
-  await sidebar.locator(".session-open")
+  await picker.locator(".session-open")
     .filter({ hasText: "Saved ACP session" })
     .click();
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
@@ -356,7 +431,7 @@ test("switches between already-open ACP threads without loading them twice", asy
 
 test("runs different ACP sessions concurrently without treating running as a global lock", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
 
   const composer = page.locator('textarea[role="combobox"]');
@@ -364,8 +439,9 @@ test("runs different ACP sessions concurrently without treating running as a glo
   await composer.press("Enter");
   await expect(page.getByRole("button", { name: "Stop current turn" })).toBeVisible();
 
-  const sidebar = page.getByRole("complementary", { name: "Application sidebar" });
-  const earlier = sidebar.locator(".session-open").filter({ hasText: "Earlier Agent thread" });
+  const picker = page.locator(".session-switcher");
+  await openSessionPicker(page);
+  const earlier = picker.locator(".session-open").filter({ hasText: "Earlier Agent thread" });
   await expect(earlier).toBeEnabled();
   await earlier.click();
   await expect(page.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
@@ -375,11 +451,14 @@ test("runs different ACP sessions concurrently without treating running as a glo
   await composer.press("Enter");
   await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
 
-  const saved = sidebar.locator(".session-open").filter({ hasText: "Saved ACP session" });
+  await openSessionPicker(page);
+  const saved = picker.locator(".session-open").filter({ hasText: "Saved ACP session" });
   await saved.click();
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Stop current turn" })).toBeVisible();
-  await expect(sidebar.getByRole("button", { name: "Delete Saved ACP session" })).toBeDisabled();
+  await openSessionPicker(page);
+  await expect(picker.getByRole("button", { name: "Delete Saved ACP session" })).toBeDisabled();
+  await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Stop current turn" }).click();
   await expect(composer).toBeEnabled();
   expect(browserErrors).toEqual([]);
@@ -399,26 +478,31 @@ test("closes then deletes both switched-away and current ACP sessions", async ({
   const browserErrors = collectBrowserErrors(page);
 
   try {
-    await page.goto(`http://127.0.0.1:${server.port}`);
-    const sidebar = page.getByRole("complementary", { name: "Application sidebar" });
+    await page.goto(`http://127.0.0.1:${server.port}/sessions/saved-session`);
+    const picker = page.locator(".session-switcher");
     await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
 
-    await sidebar.locator(".session-open")
+    await openSessionPicker(page);
+    await picker.locator(".session-open")
       .filter({ hasText: "Earlier Agent thread" })
       .click();
     await expect(page.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
-    const oldDelete = sidebar.getByRole("button", { name: "Delete Saved ACP session" });
+    await openSessionPicker(page);
+    const oldDelete = picker.getByRole("button", { name: "Delete Saved ACP session" });
     await expect(oldDelete).toBeEnabled();
     page.once("dialog", (dialog) => dialog.accept());
     await oldDelete.click();
-    await expect(sidebar.getByText("Saved ACP session", { exact: true })).toBeHidden();
+    await expect(picker.getByText("Saved ACP session", { exact: true })).toBeHidden();
+    await expect(page).toHaveURL(/\/sessions\/earlier-session$/u);
     await expect(page.getByRole("alert")).toHaveCount(0);
 
+    await page.keyboard.press("Escape");
     await page.getByRole("button", { name: "Thread actions" }).click();
     page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Delete thread" }).click();
-    await expect(page.getByRole("heading", { name: "No active session" })).toBeVisible();
-    await expect(sidebar.getByText("Earlier Agent thread", { exact: true })).toBeHidden();
+    await expect(page).toHaveURL(/\/$/u);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(picker.getByText("Earlier Agent thread", { exact: true })).toBeHidden();
     await expect(page.getByRole("alert")).toHaveCount(0);
     expect(browserErrors).toEqual([]);
   } finally {
@@ -428,7 +512,7 @@ test("closes then deletes both switched-away and current ACP sessions", async ({
 
 test("keeps expanded ACP turn payloads inside the message flow", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -450,7 +534,7 @@ test("keeps expanded ACP turn payloads inside the message flow", async ({ page }
 
 test("renders live ACP context usage at the Zed-style composer edge", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -483,7 +567,7 @@ test("renders live ACP context usage at the Zed-style composer edge", async ({ p
 test("expands the same ACP composer with Zed's composer shortcut", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.setViewportSize({ width: 900, height: 640 });
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const editor = page.locator('textarea[role="combobox"]');
   const composer = page.locator(".composer");
@@ -536,7 +620,7 @@ test("expands the same ACP composer with Zed's composer shortcut", async ({ page
 
 test("reviews Agent-reported ACP diffs without inventing editor actions", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -575,9 +659,59 @@ test("reviews Agent-reported ACP diffs without inventing editor actions", async 
   expect(browserErrors).toEqual([]);
 });
 
+test("keeps file changes with their original turns across later prompts", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/sessions/saved-session");
+  const thread = page.getByRole("region", { name: "Conversation thread" });
+  const composer = page.locator('textarea[role="combobox"]');
+  const reviews = thread.getByLabel("Agent-reported changes");
+  await expect(composer).toBeEnabled();
+  await composer.fill("review-flow first edit");
+  await composer.press("Enter");
+  await expect(reviews).toHaveCount(1);
+  const firstReview = reviews.first();
+  await firstReview.locator(".change-review-trigger").click();
+  await expect(firstReview.locator(".change-review-panel")).toBeVisible();
+
+  await composer.fill("stream-follow-flow without edits");
+  await composer.press("Enter");
+  await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+  await expect(reviews).toHaveCount(1);
+  await expect(firstReview.locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "true");
+
+  await composer.fill("review-flow second edit");
+  await composer.press("Enter");
+  await expect(page.getByText("Reported two workspace changes.", { exact: true })).toHaveCount(2);
+  await expect(reviews).toHaveCount(2);
+  await expect(firstReview.locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "true");
+  await expect(reviews.last().locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "false");
+  await expect(thread.locator(".tool-card").filter({ hasText: "Edit workspace files" })).toHaveCount(2);
+  await expect(page.locator(".composer-dock .change-review")).toHaveCount(0);
+  for (const review of await reviews.all()) {
+    await expect(review.locator(".change-review-trigger")).toContainText("2 files");
+    await expect(review.locator(".change-review-trigger")).toContainText("+4");
+  }
+  const firstPanelId = await firstReview.locator(".change-review-trigger").getAttribute("aria-controls");
+  const secondPanelId = await reviews.last().locator(".change-review-trigger").getAttribute("aria-controls");
+  expect(firstPanelId).not.toBe(secondPanelId);
+  expect(await thread.evaluate((element) => {
+    const changes = [...element.querySelectorAll(".change-review")];
+    const prompts = [...element.querySelectorAll('[data-thread-role="user"]')];
+    const firstPrompt = prompts.find((prompt) => prompt.textContent?.includes("review-flow first edit"))!;
+    const plainPrompt = prompts.find((prompt) => prompt.textContent?.includes("stream-follow-flow without edits"))!;
+    const secondPrompt = prompts.find((prompt) => prompt.textContent?.includes("review-flow second edit"))!;
+    const before = (left: Element, right: Element) => Boolean(
+      left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING
+    );
+    return before(firstPrompt, changes[0]) && before(changes[0], plainPrompt) &&
+      before(plainPrompt, secondPrompt) && before(secondPrompt, changes[1]);
+  })).toBe(true);
+  expect(browserErrors).toEqual([]);
+});
+
 test("follows ACP thought and tool activity with responsive Zed-style disclosure", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -714,7 +848,7 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
 
 test("uses one visual language for structured tool input and Markdown tool output", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -746,7 +880,7 @@ test("uses one visual language for structured tool input and Markdown tool outpu
 test("stops following streamed Agent output after the user scrolls upward", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.setViewportSize({ width: 900, height: 480 });
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
   await page.addStyleTag({ content: ".conversation-wrap{min-height:1500px!important}" });
 
   const thread = page.getByRole("region", { name: "Conversation thread" });
@@ -789,10 +923,205 @@ test("stops following streamed Agent output after the user scrolls upward", asyn
   expect(browserErrors).toEqual([]);
 });
 
+for (const gesture of ["wheel", "touch"] as const) {
+  test(`follows a new turn after a downward ${gesture} gesture at the bottom`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.setViewportSize({ width: 900, height: 420 });
+    await page.goto("/sessions/saved-session");
+
+    const thread = page.getByRole("region", { name: "Conversation thread" });
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill("stream-follow-flow");
+    await composer.press("Enter");
+    await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+    await expect.poll(() => thread.evaluate((element) =>
+      element.scrollHeight - element.clientHeight - element.scrollTop
+    )).toBeLessThan(3);
+
+    await thread.evaluate((element, input) => {
+      if (input === "wheel") {
+        element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 120 }));
+      } else {
+        for (const [type, clientY] of [["touchstart", 200], ["touchmove", 80]] as const) {
+          element.dispatchEvent(new TouchEvent(type, {
+            bubbles: true,
+            touches: [new Touch({ identifier: 1, target: element, clientY })],
+          }));
+        }
+        element.dispatchEvent(new TouchEvent("touchend", { bubbles: true, touches: [] }));
+      }
+    }, gesture);
+
+    await composer.fill("stream-follow-flow next turn");
+    await composer.press("Enter");
+    await expect(page.getByText("Stream follow complete.", { exact: true })).toHaveCount(2);
+    await expect.poll(() => thread.evaluate((element) =>
+      element.scrollHeight - element.clientHeight - element.scrollTop
+    )).toBeLessThan(3);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+test("follows delayed content growth only while pinned to the bottom", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.setViewportSize({ width: 900, height: 420 });
+  await page.goto("/sessions/saved-session");
+  const thread = page.getByRole("region", { name: "Conversation thread" });
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("stream-follow-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+
+  // Simulate a late image/terminal layout update with no new ACP timeline event.
+  await thread.evaluate((element) => {
+    const content = element.querySelector<HTMLElement>(".conversation-wrap")!;
+    content.style.paddingBottom = "300px";
+  });
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeLessThan(3);
+
+  // Reading inside a nested output pane does not move the conversation itself.
+  await thread.evaluate((element) => {
+    const output = document.createElement("pre");
+    output.dataset.nestedOutput = "true";
+    output.style.cssText = "height:80px;overflow-y:auto";
+    output.textContent = "Tool output\n".repeat(80);
+    element.querySelector(".conversation-wrap")!.append(output);
+    output.scrollTop = 100;
+  });
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeLessThan(3);
+  await thread.evaluate((element) => {
+    const output = element.querySelector<HTMLElement>("[data-nested-output]")!;
+    output.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -50 }));
+    output.scrollTop -= 50;
+    element.querySelector<HTMLElement>(".conversation-wrap")!.style.paddingBottom = "600px";
+  });
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeLessThan(3);
+
+  await thread.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -150 }));
+    element.scrollTop -= 150;
+  });
+  const readingPosition = await thread.evaluate((element) => element.scrollTop);
+  await thread.evaluate((element) => {
+    element.querySelector<HTMLElement>(".conversation-wrap")!.style.paddingBottom = "900px";
+  });
+  await expect.poll(() => thread.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeGreaterThan(400);
+  expect(await thread.evaluate((element) => element.scrollTop)).toBe(readingPosition);
+  expect(browserErrors).toEqual([]);
+});
+
+for (const distance of [24, 500]) {
+  test(`preserves the reading position when sending ${distance}px above the bottom`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.setViewportSize({ width: 900, height: 420 });
+    await page.goto("/sessions/saved-session");
+    const thread = page.getByRole("region", { name: "Conversation thread" });
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill("stream-follow-flow");
+    await composer.press("Enter");
+    await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+    await thread.focus();
+    await thread.evaluate((element, offset) => {
+      element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -offset }));
+      element.scrollTop = element.scrollHeight - element.clientHeight - offset;
+    }, distance);
+    const readingPosition = await thread.evaluate((element) => element.scrollTop);
+    const anchor = thread.getByText("Streamed paragraph 18:", { exact: false }).first();
+    const anchorTop = await anchor.evaluate((element) => element.getBoundingClientRect().top);
+
+    await composer.fill("stream-follow-flow while reading history");
+    await composer.press("Enter");
+    await expect(page.getByText("Stream follow complete.", { exact: true })).toHaveCount(2);
+    await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+    expect(await thread.evaluate((element) => element.scrollTop)).toBe(readingPosition);
+    expect(await anchor.evaluate((element) => element.getBoundingClientRect().top)).toBe(anchorTop);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+test("keeps the reading position after scrolling up during streamed output", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.setViewportSize({ width: 900, height: 420 });
+  await page.goto("/sessions/saved-session");
+  const thread = page.getByRole("region", { name: "Conversation thread" });
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("stream-follow-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+  await composer.fill("stream-follow-flow next turn");
+  await composer.press("Enter");
+  await expect(thread.getByText("Streamed paragraph 4:", { exact: false })).toHaveCount(2);
+  const readingPosition = await thread.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -500 }));
+    element.scrollTop -= 500;
+    return element.scrollTop;
+  });
+  const anchor = thread.getByText("Streamed paragraph 18:", { exact: false }).first();
+  const anchorTop = await anchor.evaluate((element) => element.getBoundingClientRect().top);
+  await expect(page.getByText("Stream follow complete.", { exact: true })).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+  expect(await thread.evaluate((element) => element.scrollTop)).toBe(readingPosition);
+  expect(await anchor.evaluate((element) => element.getBoundingClientRect().top)).toBe(anchorTop);
+  expect(browserErrors).toEqual([]);
+});
+
+test("keeps the historical search position when sending and receiving a later turn", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.setViewportSize({ width: 900, height: 420 });
+  await page.goto("/sessions/saved-session");
+  const thread = page.getByRole("region", { name: "Conversation thread" });
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("stream-follow-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Search Agent thread" }).click();
+  const query = page.getByRole("searchbox", { name: "Search this thread" });
+  await query.fill("Loaded history");
+  const history = page.getByText("Loaded history.", { exact: true });
+  await expect(history).toBeInViewport();
+  let readingPosition = -1;
+  await expect.poll(async () => {
+    const position = await thread.evaluate((element) => element.scrollTop);
+    const settled = position === readingPosition;
+    readingPosition = position;
+    return settled;
+  }, { intervals: [100] }).toBe(true);
+  await query.press("Escape");
+  await expect(composer).toBeFocused();
+  await expect(history).toBeInViewport();
+  await expect.poll(async () => Math.abs(
+    await thread.evaluate((element) => element.scrollTop) - readingPosition
+  )).toBeLessThan(1);
+  const anchorTop = await history.evaluate((element) => element.getBoundingClientRect().top);
+  await composer.fill("stream-follow-flow after search");
+  await composer.press("Enter");
+  await expect(page.getByText("Stream follow complete.", { exact: true })).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+  expect(await thread.evaluate((element) => element.scrollTop)).toBe(readingPosition);
+  expect(await history.evaluate((element) => element.getBoundingClientRect().top)).toBe(anchorTop);
+  expect(browserErrors).toEqual([]);
+});
+
 test("keeps bottom following stable during rapid streamed output", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.setViewportSize({ width: 900, height: 420 });
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const thread = page.getByRole("region", { name: "Conversation thread" });
   await expect(thread).toHaveCSS("scroll-behavior", "auto");
@@ -831,7 +1160,7 @@ test("keeps bottom following stable during rapid streamed output", async ({ page
 
 test("searches the visible ACP Agent thread with Zed-style match navigation", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -888,7 +1217,7 @@ test("searches the visible ACP Agent thread with Zed-style match navigation", as
 
 test("searches tool output only after the default-collapsed tool is expanded", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -914,7 +1243,7 @@ test("searches tool output only after the default-collapsed tool is expanded", a
 
 test("collapses completed ACP compaction summaries into a Zed-style thread disclosure", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -952,7 +1281,7 @@ test("collapses completed ACP compaction summaries into a Zed-style thread discl
 
 test("offers Zed-style context actions on an ACP Agent response", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -1049,7 +1378,7 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page 
 test("navigates long threads and opens a faithful Markdown view", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.setViewportSize({ width: 900, height: 480 });
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -1112,26 +1441,556 @@ test("navigates long threads and opens a faithful Markdown view", async ({ page 
   expect(browserErrors).toEqual([]);
 });
 
-test("restores the latest Agent session instead of creating an empty thread on reload", async ({ page }) => {
+for (const storedSessionId of ["stale-session", "earlier-session"]) {
+  test(`keeps the homepage unselected despite cached ${storedSessionId}`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.addInitScript((sessionId) => {
+      localStorage.setItem("attyd:last-session-id", sessionId);
+    }, storedSessionId);
+    const sessionRequests: string[] = [];
+    page.on("request", (request) => {
+      if (/^\/api\/v1\/sessions\/[^/]+(?:\/events)?$/u.test(new URL(request.url()).pathname)) {
+        sessionRequests.push(request.url());
+      }
+    });
+
+    await page.goto("/");
+    await expect(page.locator(".project-card")).toHaveCount(1);
+    await expect(page.locator(".session-open")).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
+    await expect(page.locator('.session-history [aria-current="page"]')).toHaveCount(0);
+    await expect(page).toHaveURL(/\/$/u);
+    expect(sessionRequests).toEqual([]);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+test("returns a missing session URL to the homepage without an ACP error", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page, [404]);
+  await page.goto("/sessions/nonexistent-session");
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await expect(page.locator(".project-card")).toHaveCount(1);
+  await expect(page.locator(".session-open")).toHaveCount(0);
+  await expect(page.locator('.session-history [aria-current="page"]')).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
+  expect(browserErrors).toEqual([]);
+});
+
+test("keeps the homepage selected when a previous create response arrives late", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  let releaseCreate!: () => void;
+  const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+  let notifyCreated!: () => void;
+  const createdUpstream = new Promise<void>((resolve) => { notifyCreated = resolve; });
+  await page.route("**/api/v1/sessions", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    notifyCreated();
+    await createGate;
+    await route.fulfill({ response });
+  });
+
+  try {
+    await page.goto(projectPath(process.cwd()));
+    await expect(page.locator(".project-browser-path")).toHaveText(process.cwd());
+    await page.getByRole("link", { name: "Back to projects", exact: true }).click();
+    await expect(page).toHaveURL(/\/$/u);
+    await page.getByRole("button", { name: "New project", exact: true }).click();
+    await page.getByRole("dialog", { name: "New project" })
+      .getByLabel("Project working directory", { exact: true }).fill(process.cwd());
+    await page.getByRole("dialog", { name: "New project" })
+      .getByRole("button", { name: "Create project" }).click();
+    await createdUpstream;
+    await page.goBack();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
+    await page.getByRole("link", { name: "Back to projects", exact: true }).click();
+    await expect(page).toHaveURL(/\/$/u);
+
+    const delivered = page.waitForResponse((response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/v1/sessions"
+    );
+    releaseCreate();
+    expect((await delivered).status()).toBe(201);
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    await expect(page).toHaveURL(/\/$/u);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.locator('.session-history [aria-current="page"]')).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    releaseCreate();
+    await page.unrouteAll({ behavior: "wait" });
+  }
+});
+
+test("serializes session list requests while startup and route refreshes overlap", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  let releaseList!: () => void;
+  const listGate = new Promise<void>((resolve) => { releaseList = resolve; });
+  let notifyListStarted!: () => void;
+  const firstListStarted = new Promise<void>((resolve) => { notifyListStarted = resolve; });
+  let listRequests = 0;
+  let inFlight = 0;
+  let maximumInFlight = 0;
+  await page.route("**/api/v1/sessions", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    listRequests += 1;
+    inFlight += 1;
+    maximumInFlight = Math.max(maximumInFlight, inFlight);
+    let settled = false;
+    try {
+      if (listRequests === 1) {
+        notifyListStarted();
+        await listGate;
+      }
+      const response = await route.fetch();
+      inFlight -= 1;
+      settled = true;
+      await route.fulfill({ response });
+    } finally {
+      if (!settled) inFlight -= 1;
+    }
+  });
+
+  try {
+    await page.goto("/sessions/saved-session");
+    await firstListStarted;
+    await page.evaluate(() => {
+      for (let index = 0; index < 3; index += 1) {
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      }
+    });
+    // Keep the first request pending long enough for independent startup and
+    // navigation callbacks to try to refresh the same Agent-owned list.
+    await page.waitForTimeout(200);
+    releaseList();
+    await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+    await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
+    await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(listRequests).toBeGreaterThanOrEqual(1);
+    expect(maximumInFlight).toBe(1);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    releaseList();
+    await page.unrouteAll({ behavior: "wait" });
+  }
+});
+
+for (const width of [1280, 390]) {
+  test(`creates a project with its first session and navigates up independently at ${width}px`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    const cwd = `${process.cwd()}/tests`;
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.locator(".page-back")).toHaveCount(0);
+    await expectFullWidthMain(page);
+
+    await page.getByRole("button", { name: "New project", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "New project", exact: true });
+    await expect(dialog.getByRole("button", { name: "Cancel new project" })).toBeVisible();
+    await expectWithinViewport(dialog, width);
+    await dialog.getByLabel("Project working directory", { exact: true }).fill(cwd);
+    await page.screenshot({ path: test.info().outputPath("new-project-dialog.png") });
+    const created = page.waitForRequest((request) =>
+      request.method() === "POST" && new URL(request.url()).pathname === "/api/v1/sessions"
+    );
+    await dialog.getByRole("button", { name: "Create project", exact: true }).click();
+    expect((await created).postDataJSON()).toMatchObject({ cwd });
+    await expect(dialog).toBeHidden();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("test-session", cwd));
+    await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+    const backToProject = page.getByRole("link", { name: "Back to project", exact: true });
+    await expect(backToProject).toHaveClass(/page-back/u);
+    await expect(backToProject).toHaveAttribute("href", projectPath(cwd));
+    await expectWithinViewport(backToProject, width);
+    await expectFullWidthMain(page);
+    await page.screenshot({ path: test.info().outputPath("session-back-to-project.png") });
+
+    // The preceding browser entry is the homepage. This button must still go
+    // to the new session's project rather than traversing browser history.
+    await backToProject.click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    await expect(page.locator(".project-browser-path")).toHaveText(cwd);
+    await expect(page.locator(".project-session-link")).toHaveCount(1);
+    await expect(page.locator(".project-session-link"))
+      .toHaveAttribute("href", sessionPath("test-session", cwd));
+    const backToProjects = page.getByRole("link", { name: "Back to projects", exact: true });
+    await expect(backToProjects).toHaveClass(/page-back/u);
+    await expect(backToProjects).toHaveAttribute("href", "/");
+    await expectWithinViewport(backToProjects, width);
+    await backToProjects.click();
+    await expect(page).toHaveURL(/\/$/u);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.locator(".project-card").filter({ hasText: cwd })).toBeVisible();
+    await expect(page.locator(".page-back")).toHaveCount(0);
+    await expectFullWidthMain(page);
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    expect(browserErrors).toEqual([]);
+  });
+
+  test(`navigates up from a deep session link without showing idle Open badges at ${width}px`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    const cwd = process.cwd();
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto(projectPath(`${cwd}/tests`));
+    await expect(page.locator(".project-browser-path")).toHaveText(`${cwd}/tests`);
+    await page.goto(sessionPath("saved-session", "/wrong-project"));
+    await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+    const backToProject = page.getByRole("link", { name: "Back to project", exact: true });
+    await expect(backToProject).toHaveAttribute("href", projectPath(cwd));
+    await expectWithinViewport(backToProject, width);
+    await backToProject.click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    const saved = page.locator(".project-session-row").filter({ hasText: "Saved ACP session" });
+    await expect(saved).toBeVisible();
+    await expect(saved.locator(".project-session-status")).toHaveCount(0);
+    await expect(saved.getByText("Open", { exact: true })).toHaveCount(0);
+    await page.screenshot({ path: test.info().outputPath("idle-project-sessions.png") });
+    await page.reload();
+    await expect(saved).toBeVisible();
+    await expect(saved.locator(".project-session-status")).toHaveCount(0);
+    await expect(saved.getByText("Open", { exact: true })).toHaveCount(0);
+    await saved.locator(".project-session-link").click();
+    await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+    const picker = await openSessionPicker(page);
+    await expect(picker).not.toContainText(/\bopen\b/iu);
+    await page.keyboard.press("Escape");
+    await backToProject.click();
+    await expect(saved).toBeVisible();
+    await expect(saved.locator(".project-session-status")).toHaveCount(0);
+    await expectWithinViewport(page.getByRole("link", { name: "Back to projects", exact: true }), width);
+    await expectFullWidthMain(page);
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    expect(browserErrors).toEqual([]);
+  });
+
+  test(`navigates home, project, and session pages through browser back and forward at ${width}px`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.setViewportSize({ width, height: 844 });
+    const cwd = process.cwd();
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expectFullWidthMain(page);
+    const picker = page.locator(".session-switcher");
+    await expect(picker.locator(".session-history")).toHaveCount(0);
+    await page.locator(".project-card").filter({ hasText: cwd }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    await expect(page.locator(".project-browser-path")).toHaveText(cwd);
+    await expectFullWidthMain(page);
+    await expect(page.locator(".project-session-link")).toHaveCount(2);
+    await expect(picker.locator(".session-history")).toHaveCount(0);
+    await page.locator(".project-session-link").filter({ hasText: "Saved ACP session" }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+    await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+    await expectFullWidthMain(page);
+    await expect(page.getByRole("link", { name: "Project sessions", exact: true })).toHaveAttribute("href", projectPath(cwd));
+    await openSessionPicker(page);
+    await picker.locator(".session-open").filter({ hasText: "Earlier Agent thread" }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("earlier-session", cwd));
+    await expect(page.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
+
+    await page.goBack();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+    await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+    await page.goBack();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    await expect(page.locator(".project-session-link")).toHaveCount(2);
+    await expect(page.locator('textarea[role="combobox"]')).toHaveCount(0);
+    await page.goBack();
+    await expect(page).toHaveURL(/\/$/u);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.locator('.session-history [aria-current="page"]')).toHaveCount(0);
+    await page.goForward();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    await expect(page.locator(".project-session-link")).toHaveCount(2);
+    await page.goForward();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+    await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+    await expect(page.getByText("Loaded history.", { exact: true })).toHaveCount(1);
+
+    await page.getByRole("link", { name: "Project sessions", exact: true }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    await page.getByRole("link", { name: "All projects", exact: true }).click();
+    await expect(page).toHaveURL(/\/$/u);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+test("puts created and forked sessions in the URL and returns home on close", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");
+  await page.getByRole("button", { name: "New project", exact: true }).click();
+  await page.getByRole("dialog", { name: "New project" })
+    .getByLabel("Project working directory", { exact: true }).fill(process.cwd());
+  await page.getByRole("dialog", { name: "New project" })
+    .getByRole("button", { name: "Create project" }).click();
+  await expect(page).toHaveURL(/\/sessions\/test-session$/u);
+  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+
+  await page.getByRole("button", { name: "Thread actions" }).click();
+  await page.getByRole("button", { name: "Fork thread" }).click();
+  await expect(page).toHaveURL(/\/sessions\/forked-session$/u);
+  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  await page.goBack();
+  await expect(page).toHaveURL(/\/sessions\/test-session$/u);
+  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  await page.goForward();
+  await expect(page).toHaveURL(/\/sessions\/forked-session$/u);
+  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+
+  if (!(await page.getByRole("button", { name: "Close thread" }).isVisible())) {
+    await page.getByRole("button", { name: "Thread actions" }).click();
+  }
+  await page.getByRole("button", { name: "Close thread" }).click();
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
+});
+
+test("creates a session in the selected project instead of the startup directory", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  const cwd = `${process.cwd()}/tests`;
+  await page.goto(projectPath(cwd));
+  await expect(page.locator(".project-browser-path")).toHaveText(cwd);
+  await expect(page.locator(".project-session-link")).toHaveCount(0);
+  await page.getByRole("button", { name: "New session in project", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "New thread" });
+  await expect(dialog.getByLabel("Agent workspace", { exact: true })).toHaveValue(cwd);
+  const created = page.waitForRequest((request) =>
+    request.method() === "POST" && new URL(request.url()).pathname === "/api/v1/sessions"
+  );
+  await dialog.getByRole("button", { name: "Create thread" }).click();
+  expect((await created).postDataJSON()).toMatchObject({ cwd });
+  await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("test-session", cwd));
+  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  await expect(page.locator(".session-open")).toHaveCount(1);
+  await expect(page.locator(".session-open").filter({ hasText: "Saved ACP session" })).toHaveCount(0);
+  await page.getByRole("link", { name: "Project sessions", exact: true }).click();
+  await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+  await expect(page.locator(".project-session-link")).toHaveCount(1);
+  await expect(page.locator(".project-session-link")).toHaveAttribute("href", sessionPath("test-session", cwd));
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
+});
+
+test("canonicalizes a session link to its reported project and sends missing nested sessions home", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page, [404]);
+  const cwd = process.cwd();
+  await page.goto(sessionPath("saved-session", "/wrong-project"));
+  await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+  await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+  await expect(page.getByRole("link", { name: "Project sessions", exact: true })).toHaveAttribute("title", cwd);
+  await page.goto(sessionPath("nonexistent-session", cwd));
+  await expect(page).toHaveURL(/\/$/u);
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await expect(page.locator(".session-history")).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
+});
+
+test("reloads a created session URL even when the Agent list is empty", async ({ page }) => {
+  const server = await startRustTestServer({
+    cwd: process.cwd(),
+    command: [
+      process.execPath,
+      "--import",
+      "tsx",
+      join(process.cwd(), "tests/fixtures/fake-agent.ts"),
+      "--empty-session-list",
+    ],
+  });
+  const browserErrors = collectBrowserErrors(page);
+  try {
+    await page.goto(`http://127.0.0.1:${server.port}/`);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "New project", exact: true }).click();
+    const refreshedList = page.waitForResponse((response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      response.status() === 200
+    );
+    await page.getByRole("dialog", { name: "New project" })
+      .getByLabel("Project working directory", { exact: true }).fill(process.cwd());
+    await page.getByRole("dialog", { name: "New project" })
+      .getByRole("button", { name: "Create project" }).click();
+    await expect(page).toHaveURL(/\/sessions\/test-session$/u);
+    await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+    const listed = await refreshedList;
+    expect((await listed.json()).sessions).toEqual([]);
+    const picker = await openSessionPicker(page);
+    const workspaceGroup = picker.locator(".session-group").filter({
+      has: page.getByRole("heading", { name: process.cwd(), exact: true }),
+    });
+    await expect(workspaceGroup.locator('[aria-current="page"]')).toBeVisible();
+    await expect(picker.locator(".session-group-label")).toHaveCount(1);
+
+    await page.reload();
+    await expect(page).toHaveURL(/\/sessions\/test-session$/u);
+    await expect(page.getByRole("heading", { name: "New agent session" })).toBeVisible();
+    await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+    await openSessionPicker(page);
+    await expect(workspaceGroup.locator('[aria-current="page"]')).toBeVisible();
+    await expect(picker.locator(".session-group-label")).toHaveCount(1);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("browses cross-workspace projects and restores a shared session with its own cwd", async ({ browser, page }) => {
+  const cwd = process.cwd();
+  const otherCwd = "/other-workspace";
+  const server = await startRustTestServer({
+    cwd,
+    command: [
+      process.execPath,
+      "--import",
+      "tsx",
+      join(cwd, "tests/fixtures/fake-agent.ts"),
+      "--cross-workspace-sessions",
+    ],
+  });
+  const origin = `http://127.0.0.1:${server.port}`;
+  const browserErrors = collectBrowserErrors(page);
+  try {
+    await page.goto(`${origin}/`);
+    const picker = page.locator(".session-switcher");
+    await expect(page.locator(".project-card")).toHaveCount(1);
+    await expect(picker.locator(".session-open")).toHaveCount(0);
+    await page.getByRole("button", { name: "Load more sessions", exact: true }).click();
+    await expect(page.locator(".project-card")).toHaveCount(2);
+    await expect(page.locator(".project-card-path")).toHaveText([cwd, otherCwd]);
+    const search = page.getByRole("searchbox", { name: "Search projects", exact: true });
+    await search.fill(otherCwd);
+    await expect(page.locator(".project-card")).toHaveCount(1);
+    await expect(page.locator(".project-card-path")).toHaveText(otherCwd);
+    await search.press("Escape");
+    await expect(page.locator(".project-card")).toHaveCount(2);
+    await page.locator(".project-card").filter({ hasText: otherCwd }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(otherCwd));
+    await expect(page.locator(".project-browser-path")).toHaveText(otherCwd);
+    await expect(page.locator(".project-session-link")).toHaveCount(1);
+    await expect(page.locator(".project-session-link")).toContainText("Earlier Agent thread");
+    await expect(picker.locator(".session-open")).toHaveCount(0);
+
+    await page.reload();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(otherCwd));
+    await expect(page.locator(".project-session-link")).toHaveCount(1);
+    await expect(page.locator(".project-session-link")).toContainText("Earlier Agent thread");
+    await page.locator(".project-session-link").click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("earlier-session", otherCwd));
+    await expect(page.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
+    await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+    await openSessionPicker(page);
+    await expect(picker.locator(".session-open")).toHaveCount(1);
+    await expect(picker.locator('.session-history [aria-current="page"]')).toContainText("Earlier Agent thread");
+    await expect(picker.locator(".session-open").filter({ hasText: "Saved ACP session" })).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "Project sessions", exact: true }))
+      .toHaveAttribute("title", otherCwd);
+
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "New thread", exact: true }).click();
+    const newThread = page.getByRole("dialog", { name: "New thread" });
+    await expect(newThread.getByLabel("Agent workspace", { exact: true })).toHaveValue(otherCwd);
+    await newThread.getByRole("button", { name: "Cancel new thread" }).click();
+
+    // Release the active view so a shared URL must discover and load its cwd.
+    await page.getByRole("button", { name: "Thread actions" }).click();
+    const refreshedList = page.waitForResponse((response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      response.status() === 200
+    );
+    await page.getByRole("button", { name: "Close thread" }).click();
+    await expect(page).toHaveURL(/\/$/u);
+    await refreshedList;
+    const shared = await browser.newPage();
+    const sharedErrors = collectBrowserErrors(shared);
+    const listedCursors: Array<string | null> = [];
+    shared.on("request", (request) => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && url.pathname === "/api/v1/sessions") {
+        listedCursors.push(url.searchParams.get("cursor"));
+      }
+    });
+    try {
+      await shared.goto(`${origin}${sessionPath("earlier-session", otherCwd)}`);
+      await expect(shared.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
+      await expect(shared.getByRole("link", { name: "Project sessions", exact: true }))
+        .toHaveAttribute("title", otherCwd);
+      await expect(shared.locator('textarea[role="combobox"]')).toBeEnabled();
+      await expect.poll(() => new URL(shared.url()).pathname).toBe(sessionPath("earlier-session", otherCwd));
+      await expect(shared.getByRole("alert")).toHaveCount(0);
+      expect(listedCursors).toContain(null);
+      expect(listedCursors.some((cursor) => cursor != null)).toBe(true);
+      expect(sharedErrors).toEqual([]);
+    } finally {
+      await shared.close();
+    }
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("restores the session in a directly opened URL on reload and in a fresh browser", async ({ browser, page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  const response = await page.goto("/sessions/saved-session");
+  expect(response?.status()).toBe(200);
+  expect(response?.headers()["content-type"]).toContain("text/html");
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
+  await openSessionPicker(page);
   await expect(page.locator(".session-open")).toHaveCount(2);
-  await expect(page.locator('[aria-current="page"]')).toHaveCount(1);
+  await expect(page.locator('.session-history [aria-current="page"]')).toHaveCount(1);
   await expect(page.getByText("Earlier Agent thread", { exact: true })).toBeVisible();
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
+  await openSessionPicker(page);
   await expect(page.locator(".session-open")).toHaveCount(2);
-  await expect(page.locator('[aria-current="page"]')).toHaveCount(1);
+  await expect(page.locator('.session-history [aria-current="page"]')).toHaveCount(1);
+  await expect(page).toHaveURL(/\/sessions\/saved-session$/u);
+  const shared = await browser.newPage();
+  try {
+    await shared.goto(page.url());
+    await expect(shared.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
+    await expect(shared.getByText("Loaded history.", { exact: true })).toHaveCount(1);
+    await expect(shared.locator('textarea[role="combobox"]')).toBeEnabled();
+  } finally {
+    await shared.close();
+  }
   expect(browserErrors).toEqual([]);
 });
 
 test("keeps completed turn markers at their original boundaries across reload", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -1154,7 +2013,7 @@ test("keeps completed turn markers at their original boundaries across reload", 
 
 test("offers an explicit reconnect over the composer after the ACP connection stops", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -1193,7 +2052,7 @@ test("keeps an active stdio prompt alive across browser reconnect", async ({ bro
   try {
     await expect.poll(() => readMarker(processMarker)).not.toBe("");
     const agentPid = await readMarker(processMarker);
-    await page.goto(`http://127.0.0.1:${server.port}`);
+    await page.goto(`http://127.0.0.1:${server.port}/sessions/saved-session`);
     const composer = page.locator('textarea[role="combobox"]');
     await expect(composer).toBeEnabled();
     await composer.fill("disconnect-cancel-flow");
@@ -1206,7 +2065,7 @@ test("keeps an active stdio prompt alive across browser reconnect", async ({ bro
 
     const reconnected = await browser.newPage();
     try {
-      await reconnected.goto(`http://127.0.0.1:${server.port}`);
+      await reconnected.goto(`http://127.0.0.1:${server.port}/sessions/saved-session`);
       await expect(reconnected.getByText("disconnect-cancel-flow", { exact: true })).toBeVisible();
       const stop = reconnected.getByRole("button", { name: "Stop current turn" });
       await expect(stop).toBeVisible();
@@ -1225,7 +2084,7 @@ test("keeps an active stdio prompt alive across browser reconnect", async ({ bro
 
 test("reconnects a stale mobile-style socket after a focus liveness probe", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
-  await page.goto("/");
+  await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
@@ -1253,12 +2112,12 @@ test("recovers startup through Agent-owned ACP authentication", async ({ page })
   const browserErrors = collectBrowserErrors(page, [409]);
 
   try {
-    await page.goto(`http://127.0.0.1:${authServer.port}`);
+    await page.goto(`http://127.0.0.1:${authServer.port}/sessions/saved-session`);
     const signIn = page.getByRole("button", { name: "Authenticate with Continue with Fake Agent" });
     await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeVisible();
     await expect(signIn).toBeFocused();
-    await expect(page.locator('textarea[role="combobox"]')).toBeDisabled();
-    await expect(page.getByRole("button", { name: "New thread" })).toBeDisabled();
+    await expect(page.locator('textarea[role="combobox"]')).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /^(?:New project|New session in project)$/u })).toBeDisabled();
     await signIn.click();
 
     await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
@@ -1266,7 +2125,7 @@ test("recovers startup through Agent-owned ACP authentication", async ({ page })
     await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeHidden();
     await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
 
-    await page.locator(".agent-details > summary").click();
+    await page.getByRole("button", { name: "Agent settings", exact: true }).click();
     const authDetails = page.locator(".agent-auth-details");
     await authDetails.locator(":scope > summary").click();
     await expect(authDetails).toContainText("Signed in");
@@ -1277,13 +2136,16 @@ test("recovers startup through Agent-owned ACP authentication", async ({ page })
     await expect(page.getByRole("heading", { name: "Signed out of attyd-test-agent" }))
       .toBeVisible();
     await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
-    await expect(page.locator('[aria-current="page"]')).toBeVisible();
+    await page.keyboard.press("Escape");
+    await openSessionPicker(page);
+    await expect(page.locator('.session-history [aria-current="page"]')).toBeVisible();
+    await page.keyboard.press("Escape");
     await expect(page.getByRole("button", { name: "New thread" })).toBeDisabled();
 
     await page.getByRole("button", { name: "Authenticate with Continue with Fake Agent" }).first().click();
     await expect(page.getByRole("heading", { name: "Signed out of attyd-test-agent" }))
       .toBeHidden();
-    await expect(page.getByRole("button", { name: "New thread" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
   } finally {
@@ -1308,7 +2170,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   const browserErrors = collectBrowserErrors(page, [409]);
 
   try {
-    await page.goto(`http://127.0.0.1:${authServer.port}`);
+    await page.goto(`http://127.0.0.1:${authServer.port}/sessions/saved-session`);
     const signIn = page.getByRole("button", { name: "Authenticate with Sign in in terminal" });
     await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeVisible();
     await expect(signIn).toBeEnabled();
@@ -1337,6 +2199,33 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function openSessionPicker(page: Page): Promise<Locator> {
+  const picker = page.locator("details.session-switcher");
+  if (await picker.getAttribute("open") == null) {
+    await page.getByRole("button", { name: "Switch project session", exact: true }).click();
+  }
+  await expect(picker.locator(".session-history")).toBeVisible();
+  return picker;
+}
+
+async function expectWithinViewport(locator: Locator, width: number): Promise<void> {
+  const bounds = await locator.boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.x).toBeGreaterThanOrEqual(-1);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width + 1);
+}
+
+async function expectFullWidthMain(page: Page): Promise<void> {
+  await expect(page.locator("aside, .mobile-menu, .sidebar-overlay")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Open sidebar", exact: true })).toHaveCount(0);
+  const bounds = await page.getByRole("main").boundingBox();
+  const width = page.viewportSize()?.width;
+  expect(bounds).not.toBeNull();
+  expect(width).toBeDefined();
+  expect(Math.abs(bounds!.x)).toBeLessThanOrEqual(1);
+  expect(bounds!.width).toBeGreaterThanOrEqual(width! - 1);
+}
 
 async function expectTurnMarkerOrder(page: Page): Promise<void> {
   const entries = await page.locator("[data-thread-entry]").evaluateAll((elements) =>

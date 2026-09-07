@@ -1,16 +1,16 @@
 import type { SessionInfo } from "@agentclientprotocol/sdk";
-import { History, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { FolderOpen, History, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import {
   filterSessions,
-  groupSessionsByRecency,
-  sessionMatchesFilter,
+  groupSessionsByWorkspace,
 } from "../../lib/session-history";
 
 export function SessionHistory({
   sessions,
   activeSessionId,
   activeTitle,
+  activeCwd,
   canList,
   nextCursor,
   canAttach,
@@ -28,6 +28,7 @@ export function SessionHistory({
   sessions: SessionInfo[];
   activeSessionId?: string;
   activeTitle?: string;
+  activeCwd?: string;
   canList: boolean;
   nextCursor?: string | null;
   canAttach: boolean;
@@ -48,27 +49,29 @@ export function SessionHistory({
     const reported = sessions.find(({ sessionId }) => sessionId === activeSessionId);
     return {
       sessionId: activeSessionId,
-      cwd: reported?.cwd ?? "",
+      cwd: activeCwd || reported?.cwd || "",
       additionalDirectories: reported?.additionalDirectories,
       title: activeTitle ?? reported?.title,
       updatedAt: reported?.updatedAt,
     } satisfies SessionInfo;
-  }, [activeSessionId, activeTitle, sessions]);
-  const otherSessions = useMemo(
-    () => sessions.filter(({ sessionId }) => sessionId !== activeSessionId),
-    [activeSessionId, sessions],
-  );
+  }, [activeSessionId, activeTitle, activeCwd, sessions]);
+  const displayedSessions = useMemo(() => {
+    if (!activeSession) return sessions;
+    const listed = sessions.some(({ sessionId }) => sessionId === activeSession.sessionId);
+    return listed
+      ? sessions.map((session) => session.sessionId === activeSession.sessionId ? activeSession : session)
+      : [activeSession, ...sessions];
+  }, [activeSession, sessions]);
   const filteredSessions = useMemo(
-    () => filterSessions(otherSessions, query),
-    [otherSessions, query],
+    () => filterSessions(displayedSessions, query),
+    [displayedSessions, query],
   );
   const groups = useMemo(
-    () => groupSessionsByRecency(filteredSessions),
+    () => groupSessionsByWorkspace(filteredSessions),
     [filteredSessions],
   );
-  const activeVisible = Boolean(activeSession && sessionMatchesFilter(activeSession, query));
-  const totalCount = otherSessions.length + (activeSession ? 1 : 0);
-  const visibleCount = filteredSessions.length + (activeVisible ? 1 : 0);
+  const totalCount = displayedSessions.length;
+  const visibleCount = filteredSessions.length;
   const filtering = query.trim().length > 0;
 
   return (
@@ -112,31 +115,17 @@ export function SessionHistory({
         {filtering ? `${visibleCount} of ${totalCount} loaded threads` : `${totalCount} loaded ${totalCount === 1 ? "thread" : "threads"}`}
       </p>
       <div className="session-list">
-        {activeVisible && activeSession ? (
-          <div className="session-group">
-            <h3 className="session-group-label">Current</h3>
-            <SessionRow
-              session={activeSession}
-              active
-              busy={busySessionIds.includes(activeSession.sessionId)}
-              attention={attentionSessionIds.includes(activeSession.sessionId)}
-              deleting={deletingSessionIds.includes(activeSession.sessionId)}
-              disabled={disabled}
-              canAttach={canAttach}
-              canDelete={canDelete}
-              onAttach={onAttach}
-              onDelete={onDelete}
-            />
-          </div>
-        ) : null}
         {groups.map((group) => (
-          <div className="session-group" key={group.label}>
-            <h3 className="session-group-label">{group.label}</h3>
+          <div className="session-group" key={group.cwd}>
+            <h3 className="session-group-label" title={group.cwd || undefined}>
+              <FolderOpen size={12} aria-hidden="true" />
+              <span>{group.label}</span>
+            </h3>
             {group.sessions.map((session) => (
               <SessionRow
                 key={session.sessionId}
                 session={session}
-                active={false}
+                active={session.sessionId === activeSessionId}
                 busy={busySessionIds.includes(session.sessionId)}
                 attention={attentionSessionIds.includes(session.sessionId)}
                 deleting={deletingSessionIds.includes(session.sessionId)}
@@ -151,8 +140,8 @@ export function SessionHistory({
           </div>
         ))}
       </div>
-      {canList && !filtering && otherSessions.length === 0 ? (
-        <p className="no-saved-threads">No other threads reported by the Agent.</p>
+      {canList && !filtering && totalCount === (activeSession ? 1 : 0) ? (
+        <p className="no-saved-threads">No other sessions in this project.</p>
       ) : null}
       {filtering && visibleCount === 0 ? (
         <p className="no-saved-threads">No loaded Agent threads match this filter.</p>
@@ -210,7 +199,7 @@ function SessionRow({
           <strong>{title}</strong>
           <small>{active
             ? `${shortId(session.sessionId)} · active`
-            : `${formatSessionDate(session.updatedAt)}${open ? " · open" : ""}`}</small>
+            : formatSessionDate(session.updatedAt)}</small>
         </span>
         {attention ? (
           <i className="session-attention" aria-label="Agent input required" title="Agent input required" />

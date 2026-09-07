@@ -847,13 +847,16 @@ impl BridgeHub {
             .map_err(|_| ())
     }
 
-    async fn session_view(&self, session_id: String) -> Result<serde_json::Value, String> {
+    async fn session_view(
+        &self,
+        session_id: String,
+    ) -> Result<serde_json::Value, bridge::SessionViewError> {
         let input = {
             let state = self.state.lock().await;
             state
                 .input
                 .clone()
-                .ok_or_else(|| "bridge is not ready".to_string())?
+                .ok_or_else(|| bridge::SessionViewError::unavailable("bridge is not ready"))?
         };
         let (response, result) = oneshot::channel();
         input
@@ -862,11 +865,15 @@ impl BridgeHub {
                 response,
             })
             .await
-            .map_err(|_| "bridge stopped before accepting the query".to_string())?;
+            .map_err(|_| {
+                bridge::SessionViewError::unavailable("bridge stopped before accepting the query")
+            })?;
         tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
             .await
-            .map_err(|_| "bridge session query timed out".to_string())?
-            .map_err(|_| "bridge stopped before answering the query".to_string())?
+            .map_err(|_| bridge::SessionViewError::unavailable("bridge session query timed out"))?
+            .map_err(|_| {
+                bridge::SessionViewError::unavailable("bridge stopped before answering the query")
+            })?
     }
 
     async fn start_turn(
@@ -1695,12 +1702,30 @@ async fn get_session_view(
             }
             response
         }
-        Err(message) if message == "session is not materialized" => (
-            StatusCode::CONFLICT,
-            axum::Json(json!({ "error": message })),
+        Err(error) => session_view_error(error),
+    }
+}
+
+fn session_view_error(error: bridge::SessionViewError) -> Response {
+    match error {
+        bridge::SessionViewError::NotFound => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "error": "session was not found in the current agent workspace",
+                "code": "session_not_found",
+            })),
         )
             .into_response(),
-        Err(message) => (
+        bridge::SessionViewError::Unavailable(message)
+            if message == "session is not materialized" =>
+        {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(json!({ "error": message })),
+            )
+                .into_response()
+        }
+        bridge::SessionViewError::Unavailable(message) => (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(json!({ "error": message })),
         )
@@ -1796,12 +1821,12 @@ async fn session_events(Path(session_id): Path<String>, State(state): State<AppS
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         },
-        Err(_) => {
+        Err(error) => {
             state
                 .bridge
                 .unsubscribe(subscription.id, subscription.generation)
                 .await;
-            return StatusCode::CONFLICT.into_response();
+            return session_view_error(error);
         }
     };
     let guard = SubscriptionGuard {
@@ -2457,6 +2482,168 @@ mod tests {
         assert!(!replay.contains("Agent history"));
         assert!(!replay.contains("acp/session_attached"));
         assert!(!replay.contains("bridge/runtime_session"));
+    }
+
+    #[tokio::test]
+    async fn stdio_discovery_lists_other_workspaces_and_loads_their_own_cwd() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--cross-workspace-sessions",
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut browser = hub.subscribe().await.expect("browser subscription");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = browser.events.recv().await {
+                let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                    return;
+                }
+            }
+            panic!("bridge subscriber closed before initialization");
+        })
+        .await
+        .expect("bridge initialization");
+
+        let first_page = hub
+            .business_request(json!({
+                "type": "session/list",
+                "requestId": "list-workspaces",
+            }))
+            .await
+            .expect("first workspace page");
+        assert_eq!(first_page["sessions"][0]["sessionId"], "saved-session");
+        assert_eq!(first_page["sessions"][0]["cwd"], cwd);
+        assert_eq!(first_page["nextCursor"], "workspace-page-2");
+
+        let second_page = hub
+            .business_request(json!({
+                "type": "session/list",
+                "requestId": "list-other-workspace",
+                "cursor": first_page["nextCursor"],
+            }))
+            .await
+            .expect("other workspace page");
+        assert_eq!(second_page["sessions"][0]["sessionId"], "earlier-session");
+        assert_eq!(second_page["sessions"][0]["cwd"], "/other-workspace");
+        assert!(second_page["nextCursor"].is_null());
+
+        // Cold loading must use the Agent's listed cwd, even outside --cwd.
+        // The fixture rejects requests that substitute the startup directory.
+        let view = hub
+            .session_view("earlier-session".to_string())
+            .await
+            .expect("other workspace session can be loaded");
+        assert_eq!(view["live"]["cwd"], "/other-workspace");
+        assert_eq!(view["session"]["phase"], "ready");
+        assert!(
+            view["baseline"]["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|update| { update["content"]["text"] == "Loaded history." })
+        );
+
+        let created = hub
+            .business_request(json!({
+                "type": "session/new",
+                "requestId": "new-default-workspace",
+            }))
+            .await
+            .expect("startup cwd remains the new session default");
+        assert_eq!(created["cwd"], cwd);
+
+        hub.unsubscribe(browser.id, browser.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn missing_session_views_return_not_found_but_live_unlisted_sessions_remain_readable() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
+        let fixture = fixture.to_string_lossy().into_owned();
+        let options = Options::try_parse_from([
+            "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
+        ])
+        .unwrap()
+        .normalized()
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut browser = hub.subscribe().await.expect("browser subscription");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = browser.events.recv().await {
+                let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                    return;
+                }
+            }
+            panic!("bridge subscriber closed before initialization");
+        })
+        .await
+        .expect("bridge initialization");
+        let state = AppState {
+            bridge: hub.clone(),
+        };
+        let listed = hub
+            .business_request(json!({
+                "type": "session/list",
+                "requestId": "list-before-restore",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|session| {
+                    session["sessionId"] != "stale-session"
+                        && session["sessionId"] != "test-session"
+                })
+        );
+
+        let missing =
+            get_session_view(Path("stale-session".to_string()), State(state.clone())).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(missing.into_body(), 4_096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "session_not_found");
+        let missing_events =
+            session_events(Path("stale-session".to_string()), State(state.clone())).await;
+        assert_eq!(missing_events.status(), StatusCode::NOT_FOUND);
+
+        hub.business_request(json!({
+            "type": "session/new",
+            "requestId": "new-unlisted",
+            "cwd": cwd,
+        }))
+        .await
+        .expect("new session is materialized without listing it");
+        let live = get_session_view(Path("test-session".to_string()), State(state)).await;
+        assert_eq!(live.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(live.into_body(), 64 * 1_024)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(view["sessionId"], "test-session");
+        assert_eq!(view["phase"], "ready");
+
+        hub.unsubscribe(browser.id, browser.generation).await;
+        hub.shutdown().await;
     }
 
     #[tokio::test]

@@ -1,24 +1,33 @@
 import { ChevronRight, FileDiff, Info } from "lucide-react";
+import { useId } from "react";
 import type { ReviewDiff, ReviewSummary } from "../../lib/review-changes";
 
 export function ChangeReview({
   summary,
   open,
   onToggle,
+  entryId,
 }: {
   summary: ReviewSummary;
   open: boolean;
   onToggle: () => void;
+  entryId?: string;
 }) {
+  const panelId = useId();
   if (summary.fileCount === 0) return null;
   const qualifier = summary.approximate ? "approximately " : "";
   return (
-    <section className={`change-review ${open ? "open" : ""}`} aria-label="Agent-reported changes">
+    <section
+      className={`change-review ${open ? "open" : ""}`}
+      aria-label="Agent-reported changes"
+      data-thread-entry={entryId != null ? true : undefined}
+      data-thread-entry-id={entryId}
+    >
       <button
         type="button"
         className="change-review-trigger"
         aria-expanded={open}
-        aria-controls="agent-change-review-panel"
+        aria-controls={panelId}
         onClick={onToggle}
       >
         <FileDiff size={15} />
@@ -31,7 +40,7 @@ export function ChangeReview({
         <ChevronRight className="change-review-chevron" size={14} />
       </button>
       {open ? (
-        <div id="agent-change-review-panel" className="change-review-panel">
+        <div id={panelId} className="change-review-panel">
           <header>
             <span><FileDiff size={15} /><strong>Agent-reported ACP diffs</strong></span>
             <p><Info size={12} /> Read-only. ACP reports display diffs but does not define client rollback.</p>

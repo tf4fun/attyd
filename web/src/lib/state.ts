@@ -34,6 +34,7 @@ import type {
   SessionSyncPhase,
 } from "./business-api";
 import { randomId } from "./id";
+import { timelineTurnStarts } from "./timeline-turns";
 
 export interface AssistantMessageChunk {
   id: string;
@@ -379,6 +380,7 @@ export type AppAction =
       triggerKind: PendingNesSuggestion["triggerKind"];
     }
   | { type: "session/reset" }
+  | { type: "session/deselect" }
   | { type: "session/activate_cached"; sessionId: string };
 
 export const initialState: AppState = {
@@ -800,6 +802,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     case "session/reset":
       return resetActiveSession(state);
+    case "session/deselect":
+      return resetActiveSession(cacheCurrentSession(state));
     case "session/activate_cached":
       return activateCachedSession(state, action.sessionId);
     case "server/event": {
@@ -866,7 +870,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         transport: event.transport,
         command: event.command,
         defaultCwd: event.cwd,
-        cwd: event.cwd,
+        cwd: state.session ? state.cwd : event.cwd,
         readOnly: event.readOnly,
         additionalDirectories: event.additionalDirectories,
         mcpServers: event.mcpServers,
@@ -2027,12 +2031,14 @@ function upsertToolCall(
   raw: unknown,
   source: "create" | "update" | "permission",
 ): { timeline: TimelineItem[]; call: ToolCall } {
-  const id = `tool:${update.toolCallId}`;
+  const turnStart = timelineTurnStarts(timeline).at(-1) ?? 0;
   const index = timeline.findIndex(
-    (item) => item.type === "tool" && item.call.toolCallId === update.toolCallId,
+    (item, itemIndex) => itemIndex >= turnStart &&
+      item.type === "tool" && item.call.toolCallId === update.toolCallId,
   );
   const current = index >= 0 ? timeline[index] : undefined;
   const previous = current?.type === "tool" ? current : undefined;
+  const id = previous?.id ?? `tool:${update.toolCallId}:${timeline.length}`;
 
   let call: ToolCall;
   if (!previous && source === "update") {

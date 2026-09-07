@@ -317,7 +317,7 @@ struct BridgeState {
     early_update_count: usize,
     early_update_bytes: usize,
     session_updates: HashMap<String, SessionUpdateSemanticState>,
-    session_view_waiters: HashMap<String, Vec<oneshot::Sender<Result<Value, String>>>>,
+    session_view_waiters: HashMap<String, Vec<oneshot::Sender<Result<Value, SessionViewError>>>>,
     permissions: HashMap<String, PendingPermission>,
     elicitations: HashMap<String, PendingElicitation>,
     url_elicitations: HashMap<String, ActiveUrlElicitation>,
@@ -1004,7 +1004,7 @@ pub(crate) enum BridgeInput {
     RuntimeSnapshotRequest,
     SessionViewRequest {
         session_id: String,
-        response: oneshot::Sender<Result<Value, String>>,
+        response: oneshot::Sender<Result<Value, SessionViewError>>,
     },
     RetireIdleSession {
         session_id: String,
@@ -1020,6 +1020,24 @@ pub(crate) enum BridgeInput {
         command: Value,
         response: oneshot::Sender<Result<Value, BridgeRequestError>>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SessionViewError {
+    NotFound,
+    Unavailable(String),
+}
+
+impl SessionViewError {
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+}
+
+impl From<Error> for SessionViewError {
+    fn from(error: Error) -> Self {
+        Self::Unavailable(error_message(error))
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1980,7 +1998,7 @@ where
                             {
                                 let result =
                                     session_view_value(&mut state, &session_id, incarnation)
-                                        .map_err(error_message);
+                                        .map_err(SessionViewError::from);
                                 let _ = response.send(result);
                                 None
                             } else if let Some(incarnation) = state
@@ -1992,14 +2010,11 @@ where
                             {
                                 let result =
                                     session_view_value(&mut state, &session_id, incarnation)
-                                        .map_err(error_message);
+                                        .map_err(SessionViewError::from);
                                 let _ = response.send(result);
                                 None
                             } else if !state.listed_sessions.contains_key(&session_id) {
-                                let _ = response.send(Err(
-                                    "session is neither materialized nor present in session/list"
-                                        .to_string(),
-                                ));
+                                let _ = response.send(Err(SessionViewError::NotFound));
                                 None
                             } else {
                                 let already_loading =
@@ -2010,10 +2025,9 @@ where
                                     .or_default();
                                 waiters.retain(|waiter| !waiter.is_closed());
                                 if waiters.len() >= MAX_SESSION_VIEW_WAITERS_PER_SESSION {
-                                    let _ = response.send(Err(
-                                        "too many observers are waiting for this session"
-                                            .to_string(),
-                                    ));
+                                    let _ = response.send(Err(SessionViewError::unavailable(
+                                        "too many observers are waiting for this session",
+                                    )));
                                     None
                                 } else {
                                     waiters.push(response);
@@ -2417,15 +2431,20 @@ async fn resolve_session_view_waiters(
                 .get(session_id)
                 .map(|session| session.incarnation)
                 .ok_or_else(|| {
-                    "session/load completed without materializing the session".to_string()
+                    SessionViewError::unavailable(
+                        "session/load completed without materializing the session",
+                    )
                 })
                 .and_then(|incarnation| {
-                    session_view_value(&mut state, session_id, incarnation).map_err(error_message)
+                    session_view_value(&mut state, session_id, incarnation)
+                        .map_err(SessionViewError::from)
                 }),
-            Err(error) => Err(error
-                .data
-                .clone()
-                .map_or_else(|| error.message.clone(), |data| data.to_string())),
+            Err(error) => Err(SessionViewError::Unavailable(
+                error
+                    .data
+                    .clone()
+                    .map_or_else(|| error.message.clone(), |data| data.to_string()),
+            )),
         };
         (waiters, result)
     };
@@ -3243,14 +3262,10 @@ async fn handle_command(
                 }
                 state.session_list_in_flight = true;
             }
-            let requested_cwd =
-                (options.transport == Transport::Stdio).then(|| options.cwd.clone());
+            // Startup cwd is the new-session default, not a discovery filter.
+            // Existing sessions retain the cwd returned by the Agent.
             let result = connection
-                .send_request(
-                    ListSessionsRequest::new()
-                        .cwd(requested_cwd)
-                        .cursor(cursor.clone()),
-                )
+                .send_request(ListSessionsRequest::new().cursor(cursor.clone()))
                 .block_task()
                 .await;
             let mut state = state.lock().await;

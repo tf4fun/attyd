@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type {
   ContentBlock,
   CreateElicitationResponse,
@@ -24,12 +24,12 @@ import {
   workspaceContextSearchPath,
 } from "./business-api";
 import { randomId } from "./id";
+import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
 import { appReducer, initialState } from "./state";
-
-const LAST_SESSION_STORAGE_KEY = "attyd:last-session-id";
 
 export function useAcp() {
   const [state, dispatch] = useReducer(appReducer, initialState);
+  const [projectCwd, setProjectCwd] = useState(() => readProjectCwdFromPath(window.location.pathname));
   const stateRef = useRef(state);
   stateRef.current = state;
 
@@ -41,11 +41,34 @@ export function useAcp() {
     requestId: string;
     baseRevision: string;
   }>());
-  const refreshInFlightRef = useRef(false);
-  const refreshPendingRef = useRef(false);
-  const initialSelectionPendingRef = useRef(false);
+  const refreshInFlightRef = useRef<{ sessionId: string; pending: boolean } | undefined>(undefined);
+  const runtimeRefreshRef = useRef<{ pending: boolean } | undefined>(undefined);
+  const sessionListQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const navigationRef = useRef(0);
   const reconnectRef = useRef<() => void>(() => undefined);
   const refreshSessionRef = useRef<(sessionId: string) => void>(() => undefined);
+
+  const resetSession = useCallback((preserve = false) => {
+    sessionEventsRef.current?.close();
+    sessionEventsRef.current = undefined;
+    activeSessionIdRef.current = undefined;
+    sessionViewRef.current = undefined;
+    refreshInFlightRef.current = undefined;
+    dispatch({ type: preserve ? "session/deselect" : "session/reset" });
+  }, []);
+
+  const returnHome = useCallback((replace = false, preserve = true) => {
+    navigationRef.current += 1;
+    setRoute("/", replace);
+    setProjectCwd(undefined);
+    resetSession(preserve);
+  }, [resetSession]);
+
+  const navigateSession = useCallback((sessionId: string, cwd?: string | null, replace = false) => {
+    const validCwd = cwd != null && projectPath(cwd) !== "/" ? cwd : undefined;
+    setRoute(sessionPath(sessionId, validCwd), replace);
+    setProjectCwd(validCwd);
+  }, []);
 
   const reportError = useCallback((error: unknown) => {
     if (error instanceof ApiError) {
@@ -103,39 +126,44 @@ export function useAcp() {
       current.sessionIncarnation === view.sessionIncarnation &&
       view.viewRevision < current.viewRevision
     ) return;
+    const cwd = view.workspace.cwd;
+    if (cwd != null) navigateSession(view.sessionId, cwd, true);
     sessionViewRef.current = view;
-    storeSessionId(view.sessionId);
     dispatch({ type: "bridge/session_hydrate", view });
-  }, []);
+  }, [navigateSession]);
 
   const refreshSession = useCallback((sessionId: string) => {
     if (activeSessionIdRef.current !== sessionId) return;
-    if (refreshInFlightRef.current) {
-      refreshPendingRef.current = true;
+    if (refreshInFlightRef.current?.sessionId === sessionId) {
+      refreshInFlightRef.current.pending = true;
       return;
     }
-    refreshInFlightRef.current = true;
+    const refresh = { sessionId, pending: false };
+    refreshInFlightRef.current = refresh;
     void (async () => {
       try {
         do {
-          refreshPendingRef.current = false;
+          refresh.pending = false;
           const view = await requestJson<BridgeSessionView>(
             `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
           );
-          if (activeSessionIdRef.current !== sessionId) return;
+          if (refreshInFlightRef.current !== refresh || activeSessionIdRef.current !== sessionId) return;
           hydrateSession(view);
-        } while (refreshPendingRef.current && activeSessionIdRef.current === sessionId);
+        } while (refresh.pending && activeSessionIdRef.current === sessionId);
       } catch (error) {
-        if (activeSessionIdRef.current === sessionId) reportError(error);
+        if (refreshInFlightRef.current !== refresh || activeSessionIdRef.current !== sessionId) return;
+        if (isMissingSession(error)) returnHome(true, false);
+        else reportError(error);
       } finally {
-        refreshInFlightRef.current = false;
-        if (refreshPendingRef.current && activeSessionIdRef.current === sessionId) {
-          refreshPendingRef.current = false;
-          refreshSessionRef.current(sessionId);
+        if (refreshInFlightRef.current === refresh) {
+          refreshInFlightRef.current = undefined;
+          if (refresh.pending && activeSessionIdRef.current === sessionId) {
+            refreshSessionRef.current(sessionId);
+          }
         }
       }
     })();
-  }, [hydrateSession, reportError]);
+  }, [hydrateSession, reportError, returnHome]);
   refreshSessionRef.current = refreshSession;
 
   const connectSessionEvents = useCallback((sessionId: string) => {
@@ -210,7 +238,9 @@ export function useAcp() {
     };
   }, [reportError]);
 
-  const activateSession = useCallback((session: SessionInfo, transition = true) => {
+  const activateSession = useCallback((session: SessionInfo, transition = true, view?: BridgeSessionView) => {
+    navigationRef.current += 1;
+    navigateSession(session.sessionId, view?.workspace.cwd ?? session.cwd, !transition);
     if (activeSessionIdRef.current === session.sessionId && sessionViewRef.current != null) {
       refreshSessionRef.current(session.sessionId);
       return;
@@ -218,7 +248,6 @@ export function useAcp() {
     const requestId = randomId();
     activeSessionIdRef.current = session.sessionId;
     sessionViewRef.current = undefined;
-    refreshPendingRef.current = false;
     sessionEventsRef.current?.close();
     if (transition) {
       dispatch({
@@ -231,10 +260,11 @@ export function useAcp() {
       });
     }
     connectSessionEvents(session.sessionId);
-    refreshSessionRef.current(session.sessionId);
-  }, [connectSessionEvents]);
+    if (view != null) hydrateSession(view);
+    else refreshSessionRef.current(session.sessionId);
+  }, [connectSessionEvents, hydrateSession, navigateSession]);
 
-  const refreshSessionList = useCallback(async (cursor?: string) => {
+  const readSessionList = useCallback(async (cursor?: string) => {
     const suffix = cursor == null ? "" : `?${new URLSearchParams({ cursor })}`;
     const response = await requestJson<SessionListResult>(`/api/v1/sessions${suffix}`);
     dispatch({
@@ -249,10 +279,37 @@ export function useAcp() {
     return response;
   }, []);
 
-  const refreshRuntime = useCallback(async (selectInitialSession: boolean) => {
-    if (selectInitialSession) initialSelectionPendingRef.current = true;
+  const withSessionList = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
+    const result = sessionListQueueRef.current.then(operation, operation);
+    sessionListQueueRef.current = result.catch(() => undefined);
+    return result;
+  }, []);
+
+  const refreshSessionList = useCallback((cursor?: string) => withSessionList(async () => {
+    const pathname = window.location.pathname;
+    const discoverProject = cursor == null && (
+      readProjectCwdFromPath(pathname) != null || readSessionIdFromPath(pathname) != null
+    );
+    let listed = await readSessionList(cursor);
+    const cursors = new Set<string>();
+    while (discoverProject && listed.nextCursor != null && window.location.pathname === pathname) {
+      if (cursors.has(listed.nextCursor)) throw new Error("Agent session list repeated a cursor");
+      cursors.add(listed.nextCursor);
+      listed = await readSessionList(listed.nextCursor);
+    }
+    return listed;
+  }), [readSessionList, withSessionList]);
+
+  const refreshRuntimeOnce = useCallback(async () => {
+    const navigation = navigationRef.current;
+    const routeProjectCwd = readProjectCwdFromPath(window.location.pathname);
+    const routeSessionId = readSessionIdFromPath(window.location.pathname);
+    const stillCurrent = () => navigationRef.current === navigation &&
+      readProjectCwdFromPath(window.location.pathname) === routeProjectCwd &&
+      readSessionIdFromPath(window.location.pathname) === routeSessionId;
     try {
       const runtime = await requestJson<RuntimeView>("/api/v1/runtime");
+      if (!stillCurrent()) return;
       dispatch({ type: "socket/open" });
       if (runtime.hello != null) dispatch({ type: "server/event", event: runtime.hello });
       if (runtime.initialized != null) {
@@ -264,32 +321,85 @@ export function useAcp() {
 
       if (!runtime.connected || runtime.phase?.phase !== "ready") return;
 
-      const listed = await refreshSessionList();
-      const activeSessionId = activeSessionIdRef.current;
-      if (activeSessionId != null) {
-        initialSelectionPendingRef.current = false;
-        connectSessionEvents(activeSessionId);
-        refreshSessionRef.current(activeSessionId);
+      await withSessionList(async () => {
+        if (!stillCurrent()) return;
+        let listed = await readSessionList();
+        if (!stillCurrent() || (routeSessionId == null && routeProjectCwd == null)) return;
+
+        let selected = listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
+        // Keep discovery and materialization in one list transaction: another
+        // first-page refresh would otherwise invalidate the offered cursors/cwd.
+        const cursors = new Set<string>();
+        while (listed.nextCursor != null) {
+          if (cursors.has(listed.nextCursor)) throw new Error("Agent session list repeated a cursor");
+          cursors.add(listed.nextCursor);
+          listed = await readSessionList(listed.nextCursor);
+          if (!stillCurrent()) return;
+          selected ??= listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
+        }
+        // Projects show their complete session metadata without materializing a
+        // conversation. Only an explicit session URL opens a session stream.
+        if (routeSessionId == null) return;
+        if (activeSessionIdRef.current === routeSessionId) {
+          connectSessionEvents(routeSessionId);
+          refreshSessionRef.current(routeSessionId);
+          return;
+        }
+        // Materialized sessions remain readable even if they are not listed.
+        // Only the bridge's explicit not-found response sends this route home.
+        const view = await requestJson<BridgeSessionView>(
+          `/api/v1/sessions/${encodeURIComponent(routeSessionId)}`,
+        );
+        if (stillCurrent()) {
+          activateSession(selected ?? { sessionId: routeSessionId, cwd: "" }, false, view);
+        }
+      });
+    } catch (error) {
+      if (!stillCurrent()) return;
+      if (isMissingSession(error)) {
+        returnHome(true, false);
         return;
       }
-      if (!initialSelectionPendingRef.current) return;
-      initialSelectionPendingRef.current = false;
-      const stored = readStoredSessionId();
-      const selected = stored == null
-        ? mostRecentSession(listed.sessions)
-        : listed.sessions.find(({ sessionId }) => sessionId === stored) ??
-          { sessionId: stored, cwd: "" };
-      if (selected != null) activateSession(selected, false);
-    } catch (error) {
-      // A ready Agent can reject a business request (notably session/list
-      // with auth-required) while the REST/SSE connection remains healthy.
-      // Only transport/server failures make the browser connection stale.
+      // Business errors leave the route intact; only a transport failure makes
+      // the connection stale. Authentication and load failures remain visible.
       if (!(error instanceof ApiError) || error.status >= 500) {
         dispatch({ type: "socket/closed" });
       }
       reportError(error);
     }
-  }, [activateSession, connectSessionEvents, refreshSessionList, reportError]);
+  }, [activateSession, connectSessionEvents, readSessionList, reportError, returnHome, withSessionList]);
+
+  const refreshRuntime = useCallback(() => {
+    if (runtimeRefreshRef.current != null) {
+      runtimeRefreshRef.current.pending = true;
+      return;
+    }
+    const refresh = { pending: false };
+    runtimeRefreshRef.current = refresh;
+    void (async () => {
+      try {
+        do {
+          refresh.pending = false;
+          await refreshRuntimeOnce();
+        } while (refresh.pending && runtimeRefreshRef.current === refresh);
+      } finally {
+        if (runtimeRefreshRef.current === refresh) runtimeRefreshRef.current = undefined;
+      }
+    })();
+  }, [refreshRuntimeOnce]);
+
+  const openProject = useCallback((cwd: string) => {
+    const path = projectPath(cwd);
+    if (path === "/") {
+      returnHome();
+      return;
+    }
+    navigationRef.current += 1;
+    setRoute(path);
+    setProjectCwd(cwd);
+    resetSession(true);
+    void refreshRuntime();
+  }, [refreshRuntime, resetSession, returnHome]);
 
   const handleGlobalEvent = useCallback((event: GlobalBusinessEvent) => {
     switch (event.type) {
@@ -305,7 +415,7 @@ export function useAcp() {
           if (stateRef.current.authTerminal?.status === "succeeded") {
             dispatch({ type: "auth/dismiss_terminal" });
           }
-          void refreshRuntime(false);
+          void refreshRuntime();
         }
         return;
       case "bridge/connection_error":
@@ -318,7 +428,7 @@ export function useAcp() {
             data: event.data,
           },
         });
-        void refreshRuntime(false);
+        void refreshRuntime();
         return;
       default:
         dispatch({ type: "server/event", event: event as ServerEvent });
@@ -331,7 +441,7 @@ export function useAcp() {
     globalEventsRef.current = source;
     source.onopen = () => {
       dispatch({ type: "socket/open" });
-      void refreshRuntime(false);
+      void refreshRuntime();
     };
     source.onmessage = ({ data }) => {
       try {
@@ -353,7 +463,19 @@ export function useAcp() {
     };
     reconnectRef.current = reconnectStreams;
     connectGlobalEvents();
-    void refreshRuntime(true);
+    const restoreRoute = () => {
+      navigationRef.current += 1;
+      const cwd = readProjectCwdFromPath(window.location.pathname);
+      const sessionId = readSessionIdFromPath(window.location.pathname);
+      if (cwd == null && sessionId == null) returnHome(true);
+      else {
+        setProjectCwd(cwd);
+        setRoute(sessionId == null ? projectPath(cwd!) : sessionPath(sessionId, cwd), true);
+        if (sessionId == null || activeSessionIdRef.current !== sessionId) resetSession(true);
+      }
+      void refreshRuntime();
+    };
+    restoreRoute();
 
     const recoverClosedStreams = () => {
       if (
@@ -366,18 +488,22 @@ export function useAcp() {
     window.addEventListener("online", recoverClosedStreams);
     window.addEventListener("focus", recoverClosedStreams);
     window.addEventListener("pageshow", recoverClosedStreams);
+    window.addEventListener("popstate", restoreRoute);
     document.addEventListener("visibilitychange", recoverClosedStreams);
     return () => {
       disposed = true;
+      navigationRef.current += 1;
       reconnectRef.current = () => undefined;
       window.removeEventListener("online", recoverClosedStreams);
       window.removeEventListener("focus", recoverClosedStreams);
       window.removeEventListener("pageshow", recoverClosedStreams);
+      window.removeEventListener("popstate", restoreRoute);
       document.removeEventListener("visibilitychange", recoverClosedStreams);
       globalEventsRef.current?.close();
       sessionEventsRef.current?.close();
+      refreshInFlightRef.current = undefined;
     };
-  }, [connectGlobalEvents, connectSessionEvents, refreshRuntime]);
+  }, [connectGlobalEvents, refreshRuntime, resetSession, returnHome]);
 
   const searchWorkspaceContext = useCallback(async (query: string) => {
     const response = await requestJson<{ matches: WorkspaceContextMatch[] }>(
@@ -539,7 +665,7 @@ export function useAcp() {
       { method: "POST" },
     ).then(({ requestId, response }) => {
       handleGlobalEvent({ type: "acp/authenticated", requestId, methodId, response });
-      void refreshRuntime(false);
+      void refreshRuntime();
     }).catch(reportError);
   }, [handleGlobalEvent, refreshRuntime, reportError]);
 
@@ -575,21 +701,29 @@ export function useAcp() {
 
   const newSession = useCallback((cwd: string): boolean => {
     if (stateRef.current.phase !== "ready") return false;
+    const navigation = ++navigationRef.current;
     const requestId = randomId();
     dispatch({ type: "session/transition_start", kind: "new", requestId, cwd });
     void requestJson<CreatedSessionResult>("/api/v1/sessions", {
       method: "POST",
       body: JSON.stringify({ cwd }),
     }).then((created) => {
+      if (navigationRef.current !== navigation) {
+        void refreshSessionList().catch(reportError);
+        return;
+      }
+      navigateSession(created.sessionId, created.view.workspace.cwd ?? created.cwd ?? cwd);
       activeSessionIdRef.current = created.sessionId;
       sessionViewRef.current = undefined;
       sessionEventsRef.current?.close();
       connectSessionEvents(created.sessionId);
       hydrateSession(created.view);
       void refreshSessionList();
-    }).catch((error) => reportRequestError(error, requestId, "session/new"));
+    }).catch((error) => {
+      if (navigationRef.current === navigation) reportRequestError(error, requestId, "session/new");
+    });
     return true;
-  }, [connectSessionEvents, hydrateSession, refreshSessionList, reportRequestError]);
+  }, [connectSessionEvents, hydrateSession, navigateSession, refreshSessionList, reportError, reportRequestError]);
 
   const listSessions = useCallback((cursor?: string) => {
     void refreshSessionList(cursor).catch(reportError);
@@ -605,32 +739,36 @@ export function useAcp() {
     void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/close`, {
       method: "POST",
     }).then(() => {
-      sessionEventsRef.current?.close();
-      activeSessionIdRef.current = undefined;
-      sessionViewRef.current = undefined;
-      storeSessionId(undefined);
-      dispatch({ type: "session/reset" });
+      if (activeSessionIdRef.current === sessionId) returnHome(true, false);
       void refreshSessionList();
     }).catch((error) => reportRequestError(error, requestId, "session/close"));
-  }, [refreshSessionList, reportRequestError]);
+  }, [refreshSessionList, reportRequestError, returnHome]);
 
   const forkSession = useCallback(() => {
     const sessionId = activeSessionIdRef.current;
     if (sessionId == null || stateRef.current.running) return;
+    const navigation = ++navigationRef.current;
     const requestId = randomId();
     dispatch({ type: "session/transition_start", kind: "fork", requestId, sessionId });
     void requestJson<CreatedSessionResult>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/fork`,
       { method: "POST" },
     ).then((forked) => {
+      if (navigationRef.current !== navigation) {
+        void refreshSessionList().catch(reportError);
+        return;
+      }
+      navigateSession(forked.sessionId, forked.view.workspace.cwd ?? forked.cwd ?? stateRef.current.cwd);
       activeSessionIdRef.current = forked.sessionId;
       sessionViewRef.current = undefined;
       sessionEventsRef.current?.close();
       connectSessionEvents(forked.sessionId);
       hydrateSession(forked.view);
       void refreshSessionList();
-    }).catch((error) => reportRequestError(error, requestId, "session/fork"));
-  }, [connectSessionEvents, hydrateSession, refreshSessionList, reportRequestError]);
+    }).catch((error) => {
+      if (navigationRef.current === navigation) reportRequestError(error, requestId, "session/fork");
+    });
+  }, [connectSessionEvents, hydrateSession, navigateSession, refreshSessionList, reportError, reportRequestError]);
 
   const deleteSession = useCallback((sessionId: string) => {
     if (stateRef.current.pendingSessionDeletions.some((pending) => pending.sessionId === sessionId)) {
@@ -642,10 +780,7 @@ export function useAcp() {
       method: "DELETE",
     }).then(() => {
       if (activeSessionIdRef.current === sessionId) {
-        sessionEventsRef.current?.close();
-        activeSessionIdRef.current = undefined;
-        sessionViewRef.current = undefined;
-        storeSessionId(undefined);
+        returnHome(true, false);
       }
       dispatch({
         type: "server/event",
@@ -653,7 +788,7 @@ export function useAcp() {
       });
       void refreshSessionList();
     }).catch((error) => reportRequestError(error, requestId, "session/delete"));
-  }, [refreshSessionList, reportRequestError]);
+  }, [refreshSessionList, reportRequestError, returnHome]);
 
   const dismissExternalFlow = useCallback((elicitationId: string) => {
     dispatch({ type: "elicitation/dismiss_flow", elicitationId });
@@ -678,27 +813,15 @@ export function useAcp() {
     newSession,
     listSessions,
     attachSession,
+    projectCwd,
+    openProject,
+    goHome: returnHome,
     forkSession,
     closeSession,
     deleteSession,
     searchWorkspaceContext,
     readWorkspaceContext,
   };
-}
-
-export function mostRecentSession(sessions: SessionInfo[]): SessionInfo | undefined {
-  let selected: SessionInfo | undefined;
-  let selectedTime = Number.NEGATIVE_INFINITY;
-  for (const session of sessions) {
-    const time = session.updatedAt == null
-      ? Number.NEGATIVE_INFINITY
-      : Date.parse(session.updatedAt);
-    if (selected == null || time > selectedTime) {
-      selected = session;
-      selectedTime = Number.isNaN(time) ? Number.NEGATIVE_INFINITY : time;
-    }
-  }
-  return selected;
 }
 
 function advanceSessionViewToTurnOutcome(
@@ -738,21 +861,15 @@ function clearMatchingPromptAdmission(
   }
 }
 
-function readStoredSessionId(): string | undefined {
-  try {
-    return localStorage.getItem(LAST_SESSION_STORAGE_KEY) ?? undefined;
-  } catch {
-    return undefined;
-  }
+function setRoute(path: string, replace = false): void {
+  if (window.location.pathname === path && !window.location.search && !window.location.hash) return;
+  if (replace) window.history.replaceState(null, "", path);
+  else window.history.pushState(null, "", path);
 }
 
-function storeSessionId(sessionId: string | undefined): void {
-  try {
-    if (sessionId == null) localStorage.removeItem(LAST_SESSION_STORAGE_KEY);
-    else localStorage.setItem(LAST_SESSION_STORAGE_KEY, sessionId);
-  } catch {
-    // Private browsing can deny storage while the live REST/SSE session remains usable.
-  }
+function isMissingSession(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404 &&
+    isRecord(error.body) && error.body.code === "session_not_found";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

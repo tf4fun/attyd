@@ -26,6 +26,7 @@ vi.mock("../web/src/lib/use-acp", async () => {
       newSession: noop,
       listSessions: noop,
       attachSession: noop,
+      goHome: noop,
       forkSession: noop,
       closeSession: noop,
       deleteSession: noop,
@@ -65,37 +66,54 @@ describe("application shell interaction", () => {
     container.remove();
   });
 
-  it("moves focus into the mobile drawer and restores it on Escape", async () => {
-    const open = requireButton(container, "Open sidebar");
-    expect(open.getAttribute("aria-controls")).toBe("app-sidebar");
-    expect(open.getAttribute("aria-expanded")).toBe("false");
+  it("renders the project browser without a sidebar or drawer controls", () => {
+    expect(container.querySelectorAll("main")).toHaveLength(1);
+    expect(container.querySelector("aside, .sidebar, .mobile-menu, .sidebar-overlay, .topbar")).toBeNull();
+    expect(container.querySelector('[aria-label="Open sidebar"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Close sidebar"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Dismiss sidebar overlay"]')).toBeNull();
+    expect(container.querySelector("h1")?.textContent).toBe("Projects");
+  });
 
-    await act(async () => open.click());
-    const close = requireButton(container, "Close sidebar");
-    expect(document.activeElement).toBe(close);
-    expect(open.getAttribute("aria-expanded")).toBe("true");
-    expect(requireButton(container, "Dismiss sidebar overlay")).toBeTruthy();
+  it("closes Agent settings on Escape and restores focus to its trigger", async () => {
+    const trigger = container.querySelector<HTMLElement>('summary[aria-label="Agent settings"]');
+    if (!trigger) throw new Error("Missing Agent settings trigger");
+    await act(async () => trigger.click());
+    const settings = container.querySelector<HTMLDetailsElement>(".agent-details");
+    expect(settings?.open).toBe(true);
 
     await act(async () => {
       window.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape" }));
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     });
-    expect(open.getAttribute("aria-expanded")).toBe("false");
-    expect(document.activeElement).toBe(open);
-    expect(container.querySelector('[aria-label="Dismiss sidebar overlay"]')).toBeNull();
+    expect(settings?.open).toBe(false);
+    expect(document.activeElement).toBe(trigger);
   });
 
-  it("exposes one unambiguous new-thread action", () => {
-    expect(container.querySelectorAll('button[aria-label="New thread"]')).toHaveLength(1);
-    expect(container.querySelector('button[aria-label="New session"]')).toBeNull();
+  it("exposes one primary project action on the homepage", () => {
+    expect(container.querySelectorAll("button.project-new")).toHaveLength(1);
+    expect(container.querySelector("button.project-new")?.textContent).toBe("New project");
+    expect(container.querySelector('button[aria-label="New thread"]')).toBeNull();
+    expect(container.querySelector(".page-back")).toBeNull();
   });
 
-  it("asks for the Agent workspace and pre-fills the stdio default", async () => {
-    await act(async () => requireButton(container, "New thread").click());
+  it("opens project creation with the default workspace and restores its action on cancellation", async () => {
+    const trigger = container.querySelector<HTMLButtonElement>("button.project-new");
+    if (!trigger) throw new Error("Missing session action");
+    trigger.focus();
+    await act(async () => trigger.click());
     expect(container.querySelector('[role="dialog"][aria-labelledby="new-thread-title"]')).toBeTruthy();
+    expect(container.querySelector("#new-thread-title")?.textContent).toBe("New project");
+    expect(container.querySelector('button[type="submit"]')?.textContent).toBe("Create project");
     expect(container.querySelector<HTMLInputElement>("#new-thread-cwd")?.value)
       .toBe("/workspace/attyd");
     expect(document.activeElement).toBe(container.querySelector("#new-thread-cwd"));
+    await act(async () => {
+      requireButton(container, "Cancel new project").click();
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    });
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
   });
 });
 

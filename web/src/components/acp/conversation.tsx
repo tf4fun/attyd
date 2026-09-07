@@ -12,7 +12,7 @@ import {
   TextSelect,
 } from "lucide-react";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type {
   AgentActivity,
@@ -21,6 +21,8 @@ import type {
 } from "../../lib/state";
 import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { contentBlocksToMarkdown } from "../../lib/thread-markdown";
+import { collectTurnReviewChanges, type ReviewSummary } from "../../lib/review-changes";
+import { ChangeReview } from "./change-review";
 import { ContentBlocks } from "./content-block";
 import { CompactionCard } from "./compaction";
 import { DebugInfoButton, DebugInfoPanel } from "./debug-info";
@@ -47,6 +49,7 @@ export function Conversation({
   onNavigateThread?: (target: "top" | "bottom") => void;
   onOpenThreadMarkdown?: () => void;
 }) {
+  const turns = useMemo(() => collectTurnReviewChanges(timeline), [timeline]);
   if (timeline.length === 0) {
     return (
       <div className="empty-state">
@@ -59,20 +62,42 @@ export function Conversation({
 
   return (
     <div className="conversation">
-      {timeline.map((item) => (
-        <TimelineEntry
-          item={item}
-          terminalSnapshots={terminalSnapshots}
-          canReusePrompt={canReusePrompt}
-          onReusePrompt={onReusePrompt}
-          onRetryPrompt={onRetryPrompt}
-          agentActivity={agentActivity}
-          onNavigateThread={onNavigateThread}
-          onOpenThreadMarkdown={onOpenThreadMarkdown}
-          key={item.id}
-        />
-      ))}
+      {turns.flatMap((turn) => {
+        // Prompt UUIDs are regenerated when authoritative history is hydrated.
+        // Tool entry IDs retain their turn position, keeping open reviews mounted.
+        const reviewId = turn.summary.files[0]?.diffs[0]?.id;
+        return [
+          ...turn.items.map((item) => (
+            <TimelineEntry
+              item={item}
+              terminalSnapshots={terminalSnapshots}
+              canReusePrompt={canReusePrompt}
+              onReusePrompt={onReusePrompt}
+              onRetryPrompt={onRetryPrompt}
+              agentActivity={agentActivity}
+              onNavigateThread={onNavigateThread}
+              onOpenThreadMarkdown={onOpenThreadMarkdown}
+              key={item.id}
+            />
+          )),
+          ...(reviewId ? [
+            <TurnChangeReview key={`changes:${reviewId}`} turnId={reviewId} summary={turn.summary} />,
+          ] : []),
+        ];
+      })}
     </div>
+  );
+}
+
+function TurnChangeReview({ turnId, summary }: { turnId: string; summary: ReviewSummary }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <ChangeReview
+      entryId={`changes:${turnId}`}
+      summary={summary}
+      open={open}
+      onToggle={() => setOpen((value) => !value)}
+    />
   );
 }
 

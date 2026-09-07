@@ -1,26 +1,25 @@
-import type { ContentBlock, ToolCall } from "@agentclientprotocol/sdk";
+import type { ContentBlock, SessionInfo, ToolCall } from "@agentclientprotocol/sdk";
 import {
   Activity,
   ArrowDownToLine,
+  ArrowLeft,
   ArrowUpToLine,
   Bot,
   ChevronDown,
+  ChevronRight,
   Ellipsis,
   FileText,
   FolderGit2,
   GitFork,
   LogOut,
-  Menu,
   Plus,
   Search as SearchIcon,
   ScrollText,
   Settings2,
   ShieldCheck,
   Trash2,
-  X,
 } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChangeReview } from "./components/acp/change-review";
 import { AgentAuthCard, AgentAuthControls } from "./components/acp/agent-auth";
 import { Conversation } from "./components/acp/conversation";
 import { ElicitationCard, ExternalFlowCard } from "./components/acp/elicitation";
@@ -41,10 +40,11 @@ import { RawJson } from "./components/acp/raw-json";
 import { SessionControls } from "./components/acp/session-controls";
 import { SessionHistory } from "./components/acp/session-history";
 import { ThreadSearchBar } from "./components/acp/thread-search";
+import { ProjectBrowser } from "./components/acp/project-browser";
+import { projectPath } from "./lib/session-route";
 import { randomId } from "./lib/id";
 import { collectPromptHistory } from "./lib/prompt-history";
 import { timelineToMarkdown } from "./lib/thread-markdown";
-import { collectReviewChanges } from "./lib/review-changes";
 import type { AgentActivity, TimelineItem } from "./lib/state";
 import { useAcp } from "./lib/use-acp";
 
@@ -72,19 +72,20 @@ export default function App() {
     newSession,
     listSessions,
     attachSession,
+    goHome,
+    projectCwd,
+    openProject,
     forkSession,
     closeSession,
     deleteSession,
     searchWorkspaceContext,
     readWorkspaceContext,
   } = useAcp();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [newThreadOpen, setNewThreadOpen] = useState(false);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>();
   const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
   const [queueError, setQueueError] = useState<string>();
   const [queuePaused, setQueuePaused] = useState(false);
-  const [reviewOpen, setReviewOpen] = useState(false);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchFocusRequest, setThreadSearchFocusRequest] = useState(0);
   const [threadScroll, setThreadScroll] = useState({
@@ -94,12 +95,20 @@ export default function App() {
   });
   const scroll = useRef<HTMLDivElement>(null);
   const threadSearchContainer = useRef<HTMLDivElement>(null);
-  const mobileMenu = useRef<HTMLButtonElement>(null);
-  const newThreadButton = useRef<HTMLButtonElement>(null);
-  const sidebarClose = useRef<HTMLButtonElement>(null);
+  const newThreadOpener = useRef<HTMLElement | null>(null);
+  const sessionSwitcher = useRef<HTMLDetailsElement>(null);
+  const agentSettings = useRef<HTMLDetailsElement>(null);
+  const threadActions = useRef<HTMLDetailsElement>(null);
+  const sessionHeading = useRef<HTMLElement>(null);
   const lastPositionedSession = useRef<string | undefined>(undefined);
   const followLatestOnViewport = useRef(false);
   const followLatestContent = useRef(true);
+  const lastThreadScrollTop = useRef(0);
+
+  const pauseThreadFollowing = useCallback(() => {
+    followLatestContent.current = false;
+    followLatestOnViewport.current = false;
+  }, []);
 
   const measureThreadScroll = useCallback(() => {
     const element = scroll.current;
@@ -216,7 +225,7 @@ export default function App() {
     const rememberPosition = (event: FocusEvent) => {
       if (!(event.target instanceof Element) || event.target.closest(".composer") == null) return;
       const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-      followLatestOnViewport.current = distance <= 48;
+      followLatestOnViewport.current = distance <= 2;
       followViewport();
     };
     const stopFollowing = () => {
@@ -224,34 +233,56 @@ export default function App() {
       followLatestContent.current = false;
       cancelAnimationFrame(frame);
     };
+    const scrollsThreadUp = (target: EventTarget | null) => {
+      for (let node = target instanceof Element ? target : null;
+        node && node !== element; node = node.parentElement) {
+        if (node.scrollTop > 0 && /^(auto|scroll)$/.test(getComputedStyle(node).overflowY)) {
+          return false;
+        }
+      }
+      return element.scrollTop > 0;
+    };
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.defaultPrevented && event.deltaY < 0 && scrollsThreadUp(event.target)) stopFollowing();
+    };
+    let touchY: number | undefined;
+    const rememberTouch = (event: TouchEvent) => {
+      touchY = event.touches.length === 1 ? event.touches[0].clientY : undefined;
+    };
+    const handleTouchMove = (event: TouchEvent) => {
+      const nextY = event.touches.length === 1 ? event.touches[0].clientY : undefined;
+      if (!event.defaultPrevented && touchY != null && nextY != null && nextY > touchY &&
+        scrollsThreadUp(event.target)) stopFollowing();
+      touchY = nextY;
+    };
 
     document.addEventListener("focusin", rememberPosition);
-    element.addEventListener("touchmove", stopFollowing, { passive: true });
-    element.addEventListener("wheel", stopFollowing, { passive: true });
+    element.addEventListener("touchstart", rememberTouch, { passive: true });
+    element.addEventListener("touchmove", handleTouchMove, { passive: true });
+    element.addEventListener("touchend", rememberTouch, { passive: true });
+    element.addEventListener("touchcancel", rememberTouch, { passive: true });
+    element.addEventListener("wheel", handleWheel, { passive: true });
     window.addEventListener("resize", followViewport);
     window.visualViewport?.addEventListener("resize", followViewport);
     window.visualViewport?.addEventListener("scroll", followViewport);
     return () => {
       cancelAnimationFrame(frame);
       document.removeEventListener("focusin", rememberPosition);
-      element.removeEventListener("touchmove", stopFollowing);
-      element.removeEventListener("wheel", stopFollowing);
+      element.removeEventListener("touchstart", rememberTouch);
+      element.removeEventListener("touchmove", handleTouchMove);
+      element.removeEventListener("touchend", rememberTouch);
+      element.removeEventListener("touchcancel", rememberTouch);
+      element.removeEventListener("wheel", handleWheel);
       window.removeEventListener("resize", followViewport);
       window.visualViewport?.removeEventListener("resize", followViewport);
       window.visualViewport?.removeEventListener("scroll", followViewport);
     };
-  }, [measureThreadScroll]);
-
-  const closeMobileSidebar = () => {
-    setSidebarOpen(false);
-    requestAnimationFrame(() => mobileMenu.current?.focus());
-  };
+  }, [measureThreadScroll, state.session?.sessionId]);
 
   const closeNewThread = useCallback(() => {
     setNewThreadOpen(false);
     requestAnimationFrame(() => {
-      if (window.innerWidth <= 760) mobileMenu.current?.focus();
-      else newThreadButton.current?.focus();
+      if (newThreadOpener.current?.isConnected) newThreadOpener.current.focus();
     });
   }, []);
 
@@ -273,16 +304,72 @@ export default function App() {
   }, [closeThreadSearch, threadSearchOpen]);
 
   useEffect(() => {
-    if (!sidebarOpen) return;
-    sidebarClose.current?.focus();
+    const popovers = () => [sessionSwitcher.current, agentSettings.current, threadActions.current];
+    const fitPopovers = () => {
+      const viewport = window.visualViewport;
+      const bottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
+      for (const popover of popovers()) {
+        if (!popover?.open) continue;
+        const panel = popover.querySelector<HTMLElement>(":scope > div");
+        if (!panel) continue;
+        popover.style.setProperty("--menu-space", `${Math.max(0, bottom - panel.getBoundingClientRect().top - 16)}px`);
+      }
+    };
+    const onToggle = (event: Event) => {
+      const opened = popovers().find((popover) => popover === event.target);
+      if (!opened?.open) return;
+      for (const popover of popovers()) {
+        if (popover && popover !== opened) popover.open = false;
+      }
+      fitPopovers();
+    };
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      const open = popovers().find((popover) => popover?.open);
+      if (!open) return;
       event.preventDefault();
-      closeMobileSidebar();
+      open.open = false;
+      open.querySelector<HTMLElement>("summary")?.focus();
+    };
+    const closeOutside = (event: PointerEvent) => {
+      for (const popover of popovers()) {
+        if (popover?.open && event.target instanceof Node && !popover.contains(event.target)) {
+          popover.open = false;
+        }
+      }
     };
     window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [sidebarOpen]);
+    window.addEventListener("pointerdown", closeOutside);
+    window.addEventListener("toggle", onToggle, true);
+    window.addEventListener("resize", fitPopovers);
+    window.addEventListener("scroll", fitPopovers, true);
+    window.visualViewport?.addEventListener("resize", fitPopovers);
+    window.visualViewport?.addEventListener("scroll", fitPopovers);
+    return () => {
+      window.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("pointerdown", closeOutside);
+      window.removeEventListener("toggle", onToggle, true);
+      window.removeEventListener("resize", fitPopovers);
+      window.removeEventListener("scroll", fitPopovers, true);
+      window.visualViewport?.removeEventListener("resize", fitPopovers);
+      window.visualViewport?.removeEventListener("scroll", fitPopovers);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const heading = sessionHeading.current;
+    if (!heading) return;
+    const updateComposerBoundary = () => {
+      heading.parentElement?.style.setProperty(
+        "--session-heading-end", `${heading.offsetTop + heading.offsetHeight + 14}px`,
+      );
+    };
+    updateComposerBoundary();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(updateComposerBoundary);
+    observer.observe(heading);
+    return () => observer.disconnect();
+  }, [state.session?.sessionId]);
 
   useLayoutEffect(() => {
     const element = scroll.current;
@@ -299,19 +386,32 @@ export default function App() {
     if (!element) return;
     if (element.scrollHeight - element.scrollTop - element.clientHeight <= 2) {
       followLatestContent.current = true;
+      followLatestOnViewport.current = true;
+    } else if (element.scrollTop < lastThreadScrollTop.current) {
+      // Also respect navigation initiated by the browser or assistive tools.
+      pauseThreadFollowing();
     }
+    lastThreadScrollTop.current = element.scrollTop;
     measureThreadScroll();
-  }, [measureThreadScroll]);
+  }, [measureThreadScroll, pauseThreadFollowing]);
 
   useEffect(() => {
     const element = scroll.current;
     if (!element) return;
-    measureThreadScroll();
+    const syncLayout = () => {
+      // Child disclosures, media, and composer resizing can change the bottom
+      // without producing a new ACP timeline event.
+      if (followLatestContent.current) {
+        element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+      }
+      measureThreadScroll();
+    };
+    syncLayout();
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measureThreadScroll);
-    observer.observe(element);
+    const observer = new ResizeObserver(syncLayout);
+    observer.observe(element, { box: "border-box" });
     const content = element.querySelector(".conversation-wrap");
-    if (content) observer.observe(content);
+    if (content) observer.observe(content, { box: "border-box" });
     return () => observer.disconnect();
   }, [measureThreadScroll, state.session?.sessionId]);
 
@@ -320,7 +420,6 @@ export default function App() {
     setQueuedPrompts([]);
     setQueueError(undefined);
     setQueuePaused(false);
-    setReviewOpen(false);
     setThreadSearchOpen(false);
   }, [state.session?.sessionId]);
 
@@ -355,8 +454,75 @@ export default function App() {
   const showAuthCard = authMethods.length > 0 &&
     (state.authStatus === "required" || state.authStatus === "logged_out") &&
     !terminalAuthOwnsInteraction;
-  const reviewChanges = useMemo(() => collectReviewChanges(state.timeline), [state.timeline]);
   const promptHistory = useMemo(() => collectPromptHistory(state.timeline), [state.timeline]);
+  const selectedProjectCwd = state.session ? state.cwd : projectCwd;
+  const knownSessions = useMemo(() => {
+    const sessions = new Map(state.sessions.map((session) => [session.sessionId, session]));
+    for (const [sessionId, cached] of state.cachedSessions) {
+      if (!sessions.has(sessionId)) sessions.set(sessionId, {
+        sessionId, cwd: cached.cwd, title: cached.title,
+      });
+    }
+    if (state.session) sessions.set(state.session.sessionId, {
+      ...sessions.get(state.session.sessionId),
+      sessionId: state.session.sessionId, cwd: state.cwd, title: state.title,
+    });
+    return [...sessions.values()];
+  }, [state.sessions, state.cachedSessions, state.session, state.cwd, state.title]);
+  const projectSessions = useMemo(() => knownSessions.filter(
+    (session) => session.cwd === selectedProjectCwd,
+  ), [knownSessions, selectedProjectCwd]);
+  const busySessionIds = [
+    ...((state.running || state.runtimeOperation != null) && state.session ? [state.session.sessionId] : []),
+    ...[...state.cachedSessions].filter(([, session]) => session.running || session.runtimeOperation != null)
+      .map(([sessionId]) => sessionId),
+  ];
+  const navigationDisabled = transitioning || changingControl || authBlocksCurrent || queuedPrompts.length > 0;
+  const browseProject = (cwd: string) => {
+    if (sessionSwitcher.current) sessionSwitcher.current.open = false;
+    openProject(cwd);
+  };
+  const browseHome = () => {
+    if (sessionSwitcher.current) sessionSwitcher.current.open = false;
+    goHome();
+  };
+  const openThread = (session: SessionInfo) => {
+    if (sessionSwitcher.current) sessionSwitcher.current.open = false;
+    attachSession(session);
+  };
+  const openNewThread = () => {
+    newThreadOpener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (sessionSwitcher.current) sessionSwitcher.current.open = false;
+    if (agentSettings.current) agentSettings.current.open = false;
+    setNewThreadOpen(true);
+  };
+  const authContent = <>
+    {showAuthCard && state.authStatus ? (
+      <AgentAuthCard
+        agentName={agent?.title ?? agent?.name ?? "Agent"}
+        methods={authMethods}
+        status={state.authStatus}
+        pending={state.pendingAuth}
+        error={state.authError}
+        focusAction={state.session == null}
+        disabled={state.phase !== "ready"}
+        onAuthenticate={authenticate}
+      />
+    ) : null}
+    {state.authTerminal && authTerminalMethod ? (
+      <Suspense fallback={<div className="auth-terminal-loading" role="status">Opening Agent terminal…</div>}>
+        <AuthTerminalCard
+          terminalState={state.authTerminal}
+          method={authTerminalMethod}
+          onInput={writeAuthTerminal}
+          onResize={resizeAuthTerminal}
+          onCancel={cancelAuthTerminal}
+          onRetry={authenticate}
+          onDismiss={dismissAuthTerminal}
+        />
+      </Suspense>
+    ) : null}
+  </>;
   const openActiveThreadMarkdown = useCallback(() => {
     openThreadMarkdown(timelineToMarkdown(state.timeline, {
       title: state.title ?? "Agent thread",
@@ -381,10 +547,6 @@ export default function App() {
   }, [deleteSession]);
 
   useEffect(() => {
-    if (reviewChanges.fileCount === 0) setReviewOpen(false);
-  }, [reviewChanges.fileCount]);
-
-  useEffect(() => {
     if (!ready || state.running || queuePaused || queuedPrompts.length === 0) return;
     const next = queuedPrompts[0];
     if (next.sessionId !== state.session?.sessionId) {
@@ -400,7 +562,6 @@ export default function App() {
       ? current.slice(1)
       : current.filter(({ id }) => id !== next.id));
     setQueueError(undefined);
-    setReviewOpen(false);
   }, [prompt, queuePaused, queuedPrompts, ready, state.running, state.session?.sessionId]);
 
   const submitPrompt = (
@@ -412,6 +573,13 @@ export default function App() {
       ...(text ? [{ type: "text" as const, text }] : []),
       ...attachments,
     ];
+    // Capture the position before sending changes the timeline/composer layout.
+    const element = scroll.current;
+    if (element) {
+      const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight <= 2;
+      followLatestContent.current = atBottom;
+      followLatestOnViewport.current = atBottom;
+    }
     setComposerDraft(undefined);
     if (!state.running) {
       setQueuePaused(false);
@@ -432,151 +600,115 @@ export default function App() {
     return true;
   };
 
-  return (
-    <div className="app-shell">
-      <button
-        ref={mobileMenu}
-        className="mobile-menu"
-        aria-label="Open sidebar"
-        aria-controls="app-sidebar"
-        aria-expanded={sidebarOpen}
-        onClick={() => setSidebarOpen(true)}
-      >
-        <Menu size={18} />
-      </button>
-      <aside
-        id="app-sidebar"
-        className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}
-        aria-label="Application sidebar"
-      >
-        <div className="brand">
-          <div className="brand-mark">a<span>&gt;</span></div>
-          <div><strong>attyd</strong><small>Agent threads</small></div>
-          <button
-            ref={sidebarClose}
-            className="close-sidebar"
-            aria-label="Close sidebar"
-            onClick={closeMobileSidebar}
-          ><X size={17} /></button>
+  const parentNavigation = selectedProjectCwd != null ? (
+    <div className="page-navigation">
+      <a
+        className="page-back"
+        href={state.session ? projectPath(selectedProjectCwd) : "/"}
+        aria-label={state.session ? "Back to project" : "Back to projects"}
+        title={state.session ? "Back to project" : "Back to projects"}
+        onClick={(event) => {
+          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+          event.preventDefault();
+          if (state.session) browseProject(selectedProjectCwd);
+          else browseHome();
+        }}
+      ><ArrowLeft size={18} aria-hidden="true" /></a>
+      <nav className="workspace-breadcrumbs" aria-label="Breadcrumb">
+        <a href="/" aria-label="All projects" onClick={(event) => {
+          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+          event.preventDefault();
+          browseHome();
+        }}>Projects</a>
+        {selectedProjectCwd != null ? <>
+          <ChevronRight size={12} aria-hidden="true" />
+          <a href={projectPath(selectedProjectCwd)} aria-label="Project sessions" title={selectedProjectCwd}
+            aria-current={!state.session ? "page" : undefined} onClick={(event) => {
+              if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              event.preventDefault();
+              browseProject(selectedProjectCwd);
+            }}>{workspaceName(selectedProjectCwd)}</a>
+        </> : null}
+      </nav>
+    </div>
+  ) : null;
+  const agentSettingsMenu = (
+    <details className="agent-details" ref={agentSettings} onToggle={(event) => {
+      if (event.currentTarget.open && sessionSwitcher.current) sessionSwitcher.current.open = false;
+    }}>
+      <summary role="button" aria-label="Agent settings" title="Agent settings">
+        <StatusDot phase={state.phase} /><Settings2 size={17} />
+      </summary>
+      <div className="agent-details-body">
+        <div className="agent-settings-heading">
+          <strong>{agent?.title ?? agent?.name ?? "Starting agent"}</strong>
+          <small>{phaseLabel(state.phase)} · ACP v{state.initialized?.protocolVersion ?? "–"}</small>
         </div>
-        <button
-          ref={newThreadButton}
-          className="new-session"
-          aria-label="New thread"
-          disabled={state.phase !== "ready" || transitioning || changingControl || authBlocksNewSession || queuedPrompts.length > 0}
-          onClick={() => {
-            setSidebarOpen(false);
-            setNewThreadOpen(true);
-          }}
-        >
-          <Plus size={15} /> New thread
-        </button>
-
-        <SessionHistory
-          sessions={state.sessions}
-          activeSessionId={state.session?.sessionId}
-          activeTitle={state.title ?? (state.session ? "New agent session" : undefined)}
-          canList={sessionCapabilities?.list != null}
-          nextCursor={state.nextSessionCursor}
-          canAttach={Boolean(agentCapabilities?.loadSession || sessionCapabilities?.resume != null)}
-          canDelete={sessionCapabilities?.delete != null}
-          deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
-          busySessionIds={[
-            ...((state.running || state.runtimeOperation != null) && state.session != null
-              ? [state.session.sessionId]
-              : []),
-            ...[...state.cachedSessions.entries()]
-              .filter(([, snapshot]) => snapshot.running || snapshot.runtimeOperation != null)
-              .map(([sessionId]) => sessionId),
-          ]}
-          attentionSessionIds={state.attentionSessionIds}
-          openSessionIds={[...state.cachedSessions.keys()]}
-          disabled={transitioning || changingControl || authBlocksCurrent || queuedPrompts.length > 0}
-          onAttach={(session) => {
-            attachSession(session);
-            closeMobileSidebar();
-          }}
-          onDelete={requestSessionDeletion}
-          onRefresh={() => listSessions()}
-          onMore={(cursor) => listSessions(cursor)}
-        />
-
-        <div className="sidebar-spacer" />
-        <details className="agent-details">
-          <summary>
-            <StatusDot phase={state.phase} />
-            <span><strong>{agent?.title ?? agent?.name ?? "Starting agent"}</strong><small>{phaseLabel(state.phase)} · ACP v{state.initialized?.protocolVersion ?? "–"}</small></span>
-            <ChevronDown size={13} />
-          </summary>
-          <div className="agent-details-body">
-            <div className="workspace-path"><FolderGit2 size={14} /><span title={state.cwd}>{state.cwd || "…"}</span></div>
-            {state.additionalDirectories.map((directory) => (
-              <div className="workspace-path workspace-extra" key={directory}><Plus size={12} /><span title={directory}>{directory}</span></div>
-            ))}
-            <div className="safety-row"><ShieldCheck size={14} />{state.readOnly ? "Read only" : "Filesystem confined"}</div>
-            <code className="agent-command" title={state.command.join(" ")}>
-              {state.transport} · {state.command.join(" ") || "Connecting…"}
-            </code>
-            {state.mcpServers.length > 0 ? (
-              <div className="mcp-summary" title={state.mcpServers.map(({ name, type }) => `${name} (${type})`).join("\n")}>
-                {state.mcpServers.length} MCP server{state.mcpServers.length === 1 ? "" : "s"}
-                {state.mcpConnections.length > 0 ? ` · ${state.mcpConnections.length} active` : ""}
-              </div>
-            ) : null}
-            {authMethods.length > 0 && state.authStatus ? (
-              <AgentAuthControls
-                methods={authMethods}
-                status={state.authStatus}
-                pending={state.pendingAuth}
-                error={state.authError}
-                canLogout={agentCapabilities?.auth?.logout != null}
-                lastResponse={state.lastAuthResponse}
-                disabled={state.phase !== "ready"}
-                onAuthenticate={authenticate}
-                onLogout={() => {
-                  if (window.confirm("Sign out of this ACP Agent? Active sessions may behave differently afterward.")) logout();
-                }}
-              />
-            ) : null}
-            {state.initialized ? (
-              <details className="sidebar-details">
-                <summary><Settings2 size={13} /> Capabilities <ChevronDown size={12} /></summary>
-                <RawJson label="initialize response" value={state.initialized} />
-              </details>
-            ) : null}
-            {state.stderr ? (
-              <details className="sidebar-details logs">
-                <summary><ScrollText size={13} /> Agent stderr <ChevronDown size={12} /></summary>
-                <pre>{state.stderr}</pre>
-              </details>
-            ) : null}
-            {state.backgroundEvents.length > 0 ? (
-              <details className="sidebar-details">
-                <summary><ScrollText size={13} /> Background events ({state.backgroundEvents.length}) <ChevronDown size={12} /></summary>
-                <RawJson label="non-current session events" value={state.backgroundEvents} />
-              </details>
-            ) : null}
-            {state.mcpActivity.length > 0 ? (
-              <details className="sidebar-details">
-                <summary><Activity size={13} /> MCP-over-ACP ({state.mcpActivity.length}) <ChevronDown size={12} /></summary>
-                <RawJson label="MCP transport activity" value={{ activeConnections: state.mcpConnections, messages: state.mcpActivity }} />
-              </details>
-            ) : null}
+        <div className="workspace-path"><FolderGit2 size={14} /><span title={state.cwd}>{state.cwd || "…"}</span></div>
+        {state.additionalDirectories.map((directory) => (
+          <div className="workspace-path workspace-extra" key={directory}><Plus size={12} /><span title={directory}>{directory}</span></div>
+        ))}
+        <div className="safety-row"><ShieldCheck size={14} />{state.readOnly ? "Read only" : "Filesystem confined"}</div>
+        <code className="agent-command" title={state.command.join(" ")}>
+          {state.transport} · {state.command.join(" ") || "Connecting…"}
+        </code>
+        {state.mcpServers.length > 0 ? (
+          <div className="mcp-summary" title={state.mcpServers.map(({ name, type }) => `${name} (${type})`).join("\n")}>
+            {state.mcpServers.length} MCP server{state.mcpServers.length === 1 ? "" : "s"}
+            {state.mcpConnections.length > 0 ? ` · ${state.mcpConnections.length} active` : ""}
           </div>
-        </details>
-      </aside>
-      {sidebarOpen ? (
-        <button
-          className="sidebar-backdrop"
-          aria-label="Dismiss sidebar overlay"
-          onClick={closeMobileSidebar}
-        />
-      ) : null}
+        ) : null}
+        {authMethods.length > 0 && state.authStatus ? (
+          <AgentAuthControls
+            methods={authMethods}
+            status={state.authStatus}
+            pending={state.pendingAuth}
+            error={state.authError}
+            canLogout={agentCapabilities?.auth?.logout != null}
+            lastResponse={state.lastAuthResponse}
+            disabled={state.phase !== "ready"}
+            onAuthenticate={authenticate}
+            onLogout={() => {
+              if (window.confirm("Sign out of this ACP Agent? Active sessions may behave differently afterward.")) logout();
+            }}
+          />
+        ) : null}
+        {state.initialized ? (
+          <details className="sidebar-details">
+            <summary><Settings2 size={13} /> Capabilities <ChevronDown size={12} /></summary>
+            <RawJson label="initialize response" value={state.initialized} />
+          </details>
+        ) : null}
+        {state.stderr ? (
+          <details className="sidebar-details logs">
+            <summary><ScrollText size={13} /> Agent stderr <ChevronDown size={12} /></summary>
+            <pre>{state.stderr}</pre>
+          </details>
+        ) : null}
+        {state.backgroundEvents.length > 0 ? (
+          <details className="sidebar-details">
+            <summary><ScrollText size={13} /> Background events ({state.backgroundEvents.length}) <ChevronDown size={12} /></summary>
+            <RawJson label="non-current session events" value={state.backgroundEvents} />
+          </details>
+        ) : null}
+        {state.mcpActivity.length > 0 ? (
+          <details className="sidebar-details">
+            <summary><Activity size={13} /> MCP-over-ACP ({state.mcpActivity.length}) <ChevronDown size={12} /></summary>
+            <RawJson label="MCP transport activity" value={{ activeConnections: state.mcpConnections, messages: state.mcpActivity }} />
+          </details>
+        ) : null}
+      </div>
+    </details>
+  );
 
+  return (
+    <div className={`app-shell ${state.session ? "session-page" : "browse-page"}`}>
       <main
         className="main-panel"
         onKeyDownCapture={(event) => {
           if (
+            state.session &&
+            !(event.target instanceof Element && event.target.closest(".session-switcher, .agent-details")) &&
             event.key.toLowerCase() === "f" &&
             (event.ctrlKey || event.metaKey) &&
             !event.altKey
@@ -586,68 +718,153 @@ export default function App() {
           }
         }}
       >
-        <header className="topbar">
-          <div className="thread-heading">
-            <div className="thread-agent-icon"><Bot size={16} /></div>
-            <div>
-              <h1>{state.title ?? (state.session ? "New agent session" : "No active session")}</h1>
-              <span>{agent?.title ?? agent?.name ?? "Agent"}{state.cwd ? ` · ${workspaceName(state.cwd)}` : ""}</span>
-            </div>
-          </div>
-          <div className="topbar-actions">
-            <div className="session-metrics">
-              <span className="live-indicator"><StatusDot phase={state.phase} />{state.running ? "Working" : phaseLabel(state.phase)}</span>
-            </div>
-            {state.session ? (
-              <button
-                type="button"
-                className={threadSearchOpen ? "topbar-icon-button active" : "topbar-icon-button"}
-                aria-label="Search Agent thread"
-                aria-keyshortcuts="Control+F Meta+F"
-                aria-pressed={threadSearchOpen}
-                title="Search thread · Ctrl/⌘F"
-                onClick={toggleThreadSearch}
-              ><SearchIcon size={15} /></button>
-            ) : null}
-            {state.session ? (
-              <details className="thread-actions">
-                <summary role="button" aria-label="Thread actions" title="Thread actions"><Ellipsis size={17} /></summary>
+        {state.session ? (
+          <header className="session-header" ref={sessionHeading}>
+            {parentNavigation}
+            <div className="session-header-main">
+              <div className="thread-heading">
+                <div className="thread-agent-icon"><Bot size={16} /></div>
                 <div>
+                  <div className="session-title-row">
+                    <h1>{state.title ?? "New agent session"}</h1>
+                    <details className="session-switcher" ref={sessionSwitcher} onToggle={(event) => {
+                      if (!event.currentTarget.open) return;
+                      if (agentSettings.current) agentSettings.current.open = false;
+                      sessionSwitcher.current?.querySelector<HTMLInputElement>("input")?.focus();
+                    }}>
+                      <summary role="button" aria-label="Switch project session" title="Switch project session">
+                        <ChevronDown size={14} />
+                      </summary>
+                      <div className="session-switcher-panel" role="dialog" aria-label="Project sessions">
+                        <SessionHistory
+                          key={selectedProjectCwd}
+                          sessions={projectSessions}
+                          activeSessionId={state.session?.sessionId}
+                          activeTitle={state.title ?? (state.session ? "New agent session" : undefined)}
+                          activeCwd={state.cwd}
+                          canList={sessionCapabilities?.list != null}
+                          nextCursor={state.nextSessionCursor}
+                          canAttach={Boolean(agentCapabilities?.loadSession || sessionCapabilities?.resume != null)}
+                          canDelete={sessionCapabilities?.delete != null}
+                          deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
+                          busySessionIds={busySessionIds}
+                          attentionSessionIds={state.attentionSessionIds}
+                          openSessionIds={[...state.cachedSessions.keys()]}
+                          disabled={navigationDisabled}
+                          onAttach={openThread}
+                          onDelete={requestSessionDeletion}
+                          onRefresh={() => listSessions()}
+                          onMore={(cursor) => listSessions(cursor)}
+                        />
+                      </div>
+                    </details>
+                  </div>
+                  <span>{agent?.title ?? agent?.name ?? "Agent"}{state.cwd ? ` · ${workspaceName(state.cwd)}` : ""}</span>
+                </div>
+              </div>
+              <div className="session-header-actions page-actions">
+                {state.session ? (
+                  <button type="button" className="page-icon-button" aria-label="New thread" title="New thread"
+                    disabled={state.phase !== "ready" || navigationDisabled || authBlocksNewSession}
+                    onClick={openNewThread}><Plus size={16} /></button>
+                ) : null}
+                {state.session ? (
                   <button
                     type="button"
-                    onClick={openActiveThreadMarkdown}
-                  ><FileText size={14} /> Open as Markdown</button>
-                  {sessionCapabilities?.fork != null ? (
-                    <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> Fork thread</button>
-                  ) : null}
-                  {sessionCapabilities?.close != null ? (
-                    <button type="button" className="danger" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={closeSession}><LogOut size={14} /> Close thread</button>
-                  ) : null}
-                  {sessionCapabilities?.delete != null ? (
-                    <button
-                      type="button"
-                      className="danger"
-                      disabled={state.running || transitioning || changingControl || deletingCurrentSession || queuedPrompts.length > 0}
-                      onClick={() => state.session && requestSessionDeletion(state.session.sessionId)}
-                    ><Trash2 size={14} /> Delete thread</button>
-                  ) : null}
-                </div>
-              </details>
-            ) : null}
-          </div>
-        </header>
+                    className={threadSearchOpen ? "page-icon-button active" : "page-icon-button"}
+                    aria-label="Search Agent thread"
+                    aria-keyshortcuts="Control+F Meta+F"
+                    aria-pressed={threadSearchOpen}
+                    title="Search thread · Ctrl/⌘F"
+                    onClick={toggleThreadSearch}
+                  ><SearchIcon size={15} /></button>
+                ) : null}
+                {state.session ? (
+                  <details className="thread-actions" ref={threadActions}>
+                    <summary role="button" aria-label="Thread actions" title="Thread actions"><Ellipsis size={17} /></summary>
+                    <div>
+                      <button
+                        type="button"
+                        onClick={openActiveThreadMarkdown}
+                      ><FileText size={14} /> Open as Markdown</button>
+                      {sessionCapabilities?.fork != null ? (
+                        <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> Fork thread</button>
+                      ) : null}
+                      {sessionCapabilities?.close != null ? (
+                        <button type="button" className="danger" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={closeSession}><LogOut size={14} /> Close thread</button>
+                      ) : null}
+                      {sessionCapabilities?.delete != null ? (
+                        <button
+                          type="button"
+                          className="danger"
+                          disabled={state.running || transitioning || changingControl || deletingCurrentSession || queuedPrompts.length > 0}
+                          onClick={() => state.session && requestSessionDeletion(state.session.sessionId)}
+                        ><Trash2 size={14} /> Delete thread</button>
+                      ) : null}
+                    </div>
+                  </details>
+                ) : null}
+                {agentSettingsMenu}
+              </div>
+            </div>
+          </header>
+        ) : null}
 
-        {threadSearchOpen ? (
+        {state.session && threadSearchOpen ? (
           <ThreadSearchBar
             rootRef={scroll}
             containerRef={threadSearchContainer}
             contentVersion={state.timeline}
             terminalVersion={state.terminalSnapshots}
             focusRequest={threadSearchFocusRequest}
+            onNavigate={pauseThreadFollowing}
             onClose={closeThreadSearch}
           />
         ) : null}
 
+        {!state.session ? <div className="browse-panel">
+          {authContent}
+          {state.elicitations.map((pending) => (
+            <ElicitationCard
+              key={pending.elicitationId}
+              pending={pending}
+              onRespond={(response) => respondElicitation(pending.elicitationId, response)}
+            />
+          ))}
+          {state.externalFlows.map((flow) => (
+            <ExternalFlowCard key={flow.elicitationId} flow={flow}
+              onDismiss={() => dismissExternalFlow(flow.elicitationId)} />
+          ))}
+          {state.timeline.some((item) => item.type === "error") ? (
+            <Conversation timeline={state.timeline.filter((item) => item.type === "error")} />
+          ) : null}
+          {state.phase === "stopped" || state.phase === "error" ? (
+            <div className="project-connection-error" role="status">
+              <span>Connection interrupted.</span><button type="button" onClick={reconnect}>Reconnect</button>
+            </div>
+          ) : null}
+          <ProjectBrowser
+            navigation={parentNavigation}
+            actions={agentSettingsMenu}
+            sessions={knownSessions}
+            projectCwd={selectedProjectCwd}
+            nextCursor={state.nextSessionCursor}
+            canList={sessionCapabilities?.list != null}
+            canAttach={Boolean(agentCapabilities?.loadSession || sessionCapabilities?.resume != null)}
+            canDelete={sessionCapabilities?.delete != null}
+            disabled={navigationDisabled || state.phase !== "ready" || authBlocksNewSession}
+            busySessionIds={busySessionIds}
+            attentionSessionIds={state.attentionSessionIds}
+            deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
+            openSessionIds={[...state.cachedSessions.keys()]}
+            onProject={browseProject}
+            onAttach={openThread}
+            onDelete={requestSessionDeletion}
+            onNew={openNewThread}
+            onRefresh={() => listSessions()}
+            onMore={(cursor) => listSessions(cursor)}
+          />
+        </div> : <>
         <div className="thread-body">
           <div
             className="scroll-region"
@@ -693,31 +910,7 @@ export default function App() {
             }}
           >
             <div className="conversation-wrap">
-              {showAuthCard && state.authStatus ? (
-                <AgentAuthCard
-                  agentName={agent?.title ?? agent?.name ?? "Agent"}
-                  methods={authMethods}
-                  status={state.authStatus}
-                  pending={state.pendingAuth}
-                  error={state.authError}
-                  focusAction={state.session == null}
-                  disabled={state.phase !== "ready"}
-                  onAuthenticate={authenticate}
-                />
-              ) : null}
-              {state.authTerminal && authTerminalMethod ? (
-                <Suspense fallback={<div className="auth-terminal-loading" role="status">Opening Agent terminal…</div>}>
-                  <AuthTerminalCard
-                    terminalState={state.authTerminal}
-                    method={authTerminalMethod}
-                    onInput={writeAuthTerminal}
-                    onResize={resizeAuthTerminal}
-                    onCancel={cancelAuthTerminal}
-                    onRetry={authenticate}
-                    onDismiss={dismissAuthTerminal}
-                  />
-                </Suspense>
-              ) : null}
+              {authContent}
               {(!showAuthCard && !terminalAuthOwnsInteraction) || state.timeline.length > 0 ? <Conversation
                 timeline={state.timeline}
                 terminalSnapshots={state.terminalSnapshots}
@@ -816,11 +1009,6 @@ export default function App() {
                 cancel();
               }}
             />
-            <ChangeReview
-              summary={reviewChanges}
-              open={reviewOpen}
-              onToggle={() => setReviewOpen((open) => !open)}
-            />
             <PromptComposer
               key={state.session?.sessionId ?? "no-session"}
               disabled={!composerAvailable}
@@ -864,11 +1052,13 @@ export default function App() {
             />
           </div>
         </div>
+        </>}
       </main>
       {newThreadOpen ? (
         <NewSessionDialog
           transport={state.transport}
-          defaultCwd={state.defaultCwd}
+          purpose={selectedProjectCwd == null ? "project" : "session"}
+          defaultCwd={selectedProjectCwd ?? state.defaultCwd}
           disabled={transitioning || state.phase !== "ready"}
           onCancel={closeNewThread}
           onCreate={(cwd) => {

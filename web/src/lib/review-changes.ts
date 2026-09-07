@@ -1,5 +1,6 @@
 import type { ToolCallStatus } from "@agentclientprotocol/sdk";
 import type { TimelineItem } from "./state";
+import { timelineTurnStarts } from "./timeline-turns";
 
 const MAX_EXACT_DIFF_CELLS = 500_000;
 const CONTEXT_LINES = 3;
@@ -46,6 +47,20 @@ export interface ReviewSummary {
   approximate: boolean;
 }
 
+export interface ReviewTurn {
+  id: string;
+  items: TimelineItem[];
+  summary: ReviewSummary;
+}
+
+export function collectTurnReviewChanges(timeline: TimelineItem[]): ReviewTurn[] {
+  const starts = timelineTurnStarts(timeline);
+  return starts.filter((start) => start < timeline.length).map((start, index) => {
+    const items = timeline.slice(start, starts[index + 1]);
+    return { id: items[0].id, items, summary: collectReviewChanges(items) };
+  });
+}
+
 export function collectReviewChanges(timeline: TimelineItem[]): ReviewSummary {
   const byPath = new Map<string, ReviewFile>();
   let diffCount = 0;
@@ -59,7 +74,7 @@ export function collectReviewChanges(timeline: TimelineItem[]): ReviewSummary {
       if (content.type !== "diff") continue;
       const result = buildReviewLines(content.oldText, content.newText);
       const diff: ReviewDiff = {
-        id: `${item.call.toolCallId}:${index}`,
+        id: `${item.id}:${index}`,
         path: content.path,
         toolCallId: item.call.toolCallId,
         title: item.call.title,

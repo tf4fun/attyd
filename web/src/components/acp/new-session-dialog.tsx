@@ -6,6 +6,7 @@ import { isAbsoluteWorkspacePath } from "../../../../shared/bridge";
 export interface NewSessionDialogProps {
   transport: AgentTransport;
   defaultCwd: string;
+  purpose?: "project" | "session";
   disabled?: boolean;
   onCancel: () => void;
   onCreate: (cwd: string) => boolean;
@@ -14,6 +15,7 @@ export interface NewSessionDialogProps {
 export function NewSessionDialog({
   transport,
   defaultCwd,
+  purpose = "session",
   disabled = false,
   onCancel,
   onCreate,
@@ -23,6 +25,7 @@ export function NewSessionDialog({
   const input = useRef<HTMLInputElement>(null);
   const normalized = cwd.trim();
   const valid = normalized.length > 0 && isAbsoluteWorkspacePath(normalized);
+  const isProject = purpose === "project";
 
   useEffect(() => {
     input.current?.focus();
@@ -58,15 +61,17 @@ export function NewSessionDialog({
         <header>
           <span className="new-thread-dialog-icon"><FolderGit2 size={17} /></span>
           <div>
-            <h2 id="new-thread-title">New thread</h2>
-            <p>Choose the workspace this Agent session can work in.</p>
+            <h2 id="new-thread-title">{isProject ? "New project" : "New thread"}</h2>
+            <p>{isProject
+              ? "Enter a working directory to start this project's first session."
+              : "Choose the workspace this Agent session can work in."}</p>
           </div>
-          <button type="button" aria-label="Cancel new thread" onClick={onCancel}>
+          <button type="button" aria-label={isProject ? "Cancel new project" : "Cancel new thread"} onClick={onCancel}>
             <X size={16} />
           </button>
         </header>
 
-        <label htmlFor="new-thread-cwd">Agent workspace</label>
+        <label htmlFor="new-thread-cwd">{isProject ? "Project working directory" : "Agent workspace"}</label>
         <input
           ref={input}
           id="new-thread-cwd"
@@ -86,7 +91,7 @@ export function NewSessionDialog({
           className={submitted && !valid ? "new-thread-path-error" : undefined}
         >
           {submitted && !valid
-            ? "Enter an absolute workspace path."
+            ? isProject ? "Enter an absolute working directory." : "Enter an absolute workspace path."
             : transport === "stdio"
               ? "Local path on the machine running attyd."
               : "Absolute path on the remote Agent host."}
@@ -94,7 +99,7 @@ export function NewSessionDialog({
 
         <footer>
           <button type="button" className="secondary" onClick={onCancel}>Cancel</button>
-          <button type="submit" className="primary" disabled={disabled}>Create thread</button>
+          <button type="submit" className="primary" disabled={disabled}>{isProject ? "Create project" : "Create thread"}</button>
         </footer>
       </form>
     </div>
