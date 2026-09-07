@@ -182,6 +182,19 @@ for (const transport of ["http", "ws"] as const) {
       (view) => view.phase === "ready" && view.activeTurn == null,
       `${transport} cancelled turn reconciliation`,
     );
+
+    // Remote workspaces belong to the Agent host, including Windows Agents
+    // reached from a POSIX client. Preserve both drive-letter and UNC paths.
+    for (const agentCwd of ["C:\\agent\\project", "\\\\agent-host\\workspace\\project"]) {
+      const windowsSession = await postJson<CreatedSession>(
+        `${origin}/api/v1/sessions`,
+        { cwd: agentCwd },
+        201,
+      );
+      assert.equal(windowsSession.cwd, agentCwd);
+      assert.equal(createdCwd, agentCwd, "the Agent must receive the original remote path");
+      assert.equal((await getSession(origin, windowsSession.sessionId)).phase, "ready");
+    }
   } finally {
     observer?.abort();
     await host.close();

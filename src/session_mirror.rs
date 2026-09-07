@@ -6,7 +6,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::history_cache::{
-    HistoryCache, HistoryCacheError, HistorySnapshot, SessionKey, normalize_history_updates,
+    HistoryCache, HistoryCacheError, HistorySnapshot, SessionKey, fold_history_update,
+    normalize_history_updates,
 };
 use crate::runtime_state::fold_active_turn_update;
 
@@ -322,20 +323,19 @@ impl SessionMirror {
                 .peek(&key)
                 .ok_or(MirrorError::InconsistentHistory)?;
             let candidate = self.history.candidate_updates(&key, attempt_id)?;
-            if candidate.len() <= prior.updates().len()
-                || !history_prefix_semantically_matches(&candidate, prior.updates())
-            {
+            let Some(prefix_end) = history_prefix_end(candidate, prior.updates()) else {
                 return Err(MirrorError::InconsistentHistory);
-            }
+            };
             let turn = session
                 .active_turn
                 .as_ref()
                 .ok_or(MirrorError::InconsistentHistory)?;
-            if !replay_suffix_starts_with_prompt(&candidate[prior.updates().len()..], &turn.prompt)
+            if prefix_end >= candidate.len()
+                || !replay_suffix_starts_with_prompt(&candidate[prefix_end..], &turn.prompt)
             {
                 return Err(MirrorError::InconsistentHistory);
             }
-            if !replay_contains_completed_turn(&candidate[prior.updates().len()..], &turn.updates) {
+            if !replay_contains_completed_turn(&candidate[prefix_end..], &turn.updates) {
                 return Err(MirrorError::InconsistentHistory);
             }
         }
@@ -545,6 +545,54 @@ impl SessionMirror {
         Ok(())
     }
 
+    pub(crate) fn append_session_update(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        update: Value,
+    ) -> Result<(), MirrorError> {
+        let session = self.require_session(session_id, incarnation)?;
+        if session.load_attempt.is_some() {
+            return Err(MirrorError::WrongPhase);
+        }
+        if session.phase == MirrorPhase::Reconciling {
+            let turn = session
+                .active_turn
+                .as_ref()
+                .ok_or(MirrorError::OperationMismatch)?;
+            let old_bytes = session.active_overlay_bytes;
+            let mut candidate = turn.clone();
+            candidate.updates = fold_active_turn_update(&turn.updates, &update)
+                .map_err(|_| MirrorError::InconsistentHistory)?;
+            let candidate_bytes = serialized_len(&candidate);
+            let session = self
+                .sessions
+                .get_mut(session_id)
+                .expect("validated session");
+            session.active_turn = Some(candidate);
+            session.active_overlay_bytes = candidate_bytes;
+            session.view_revision = next_revision(session.view_revision);
+            self.overlay_bytes = self
+                .overlay_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(candidate_bytes);
+            return Ok(());
+        }
+        if session.phase != MirrorPhase::Ready {
+            return Err(MirrorError::WrongPhase);
+        }
+        let snapshot = self
+            .history
+            .append_committed_updates(&SessionKey::new(session_id, incarnation), &[update])?;
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .expect("validated session");
+        session.history_revision = Some(snapshot.revision().to_string());
+        session.view_revision = next_revision(session.view_revision);
+        Ok(())
+    }
+
     pub(crate) fn retain_terminal_output(
         &mut self,
         session_id: &str,
@@ -672,22 +720,27 @@ impl SessionMirror {
                 after_update: 0,
                 response: response.clone(),
             });
-        let mut suffix = turn
-            .prompt
-            .iter()
-            .cloned()
-            .map(|content| {
-                serde_json::json!({
-                    "sessionUpdate": "user_message_chunk",
-                    "content": content,
-                    "_meta": {
-                        "attyd": {
-                            "turnOperationId": turn.operation_id,
-                        }
-                    },
+        let mut suffix = if replay_suffix_starts_with_prompt(&turn.updates, &turn.prompt) {
+            // Prefer the Agent's echo, including message IDs and metadata. This
+            // comparison is scoped to this accepted prompt, never earlier turns.
+            Vec::new()
+        } else {
+            turn.prompt
+                .iter()
+                .cloned()
+                .map(|content| {
+                    serde_json::json!({
+                        "sessionUpdate": "user_message_chunk",
+                        "content": content,
+                        "_meta": {
+                            "attyd": {
+                                "turnOperationId": turn.operation_id,
+                            }
+                        },
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
         suffix.extend(turn.updates.iter().cloned());
         let snapshot = self
             .history
@@ -972,11 +1025,27 @@ fn replay_suffix_starts_with_prompt(updates: &[Value], prompt: &[Value]) -> bool
     normalize_prompt_blocks(&replay_prompt) == normalize_prompt_blocks(prompt)
 }
 
-fn history_prefix_semantically_matches(candidate: &[Value], prior: &[Value]) -> bool {
-    candidate.len() >= prior.len()
-        && candidate.iter().zip(prior).all(|(candidate, prior)| {
-            history_update_identity(candidate) == history_update_identity(prior)
-        })
+fn history_prefix_end(candidate: &[Value], prior: &[Value]) -> Option<usize> {
+    // IDs/chunk boundaries may change on load. Normalize only this comparison;
+    // never discard identities from the snapshot installed for the browser.
+    let prior = normalize_history_updates(
+        &prior
+            .iter()
+            .map(history_update_identity)
+            .collect::<Vec<_>>(),
+    )
+    .ok()?;
+    if prior.is_empty() {
+        return Some(0);
+    }
+    let mut prefix = Vec::new();
+    for (index, update) in candidate.iter().enumerate() {
+        prefix = fold_history_update(&prefix, &history_update_identity(update)).ok()?;
+        if prefix == prior {
+            return Some(index + 1);
+        }
+    }
+    None
 }
 
 fn replay_contains_completed_turn(replay: &[Value], live_updates: &[Value]) -> bool {
@@ -987,11 +1056,15 @@ fn replay_contains_completed_turn(replay: &[Value], live_updates: &[Value]) -> b
         )
     }
 
-    let replay = replay.iter().filter(durable).cloned().collect::<Vec<_>>();
+    let replay = replay
+        .iter()
+        .filter(durable)
+        .map(history_update_identity)
+        .collect::<Vec<_>>();
     let live = live_updates
         .iter()
         .filter(durable)
-        .cloned()
+        .map(history_update_identity)
         .collect::<Vec<_>>();
     let Ok(replay) = normalize_history_updates(&replay) else {
         return false;
@@ -1032,6 +1105,13 @@ fn normalize_prompt_blocks(blocks: &[Value]) -> Vec<Value> {
         };
         if let Some(previous) = normalized.last_mut()
             && previous.get("type").and_then(Value::as_str) == Some("text")
+            && {
+                let mut shape = block.clone();
+                shape["text"] = Value::Null;
+                let mut previous_shape = previous.clone();
+                previous_shape["text"] = Value::Null;
+                shape == previous_shape
+            }
         {
             let previous_text = previous.get("text").and_then(Value::as_str).unwrap_or("");
             previous["text"] = Value::String(format!("{previous_text}{text}"));
@@ -1046,6 +1126,108 @@ fn normalize_prompt_blocks(blocks: &[Value]) -> Vec<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_updates_preserve_reconciling_load_and_incarnation_boundaries() {
+        let mut mirror = mirror();
+        mirror.register_new("session", 1);
+        let revision = mirror
+            .view("session", 1)
+            .unwrap()
+            .baseline
+            .revision()
+            .to_string();
+        let TurnAdmission::Accepted { operation_id } = mirror
+            .start_turn("session", 1, &revision, "intent", text_prompt("Run"))
+            .unwrap()
+        else {
+            panic!("new intent")
+        };
+        mirror.append_turn_update("session", 1, &operation_id, json!({ "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run", "status": "in_progress" })).unwrap();
+        mirror
+            .complete_turn(
+                "session",
+                1,
+                &operation_id,
+                json!({ "stopReason": "cancelled" }),
+            )
+            .unwrap();
+        mirror.append_session_update("session", 1, json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed" })).unwrap();
+        let reconciling = mirror.view("session", 1).unwrap();
+        assert!(reconciling.baseline.updates().is_empty());
+        assert_eq!(
+            reconciling.session.active_turn.unwrap().terminal,
+            Some(json!({ "stopReason": "cancelled" }))
+        );
+        let baseline = mirror
+            .commit_completed_turn_from_memory("session", 1, &operation_id)
+            .unwrap();
+        assert_eq!(baseline.updates()[1]["status"], "completed");
+        mirror.begin_load("session", 1, "load").unwrap();
+        assert_eq!(
+            mirror.append_session_update("session", 1, json!({})),
+            Err(MirrorError::WrongPhase)
+        );
+        assert_eq!(
+            mirror.append_session_update("session", 2, json!({})),
+            Err(MirrorError::StaleIncarnation)
+        );
+        assert_eq!(
+            mirror.view("session", 1).unwrap().baseline.revision(),
+            baseline.revision()
+        );
+    }
+
+    #[test]
+    fn completed_turn_uses_agent_prompt_echo_once_and_keeps_its_identity() {
+        let mut mirror = mirror();
+        mirror.register_new("session", 1);
+        for intent in ["first", "second"] {
+            let revision = mirror
+                .view("session", 1)
+                .unwrap()
+                .baseline
+                .revision()
+                .to_string();
+            let prompt = vec![
+                json!({ "type": "text", "text": "repeat" }),
+                json!({ "type": "resource_link", "uri": "file:///file", "name": "file" }),
+            ];
+            let TurnAdmission::Accepted { operation_id } = mirror
+                .start_turn("session", 1, &revision, intent, prompt.clone())
+                .unwrap()
+            else {
+                panic!("new intent")
+            };
+            for content in prompt {
+                mirror.append_turn_update("session", 1, &operation_id, json!({ "sessionUpdate": "user_message_chunk", "messageId": intent, "content": content })).unwrap();
+            }
+            mirror.append_turn_update("session", 1, &operation_id, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "done" } })).unwrap();
+            mirror
+                .complete_turn(
+                    "session",
+                    1,
+                    &operation_id,
+                    json!({ "stopReason": "end_turn" }),
+                )
+                .unwrap();
+            mirror
+                .commit_completed_turn_from_memory("session", 1, &operation_id)
+                .unwrap();
+        }
+        let view = mirror.view("session", 1).unwrap();
+        assert_eq!(view.baseline.updates().len(), 6);
+        assert_eq!(view.baseline.updates()[0]["messageId"], "first");
+        assert_eq!(view.baseline.updates()[3]["messageId"], "second");
+        assert_eq!(
+            view.session
+                .turn_outcomes
+                .iter()
+                .map(|outcome| outcome.after_update)
+                .collect::<Vec<_>>(),
+            vec![3, 6]
+        );
+    }
 
     fn mirror() -> SessionMirror {
         SessionMirror::new("epoch")
@@ -2045,7 +2227,9 @@ mod tests {
                 .unwrap();
         }
         let old = mirror.commit_load("session", 1, "initial").unwrap();
-        assert_eq!(old.updates().len(), 1);
+        assert_eq!(old.updates().len(), 2);
+        assert_eq!(old.updates()[0]["messageId"], "old-a");
+        assert_eq!(old.updates()[1]["messageId"], "old-b");
         let operation = match mirror
             .start_turn("session", 1, old.revision(), "intent", text_prompt("next"))
             .unwrap()

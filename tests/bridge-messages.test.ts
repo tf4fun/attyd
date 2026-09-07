@@ -50,19 +50,23 @@ describe("browser bridge messages", () => {
     expect(parseClientCommand(JSON.stringify({
       type: "context/search",
       requestId: "context-search",
+      sessionId: "session",
       query: "src app",
     }))).toEqual({
       type: "context/search",
       requestId: "context-search",
+      sessionId: "session",
       query: "src app",
     });
     expect(parseClientCommand(JSON.stringify({
       type: "context/search",
       requestId: "context-search-all",
+      sessionId: "session",
       query: "",
     }))).toEqual({
       type: "context/search",
       requestId: "context-search-all",
+      sessionId: "session",
       query: "",
     });
     expect(parseClientCommand(JSON.stringify({
@@ -142,12 +146,19 @@ describe("browser bridge messages", () => {
     expect(() => parseClientCommand(JSON.stringify({
       type: "context/search",
       requestId: "x",
+      sessionId: "s",
       query: "x".repeat(257),
     }))).toThrow("query exceeds 256 characters");
     expect(() => parseClientCommand(JSON.stringify({
       type: "context/search",
       requestId: "x",
+      sessionId: "s",
     }))).toThrow("query must be a string");
+    expect(() => parseClientCommand(JSON.stringify({
+      type: "context/search",
+      requestId: "x",
+      query: "",
+    }))).toThrow("sessionId");
     expect(() => parseClientCommand(JSON.stringify({
       type: "context/read",
       requestId: "x",

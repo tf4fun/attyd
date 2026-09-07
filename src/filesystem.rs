@@ -21,6 +21,7 @@ const MAX_CONTEXT_DEPTH: usize = 32;
 #[derive(Clone)]
 pub struct WorkspaceFileSystem {
     roots: Arc<Vec<WorkspaceRoot>>,
+    additional_roots: Arc<Vec<PathBuf>>,
     read_only: bool,
 }
 
@@ -51,8 +52,14 @@ impl WorkspaceFileSystem {
         }
         Ok(Self {
             roots: Arc::new(roots),
+            additional_roots: Arc::new(additional_roots.to_vec()),
             read_only,
         })
+    }
+
+    /// Rebase the primary workspace to the session's cwd, preserving host policy.
+    pub fn for_workspace(&self, cwd: &Path) -> Result<Self, Error> {
+        Self::new(cwd, self.read_only, &self.additional_roots)
     }
 
     #[cfg(test)]
@@ -779,6 +786,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.content, "head\n");
+    }
+
+    #[tokio::test]
+    async fn session_workspace_replaces_launch_root_and_preserves_host_policy() {
+        let launch = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        for root in [launch.path(), session.path(), additional.path()] {
+            std::fs::write(root.join("input.txt"), "input").unwrap();
+        }
+        let filesystem =
+            WorkspaceFileSystem::new(launch.path(), false, &[additional.path().to_path_buf()])
+                .unwrap();
+        let scoped = filesystem.for_workspace(session.path()).unwrap();
+        assert_eq!(
+            scoped.checked_directory(None).await.unwrap(),
+            std::fs::canonicalize(session.path()).unwrap()
+        );
+        for path in [
+            session.path().join("input.txt"),
+            additional.path().join("input.txt"),
+        ] {
+            assert_eq!(
+                scoped
+                    .read(ReadTextFileRequest::new("s", &path))
+                    .await
+                    .unwrap()
+                    .content,
+                "input"
+            );
+        }
+        assert!(
+            scoped
+                .read(ReadTextFileRequest::new(
+                    "s",
+                    launch.path().join("input.txt")
+                ))
+                .await
+                .is_err()
+        );
+        scoped
+            .write(WriteTextFileRequest::new(
+                "s",
+                session.path().join("output.txt"),
+                "output",
+            ))
+            .await
+            .unwrap();
+        let read_only = WorkspaceFileSystem::new(launch.path(), true, &[])
+            .unwrap()
+            .for_workspace(session.path())
+            .unwrap();
+        assert!(
+            read_only
+                .write(WriteTextFileRequest::new(
+                    "s",
+                    session.path().join("blocked.txt"),
+                    "blocked"
+                ))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

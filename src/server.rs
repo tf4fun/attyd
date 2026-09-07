@@ -127,6 +127,12 @@ struct ListSessionsQuery {
     cursor: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionViewQuery {
+    cwd: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateSessionBody {
@@ -157,6 +163,7 @@ struct SetConfigBody {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ContextSearchQuery {
     query: String,
+    session_id: String,
 }
 
 #[derive(Deserialize)]
@@ -931,6 +938,14 @@ impl BridgeHub {
         &self,
         session_id: String,
     ) -> Result<serde_json::Value, bridge::SessionViewError> {
+        self.session_view_with_cwd(session_id, None).await
+    }
+
+    async fn session_view_with_cwd(
+        &self,
+        session_id: String,
+        cwd: Option<String>,
+    ) -> Result<serde_json::Value, bridge::SessionViewError> {
         let input = {
             let state = self.state.lock().await;
             state
@@ -942,6 +957,7 @@ impl BridgeHub {
         input
             .send(bridge::BridgeInput::SessionViewRequest {
                 session_id,
+                cwd,
                 response,
             })
             .await
@@ -1471,8 +1487,8 @@ async fn search_context(
     State(state): State<AppState>,
     Query(query): Query<ContextSearchQuery>,
 ) -> Response {
-    if query.query.encode_utf16().count() > 256 {
-        return api_bad_request("context query is too long");
+    if query.query.encode_utf16().count() > 256 || !valid_api_identifier(&query.session_id) {
+        return api_bad_request("invalid context session or query");
     }
     business_response(
         state
@@ -1480,6 +1496,7 @@ async fn search_context(
             .business_request(json!({
                 "type": "context/search",
                 "requestId": format!("api-context-search-{}", Uuid::new_v4()),
+                "sessionId": query.session_id,
                 "query": query.query,
             }))
             .await,
@@ -1790,6 +1807,7 @@ fn normalize_embedded_session_view(mut value: serde_json::Value) -> Option<serde
 async fn get_session_view(
     Path(session_id): Path<String>,
     State(state): State<AppState>,
+    Query(query): Query<SessionViewQuery>,
 ) -> Response {
     if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
         return (
@@ -1798,7 +1816,16 @@ async fn get_session_view(
         )
             .into_response();
     }
-    match state.bridge.session_view(session_id).await {
+    if query.cwd.as_ref().is_some_and(|cwd| {
+        cwd.is_empty() || cwd.encode_utf16().count() > 16_384 || cwd.contains('\0')
+    }) {
+        return api_bad_request("invalid session cwd");
+    }
+    match state
+        .bridge
+        .session_view_with_cwd(session_id, query.cwd)
+        .await
+    {
         Ok(view) => {
             let revision = view
                 .pointer("/session/historyRevision")
@@ -1924,14 +1951,27 @@ fn parse_strong_etag(value: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn session_events(Path(session_id): Path<String>, State(state): State<AppState>) -> Response {
+async fn session_events(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    Query(query): Query<SessionViewQuery>,
+) -> Response {
     if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if query.cwd.as_ref().is_some_and(|cwd| {
+        cwd.is_empty() || cwd.encode_utf16().count() > 16_384 || cwd.contains('\0')
+    }) {
+        return api_bad_request("invalid session cwd");
     }
     let Some(subscription) = state.bridge.subscribe_session(session_id.clone()).await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let initial = match state.bridge.session_view(session_id.clone()).await {
+    let initial = match state
+        .bridge
+        .session_view_with_cwd(session_id.clone(), query.cwd)
+        .await
+    {
         Ok(view) => match session_reset_value(&session_id, &view) {
             Some(reset) => reset.to_string(),
             None => {
@@ -2773,6 +2813,243 @@ mod tests {
         assert!(!replay.contains("bridge/runtime_session"));
     }
 
+    async fn capability_fixture(flags: &[&str]) -> (Arc<BridgeHub>, BridgeSubscription) {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = format!("{cwd}/tests/fixtures/session-capabilities-agent.ts");
+        let mut args = vec![
+            "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
+        ];
+        args.extend_from_slice(flags);
+        let options = Options::try_parse_from(args).unwrap().normalized().unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut observer = hub.subscribe().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = observer.events.recv().await {
+                let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+                assert_ne!(event["type"], "bridge/error", "{event}");
+                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                    return;
+                }
+            }
+            panic!("fixture disconnected before ready");
+        })
+        .await
+        .unwrap();
+        (hub, observer)
+    }
+
+    #[tokio::test]
+    async fn independent_session_capabilities_restore_without_listing() {
+        let (hub, observer) = capability_fixture(&["--no-list"]).await;
+        let response = get_session_view(
+            Path("saved".to_string()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: Some(env!("CARGO_MANIFEST_DIR").to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "known ID and cwd should not require list capability"
+        );
+        let view = hub.session_view("saved".to_string()).await.unwrap();
+        assert_eq!(view["session"]["phase"], "ready");
+        assert!(view["baseline"]["updates"].to_string().contains("Loaded"));
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn independent_session_known_workspace_survives_another_observer_clearing_discovery() {
+        let (hub, observer) = capability_fixture(&["--split-list"]).await;
+        let first = hub
+            .business_request(json!({ "type": "session/list", "requestId": "first" }))
+            .await
+            .unwrap();
+        let discovered = hub
+            .business_request(json!({
+                "type": "session/list", "requestId": "next", "cursor": first["nextCursor"],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(discovered["sessions"][0]["sessionId"], "saved");
+        hub.business_request(json!({ "type": "session/list", "requestId": "other-observer" }))
+            .await
+            .unwrap();
+        // The browser retains the row's workspace even after the shared metadata
+        // cache is replaced. Its SSE handshake must materialize the known ID.
+        let stream = session_events(
+            Path("saved".to_string()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: Some(env!("CARGO_MANIFEST_DIR").to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(stream.status(), StatusCode::OK);
+        let view = get_session_view(
+            Path("saved".to_string()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: Some("/ignored-route-workspace".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(view.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(view.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["workspace"]["cwd"], env!("CARGO_MANIFEST_DIR"));
+        drop(stream);
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn independent_session_missing_cold_link_stays_not_found() {
+        let (hub, observer) = capability_fixture(&["--no-list"]).await;
+        for _ in 0..2 {
+            let response = get_session_view(
+                Path("missing".to_string()),
+                State(AppState {
+                    bridge: hub.clone(),
+                }),
+                Query(SessionViewQuery {
+                    cwd: Some(env!("CARGO_MANIFEST_DIR").to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn independent_session_list_cursors_survive_other_observers_refreshing() {
+        let (hub, observer) = capability_fixture(&[]).await;
+        let (a, b) = tokio::join!(
+            hub.business_request(json!({ "type": "session/list", "requestId": "list-a" })),
+            hub.business_request(json!({ "type": "session/list", "requestId": "list-b" })),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a["nextCursor"], b["nextCursor"]);
+        for (index, first) in [a, b].into_iter().enumerate() {
+            let next = hub.business_request(json!({
+                "type": "session/list", "requestId": format!("next-{index}"), "cursor": first["nextCursor"],
+            })).await.expect("another observer must not revoke this Agent-provided cursor");
+            assert_eq!(next["_meta"]["requestedCursor"], first["nextCursor"]);
+        }
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn independent_session_list_pages_budget_retained_metadata() {
+        let (hub, observer) = capability_fixture(&["--large-list-meta"]).await;
+        let first = hub
+            .business_request(json!({ "type": "session/list", "requestId": "first" }))
+            .await
+            .unwrap();
+        for index in 0..9 {
+            hub.business_request(json!({
+                "type": "session/list", "requestId": format!("observer-{index}"), "cursor": first["nextCursor"],
+            })).await.expect("repeated observers must not spend the retained metadata budget again");
+        }
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn independent_session_fork_rejects_missing_history_before_agent_dispatch() {
+        let (hub, observer) = capability_fixture(&["--no-load"]).await;
+        hub.business_request(json!({ "type": "session/new", "requestId": "new" }))
+            .await
+            .unwrap();
+        let error = hub
+            .business_request(json!({
+                "type": "session/fork", "requestId": "fork", "sessionId": "created",
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("history loading"), "{error:?}");
+        let error = hub
+            .business_request(json!({
+                "type": "session/resume", "requestId": "resume", "sessionId": "saved",
+                "cwd": env!("CARGO_MANIFEST_DIR"),
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("history loading"), "{error:?}");
+        let listed = hub
+            .business_request(json!({ "type": "session/list", "requestId": "list" }))
+            .await
+            .unwrap();
+        assert_eq!(listed["_meta"]["forks"], 0);
+        assert_eq!(listed["_meta"]["resumes"], 0);
+        assert_eq!(listed["_meta"]["loads"], 0);
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_context_follows_session_workspace() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("session-context.txt");
+        std::fs::write(&path, "selected project context").unwrap();
+        let (hub, observer) = capability_fixture(&[]).await;
+        hub.business_request(json!({
+            "type": "session/new", "requestId": "context-new", "cwd": project.path(),
+        }))
+        .await
+        .unwrap();
+        let matches = hub
+            .business_request(json!({
+                "type": "context/search", "requestId": "context-search",
+                "sessionId": "created", "query": "session-context",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(matches["matches"].as_array().unwrap().len(), 1);
+        let attachment = hub
+            .business_request(json!({
+                "type": "context/read", "requestId": "context-read",
+                "sessionId": "created", "path": path,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            attachment["attachment"]["block"]["resource"]["text"],
+            "selected project context"
+        );
+        let outside = hub.business_request(json!({
+            "type": "context/read", "requestId": "context-outside",
+            "sessionId": "created", "path": format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")),
+        })).await;
+        assert!(
+            outside.is_err(),
+            "the startup workspace is not an implicit additional root"
+        );
+        let missing = hub.business_request(json!({
+            "type": "context/search", "requestId": "context-missing", "query": "session-context",
+        })).await;
+        assert!(
+            missing.is_err(),
+            "search must not silently fall back to the startup workspace"
+        );
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
     #[tokio::test]
     async fn stdio_discovery_lists_other_workspaces_and_loads_their_own_cwd() {
         let cwd = env!("CARGO_MANIFEST_DIR");
@@ -2903,16 +3180,24 @@ mod tests {
                 })
         );
 
-        let missing =
-            get_session_view(Path("stale-session".to_string()), State(state.clone())).await;
+        let missing = get_session_view(
+            Path("stale-session".to_string()),
+            State(state.clone()),
+            Query(SessionViewQuery::default()),
+        )
+        .await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(missing.into_body(), 4_096)
             .await
             .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["code"], "session_not_found");
-        let missing_events =
-            session_events(Path("stale-session".to_string()), State(state.clone())).await;
+        let missing_events = session_events(
+            Path("stale-session".to_string()),
+            State(state.clone()),
+            Query(SessionViewQuery::default()),
+        )
+        .await;
         assert_eq!(missing_events.status(), StatusCode::NOT_FOUND);
 
         hub.business_request(json!({
@@ -2922,7 +3207,12 @@ mod tests {
         }))
         .await
         .expect("new session is materialized without listing it");
-        let live = get_session_view(Path("test-session".to_string()), State(state)).await;
+        let live = get_session_view(
+            Path("test-session".to_string()),
+            State(state),
+            Query(SessionViewQuery::default()),
+        )
+        .await;
         assert_eq!(live.status(), StatusCode::OK);
         let body = axum::body::to_bytes(live.into_body(), 64 * 1_024)
             .await
@@ -3404,8 +3694,9 @@ mod tests {
 
         let first = hub.session_view("saved-session".to_string()).await;
         assert!(
-            first.is_err(),
-            "the initiating observer receives the load error"
+            matches!(first, Err(bridge::SessionViewError::Unavailable(ref error))
+                if error.contains("deterministic load failure")),
+            "a non-not-found load failure stays visible instead of becoming a missing session: {first:?}"
         );
         for _ in 0..3 {
             let blocked = hub

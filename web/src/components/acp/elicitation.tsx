@@ -19,9 +19,11 @@ import { RawJson } from "./raw-json";
 type FormValue = string | number | boolean | string[];
 
 export function ElicitationCard({
+  agentName = "Agent",
   pending,
   onRespond,
 }: {
+  agentName?: string;
   pending: PendingElicitation;
   onRespond: (response: CreateElicitationResponse) => void;
 }) {
@@ -82,7 +84,7 @@ export function ElicitationCard({
     >
       <div className="permission-title">
         <span className="permission-icon"><ListTodo size={17} /></span>
-        <div><strong>Agent needs input</strong><p>{request.message}</p></div>
+        <div><strong>{agentName} needs input</strong><p>{request.message}</p></div>
       </div>
 
       {formRequest ? (
@@ -110,22 +112,28 @@ export function ElicitationCard({
 
       {urlRequest ? (
         externalUrl ? (
-          <a
-            className="elicitation-url"
-            href={externalUrl}
-            target="_blank"
-            rel="noreferrer"
-            aria-disabled={responding}
-            onClick={(event) => {
-              if (responding) {
-                event.preventDefault();
-                return;
-              }
-              onRespond({ action: "accept" });
-            }}
-          >
-            Open external flow <ExternalLink size={14} />
-          </a>
+          <>
+            <div className="elicitation-destination">
+              <strong>{new URL(externalUrl).host}</strong>
+              <span>{externalUrl}</span>
+            </div>
+            <a
+              className="elicitation-url"
+              href={externalUrl}
+              target="_blank"
+              rel="noreferrer"
+              aria-disabled={responding}
+              onClick={(event) => {
+                if (responding) {
+                  event.preventDefault();
+                  return;
+                }
+                onRespond({ action: "accept" });
+              }}
+            >
+              Open external flow <ExternalLink size={14} />
+            </a>
+          </>
         ) : (
           <p className="elicitation-url-error">Blocked non-HTTP elicitation URL.</p>
         )
@@ -261,12 +269,14 @@ function ElicitationField({
     const choices = stringSchema.oneOf && stringSchema.oneOf.length > 0
       ? stringSchema.oneOf.map((item) => ({ value: item.const, label: item.title }))
       : (stringSchema.enum ?? []).map((item) => ({ value: item, label: item }));
+    let unspecified = "__attyd_unspecified__";
+    while (choices.some((choice) => choice.value === unspecified)) unspecified += "_";
     return (
       <label>
         <strong>{title}{required ? " *" : ""}</strong>
         {description ? <small>{description}</small> : null}
-        <select disabled={disabled} required={required} value={String(value ?? "")} onChange={(event) => onChange(event.target.value || undefined)}>
-          {!required ? <option value="">Not specified</option> : null}
+        <select disabled={disabled} aria-required={required} value={value === undefined ? unspecified : String(value)} onChange={(event) => onChange(event.target.value === unspecified ? undefined : event.target.value)}>
+          {!required ? <option value={unspecified}>Not specified</option> : null}
           {choices.map((choice) => <option value={choice.value} key={choice.value}>{choice.label}</option>)}
         </select>
       </label>
@@ -301,12 +311,9 @@ function ElicitationField({
         {description ? <small>{description}</small> : null}
         <input
           disabled={disabled}
-          required={required}
+          aria-required={required}
           type={stringSchema.format === "email" ? "email" : stringSchema.format === "uri" ? "url" : stringSchema.format === "date" ? "date" : "text"}
           placeholder={stringSchema.format === "date-time" ? "2026-08-30T12:30:00Z" : undefined}
-          minLength={stringSchema.minLength ?? undefined}
-          maxLength={stringSchema.maxLength ?? undefined}
-          pattern={stringSchema.pattern ?? undefined}
           value={typeof value === "string" ? value : ""}
           onChange={(event) => {
             const input = event.target.value;
@@ -366,6 +373,17 @@ function validateForm(
   }
   for (const [name, value] of Object.entries(values)) {
     const schema = properties[name];
+    if (schema?.type === "string" && typeof value === "string") {
+      // JSON Schema counts Unicode characters; HTML length constraints count UTF-16 units.
+      const stringSchema = schema as StringPropertySchema;
+      const length = Array.from(value).length;
+      if (stringSchema.minLength != null && length < stringSchema.minLength) {
+        return `Enter at least ${stringSchema.minLength} character${stringSchema.minLength === 1 ? "" : "s"} for ${name}.`;
+      }
+      if (stringSchema.maxLength != null && length > stringSchema.maxLength) {
+        return `Enter at most ${stringSchema.maxLength} character${stringSchema.maxLength === 1 ? "" : "s"} for ${name}.`;
+      }
+    }
     if (schema?.type !== "array" || !Array.isArray(value)) continue;
     const arraySchema = schema as MultiSelectPropertySchema;
     if (arraySchema.minItems != null && value.length < arraySchema.minItems) {

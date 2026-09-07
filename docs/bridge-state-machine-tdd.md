@@ -129,7 +129,8 @@ The following are explicit compatibility rules, not heuristics:
 - `loadSession` is used for cold recovery, never routine post-turn synchronization;
 - without load, only new/already materialized sessions are recoverable and history ends with the
   bridge process;
-- all prompt updates precede PromptResponse;
+- valid updates for a materialized session may arrive outside a prompt; accept them without
+  inventing a turn boundary and keep message/tool identities session-scoped;
 - one bridge is the sole writer to a materialized Agent session;
 - bridge crash recovery provides at-most-once caution, not exactly-once resubmission.
 

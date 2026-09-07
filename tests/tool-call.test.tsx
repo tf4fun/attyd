@@ -35,6 +35,16 @@ describe("ACP tool output presentation", () => {
     return element<HTMLElement>(container, ".tool-card");
   }
 
+  it("shows local cancellation without mutating the Agent's tool status", async () => {
+    const call: ToolCall = { toolCallId: "tool", title: "Run", status: "in_progress" };
+    await act(async () => root.render(<ToolCallCard item={{ id: "tool", type: "tool", call, raw: [], cancelled: true }} />));
+    const card = element<HTMLElement>(container, ".tool-card");
+    expect(card.dataset.live).toBe("false");
+    expect(card.textContent).toContain("Cancelled");
+    expect(card.querySelector(".spin")).toBeNull();
+    expect(call.status).toBe("in_progress");
+  });
+
   it("renders mixed content in Agent order without replacing it with raw output", async () => {
     const card = await render({
       status: "completed",

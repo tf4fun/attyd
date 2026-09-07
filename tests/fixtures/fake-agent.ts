@@ -73,6 +73,7 @@ if (terminalLogin) {
   process.exit(1);
 }
 let configuredMcpServers: acp.McpServer[] = [];
+const sessionWorkingDirectories = new Map<string, string>();
 const observedSessionCloses: string[] = [];
 const deletedSessions = new Set<string>();
 const crossWorkspaceSessions = process.argv.includes("--cross-workspace-sessions");
@@ -259,6 +260,13 @@ const agent = acp
     };
   })
   .onRequest(acp.methods.agent.session.load, async ({ params, client }) => {
+    const knownSession = params.sessionId === "saved-session" || params.sessionId === "earlier-session" ||
+      sessionWorkingDirectories.has(params.sessionId) ||
+      (cyclicList && /^cyclic-session-[1-3]$/u.test(params.sessionId)) ||
+      (duplicateListPage && params.sessionId === "repeated-session");
+    if (!knownSession || deletedSessions.has(params.sessionId)) {
+      throw acp.RequestError.resourceNotFound(params.sessionId);
+    }
     if (crossWorkspaceSessions && params.sessionId === "earlier-session" && params.cwd !== "/other-workspace") {
       throw acp.RequestError.invalidParams(undefined, "Load must retain the session's workspace");
     }
@@ -268,7 +276,7 @@ const agent = acp
       throw new acp.RequestError(-32603, "Synthetic load failure");
     }
     if (failLoadAlways) {
-      throw new acp.RequestError(-32002, "Synthetic deterministic load failure");
+      throw acp.RequestError.invalidParams(undefined, "Synthetic deterministic load failure");
     }
     if (invalidLoadModeOnce && loadAttempts === 1) {
       await client.notify(acp.methods.client.session.update, {
@@ -355,10 +363,11 @@ const agent = acp
         },
       });
     }
+    const sessionId = forkSourceIdOnce && forkAttempts === 1 ? params.sessionId : "forked-session";
+    deletedSessions.delete(sessionId);
+    sessionWorkingDirectories.set(sessionId, params.cwd);
     return {
-      sessionId: forkSourceIdOnce && forkAttempts === 1
-        ? params.sessionId
-        : "forked-session",
+      sessionId,
       modes: {
         currentModeId: "build",
         availableModes: [{ id: "build", name: "Build" }],
@@ -407,6 +416,8 @@ const agent = acp
     }
     configuredMcpServers = params.mcpServers;
     const sessionId = raceNew ? `test-session-${attempt}` : "test-session";
+    deletedSessions.delete(sessionId);
+    sessionWorkingDirectories.set(sessionId, params.cwd);
     sessionHistory.set(sessionId, []);
     if (invalidEarlyContentOnce && attempt === 1) {
       await client.notify(acp.methods.client.session.update, {
@@ -526,11 +537,19 @@ const agent = acp
   .onRequest<acp.MessageMcpRequest, acp.MessageMcpResponse>(
     acp.AGENT_METHODS.mcp_message,
     parseMcpMessage,
-    ({ params }) => ({
-      roots: [{ uri: "file:///fake-agent-workspace" }],
-      receivedMethod: params.method,
-      receivedParams: params.params,
-    }),
+    async ({ params, client }) => {
+      if (params.method === "fixture/nested") {
+        return client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+          acp.CLIENT_METHODS.mcp_message,
+          { connectionId: params.connectionId, method: "echo", params: { nested: true } },
+        );
+      }
+      return {
+        roots: [{ uri: "file:///fake-agent-workspace" }],
+        receivedMethod: params.method,
+        receivedParams: params.params,
+      };
+    },
   )
   .onNotification<acp.MessageMcpNotification>(
     acp.AGENT_METHODS.mcp_message,
@@ -608,6 +627,58 @@ const agent = acp
       if (disconnectCancelFile) writeFileSync(disconnectCancelFile, "prompt\n");
       await new Promise<void>((resolve) => { finishDisconnectPrompt = resolve; });
       return { stopReason: "cancelled" };
+    }
+    if (promptText === "client-services-flow") {
+      const sessionId = params.sessionId;
+      const cwd = sessionWorkingDirectories.get(sessionId)!;
+      const read = await client.request(acp.methods.client.fs.readTextFile, {
+        sessionId, path: join(cwd, "input.txt"),
+      });
+      await client.request(acp.methods.client.fs.writeTextFile, {
+        sessionId, path: join(cwd, "output.txt"), content: "written in session workspace",
+      });
+      const directories: string[] = [];
+      for (const explicit of [false, true]) {
+        const terminal = await client.request(acp.methods.client.terminal.create, {
+          sessionId, command: "pwd", ...(explicit ? { cwd } : {}),
+        });
+        await client.request(acp.methods.client.terminal.waitForExit, { sessionId, ...terminal });
+        directories.push((await client.request(acp.methods.client.terminal.output, { sessionId, ...terminal })).output.trim());
+        await client.request(acp.methods.client.terminal.release, { sessionId, ...terminal });
+      }
+      let unsupportedMode: ReturnType<typeof requestErrorDetails> | undefined;
+      try {
+        await client.request<unknown, Record<string, unknown>>("elicitation/create", {
+          sessionId, mode: "future-unsupported-mode", message: "Unsupported mode",
+        });
+      } catch (error) { unsupportedMode = requestErrorDetails(error); }
+      const unicode = await client.request(acp.methods.client.elicitation.create, {
+        sessionId, mode: "form", message: "Unicode form",
+        requestedSchema: { type: "object", properties: {
+          value: { type: "string", minLength: 1, maxLength: 1, default: "😀" },
+        } },
+      });
+      const urlRequest = {
+        sessionId, mode: "url" as const, elicitationId: "reusable-url",
+        message: "Reuse URL", url: "https://example.test/connect",
+      };
+      const urls = [];
+      urls.push(await client.request(acp.methods.client.elicitation.create, urlRequest));
+      let outstandingDuplicate: ReturnType<typeof requestErrorDetails> | undefined;
+      try {
+        await client.request(acp.methods.client.elicitation.create, urlRequest);
+      } catch (error) { outstandingDuplicate = requestErrorDetails(error); }
+      await client.notify(acp.methods.client.elicitation.complete, { elicitationId: urlRequest.elicitationId });
+      urls.push(await client.request(acp.methods.client.elicitation.create, urlRequest));
+      await client.notify(acp.methods.client.elicitation.complete, { elicitationId: urlRequest.elicitationId });
+      urls.push(await client.request(acp.methods.client.elicitation.create, { ...urlRequest, message: "Decline URL" }));
+      urls.push(await client.request(acp.methods.client.elicitation.create, urlRequest));
+      await client.notify(acp.methods.client.elicitation.complete, { elicitationId: urlRequest.elicitationId });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId, update: { sessionUpdate: "agent_message_chunk", messageId: "client-services-result",
+          content: { type: "text", text: JSON.stringify({ read, directories, unsupportedMode, unicode, urls, outstandingDuplicate }) } },
+      });
+      return { stopReason: "end_turn" };
     }
     if (promptText.includes("oversized-notification-flow")) {
       await client.notify(acp.methods.client.session.update, {
@@ -1000,6 +1071,10 @@ const agent = acp
         acp.CLIENT_METHODS.mcp_message,
         { connectionId: connected.connectionId, method: "serverRoundTrip" },
       );
+      const nestedRoundTrip = await client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+        acp.CLIENT_METHODS.mcp_message,
+        { connectionId: connected.connectionId, method: "nestedServerRoundTrip" },
+      );
       await client.notify<acp.MessageMcpNotification>(acp.CLIENT_METHODS.mcp_message, {
         connectionId: connected.connectionId,
         method: "notifications/initialized",
@@ -1023,7 +1098,7 @@ const agent = acp
           content: {
             type: "text",
             text: JSON.stringify({
-              initialized, echoed, failed, resultAndError, roundTrip,
+              initialized, echoed, failed, resultAndError, roundTrip, nestedRoundTrip,
               serverNotifications,
               agentNotifications: observedMcpNotifications
                 .filter(({ connectionId }) => connectionId === connected.connectionId)
@@ -1177,10 +1252,12 @@ const agent = acp
       return { stopReason: "end_turn" };
     }
     if (promptText.includes("stream-follow-flow")) {
+      // Chunks share a session-scoped message ID; a later prompt starts a new message.
+      const messageId = `stream-follow-answer-${requestId}`;
       for (let index = 1; index <= 20; index += 1) {
         const update = {
           sessionUpdate: "agent_message_chunk" as const,
-          messageId: "stream-follow-answer",
+          messageId,
           content: {
             type: "text" as const,
             text: `Streamed paragraph ${index}: ${"follow the latest Agent output without competing scroll animations. ".repeat(3)}\n\n`,
@@ -1194,7 +1271,7 @@ const agent = acp
       }
       const finalUpdate = {
         sessionUpdate: "agent_message_chunk" as const,
-        messageId: "stream-follow-answer",
+        messageId,
         content: { type: "text" as const, text: "Stream follow complete." },
       };
       await client.notify(acp.methods.client.session.update, {
@@ -1276,7 +1353,7 @@ const agent = acp
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "agent_thought_chunk",
-          messageId: "activity-thought",
+          messageId: `activity-thought-${requestId}`,
           content: { type: "text", text: "Inspecting the requested task." },
         },
       });
@@ -1309,7 +1386,7 @@ const agent = acp
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
-          messageId: "activity-answer",
+          messageId: `activity-answer-${requestId}`,
           content: { type: "text", text: "Activity flow complete." },
         },
       });
@@ -1347,7 +1424,7 @@ const agent = acp
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
-          messageId: "review-flow-result",
+          messageId: `review-flow-result-${requestId}`,
           content: { type: "text", text: "Reported two workspace changes." },
         },
       });

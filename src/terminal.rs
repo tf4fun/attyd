@@ -124,6 +124,13 @@ impl TerminalManager {
         }
     }
 
+    pub(crate) fn in_workspace(&self, filesystem: WorkspaceFileSystem) -> Self {
+        Self {
+            filesystem: Arc::new(filesystem),
+            ..self.clone()
+        }
+    }
+
     pub(crate) async fn create_for_incarnation(
         &self,
         request: CreateTerminalRequest,
@@ -189,11 +196,8 @@ impl TerminalManager {
             .require(&request.terminal_id.0, &request.session_id.0)
             .await?;
         let state = terminal.state.lock().await;
-        Ok(TerminalOutputResponse::new(
-            String::from_utf8_lossy(&state.output).into_owned(),
-            state.truncated,
-        )
-        .exit_status(state.exit_status.clone()))
+        let (output, truncated) = output_text(&state, terminal.output_limit);
+        Ok(TerminalOutputResponse::new(output, truncated).exit_status(state.exit_status.clone()))
     }
 
     pub async fn wait_for_exit(
@@ -247,13 +251,14 @@ impl TerminalManager {
         self.emit_snapshot(&terminal).await;
         let snapshot = {
             let state = terminal.state.lock().await;
+            let (output, truncated) = output_text(&state, terminal.output_limit);
             TerminalSnapshot {
                 incarnation: terminal.incarnation,
                 value: json!({
                     "sessionId": terminal.session_id,
                     "terminalId": terminal.id,
-                    "output": String::from_utf8_lossy(&state.output),
-                    "truncated": state.truncated,
+                    "output": output,
+                    "truncated": truncated,
                     "exitStatus": state.exit_status,
                     "released": true,
                 }),
@@ -285,6 +290,11 @@ impl TerminalManager {
 
     pub async fn assert_reference(&self, terminal_id: &str, session_id: &str) -> Result<(), Error> {
         self.require(terminal_id, session_id).await.map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_references_for_test(&self) -> impl Drop + '_ {
+        self.terminals.lock().await
     }
 
     pub async fn close_all(&self) {
@@ -476,6 +486,31 @@ impl TerminalManager {
     }
 }
 
+fn output_text(state: &TerminalState, limit: usize) -> (String, bool) {
+    let mut bytes = state.output.as_slice();
+    if state.exit_status.is_none() && !state.released {
+        // A reader may stop between bytes of a character. Hold that suffix until
+        // the next read instead of expanding it into a replacement character.
+        let mut position = 0;
+        while let Err(error) = std::str::from_utf8(&bytes[position..]) {
+            position += error.valid_up_to();
+            match error.error_len() {
+                Some(length) => position += length,
+                None => {
+                    bytes = &bytes[..position];
+                    break;
+                }
+            }
+        }
+    }
+    let output = String::from_utf8_lossy(bytes);
+    let mut start = output.len().saturating_sub(limit);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    (output[start..].to_string(), state.truncated || start > 0)
+}
+
 fn spawn_command(request: &CreateTerminalRequest, cwd: &Path) -> std::io::Result<TerminalProcess> {
     #[cfg(unix)]
     let mut command = {
@@ -619,6 +654,54 @@ mod tests {
         })
         .await
         .expect("terminal did not exit")
+    }
+
+    #[tokio::test]
+    async fn output_respects_utf8_byte_budget_while_a_character_is_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let (terminals, _events) = manager(root.path());
+        let terminal = Arc::new(Terminal {
+            id: "partial".to_string(),
+            session_id: "session".to_string(),
+            incarnation: 1,
+            output_limit: 1,
+            state: Mutex::new(TerminalState {
+                output: vec![0xe4],
+                ..Default::default()
+            }),
+            changed: Notify::new(),
+            kill: Mutex::new(None),
+            readers_remaining: AtomicUsize::new(1),
+            reader_tasks: Mutex::new(Vec::new()),
+        });
+        terminals
+            .terminals
+            .lock()
+            .await
+            .insert(terminal.id.clone(), terminal.clone());
+        let running = terminals
+            .output(TerminalOutputRequest::new("session", "partial"))
+            .await
+            .unwrap();
+        assert!(running.output.len() <= 1);
+        assert_eq!(
+            running.output, "",
+            "an incomplete UTF-8 character is not output yet"
+        );
+        terminal.state.lock().await.exit_status = Some(TerminalExitStatus::new().exit_code(0));
+        let completed = terminals
+            .output(TerminalOutputRequest::new("session", "partial"))
+            .await
+            .unwrap();
+        assert!(
+            completed.output.len() <= 1,
+            "replacement characters also obey the byte budget"
+        );
+        let (_, retained) = terminals
+            .release_with_snapshot(ReleaseTerminalRequest::new("session", "partial"))
+            .await
+            .unwrap();
+        assert!(retained.value["output"].as_str().unwrap().len() <= 1);
     }
 
     #[tokio::test]

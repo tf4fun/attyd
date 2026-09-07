@@ -294,8 +294,8 @@ export function strongEtag(revision: string): string {
   return `"${revision}"`;
 }
 
-export function workspaceContextSearchPath(query: string): string {
-  return `/api/v1/context/search?${new URLSearchParams({ query })}`;
+export function workspaceContextSearchPath(query: string, sessionId: string): string {
+  return `/api/v1/context/search?${new URLSearchParams({ query, sessionId })}`;
 }
 
 export type { WorkspaceContextAttachment, WorkspaceContextMatch };

@@ -366,10 +366,26 @@ impl HistoryCache {
     }
 }
 
-fn fold_history_update(
+pub(crate) fn fold_history_update(
     retained: &[Value],
     update: &Value,
 ) -> Result<Vec<Value>, crate::runtime_state::RuntimeStateError> {
+    if update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update") {
+        // Tool IDs belong to the session: a background tool may finish after a
+        // later prompt starts. Keep its original slot (and outcome offsets).
+        let tool_id = update.get("toolCallId");
+        if let Some(position) = retained.iter().rposition(|candidate| {
+            matches!(
+                candidate.get("sessionUpdate").and_then(Value::as_str),
+                Some("tool_call" | "tool_call_update")
+            ) && candidate.get("toolCallId") == tool_id
+        }) {
+            let mut folded = retained.to_vec();
+            folded[position] =
+                fold_active_turn_update(&[retained[position].clone()], update)?.remove(0);
+            return Ok(folded);
+        }
+    }
     let turn_start = retained
         .iter()
         .rposition(|candidate| {
@@ -377,22 +393,7 @@ fn fold_history_update(
         })
         .unwrap_or(0);
     let mut folded = retained[..turn_start].to_vec();
-    let mut turn = retained[turn_start..].to_vec();
-    if let Some((shape, text)) = history_text_chunk_shape(update)?
-        && let Some(previous) = turn.last_mut()
-        && history_text_chunk_shape(previous)?
-            .as_ref()
-            .is_some_and(|(previous_shape, _)| previous_shape == &shape)
-    {
-        let previous_text = previous
-            .pointer("/content/text")
-            .and_then(Value::as_str)
-            .ok_or(crate::runtime_state::RuntimeStateError::OperationMismatch)?;
-        previous["content"]["text"] = Value::String(format!("{previous_text}{text}"));
-    } else {
-        turn = fold_active_turn_update(&turn, update)?;
-    }
-    folded.extend(turn);
+    folded.extend(fold_active_turn_update(&retained[turn_start..], update)?);
     Ok(folded)
 }
 
@@ -404,43 +405,35 @@ pub(crate) fn normalize_history_updates(
     })
 }
 
-fn history_text_chunk_shape(
-    update: &Value,
-) -> Result<Option<(Value, &str)>, crate::runtime_state::RuntimeStateError> {
-    if !matches!(
-        update.get("sessionUpdate").and_then(Value::as_str),
-        Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk")
-    ) {
-        return Ok(None);
-    }
-    let content = update
-        .get("content")
-        .and_then(Value::as_object)
-        .ok_or(crate::runtime_state::RuntimeStateError::OperationMismatch)?;
-    if content.get("type").and_then(Value::as_str) != Some("text") {
-        return Ok(None);
-    }
-    let text = content
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or(crate::runtime_state::RuntimeStateError::OperationMismatch)?;
-    let mut shape = update.clone();
-    let shape = shape
-        .as_object_mut()
-        .ok_or(crate::runtime_state::RuntimeStateError::OperationMismatch)?;
-    shape.remove("messageId");
-    shape
-        .get_mut("content")
-        .and_then(Value::as_object_mut)
-        .expect("validated text content is an object")
-        .insert("text".to_string(), Value::String(String::new()));
-    Ok(Some((Value::Object(shape.clone()), text)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn replay_preserves_distinct_message_ids_and_session_scoped_tool_updates() {
+        let updates = vec![
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "a", "content": { "type": "text", "text": "first" } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "b", "content": { "type": "text", "text": "second" } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run", "status": "in_progress" }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "next turn" } }),
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed" }),
+        ];
+        let key = SessionKey::new("session", 1);
+        let mut cache = HistoryCache::new("epoch");
+        cache.begin_candidate(key.clone(), "load").unwrap();
+        for update in &updates {
+            cache
+                .append_candidate(&key, "load", update.clone())
+                .unwrap();
+        }
+        let snapshot = cache.commit_candidate(&key, "load").unwrap();
+        assert_eq!(snapshot.updates().len(), 4);
+        assert_eq!(snapshot.updates()[0], updates[0]);
+        assert_eq!(snapshot.updates()[1], updates[1]);
+        assert_eq!(snapshot.updates()[2]["status"], "completed");
+        assert_eq!(snapshot.updates()[3], updates[3]);
+    }
 
     #[test]
     fn valid_candidate_atomically_replaces_the_baseline_and_advances_revision() {

@@ -109,8 +109,8 @@ describe("ACP UI component contract", () => {
       />,
     );
     expect(html).toContain("Agent needs input");
-    expect(html).toContain('minLength="2"');
-    expect(html).toContain('pattern="^[A-Za-z ]+$"');
+    expect(html).not.toContain('minLength="2"'); // JSON Schema length uses Unicode characters.
+    expect(html).not.toContain('pattern="^[A-Za-z ]+$"'); // HTML patterns have different anchoring semantics.
     expect(html).toContain('min="1"');
     expect(html).toContain('max="3"');
     expect(html).toContain("Submit");

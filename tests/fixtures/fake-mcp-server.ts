@@ -81,10 +81,11 @@ lines.on("line", (line) => {
         error: { code: -32042, message: "deliberate MCP failure", data: { fixture: true } },
       });
       break;
+    case "nestedServerRoundTrip":
     case "serverRoundTrip": {
       const serverRequestId = `server-${++nextServerRequest}`;
       pendingRoundTrips.set(serverRequestId, { requestId: value.id as JsonRpcId });
-      write({
+      if (value.method === "serverRoundTrip") write({
         jsonrpc: "2.0",
         method: "notifications/progress",
         params: { progressToken: "fixture", progress: 0.5 },
@@ -92,7 +93,7 @@ lines.on("line", (line) => {
       write({
         jsonrpc: "2.0",
         id: serverRequestId,
-        method: "roots/list",
+        method: value.method === "nestedServerRoundTrip" ? "fixture/nested" : "roots/list",
         params: { requestedBy: "fake-mcp" },
       });
       break;

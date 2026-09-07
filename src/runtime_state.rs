@@ -758,6 +758,7 @@ impl RuntimeState {
             return Err(RuntimeStateError::SessionNotActive);
         }
         let key = key.into();
+        let update = fold_control_update(session.control_state.get(&key), update);
         if session.control_state.get(&key) == Some(&update) {
             return Ok(());
         }
@@ -1166,6 +1167,9 @@ impl RuntimeState {
                 let PendingInteraction { request, .. } = pending;
                 remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
                 if let Some(elicitation_id) = accepted_url_id {
+                    session
+                        .resolved_url_flows
+                        .retain(|resolved| resolved != elicitation_id);
                     session.url_flows.insert(
                         elicitation_id.to_string(),
                         UrlFlow {
@@ -1200,6 +1204,8 @@ impl RuntimeState {
                     interaction_id,
                 );
                 if let Some(elicitation_id) = accepted_url_id {
+                    self.resolved_request_url_flows
+                        .retain(|resolved| resolved != elicitation_id);
                     self.request_url_flows.insert(
                         elicitation_id.to_string(),
                         UrlFlow {
@@ -1782,16 +1788,9 @@ impl RuntimeState {
     fn url_flow_in_use(&self, elicitation_id: &str) -> bool {
         self.request_url_flows.contains_key(elicitation_id)
             || self
-                .resolved_request_url_flows
-                .iter()
-                .any(|resolved| resolved == elicitation_id)
-            || self.sessions.values().any(|session| {
-                session.url_flows.contains_key(elicitation_id)
-                    || session
-                        .resolved_url_flows
-                        .iter()
-                        .any(|resolved| resolved == elicitation_id)
-            })
+                .sessions
+                .values()
+                .any(|session| session.url_flows.contains_key(elicitation_id))
     }
 
     fn drop_turn_delivery_payload(
@@ -1980,10 +1979,32 @@ fn extract_control_state(entries: Vec<Value>) -> BTreeMap<String, Value> {
                 .as_str()
                 .expect("retained control update has a kind")
                 .to_string();
+            let update = fold_control_update(controls.get(&kind), update);
             controls.insert(kind, update);
         }
     }
     controls
+}
+
+fn fold_control_update(previous: Option<&Value>, update: Value) -> Value {
+    let kind = update.get("sessionUpdate").and_then(Value::as_str);
+    if !matches!(kind, Some("session_info_update" | "usage_update")) {
+        return update;
+    }
+    let Some(mut merged) = previous.and_then(Value::as_object).cloned() else {
+        return update;
+    };
+    if let Some(fields) = update.as_object() {
+        for (key, value) in fields {
+            // Session info uses absent/clear/set patches. Usage's optional cost
+            // carries the last known total until the Agent supplies a new value.
+            if kind == Some("usage_update") && key == "cost" && value.is_null() {
+                continue;
+            }
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
 }
 
 fn retain_session_metadata(session_id: &str, response: Value) -> Value {
@@ -2126,7 +2147,7 @@ pub(crate) fn fold_active_turn_update(
                 ) && candidate.get("toolCallId").and_then(Value::as_str) == Some(tool_call_id)
             }) {
                 let retained_kind = folded[position]["sessionUpdate"].clone();
-                deep_merge_json_object(&mut folded[position], update)?;
+                replace_tool_fields(&mut folded[position], update)?;
                 folded[position]["sessionUpdate"] = if kind == "tool_call" {
                     Value::String("tool_call".to_string())
                 } else {
@@ -2252,7 +2273,7 @@ fn replace_fold_slot(
     }
 }
 
-fn deep_merge_json_object(target: &mut Value, patch: &Value) -> Result<(), RuntimeStateError> {
+fn replace_tool_fields(target: &mut Value, patch: &Value) -> Result<(), RuntimeStateError> {
     let target = target
         .as_object_mut()
         .ok_or(RuntimeStateError::OperationMismatch)?;
@@ -2260,32 +2281,11 @@ fn deep_merge_json_object(target: &mut Value, patch: &Value) -> Result<(), Runti
         .as_object()
         .ok_or(RuntimeStateError::OperationMismatch)?;
     for (key, patch_value) in patch {
-        match (target.get_mut(key), patch_value) {
-            (Some(Value::Object(target_object)), Value::Object(patch_object)) => {
-                deep_merge_json_maps(target_object, patch_object);
-            }
-            _ => {
-                target.insert(key.clone(), patch_value.clone());
-            }
+        if !patch_value.is_null() {
+            target.insert(key.clone(), patch_value.clone());
         }
     }
     Ok(())
-}
-
-fn deep_merge_json_maps(
-    target: &mut serde_json::Map<String, Value>,
-    patch: &serde_json::Map<String, Value>,
-) {
-    for (key, patch_value) in patch {
-        match (target.get_mut(key), patch_value) {
-            (Some(Value::Object(target_object)), Value::Object(patch_object)) => {
-                deep_merge_json_maps(target_object, patch_object);
-            }
-            _ => {
-                target.insert(key.clone(), patch_value.clone());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2429,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_deep_merges_tool_updates_at_the_first_position_without_changing_start_kind() {
+    fn active_turn_replaces_tool_fields_at_the_first_position_without_changing_start_kind() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
@@ -2441,7 +2441,9 @@ mod tests {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "tool",
                 "status": "pending",
-                "details": { "path": "/first", "nested": { "left": 1 } }
+                "rawInput": { "path": "/first", "nested": { "left": 1 } },
+                "rawOutput": { "obsolete": true },
+                "locations": [{ "path": "/first" }]
             }),
             json!({
                 "sessionUpdate": "agent_message_chunk",
@@ -2452,12 +2454,15 @@ mod tests {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "tool",
                 "status": "in_progress",
-                "details": { "nested": { "right": 2 } }
+                "rawInput": { "nested": { "right": 2 } },
+                "rawOutput": { "result": "ok" },
+                "locations": []
             }),
             json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "tool",
-                "details": { "path": "/last", "nested": { "left": 3 } }
+                "rawInput": { "path": "/last", "nested": { "left": 3 } },
+                "status": null
             }),
         ];
         for update in updates.clone() {
@@ -2477,9 +2482,12 @@ mod tests {
         assert_eq!(retained[0]["sessionUpdate"], "tool_call");
         assert_eq!(retained[0]["toolCallId"], "tool");
         assert_eq!(retained[0]["status"], "in_progress");
-        assert_eq!(retained[0]["details"]["path"], "/last");
-        assert_eq!(retained[0]["details"]["nested"]["left"], 3);
-        assert_eq!(retained[0]["details"]["nested"]["right"], 2);
+        assert_eq!(
+            retained[0]["rawInput"],
+            json!({ "path": "/last", "nested": { "left": 3 } })
+        );
+        assert_eq!(retained[0]["rawOutput"], json!({ "result": "ok" }));
+        assert_eq!(retained[0]["locations"], json!([]));
         assert_eq!(retained[1]["content"]["text"], "between");
         let published = state
             .deltas_after(before)
@@ -5103,6 +5111,46 @@ mod tests {
     }
 
     #[test]
+    fn sparse_session_controls_preserve_omitted_fields_in_live_and_replay_snapshots() {
+        let updates = vec![
+            json!({ "sessionUpdate": "session_info_update", "title": "Keep", "updatedAt": "before" }),
+            json!({ "sessionUpdate": "usage_update", "used": 1, "size": 100, "cost": { "amount": 2, "currency": "USD" } }),
+            json!({ "sessionUpdate": "session_info_update", "updatedAt": "after" }),
+            json!({ "sessionUpdate": "usage_update", "used": 3, "size": 100, "cost": null }),
+        ];
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        for update in &updates {
+            state
+                .update_control_state(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    update["sessionUpdate"].as_str().unwrap(),
+                    update.clone(),
+                )
+                .unwrap();
+        }
+        let controls = &state.session("session").unwrap().control_state;
+        assert_eq!(controls["session_info_update"]["title"], "Keep");
+        assert_eq!(controls["session_info_update"]["updatedAt"], "after");
+        assert_eq!(controls["usage_update"]["cost"]["amount"], 2);
+        assert_eq!(&extract_control_state(updates), controls);
+        state
+            .update_control_state(
+                "epoch",
+                "session",
+                incarnation,
+                "session_info_update",
+                json!({ "sessionUpdate": "session_info_update", "title": null }),
+            )
+            .unwrap();
+        let controls = &state.session("session").unwrap().control_state;
+        assert_eq!(controls["session_info_update"]["title"], Value::Null);
+        assert_eq!(controls["session_info_update"]["updatedAt"], "after");
+    }
+
+    #[test]
     fn same_session_reload_error_remains_actionable_and_does_not_loop() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
@@ -5299,6 +5347,29 @@ mod tests {
             )
             .unwrap();
         assert_reload_busy(&mut state, "terminal", terminal);
+    }
+
+    #[test]
+    fn completed_url_identifiers_can_be_reused_in_session_and_request_scopes() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        for scope in [Some(("session", incarnation)), None] {
+            for index in 0..2 {
+                let interaction = format!("{scope:?}-{index}");
+                state
+                    .upsert_elicitation("epoch", scope, &interaction, json!({"mode": "url"}))
+                    .unwrap();
+                state
+                    .resolve_elicitation("epoch", scope, &interaction, Some("reusable"))
+                    .unwrap();
+                assert_eq!(
+                    state
+                        .settle_url_flow("epoch", scope, "reusable", UrlFlowStatus::Completed)
+                        .unwrap(),
+                    UrlFlowResolution::Applied
+                );
+            }
+        }
     }
 
     #[test]

@@ -50,9 +50,10 @@ While a session is materialized by a bridge, that bridge is assumed to be its on
 provides no revision or lease that can prevent a different ACP client from concurrently appending to
 the same Agent session.
 
-The Agent must emit all updates belonging to a prompt before its `PromptResponse`. ACP v1 does not
-correlate `session/update` with a prompt or load request, so late same-session conversation updates
-cannot be attributed safely.
+ACP v1 does not correlate `session/update` with a prompt or load request and does not prohibit
+updates outside a prompt. A still-materialized session therefore accepts valid session updates
+while idle. These updates change its process-local projection without inventing a prompt boundary.
+Tool and message identities remain session-scoped; only closed or replaced incarnations are retired.
 
 ## Ownership
 
@@ -118,8 +119,10 @@ baseline. Concurrent observers join the same load and never see a partial candid
 
 A transient load failure retries with bounded exponential backoff and jitter. A retry begins only
 after the prior request has definitively terminated; if its outcome is uncertain the connection
-must be drained or replaced first. Unsupported, not-found, authorization and invalid replay
-failures become visible `Blocked` states rather than hot retry loops.
+must be drained or replaced first. Unsupported, authorization and invalid replay failures become
+visible `Blocked` states rather than hot retry loops. If the Agent returns `ResourceNotFound`
+during initial materialization, the bridge discards that failed candidate and stale list entry,
+returns HTTP 404 and lets the browser return home. It does not retain a blocked phantom session.
 
 If the Agent does not advertise load, a Cold historical session cannot be materialized. This does
 not affect a new or already materialized no-load session whose baseline is still in bridge memory.
@@ -197,9 +200,10 @@ resources are not assumed to be history. A terminal, accepted URL flow or MCP op
 the turn that introduced it and is retained until its own protocol terminal transition. Baseline
 commit clears only the committed overlay and turn-scoped interactions.
 
-When an ACP tool refers to a client-managed terminal, the terminal's bounded final output, exit
-status and truncation flag are folded into that tool's `rawOutput` before release. The terminal
-handle itself remains ephemeral, while the completed tool remains useful after a memory rebuild.
+When an ACP tool refers to a client-managed terminal, its final output, exit status and truncation
+flag remain in a separate, session-incarnation-scoped memory projection while referenced. They are
+not written into Agent `rawOutput` or other message fields. Release invalidates the terminal handle;
+cold recovery can show only the output that remains in memory or is supplied by Agent replay.
 
 ## Memory model
 

@@ -107,7 +107,7 @@ export type ClientCommand =
     }
   | { type: "auth/terminal_cancel"; requestId: string }
   | { type: "auth/logout"; requestId: string }
-  | { type: "context/search"; requestId: string; query: string }
+  | { type: "context/search"; requestId: string; sessionId: string; query: string }
   | {
       type: "context/read";
       requestId: string;
@@ -980,6 +980,7 @@ export function parseClientCommand(raw: string): ClientCommand {
       break;
     case "context/search":
       requireBridgeIdentifier(value, "requestId");
+      requireBridgeIdentifier(value, "sessionId");
       requireBoundedStringAllowEmpty(value, "query", 256);
       break;
     case "context/read":

@@ -3,6 +3,7 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
+  CircleMinus,
   FilePenLine,
   FileSearch,
   Globe2,
@@ -43,7 +44,8 @@ export function ToolCallCard({
 }) {
   const { call } = item;
   const Icon = kindIcons[call.kind ?? "other"] ?? Wrench;
-  const live = call.status == null || call.status === "pending" || call.status === "in_progress";
+  const status = item.cancelled ? "cancelled" : call.status;
+  const live = status == null || status === "pending" || status === "in_progress";
   const [open, setOpen] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   const bodyId = useId();
@@ -89,10 +91,10 @@ export function ToolCallCard({
   return (
     <section
       ref={disclosure}
-      className={`tool-card status-${call.status ?? "pending"}`}
+      className={`tool-card status-${status ?? "pending"}`}
       data-thread-entry
       data-thread-entry-id={item.id}
-      data-tool-status={call.status ?? "pending"}
+      data-tool-status={status ?? "pending"}
       data-live={live ? "true" : "false"}
       data-open={open ? "true" : "false"}
     >
@@ -113,7 +115,7 @@ export function ToolCallCard({
           </span>
         </button>
         <span className="tool-actions">
-          <ToolStatus status={call.status} />
+          <ToolStatus status={status} />
           <button
             type="button"
             className="component-disclosure-button"
@@ -150,7 +152,7 @@ export function ToolCallCard({
           ) : call.rawOutput !== undefined ? (
             <StructuredData value={call.rawOutput} />
           ) : (
-            <p className="tool-output-empty">{emptyOutputMessage(call.status)}</p>
+            <p className="tool-output-empty">{emptyOutputMessage(status)}</p>
           )}
         </section>
         <footer className={debugOpen ? "message-meta message-meta-open component-debug-meta" : "message-meta component-debug-meta"}>
@@ -184,13 +186,14 @@ function toolKindLabel(kind: ToolKind | undefined): string | undefined {
   return kind.split("_").map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ");
 }
 
-function emptyOutputMessage(status: ToolCall["status"]): string {
+function emptyOutputMessage(status: ToolCall["status"] | "cancelled"): string {
+  if (status === "cancelled") return "Cancelled before the tool finished.";
   if (status === "completed") return "Completed without output.";
   if (status === "failed") return "No error details were provided.";
   return status === "in_progress" ? "Waiting for output…" : "Waiting for the tool…";
 }
 
-function ToolStatus({ status }: { status: ToolCall["status"] }) {
+function ToolStatus({ status }: { status: ToolCall["status"] | "cancelled" }) {
   const state = status ?? "pending";
   const label = state === "in_progress"
     ? "Running"
@@ -198,10 +201,12 @@ function ToolStatus({ status }: { status: ToolCall["status"] }) {
       ? "Completed"
       : state === "failed"
         ? "Failed"
-        : "Pending";
+        : state === "cancelled" ? "Cancelled" : "Pending";
   return (
     <span className={`tool-status tool-status-${state}`} aria-label={`Tool status: ${label}`}>
-      {state === "completed" ? (
+      {state === "cancelled" ? (
+        <CircleMinus className="status-icon" size={14} aria-hidden="true" />
+      ) : state === "completed" ? (
         <Check className="status-icon complete" size={14} aria-hidden="true" />
       ) : state === "failed" ? (
         <CircleAlert className="status-icon failed" size={14} aria-hidden="true" />

@@ -44,6 +44,8 @@ export function useAcp() {
   const refreshInFlightRef = useRef<{ sessionId: string; pending: boolean } | undefined>(undefined);
   const runtimeRefreshRef = useRef<{ pending: boolean } | undefined>(undefined);
   const sessionListQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const sessionListSupportedRef = useRef(false);
+  const sessionLoadSupportedRef = useRef(false);
   const navigationRef = useRef(0);
   const reconnectRef = useRef<() => void>(() => undefined);
   const refreshSessionRef = useRef<(sessionId: string) => void>(() => undefined);
@@ -144,8 +146,10 @@ export function useAcp() {
       try {
         do {
           refresh.pending = false;
+          const cwd = sessionViewRef.current?.workspace.cwd ?? readProjectCwdFromPath(window.location.pathname);
+          const query = sessionCwdQuery(cwd, sessionLoadSupportedRef.current);
           const view = await requestJson<BridgeSessionView>(
-            `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+            `/api/v1/sessions/${encodeURIComponent(sessionId)}${query}`,
           );
           if (refreshInFlightRef.current !== refresh || activeSessionIdRef.current !== sessionId) return;
           hydrateSession(view);
@@ -168,8 +172,10 @@ export function useAcp() {
 
   const connectSessionEvents = useCallback((sessionId: string) => {
     sessionEventsRef.current?.close();
+    const cwd = sessionViewRef.current?.workspace.cwd ?? readProjectCwdFromPath(window.location.pathname);
+    const query = sessionCwdQuery(cwd, sessionLoadSupportedRef.current);
     const source = new EventSource(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/events`,
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     );
     sessionEventsRef.current = source;
     source.onmessage = ({ data }) => {
@@ -283,6 +289,7 @@ export function useAcp() {
   }, [connectSessionEvents, hydrateSession, navigateSession]);
 
   const readSessionList = useCallback(async (cursor?: string) => {
+    if (!sessionListSupportedRef.current) return { sessions: [] } as SessionListResult;
     const suffix = cursor == null ? "" : `?${new URLSearchParams({ cursor })}`;
     const response = await requestJson<SessionListResult>(`/api/v1/sessions${suffix}`);
     dispatch({
@@ -333,6 +340,8 @@ export function useAcp() {
       if (runtime.initialized != null) {
         dispatch({ type: "server/event", event: runtime.initialized });
       }
+      sessionListSupportedRef.current = runtime.initialized?.response.agentCapabilities?.sessionCapabilities?.list != null;
+      sessionLoadSupportedRef.current = runtime.initialized?.response.agentCapabilities?.loadSession === true;
       if (runtime.error != null) dispatch({ type: "server/event", event: runtime.error });
       if (runtime.phase != null) dispatch({ type: "server/event", event: runtime.phase });
       else if (!runtime.connected) dispatch({ type: "socket/closed" });
@@ -345,8 +354,7 @@ export function useAcp() {
         if (!stillCurrent() || (routeSessionId == null && routeProjectCwd == null)) return;
 
         let selected = listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
-        // Keep discovery and materialization in one list transaction: another
-        // first-page refresh would otherwise invalidate the offered cursors/cwd.
+        // Complete this page's discovery before choosing its session workspace.
         const cursors = new Set<string>();
         while (listed.nextCursor != null) {
           if (cursors.has(listed.nextCursor)) throw new Error("Agent session list repeated a cursor");
@@ -365,8 +373,10 @@ export function useAcp() {
         }
         // Materialized sessions remain readable even if they are not listed.
         // Only the bridge's explicit not-found response sends this route home.
+        const cwdQuery = sessionCwdQuery(selected?.cwd ?? routeProjectCwd,
+          runtime.initialized?.response.agentCapabilities?.loadSession);
         const view = await requestJson<BridgeSessionView>(
-          `/api/v1/sessions/${encodeURIComponent(routeSessionId)}`,
+          `/api/v1/sessions/${encodeURIComponent(routeSessionId)}${cwdQuery}`,
         );
         if (stillCurrent()) {
           activateSession(selected ?? { sessionId: routeSessionId, cwd: "" }, false, view);
@@ -524,8 +534,12 @@ export function useAcp() {
   }, [connectGlobalEvents, refreshRuntime, resetSession, returnHome]);
 
   const searchWorkspaceContext = useCallback(async (query: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) {
+      throw new Error("Wait for an active ACP session before searching workspace context");
+    }
     const response = await requestJson<{ matches: WorkspaceContextMatch[] }>(
-      workspaceContextSearchPath(query),
+      workspaceContextSearchPath(query, sessionId),
     );
     return response.matches;
   }, []);
@@ -765,6 +779,10 @@ export function useAcp() {
   const forkSession = useCallback(() => {
     const sessionId = activeSessionIdRef.current;
     if (sessionId == null || stateRef.current.running) return;
+    if (stateRef.current.initialized?.agentCapabilities?.loadSession !== true) {
+      reportError(new Error("Forking requires Agent history loading in this client."));
+      return;
+    }
     const navigation = ++navigationRef.current;
     const requestId = randomId();
     dispatch({ type: "session/transition_start", kind: "fork", requestId, sessionId });
@@ -840,6 +858,10 @@ export function useAcp() {
     searchWorkspaceContext,
     readWorkspaceContext,
   };
+}
+
+function sessionCwdQuery(cwd: string | null | undefined, canLoad: boolean | undefined): string {
+  return canLoad === true && cwd != null ? `?${new URLSearchParams({ cwd })}` : "";
 }
 
 function mergeTerminalSnapshot(

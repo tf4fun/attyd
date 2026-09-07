@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import type {
   BridgeSessionView,
   CreatedSessionResult,
@@ -10,6 +12,8 @@ import { startRustTestServer } from "./rust-test-server.js";
 // SDK Agent -> ACP client terminal/MCP services, with the same REST/SSE
 // observation used by the browser. Fixtures report results; assertions live here.
 const cwd = process.cwd();
+const sessionCwd = await realpath(await mkdtemp(join(tmpdir(), "attyd-session-services-")));
+await writeFile(join(sessionCwd, "input.txt"), "session workspace input");
 const server = await startRustTestServer({
   cwd,
   command: [process.execPath, "--import", "tsx", join(cwd, "tests/fixtures/fake-agent.ts")],
@@ -35,7 +39,7 @@ try {
   const createdResponse = await fetch(`${origin}/api/v1/sessions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({}),
+    body: JSON.stringify({ cwd: sessionCwd }),
   });
   assert.equal(createdResponse.status, 201);
   const created = await createdResponse.json() as CreatedSessionResult;
@@ -53,6 +57,24 @@ try {
   });
 
   try {
+    const services = await runFlow(sessionUrl, "client-services-flow", "client-services-result", async (view) => {
+      for (const pending of Object.values(view.interactions.elicitations)) {
+        const response = pending.request.mode === "form"
+          ? { action: "accept", content: { value: "😀" } }
+          : { action: pending.request.message === "Decline URL" ? "decline" : "accept" };
+        const responded = await fetch(`${sessionUrl}/interactions/${encodeURIComponent(pending.interactionId)}/response`, {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: "elicitation", response }),
+        });
+        assert.equal(responded.status, 200, await responded.text());
+      }
+    });
+    assert.deepEqual(services.read, { content: "session workspace input" });
+    assert.equal(await readFile(join(sessionCwd, "output.txt"), "utf8"), "written in session workspace");
+    assert.deepEqual(services.directories, [sessionCwd, sessionCwd]);
+    assert.equal(asRecord(services.unsupportedMode).code, -32602);
+    assert.deepEqual(services.unicode, { action: "accept", content: { value: "😀" } });
+    assert.equal(asRecord(services.outstandingDuplicate).code, -32602);
+    assert.deepEqual(services.urls, [{ action: "accept" }, { action: "accept" }, { action: "decline" }, { action: "accept" }]);
     const relay = await runFlow(sessionUrl, "mcp-flow", "mcp-result");
     assert.deepEqual(relay.initialized, {
       protocolVersion: "2025-06-18",
@@ -73,6 +95,8 @@ try {
         receivedParams: { requestedBy: "fake-mcp" },
       },
     });
+    assert.deepEqual(relay.nestedRoundTrip, { clientResult: { nested: true } },
+      "the MCP reader must process nested responses while an Agent callback is pending");
     assert.deepEqual(relay.agentNotifications, [{
       method: "notifications/progress",
       params: { progressToken: "fixture", progress: 0.5 },
@@ -127,7 +151,7 @@ try {
       "a redirected nohup service must survive its launching shell's normal exit");
     assert.equal(lifecycle.backgroundAfterRelease, true,
       "releasing an already completed terminal must not kill its background service");
-    console.log("ACP SDK protocol smoke passed (terminal scripts/argv/recovery/lifecycle; MCP relay, cancellation and reconnect)");
+    console.log("ACP SDK protocol smoke passed (session workspace services; elicitation modes, Unicode and URL ID reuse; terminal lifecycle; nested MCP relay, cancellation and reconnect)");
   } finally {
     observer.abort();
     await drain;
@@ -135,12 +159,14 @@ try {
 } finally {
   observer.abort();
   await server.close();
+  await rm(sessionCwd, { recursive: true, force: true });
 }
 
 async function runFlow(
   sessionUrl: string,
   flow: string,
   resultMessageId: string,
+  respond?: (view: BridgeSessionView) => Promise<void>,
 ): Promise<Record<string, unknown>> {
   const before = await getJson<BridgeSessionView>(sessionUrl);
   assert.equal(before.phase, "ready");
@@ -158,6 +184,7 @@ async function runFlow(
   const completed = await eventually(async () => {
     const view = await getJson<BridgeSessionView>(sessionUrl);
     assert.notEqual(view.phase, "blocked", view.syncError ?? "session became blocked");
+    await respond?.(view);
     return view.phase === "ready" && view.historyRevision !== before.historyRevision
       ? view : undefined;
   }, flow);

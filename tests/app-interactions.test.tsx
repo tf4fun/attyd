@@ -4,6 +4,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const authScenario = vi.hoisted(() => ({ logoutOnly: false, logout: vi.fn() }));
+
 vi.mock("../web/src/lib/use-acp", async () => {
   const { initialState } = await import("../web/src/lib/state");
   const noop = () => undefined;
@@ -15,7 +17,12 @@ vi.mock("../web/src/lib/use-acp", async () => {
         socketOpen: true,
         defaultCwd: "/workspace/attyd",
         cwd: "/workspace/attyd",
+        ...(authScenario.logoutOnly ? {
+          initialized: { protocolVersion: 1, authMethods: [], agentCapabilities: { auth: { logout: {} } } },
+          authStatus: "available",
+        } : {}),
       },
+      logout: authScenario.logout,
       prompt: noop,
       cancel: noop,
       setMode: noop,
@@ -55,6 +62,8 @@ describe("application shell interaction", () => {
   let root: Root;
 
   beforeEach(async () => {
+    authScenario.logoutOnly = false;
+    authScenario.logout.mockReset();
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -64,6 +73,20 @@ describe("application shell interaction", () => {
   afterEach(async () => {
     await act(async () => root.unmount());
     container.remove();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("offers negotiated logout even when sign-in is managed outside ACP", async () => {
+    authScenario.logoutOnly = true;
+    await act(async () => root.render(<App />));
+    const logout = container.querySelector<HTMLButtonElement>(".agent-auth-logout");
+    expect(logout).not.toBeNull();
+    expect(logout?.disabled).toBe(false);
+    expect(container.querySelector('[aria-label^="Authenticate with"]')).toBeNull();
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    await act(async () => logout?.click());
+    expect(authScenario.logout).toHaveBeenCalledOnce();
   });
 
   it("renders the project browser without a sidebar or drawer controls", () => {

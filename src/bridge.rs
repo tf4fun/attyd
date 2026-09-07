@@ -281,16 +281,46 @@ struct SyncControlCandidate {
     bytes: usize,
 }
 
+#[derive(Clone)]
+struct SessionUpdateOwner {
+    incarnation: Option<u64>,
+    allocation: Arc<()>,
+}
+
+impl SessionUpdateOwner {
+    fn matches(&self, state: &BridgeState, session_id: &str) -> bool {
+        state
+            .session_updates
+            .get(session_id)
+            .is_some_and(|validation| Arc::ptr_eq(&validation.allocation, &self.allocation))
+            && self.incarnation.is_none_or(|incarnation| {
+                state
+                    .runtime
+                    .session(session_id)
+                    .map(|session| session.incarnation)
+                    .or_else(|| {
+                        state
+                            .active_sessions
+                            .get(session_id)
+                            .map(|session| session.incarnation)
+                    })
+                    == Some(incarnation)
+            })
+    }
+}
+
+struct ReplayValidationBackup {
+    owner: SessionUpdateOwner,
+    previous: Option<SessionUpdateSemanticState>,
+}
+
 #[derive(Default)]
 struct BridgeState {
     agent_capabilities: Option<AgentCapabilities>,
     auth_methods: HashMap<String, AuthMethod>,
     active_sessions: HashMap<String, ActiveSession>,
     listed_sessions: HashMap<String, SessionInfo>,
-    listed_next_cursor: Option<String>,
-    listed_cursors: HashSet<String>,
-    listed_session_bytes: usize,
-    session_list_in_flight: bool,
+    session_list_gate: Arc<Mutex<()>>,
     prompts: HashSet<String>,
     pending_forks: HashSet<String>,
     pending_closes: HashSet<String>,
@@ -307,11 +337,11 @@ struct BridgeState {
     early_update_count: usize,
     early_update_bytes: usize,
     session_updates: HashMap<String, SessionUpdateSemanticState>,
+    replay_validation_backups: HashMap<String, ReplayValidationBackup>,
     session_view_waiters: HashMap<String, Vec<oneshot::Sender<Result<Value, SessionViewError>>>>,
     permissions: HashMap<String, PendingPermission>,
     elicitations: HashMap<String, PendingElicitation>,
     url_elicitations: HashMap<String, ActiveUrlElicitation>,
-    seen_url_elicitation_ids: HashSet<String>,
     in_flight_request_ids: HashSet<String>,
     runtime: RuntimeState,
     session_mirror: Option<SessionMirror>,
@@ -807,13 +837,87 @@ fn fail_runtime_attachment(
     }
 }
 
-fn clear_attachment_tracking(state: &mut BridgeState, session_id: &str, clear_validation: bool) {
+fn clear_attachment_tracking(
+    state: &mut BridgeState,
+    session_id: &str,
+    owner: &SessionUpdateOwner,
+    clear_validation: bool,
+) {
+    if !owner.matches(state, session_id) {
+        return;
+    }
     state.pending_attachments.remove(session_id);
     state.attachment_subscribers.remove(session_id);
     state.attachment_update_counts.remove(session_id);
     state.attachment_update_bytes.remove(session_id);
-    if clear_validation {
+    if state.replay_validation_backups.contains_key(session_id) {
+        rollback_replay_validation(state, session_id, owner);
+    } else if clear_validation {
         state.session_updates.remove(session_id);
+    }
+}
+
+fn begin_replay_validation(state: &mut BridgeState, session_id: &str) -> SessionUpdateOwner {
+    let validation = SessionUpdateSemanticState::default();
+    let owner = SessionUpdateOwner {
+        incarnation: state
+            .active_sessions
+            .get(session_id)
+            .map(|session| session.incarnation),
+        allocation: validation.allocation.clone(),
+    };
+    let previous = state
+        .session_updates
+        .insert(session_id.to_string(), validation);
+    state.replay_validation_backups.insert(
+        session_id.to_string(),
+        ReplayValidationBackup {
+            owner: owner.clone(),
+            previous,
+        },
+    );
+    owner
+}
+
+fn take_replay_validation_backup(
+    state: &mut BridgeState,
+    session_id: &str,
+    owner: &SessionUpdateOwner,
+) -> Option<ReplayValidationBackup> {
+    let backup = state.replay_validation_backups.get(session_id)?;
+    if !Arc::ptr_eq(&backup.owner.allocation, &owner.allocation) {
+        return None;
+    }
+    state.replay_validation_backups.remove(session_id)
+}
+
+fn commit_replay_validation(state: &mut BridgeState, session_id: &str, owner: &SessionUpdateOwner) {
+    if take_replay_validation_backup(state, session_id, owner).is_none()
+        || !owner.matches(state, session_id)
+    {
+        return;
+    }
+    if let Some(validation) = state.session_updates.get_mut(session_id) {
+        validation.retire_turn();
+    }
+}
+
+fn rollback_replay_validation(
+    state: &mut BridgeState,
+    session_id: &str,
+    owner: &SessionUpdateOwner,
+) {
+    if let Some(backup) = take_replay_validation_backup(state, session_id, owner) {
+        if !owner.matches(state, session_id) {
+            return;
+        }
+        if let Some(previous) = backup.previous {
+            state
+                .session_updates
+                .insert(session_id.to_string(), previous);
+        } else {
+            state.session_updates.remove(session_id);
+        }
     }
 }
 
@@ -1039,6 +1143,7 @@ pub(crate) enum BridgeInput {
     RuntimeSnapshotRequest,
     SessionViewRequest {
         session_id: String,
+        cwd: Option<String>,
         response: oneshot::Sender<Result<Value, SessionViewError>>,
     },
     RetireIdleSession {
@@ -1071,7 +1176,11 @@ impl SessionViewError {
 
 impl From<Error> for SessionViewError {
     fn from(error: Error) -> Self {
-        Self::Unavailable(error_message(error))
+        if error.code == agent_client_protocol::ErrorCode::ResourceNotFound {
+            Self::NotFound
+        } else {
+            Self::Unavailable(error_message(error))
+        }
     }
 }
 
@@ -1467,7 +1576,7 @@ where
                 async move |request: CreateElicitationRequest, responder, _connection| {
                     ensure_relay_size(&request, "elicitation request")?;
                     let request_value =
-                        validate_elicitation_request(&request).map_err(semantic_error)?;
+                        validate_elicitation_request(&request).map_err(|error| Error::invalid_params().data(error))?;
                     let elicitation_id = Uuid::new_v4().to_string();
                     let url_elicitation_id = match &request.mode {
                         ElicitationMode::Url(mode) => {
@@ -1507,18 +1616,18 @@ where
                                 return Err(Error::invalid_params()
                                     .data("Agent returned an invalid URL elicitation ID"));
                             }
-                            if !state
-                                .seen_url_elicitation_ids
-                                .insert(url_elicitation_id.clone())
+                            if state.url_elicitations.contains_key(url_elicitation_id)
+                                || state.elicitations.values().any(|pending| {
+                                    pending.url_elicitation_id.as_ref() == Some(url_elicitation_id)
+                                })
                             {
                                 return Err(Error::invalid_params().data(format!(
-                                    "Agent reused a URL elicitation ID: {url_elicitation_id}"
+                                    "URL elicitation ID is already outstanding: {url_elicitation_id}"
                                 )));
                             }
-                            if state.seen_url_elicitation_ids.len() > MAX_URL_ELICITATION_IDS {
-                                state.seen_url_elicitation_ids.remove(url_elicitation_id);
+                            if state.url_elicitations.len() + state.elicitations.len() >= MAX_URL_ELICITATION_IDS {
                                 return Err(Error::invalid_request().data(format!(
-                                    "Agent exceeded {MAX_URL_ELICITATION_IDS} URL elicitation IDs"
+                                    "Agent exceeded {MAX_URL_ELICITATION_IDS} outstanding URL elicitations"
                                 )));
                             }
                         }
@@ -1697,8 +1806,8 @@ where
                         let result = match filesystem {
                             Some(filesystem) => {
                                 let session_id = request.session_id.0.to_string();
-                                match require_live_session(&session_id, &state).await {
-                                    Ok(()) => {
+                                match require_session_workspace(&session_id, &state, &filesystem).await {
+                                    Ok((_, filesystem)) => {
                                         filesystem.read_cancellable(request, cancellation).await
                                     }
                                     Err(error) => Err(error),
@@ -1726,8 +1835,8 @@ where
                         let result = match filesystem {
                             Some(filesystem) => {
                                 let session_id = request.session_id.0.to_string();
-                                match require_live_session(&session_id, &state).await {
-                                    Ok(()) => {
+                                match require_session_workspace(&session_id, &state, &filesystem).await {
+                                    Ok((_, filesystem)) => {
                                         filesystem.write_cancellable(request, cancellation).await
                                     }
                                     Err(error) => Err(error),
@@ -1746,17 +1855,20 @@ where
         .on_receive_request(
             {
                 let terminals = terminals.clone();
+                let filesystem = filesystem.clone();
                 let state = state.clone();
                 async move |request: CreateTerminalRequest, responder, connection| {
                     let terminals = terminals.clone();
+                    let filesystem = filesystem.clone();
                     let state = state.clone();
                     connection.spawn(async move {
-                        let result = match terminals {
-                            Some(terminals) => {
+                        let result = match (terminals, filesystem) {
+                            (Some(terminals), Some(filesystem)) => {
                                 let session_id = request.session_id.0.to_string();
-                                match require_live_session_incarnation(&session_id, &state).await {
-                                    Ok(incarnation) => {
+                                match require_session_workspace(&session_id, &state, &filesystem).await {
+                                    Ok((incarnation, filesystem)) => {
                                         let result = terminals
+                                            .in_workspace(filesystem)
                                             .create_for_incarnation(request, incarnation)
                                             .await;
                                         match result {
@@ -1785,7 +1897,7 @@ where
                                     Err(error) => Err(error),
                                 }
                             }
-                            None => Err(Error::method_not_found()
+                            _ => Err(Error::method_not_found()
                                 .data("terminal methods are unavailable for remote transports")),
                         };
                         responder.respond_with_result(result)
@@ -1954,7 +2066,6 @@ where
             }
             validate_auth_methods(
                 &response.auth_methods,
-                &response.agent_capabilities,
                 options.transport == Transport::Stdio,
             )?;
             validate_configured_capabilities(&response.agent_capabilities, &options)?;
@@ -2016,6 +2127,7 @@ where
                     }
                     Some(BridgeInput::SessionViewRequest {
                         session_id,
+                        cwd,
                         response,
                     }) => {
                         let materialize = {
@@ -2042,7 +2154,9 @@ where
                                         .map_err(SessionViewError::from);
                                 let _ = response.send(result);
                                 None
-                            } else if !state.listed_sessions.contains_key(&session_id) {
+                            } else if !state.listed_sessions.contains_key(&session_id)
+                                && cwd.is_none()
+                            {
                                 let _ = response.send(Err(SessionViewError::NotFound));
                                 None
                             } else {
@@ -2078,6 +2192,7 @@ where
                                 "type": "session/load",
                                 "requestId": format!("bridge-materialize-{}", Uuid::new_v4()),
                                 "sessionId": session_id,
+                                "cwd": cwd,
                                 "bridgeManagedMaterialization": true,
                                 "bridgeMaterializationId": materialization_id,
                             }),
@@ -2297,12 +2412,7 @@ async fn resolve_session_view_waiters(
                     session_view_value(&mut state, session_id, incarnation)
                         .map_err(SessionViewError::from)
                 }),
-            Err(error) => Err(SessionViewError::Unavailable(
-                error
-                    .data
-                    .clone()
-                    .map_or_else(|| error.message.clone(), |data| data.to_string()),
-            )),
+            Err(error) => Err(SessionViewError::from(error.clone())),
         };
         (waiters, result)
     };
@@ -2448,9 +2558,9 @@ async fn handle_session_update(
             return;
         }
     };
-    let tracked = {
+    let owner = {
         let mut state = state.lock().await;
-        if state.active_sessions.contains_key(&session_id)
+        let tracked = if state.active_sessions.contains_key(&session_id)
             || state.pending_attachments.contains(&session_id)
         {
             true
@@ -2477,11 +2587,34 @@ async fn handle_session_update(
         } else {
             // Late updates for closed or failed sessions must not leak into the visible thread.
             false
+        };
+        if !tracked {
+            return;
+        }
+        let incarnation = state
+            .active_sessions
+            .get(&session_id)
+            .map(|session| session.incarnation)
+            .or_else(|| {
+                state
+                    .pending_attachments
+                    .contains(&session_id)
+                    .then(|| state.runtime.session(&session_id))
+                    .flatten()
+                    .filter(|session| session.lifecycle != SessionLifecycle::Closed)
+                    .map(|session| session.incarnation)
+            });
+        let allocation = state
+            .session_updates
+            .entry(session_id.clone())
+            .or_default()
+            .allocation
+            .clone();
+        SessionUpdateOwner {
+            incarnation,
+            allocation,
         }
     };
-    if !tracked {
-        return;
-    }
 
     let tool_update = matches!(
         update.get("sessionUpdate").and_then(Value::as_str),
@@ -2489,6 +2622,9 @@ async fn handle_session_update(
     );
     let replaying = if tool_update {
         let state = state.lock().await;
+        if !owner.matches(&state, &session_id) {
+            return;
+        }
         state.pending_attachments.contains(&session_id)
             || state
                 .active_sessions
@@ -2513,6 +2649,9 @@ async fn handle_session_update(
             };
             if let Err(error) = result {
                 let mut state = state.lock().await;
+                if !owner.matches(&state, &session_id) {
+                    return;
+                }
                 let attachment = state.pending_attachments.contains(&session_id);
                 let reconciling = state
                     .active_sessions
@@ -2547,6 +2686,9 @@ async fn handle_session_update(
 
     let outcome = {
         let mut state = state.lock().await;
+        if !owner.matches(&state, &session_id) {
+            return;
+        }
         let active = state.active_sessions.contains_key(&session_id);
         let attachment = state.pending_attachments.contains(&session_id);
         let early_creation = !active && !attachment && state.pending_creations > 0;
@@ -2572,21 +2714,6 @@ async fn handle_session_update(
                 .and_then(|mirror| mirror.load_attempt(&session_id, incarnation))
                 .map(str::to_string)
         });
-        let late_canonical_conversation = active
-            && !attachment
-            && mirror_replay_attempt.is_none()
-            && is_conversation_update(&update)
-            && state
-                .active_sessions
-                .get(&session_id)
-                .is_some_and(|session| session.incarnation != 0)
-            && state
-                .runtime
-                .session(&session_id)
-                .is_none_or(|session| session.active_turn.is_none());
-        if late_canonical_conversation {
-            return;
-        }
         let attachment_subscriber = attachment
             .then(|| state.attachment_subscribers.get(&session_id).copied())
             .flatten();
@@ -2771,6 +2898,17 @@ async fn handle_session_update(
                             );
                         }
                         mirrored
+                    } else if matches!(
+                        mirror_phase,
+                        Some(MirrorPhase::Ready | MirrorPhase::Reconciling)
+                    ) {
+                        session_mirror(&mut state).append_session_update(&session_id, incarnation, update.clone())
+                            .map_err(mirror_error)
+                            .and_then(|()| {
+                                let view = session_view_value(&mut state, &session_id, incarnation)?;
+                                business_delta = Some(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": view }));
+                                Ok(())
+                            })
                     } else {
                         Ok(())
                     };
@@ -3055,6 +3193,7 @@ async fn handle_command(
                         Err(error) => {
                             state.active_sessions.remove(&session_id);
                             state.session_updates.remove(&session_id);
+                            state.replay_validation_backups.remove(&session_id);
                             let can_close = can_close_rejected_chat_session(&state, &session_id);
                             drop(state);
                             close_rejected_chat_session(&connection, &session_id, can_close).await;
@@ -3111,19 +3250,10 @@ async fn handle_command(
                         .data("session/list cursor must be a non-empty bounded string"));
                 }
             };
-            {
-                let mut state = state.lock().await;
-                if state.session_list_in_flight {
-                    return Err(
-                        Error::invalid_request().data("a session/list request is already running")
-                    );
-                }
-                if cursor.is_some() && cursor != state.listed_next_cursor {
-                    return Err(Error::invalid_params()
-                        .data("session/list cursor was not offered by the Agent"));
-                }
-                state.session_list_in_flight = true;
-            }
+            // Browsers have independent pagination chains. Serialize Agent I/O,
+            // but leave opaque cursor validity to the Agent that issued it.
+            let list_gate = state.lock().await.session_list_gate.clone();
+            let _list_request = list_gate.lock().await;
             // Startup cwd is the new-session default, not a discovery filter.
             // Existing sessions retain the cwd returned by the Agent.
             let result = connection
@@ -3131,24 +3261,16 @@ async fn handle_command(
                 .block_task()
                 .await;
             let mut state = state.lock().await;
-            state.session_list_in_flight = false;
             let response = result?;
-            let page_bytes = validate_session_list_page(&response, cursor.as_deref(), &state)?;
+            validate_session_list_page(&response, cursor.as_deref(), &state)?;
             if cursor.is_none() {
                 state.listed_sessions.clear();
-                state.listed_cursors.clear();
-                state.listed_session_bytes = 0;
             }
             for session in &response.sessions {
                 state
                     .listed_sessions
                     .insert(session.session_id.0.to_string(), session.clone());
             }
-            state.listed_next_cursor = response.next_cursor.clone();
-            if let Some(next_cursor) = &response.next_cursor {
-                state.listed_cursors.insert(next_cursor.clone());
-            }
-            state.listed_session_bytes = state.listed_session_bytes.saturating_add(page_bytes);
             drop(state);
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
@@ -3172,12 +3294,26 @@ async fn handle_command(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             require_agent_method(operation, &state).await?;
+            if operation == "session/resume" {
+                require_history_attachment_support(operation, &state).await?;
+            }
             let attachment_kind = if operation == "session/load" {
                 RuntimeSessionOperationKind::Load
             } else {
                 RuntimeSessionOperationKind::Resume
             };
-            let reservation = reserve_attachment(&session_id, attachment_kind, &state).await?;
+            let requested_cwd = command.get("cwd").and_then(Value::as_str);
+            let reservation =
+                reserve_attachment_with_cwd(&session_id, attachment_kind, requested_cwd, &state)
+                    .await?;
+            let validation_owner = state
+                .lock()
+                .await
+                .replay_validation_backups
+                .get(&session_id)
+                .expect("attachment reservation owns validation")
+                .owner
+                .clone();
             let cwd = reservation.cwd().clone();
             let reload = reservation.is_reload();
             state
@@ -3210,7 +3346,12 @@ async fn handle_command(
                 let incarnation = match started {
                     Ok(incarnation) => incarnation,
                     Err(error) => {
-                        clear_attachment_tracking(&mut state, &session_id, false);
+                        clear_attachment_tracking(
+                            &mut state,
+                            &session_id,
+                            &validation_owner,
+                            false,
+                        );
                         return Err(runtime_state_error(error));
                     }
                 };
@@ -3233,7 +3374,12 @@ async fn handle_command(
                         if !reload {
                             session_mirror(&mut state).remove(&session_id, incarnation);
                         }
-                        clear_attachment_tracking(&mut state, &session_id, false);
+                        clear_attachment_tracking(
+                            &mut state,
+                            &session_id,
+                            &validation_owner,
+                            false,
+                        );
                         return Err(error);
                     }
                 }
@@ -3266,6 +3412,9 @@ async fn handle_command(
                     })
             };
             let mut state = state.lock().await;
+            if !validation_owner.matches(&state, &session_id) {
+                return Err(Error::invalid_request().data("session attachment owner changed"));
+            }
             let response = match result {
                 Ok(response) => response,
                 Err(error) => {
@@ -3290,8 +3439,14 @@ async fn handle_command(
                                 && !bridge_materialization_final_attempt,
                             &error.message,
                         );
+                        if !reload
+                            && error.code == agent_client_protocol::ErrorCode::ResourceNotFound
+                        {
+                            session_mirror(&mut state).remove(&session_id, attachment_incarnation);
+                            state.listed_sessions.remove(&session_id);
+                        }
                     }
-                    clear_attachment_tracking(&mut state, &session_id, true);
+                    clear_attachment_tracking(&mut state, &session_id, &validation_owner, true);
                     return Err(error);
                 }
             };
@@ -3317,7 +3472,7 @@ async fn handle_command(
                         &error.message,
                     );
                 }
-                clear_attachment_tracking(&mut state, &session_id, true);
+                clear_attachment_tracking(&mut state, &session_id, &validation_owner, true);
                 return Err(error);
             }
             let tracked = if reload {
@@ -3376,7 +3531,7 @@ async fn handle_command(
                             &error.message,
                         );
                     }
-                    clear_attachment_tracking(&mut state, &session_id, true);
+                    clear_attachment_tracking(&mut state, &session_id, &validation_owner, true);
                     return Err(error);
                 }
             };
@@ -3405,7 +3560,7 @@ async fn handle_command(
                 )
             };
             if let Err(error) = completed {
-                clear_attachment_tracking(&mut state, &session_id, true);
+                clear_attachment_tracking(&mut state, &session_id, &validation_owner, true);
                 return Err(runtime_state_error(error));
             }
             if let Some((modes, config_options)) = replacement_controls {
@@ -3418,9 +3573,7 @@ async fn handle_command(
             } else {
                 set_active_incarnation(&mut state, &session_id, attachment_incarnation);
             }
-            if let Some(validation) = state.session_updates.get_mut(&session_id) {
-                validation.retire_turn();
-            }
+            commit_replay_validation(&mut state, &session_id, &validation_owner);
             state.pending_attachments.remove(&session_id);
             let attachment_subscriber = state
                 .attachment_subscribers
@@ -3467,6 +3620,7 @@ async fn handle_command(
             let request_id = string_field(&command, "requestId")?.to_string();
             let source_id = string_field(&command, "sessionId")?.to_string();
             require_agent_method("session/fork", &state).await?;
+            require_history_attachment_support("session/fork", &state).await?;
             let (cwd, source_incarnation) = {
                 let mut state = state.lock().await;
                 let source = state.active_sessions.get(&source_id).ok_or_else(|| {
@@ -3594,6 +3748,7 @@ async fn handle_command(
                 Err(error) => {
                     state.active_sessions.remove(&session_id);
                     state.session_updates.remove(&session_id);
+                    state.replay_validation_backups.remove(&session_id);
                     state
                         .runtime
                         .fail_operation(
@@ -3719,6 +3874,7 @@ async fn handle_command(
                 state.sync_control_candidates.remove(&session_id);
                 state.active_sessions.remove(&session_id);
                 state.session_updates.remove(&session_id);
+                state.replay_validation_backups.remove(&session_id);
             }
             cancel_interactions(&session_id, "session_closed", &state, &sink).await;
             if let Some(terminals) = &terminals {
@@ -3806,6 +3962,7 @@ async fn handle_command(
                     }
                     state.active_sessions.remove(&session_id);
                     state.session_updates.remove(&session_id);
+                    state.replay_validation_backups.remove(&session_id);
                 }
                 cancel_interactions(&session_id, "session_closed", &state, &sink).await;
                 if let Some(terminals) = &terminals {
@@ -3851,6 +4008,7 @@ async fn handle_command(
                     let mut state = state.lock().await;
                     state.active_sessions.remove(&session_id);
                     state.session_updates.remove(&session_id);
+                    state.replay_validation_backups.remove(&session_id);
                 }
                 cancel_interactions(&session_id, "session_closed", &state, &sink).await;
                 if let Some(terminals) = &terminals {
@@ -4669,10 +4827,11 @@ async fn handle_command(
                 return Err(Error::invalid_params().data("elicitation is no longer pending"));
             };
             flush_runtime(&mut locked, &sink);
-            drop(locked);
             let delivered = pending.sender.send(response.clone()).is_ok();
             let business_delta = {
-                let mut state = state.lock().await;
+                // Publish the accepted flow while holding the same lock as delivery.
+                // Immediate Agent completion/reuse cannot overtake registration.
+                let mut state = locked;
                 let scope_still_exists =
                     runtime_scope
                         .as_ref()
@@ -4743,12 +4902,19 @@ async fn handle_command(
         }
         "context/search" => {
             let request_id = string_field(&command, "requestId")?;
+            let session_id = string_field(&command, "sessionId")?;
             let query = string_field_allow_empty(&command, "query", 256)?;
             let filesystem = filesystem.ok_or_else(|| {
                 Error::method_not_found()
                     .data("workspace context is unavailable for remote transports")
             })?;
+            let (incarnation, filesystem) =
+                require_session_workspace(session_id, &state, &filesystem).await?;
             let matches = filesystem.search_context(query).await?;
+            if require_live_session_incarnation(session_id, &state).await? != incarnation {
+                return Err(Error::invalid_params()
+                    .data("session changed while searching workspace context"));
+            }
             if let Some(responder) = &business_responder {
                 responder.success(json!({ "matches": matches }));
             }
@@ -4763,14 +4929,20 @@ async fn handle_command(
             let request_id = string_field(&command, "requestId")?;
             let session_id = string_field(&command, "sessionId")?;
             let path = bounded_string_field(&command, "path", MAX_BRIDGE_PATH_LENGTH)?;
-            require_active(session_id, &state).await?;
             let filesystem = filesystem.ok_or_else(|| {
                 Error::method_not_found()
                     .data("workspace context is unavailable for remote transports")
             })?;
+            let (incarnation, filesystem) =
+                require_session_workspace(session_id, &state, &filesystem).await?;
             let attachment = filesystem
                 .read_context(PathBuf::from(path).as_path())
                 .await?;
+            if require_live_session_incarnation(session_id, &state).await? != incarnation {
+                return Err(
+                    Error::invalid_params().data("session changed while reading workspace context")
+                );
+            }
             if let Some(responder) = &business_responder {
                 responder.success(json!({ "attachment": attachment }));
             }
@@ -4906,6 +5078,7 @@ async fn synchronize_authoritative_history(
     session_id: &str,
     incarnation: u64,
 ) -> Result<(), Error> {
+    require_agent_method("session/load", state).await?;
     let cwd = {
         let state = state.lock().await;
         state
@@ -4922,26 +5095,23 @@ async fn synchronize_authoritative_history(
     loop {
         attempt += 1;
         let attempt_id = Uuid::new_v4().to_string();
-        let sync_phase = {
+        let (sync_phase, validation_owner) = {
             let mut state = state.lock().await;
             session_mirror(&mut state)
                 .begin_load(session_id, incarnation, attempt_id.clone())
                 .map_err(mirror_error)?;
-            state
-                .session_updates
-                .entry(session_id.to_string())
-                .or_default()
-                .retire_turn();
+            let validation_owner = begin_replay_validation(&mut state, session_id);
             state
                 .sync_control_candidates
                 .insert(session_id.to_string(), SyncControlCandidate::default());
-            match session_mirror(&mut state)
+            let phase = match session_mirror(&mut state)
                 .state(session_id)
                 .map(|session| session.phase)
             {
                 Some(MirrorPhase::Loading) => "loading",
                 _ => "reconciling",
-            }
+            };
+            (phase, validation_owner)
         };
         sink.send(json!({
             "type": "bridge/session_sync",
@@ -4961,6 +5131,11 @@ async fn synchronize_authoritative_history(
 
         let failure = {
             let mut state = state.lock().await;
+            if !validation_owner.matches(&state, session_id) {
+                return Err(
+                    Error::invalid_request().data("session history synchronization owner changed")
+                );
+            }
             match result {
                 Ok(response) => {
                     let response_value = serde_json::to_value(&response)?;
@@ -4985,6 +5160,7 @@ async fn synchronize_authoritative_history(
                                 .map(semantic_error)
                         });
                     if let Some(error) = validation_error {
+                        rollback_replay_validation(&mut state, session_id, &validation_owner);
                         state.sync_control_candidates.remove(session_id);
                         session_mirror(&mut state)
                             .fail_load(
@@ -5036,10 +5212,7 @@ async fn synchronize_authoritative_history(
                                     active.config_options = config_options;
                                 }
                                 let view = session_view_value(&mut state, session_id, incarnation)?;
-                                if let Some(validation) = state.session_updates.get_mut(session_id)
-                                {
-                                    validation.retire_turn();
-                                }
+                                commit_replay_validation(&mut state, session_id, &validation_owner);
                                 sink.send(json!({
                                     "type": "bridge/session_view",
                                     "sessionId": session_id,
@@ -5053,6 +5226,11 @@ async fn synchronize_authoritative_history(
                                 return Ok(());
                             }
                             Err(error) => {
+                                rollback_replay_validation(
+                                    &mut state,
+                                    session_id,
+                                    &validation_owner,
+                                );
                                 state.sync_control_candidates.remove(session_id);
                                 let error = mirror_error(error);
                                 session_mirror(&mut state)
@@ -5080,6 +5258,7 @@ async fn synchronize_authoritative_history(
                     }
                 }
                 Err(error) => {
+                    rollback_replay_validation(&mut state, session_id, &validation_owner);
                     state.sync_control_candidates.remove(session_id);
                     let retryable =
                         retryable_reconcile_error(&error) && attempt < RECONCILE_MAX_ATTEMPTS;
@@ -5180,28 +5359,22 @@ fn validate_session_list_page(
     response: &ListSessionsResponse,
     cursor: Option<&str>,
     state: &BridgeState,
-) -> Result<usize, Error> {
-    let page_bytes = ensure_relay_size(response, "session/list response")?;
-    let accumulated = if cursor.is_none() {
-        page_bytes
-    } else {
-        state.listed_session_bytes.saturating_add(page_bytes)
-    };
-    if accumulated > MAX_SESSION_LIST_TOTAL_BYTES {
-        return Err(Error::invalid_request().data(format!(
-            "accumulated session/list responses exceed {MAX_SESSION_LIST_TOTAL_BYTES} bytes"
-        )));
-    }
+) -> Result<(), Error> {
+    ensure_relay_size(response, "session/list response")?;
     if response.sessions.len() > MAX_LISTED_SESSIONS {
         return Err(Error::invalid_request().data(format!(
             "Agent returned more than {MAX_LISTED_SESSIONS} sessions in one page"
         )));
     }
 
-    let mut session_ids = if cursor.is_none() {
-        HashSet::new()
+    let mut retained_sessions: HashMap<&str, &SessionInfo> = if cursor.is_none() {
+        HashMap::new()
     } else {
-        state.listed_sessions.keys().cloned().collect()
+        state
+            .listed_sessions
+            .iter()
+            .map(|(id, session)| (id.as_str(), session))
+            .collect()
     };
     for session in &response.sessions {
         let session_id = session.session_id.0.as_ref();
@@ -5239,11 +5412,23 @@ fn validate_session_list_page(
             &format!("Agent listed session {session_id}"),
         )
         .map_err(semantic_error)?;
-        session_ids.insert(session_id.to_string());
+        retained_sessions.insert(session_id, session);
     }
-    if session_ids.len() > MAX_LISTED_SESSIONS {
+    if retained_sessions.len() > MAX_LISTED_SESSIONS {
         return Err(Error::invalid_request().data(format!(
             "session/list returned more than {MAX_LISTED_SESSIONS} unique sessions"
+        )));
+    }
+    // Repeated pages from independent observers replace the same metadata.
+    // Bound the actual retained rows, not previously relayed response bytes.
+    let retained_bytes = retained_sessions
+        .values()
+        .try_fold(0_usize, |total, session| {
+            serde_json::to_vec(session).map(|bytes| total.saturating_add(bytes.len()))
+        })?;
+    if retained_bytes > MAX_SESSION_LIST_TOTAL_BYTES {
+        return Err(Error::invalid_request().data(format!(
+            "retained session/list metadata exceeds {MAX_SESSION_LIST_TOTAL_BYTES} bytes"
         )));
     }
 
@@ -5253,12 +5438,12 @@ fn validate_session_list_page(
                 Error::invalid_request().data("Agent returned an invalid session/list cursor")
             );
         }
-        if cursor.is_some() && state.listed_cursors.contains(next_cursor) {
+        if cursor == Some(next_cursor.as_str()) {
             return Err(Error::invalid_request()
                 .data(format!("Agent reused session/list cursor: {next_cursor}")));
         }
     }
-    Ok(page_bytes)
+    Ok(())
 }
 
 fn valid_session_path(value: &str) -> bool {
@@ -5319,7 +5504,9 @@ fn new_session_cwd(command: &Value, options: &Options) -> Result<PathBuf, Error>
                 .data("session/new requires an absolute Agent workspace for remote transports"));
         }
     };
-    if !cwd.is_absolute() {
+    if !valid_session_path(&cwd.to_string_lossy())
+        || (options.transport == Transport::Stdio && !cwd.is_absolute())
+    {
         return Err(Error::invalid_params().data("session cwd must be an absolute path"));
     }
     Ok(cwd)
@@ -5333,13 +5520,24 @@ fn local_additional_directories(options: &Options) -> Vec<PathBuf> {
     }
 }
 
+#[cfg(test)]
 async fn reserve_attachment(
     session_id: &str,
     kind: RuntimeSessionOperationKind,
     state: &Arc<Mutex<BridgeState>>,
 ) -> Result<AttachmentReservation, Error> {
+    reserve_attachment_with_cwd(session_id, kind, None, state).await
+}
+
+async fn reserve_attachment_with_cwd(
+    session_id: &str,
+    kind: RuntimeSessionOperationKind,
+    requested_cwd: Option<&str>,
+    state: &Arc<Mutex<BridgeState>>,
+) -> Result<AttachmentReservation, Error> {
     let mut state = state.lock().await;
-    if state.prompts.contains(session_id)
+    if session_history_loading(&state, session_id)
+        || state.prompts.contains(session_id)
         || state.pending_attachments.contains(session_id)
         || state.pending_forks.contains(session_id)
         || state.pending_closes.contains(session_id)
@@ -5372,11 +5570,14 @@ async fn reserve_attachment(
                 .data("session/load requires the tracked session to be idle"));
         }
         None => {
-            let listed = state.listed_sessions.get(session_id).ok_or_else(|| {
-                Error::invalid_params().data(format!(
-                    "session was not returned by session/list: {session_id}"
-                ))
-            })?;
+            let cwd = match state.listed_sessions.get(session_id) {
+                Some(listed) => listed.cwd.clone(),
+                None => PathBuf::from(requested_cwd.filter(|cwd| valid_session_path(cwd)).ok_or_else(|| {
+                    Error::invalid_params().data(format!(
+                        "session was not returned by session/list; an absolute cwd is required: {session_id}"
+                    ))
+                })?),
+            };
             if state.active_sessions.len()
                 + state.pending_creations
                 + state.pending_attachments.len()
@@ -5386,17 +5587,11 @@ async fn reserve_attachment(
                     "Active session limit reached ({MAX_TRACKED_SESSIONS})"
                 )));
             }
-            AttachmentReservation::Fresh {
-                cwd: listed.cwd.clone(),
-            }
+            AttachmentReservation::Fresh { cwd }
         }
     };
     state.pending_attachments.insert(session_id.to_string());
-    state
-        .session_updates
-        .entry(session_id.to_string())
-        .or_default()
-        .retire_turn();
+    begin_replay_validation(&mut state, session_id);
     state
         .attachment_update_counts
         .insert(session_id.to_string(), 0);
@@ -5416,7 +5611,8 @@ fn reserve_session_operation(
             Error::invalid_params().data(format!("unknown or inactive session: {session_id}"))
         );
     }
-    if state.prompts.contains(session_id)
+    if session_history_loading(state, session_id)
+        || state.prompts.contains(session_id)
         || state.pending_attachments.contains(session_id)
         || state.pending_forks.contains(session_id)
         || state.pending_closes.contains(session_id)
@@ -5463,7 +5659,8 @@ fn finish_prompt_operation(state: &mut BridgeState, session_id: &str, lifecycle:
 }
 
 fn reserve_deletion(state: &mut BridgeState, session_id: &str) -> Result<(), Error> {
-    if state.pending_attachments.contains(session_id)
+    if session_history_loading(state, session_id)
+        || state.pending_attachments.contains(session_id)
         || state.prompts.contains(session_id)
         || state.pending_forks.contains(session_id)
         || state.pending_closes.contains(session_id)
@@ -5482,6 +5679,20 @@ fn reserve_deletion(state: &mut BridgeState, session_id: &str) -> Result<(), Err
         return Err(Error::invalid_request().data("session deletion is already running"));
     }
     Ok(())
+}
+
+fn session_history_loading(state: &BridgeState, session_id: &str) -> bool {
+    state.active_sessions.contains_key(session_id)
+        && state
+            .session_mirror
+            .as_ref()
+            .and_then(|mirror| mirror.state(session_id))
+            .is_some_and(|session| {
+                matches!(
+                    session.phase,
+                    MirrorPhase::Cold | MirrorPhase::Loading | MirrorPhase::Reconciling
+                )
+            })
 }
 
 fn begin_runtime_delete(
@@ -5539,15 +5750,6 @@ async fn require_active(session_id: &str, state: &Arc<Mutex<BridgeState>>) -> Re
     Ok(())
 }
 
-async fn require_live_session(
-    session_id: &str,
-    state: &Arc<Mutex<BridgeState>>,
-) -> Result<(), Error> {
-    require_live_session_incarnation(session_id, state)
-        .await
-        .map(|_| ())
-}
-
 async fn require_live_session_incarnation(
     session_id: &str,
     state: &Arc<Mutex<BridgeState>>,
@@ -5556,6 +5758,21 @@ async fn require_live_session_incarnation(
     live_session_incarnation(&state, session_id).ok_or_else(|| {
         Error::invalid_params().data(format!("unknown or inactive session: {session_id}"))
     })
+}
+
+async fn require_session_workspace(
+    session_id: &str,
+    state: &Arc<Mutex<BridgeState>>,
+    filesystem: &WorkspaceFileSystem,
+) -> Result<(u64, WorkspaceFileSystem), Error> {
+    let (incarnation, cwd) = {
+        let state = state.lock().await;
+        let incarnation = live_session_incarnation(&state, session_id).ok_or_else(|| {
+            Error::invalid_params().data(format!("unknown or inactive session: {session_id}"))
+        })?;
+        (incarnation, state.active_sessions[session_id].cwd.clone())
+    };
+    Ok((incarnation, filesystem.for_workspace(&cwd)?))
 }
 
 async fn cancel_interactions(
@@ -5688,11 +5905,7 @@ fn validate_configured_capabilities(
     Ok(())
 }
 
-fn validate_auth_methods(
-    methods: &[AuthMethod],
-    capabilities: &AgentCapabilities,
-    terminal_supported: bool,
-) -> Result<(), Error> {
+fn validate_auth_methods(methods: &[AuthMethod], terminal_supported: bool) -> Result<(), Error> {
     if methods.len() > MAX_AUTH_METHODS {
         return Err(semantic_error(format!(
             "Agent advertised more than {MAX_AUTH_METHODS} authentication methods"
@@ -5729,9 +5942,23 @@ fn validate_auth_methods(
             validate_terminal_auth_method(method)?;
         }
     }
-    if methods.is_empty() && capabilities.auth.logout.is_some() {
-        return Err(semantic_error(
-            "Agent advertised logout without any authentication methods",
+    Ok(())
+}
+
+async fn require_history_attachment_support(
+    operation: &str,
+    state: &Arc<Mutex<BridgeState>>,
+) -> Result<(), Error> {
+    if !state
+        .lock()
+        .await
+        .agent_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.load_session)
+    {
+        return Err(Error::new(
+            agent_client_protocol::ErrorCode::InvalidRequest.into(),
+            format!("{operation} requires Agent history loading in this client"),
         ));
     }
     Ok(())
@@ -5770,6 +5997,31 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn empty_auth_methods_are_valid() {
+        validate_auth_methods(&[], true).unwrap();
+    }
+
+    #[test]
+    fn remote_new_session_uses_agent_absolute_path_syntax() {
+        let options = options(&[
+            "attyd",
+            "--transport",
+            "ws",
+            "--",
+            "ws://127.0.0.1:9999/acp",
+        ]);
+        for cwd in [r"C:\repo", r"\\server\workspace", "/remote/repo"] {
+            assert_eq!(
+                new_session_cwd(&json!({ "cwd": cwd }), &options).unwrap(),
+                PathBuf::from(cwd)
+            );
+        }
+        for cwd in ["relative", "", "C:relative"] {
+            assert!(new_session_cwd(&json!({ "cwd": cwd }), &options).is_err());
+        }
+    }
+
     fn options(arguments: &[&str]) -> Options {
         Options::try_parse_from(arguments)
             .unwrap()
@@ -5790,6 +6042,7 @@ mod tests {
                 commands
                     .send(BridgeInput::SessionViewRequest {
                         session_id: session_id.clone(),
+                        cwd: None,
                         response,
                     })
                     .await
@@ -6377,6 +6630,7 @@ mod tests {
         commands
             .send(BridgeInput::SessionViewRequest {
                 session_id: "test-session".to_string(),
+                cwd: None,
                 response: response_tx,
             })
             .await
@@ -6785,7 +7039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_turn_update_without_active_turn_is_quarantined_from_all_business_streams() {
+    async fn idle_session_updates_advance_the_memory_view_without_a_local_prompt() {
         let mut bridge_state = BridgeState::default();
         let epoch = bridge_state.runtime.epoch().to_string();
         let incarnation = bridge_state
@@ -6821,6 +7075,13 @@ mod tests {
             },
         );
         bridge_state.published_runtime_seq = bridge_state.runtime.seq();
+        session_mirror(&mut bridge_state).register_new("session", incarnation);
+        let previous_revision = session_mirror(&mut bridge_state)
+            .view("session", incarnation)
+            .unwrap()
+            .baseline
+            .revision()
+            .to_string();
         let before = bridge_state.runtime.snapshot();
         let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -6837,17 +7098,349 @@ mod tests {
 
         handle_session_update(late, &state, &sink, None).await;
 
-        let state = state.lock().await;
+        let mut state = state.lock().await;
         assert_eq!(state.runtime.snapshot(), before);
-        assert!(
-            !state.session_updates.contains_key("session"),
-            "a quarantined update must not poison validation state for the next turn"
-        );
+        let view = session_mirror(&mut state)
+            .view("session", incarnation)
+            .unwrap();
+        assert_eq!(view.baseline.updates().len(), 1);
+        assert_eq!(view.baseline.updates()[0]["content"]["text"], "too late");
+        assert_ne!(view.baseline.revision(), previous_revision);
+        assert!(view.session.active_turn.is_none());
         drop(state);
+        let events = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .collect::<Vec<_>>();
         assert!(
-            rx.try_recv().is_err(),
-            "a late conversation update must not leak through the legacy business stream"
+            events
+                .iter()
+                .any(|event| event["type"] == "bridge/session_view")
         );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "acp/session_update")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_reference_wait_cannot_deliver_an_old_update_into_a_reopened_session() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for reference_valid in [true, false] {
+                let workspace = tempfile::tempdir().unwrap();
+                let filesystem =
+                    Arc::new(WorkspaceFileSystem::new(workspace.path(), false, &[]).unwrap());
+                let (terminal_events, _terminal_rx) = mpsc::unbounded_channel();
+                let terminals =
+                    TerminalManager::new_with_snapshots(filesystem, terminal_events, None);
+                let mut bridge_state = BridgeState::default();
+                let epoch = bridge_state.runtime.epoch().to_string();
+                let old = bridge_state
+                    .runtime
+                    .open_new(
+                        &epoch,
+                        "session",
+                        "/workspace",
+                        json!({ "sessionId": "session" }),
+                    )
+                    .unwrap();
+                bridge_state.active_sessions.insert(
+                    "session".to_string(),
+                    ActiveSession {
+                        cwd: workspace.path().to_path_buf(),
+                        modes: None,
+                        config_options: json!([]),
+                        incarnation: old,
+                    },
+                );
+                session_mirror(&mut bridge_state).register_new("session", old);
+                bridge_state.published_runtime_seq = bridge_state.runtime.seq();
+                let terminal = terminals
+                    .create_for_incarnation(CreateTerminalRequest::new("session", "true"), old)
+                    .await
+                    .unwrap();
+                let notification =
+                    serde_json::from_value(json!({ "sessionId": "session", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "old-tool", "title": "Old instance",
+            "content": [{ "type": "terminal", "terminalId": terminal.terminal_id }]
+        } }))
+                    .unwrap();
+                let state = Arc::new(Mutex::new(bridge_state));
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let sink = EventSink { tx: tx.into() };
+                if !reference_valid {
+                    terminals.release_session("session").await;
+                }
+                let reference_guard = terminals.pause_references_for_test().await;
+                let pending = handle_session_update(notification, &state, &sink, Some(&terminals));
+                tokio::pin!(pending);
+                assert!(
+                    futures::poll!(&mut pending).is_pending(),
+                    "pause at terminal lookup"
+                );
+                let mut locked = state.lock().await;
+                drop(reference_guard);
+                assert!(
+                    futures::poll!(&mut pending).is_pending(),
+                    "pause after lookup at the bridge commit lock"
+                );
+                locked
+                    .runtime
+                    .start_operation(
+                        &epoch,
+                        "session",
+                        old,
+                        "close",
+                        RuntimeSessionOperationKind::Close,
+                        "closing",
+                    )
+                    .unwrap();
+                locked
+                    .runtime
+                    .close_session(&epoch, "session", old, "close")
+                    .unwrap();
+                locked.active_sessions.remove("session");
+                locked.session_updates.remove("session");
+                let new = locked
+                    .runtime
+                    .open_new(
+                        &epoch,
+                        "session",
+                        "/workspace",
+                        json!({ "sessionId": "session" }),
+                    )
+                    .unwrap();
+                locked.active_sessions.insert(
+                    "session".to_string(),
+                    ActiveSession {
+                        cwd: workspace.path().to_path_buf(),
+                        modes: None,
+                        config_options: json!([]),
+                        incarnation: new,
+                    },
+                );
+                session_mirror(&mut locked).register_new("session", new);
+                locked.published_runtime_seq = locked.runtime.seq();
+                drop(locked);
+                pending.await;
+                let mut locked = state.lock().await;
+                assert!(
+                    session_mirror(&mut locked)
+                        .view("session", new)
+                        .unwrap()
+                        .baseline
+                        .updates()
+                        .is_empty()
+                );
+                assert!(!locked.session_updates.contains_key("session"));
+                assert!(rx.try_recv().is_err());
+                drop(locked);
+                terminals.close_all().await;
+            }
+        })
+        .await
+        .expect("terminal reference barrier did not finish");
+    }
+
+    #[tokio::test]
+    async fn reload_validation_failure_preserves_the_session_compaction_index() {
+        let mut bridge_state = BridgeState::default();
+        let epoch = bridge_state.runtime.epoch().to_string();
+        let incarnation = bridge_state
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        session_mirror(&mut bridge_state).register_new("session", incarnation);
+        bridge_state.active_sessions.insert(
+            "session".to_string(),
+            ActiveSession {
+                cwd: PathBuf::from("/workspace"),
+                modes: None,
+                config_options: json!([]),
+                incarnation,
+            },
+        );
+        let validation = bridge_state
+            .session_updates
+            .entry("session".to_string())
+            .or_default();
+        validate_and_track_session_update(validation, &json!({ "sessionUpdate": "compaction_update", "compactionId": "original", "status": "in_progress" })).unwrap();
+        let state = Arc::new(Mutex::new(bridge_state));
+        reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
+            .await
+            .unwrap();
+        let mut state = state.lock().await;
+        validate_and_track_session_update(state.session_updates.get_mut("session").unwrap(), &json!({ "sessionUpdate": "compaction_update", "compactionId": "candidate", "status": "in_progress" })).unwrap();
+        let owner = state.replay_validation_backups["session"].owner.clone();
+        clear_attachment_tracking(&mut state, "session", &owner, true);
+        let validation = state
+            .session_updates
+            .get_mut("session")
+            .expect("failed replay keeps prior validation");
+        validate_and_track_session_update(validation, &json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "original", "content": { "type": "text", "text": "continued" } })).unwrap();
+        assert!(validate_and_track_session_update(validation, &json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "candidate", "content": { "type": "text", "text": "must not survive" } })).is_err());
+    }
+
+    #[tokio::test]
+    async fn automatic_load_blocks_close_delete_and_another_reload_until_its_attempt_finishes() {
+        let mut state = BridgeState::default();
+        let epoch = state.runtime.epoch().to_string();
+        let incarnation = state
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        state.active_sessions.insert(
+            "session".to_string(),
+            ActiveSession {
+                cwd: PathBuf::from("/workspace"),
+                modes: None,
+                config_options: json!([]),
+                incarnation,
+            },
+        );
+        session_mirror(&mut state).register_cold("session", incarnation);
+        assert!(
+            reserve_session_operation(&mut state, "session", SessionOperation::Close).is_err(),
+            "the cold target is already reserved for materialization"
+        );
+        assert!(reserve_deletion(&mut state, "session").is_err());
+        session_mirror(&mut state)
+            .begin_load("session", incarnation, "automatic")
+            .unwrap();
+        begin_replay_validation(&mut state, "session");
+        assert!(reserve_session_operation(&mut state, "session", SessionOperation::Close).is_err());
+        assert!(reserve_deletion(&mut state, "session").is_err());
+        let state = Arc::new(Mutex::new(state));
+        assert!(
+            reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
+                .await
+                .is_err()
+        );
+        let mut state = state.lock().await;
+        session_mirror(&mut state)
+            .fail_load("session", incarnation, "automatic", "retrying", true)
+            .unwrap();
+        assert!(
+            reserve_session_operation(&mut state, "session", SessionOperation::Close).is_err(),
+            "retry backoff retains the load scope"
+        );
+    }
+
+    #[test]
+    fn replay_validation_rollback_cannot_replace_a_new_attempt_or_incarnation() {
+        let mut state = BridgeState::default();
+        let epoch = state.runtime.epoch().to_string();
+        let first = state
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        state.active_sessions.insert(
+            "session".to_string(),
+            ActiveSession {
+                cwd: PathBuf::from("/workspace"),
+                modes: None,
+                config_options: json!([]),
+                incarnation: first,
+            },
+        );
+        let old = begin_replay_validation(&mut state, "session");
+        let newer = begin_replay_validation(&mut state, "session");
+        rollback_replay_validation(&mut state, "session", &old);
+        assert!(newer.matches(&state, "session"));
+        assert!(state.replay_validation_backups.contains_key("session"));
+        state
+            .runtime
+            .start_operation(
+                &epoch,
+                "session",
+                first,
+                "close",
+                RuntimeSessionOperationKind::Close,
+                "closing",
+            )
+            .unwrap();
+        state
+            .runtime
+            .close_session(&epoch, "session", first, "close")
+            .unwrap();
+        let second = state
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        state
+            .active_sessions
+            .get_mut("session")
+            .unwrap()
+            .incarnation = second;
+        state
+            .session_updates
+            .insert("session".to_string(), SessionUpdateSemanticState::default());
+        let fresh = state.session_updates["session"].allocation.clone();
+        rollback_replay_validation(&mut state, "session", &newer);
+        assert!(Arc::ptr_eq(
+            &fresh,
+            &state.session_updates["session"].allocation
+        ));
+        assert!(!state.replay_validation_backups.contains_key("session"));
+    }
+
+    #[test]
+    fn an_early_allocation_owner_survives_materialization_but_not_reallocation() {
+        let mut state = BridgeState::default();
+        let allocation = state
+            .session_updates
+            .entry("session".to_string())
+            .or_default()
+            .allocation
+            .clone();
+        let owner = SessionUpdateOwner {
+            incarnation: None,
+            allocation,
+        };
+        let epoch = state.runtime.epoch().to_string();
+        let incarnation = state
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        state.active_sessions.insert(
+            "session".to_string(),
+            ActiveSession {
+                cwd: PathBuf::from("/workspace"),
+                modes: None,
+                config_options: json!([]),
+                incarnation,
+            },
+        );
+        assert!(owner.matches(&state, "session"));
+        state
+            .session_updates
+            .insert("session".to_string(), SessionUpdateSemanticState::default());
+        assert!(!owner.matches(&state, "session"));
     }
 
     #[tokio::test]
@@ -7452,10 +8045,6 @@ mod tests {
             "saved".to_string(),
             session_info("saved", "/agent/workspace"),
         );
-        state
-            .listed_cursors
-            .extend(["cursor-a".to_string(), "cursor-b".to_string()]);
-        state.listed_session_bytes = 128;
 
         let cyclic: ListSessionsResponse = serde_json::from_value(json!({
             "sessions": [{
@@ -7466,7 +8055,7 @@ mod tests {
             "nextCursor": "cursor-a"
         }))
         .unwrap();
-        let error = validate_session_list_page(&cyclic, Some("cursor-b"), &state).unwrap_err();
+        let error = validate_session_list_page(&cyclic, Some("cursor-a"), &state).unwrap_err();
         assert!(
             error
                 .data
@@ -7605,37 +8194,13 @@ mod tests {
         );
 
         let agent_method = AuthMethod::Agent(AuthMethodAgent::new("login", "Login"));
-        assert!(
-            validate_auth_methods(
-                std::slice::from_ref(&agent_method),
-                &AgentCapabilities::new(),
-                true,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_auth_methods(
-                &[agent_method.clone(), agent_method],
-                &AgentCapabilities::new(),
-                true,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_auth_methods(
-                &[],
-                &AgentCapabilities::new()
-                    .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new())),
-                true,
-            )
-            .is_err()
-        );
+        assert!(validate_auth_methods(std::slice::from_ref(&agent_method), true,).is_ok());
+        assert!(validate_auth_methods(&[agent_method.clone(), agent_method], true,).is_err());
         assert!(
             validate_auth_methods(
                 &[AuthMethod::Terminal(AuthMethodTerminal::new(
                     "terminal", "Terminal",
                 ))],
-                &AgentCapabilities::new(),
                 false,
             )
             .is_err()

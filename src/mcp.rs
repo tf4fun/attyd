@@ -10,7 +10,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::event_queue::EventSender;
@@ -46,6 +47,8 @@ struct McpConnection {
     closed: AtomicBool,
     announced: AtomicBool,
     kill: Mutex<Option<oneshot::Sender<()>>>,
+    callbacks: Arc<Semaphore>,
+    cancelled: CancellationToken,
 }
 
 impl McpManager {
@@ -151,6 +154,8 @@ impl McpManager {
             closed: AtomicBool::new(false),
             announced: AtomicBool::new(false),
             kill: Mutex::new(Some(kill_tx)),
+            callbacks: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
+            cancelled: CancellationToken::new(),
         });
         self.connections
             .lock()
@@ -380,6 +385,35 @@ impl McpManager {
                     manager.stderr(&connection, "invalid JSON-RPC message ignored");
                     continue;
                 };
+                if value.get("method").and_then(Value::as_str).is_some()
+                    && value.get("id").is_some()
+                {
+                    let Ok(permit) = connection.callbacks.clone().try_acquire_owned() else {
+                        let _ = write_json(&connection, &json!({
+                            "jsonrpc": "2.0", "id": value["id"],
+                            "error": {"code": -32000, "message": "Too many pending MCP server requests"},
+                        })).await;
+                        continue;
+                    };
+                    let manager = manager.clone();
+                    let connection = connection.clone();
+                    let acp = acp.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        // A callback may issue another request on this same MCP connection.
+                        // Keep the reader free to deliver that request's response.
+                        tokio::select! {
+                            biased;
+                            () = connection.cancelled.cancelled() => {}
+                            result = manager.route(&connection, &acp, value) => {
+                                if let Err(error) = result {
+                                    manager.stderr(&connection, &format!("MCP routing failed: {error}"));
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
                 if let Err(error) = manager.route(&connection, &acp, value).await {
                     manager.stderr(&connection, &format!("MCP routing failed: {error}"));
                 }
@@ -566,6 +600,7 @@ impl McpManager {
         {
             return;
         }
+        connection.cancelled.cancel();
         let removed = self
             .connections
             .lock()

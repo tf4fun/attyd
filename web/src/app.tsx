@@ -658,7 +658,7 @@ export default function App() {
             {state.mcpConnections.length > 0 ? ` · ${state.mcpConnections.length} active` : ""}
           </div>
         ) : null}
-        {authMethods.length > 0 && state.authStatus ? (
+        {(authMethods.length > 0 || agentCapabilities?.auth?.logout != null) && state.authStatus ? (
           <AgentAuthControls
             methods={authMethods}
             status={state.authStatus}
@@ -788,7 +788,7 @@ export default function App() {
                         onClick={openActiveThreadMarkdown}
                       ><FileText size={14} /> Open as Markdown</button>
                       {sessionCapabilities?.fork != null ? (
-                        <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> Fork thread</button>
+                        <button type="button" disabled={state.initialized?.agentCapabilities?.loadSession !== true || state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> {state.initialized?.agentCapabilities?.loadSession === true ? "Fork thread" : "Fork requires history loading"}</button>
                       ) : null}
                       {sessionCapabilities?.close != null ? (
                         <button type="button" className="danger" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={closeSession}><LogOut size={14} /> Close thread</button>
@@ -827,6 +827,7 @@ export default function App() {
           {state.elicitations.map((pending) => (
             <ElicitationCard
               key={pending.elicitationId}
+              agentName={agent?.title ?? agent?.name ?? "Agent"}
               pending={pending}
               onRespond={(response) => respondElicitation(pending.elicitationId, response)}
             />
@@ -964,6 +965,7 @@ export default function App() {
             {state.elicitations.map((pending) => (
               <ElicitationCard
                 key={pending.elicitationId}
+                agentName={agent?.title ?? agent?.name ?? "Agent"}
                 pending={pending}
                 onRespond={(response) => respondElicitation(pending.elicitationId, response)}
               />

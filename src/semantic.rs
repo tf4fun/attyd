@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -41,10 +42,15 @@ pub type ValidationResult<T = ()> = Result<T, String>;
 
 #[derive(Clone, Default)]
 pub struct SessionUpdateSemanticState {
+    pub(crate) allocation: Arc<()>,
     compactions: HashMap<String, TrackedCompaction>,
     tool_calls: HashMap<String, Option<String>>,
     messages: HashMap<String, String>,
     plans: HashMap<String, String>,
+    new_messages: usize,
+    new_tool_calls: usize,
+    new_plans: usize,
+    new_compactions: usize,
     pub update_count: usize,
     pub update_bytes: usize,
     pub current_mode_id: Option<String>,
@@ -52,13 +58,13 @@ pub struct SessionUpdateSemanticState {
 }
 
 impl SessionUpdateSemanticState {
-    /// Retire validation indexes that are meaningful only while a turn is live.
-    /// Session-scoped control state remains available for validating later commands.
+    /// Reset turn accounting while retaining session-scoped entities. ACP v1
+    /// notifications and compactions can continue outside a prompt's lifetime.
     pub fn retire_turn(&mut self) {
-        self.compactions.clear();
-        self.tool_calls.clear();
-        self.messages.clear();
-        self.plans.clear();
+        self.new_messages = 0;
+        self.new_tool_calls = 0;
+        self.new_plans = 0;
+        self.new_compactions = 0;
         self.update_count = 0;
         self.update_bytes = 0;
         self.invalid_reason = None;
@@ -530,12 +536,12 @@ fn validate_session_update_payload(
             )?;
             if let Some(message_id) = optional_string(update, "messageId", "session update")? {
                 validate_identifier(message_id, MAX_IDENTIFIER_LENGTH, "Agent message ID")?;
-                if !state.messages.contains_key(message_id) && state.messages.len() >= MAX_MESSAGES
-                {
-                    return Err(format!(
-                        "Agent exceeded {MAX_MESSAGES} message IDs in one session"
-                    ));
-                }
+                charge_new_entity(
+                    !state.messages.contains_key(message_id),
+                    &mut state.new_messages,
+                    MAX_MESSAGES,
+                    "message IDs",
+                )?;
                 state
                     .messages
                     .insert(message_id.to_string(), kind.to_string());
@@ -552,12 +558,26 @@ fn validate_session_update_payload(
             if plan.get("type").and_then(Value::as_str) == Some("items") {
                 validate_plan_entries(plan.get("entries"))?;
             }
-            track_named_state(&mut state.plans, plan_id, "active", MAX_PLANS, "plans")?;
+            track_named_state(
+                &mut state.plans,
+                &mut state.new_plans,
+                plan_id,
+                "active",
+                MAX_PLANS,
+                "plans",
+            )?;
         }
         "plan_removed" => {
             let plan_id = required_string(update, "planId", "plan removal")?;
             validate_identifier(plan_id, MAX_IDENTIFIER_LENGTH, "Agent plan ID")?;
-            track_named_state(&mut state.plans, plan_id, "removed", MAX_PLANS, "plans")?;
+            track_named_state(
+                &mut state.plans,
+                &mut state.new_plans,
+                plan_id,
+                "removed",
+                MAX_PLANS,
+                "plans",
+            )?;
         }
         "available_commands_update" => validate_available_commands(update)?,
         "current_mode_update" => {
@@ -649,11 +669,12 @@ fn validate_tool_update(
             }
         }
     }
-    if !state.tool_calls.contains_key(tool_id) && state.tool_calls.len() >= MAX_TOOL_CALLS {
-        return Err(format!(
-            "Agent exceeded {MAX_TOOL_CALLS} tool calls in one session"
-        ));
-    }
+    charge_new_entity(
+        !state.tool_calls.contains_key(tool_id),
+        &mut state.new_tool_calls,
+        MAX_TOOL_CALLS,
+        "tool calls",
+    )?;
     let previous = state.tool_calls.get(tool_id).cloned().flatten();
     let status = optional_string(update, "status", "tool update")?
         .map(str::to_string)
@@ -811,11 +832,12 @@ fn validate_compaction_update(
     {
         return Err(format!("Compaction is already terminal: {id}"));
     }
-    if !state.compactions.contains_key(id) && state.compactions.len() >= MAX_COMPACTIONS {
-        return Err(format!(
-            "Agent exceeded {MAX_COMPACTIONS} compactions in one session"
-        ));
-    }
+    charge_new_entity(
+        !state.compactions.contains_key(id),
+        &mut state.new_compactions,
+        MAX_COMPACTIONS,
+        "compactions",
+    )?;
     state.compactions.insert(
         id.to_string(),
         TrackedCompaction {
@@ -1026,15 +1048,31 @@ fn js_len(value: &str) -> usize {
 
 fn track_named_state(
     ids: &mut HashMap<String, String>,
+    new_ids: &mut usize,
     id: &str,
     value: &str,
     maximum: usize,
     label: &str,
 ) -> ValidationResult {
-    if !ids.contains_key(id) && ids.len() >= maximum {
-        return Err(format!("Agent exceeded {maximum} {label} in one session"));
-    }
+    charge_new_entity(!ids.contains_key(id), new_ids, maximum, label)?;
     ids.insert(id.to_string(), value.to_string());
+    Ok(())
+}
+
+fn charge_new_entity(
+    is_new: bool,
+    count: &mut usize,
+    maximum: usize,
+    label: &str,
+) -> ValidationResult {
+    if is_new {
+        if *count >= maximum {
+            return Err(format!(
+                "Agent exceeded {maximum} new {label} in one turn or replay"
+            ));
+        }
+        *count += 1;
+    }
     Ok(())
 }
 
@@ -1073,6 +1111,56 @@ fn optional_string<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_indexes_do_not_turn_per_turn_limits_into_lifetime_limits() {
+        let mut state = SessionUpdateSemanticState::default();
+        state.messages.extend(
+            (0..MAX_MESSAGES).map(|i| (format!("m-{i}"), "agent_message_chunk".to_string())),
+        );
+        state
+            .tool_calls
+            .extend((0..MAX_TOOL_CALLS).map(|i| (format!("t-{i}"), Some("completed".to_string()))));
+        state
+            .plans
+            .extend((0..MAX_PLANS).map(|i| (format!("p-{i}"), "removed".to_string())));
+        state.compactions.extend((0..MAX_COMPACTIONS).map(|i| {
+            (
+                format!("c-{i}"),
+                TrackedCompaction {
+                    status: "completed".to_string(),
+                    summary_bytes: 0,
+                },
+            )
+        }));
+        state.new_messages = MAX_MESSAGES;
+        state.new_tool_calls = MAX_TOOL_CALLS;
+        state.new_plans = MAX_PLANS;
+        state.new_compactions = MAX_COMPACTIONS;
+        assert!(
+            validate_and_track_session_update(
+                &mut state,
+                &json!({
+                    "sessionUpdate": "agent_message_chunk", "messageId": "new",
+                    "content": { "type": "text", "text": "over the current turn limit" }
+                })
+            )
+            .is_err()
+        );
+        state.retire_turn();
+        for update in [
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "new", "content": { "type": "text", "text": "next turn" } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "new", "title": "Run" }),
+            json!({ "sessionUpdate": "plan_update", "plan": { "type": "markdown", "planId": "new", "content": "Next" } }),
+            json!({ "sessionUpdate": "compaction_update", "compactionId": "new", "status": "in_progress" }),
+        ] {
+            validate_and_track_session_update(&mut state, &update).unwrap();
+        }
+        assert_eq!(state.messages.len(), MAX_MESSAGES + 1);
+        assert_eq!(state.tool_calls.len(), MAX_TOOL_CALLS + 1);
+        assert_eq!(state.plans.len(), MAX_PLANS + 1);
+        assert_eq!(state.compactions.len(), MAX_COMPACTIONS + 1);
+    }
 
     #[test]
     fn validates_standard_content_blocks_and_annotations() {
@@ -1426,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn retiring_a_turn_releases_semantic_indexes_but_keeps_session_controls() {
+    fn retiring_a_turn_keeps_session_entities_and_controls() {
         let mut state = SessionUpdateSemanticState::default();
         for update in [
             json!({
@@ -1443,6 +1531,7 @@ mod tests {
                 "sessionUpdate": "current_mode_update",
                 "currentModeId": "code"
             }),
+            json!({ "sessionUpdate": "compaction_update", "compactionId": "background", "status": "in_progress" }),
         ] {
             validate_and_track_session_update(&mut state, &update).unwrap();
         }
@@ -1454,6 +1543,9 @@ mod tests {
         assert_eq!(state.update_count, 0);
         assert_eq!(state.update_bytes, 0);
         assert_eq!(state.current_mode_id.as_deref(), Some("code"));
+        assert!(state.messages.contains_key("reusable-message"));
+        assert!(state.tool_calls.contains_key("reusable-tool"));
+        validate_and_track_session_update(&mut state, &json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "background", "content": { "type": "text", "text": "summary after response" } })).unwrap();
         for update in [
             json!({
                 "sessionUpdate": "agent_message_chunk",

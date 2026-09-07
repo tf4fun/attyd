@@ -32,6 +32,85 @@ describe("ACP interactive UI contract", () => {
     container.remove();
   });
 
+  it("displays the requesting Agent, host and full external URL before consent", async () => {
+    const onRespond = vi.fn();
+    const url = "https://accounts.example.test:8443/connect?project=demo#consent";
+    await render(root, <ElicitationCard
+      agentName="Example Agent"
+      pending={{ elicitationId: "url", request: {
+        sessionId: "session", mode: "url", elicitationId: "flow", message: "Connect account", url,
+      } }}
+      onRespond={onRespond}
+    />);
+    expect(container.querySelector(".permission-title")?.textContent).toContain("Example Agent");
+    const destination = requireElement(container.querySelector(".elicitation-destination"));
+    expect(destination.textContent).toContain("accounts.example.test:8443");
+    expect(destination.textContent).toContain(url);
+    expect(destination.closest("details")).toBe(null);
+    expect(onRespond).not.toHaveBeenCalled();
+    const link = requireElement<HTMLAnchorElement>(container.querySelector("a.elicitation-url"));
+    expect(link.href).toBe(url);
+    link.addEventListener("click", (event) => event.preventDefault());
+    await click(link);
+    expect(onRespond).toHaveBeenCalledWith({ action: "accept" });
+  });
+
+  it("validates elicitation lengths as Unicode characters rather than UTF-16 units", async () => {
+    const onRespond = vi.fn();
+    await render(root, <ElicitationCard
+      pending={{ elicitationId: "unicode", request: {
+        sessionId: "session", mode: "form", message: "One character",
+        requestedSchema: { type: "object", properties: {
+          value: { type: "string", minLength: 1, maxLength: 1 },
+        } },
+      } }}
+      onRespond={onRespond}
+    />);
+    const input = requireElement<HTMLInputElement>(container.querySelector("input"));
+    expect(input.hasAttribute("maxlength")).toBe(false);
+    expect(input.hasAttribute("minlength")).toBe(false);
+    await replaceInput(input, "😀");
+    await click(buttonWithText(container, "Submit"));
+    expect(onRespond).toHaveBeenCalledWith({ action: "accept", content: { value: "😀" } });
+    onRespond.mockClear();
+    await replaceInput(input, "😀😀");
+    await click(buttonWithText(container, "Submit"));
+    expect(onRespond).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("at most 1 character");
+  });
+
+  it("accepts present empty strings and substring patterns using JSON Schema semantics", async () => {
+    const onRespond = vi.fn();
+    await render(root, <ElicitationCard
+      pending={{ elicitationId: "schema-strings", request: {
+        sessionId: "session", mode: "form", message: "String constraints",
+        requestedSchema: { type: "object", required: ["empty", "choice", "match"], properties: {
+          empty: { type: "string", default: "" },
+          choice: { type: "string", enum: ["", "other"], default: "" },
+          match: { type: "string", pattern: "a", default: "ba" },
+        } },
+      } }}
+      onRespond={onRespond}
+    />);
+    const form = requireElement<HTMLFormElement>(container.querySelector("form"));
+    expect(form.checkValidity()).toBe(true);
+    await click(buttonWithText(container, "Submit"));
+    expect(onRespond).toHaveBeenCalledWith({ action: "accept", content: { empty: "", choice: "", match: "ba" } });
+    onRespond.mockClear();
+    await render(root, <ElicitationCard key="missing"
+      pending={{ elicitationId: "missing", request: {
+        sessionId: "session", mode: "form", message: "Required property",
+        requestedSchema: { type: "object", required: ["value"], properties: {
+          value: { type: "string" },
+        } },
+      } }}
+      onRespond={onRespond}
+    />);
+    await click(buttonWithText(container, "Submit"));
+    expect(onRespond).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Complete required field value");
+  });
+
   it("exposes the Agent change review as a controlled disclosure", async () => {
     const onToggle = vi.fn();
     const summary = collectReviewChanges([{

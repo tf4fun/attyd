@@ -238,14 +238,14 @@ fn validate_field(name: &str, value: &Value, schema: &Value) -> ValidationResult
         Some("string") => {
             let value = value.as_str().ok_or_else(|| invalid_type(name, "string"))?;
             if let Some(minimum) = optional_safe_length(schema.get("minLength"))?
-                && js_len(value) < minimum
+                && value.chars().count() < minimum
             {
                 return Err(format!(
                     "Elicitation field {name} is shorter than minLength"
                 ));
             }
             if let Some(maximum) = optional_safe_length(schema.get("maxLength"))?
-                && js_len(value) > maximum
+                && value.chars().count() > maximum
             {
                 return Err(format!("Elicitation field {name} is longer than maxLength"));
             }
@@ -714,6 +714,36 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn form_string_lengths_count_unicode_characters() {
+        let mut request = json!({
+            "sessionId": "s", "mode": "form", "message": "One character",
+            "requestedSchema": {"type": "object", "properties": {
+                "value": {"type": "string", "minLength": 1, "maxLength": 1, "default": "😀"}
+            }}
+        });
+        validate_elicitation_request_value(&request).unwrap();
+        validate_elicitation_response_value(
+            &request,
+            &json!({"action": "accept", "content": {"value": "😀"}}),
+        )
+        .unwrap();
+        request["requestedSchema"]["properties"]["value"] =
+            json!({"type": "string", "minLength": 2, "maxLength": 2});
+        assert!(
+            validate_elicitation_response_value(
+                &request,
+                &json!({"action": "accept", "content": {"value": "😀"}}),
+            )
+            .is_err()
+        );
+        validate_elicitation_response_value(
+            &request,
+            &json!({"action": "accept", "content": {"value": "e\u{301}"}}),
+        )
+        .unwrap();
     }
 
     #[test]

@@ -7,6 +7,8 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
 - Display the Agent's `title` without splitting it into invented fields. Use the tool name, category, or “Tool” only when the title is empty.
 - Use `kind` for the icon and category label. Missing or unrecognized categories use the generic icon; they do not select an output schema.
 - Display the reported tool status. Pending can mean streaming input or awaiting permission; do not assume which.
+- If a turn is cancelled while a tool is pending or running, show a local cancelled state instead
+  of an endless spinner. Preserve the Agent's wire status and allow later Agent updates to resolve it.
 - Start cards collapsed and preserve the user's disclosure choice as updates arrive. Expanded titles remain readable at narrow widths.
 
 ## Inputs and results

@@ -37,9 +37,9 @@ describe("browser REST and SSE transport", () => {
     expect(() => strongEtag('bad"revision')).toThrow("History revision");
   });
 
-  it("encodes context search text as a query parameter", () => {
-    expect(workspaceContextSearchPath("src/a.ts & tests"))
-      .toBe("/api/v1/context/search?query=src%2Fa.ts+%26+tests");
+  it("encodes context search text and session identity as query parameters", () => {
+    expect(workspaceContextSearchPath("src/a.ts & tests", "project/session"))
+      .toBe("/api/v1/context/search?query=src%2Fa.ts+%26+tests&sessionId=project%2Fsession");
   });
 
   it("accepts only the global business event vocabulary", () => {
@@ -163,7 +163,10 @@ describe("project navigation", () => {
   const defaultFetch: typeof fetch = async (input, init) => {
     const path = String(input);
     if (path === "/api/v1/runtime") return response({
-      connected: true, generation: 1, hello: null, initialized: null,
+      connected: true, generation: 1, hello: null, initialized: {
+        type: "acp/initialized", response: { protocolVersion: 1,
+          agentCapabilities: { loadSession: true, sessionCapabilities: { list: {}, fork: {} } } },
+      },
       error: null, phase: { type: "bridge/phase", phase: "ready" },
     });
     if (path === "/api/v1/sessions") {
@@ -172,7 +175,7 @@ describe("project navigation", () => {
     }
     if (path === "/api/v1/sessions?cursor=more") return response({ sessions: list.slice(2) });
     if (path.startsWith("/api/v1/sessions/")) {
-      const id = decodeURIComponent(path.slice("/api/v1/sessions/".length));
+      const id = decodeURIComponent(path.split("?")[0].slice("/api/v1/sessions/".length));
       if (id === "missing") return response({ error: "Missing session", code: "session_not_found" }, 404);
       if (id.endsWith("/fork")) return response({ sessionId: "forked", view: sessionView("forked") });
       return response(sessionView(id, list.find(({ sessionId }) => sessionId === id)?.cwd));
@@ -210,6 +213,45 @@ describe("project navigation", () => {
     vi.unstubAllGlobals();
   });
 
+  it("uses new and materialized sessions when the Agent has no list capability", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/runtime") return response({
+        connected: true, generation: 1, hello: null,
+        initialized: { type: "acp/initialized", response: { protocolVersion: 1, agentCapabilities: {} } },
+        error: null, phase: { type: "bridge/phase", phase: "ready" },
+      });
+      if (String(input) === "/api/v1/sessions" && init?.method !== "POST") {
+        throw new Error("A no-list Agent must not be queried for session history");
+      }
+      return defaultFetch(input, init);
+    });
+    await mount("/");
+    expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
+    await act(async () => { expect(acp.newSession("/work/alpha")).toBe(true); });
+    expect(acp.state.session?.sessionId).toBe("created");
+    await restore(sessionPath("created", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("created");
+    expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
+    expect(fetchMock.mock.calls.filter(([path, init]) => path === "/api/v1/sessions" && init?.method !== "POST")).toHaveLength(0);
+  });
+
+  it("restores a load-only Agent session using the shared route workspace", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/runtime") return response({
+        connected: true, generation: 1, hello: null,
+        initialized: { type: "acp/initialized", response: { protocolVersion: 1, agentCapabilities: { loadSession: true } } },
+        error: null, phase: { type: "bridge/phase", phase: "ready" },
+      });
+      if (String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha") return response(sessionView("alpha-one"));
+      if (String(input).startsWith("/api/v1/sessions")) throw new Error(`Unexpected cold request: ${String(input)}`);
+      return defaultFetch(input, init);
+    });
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
+    expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
+  });
+
   it("loads every project list page without opening a conversation", async () => {
     await mount(projectPath("/work/alpha"));
     expect(acp.projectCwd).toBe("/work/alpha");
@@ -219,6 +261,41 @@ describe("project navigation", () => {
       "/api/v1/runtime", "/api/v1/sessions", "/api/v1/sessions?cursor=more",
     ]);
     expect(window.location.pathname).toBe(projectPath("/work/alpha"));
+  });
+
+  it("offers the route workspace for an ID absent from an available session list", async () => {
+    await mount(sessionPath("unlisted", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("unlisted");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/unlisted?cwd=%2Fwork%2Falpha");
+  });
+
+  it("keeps listed route workspaces available to both view and stream after other observers refresh", async () => {
+    await mount(sessionPath("alpha-one", "/work/wrong"));
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
+    expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha");
+  });
+
+  it("passes the selected workspace on ordinary session clicks for view and stream", async () => {
+    await mount(projectPath("/work/alpha"));
+    await act(async () => acp.attachSession(list[0]));
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
+    expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha");
+  });
+
+  it("explains why a fork without history loading is unavailable before posting", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/runtime") return response({
+        connected: true, generation: 1, hello: null,
+        initialized: { type: "acp/initialized", response: { protocolVersion: 1,
+          agentCapabilities: { sessionCapabilities: { fork: {} } } } },
+        error: null, phase: { type: "bridge/phase", phase: "ready" },
+      });
+      return defaultFetch(input, init);
+    });
+    await mount(sessionPath("created", "/work/alpha"));
+    await act(async () => acp.forkSession());
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/fork"))).toBe(false);
+    expect(JSON.stringify(acp.state.timeline)).toContain("Forking requires Agent history loading");
   });
 
   it("canonicalizes legacy and mismatched project links using the Agent workspace", async () => {
@@ -232,9 +309,26 @@ describe("project navigation", () => {
     expect(window.location.pathname).toBe(sessionPath("beta-one", "/work/beta"));
   });
 
+  it("searches workspace context in the selected session after changing projects", async () => {
+    fetchMock.mockImplementation(async (input, init) => String(input).startsWith("/api/v1/context/search?")
+      ? response({ matches: [] })
+      : defaultFetch(input, init));
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    await acp.searchWorkspaceContext("src");
+    await act(async () => acp.attachSession(list[1]));
+    await acp.searchWorkspaceContext("src");
+    expect(fetchMock.mock.calls.map(([path]) => path).filter((path) => String(path).startsWith("/api/v1/context/search?")))
+      .toEqual([
+        "/api/v1/context/search?query=src&sessionId=alpha-one",
+        "/api/v1/context/search?query=src&sessionId=beta-one",
+      ]);
+    await act(async () => acp.openProject("/work/alpha"));
+    await expect(acp.searchWorkspaceContext("src")).rejects.toThrow("active ACP session");
+  });
+
   it("applies versioned terminal output and release without fetching the session for each delta", async () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
-    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
     const emit = async (event: unknown) => act(async () => source.onmessage?.({ data: JSON.stringify(event) }));
     await emit(terminalDelta({ ...terminalSnapshot({ output: "starting\n" }) }));
     expect(acp.state.terminalSnapshots).toHaveLength(1);
@@ -252,12 +346,12 @@ describe("project navigation", () => {
       type: "bridge/session_reset", bridgeEpoch: "epoch", sessionId: "alpha-one",
       sessionIncarnation: 1, viewRevision: 4,
     });
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(1);
   });
 
   it("merges raw UTF-8 fragments and trims retained output by bytes", async () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
-    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
     const emit = async (terminal: TerminalSnapshot, revision: number) => act(async () =>
       source.onmessage?.({ data: JSON.stringify(terminalDelta({ ...terminal }, revision)) }));
     await emit(terminalSnapshot({ output: "old🙂" }), 1);
@@ -275,7 +369,7 @@ describe("project navigation", () => {
     await emit(terminalSnapshot({ output: "🙂好", retainedBytes: 5, truncated: true }), 6);
     expect(acp.state.terminalSnapshots[0].output).toBe("好");
     expect(acp.state.terminalSnapshots[0].retainedBytes).toBe(3);
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(1);
   });
 
   it.each([
@@ -284,22 +378,22 @@ describe("project navigation", () => {
     { sessionIncarnation: 2 },
   ])("refreshes terminal state after a delta version mismatch: %j", async (mismatch) => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
-    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
     const authoritative = terminalSnapshot({ output: "authoritative output", released: true });
-    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one"
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha"
       ? response({ ...sessionView("alpha-one"), viewRevision: 8, terminals: { "terminal-1": authoritative } })
       : defaultFetch(input, init));
     await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta(
       { ...terminalSnapshot({ output: "out of order", outputAppend: true }) }, 1, mismatch,
     )) }));
     expect(acp.state.terminalSnapshots).toEqual([authoritative]);
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(2);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(2);
   });
 
   it("recovers a missing append base and resumes from authoritative snapshot bytes", async () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
-    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
-    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one"
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha"
       ? response({ ...sessionView("alpha-one"), viewRevision: 2, terminals: {
         "terminal-1": terminalSnapshot({ output: "", outputBytes: "5A==" }),
       } })
@@ -311,12 +405,12 @@ describe("project navigation", () => {
       ...terminalSnapshot({ output: "", outputBytes: "uK0=", outputAppend: true, retainedBytes: 3 }),
     }, 2)) }));
     expect(acp.state.terminalSnapshots[0].output).toBe("中");
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(2);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(2);
   });
 
   it("rejects cross-session and malformed terminal deltas without advancing the active view", async () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
-    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
     await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta({
       ...terminalSnapshot({ output: "different active session", sessionId: "beta-one" }),
     }, 1, { sessionId: "beta-one" })) }));
@@ -331,7 +425,7 @@ describe("project navigation", () => {
       ...terminalSnapshot({ output: "accepted" }),
     })) }));
     expect(acp.state.terminalSnapshots[0].output).toBe("accepted");
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(1);
   });
 
   it("tracks home, project and session navigation without selecting project sessions", async () => {
@@ -402,7 +496,7 @@ describe("project navigation", () => {
         intentId = new Headers(init?.headers).get("Idempotency-Key");
         return response({ operationId: "turn-1", disposition: "accepted", status: "running" });
       }
-      if (String(input) === "/api/v1/sessions/alpha-one" && admitted) {
+      if (String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha" && admitted) {
         const view = sessionView("alpha-one");
         view.viewRevision = completed ? 3 : 2;
         view.phase = completed ? "ready" : "running";
@@ -426,7 +520,7 @@ describe("project navigation", () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
     await act(async () => { expect(acp.prompt([{ type: "text", text: "Keep working" }])).toBe(true); });
     expect(acp.state.running).toBe(true);
-    const previousStream = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const previousStream = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
     await act(async () => acp.openProject("/work/alpha"));
     expect(previousStream.readyState).toBe(TestEventSource.CLOSED);
     expect(acp.state.session).toBeUndefined();
@@ -438,7 +532,7 @@ describe("project navigation", () => {
     expect(acp.state.sessionSyncPhase).toBe(returnPhase);
     expect(acp.state.timeline.filter((item) => item.type === "message" &&
       (item.role === "user" || item.role === "protocol-user"))).toHaveLength(1);
-    const restoredStream = TestEventSource.instances.filter(({ url }) => url.endsWith("alpha-one/events")).at(-1)!;
+    const restoredStream = TestEventSource.instances.filter(({ url }) => url.split("?")[0].endsWith("alpha-one/events")).at(-1)!;
     expect(restoredStream).not.toBe(previousStream);
     expect(restoredStream.readyState).not.toBe(TestEventSource.CLOSED);
     if (returnPhase === "running") {

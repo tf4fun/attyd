@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ServerEvent } from "../shared/bridge";
+import type { SessionUpdate } from "@agentclientprotocol/sdk";
+import type { BridgeSessionView } from "../web/src/lib/business-api";
 import { appReducer, initialState, type AppState } from "../web/src/lib/state";
 
 function event(value: ServerEvent) {
@@ -7,6 +9,72 @@ function event(value: ServerEvent) {
 }
 
 describe("ACP UI state", () => {
+  it("rebuilds cancelled tool display from completed and reconciling memory views", () => {
+    const updates: SessionUpdate[] = [
+      { sessionUpdate: "user_message_chunk", content: { type: "text", text: "Run" } },
+      { sessionUpdate: "tool_call", toolCallId: "tool", title: "Run", status: "in_progress" },
+    ];
+    const view: BridgeSessionView = {
+      bridgeEpoch: "epoch", sessionId: "s1", sessionIncarnation: 1, viewRevision: 3,
+      historyRevision: "revision", phase: "ready", syncError: null,
+      timeline: updates, turnOutcomes: [{ operationId: "op", afterUpdate: 2, response: { stopReason: "cancelled" } }],
+      activeTurn: null, workspace: { cwd: "/workspace", session: {} }, controls: {},
+      interactions: { permissions: {}, elicitations: {}, urlFlows: {} }, operation: null, terminals: {},
+    };
+    const completed = appReducer(initialState, { type: "bridge/session_hydrate", view });
+    expect(completed.timeline.find((item) => item.type === "tool")).toMatchObject({ cancelled: true, call: { status: "in_progress" } });
+    const reconciling = appReducer(initialState, { type: "bridge/session_hydrate", view: {
+      ...view, phase: "reconciling", timeline: [], turnOutcomes: [], activeTurn: {
+        operationId: "op", clientIntentId: "intent", prompt: [{ type: "text", text: "Run" }], updates: updates.slice(1), terminal: { stopReason: "cancelled" },
+      },
+    } });
+    expect(reconciling.timeline.find((item) => item.type === "tool")).toMatchObject({ cancelled: true, call: { status: "in_progress" } });
+  });
+  it("starts a reused URL elicitation ID as a new flow", () => {
+    let state: AppState = { ...initialState, session: { sessionId: "s1" }, externalFlows: [{ elicitationId: "flow", message: "Old", status: "completed" }] };
+    state = appReducer(state, event({ type: "acp/elicitation_request", elicitationId: "request-new", request: { sessionId: "s1", mode: "url", elicitationId: "flow", message: "New", url: "https://example.com/new" } }));
+    state = appReducer(state, event({ type: "acp/elicitation_resolved", elicitationId: "request-new", response: { action: "accept" } }));
+    expect(state.externalFlows).toEqual([{ elicitationId: "flow", sessionId: "s1", message: "New", url: "https://example.com/new", status: "waiting" }]);
+  });
+  it("keeps identified messages in their first position around compaction and preserves annotations", () => {
+    let state: AppState = { ...initialState, session: { sessionId: "s1" } };
+    for (const update of [
+      { sessionUpdate: "agent_message_chunk", messageId: "m", content: { type: "text", text: "A", annotations: { audience: ["user"] } } },
+      { sessionUpdate: "compaction_update", compactionId: "c", status: "in_progress" },
+      { sessionUpdate: "agent_message_chunk", messageId: "m", content: { type: "text", text: "B", annotations: { audience: ["assistant"] } } },
+      { sessionUpdate: "agent_message_chunk", messageId: "m", content: { type: "text", text: "C", annotations: { audience: ["assistant"] } } },
+    ] satisfies SessionUpdate[]) {
+      state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update } }));
+    }
+    expect(state.timeline).toHaveLength(2);
+    expect(state.timeline[0]).toMatchObject({ type: "assistant", chunks: [{ messageId: "m", blocks: [
+      { type: "text", text: "A", annotations: { audience: ["user"] } },
+      { type: "text", text: "BC", annotations: { audience: ["assistant"] } },
+    ] }] });
+    expect(state.timeline[1]).toMatchObject({ type: "compaction", compactionId: "c" });
+  });
+
+  it("matches every block of one optimistic prompt echo without duplicating attachments", () => {
+    const blocks = [{ type: "text" as const, text: "Inspect" }, { type: "resource_link" as const, uri: "file:///file", name: "file" }];
+    let state: AppState = { ...initialState, session: { sessionId: "s1" }, timeline: [{ id: "local", type: "message", role: "user", blocks, raw: [] }] };
+    for (const content of blocks) {
+      state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "user_message_chunk", messageId: "echo", content } } }));
+    }
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({ role: "user", messageId: "echo", blocks, raw: [expect.anything(), expect.anything()] });
+  });
+
+  it("derives cancellation for unfinished tools and accepts later session-scoped completion", () => {
+    let state: AppState = { ...initialState, session: { sessionId: "s1" }, pendingPrompt: { requestId: "p", sessionId: "s1", blocks: [] }, running: true };
+    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: "Run", status: "in_progress" } } }));
+    state = appReducer(state, event({ type: "acp/prompt_complete", sessionId: "s1", requestId: "p", response: { stopReason: "cancelled" } }));
+    expect(state.timeline[0]).toMatchObject({ type: "tool", cancelled: true, call: { status: "in_progress" } });
+    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "next" } } } }));
+    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "tool_call_update", toolCallId: "tool", status: "completed" } } }));
+    expect(state.timeline.filter((item) => item.type === "tool")).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({ type: "tool", call: { title: "Run", status: "completed" } });
+    expect(state.timeline[0]).not.toHaveProperty("cancelled", true);
+  });
   it("keeps the active project's cwd when connection metadata refreshes", () => {
     const state = appReducer({
       ...initialState, session: { sessionId: "other" }, cwd: "/projects/other",
@@ -601,6 +669,16 @@ describe("ACP UI state", () => {
     }));
     expect(state.authStatus).toBe("logged_out");
     expect(state.timeline).toEqual([]);
+  });
+
+  it("exposes auth controls for logout without assuming external sign-in state", () => {
+    const state = appReducer(initialState, event({
+      type: "acp/initialized",
+      response: { protocolVersion: 1, authMethods: [], agentCapabilities: { auth: { logout: {} } } },
+    }));
+    expect(state.authStatus).toBe("available");
+    expect(state.initialized?.authMethods).toEqual([]);
+    expect(state.lastAuthResponse).toBeUndefined();
   });
 
   it("turns auth_required into a recoverable Agent sign-in state", () => {
@@ -1868,7 +1946,7 @@ describe("ACP UI state", () => {
     }
   });
 
-  it("starts a new assistant entry after an interleaved tool event", () => {
+  it("keeps a message ID at its first position across an interleaved tool event", () => {
     let state = appReducer(
       { ...initialState, session: { sessionId: "s1" } },
       event({
@@ -1906,15 +1984,12 @@ describe("ACP UI state", () => {
       },
     }));
 
-    expect(state.timeline).toHaveLength(3);
+    expect(state.timeline).toHaveLength(2);
     expect(state.timeline[0]).toMatchObject({
       type: "assistant",
-      chunks: [{ messageId: "m1", blocks: [{ type: "text", text: "before " }] }],
+      chunks: [{ messageId: "m1", blocks: [{ type: "text", text: "before after" }] }],
     });
-    expect(state.timeline[2]).toMatchObject({
-      type: "assistant",
-      chunks: [{ messageId: "m1", blocks: [{ type: "text", text: "after" }] }],
-    });
+    expect(state.timeline[1]).toMatchObject({ type: "tool" });
   });
 
   it("merges anonymous adjacent chunks with an identified message like Zed", () => {
@@ -2033,7 +2108,7 @@ describe("ACP UI state", () => {
     expect(tools[1].raw).toHaveLength(2);
   });
 
-  it("does not apply a new turn's unknown tool update to a previous turn", () => {
+  it("applies an update to the session's tool even after another prompt starts", () => {
     const state = appReducer({
       ...initialState,
       session: { sessionId: "s1" },
@@ -2049,8 +2124,8 @@ describe("ACP UI state", () => {
       },
     }));
 
-    expect(state.timeline[0]).toMatchObject({ call: { title: "Previous edit" } });
-    expect(state.timeline.at(-1)).toMatchObject({ call: { title: "Tool call not found", status: "failed" } });
+    expect(state.timeline).toHaveLength(2);
+    expect(state.timeline[0]).toMatchObject({ call: { title: "Previous edit", status: "completed" } });
   });
 
   it("renders a failed placeholder for a tool update without a creation", () => {

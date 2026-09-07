@@ -84,8 +84,14 @@ button takes a conversation to its project and a project to the homepage.
 
 The homepage's new-project dialog starts with `--cwd` for stdio and an empty
 directory for remote Agents. Remote paths refer to the Agent's machine.
-Existing sessions keep their Agent-owned directory when loaded, resumed, or
-forked; discovery is not filtered by attyd's startup directory.
+Existing sessions keep their Agent-owned directory when loaded or forked;
+discovery is not filtered by attyd's startup directory. A known project/session
+link can load history even when the Agent does not provide a session list.
+
+Cold history recovery requires `loadSession`. The browser does not currently
+offer a transcript-free `session/resume` flow, and its fork action requires both
+fork and load support so that the inherited history can be shown. These are
+explicit experience choices; see [difference decisions](acp-difference-decisions.md).
 
 Projects and sessions are ordered by recent activity. Homepage search and counts
 cover loaded metadata; use **Load more** to discover additional projects.
@@ -94,6 +100,11 @@ Project and conversation routes fetch further metadata pages as needed.
 Leaving a conversation does not cancel running work. Browser reconnection can
 recover the host's in-memory session state, but restarting attyd discards that
 state. Durable history and restoration support belong to the Agent.
+
+attyd does not provide a persistent conversation database, an editor with unsaved
+buffers, NES/document synchronization, model-provider credential management, or
+vendor-specific tool/history interpretation. Missing historical terminal output
+is shown as unavailable; old commands are never re-executed to reconstruct it.
 
 ## Terminal command semantics
 
