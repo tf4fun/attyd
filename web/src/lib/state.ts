@@ -9,7 +9,6 @@ import type {
   InitializeResponse,
   NewSessionResponse,
   LogoutResponse,
-  NesSuggestion,
   PromptResponse,
   RequestPermissionRequest,
   SessionConfigOption,
@@ -22,7 +21,6 @@ import type {
 import type {
   AgentTransport,
   ConnectionPhase,
-  NesDocumentState,
   ServerEvent,
   SessionRuntimeOperation,
   TerminalSnapshot,
@@ -220,23 +218,6 @@ export interface AuthTerminalState {
   message?: string;
 }
 
-export interface PendingNesAccept {
-  requestId: string;
-  sessionId: string;
-  suggestionId: string;
-  uri?: string;
-  previousDraft?: string;
-  optimisticText?: string;
-  documentAcknowledged: boolean;
-}
-
-export interface PendingNesSuggestion {
-  requestId: string;
-  sessionId: string;
-  uri: string;
-  triggerKind: "automatic" | "diagnostic" | "manual";
-}
-
 export interface AppState {
   phase: ConnectionPhase;
   socketOpen: boolean;
@@ -286,14 +267,6 @@ export interface AppState {
   title?: string;
   usage?: { used: number; size: number; cost?: { amount: number; currency: string } | null };
   activePlan?: Extract<TimelineItem, { type: "plan" }>;
-  nesSessionId?: string;
-  nesDocuments: NesDocumentState[];
-  nesDrafts: Record<string, string>;
-  pendingNesSuggestion?: PendingNesSuggestion;
-  pendingNesAccept?: PendingNesAccept;
-  nesError?: string;
-  activeNesUri?: string;
-  nesSuggestions: NesSuggestion[];
 }
 
 export type AppAction =
@@ -363,22 +336,6 @@ export type AppAction =
       sessionId: string;
       kind: PendingSessionControl["kind"];
     }
-  | { type: "nes/local_change"; uri: string; text: string }
-  | {
-      type: "nes/accept_start";
-      requestId: string;
-      sessionId: string;
-      suggestionId: string;
-      text?: string;
-    }
-  | { type: "nes/select_document"; uri: string }
-  | {
-      type: "nes/suggest_start";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-      triggerKind: PendingNesSuggestion["triggerKind"];
-    }
   | { type: "session/reset" }
   | { type: "session/deselect" }
   | { type: "session/activate_cached"; sessionId: string };
@@ -410,9 +367,6 @@ export const initialState: AppState = {
   backgroundEvents: [],
   stderr: "",
   running: false,
-  nesDocuments: [],
-  nesDrafts: {},
-  nesSuggestions: [],
 };
 
 function withoutRuntimeReplacement(state: AppState): AppState {
@@ -491,15 +445,6 @@ function isRuntimeReplacementEvent(event: ServerEvent): boolean {
     case "acp/elicitation_aborted":
     case "acp/mode_changed":
     case "acp/config_changed":
-    case "acp/nes_started":
-    case "acp/nes_suggestions":
-    case "acp/nes_suggestion_resolved":
-    case "acp/nes_closed":
-    case "acp/document_opened":
-    case "acp/document_changed":
-    case "acp/document_saved":
-    case "acp/document_focused":
-    case "acp/document_closed":
       return true;
     default:
       return false;
@@ -740,66 +685,6 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           kind: action.kind,
         },
       };
-    case "nes/local_change":
-      return {
-        ...state,
-        nesDrafts: { ...state.nesDrafts, [action.uri]: action.text },
-        nesSuggestions: state.nesSuggestions.filter(
-          (suggestion) => suggestion.uri !== action.uri,
-        ),
-        pendingNesSuggestion: state.pendingNesSuggestion?.uri === action.uri
-          ? undefined
-          : state.pendingNesSuggestion,
-        nesError: undefined,
-      };
-    case "nes/accept_start": {
-      if (
-        state.pendingNesAccept != null ||
-        state.nesSessionId !== action.sessionId
-      ) return state;
-      const suggestion = state.nesSuggestions.find(
-        ({ id }) => id === action.suggestionId,
-      );
-      if (!suggestion) return state;
-      if (suggestion.kind === "edit" && action.text == null) return state;
-      if (suggestion.kind !== "edit" && action.text != null) return state;
-      const uri = suggestion.kind === "edit" ? suggestion.uri : undefined;
-      return {
-        ...state,
-        nesDrafts: uri == null
-          ? state.nesDrafts
-          : { ...state.nesDrafts, [uri]: action.text! },
-        pendingNesAccept: {
-          requestId: action.requestId,
-          sessionId: action.sessionId,
-          suggestionId: action.suggestionId,
-          uri,
-          previousDraft: uri == null ? undefined : state.nesDrafts[uri],
-          optimisticText: uri == null ? undefined : action.text,
-          documentAcknowledged: false,
-        },
-      };
-    }
-    case "nes/select_document":
-      return state.nesDocuments.some(({ uri }) => uri === action.uri)
-        ? { ...state, activeNesUri: action.uri }
-        : state;
-    case "nes/suggest_start":
-      if (
-        state.nesSessionId !== action.sessionId ||
-        state.pendingNesAccept != null
-      ) return state;
-      return {
-        ...state,
-        nesSuggestions: [],
-        pendingNesSuggestion: {
-          requestId: action.requestId,
-          sessionId: action.sessionId,
-          uri: action.uri,
-          triggerKind: action.triggerKind,
-        },
-        nesError: undefined,
-      };
     case "session/reset":
       return resetActiveSession(state);
     case "session/deselect":
@@ -902,7 +787,6 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
       return state;
     case "bridge/runtime_snapshot":
     case "bridge/runtime_delta":
-    case "bridge/intent_ack":
       // The canonical stream is running in shadow mode until the backend
       // state-machine and transport gates are complete. Legacy ACP events
       // remain the renderer's source during this migration phase.
@@ -929,10 +813,6 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         }),
         event,
       );
-    case "bridge/pong":
-      // Liveness probes are consumed by useAcp before reducer dispatch. Keep
-      // this harmless for callers that replay every validated server event.
-      return state;
     case "bridge/phase":
       const terminalPhase = event.phase === "error" || event.phase === "stopped";
       return terminalPhase
@@ -1056,32 +936,6 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         };
       }
       if (event.requestId != null) {
-        if (
-          event.operation === "nes/accept" &&
-          state.pendingNesAccept?.requestId === event.requestId
-        ) {
-          const restored = rollbackPendingNesAccept(state);
-          return {
-            ...restored,
-            timeline: [
-              ...restored.timeline,
-              errorTimelineItem(event),
-            ],
-          };
-        }
-        if (
-          event.operation === "nes/suggest" &&
-          state.pendingNesSuggestion?.requestId === event.requestId
-        ) {
-          return {
-            ...state,
-            pendingNesSuggestion: undefined,
-            nesError: event.message,
-          };
-        }
-        if (event.operation === "nes/suggest") {
-          return appendBackgroundEvent(state, event);
-        }
         if (
           event.operation === "session/prompt" &&
           state.pendingPrompt?.requestId === event.requestId
@@ -1597,122 +1451,6 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         ...state,
         mcpActivity: [...state.mcpActivity, event].slice(-100),
       };
-    case "acp/nes_started":
-      return {
-        ...state,
-        nesSessionId: event.response.sessionId,
-        nesDocuments: [],
-        nesDrafts: {},
-        pendingNesSuggestion: undefined,
-        pendingNesAccept: undefined,
-        nesError: undefined,
-        activeNesUri: undefined,
-        nesSuggestions: [],
-      };
-    case "acp/nes_suggestions":
-      if (
-        state.nesSessionId !== event.sessionId ||
-        state.pendingNesSuggestion?.requestId !== event.requestId ||
-        state.pendingNesSuggestion.uri !== event.uri
-      ) return appendBackgroundEvent(state, event);
-      return {
-        ...state,
-        nesSuggestions: event.response.suggestions,
-        pendingNesSuggestion: undefined,
-        nesError: undefined,
-      };
-    case "acp/nes_suggestion_resolved": {
-      if (state.nesSessionId !== event.sessionId) {
-        return appendBackgroundEvent(state, event);
-      }
-      const next = {
-        ...state,
-        nesSuggestions: state.nesSuggestions.filter(
-          ({ id }) => id !== event.suggestionId,
-        ),
-      };
-      const pending = state.pendingNesAccept;
-      if (
-        pending?.requestId !== event.requestId ||
-        pending.sessionId !== event.sessionId ||
-        pending.suggestionId !== event.suggestionId
-      ) return next;
-      if (event.outcome === "rejected") return rollbackPendingNesAccept(next);
-      if (pending.optimisticText != null && !pending.documentAcknowledged) {
-        const restored = rollbackPendingNesAccept(next);
-        return {
-          ...restored,
-          timeline: [
-            ...restored.timeline,
-            {
-              id: randomId(),
-              type: "error",
-              message: "NES edit was accepted without a matching document acknowledgement",
-            },
-          ],
-        };
-      }
-      return { ...next, pendingNesAccept: undefined };
-    }
-    case "acp/nes_closed":
-      return state.nesSessionId === event.sessionId
-        ? {
-            ...state,
-            nesSessionId: undefined,
-            nesDocuments: [],
-            nesDrafts: {},
-            pendingNesSuggestion: undefined,
-            pendingNesAccept: undefined,
-            nesError: undefined,
-            activeNesUri: undefined,
-            nesSuggestions: [],
-          }
-        : appendBackgroundEvent(state, event);
-    case "acp/document_opened":
-      return state.nesSessionId === event.document.sessionId
-        ? {
-            ...state,
-            nesDocuments: upsertNesDocument(state.nesDocuments, event.document),
-            activeNesUri: event.document.uri,
-          }
-        : appendBackgroundEvent(state, event);
-    case "acp/document_changed":
-      if (state.nesSessionId !== event.document.sessionId) {
-        return appendBackgroundEvent(state, event);
-      }
-      const pendingAccept = state.pendingNesAccept;
-      const acknowledgesPendingAccept =
-        pendingAccept?.requestId === event.requestId &&
-        pendingAccept.sessionId === event.document.sessionId &&
-        pendingAccept.uri === event.document.uri &&
-        pendingAccept.optimisticText === event.document.text;
-      return {
-        ...state,
-        nesDocuments: upsertNesDocument(state.nesDocuments, event.document),
-        nesDrafts: clearAcknowledgedDraft(
-          state.nesDrafts,
-          event.document.uri,
-          event.document.text,
-        ),
-        pendingNesAccept: acknowledgesPendingAccept
-          ? { ...pendingAccept, documentAcknowledged: true }
-          : pendingAccept,
-        activeNesUri: event.document.uri,
-      };
-    case "acp/document_saved":
-    case "acp/document_focused": {
-      const sessionId = event.type === "acp/document_saved"
-        ? event.sessionId
-        : event.notification.sessionId;
-      return state.nesSessionId === sessionId
-        ? state
-        : appendBackgroundEvent(state, event);
-    }
-    case "acp/document_closed":
-      if (state.nesSessionId !== event.sessionId) {
-        return appendBackgroundEvent(state, event);
-      }
-      return removeNesDocument(state, event.uri);
   }
 
   return assertNever(event, "attyd server event reducer");
@@ -2365,14 +2103,6 @@ function terminateBridgeState(
         },
     pendingPrompt: undefined,
     runtimeOperation: undefined,
-    nesSessionId: undefined,
-    nesDocuments: [],
-    nesDrafts: {},
-    pendingNesSuggestion: undefined,
-    pendingNesAccept: undefined,
-    nesError: undefined,
-    activeNesUri: undefined,
-    nesSuggestions: [],
     terminalSnapshots: current.terminalSnapshots.map((terminal) => ({
       ...terminal,
       released: true,
@@ -2444,12 +2174,6 @@ function settleAuthenticationRequired(
       pendingSessionDeletions: next.pendingSessionDeletions.filter(
         (pending) => pending.requestId !== requestId,
       ),
-      pendingNesAccept: next.pendingNesAccept?.requestId === requestId
-        ? undefined
-        : next.pendingNesAccept,
-      pendingNesSuggestion: next.pendingNesSuggestion?.requestId === requestId
-        ? undefined
-        : next.pendingNesSuggestion,
     };
   }
   return {
@@ -3192,65 +2916,6 @@ function mergeSessions(current: SessionInfo[], incoming: SessionInfo[]): Session
   const sessions = new Map(current.map((session) => [session.sessionId, session]));
   for (const session of incoming) sessions.set(session.sessionId, session);
   return [...sessions.values()];
-}
-
-function upsertNesDocument(
-  documents: NesDocumentState[],
-  next: NesDocumentState,
-): NesDocumentState[] {
-  const index = documents.findIndex(({ uri }) => uri === next.uri);
-  if (index < 0) return [...documents, next];
-  const result = [...documents];
-  result[index] = next;
-  return result;
-}
-
-function removeNesDocument(state: AppState, uri: string): AppState {
-  const documents = state.nesDocuments.filter((document) => document.uri !== uri);
-  return {
-    ...state,
-    nesDocuments: documents,
-    nesDrafts: omitKey(state.nesDrafts, uri),
-    pendingNesSuggestion: state.pendingNesSuggestion?.uri === uri
-      ? undefined
-      : state.pendingNesSuggestion,
-    pendingNesAccept: state.pendingNesAccept?.uri === uri
-      ? undefined
-      : state.pendingNesAccept,
-    activeNesUri: state.activeNesUri === uri ? documents.at(-1)?.uri : state.activeNesUri,
-    nesSuggestions: state.nesSuggestions.filter((suggestion) => suggestion.uri !== uri),
-  };
-}
-
-function rollbackPendingNesAccept(state: AppState): AppState {
-  const pending = state.pendingNesAccept;
-  if (!pending) return state;
-  let nesDrafts = state.nesDrafts;
-  if (
-    pending.uri != null &&
-    pending.optimisticText != null &&
-    nesDrafts[pending.uri] === pending.optimisticText
-  ) {
-    nesDrafts = pending.previousDraft == null
-      ? omitKey(nesDrafts, pending.uri)
-      : { ...nesDrafts, [pending.uri]: pending.previousDraft };
-  }
-  return { ...state, nesDrafts, pendingNesAccept: undefined };
-}
-
-function clearAcknowledgedDraft(
-  drafts: Record<string, string>,
-  uri: string,
-  acknowledgedText: string,
-): Record<string, string> {
-  return drafts[uri] === acknowledgedText ? omitKey(drafts, uri) : drafts;
-}
-
-function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
-  if (!(key in record)) return record;
-  const next = { ...record };
-  delete next[key];
-  return next;
 }
 
 function tail(value: string, max: number): string {

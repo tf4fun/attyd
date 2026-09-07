@@ -2,14 +2,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuntimeLimits {
     pub max_delta_events: usize,
     pub max_delta_bytes: usize,
-    pub max_intent_records: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -17,7 +15,6 @@ impl Default for RuntimeLimits {
         Self {
             max_delta_events: 4_096,
             max_delta_bytes: 16 * 1024 * 1024,
-            max_intent_records: 4_096,
         }
     }
 }
@@ -167,19 +164,6 @@ pub(crate) enum RuntimeChange {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ClientIntentKey {
-    client_intent_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum IntentStatus {
-    Accepted,
-    InFlight,
-    Uncertain,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InteractionResolution {
     Applied,
@@ -233,25 +217,6 @@ pub(crate) enum RuntimeEffect {
     },
 }
 
-#[derive(Debug, Clone)]
-struct IntentRecord {
-    payload_digest: [u8; 32],
-    operation_id: String,
-    status: IntentStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum IntentAck {
-    Accepted {
-        operation_id: String,
-    },
-    Duplicate {
-        operation_id: String,
-        status: IntentStatus,
-    },
-    Collision,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeStateError {
     EpochMismatch,
@@ -272,13 +237,11 @@ pub(crate) struct RuntimeState {
     seq: u64,
     connection_revision: u64,
     next_incarnation: u64,
-    next_operation_id: u64,
     sessions: BTreeMap<String, SessionRuntime>,
     request_elicitations: BTreeMap<String, PendingInteraction>,
     request_url_flows: BTreeMap<String, UrlFlow>,
     resolved_request_elicitations: VecDeque<String>,
     resolved_request_url_flows: VecDeque<String>,
-    intents: BTreeMap<ClientIntentKey, IntentRecord>,
     effects: VecDeque<RuntimeEffect>,
     delta_journal: VecDeque<RuntimeDelta>,
     delta_bytes: usize,
@@ -298,13 +261,11 @@ impl RuntimeState {
             seq: 0,
             connection_revision: 0,
             next_incarnation: 0,
-            next_operation_id: 0,
             sessions: BTreeMap::new(),
             request_elicitations: BTreeMap::new(),
             request_url_flows: BTreeMap::new(),
             resolved_request_elicitations: VecDeque::new(),
             resolved_request_url_flows: VecDeque::new(),
-            intents: BTreeMap::new(),
             effects: VecDeque::new(),
             delta_journal: VecDeque::new(),
             delta_bytes: 0,
@@ -351,75 +312,8 @@ impl RuntimeState {
         self.sessions.get(session_id)
     }
 
-    pub(crate) fn intent_status(&self, operation_id: &str) -> Option<IntentStatus> {
-        self.intents
-            .values()
-            .find(|intent| intent.operation_id == operation_id)
-            .map(|intent| intent.status.clone())
-    }
-
     pub(crate) fn take_effects(&mut self) -> Vec<RuntimeEffect> {
         self.effects.drain(..).collect()
-    }
-
-    pub(crate) fn accept_intent(
-        &mut self,
-        expected_epoch: &str,
-        _subscriber_id: u64,
-        client_intent_id: impl Into<String>,
-        payload: impl AsRef<str>,
-    ) -> Result<IntentAck, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let key = ClientIntentKey {
-            client_intent_id: client_intent_id.into(),
-        };
-        let payload_digest: [u8; 32] = Sha256::digest(payload.as_ref().as_bytes()).into();
-        if let Some(existing) = self.intents.get(&key) {
-            return Ok(if existing.payload_digest == payload_digest {
-                IntentAck::Duplicate {
-                    operation_id: existing.operation_id.clone(),
-                    status: existing.status.clone(),
-                }
-            } else {
-                IntentAck::Collision
-            });
-        }
-        if !self.reserve_intent_record_capacity() {
-            return Err(RuntimeStateError::ResourceLimit);
-        }
-        self.next_operation_id = self.next_operation_id.wrapping_add(1).max(1);
-        let operation_id = format!("{}:{}", self.epoch, self.next_operation_id);
-        self.intents.insert(
-            key,
-            IntentRecord {
-                payload_digest,
-                operation_id: operation_id.clone(),
-                status: IntentStatus::Accepted,
-            },
-        );
-        Ok(IntentAck::Accepted { operation_id })
-    }
-
-    pub(crate) fn reject_intent(
-        &mut self,
-        expected_epoch: &str,
-        operation_id: &str,
-        _session_id: Option<String>,
-        _reason: Value,
-    ) -> Result<(), RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let Some(intent) = self
-            .intents
-            .values_mut()
-            .find(|intent| intent.operation_id == operation_id)
-        else {
-            return Err(RuntimeStateError::OperationMismatch);
-        };
-        if intent.status != IntentStatus::Accepted {
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        self.retire_intent(operation_id);
-        Ok(())
     }
 
     pub(crate) fn open_new_with_replay(
@@ -497,7 +391,7 @@ impl RuntimeState {
                 attachment_candidate_bytes: 0,
             },
         );
-        self.set_intent_status(&operation_id, IntentStatus::InFlight);
+
         self.commit_session(&session_id);
         Ok(incarnation)
     }
@@ -539,7 +433,7 @@ impl RuntimeState {
             uncertainty_reason: None,
         });
         session.attachment_candidate_bytes = 0;
-        self.set_intent_status(&operation_id, IntentStatus::InFlight);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -608,7 +502,7 @@ impl RuntimeState {
         session.control_state = extract_control_state(candidate);
         session.session = response;
         session.operation = None;
-        self.retire_intent(operation_id);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -635,7 +529,7 @@ impl RuntimeState {
         session.attachment_candidate.clear();
         session.attachment_candidate_bytes = 0;
         session.operation = None;
-        self.retire_intent(operation_id);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -671,7 +565,7 @@ impl RuntimeState {
         session.session = response;
         session.lifecycle = SessionLifecycle::Active;
         session.operation = None;
-        self.retire_intent(operation_id);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -701,10 +595,10 @@ impl RuntimeState {
             .sessions
             .remove(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        let (queued, effects) = drain_session_liveness(session_id, &mut session);
-        self.retire_intents(queued);
+        let effects = drain_session_liveness(session_id, &mut session);
+
         self.effects.extend(effects);
-        self.retire_intent(operation_id);
+
         self.commit_removal(session_id, incarnation);
         Ok(())
     }
@@ -811,7 +705,7 @@ impl RuntimeState {
             return Err(RuntimeStateError::BusySession);
         }
         session.active_turn = Some(active_turn);
-        self.set_intent_status(&operation_id, IntentStatus::InFlight);
+
         self.commit_session(session_id);
         Ok(turn_id)
     }
@@ -989,15 +883,6 @@ impl RuntimeState {
             .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
             .map(|(interaction_id, _)| interaction_id.clone())
             .collect::<Vec<_>>();
-        let mut responding_operation_ids = resolved_permissions
-            .iter()
-            .filter_map(|interaction_id| {
-                session
-                    .permissions
-                    .get(interaction_id)
-                    .and_then(|interaction| interaction.responding_operation_id.clone())
-            })
-            .collect::<Vec<_>>();
         for interaction_id in &resolved_permissions {
             session.permissions.remove(interaction_id);
             remember_resolved_permission(session, interaction_id);
@@ -1008,14 +893,6 @@ impl RuntimeState {
             .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
             .map(|(interaction_id, _)| interaction_id.clone())
             .collect::<Vec<_>>();
-        responding_operation_ids.extend(resolved_elicitations.iter().filter_map(
-            |interaction_id| {
-                session
-                    .elicitations
-                    .get(interaction_id)
-                    .and_then(|interaction| interaction.responding_operation_id.clone())
-            },
-        ));
         for interaction_id in &resolved_elicitations {
             session.elicitations.remove(interaction_id);
             remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
@@ -1034,8 +911,7 @@ impl RuntimeState {
                     interaction_id,
                 }
             }));
-        self.retire_intents(responding_operation_ids);
-        self.retire_intent(operation_id);
+
         self.drop_turn_delivery_payload(session_id, incarnation, operation_id);
         self.commit_session(session_id);
         Ok(())
@@ -1099,16 +975,12 @@ impl RuntimeState {
         {
             return Ok(InteractionResolution::AlreadyResolved);
         }
-        let pending = session
+        session
             .permissions
             .remove(interaction_id)
             .ok_or(RuntimeStateError::UnknownInteraction)?;
-        let responding_operation_id = pending.responding_operation_id;
         remember_resolved_permission(session, interaction_id);
         self.commit_session(session_id);
-        if let Some(operation_id) = responding_operation_id {
-            self.retire_intent(&operation_id);
-        }
         Ok(InteractionResolution::Applied)
     }
 
@@ -1139,7 +1011,7 @@ impl RuntimeState {
         if self.operation_in_use(&operation_id) {
             return Err(RuntimeStateError::OperationCollision);
         }
-        self.set_intent_status(&operation_id, IntentStatus::InFlight);
+
         let session = self.require_session_mut(session_id, incarnation)?;
         let pending = session
             .permissions
@@ -1176,7 +1048,7 @@ impl RuntimeState {
         }
         session.permissions.remove(interaction_id);
         remember_resolved_permission(session, interaction_id);
-        self.retire_intent(operation_id);
+
         self.commit_session(session_id);
         Ok(InteractionResolution::Applied)
     }
@@ -1282,11 +1154,7 @@ impl RuntimeState {
                     .elicitations
                     .remove(interaction_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
-                let PendingInteraction {
-                    request,
-                    responding_operation_id,
-                    ..
-                } = pending;
+                let PendingInteraction { request, .. } = pending;
                 remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
                 if let Some(elicitation_id) = accepted_url_id {
                     session.url_flows.insert(
@@ -1299,9 +1167,6 @@ impl RuntimeState {
                     );
                 }
                 self.commit_session(session_id);
-                if let Some(operation_id) = responding_operation_id {
-                    self.retire_intent(&operation_id);
-                }
             }
             None => {
                 if self
@@ -1320,11 +1185,7 @@ impl RuntimeState {
                     .request_elicitations
                     .remove(interaction_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
-                let PendingInteraction {
-                    request,
-                    responding_operation_id,
-                    ..
-                } = pending;
+                let PendingInteraction { request, .. } = pending;
                 remember_resolved_interaction(
                     &mut self.resolved_request_elicitations,
                     interaction_id,
@@ -1340,9 +1201,6 @@ impl RuntimeState {
                     );
                 }
                 self.commit_connection();
-                if let Some(operation_id) = responding_operation_id {
-                    self.retire_intent(&operation_id);
-                }
             }
         }
         Ok(InteractionResolution::Applied)
@@ -1382,7 +1240,7 @@ impl RuntimeState {
         if self.operation_in_use(&operation_id) {
             return Err(RuntimeStateError::OperationCollision);
         }
-        self.set_intent_status(&operation_id, IntentStatus::InFlight);
+
         match scope {
             Some((session_id, incarnation)) => {
                 self.require_session_mut(session_id, incarnation)?
@@ -1585,7 +1443,7 @@ impl RuntimeState {
             }
             _ => {}
         }
-        self.set_intent_status(&operation_id, IntentStatus::InFlight);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -1653,8 +1511,8 @@ impl RuntimeState {
         }
         operation.stage = "deleting".to_string();
         session.lifecycle = SessionLifecycle::Deleting;
-        let (queued, effects) = drain_session_liveness(session_id, session);
-        self.retire_intents(queued);
+        let effects = drain_session_liveness(session_id, session);
+
         self.effects.extend(effects);
         self.commit_session(session_id);
         Ok(())
@@ -1684,10 +1542,10 @@ impl RuntimeState {
             .sessions
             .remove(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        let (queued, effects) = drain_session_liveness(session_id, &mut session);
-        self.retire_intents(queued);
+        let effects = drain_session_liveness(session_id, &mut session);
+
         self.effects.extend(effects);
-        self.retire_intent(operation_id);
+
         self.commit_removal(session_id, incarnation);
         Ok(())
     }
@@ -1702,7 +1560,7 @@ impl RuntimeState {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let reason = reason.into();
-        let (queued, effects) = {
+        let effects = {
             let session = self.require_session_mut(session_id, incarnation)?;
             let Some(operation) = session.operation.as_mut() else {
                 return Err(RuntimeStateError::OperationMismatch);
@@ -1715,9 +1573,9 @@ impl RuntimeState {
             session.lifecycle = SessionLifecycle::Uncertain;
             drain_session_liveness(session_id, session)
         };
-        self.retire_intents(queued);
+
         self.effects.extend(effects);
-        self.set_intent_status(operation_id, IntentStatus::Uncertain);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -1742,7 +1600,7 @@ impl RuntimeState {
             return Err(RuntimeStateError::OperationMismatch);
         }
         session.operation = None;
-        self.retire_intent(operation_id);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -1776,7 +1634,7 @@ impl RuntimeState {
             .control_state
             .insert(control_key.into(), control_update);
         session.operation = None;
-        self.retire_intent(operation_id);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -1806,7 +1664,7 @@ impl RuntimeState {
             SessionOperationKind::Delete => SessionLifecycle::Active,
             _ => session.lifecycle.clone(),
         };
-        self.retire_intent(operation_id);
+
         self.commit_session(session_id);
         Ok(())
     }
@@ -1832,10 +1690,10 @@ impl RuntimeState {
             .sessions
             .remove(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        let (queued, effects) = drain_session_liveness(session_id, &mut session);
-        self.retire_intents(queued);
+        let effects = drain_session_liveness(session_id, &mut session);
+
         self.effects.extend(effects);
-        self.retire_intent(operation_id);
+
         self.commit_removal(session_id, session.incarnation);
         Ok(())
     }
@@ -1879,9 +1737,7 @@ impl RuntimeState {
     }
 
     fn operation_in_use(&self, operation_id: &str) -> bool {
-        self.intents.values().any(|intent| {
-            intent.operation_id == operation_id && intent.status != IntentStatus::Accepted
-        }) || self.sessions.values().any(|session| {
+        self.sessions.values().any(|session| {
             session
                 .active_turn
                 .as_ref()
@@ -1902,11 +1758,6 @@ impl RuntimeState {
             .any(|interaction| interaction.responding_operation_id.as_deref() == Some(operation_id))
     }
 
-    fn reserve_intent_record_capacity(&mut self) -> bool {
-        let limit = self.limits.max_intent_records;
-        limit > 0 && self.intents.len() < limit
-    }
-
     fn url_flow_in_use(&self, elicitation_id: &str) -> bool {
         self.request_url_flows.contains_key(elicitation_id)
             || self
@@ -1920,26 +1771,6 @@ impl RuntimeState {
                         .iter()
                         .any(|resolved| resolved == elicitation_id)
             })
-    }
-
-    fn set_intent_status(&mut self, operation_id: &str, status: IntentStatus) {
-        if let Some(intent) = self
-            .intents
-            .values_mut()
-            .find(|intent| intent.operation_id == operation_id)
-        {
-            intent.status = status;
-        }
-    }
-
-    fn retire_intent(&mut self, operation_id: &str) {
-        let key = self
-            .intents
-            .iter()
-            .find_map(|(key, intent)| (intent.operation_id == operation_id).then(|| key.clone()));
-        if let Some(key) = key {
-            self.intents.remove(&key);
-        }
     }
 
     fn drop_turn_delivery_payload(
@@ -1982,12 +1813,6 @@ impl RuntimeState {
             }
         }
         self.delta_bytes = self.delta_journal.iter().map(serialized_len).sum();
-    }
-
-    fn retire_intents(&mut self, operation_ids: Vec<String>) {
-        for operation_id in operation_ids {
-            self.retire_intent(&operation_id);
-        }
     }
 
     fn commit_session(&mut self, session_id: &str) {
@@ -2139,17 +1964,8 @@ fn remember_resolved_interaction(resolved: &mut VecDeque<String>, interaction_id
     }
 }
 
-fn drain_session_liveness(
-    session_id: &str,
-    session: &mut SessionRuntime,
-) -> (Vec<String>, Vec<RuntimeEffect>) {
-    let mut operation_ids = Vec::new();
+fn drain_session_liveness(session_id: &str, session: &mut SessionRuntime) -> Vec<RuntimeEffect> {
     let permissions = std::mem::take(&mut session.permissions);
-    operation_ids.extend(
-        permissions
-            .values()
-            .filter_map(|pending| pending.responding_operation_id.clone()),
-    );
     let mut effects = permissions
         .into_keys()
         .map(|interaction_id| RuntimeEffect::CancelPermissionResponder {
@@ -2158,11 +1974,6 @@ fn drain_session_liveness(
         })
         .collect::<Vec<_>>();
     let elicitations = std::mem::take(&mut session.elicitations);
-    operation_ids.extend(
-        elicitations
-            .values()
-            .filter_map(|pending| pending.responding_operation_id.clone()),
-    );
     effects.extend(elicitations.into_keys().map(|interaction_id| {
         RuntimeEffect::CancelElicitationResponder {
             session_id: Some(session_id.to_string()),
@@ -2187,7 +1998,7 @@ fn drain_session_liveness(
                 terminal_id,
             }),
     );
-    (operation_ids, effects)
+    effects
 }
 
 fn serialized_len(value: &impl Serialize) -> usize {
@@ -2435,7 +2246,6 @@ mod tests {
             RuntimeLimits {
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
-                max_intent_records: 4_096,
             },
         )
     }
@@ -2451,20 +2261,14 @@ mod tests {
             .unwrap()
     }
 
-    fn accept_and_start_prompt(
+    fn start_prompt_operation(
         state: &mut RuntimeState,
         session_id: &str,
         incarnation: u64,
-        client_intent_id: &str,
-        payload: &str,
+        operation_id: &str,
         prompt: Vec<Value>,
     ) -> String {
-        let IntentAck::Accepted { operation_id } = state
-            .accept_intent("epoch", 1, client_intent_id.to_string(), payload)
-            .unwrap()
-        else {
-            panic!("a fresh client intent must be accepted");
-        };
+        let operation_id = operation_id.to_string();
         state
             .start_prompt(
                 "epoch",
@@ -2475,70 +2279,6 @@ mod tests {
             )
             .unwrap();
         operation_id
-    }
-
-    #[test]
-    fn in_flight_intent_keeps_fixed_digest_not_full_command() {
-        let mut state = state();
-        let command = format!("sensitive-command-{}", "x".repeat(8_192));
-        let IntentAck::Accepted { operation_id } =
-            state.accept_intent("epoch", 1, "intent", &command).unwrap()
-        else {
-            panic!("fresh intent must be accepted");
-        };
-        let record = state
-            .intents
-            .values()
-            .find(|record| record.operation_id == operation_id)
-            .unwrap();
-
-        let expected: [u8; 32] = Sha256::digest(command.as_bytes()).into();
-        assert_eq!(record.payload_digest, expected);
-        assert_eq!(std::mem::size_of_val(&record.payload_digest), 32);
-    }
-
-    #[test]
-    fn sequential_completed_intents_do_not_grow_intent_maps() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-
-        for index in 0..32 {
-            let IntentAck::Accepted { operation_id } = state
-                .accept_intent(
-                    "epoch",
-                    1,
-                    format!("control-intent-{index}"),
-                    format!("control-payload-{index}"),
-                )
-                .unwrap()
-            else {
-                panic!("fresh control intent must be accepted");
-            };
-            state
-                .start_operation(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    &operation_id,
-                    SessionOperationKind::SetMode,
-                    "setting_mode",
-                )
-                .unwrap();
-            state
-                .complete_control_operation(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    &operation_id,
-                    SessionOperationKind::SetMode,
-                    "current_mode_update",
-                    json!({ "currentModeId": "plan" }),
-                    json!({ "ok": true }),
-                )
-                .unwrap();
-
-            assert!(state.intents.is_empty());
-        }
     }
 
     #[test]
@@ -2889,6 +2629,7 @@ mod tests {
         let delta_journal = serde_json::to_string(&state.delta_journal).unwrap();
         let mut retained_by = Vec::new();
 
+        assert!(!state.operation_in_use(operation_id));
         if session.active_turn.is_some() {
             retained_by.push("active_turn");
         }
@@ -2900,13 +2641,6 @@ mod tests {
         }
         if markers.iter().any(|marker| active_turn.contains(marker)) {
             retained_by.push("active_turn_payload");
-        }
-        if state
-            .intents
-            .values()
-            .any(|intent| intent.operation_id == operation_id)
-        {
-            retained_by.push("intent_record");
         }
         if markers.iter().any(|marker| delta_journal.contains(marker)) {
             retained_by.push("delta_journal");
@@ -2923,12 +2657,11 @@ mod tests {
     fn terminal_response_drops_prompt_updates_indices_and_operation_payload() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let operation_id = accept_and_start_prompt(
+        let operation_id = start_prompt_operation(
             &mut state,
             "session",
             incarnation,
             "success-client-intent",
-            "success-command-payload-marker",
             vec![json!({
                 "type": "text",
                 "text": "success-prompt-marker"
@@ -2964,7 +2697,6 @@ mod tests {
             "session",
             &operation_id,
             &[
-                "success-command-payload-marker",
                 "success-prompt-marker",
                 "success-update-marker",
                 "success-result-marker",
@@ -2976,12 +2708,11 @@ mod tests {
     fn prompt_error_drops_all_turn_payload_after_terminal_delivery() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let operation_id = accept_and_start_prompt(
+        let operation_id = start_prompt_operation(
             &mut state,
             "session",
             incarnation,
             "error-client-intent",
-            "error-command-payload-marker",
             vec![json!({ "type": "text", "text": "error-prompt-marker" })],
         );
         state
@@ -3010,7 +2741,6 @@ mod tests {
             "session",
             &operation_id,
             &[
-                "error-command-payload-marker",
                 "error-prompt-marker",
                 "error-update-marker",
                 "error-result-marker",
@@ -3022,12 +2752,11 @@ mod tests {
     fn transport_loss_produces_one_uncertain_terminal_then_drops_the_turn() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let operation_id = accept_and_start_prompt(
+        let operation_id = start_prompt_operation(
             &mut state,
             "session",
             incarnation,
             "uncertain-client-intent",
-            "uncertain-command-payload-marker",
             vec![json!({
                 "type": "text",
                 "text": "uncertain-prompt-marker"
@@ -3060,7 +2789,6 @@ mod tests {
             "session",
             &operation_id,
             &[
-                "uncertain-command-payload-marker",
                 "uncertain-prompt-marker",
                 "uncertain-update-marker",
                 "uncertain-result-marker",
@@ -3072,12 +2800,11 @@ mod tests {
     fn new_turn_can_reuse_prior_message_and_tool_ids() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let first_operation_id = accept_and_start_prompt(
+        let first_operation_id = start_prompt_operation(
             &mut state,
             "session",
             incarnation,
             "first-client-intent",
-            "first-command-payload-marker",
             vec![json!("first-prompt-marker")],
         );
         state
@@ -3114,12 +2841,11 @@ mod tests {
             )
             .unwrap();
 
-        let second_operation_id = accept_and_start_prompt(
+        let second_operation_id = start_prompt_operation(
             &mut state,
             "session",
             incarnation,
             "second-client-intent",
-            "second-command-digest",
             vec![json!("second prompt")],
         );
         state
@@ -3154,24 +2880,17 @@ mod tests {
         let session_payload = serde_json::to_string(session).unwrap();
         assert!(!session_payload.contains("first-message-marker"));
         assert!(!session_payload.contains("first-tool-marker"));
-        assert!(
-            !state
-                .intents
-                .values()
-                .any(|intent| intent.operation_id == first_operation_id)
-        );
     }
 
     #[test]
     fn turn_retirement_does_not_release_a_live_terminal() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let operation_id = accept_and_start_prompt(
+        let operation_id = start_prompt_operation(
             &mut state,
             "session",
             incarnation,
             "resource-client-intent",
-            "resource-command-payload-marker",
             vec![json!("resource-prompt-marker")],
         );
         state
@@ -3229,11 +2948,7 @@ mod tests {
             &state,
             "session",
             &operation_id,
-            &[
-                "resource-command-payload-marker",
-                "resource-prompt-marker",
-                "resource-result-marker",
-            ],
+            &["resource-prompt-marker", "resource-result-marker"],
         );
     }
 
@@ -3244,12 +2959,11 @@ mod tests {
 
         for index in 0..32 {
             let marker = format!("sequential-turn-payload-{index}");
-            let operation_id = accept_and_start_prompt(
+            let operation_id = start_prompt_operation(
                 &mut state,
                 "session",
                 incarnation,
                 &format!("sequential-intent-{index}"),
-                &format!("sequential-command-payload-{index}"),
                 vec![json!({ "type": "text", "text": marker })],
             );
             state
@@ -3276,7 +2990,7 @@ mod tests {
 
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
-        assert!(state.intents.is_empty());
+
         assert!(
             !serde_json::to_string(&state.delta_journal)
                 .unwrap()
@@ -3416,119 +3130,6 @@ mod tests {
     }
 
     #[test]
-    fn reconnecting_subscriber_reuses_the_same_epoch_scoped_intent() {
-        let mut state = state();
-        let first = state
-            .accept_intent("epoch", 1, "same", "payload-a")
-            .unwrap();
-        let duplicate = state
-            .accept_intent("epoch", 1, "same", "payload-a")
-            .unwrap();
-        let collision = state
-            .accept_intent("epoch", 1, "same", "payload-b")
-            .unwrap();
-        let other_subscriber = state
-            .accept_intent("epoch", 2, "same", "payload-a")
-            .unwrap();
-
-        let IntentAck::Accepted {
-            operation_id: first_id,
-        } = first
-        else {
-            panic!("first intent was not accepted")
-        };
-        assert_eq!(
-            duplicate,
-            IntentAck::Duplicate {
-                operation_id: first_id.clone(),
-                status: IntentStatus::Accepted,
-            }
-        );
-        assert_eq!(collision, IntentAck::Collision);
-        assert_eq!(
-            other_subscriber,
-            IntentAck::Duplicate {
-                operation_id: first_id,
-                status: IntentStatus::Accepted,
-            }
-        );
-    }
-
-    #[test]
-    fn active_intent_capacity_is_reused_after_retirement() {
-        let mut state = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_intent_records: 2,
-                ..RuntimeLimits::default()
-            },
-        );
-        let IntentAck::Accepted {
-            operation_id: retired,
-        } = state
-            .accept_intent("epoch", 1, "completed", "payload")
-            .unwrap()
-        else {
-            panic!("first intent was not accepted")
-        };
-        let IntentAck::Accepted {
-            operation_id: inflight,
-        } = state
-            .accept_intent("epoch", 1, "inflight", "payload")
-            .unwrap()
-        else {
-            panic!("inflight intent was not accepted")
-        };
-        assert_eq!(
-            state.accept_intent("epoch", 2, "replacement", "payload"),
-            Err(RuntimeStateError::ResourceLimit),
-        );
-        state.retire_intent(&retired);
-
-        assert!(matches!(
-            state.accept_intent("epoch", 2, "replacement", "payload"),
-            Ok(IntentAck::Accepted { .. })
-        ));
-        assert_eq!(state.intents.len(), 2);
-        assert_eq!(state.intent_status(&retired), None);
-        assert_eq!(state.intent_status(&inflight), Some(IntentStatus::Accepted));
-    }
-
-    #[test]
-    fn uncertain_intent_identity_is_retained_without_result_payload() {
-        let mut state = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_intent_records: 1,
-                ..RuntimeLimits::default()
-            },
-        );
-        let IntentAck::Accepted {
-            operation_id: uncertain,
-        } = state
-            .accept_intent("epoch", 1, "uncertain", "payload")
-            .unwrap()
-        else {
-            panic!("uncertain intent was not accepted")
-        };
-        state.set_intent_status(&uncertain, IntentStatus::Uncertain);
-
-        assert_eq!(
-            state.accept_intent("epoch", 2, "replacement", "payload"),
-            Err(RuntimeStateError::ResourceLimit),
-        );
-        assert_eq!(
-            state
-                .accept_intent("epoch", 3, "uncertain", "payload")
-                .unwrap(),
-            IntentAck::Duplicate {
-                operation_id: uncertain,
-                status: IntentStatus::Uncertain,
-            },
-        );
-    }
-
-    #[test]
     fn snapshot_plus_live_deltas_equals_uninterrupted_state() {
         let mut state = state();
         let a = open(&mut state, "a");
@@ -3637,7 +3238,6 @@ mod tests {
             RuntimeLimits {
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
-                max_intent_records: 4_096,
             },
         );
         let incarnation = open(&mut state, "session");
@@ -3804,12 +3404,7 @@ mod tests {
     fn prompt_failure_retires_partial_turn_and_operation_payload() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let IntentAck::Accepted { operation_id } = state
-            .accept_intent("epoch", 1, "prompt", "payload")
-            .unwrap()
-        else {
-            panic!("prompt intent was not accepted")
-        };
+        let operation_id = "prompt".to_string();
         state
             .start_prompt(
                 "epoch",
@@ -3832,7 +3427,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(state.intent_status(&operation_id), None);
+        assert!(!state.operation_in_use(&operation_id));
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
         assert_eq!(
@@ -3845,12 +3440,7 @@ mod tests {
     fn cancelled_prompt_response_retires_the_intent_outcome() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let IntentAck::Accepted { operation_id } = state
-            .accept_intent("epoch", 1, "prompt", "payload")
-            .unwrap()
-        else {
-            panic!("prompt intent was not accepted")
-        };
+        let operation_id = "prompt".to_string();
         state
             .start_prompt("epoch", "session", incarnation, &operation_id, Vec::new())
             .unwrap();
@@ -3867,7 +3457,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(state.intent_status(&operation_id), None);
+        assert!(!state.operation_in_use(&operation_id));
         assert!(state.session("session").unwrap().active_turn.is_none());
     }
 
@@ -3905,14 +3495,7 @@ mod tests {
     fn permission_response_is_visible_and_exactly_correlated() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let IntentAck::Accepted {
-            operation_id: response_operation,
-        } = state
-            .accept_intent("epoch", 1, "permission-response", "allow-once")
-            .unwrap()
-        else {
-            panic!("permission response intent was not accepted")
-        };
+        let response_operation = "permission-response".to_string();
         state
             .upsert_permission(
                 "epoch",
@@ -3991,7 +3574,7 @@ mod tests {
             InteractionResolution::Applied,
         );
         assert!(state.session("session").unwrap().permissions.is_empty());
-        assert_eq!(state.intent_status(&response_operation), None);
+        assert!(!state.operation_in_use(&response_operation));
     }
 
     #[test]
@@ -4001,7 +3584,6 @@ mod tests {
             RuntimeLimits {
                 max_delta_events: 2,
                 max_delta_bytes: 1_000_000,
-                max_intent_records: 4_096,
             },
         );
         open(&mut state, "a");
@@ -4046,7 +3628,7 @@ mod tests {
         let session = state.session("session").unwrap();
         assert_eq!(session.lifecycle, SessionLifecycle::Closed);
         assert!(session.operation.is_none());
-        assert_eq!(state.intent_status("delete-operation"), None);
+        assert!(!state.operation_in_use("delete-operation"));
         assert_eq!(
             state.start_prompt("epoch", "session", incarnation, "late", Vec::new()),
             Err(RuntimeStateError::SessionNotActive),
@@ -4422,7 +4004,7 @@ mod tests {
             .close_session("epoch", "session", incarnation, "close")
             .unwrap();
 
-        assert_eq!(state.intent_status("close"), None);
+        assert!(!state.operation_in_use("close"));
         let close_delta = &state.deltas_after(before_close).unwrap()[0];
         assert!(matches!(
             close_delta.change,
@@ -4621,16 +4203,10 @@ mod tests {
             RuntimeLimits {
                 max_delta_events: 128,
                 max_delta_bytes: 1_000_000,
-                max_intent_records: 4_096,
             },
         );
         let incarnation = open(&mut state, "session");
-        let IntentAck::Accepted { operation_id } = state
-            .accept_intent("epoch", 1, "prompt", "payload")
-            .unwrap()
-        else {
-            panic!("prompt intent was not accepted")
-        };
+        let operation_id = "prompt".to_string();
         state
             .start_prompt("epoch", "session", incarnation, &operation_id, Vec::new())
             .unwrap();
@@ -4647,7 +4223,7 @@ mod tests {
             .unwrap();
 
         assert!(state.session("session").unwrap().active_turn.is_none());
-        assert_eq!(state.intent_status(&operation_id), None);
+        assert!(!state.operation_in_use(&operation_id));
         let deltas = state.deltas_after(before).unwrap();
         assert_eq!(deltas.len(), 1);
         assert!(
@@ -4753,7 +4329,7 @@ mod tests {
         let session = state.session("session").unwrap();
         assert_eq!(session.lifecycle, SessionLifecycle::Active);
         assert!(session.operation.is_none());
-        assert_eq!(state.intent_status("close"), None);
+        assert!(!state.operation_in_use("close"));
         state
             .start_prompt("epoch", "session", incarnation, "next", Vec::new())
             .unwrap();
@@ -4857,7 +4433,7 @@ mod tests {
             session.control_state["current_mode_update"]["currentModeId"],
             "plan",
         );
-        assert_eq!(state.intent_status("mode"), None);
+        assert!(!state.operation_in_use("mode"));
         assert!(
             !serde_json::to_string(&state.deltas_after(before).unwrap())
                 .unwrap()
@@ -5253,14 +4829,7 @@ mod tests {
     fn elicitation_response_is_transactional_for_session_and_request_scopes() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let IntentAck::Accepted {
-            operation_id: session_response,
-        } = state
-            .accept_intent("epoch", 1, "session-form-response", "session-form-value")
-            .unwrap()
-        else {
-            panic!("session elicitation response intent was not accepted")
-        };
+        let session_response = "session-form-response".to_string();
         state
             .upsert_elicitation(
                 "epoch",
@@ -5322,19 +4891,12 @@ mod tests {
         let session = state.session("session").unwrap();
         assert!(!session.elicitations.contains_key("session-form"));
         assert_eq!(session.url_flows["url-flow"].status, UrlFlowStatus::Waiting);
-        assert_eq!(state.intent_status(&session_response), None);
+        assert!(!state.operation_in_use(&session_response));
 
         state
             .upsert_elicitation("epoch", None, "request-form", json!({ "mode": "form" }))
             .unwrap();
-        let IntentAck::Accepted {
-            operation_id: request_response,
-        } = state
-            .accept_intent("epoch", 1, "request-form-response", "request-form-value")
-            .unwrap()
-        else {
-            panic!("request elicitation response intent was not accepted")
-        };
+        let request_response = "request-form-response".to_string();
         state
             .begin_elicitation_response("epoch", None, "request-form", &request_response)
             .unwrap();
@@ -5353,7 +4915,7 @@ mod tests {
                 .request_elicitations
                 .contains_key("request-form")
         );
-        assert_eq!(state.intent_status(&request_response), None);
+        assert!(!state.operation_in_use(&request_response));
     }
 
     #[test]
@@ -5378,12 +4940,7 @@ mod tests {
                 json!({ "sessionUpdate": "config_option_update", "configId": "old-only" }),
             )
             .unwrap();
-        let IntentAck::Accepted { operation_id } = state
-            .accept_intent("epoch", 1, "reload-intent", "session/load")
-            .unwrap()
-        else {
-            panic!("reload intent was not accepted")
-        };
+        let operation_id = "reload-intent".to_string();
 
         state
             .start_reload(
@@ -5457,7 +5014,7 @@ mod tests {
         assert!(reloaded.operation.is_none());
         assert!(reloaded.attachment_candidate.is_empty());
         assert_eq!(reloaded.attachment_candidate_bytes, 0);
-        assert_eq!(state.intent_status(&operation_id), None);
+        assert!(!state.operation_in_use(&operation_id));
         assert_eq!(state.seq(), before_complete + 1);
         assert!(
             !serde_json::to_string(&state.snapshot())
@@ -5517,7 +5074,7 @@ mod tests {
         assert!(session.operation.is_none());
         assert!(session.attachment_candidate.is_empty());
         assert_eq!(session.attachment_candidate_bytes, 0);
-        assert_eq!(state.intent_status("reload"), None);
+        assert!(!state.operation_in_use("reload"));
         assert!(
             !serde_json::to_string(&state.delta_journal)
                 .unwrap()

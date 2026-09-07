@@ -8,8 +8,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,16 +20,18 @@ use serde_json::json;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::bridge;
 use crate::event_queue::{self, EventQueueLimits, EventReceiver, EventSender};
-use crate::options::Options;
+use crate::options::{Options, normalize_origin};
 use crate::runtime_cache::ActiveRuntimeProjection;
 use crate::runtime_state::{RuntimeChange, RuntimeDelta, RuntimeSnapshot, fold_active_turn_update};
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const HTTP_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(6);
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
 const SUBSCRIBER_QUEUE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
 const MAX_SUBSCRIBERS: usize = 64;
@@ -43,6 +46,73 @@ struct ClientAssets;
 #[derive(Clone)]
 struct AppState {
     bridge: Arc<BridgeHub>,
+}
+
+#[derive(Clone)]
+struct OriginPolicy {
+    allowed_origins: Vec<String>,
+}
+
+impl OriginPolicy {
+    fn allows(&self, request: &Request) -> bool {
+        let mut hosts = request.headers().get_all(header::HOST).iter();
+        let host = match hosts.next() {
+            Some(value) => match value.to_str() {
+                Ok(value) if hosts.next().is_none() => value,
+                _ => return false,
+            },
+            None => match request.uri().authority() {
+                Some(authority) => authority.as_str(),
+                None => return false,
+            },
+        };
+        let Ok(http_origin) = normalize_origin(&format!("http://{host}")) else {
+            return false;
+        };
+        let parsed = url::Url::parse(&http_origin).expect("validated HTTP origin");
+        let direct_host = matches!(parsed.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)))
+            || parsed.host_str() == Some("localhost");
+        let configured_host = self.allowed_origins.iter().any(|origin| {
+            let scheme = origin.split_once("://").expect("validated origin").0;
+            normalize_origin(&format!("{scheme}://{host}")).as_ref() == Ok(origin)
+        });
+        if !direct_host && !configured_host {
+            return false;
+        }
+
+        let mut origins = request.headers().get_all(header::ORIGIN).iter();
+        let Some(origin) = origins.next() else {
+            // Command-line clients do not send Origin. Host is still checked
+            // so an unconfigured DNS name cannot rebind to this server.
+            return true;
+        };
+        if origins.next().is_some() {
+            return false;
+        }
+        let Some(origin) = origin
+            .to_str()
+            .ok()
+            .and_then(|value| normalize_origin(value).ok())
+        else {
+            return false;
+        };
+        (direct_host && origin == http_origin) || self.allowed_origins.contains(&origin)
+    }
+}
+
+async fn enforce_origin(
+    State(policy): State<OriginPolicy>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !policy.allows(&request) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "error": "Request Host or Origin is not allowed" })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 #[derive(Deserialize)]
@@ -824,29 +894,6 @@ impl BridgeHub {
         self.stopped.notify_waiters();
     }
 
-    #[cfg(test)]
-    async fn send_command(
-        &self,
-        subscriber_id: u64,
-        generation: u64,
-        command: String,
-    ) -> Result<(), ()> {
-        let input = {
-            let state = self.state.lock().await;
-            if state.generation != generation || !state.subscribers.contains_key(&subscriber_id) {
-                return Err(());
-            }
-            state.input.clone().ok_or(())?
-        };
-        input
-            .send(bridge::BridgeInput::Command {
-                subscriber_id,
-                raw: command,
-            })
-            .await
-            .map_err(|_| ())
-    }
-
     async fn session_view(
         &self,
         session_id: String,
@@ -972,6 +1019,10 @@ impl BridgeHub {
         let cancellation = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
+            // Event streams must finish before HTTP graceful draining can
+            // complete, including when no Agent runtime is currently active.
+            state.subscribers.clear();
+            state.session_subscribers.clear();
             state.cancellation.clone()
         };
         let Some(cancellation) = cancellation else {
@@ -1090,8 +1141,16 @@ pub async fn serve(options: Options) -> Result<()> {
         )
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(get(static_asset))
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(bridge::MAX_BRIDGE_MESSAGE_BYTES))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            OriginPolicy {
+                allowed_origins: options.allowed_origins.clone(),
+            },
+            enforce_origin,
+        ))
         .with_state(AppState {
             bridge: bridge.clone(),
         });
@@ -1112,12 +1171,33 @@ pub async fn serve(options: Options) -> Result<()> {
         println!("Agent workspace: selected per new thread in the web UI");
     }
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server failed");
-    bridge.shutdown().await;
-    result
+    let http_shutdown = CancellationToken::new();
+    let server = async {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(http_shutdown.clone().cancelled_owned())
+            .await
+    };
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => {
+            bridge.shutdown().await;
+            result.context("HTTP server failed")
+        }
+        _ = shutdown_signal() => {
+            http_shutdown.cancel();
+            let ((), result) = tokio::join!(
+                bridge.shutdown(),
+                tokio::time::timeout(HTTP_SHUTDOWN_GRACE_PERIOD, &mut server),
+            );
+            match result {
+                Ok(result) => result.context("HTTP server failed"),
+                Err(_) => {
+                    tracing::warn!("HTTP drain deadline reached; closing remaining connections");
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -1972,6 +2052,108 @@ mod tests {
     }
 
     #[test]
+    fn origin_boundary_allows_direct_local_and_explicit_proxy_origins_only() {
+        let policy = OriginPolicy {
+            allowed_origins: vec!["https://agent.example".to_string()],
+        };
+        for (host, origin, allowed) in [
+            ("127.0.0.1:7331", None, true),
+            ("localhost:7331", Some("http://localhost:7331"), true),
+            ("[::1]:7331", Some("http://[::1]:7331"), true),
+            ("192.168.1.20:7331", Some("http://192.168.1.20:7331"), true),
+            ("127.0.0.1:7331", Some("http://127.0.0.1:8000"), false),
+            ("127.0.0.1:7331", Some("https://evil.example"), false),
+            ("127.0.0.1:7331", Some("null"), false),
+            ("evil.example:7331", None, false),
+            ("evil.example:7331", Some("http://evil.example:7331"), false),
+            ("localhost.evil.example:7331", None, false),
+            ("user@localhost:7331", None, false),
+            ("localhost:7331/path", None, false),
+            ("agent.example", Some("https://agent.example"), true),
+            ("agent.example:443", Some("https://agent.example"), true),
+            ("agent.example:8443", Some("https://agent.example"), false),
+            ("agent.example", Some("http://agent.example"), false),
+            ("agent.example", None, true),
+            ("127.0.0.1:7331", Some("https://agent.example"), true),
+            ("evil.example", Some("https://agent.example"), false),
+        ] {
+            let mut request = Request::builder()
+                .uri("/api/v1/auth/logout")
+                .header(header::HOST, host);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            assert_eq!(
+                policy.allows(&request.body(Body::empty()).unwrap()),
+                allowed,
+                "Host={host}, Origin={origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_boundary_rejects_ambiguous_headers_and_ignores_forwarded_headers() {
+        let policy = OriginPolicy {
+            allowed_origins: Vec::new(),
+        };
+        for headers in [
+            vec![("host", "localhost:7331"), ("host", "evil.example")],
+            vec![
+                ("host", "localhost:7331"),
+                ("origin", "http://localhost:7331"),
+                ("origin", "http://evil.example"),
+            ],
+            vec![
+                ("host", "evil.example"),
+                ("x-forwarded-host", "localhost:7331"),
+            ],
+            vec![
+                ("host", "localhost:7331"),
+                ("origin", "https://localhost:7331"),
+                ("x-forwarded-proto", "https"),
+            ],
+        ] {
+            let mut request = Request::builder().uri("/api/v1/runtime");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            assert!(!policy.allows(&request.body(Body::empty()).unwrap()));
+        }
+        assert!(!policy.allows(&Request::new(Body::empty())));
+        assert!(
+            policy.allows(
+                &Request::builder()
+                    .uri("http://localhost:7331/api/v1/runtime")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_event_streams_without_an_active_agent() {
+        let hub = test_hub();
+        let (global_tx, mut global_rx) = SubscriberSender::channel(4);
+        let (session_tx, mut session_rx) = SubscriberSender::channel(4);
+        {
+            let mut state = hub.state.lock().await;
+            state.subscribers.insert(1, global_tx);
+            state
+                .session_subscribers
+                .insert(2, ("session".to_string(), session_tx));
+        }
+        hub.shutdown().await;
+        tokio::time::timeout(Duration::from_millis(100), async {
+            assert!(global_rx.recv().await.is_none());
+            assert!(session_rx.recv().await.is_none());
+        })
+        .await
+        .expect("shutdown must close every SSE source before HTTP draining");
+        assert!(hub.subscribe().await.is_none());
+        assert!(hub.subscribe_session("session".to_string()).await.is_none());
+    }
+
+    #[test]
     fn turn_append_requires_a_strong_bounded_history_etag() {
         assert_eq!(
             parse_strong_etag("\"epoch:1:7\""),
@@ -2647,7 +2829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_same_session_load_uses_tracked_cwd_and_isolates_other_subscribers() {
+    async fn same_session_reload_commits_one_public_view_without_replaying_staging_to_observers() {
         async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
             let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
                 .await
@@ -2677,16 +2859,11 @@ mod tests {
         let mut observer = hub.subscribe().await.expect("observer subscription");
         observer.initial_events.clear();
 
-        hub.send_command(
-            requester.id,
-            requester.generation,
-            json!({
-                "type": "session/new",
-                "requestId": "new",
-                "cwd": cwd,
-            })
-            .to_string(),
-        )
+        hub.business_request(json!({
+            "type": "session/new",
+            "requestId": "new",
+            "cwd": cwd,
+        }))
         .await
         .unwrap();
         loop {
@@ -2712,54 +2889,26 @@ mod tests {
         // No session/list precedes this request. The bridge must use the cwd
         // already associated with the tracked session and execute a reload,
         // not allocate a second business session.
-        hub.send_command(
-            requester.id,
-            requester.generation,
-            json!({
-                "type": "session/load",
-                "requestId": "reload",
-                "sessionId": "test-session",
-            })
-            .to_string(),
-        )
+        hub.business_request(json!({
+            "type": "session/load",
+            "requestId": "reload",
+            "sessionId": "test-session",
+        }))
         .await
         .unwrap();
 
-        let mut requester_events = Vec::new();
-        loop {
-            let event = next_event(&mut requester).await;
-            let complete =
-                event["type"] == "acp/session_attached" && event["requestId"] == "reload";
-            requester_events.push(event);
-            if complete {
-                break;
-            }
-        }
-        assert!(requester_events.iter().any(|event| {
-            event["type"] == "acp/session_update"
-                && event["notification"]["update"]["content"]["text"] == "Loaded history."
-        }));
-        let attached = requester_events.last().unwrap();
-        assert_eq!(attached["cwd"], cwd);
-        assert_eq!(attached["sessionId"], "test-session");
-        assert_eq!(
-            attached["response"]["_meta"]["observedSessionCloses"],
-            json!([])
-        );
-
-        let observer_events = std::iter::from_fn(|| observer.events.try_recv().ok())
-            .map(QueuedSubscriberEvent::into_string)
-            .collect::<Vec<_>>();
-        assert!(
-            observer_events.iter().all(|event| {
-                !event.contains("acp/session_attached") && !event.contains("acp/session_update")
-            }),
-            "private load staging leaked to observer: {observer_events:?}"
-        );
-        assert!(
-            observer_events.iter().any(|event| {
-                let event: serde_json::Value = serde_json::from_str(event).unwrap();
-                event["type"] == "bridge/session_view"
+        for subscription in [&mut requester, &mut observer] {
+            loop {
+                let event = next_event(subscription).await;
+                assert_ne!(
+                    event["type"], "acp/session_update",
+                    "private load staging leaked to an observer"
+                );
+                assert_ne!(
+                    event["type"], "acp/session_attached",
+                    "internal attachment response leaked to an observer"
+                );
+                if event["type"] == "bridge/session_view"
                     && event["view"]["baseline"]["updates"]
                         .as_array()
                         .is_some_and(|updates| {
@@ -2767,9 +2916,11 @@ mod tests {
                                 .iter()
                                 .any(|update| update["content"]["text"] == "Loaded history.")
                         })
-            }),
-            "the committed authoritative view was not broadcast: {observer_events:?}"
-        );
+                {
+                    break;
+                }
+            }
+        }
 
         let refreshed = hub
             .session_view("test-session".to_string())
@@ -3386,9 +3537,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_generation_commands_and_direct_events_are_rejected() {
+    async fn old_generation_direct_events_are_rejected() {
         let hub = test_hub();
-        let (input, mut commands) = mpsc::channel(1);
+        let (input, _commands) = mpsc::channel(1);
         let (subscriber, mut events) = SubscriberSender::channel(1);
         {
             let mut state = hub.state.lock().await;
@@ -3397,12 +3548,6 @@ mod tests {
             state.subscribers.insert(42, subscriber);
         }
 
-        assert!(
-            hub.send_command(42, 1, r#"{"type":"bridge/ping"}"#.to_string())
-                .await
-                .is_err()
-        );
-        assert!(commands.try_recv().is_err());
         hub.send_to_subscriber(42, 1, "stale".to_string()).await;
         assert!(events.try_recv().is_err());
         assert!(hub.state.lock().await.subscribers.contains_key(&42));
@@ -4364,10 +4509,7 @@ mod tests {
         let hub = test_hub();
         let (input, _commands) = mpsc::channel(1);
         input
-            .send(bridge::BridgeInput::Command {
-                subscriber_id: 1,
-                raw: "queued".to_string(),
-            })
+            .send(bridge::BridgeInput::RuntimeSnapshotRequest)
             .await
             .unwrap();
         let input_probe = input.clone();
@@ -4388,10 +4530,7 @@ mod tests {
             .expect("shutdown was blocked behind the command queue");
         assert!(
             input_probe
-                .try_send(bridge::BridgeInput::Command {
-                    subscriber_id: 1,
-                    raw: "still-full".to_string(),
-                })
+                .try_send(bridge::BridgeInput::RuntimeSnapshotRequest)
                 .is_err()
         );
         hub.finish_generation(1).await;

@@ -10,6 +10,7 @@ const pendingRoundTrips = new Map<JsonRpcId, PendingRoundTrip>();
 let nextServerRequest = 0;
 let cancellationCount = 0;
 let pendingCount = 0;
+const notifications: Array<{ method: string; params: unknown }> = [];
 
 const lines = createInterface({ input: process.stdin });
 lines.on("line", (line) => {
@@ -37,6 +38,7 @@ lines.on("line", (line) => {
   }
 
   if (!("id" in value)) {
+    notifications.push({ method: value.method, params: value.params });
     if (value.method === "notifications/cancelled") cancellationCount += 1;
     return;
   }
@@ -54,6 +56,9 @@ lines.on("line", (line) => {
       break;
     case "echo":
       write({ jsonrpc: "2.0", id: value.id, result: value.params ?? null });
+      break;
+    case "notificationSnapshot":
+      write({ jsonrpc: "2.0", id: value.id, result: { notifications } });
       break;
     case "cancellationCount":
       write({ jsonrpc: "2.0", id: value.id, result: { count: cancellationCount } });

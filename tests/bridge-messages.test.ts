@@ -6,11 +6,16 @@ import {
 } from "../shared/bridge";
 
 describe("browser bridge messages", () => {
+  it("rejects retired browser transport and unadvertised editor operations", () => {
+    for (const type of ["bridge/ping", "nes/start", "nes/suggest", "document/open"]) {
+      expect(() => parseClientCommand(JSON.stringify({ type }))).toThrow("Unknown");
+    }
+    for (const type of ["bridge/pong", "bridge/intent_ack", "acp/nes_started", "acp/document_opened"]) {
+      expect(() => parseServerEvent(JSON.stringify({ type }))).toThrow("Unknown");
+    }
+  });
+
   it("accepts supported commands", () => {
-    expect(parseClientCommand(JSON.stringify({
-      type: "bridge/ping",
-      nonce: "resume-probe",
-    }))).toEqual({ type: "bridge/ping", nonce: "resume-probe" });
     expect(parseClientCommand(JSON.stringify({
       type: "auth/authenticate",
       requestId: "auth-request",
@@ -86,16 +91,6 @@ describe("browser bridge messages", () => {
         JSON.stringify({ type: "session/fork", requestId: "request-4", sessionId: "active" }),
       ),
     ).toEqual({ type: "session/fork", requestId: "request-4", sessionId: "active" });
-    expect(
-      parseClientCommand(JSON.stringify({
-        type: "nes/suggest",
-        requestId: "request-5",
-        sessionId: "nes",
-        uri: "file:///workspace/file.ts",
-        position: { line: 1, character: 2 },
-        triggerKind: "manual",
-      })),
-    ).toMatchObject({ type: "nes/suggest", sessionId: "nes" });
   });
 
   it("rejects unknown and malformed commands at the trust boundary", () => {
@@ -220,30 +215,9 @@ describe("browser bridge messages", () => {
       elicitationId: "x",
       response: { action: "decline", content: { leaked: "value" } },
     }))).toThrow("Only accepted elicitation responses");
-    expect(() => parseClientCommand(JSON.stringify({
-      type: "document/focus",
-      sessionId: "nes",
-      uri: "file:///workspace/file.ts",
-      position: { line: -1, character: 0 },
-      visibleRange: {
-        start: { line: 0, character: 0 },
-        end: { line: 1, character: 0 },
-      },
-    }))).toThrow("non-negative");
-    expect(() => parseClientCommand(JSON.stringify({
-      type: "nes/reject",
-      requestId: "x",
-      sessionId: "nes",
-      suggestionId: "suggestion",
-      reason: "invented",
-    }))).toThrow("reason");
   });
 
   it("validates server event envelopes before they reach the React reducer", () => {
-    expect(parseServerEvent(JSON.stringify({
-      type: "bridge/pong",
-      nonce: "resume-probe",
-    }))).toEqual({ type: "bridge/pong", nonce: "resume-probe" });
     expect(parseServerEvent(JSON.stringify({
       type: "bridge/hello",
       transport: "ws",
@@ -313,36 +287,6 @@ describe("browser bridge messages", () => {
       type: "bridge/runtime_delta",
       delta: { seq: 9, change: { kind: "turn_update_appended" } },
     });
-    expect(parseServerEvent(JSON.stringify({
-      type: "bridge/intent_ack",
-      requestId: "prompt-1",
-      operationId: "operation-1",
-      disposition: "duplicate",
-      status: "in_flight",
-    }))).toEqual({
-      type: "bridge/intent_ack",
-      requestId: "prompt-1",
-      operationId: "operation-1",
-      disposition: "duplicate",
-      status: "in_flight",
-    });
-    expect(parseServerEvent(JSON.stringify({
-      type: "bridge/intent_ack",
-      requestId: "prompt-2",
-      operationId: "operation-2",
-      disposition: "accepted",
-      status: "accepted",
-    }))).toMatchObject({
-      disposition: "accepted",
-      status: "accepted",
-    });
-    expect(() => parseServerEvent(JSON.stringify({
-      type: "bridge/intent_ack",
-      requestId: "prompt-1",
-      operationId: "operation-1",
-      disposition: "duplicate",
-      status: "completed",
-    }))).toThrow("status");
     expect(parseServerEvent(JSON.stringify({
       type: "acp/authenticated",
       requestId: "auth",
@@ -486,41 +430,6 @@ describe("browser bridge messages", () => {
         },
       }))).toThrow("uint32");
     }
-    expect(parseServerEvent(JSON.stringify({
-      type: "acp/document_opened",
-      requestId: "request",
-      document: {
-        sessionId: "nes",
-        path: "/workspace/empty.ts",
-        uri: "file:///workspace/empty.ts",
-        languageId: "typescript",
-        version: 1,
-        text: "",
-      },
-    }))).toMatchObject({ type: "acp/document_opened" });
-    expect(parseServerEvent(JSON.stringify({
-      type: "acp/nes_suggestions",
-      requestId: "request",
-      sessionId: "nes",
-      uri: "file:///workspace/empty.ts",
-      response: {
-        suggestions: [{
-          kind: "edit",
-          id: "suggestion",
-          uri: "file:///workspace/empty.ts",
-          edits: [{
-            range: {
-              start: { line: 0, character: 0 },
-              end: { line: 0, character: 0 },
-            },
-            newText: "hello",
-          }],
-        }],
-      },
-    }))).toMatchObject({
-      type: "acp/nes_suggestions",
-      response: { suggestions: [{ id: "suggestion" }] },
-    });
 
     expect(() => parseServerEvent("null")).toThrow("object with a type");
     expect(() => parseServerEvent(JSON.stringify({
@@ -621,50 +530,5 @@ describe("browser bridge messages", () => {
         usage: { totalTokens: 1, inputTokens: 1, outputTokens: 1 },
       },
     }))).toThrow("exceeds totalTokens");
-    expect(() => parseServerEvent(JSON.stringify({
-      type: "acp/document_changed",
-      requestId: "request",
-      document: {
-        sessionId: "nes",
-        path: "/workspace/file.ts",
-        uri: "file:///workspace/file.ts",
-        languageId: "typescript",
-        version: -1,
-        text: "bad",
-      },
-    }))).toThrow("non-negative version");
-    expect(() => parseServerEvent(JSON.stringify({
-      type: "acp/nes_started",
-      requestId: "request",
-      response: { sessionId: "x".repeat(1_025) },
-    }))).toThrow("sessionId exceeds 1024 characters");
-    expect(() => parseServerEvent(JSON.stringify({
-      type: "acp/nes_suggestions",
-      requestId: "request",
-      sessionId: "nes",
-      uri: "file:///workspace/file.ts",
-      response: {
-        suggestions: [{
-          kind: "edit",
-          id: "",
-          uri: "file:///workspace/file.ts",
-          edits: [],
-        }],
-      },
-    }))).toThrow("suggestion 0 id is required");
-    expect(() => parseServerEvent(JSON.stringify({
-      type: "acp/nes_suggestions",
-      requestId: "request",
-      sessionId: "nes",
-      uri: "file:///workspace/file.ts",
-      response: {
-        suggestions: [{
-          kind: "jump",
-          id: "jump",
-          uri: "file:///workspace/file.ts",
-          position: { line: -1, character: 0 },
-        }],
-      },
-    }))).toThrow("non-negative integer coordinates");
   });
 });

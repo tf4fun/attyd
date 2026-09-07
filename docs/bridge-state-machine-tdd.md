@@ -1,7 +1,7 @@
 # Bridge state-machine TDD ledger
 
-This ledger tracks the migration from the shipped active-turn-only bridge to the authoritative
-history projection defined by [active-turn-runtime.md](active-turn-runtime.md). The detailed test
+This ledger defines the regression gates for the authoritative history projection in
+[active-turn-runtime.md](active-turn-runtime.md). The detailed test
 matrix is [active-turn-runtime-tests.md](active-turn-runtime-tests.md).
 
 ## Product boundary
@@ -71,13 +71,9 @@ bounds.
 
 ## Append contract
 
-A turn request carries:
-
-- bridge epoch;
-- session incarnation;
-- `If-Match: historyRevision`;
-- stable `clientIntentId` (`Idempotency-Key`);
-- prompt payload.
+A turn request carries the prompt payload, an `If-Match: historyRevision` header and a stable
+`Idempotency-Key`. The opaque history revision binds the bridge epoch, session incarnation and
+append position; callers do not construct those parts separately.
 
 History revision is a bridge-generated opaque token. Intent ID identifies a retry; history revision
 identifies the append position. Neither can replace the other.
@@ -156,30 +152,24 @@ history, invents missing Agent data or silently treats a partial replay as autho
 
 ## Proof gates
 
-| Gate | Required evidence | Status |
+| Gate | Required evidence | Current implementation / verification |
 | --- | --- | --- |
-| S0 specification | new authority/state/API/memory contract and adversarial test plan | complete |
-| S1 red state tests | baseline, CAS, terminal retention, reconcile commit/failure | pending |
-| S2 state implementation | separate shared HistoryCache and new phases | pending |
-| S3 ACP orchestration | internal load, retry, validation, cross-session concurrency | pending |
-| S4 observer delivery | atomic baseline+overlay snapshot, suffix/reset, shared payload | pending |
-| S5 command API | CAS/idempotency and browser-local deferred queue dispatch | pending |
-| S6 browser migration | business snapshot/SSE rendering; no ACP lifecycle inference | pending |
-| S7 removal | old requester-private load and active-only projections deleted | pending |
-| S8 release | Rust/TS/browser/transport/Goose/memory gates all green | pending |
-
-S0 was adversarially reviewed from state/protocol, API/concurrency and memory/lifecycle angles. The
-review identified the separate shared history store, idempotency plus CAS, single-writer Agent
-profile, terminal overlay retention, single-flight retry and browser-local queued-prompt deferral as
-mandatory.
+| S0 specification | authority/state/API/memory contract and adversarial test plan | this ledger and the linked runtime documents |
+| S1 state tests | baseline, CAS, terminal retention, commit/failure | `session_mirror.rs` and `history_cache.rs` native tests |
+| S2 state implementation | separate shared HistoryCache and session phases | `session_mirror.rs`, `history_cache.rs` |
+| S3 ACP orchestration | cold load, retry, validation, cross-session concurrency | `bridge.rs` and `server.rs` native tests |
+| S4 observer delivery | atomic baseline+overlay snapshot, suffix/reset, shared payload | `server.rs` subscriber, revision-gap and byte-accounting tests |
+| S5 command API | CAS/idempotency and browser-local deferred queue dispatch | native append tests, `use-acp.test.ts`, Chromium queue cases |
+| S6 browser projection | business snapshot/SSE rendering; no ACP lifecycle ownership | `use-acp.test.ts`, `state.test.ts`, Chromium reconnect cases |
+| S7 removal | no browser raw-ACP transport or competing prompt admission registry | REST/SSE routes, protocol types and cleanup regressions |
+| S8 release | Rust/TS/browser/transport/protocol/memory gates all green | run the suites in [testing.md](testing.md) against the release commit; CI enforces the gates |
 
 ## Removal ledger
 
-These current behaviors are explicitly obsolete and must be deleted only after their replacements
-are green:
+Keep these retired behaviors out of the production path:
 
-- `RuntimeState::seal_turn` immediately dropping the active turn;
-- `append_attachment_candidate` retaining only control updates;
+- dropping the completed overlay before the baseline commit;
+- retaining only control updates from an attachment replay;
 - requester-private load replay in `attachment_subscribers`;
 - `ActiveRuntimeProjection::clear_turn_events` on PromptResponse;
 - reconnect-driven session/load from `useAcp`;

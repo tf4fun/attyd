@@ -106,15 +106,7 @@ impl TerminalManager {
             .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTES)
             .min(MAX_TERMINAL_OUTPUT_BYTES);
 
-        let mut child = match spawn_command(&request, &cwd, false) {
-            Ok(child) => child,
-            Err(_error)
-                if request.args.is_empty() && looks_like_shell_command(&request.command) =>
-            {
-                spawn_command(&request, &cwd, true).map_err(terminal_spawn_error)?
-            }
-            Err(error) => return Err(terminal_spawn_error(error)),
-        };
+        let mut child = spawn_command(&request, &cwd).map_err(terminal_spawn_error)?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let reader_count = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
@@ -455,30 +447,10 @@ impl TerminalManager {
     }
 }
 
-fn spawn_command(
-    request: &CreateTerminalRequest,
-    cwd: &Path,
-    shell: bool,
-) -> std::io::Result<Child> {
-    let mut command = if shell {
-        #[cfg(windows)]
-        {
-            let mut command = Command::new("cmd.exe");
-            command.arg("/C").arg(&request.command);
-            command
-        }
-        #[cfg(not(windows))]
-        {
-            let mut command = Command::new("/bin/sh");
-            command.arg("-c").arg(&request.command);
-            command
-        }
-    } else {
-        let mut command = Command::new(&request.command);
-        command.args(&request.args);
-        command
-    };
+fn spawn_command(request: &CreateTerminalRequest, cwd: &Path) -> std::io::Result<Child> {
+    let mut command = Command::new(&request.command);
     command
+        .args(&request.args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -525,15 +497,6 @@ fn validate_create_request(request: &CreateTerminalRequest) -> Result<(), Error>
         }
     }
     Ok(())
-}
-
-fn looks_like_shell_command(command: &str) -> bool {
-    command.chars().any(char::is_whitespace)
-        || [
-            "|", "&", ";", "<", ">", "(", ")", "$", "`", "\\", "*", "?", "[", "]", "{", "}",
-        ]
-        .iter()
-        .any(|character| command.contains(character))
 }
 
 fn terminal_spawn_error(error: std::io::Error) -> Error {
@@ -736,28 +699,52 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn falls_back_to_shell_only_for_compound_commands_without_args() {
+    async fn preserves_command_and_arguments_without_implicit_shell_execution() {
         let root = tempfile::tempdir().unwrap();
         let (terminals, _events) = manager(root.path());
-        let created = create_terminal(
-            &terminals,
-            CreateTerminalRequest::new("goose-compatible", "printf ATTYD_COMPOUND_OK")
-                .cwd(root.path().to_path_buf()),
-        )
-        .await
-        .unwrap();
-        let output = wait_until_exited(&terminals, "goose-compatible", &created.terminal_id).await;
-        assert_eq!(output.output, "ATTYD_COMPOUND_OK");
-
+        let unexpected = root.path().join("unexpected");
         assert!(
             create_terminal(
                 &terminals,
-                CreateTerminalRequest::new("strict", "printf ATTYD_MUST_NOT_RUN")
-                    .args(vec!["keep-strict-argv".to_string()])
+                CreateTerminalRequest::new("session", "touch unexpected")
                     .cwd(root.path().to_path_buf()),
             )
             .await
             .is_err()
+        );
+        assert!(!unexpected.exists());
+
+        // Whitespace and shell metacharacters remain part of an executable path.
+        let executable = root.path().join("printf with spaces;$VALUE");
+        std::os::unix::fs::symlink("/usr/bin/printf", &executable).unwrap();
+        let created = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", executable.to_string_lossy())
+                .args(vec![
+                    "%s".to_string(),
+                    "$(touch unexpected); $HOME".to_string(),
+                ])
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
+        assert_eq!(output.output, "$(touch unexpected); $HOME");
+        assert!(!unexpected.exists());
+
+        let shell = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", "/bin/sh")
+                .args(vec!["-c".to_string(), "printf explicit-shell".to_string()])
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wait_until_exited(&terminals, "session", &shell.terminal_id)
+                .await
+                .output,
+            "explicit-shell"
         );
         terminals.close_all().await;
     }
@@ -858,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_command_arguments_environment_and_shell_detection() {
+    fn validates_command_arguments_and_environment() {
         assert!(validate_create_request(&CreateTerminalRequest::new("session", "")).is_err());
         assert!(
             validate_create_request(
@@ -874,8 +861,5 @@ mod tests {
             )
             .is_err()
         );
-        assert!(looks_like_shell_command("printf hello"));
-        assert!(looks_like_shell_command("echo $VALUE"));
-        assert!(!looks_like_shell_command("/usr/bin/printf"));
     }
 }

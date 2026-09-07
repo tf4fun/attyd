@@ -30,14 +30,6 @@ const oversizedNewResponseOnce = process.argv.includes("--oversized-new-response
 const oversizedConfigResponseOnce = process.argv.includes("--oversized-config-response-once");
 const oversizedForkResponseOnce = process.argv.includes("--oversized-fork-response-once");
 const forkSourceIdOnce = process.argv.includes("--fork-source-id-once");
-const invalidNesStartIdOnce = process.argv.includes("--invalid-nes-start-id-once");
-const oversizedNesStartResponseOnce = process.argv.includes(
-  "--oversized-nes-start-response-once",
-);
-const invalidNesSuggestionIdOnce = process.argv.includes(
-  "--invalid-nes-suggestion-id-once",
-);
-const invalidNesCursorOnce = process.argv.includes("--invalid-nes-cursor-once");
 const authRequiredAtStart = process.argv.includes("--auth-required");
 const invalidTerminalAuth = process.argv.includes("--invalid-terminal-auth");
 const terminalAuthRequired = process.argv.includes("--terminal-auth-required");
@@ -79,8 +71,6 @@ if (terminalLogin) {
   process.exit(1);
 }
 let configuredMcpServers: acp.McpServer[] = [];
-const observedNesRejects: acp.RejectNesNotification[] = [];
-const observedNesEvents: string[] = [];
 const observedSessionCloses: string[] = [];
 const deletedSessions = new Set<string>();
 const crossWorkspaceSessions = process.argv.includes("--cross-workspace-sessions");
@@ -91,9 +81,6 @@ let controlAttempts = 0;
 let newAttempts = 0;
 let loadAttempts = 0;
 let listAttempts = 0;
-let nesStartAttempts = 0;
-let nesSuggestAttempts = 0;
-let nesCloseAttempts = 0;
 let forkAttempts = 0;
 let authenticated = terminalAuthRequired
   ? terminalAuthFile != null && existsSync(terminalAuthFile)
@@ -106,8 +93,8 @@ const agent = acp
   .agent({ name: "attyd-test-agent" })
   .onRequest(acp.methods.agent.initialize, ({ params }) => {
     if (
-      params.clientCapabilities.nes != null ||
-      params.clientCapabilities.positionEncodings != null
+      params.clientCapabilities?.nes != null ||
+      params.clientCapabilities?.positionEncodings != null
     ) {
       throw acp.RequestError.invalidParams(
         undefined,
@@ -116,7 +103,7 @@ const agent = acp
     }
     if (
       (terminalAuthRequired || invalidTerminalAuth) &&
-      params.clientCapabilities.auth?.terminal !== true
+      params.clientCapabilities?.auth?.terminal !== true
     ) {
       throw acp.RequestError.invalidParams(
         undefined,
@@ -134,6 +121,8 @@ const agent = acp
             loadSession: true,
             promptCapabilities: { image: true, audio: true, embeddedContext: true },
             mcpCapabilities: { http: true, sse: true, acp: true },
+            // Browser coverage verifies that Agent-only NES support does not
+            // enable editor UI or make the client advertise editor capabilities.
             nes: {
               events: {
                 document: {
@@ -532,74 +521,6 @@ const agent = acp
       },
     };
   })
-  .onRequest(acp.methods.agent.nes.start, () => {
-    nesStartAttempts += 1;
-    return {
-      sessionId: invalidNesStartIdOnce && nesStartAttempts === 1
-        ? "x".repeat(1_025)
-        : oversizedNesStartResponseOnce && nesStartAttempts === 1
-          ? "nes-rejected-session"
-          : "nes-session",
-      _meta: {
-        observedCloseAttempts: nesCloseAttempts,
-        ...(oversizedNesStartResponseOnce && nesStartAttempts === 1
-          ? { padding: "x".repeat(4_000_000) }
-          : {}),
-      },
-    };
-  })
-  .onRequest(acp.methods.agent.nes.suggest, ({ params }) => {
-    nesSuggestAttempts += 1;
-    return {
-      suggestions: [
-        {
-          kind: "edit" as const,
-          id: invalidNesSuggestionIdOnce && nesSuggestAttempts === 1
-            ? "x".repeat(1_025)
-            : "nes-edit-1",
-          uri: params.uri,
-          edits: [
-            {
-              range: { start: params.position, end: params.position },
-              newText: "/* NES */",
-            },
-          ],
-          cursorPosition: invalidNesCursorOnce && nesSuggestAttempts === 1
-            ? { line: 99, character: 0 }
-            : { line: params.position.line, character: params.position.character + 9 },
-        },
-        {
-          kind: "jump" as const,
-          id: "nes-jump-1",
-          uri: params.uri,
-          position: { line: 0, character: 0 },
-        },
-      ],
-      _meta: {
-        receivedTriggerKind: params.triggerKind,
-        receivedContext: params.context,
-        observedRejects: [...observedNesRejects],
-        observedNesEvents: [...observedNesEvents],
-      },
-    };
-  })
-  .onRequest(acp.methods.agent.nes.close, () => {
-    nesCloseAttempts += 1;
-    return {};
-  })
-  .onNotification(acp.methods.agent.document.didOpen, () => {})
-  .onNotification(acp.methods.agent.document.didChange, ({ params }) => {
-    observedNesEvents.push(`didChange:${params.version}`);
-  })
-  .onNotification(acp.methods.agent.document.didClose, () => {})
-  .onNotification(acp.methods.agent.document.didSave, () => {})
-  .onNotification(acp.methods.agent.document.didFocus, () => {})
-  .onNotification(acp.methods.agent.nes.accept, ({ params }) => {
-    observedNesEvents.push(`accept:${params.id}`);
-  })
-  .onNotification(acp.methods.agent.nes.reject, ({ params }) => {
-    observedNesRejects.push(params);
-  })
   .onRequest<acp.MessageMcpRequest, acp.MessageMcpResponse>(
     acp.AGENT_METHODS.mcp_message,
     parseMcpMessage,
@@ -846,7 +767,7 @@ const agent = acp
     }
     if (promptText.includes("mcp-cancel-flow")) {
       const server = configuredMcpServers.find(
-        (candidate): candidate is acp.McpServer & { type: "acp" } =>
+        (candidate): candidate is acp.McpServerAcp & { type: "acp" } =>
           "type" in candidate && candidate.type === "acp",
       );
       if (!server) throw new Error("No ACP-transport MCP server was configured");
@@ -861,7 +782,7 @@ const agent = acp
         { connectionId: connected.connectionId, method: "never" },
         { cancellationSignal: messageController.signal },
       );
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await waitForMcpPendingNotifications(connected.connectionId, 1);
       messageController.abort();
       let messageCancelled = false;
       try {
@@ -869,30 +790,31 @@ const agent = acp
       } catch (error) {
         messageCancelled = error instanceof acp.RequestError && error.code === -32_800;
       }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      const cancellationResult = await client.request<
-        acp.MessageMcpResponse,
-        acp.MessageMcpRequest
-      >(
-        acp.CLIENT_METHODS.mcp_message,
-        { connectionId: connected.connectionId, method: "cancellationCount" },
-      );
+      let cancellationNotificationObserved = false;
+      const cancellationDeadline = Date.now() + 5_000;
+      while (Date.now() < cancellationDeadline) {
+        const result = await client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
+          acp.CLIENT_METHODS.mcp_message,
+          { connectionId: connected.connectionId, method: "cancellationCount" },
+        );
+        if (typeof result === "object" && result !== null &&
+            "count" in result && result.count === 1) {
+          cancellationNotificationObserved = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
 
       const pending = client.request<acp.MessageMcpResponse, acp.MessageMcpRequest>(
         acp.CLIENT_METHODS.mcp_message,
         { connectionId: connected.connectionId, method: "never" },
-      );
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      ).then(() => false, () => true);
+      await waitForMcpPendingNotifications(connected.connectionId, 2);
       await client.request<acp.DisconnectMcpResponse, acp.DisconnectMcpRequest>(
         acp.CLIENT_METHODS.mcp_disconnect,
         { connectionId: connected.connectionId },
       );
-      let disconnectRejectedPending = false;
-      try {
-        await pending;
-      } catch {
-        disconnectRejectedPending = true;
-      }
+      const disconnectRejectedPending = await pending;
 
       const recovered = await client.request<acp.ConnectMcpResponse, acp.ConnectMcpRequest>(
         acp.CLIENT_METHODS.mcp_connect,
@@ -922,11 +844,7 @@ const agent = acp
             type: "text",
             text: JSON.stringify({
               messageCancelled,
-              cancellationNotificationObserved:
-                typeof cancellationResult === "object" &&
-                cancellationResult !== null &&
-                "count" in cancellationResult &&
-                cancellationResult.count === 1,
+              cancellationNotificationObserved,
               disconnectRejectedPending,
               recoveredEcho,
             }),
@@ -937,7 +855,7 @@ const agent = acp
     }
     if (promptText.includes("mcp-lifecycle-flow")) {
       const server = configuredMcpServers.find(
-        (candidate): candidate is acp.McpServer & { type: "acp" } =>
+        (candidate): candidate is acp.McpServerAcp & { type: "acp" } =>
           "type" in candidate && candidate.type === "acp",
       );
       if (!server) throw new Error("No ACP-transport MCP server was configured");
@@ -1030,7 +948,7 @@ const agent = acp
     }
     if (promptText.includes("mcp-flow")) {
       const server = configuredMcpServers.find(
-        (candidate): candidate is acp.McpServer & { type: "acp" } =>
+        (candidate): candidate is acp.McpServerAcp & { type: "acp" } =>
           "type" in candidate && candidate.type === "acp",
       );
       if (!server) throw new Error("No ACP-transport MCP server was configured");
@@ -1084,6 +1002,13 @@ const agent = acp
         connectionId: connected.connectionId,
         method: "notifications/initialized",
       });
+      const serverNotifications = await client.request<
+        acp.MessageMcpResponse,
+        acp.MessageMcpRequest
+      >(
+        acp.CLIENT_METHODS.mcp_message,
+        { connectionId: connected.connectionId, method: "notificationSnapshot" },
+      );
       await client.request<acp.DisconnectMcpResponse, acp.DisconnectMcpRequest>(
         acp.CLIENT_METHODS.mcp_disconnect,
         { connectionId: connected.connectionId },
@@ -1095,7 +1020,13 @@ const agent = acp
           messageId: "mcp-result",
           content: {
             type: "text",
-            text: JSON.stringify({ initialized, echoed, failed, resultAndError, roundTrip }),
+            text: JSON.stringify({
+              initialized, echoed, failed, resultAndError, roundTrip,
+              serverNotifications,
+              agentNotifications: observedMcpNotifications
+                .filter(({ connectionId }) => connectionId === connected.connectionId)
+                .map(({ method, params }) => ({ method, params })),
+            }),
           },
         },
       });
@@ -1184,6 +1115,25 @@ const agent = acp
           sessionUpdate: "agent_message_chunk",
           messageId: "content-recovery",
           content: { type: "text", text: "Connection survived invalid media." },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+    if (promptText.includes("large-attachment-input-flow")) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "large-attachment-result",
+          content: {
+            type: "text",
+            text: JSON.stringify(params.prompt
+              .filter((block) => block.type === "audio")
+              .map((block) => ({
+                mimeType: block.mimeType,
+                bytes: Buffer.byteLength(block.data, "base64"),
+              }))),
+          },
         },
       });
       return { stopReason: "end_turn" };

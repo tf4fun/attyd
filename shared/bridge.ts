@@ -4,29 +4,18 @@ import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
-  DidChangeDocumentNotification,
-  DidCloseDocumentNotification,
-  DidFocusDocumentNotification,
-  DidOpenDocumentNotification,
-  DidSaveDocumentNotification,
   ForkSessionResponse,
   InitializeResponse,
   ListSessionsResponse,
   LoadSessionResponse,
   LogoutResponse,
   NewSessionResponse,
-  NesRejectReason,
-  NesSuggestion,
-  Position,
   PromptResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
-  Range,
   ResumeSessionResponse,
   SessionNotification,
   SetSessionConfigOptionResponse,
-  StartNesResponse,
-  SuggestNesResponse,
   TerminalExitStatus,
 } from "@agentclientprotocol/sdk";
 import { validateContentBlockSemantics } from "./content-validation.js";
@@ -37,20 +26,8 @@ const MAX_BRIDGE_TYPE_LENGTH = 128;
 const MAX_BRIDGE_IDENTIFIER_LENGTH = 1_024;
 const MAX_BRIDGE_CURSOR_LENGTH = 4_096;
 const MAX_BRIDGE_PATH_LENGTH = 16_384;
-const MAX_BRIDGE_LANGUAGE_ID_LENGTH = 256;
-const MAX_NES_SUGGESTIONS = 100;
-const MAX_NES_EDITS = 10_000;
 const MAX_RUNTIME_SESSIONS = 10_000;
 const MAX_RUNTIME_INTENT_RESULTS = 4_096;
-
-export interface NesDocumentState {
-  sessionId: string;
-  path: string;
-  uri: string;
-  languageId: string;
-  version: number;
-  text: string;
-}
 
 export interface TerminalSnapshot {
   sessionId: string;
@@ -93,11 +70,6 @@ export interface CanonicalRuntimeDelta {
   change: Record<string, unknown>;
 }
 
-export type CanonicalIntentStatus =
-  | "accepted"
-  | "in_flight"
-  | "uncertain";
-
 export type ConnectionPhase =
   | "starting"
   | "initializing"
@@ -107,8 +79,7 @@ export type ConnectionPhase =
 
 export type ElicitationAbortReason =
   | "session_cancelled"
-  | "session_closed"
-  | "nes_closed";
+  | "session_closed";
 
 export type SessionRuntimeOperation =
   | "fork"
@@ -118,7 +89,6 @@ export type SessionRuntimeOperation =
   | "config";
 
 export type ClientCommand =
-  | { type: "bridge/ping"; nonce: string }
   | { type: "auth/authenticate"; requestId: string; methodId: string }
   | {
       type: "auth/terminal_start";
@@ -190,64 +160,6 @@ export type ClientCommand =
       configId: string;
       value: string | boolean;
     }
-  | { type: "nes/start"; requestId: string }
-  | {
-      type: "nes/suggest";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-      position: Position;
-      selection?: Range;
-      triggerKind: "automatic" | "diagnostic" | "manual";
-    }
-  | {
-      type: "nes/accept";
-      requestId: string;
-      sessionId: string;
-      suggestionId: string;
-      text?: string;
-    }
-  | {
-      type: "nes/reject";
-      requestId: string;
-      sessionId: string;
-      suggestionId: string;
-      reason?: NesRejectReason;
-    }
-  | { type: "nes/close"; requestId: string; sessionId: string }
-  | {
-      type: "document/open";
-      requestId: string;
-      sessionId: string;
-      path: string;
-      languageId: string;
-    }
-  | {
-      type: "document/change";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-      text: string;
-    }
-  | {
-      type: "document/save";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-    }
-  | {
-      type: "document/focus";
-      sessionId: string;
-      uri: string;
-      position: Position;
-      visibleRange: Range;
-    }
-  | {
-      type: "document/close";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-    }
   | {
       type: "permission/respond";
       requestId: string;
@@ -283,20 +195,12 @@ export type ServerEvent =
   | { type: "bridge/runtime_snapshot"; snapshot: CanonicalRuntimeSnapshot }
   | { type: "bridge/runtime_delta"; delta: CanonicalRuntimeDelta }
   | {
-      type: "bridge/intent_ack";
-      requestId: string;
-      operationId: string;
-      disposition: "accepted" | "duplicate";
-      status: CanonicalIntentStatus;
-    }
-  | {
       type: "bridge/session_operation_started";
       requestId: string;
       sessionId: string;
       operation: SessionRuntimeOperation;
     }
   | { type: "bridge/phase"; phase: ConnectionPhase }
-  | { type: "bridge/pong"; nonce: string }
   | { type: "bridge/stderr"; chunk: string }
   | {
       type: "bridge/context_search_result";
@@ -461,53 +365,6 @@ export type ServerEvent =
       params?: Record<string, unknown> | null;
       result?: unknown;
       error?: { code: number; message: string; data?: unknown };
-    }
-  | { type: "acp/nes_started"; requestId: string; response: StartNesResponse }
-  | {
-      type: "acp/nes_suggestions";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-      response: SuggestNesResponse;
-    }
-  | {
-      type: "acp/nes_suggestion_resolved";
-      requestId: string;
-      sessionId: string;
-      suggestionId: string;
-      outcome: "accepted" | "rejected";
-      reason?: NesRejectReason;
-    }
-  | { type: "acp/nes_closed"; requestId: string; sessionId: string }
-  | {
-      type: "acp/document_opened";
-      requestId: string;
-      document: NesDocumentState;
-      notification?: DidOpenDocumentNotification;
-    }
-  | {
-      type: "acp/document_changed";
-      requestId: string;
-      document: NesDocumentState;
-      notification?: DidChangeDocumentNotification;
-    }
-  | {
-      type: "acp/document_saved";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-      notification?: DidSaveDocumentNotification;
-    }
-  | {
-      type: "acp/document_focused";
-      notification: DidFocusDocumentNotification;
-    }
-  | {
-      type: "acp/document_closed";
-      requestId: string;
-      sessionId: string;
-      uri: string;
-      notification?: DidCloseDocumentNotification;
     };
 
 const SERVER_EVENT_TYPES = {
@@ -517,10 +374,8 @@ const SERVER_EVENT_TYPES = {
   "bridge/runtime_replay_complete": true,
   "bridge/runtime_snapshot": true,
   "bridge/runtime_delta": true,
-  "bridge/intent_ack": true,
   "bridge/session_operation_started": true,
   "bridge/phase": true,
-  "bridge/pong": true,
   "bridge/stderr": true,
   "bridge/context_search_result": true,
   "bridge/context_attached": true,
@@ -551,27 +406,18 @@ const SERVER_EVENT_TYPES = {
   "acp/config_changed": true,
   "acp/mcp_connection": true,
   "acp/mcp_message": true,
-  "acp/nes_started": true,
-  "acp/nes_suggestions": true,
-  "acp/nes_suggestion_resolved": true,
-  "acp/nes_closed": true,
-  "acp/document_opened": true,
-  "acp/document_changed": true,
-  "acp/document_saved": true,
-  "acp/document_focused": true,
-  "acp/document_closed": true,
 } as const satisfies Record<ServerEvent["type"], true>;
 
 export function parseServerEvent(raw: string): ServerEvent {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || typeof value.type !== "string") {
-    throw new Error("Server WebSocket event must be an object with a type");
+    throw new Error("Server bridge event must be an object with a type");
   }
   if (value.type.length > MAX_BRIDGE_TYPE_LENGTH) {
-    throw new Error("Server WebSocket event type is too long");
+    throw new Error("Server bridge event type is too long");
   }
   if (!Object.hasOwn(SERVER_EVENT_TYPES, value.type)) {
-    throw new Error(`Unknown server WebSocket event: ${value.type}`);
+    throw new Error(`Unknown server bridge event: ${value.type}`);
   }
   validateServerEventEnvelope(value, value.type as ServerEvent["type"]);
   return value as ServerEvent;
@@ -678,24 +524,6 @@ function validateServerEventEnvelope(
       );
       return;
     }
-    case "bridge/intent_ack":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "operationId");
-      requireEnum(
-        value.disposition,
-        ["accepted", "duplicate"],
-        "bridge/intent_ack disposition",
-      );
-      requireEnum(
-        value.status,
-        [
-          "accepted",
-          "in_flight",
-          "uncertain",
-        ],
-        "bridge/intent_ack status",
-      );
-      return;
     case "bridge/session_operation_started":
       requireBridgeIdentifier(value, "requestId");
       requireBridgeIdentifier(value, "sessionId");
@@ -707,9 +535,6 @@ function validateServerEventEnvelope(
       return;
     case "bridge/phase":
       requireEnum(value.phase, ["starting", "initializing", "ready", "stopped", "error"], "bridge/phase phase");
-      return;
-    case "bridge/pong":
-      requireBridgeIdentifier(value, "nonce");
       return;
     case "bridge/stderr":
       requireString(value, "chunk");
@@ -860,7 +685,6 @@ function validateServerEventEnvelope(
     }
     case "acp/session_closed":
     case "acp/session_deleted":
-    case "acp/nes_closed":
       requireString(value, "requestId");
       requireString(value, "sessionId");
       return;
@@ -958,7 +782,7 @@ function validateServerEventEnvelope(
       requireString(value, "sessionId");
       requireEnum(
         value.reason,
-        ["session_cancelled", "session_closed", "nes_closed"],
+        ["session_cancelled", "session_closed"],
         "acp/elicitation_aborted reason",
       );
       return;
@@ -988,58 +812,6 @@ function validateServerEventEnvelope(
       requireString(value, "method");
       requireEnum(value.kind, ["request", "notification", "response"], "acp/mcp_message kind");
       return;
-    case "acp/nes_started": {
-      requireString(value, "requestId");
-      const response = requireRecordValue(value.response, "acp/nes_started response");
-      requireBoundedStringValue(
-        response.sessionId,
-        "acp/nes_started response sessionId",
-        MAX_BRIDGE_IDENTIFIER_LENGTH,
-      );
-      return;
-    }
-    case "acp/nes_suggestions": {
-      requireString(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "uri", MAX_BRIDGE_PATH_LENGTH);
-      const response = requireRecordValue(value.response, "acp/nes_suggestions response");
-      requireArray(response.suggestions, "acp/nes_suggestions suggestions");
-      if (response.suggestions.length > MAX_NES_SUGGESTIONS) {
-        throw new Error(
-          `acp/nes_suggestions exceeds ${MAX_NES_SUGGESTIONS} suggestions`,
-        );
-      }
-      response.suggestions.forEach((suggestion, index) => {
-        validateNesSuggestionEnvelope(
-          suggestion,
-          `acp/nes_suggestions suggestion ${index}`,
-        );
-      });
-      return;
-    }
-    case "acp/nes_suggestion_resolved":
-      requireString(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBridgeIdentifier(value, "suggestionId");
-      requireEnum(value.outcome, ["accepted", "rejected"], "acp/nes_suggestion_resolved outcome");
-      return;
-    case "acp/document_opened":
-    case "acp/document_changed":
-      requireString(value, "requestId");
-      validateDocumentState(value.document, type);
-      return;
-    case "acp/document_saved":
-    case "acp/document_closed":
-      requireString(value, "requestId");
-      requireString(value, "sessionId");
-      requireString(value, "uri");
-      return;
-    case "acp/document_focused": {
-      const notification = requireRecordValue(value.notification, "acp/document_focused notification");
-      requireString(notification, "sessionId");
-      requireString(notification, "uri");
-      return;
-    }
   }
 
   const unhandled: never = type;
@@ -1077,66 +849,6 @@ function validateEarlySessionUpdates(
     }
     const update = requireRecordValue(notification.update, `${label} early update payload`);
     requireString(update, "sessionUpdate");
-  }
-}
-
-function validateDocumentState(value: unknown, label: string): void {
-  const document = requireRecordValue(value, `${label} document`);
-  for (const key of ["sessionId", "path", "uri", "languageId"] as const) {
-    requireString(document, key);
-  }
-  requireStringValue(document.text, `${label} document text`);
-  if (!Number.isSafeInteger(document.version) || Number(document.version) < 0) {
-    throw new Error(`${label} document requires a non-negative version`);
-  }
-}
-
-function validateNesSuggestionEnvelope(value: unknown, label: string): void {
-  const suggestion = requireRecordValue(value, label);
-  requireBoundedStringValue(
-    suggestion.id,
-    `${label} id`,
-    MAX_BRIDGE_IDENTIFIER_LENGTH,
-  );
-  requireBoundedStringValue(
-    suggestion.uri,
-    `${label} uri`,
-    MAX_BRIDGE_PATH_LENGTH,
-  );
-  requireEnum(
-    suggestion.kind,
-    ["edit", "jump", "rename", "searchAndReplace"],
-    `${label} kind`,
-  );
-  switch (suggestion.kind) {
-    case "edit":
-      requireArray(suggestion.edits, `${label} edits`);
-      if (suggestion.edits.length > MAX_NES_EDITS) {
-        throw new Error(`${label} exceeds ${MAX_NES_EDITS} edits`);
-      }
-      suggestion.edits.forEach((value, index) => {
-        const edit = requireRecordValue(value, `${label} edit ${index}`);
-        requireRange(edit.range, `${label} edit ${index} range`);
-        requireStringValue(edit.newText, `${label} edit ${index} newText`);
-      });
-      if (suggestion.cursorPosition != null) {
-        requirePosition(suggestion.cursorPosition, `${label} cursorPosition`);
-      }
-      return;
-    case "jump":
-      requirePosition(suggestion.position, `${label} position`);
-      return;
-    case "rename":
-      requirePosition(suggestion.position, `${label} position`);
-      requireStringValue(suggestion.newName, `${label} newName`);
-      return;
-    case "searchAndReplace":
-      requireStringValue(suggestion.search, `${label} search`);
-      requireStringValue(suggestion.replace, `${label} replace`);
-      if (suggestion.isRegex != null && typeof suggestion.isRegex !== "boolean") {
-        throw new Error(`${label} isRegex must be a boolean when provided`);
-      }
-      return;
   }
 }
 
@@ -1217,18 +929,15 @@ function requireEnum(
 export function parseClientCommand(raw: string): ClientCommand {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || typeof value.type !== "string") {
-    throw new Error("WebSocket message must be an object with a type");
+    throw new Error("Bridge command must be an object with a type");
   }
   if (Object.hasOwn(value, "history")) {
-    throw new Error("WebSocket commands must not contain completed browser history");
+    throw new Error("Bridge commands must not contain completed browser history");
   }
   if (value.type.length > MAX_BRIDGE_TYPE_LENGTH) {
-    throw new Error("WebSocket command type is too long");
+    throw new Error("Bridge command type is too long");
   }
   switch (value.type) {
-    case "bridge/ping":
-      requireBridgeIdentifier(value, "nonce");
-      break;
     case "auth/authenticate":
       requireBridgeIdentifier(value, "requestId");
       requireBridgeIdentifier(value, "methodId");
@@ -1310,68 +1019,6 @@ export function parseClientCommand(raw: string): ClientCommand {
         throw new Error(`session/set_config_option value exceeds ${MAX_BRIDGE_IDENTIFIER_LENGTH} characters`);
       }
       break;
-    case "nes/start":
-      requireBridgeIdentifier(value, "requestId");
-      break;
-    case "nes/suggest":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "uri", MAX_BRIDGE_PATH_LENGTH);
-      requirePosition(value.position, "nes/suggest position");
-      if (value.selection != null) requireRange(value.selection, "nes/suggest selection");
-      if (!["automatic", "diagnostic", "manual"].includes(String(value.triggerKind))) {
-        throw new Error("nes/suggest has an invalid triggerKind");
-      }
-      break;
-    case "nes/accept":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBridgeIdentifier(value, "suggestionId");
-      if (value.text != null) {
-        requireStringValue(value.text, "nes/accept text");
-        if (value.text.length > 2_000_000) throw new Error("nes/accept text is too large");
-      }
-      break;
-    case "nes/reject":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBridgeIdentifier(value, "suggestionId");
-      if (
-        value.reason != null &&
-        !["rejected", "ignored", "replaced", "cancelled"].includes(String(value.reason))
-      ) {
-        throw new Error("nes/reject has an invalid reason");
-      }
-      break;
-    case "nes/close":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      break;
-    case "document/open":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "path", MAX_BRIDGE_PATH_LENGTH);
-      requireBoundedString(value, "languageId", MAX_BRIDGE_LANGUAGE_ID_LENGTH);
-      break;
-    case "document/change":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "uri", MAX_BRIDGE_PATH_LENGTH);
-      requireStringValue(value.text, "document/change text");
-      if (value.text.length > 2_000_000) throw new Error("document/change text is too large");
-      break;
-    case "document/save":
-    case "document/close":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "uri", MAX_BRIDGE_PATH_LENGTH);
-      break;
-    case "document/focus":
-      requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "uri", MAX_BRIDGE_PATH_LENGTH);
-      requirePosition(value.position, "document/focus position");
-      requireRange(value.visibleRange, "document/focus visibleRange");
-      break;
     case "permission/respond":
       requireBridgeIdentifier(value, "requestId");
       requireBridgeIdentifier(value, "permissionId");
@@ -1406,7 +1053,7 @@ export function parseClientCommand(raw: string): ClientCommand {
       }
       break;
     default:
-      throw new Error(`Unknown WebSocket command: ${value.type}`);
+      throw new Error(`Unknown Bridge command: ${value.type}`);
   }
   return value as ClientCommand;
 }
@@ -1497,24 +1144,6 @@ function isElicitationValue(value: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requirePosition(value: unknown, label: string): asserts value is Position {
-  if (!isRecord(value)) throw new Error(`${label} must be an object`);
-  if (
-    !Number.isSafeInteger(value.line) ||
-    !Number.isSafeInteger(value.character) ||
-    Number(value.line) < 0 ||
-    Number(value.character) < 0
-  ) {
-    throw new Error(`${label} must contain non-negative integer coordinates`);
-  }
-}
-
-function requireRange(value: unknown, label: string): asserts value is Range {
-  if (!isRecord(value)) throw new Error(`${label} must be an object`);
-  requirePosition(value.start, `${label}.start`);
-  requirePosition(value.end, `${label}.end`);
 }
 
 function requireBridgeIdentifier(value: Record<string, unknown>, key: string): void {

@@ -13,26 +13,54 @@ drivers; there is no second backend implementation.
 
 | Layer | Command | Purpose |
 | --- | --- | --- |
-| Frontend and browser contract | `npm test` | 146 reducer, event-envelope, content, prompt-history, search, interaction, accessibility, load-replacement, and adversarial-state cases |
-| Rust backend | `npm run test:rust` | 242 native cases, including active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, bounded event queues, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
+| Frontend and browser contract | `npm test` | Reducer, event-envelope, content, prompt-history, search, interaction, accessibility, load-replacement, and adversarial-state cases |
+| Rust backend | `npm run test:rust` | Native cases for active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, bounded event queues, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
 | Remote ACP transports | `npm run test:remote` | Connects the Rust binary to SDK HTTP/SSE and WebSocket ACP servers; verifies remote capability boundaries and Agent-owned absolute cwd |
 | Rust-hosted black box | `npm run test:ui` | Exercises the production binary's embedded bundle and REST/session-SSE API with a real stdio ACP fixture, revision-guarded prompt completion, history reload, and deletion |
-| Rust coverage gate | `npm run test:coverage` | Runs native and instrumented real-binary suites and requires at least 85% Rust backend line coverage; requires `cargo-llvm-cov` |
+| MCP-over-ACP protocol | `node --import tsx scripts/acp-protocol-smoke.ts` | Verifies bidirectional requests and notifications, error preservation, cancellation, cleanup, and reconnect using SDK fixtures |
+| HTTP and process boundaries | `node --import tsx scripts/server-boundary-smoke.ts` | Rejects cross-origin and untrusted Host requests; verifies graceful shutdown with an open SSE subscription and Agent process cleanup |
+| Rust coverage gate | `npm run test:coverage` | Combines native tests, instrumented API/protocol suites, and browser interactions; requires at least 85% Rust line coverage and `cargo-llvm-cov` |
 | Standalone artifact | `npm run test:binary` | Copies only the release executable to an empty directory and verifies embedded HTML, JavaScript, health metadata, and static MIME types |
 | Browser interaction | `npm run test:browser` | Runs the production Rust host with the fake Agent and verifies Zed-style Agent interaction and mobile behavior in Chromium |
-| Real Agent | `npm run test:goose` | Runs Goose ACP v1 recovery and a deterministic local prompt/tool lifecycle through the Rust host without a real provider key |
+| Optional backend example | `npm run test:goose` | Diagnostic smoke for a separately installed Goose executable at `bin/goose`; not a protocol conformance gate |
 
 `npm run check` runs type checking, frontend/shared tests, and the production client build. CI
 runs the frontend, Rust backend, and Chromium browser suites as independent parallel jobs. Rust
 unit, remote-transport, REST/SSE host-smoke, release-build, and standalone-binary checks remain
-separate steps so failures identify their layer directly. The slower coverage and Goose suites
-remain separate.
+separate steps so failures identify their layer directly. See the workflow for CI gates.
+Conformance follows the [ACP compatibility contract](acp-coverage.md#compatibility-contract);
+backend-specific smoke tests remain optional.
 
-## Backend migration status
+## Interactive fixture
 
-The former TypeScript bridge has been removed. Its mature behavior cases were first ported into
-native Rust tests or the shared real-binary black box, then the Playwright and Goose harnesses were
-moved onto the Rust executable. The Rust suite covers CLI and MCP configuration boundaries,
+To explore the interface without installing an Agent or configuring a model provider:
+
+```bash
+npm ci
+npm run build:client
+ATTYD_SKIP_WEB_BUILD=1 cargo build --locked
+npm run test:browser:serve -- 7332
+```
+
+Open `http://127.0.0.1:7332`, create a project, and send one of these fixture prompts:
+
+| Prompts | Behavior |
+| --- | --- |
+| `review-flow`, `activity-flow` | File changes and tool activity |
+| `content-flow`, `message-actions-flow` | Rich content, message actions, and export |
+| `form-flow`, `url-flow`, `pending-url-flow` | Agent questions and external flows |
+| `terminal-flow`, `terminal-cancel-flow`, `terminal-burst-flow` | Terminal output, cancellation, and streaming |
+| `structured-error-flow`, `background-flow` | Error recovery and background work |
+| `usage-flow`, `context-window-flow`, `compaction-flow` | Usage, context, and compaction |
+| `mcp-flow`, `mcp-cancel-flow`, `mcp-lifecycle-flow` | MCP-over-ACP transport behavior |
+
+Type `/` for advertised commands or `@` for workspace context. Browser tests use
+isolated instances of this SDK fixture. Local Playwright runs require installed
+Chrome; CI installs Chromium. The coverage command uses the same browser setup.
+
+## Backend behavior
+
+The Rust suite covers CLI and MCP configuration boundaries,
 filesystem roots/read/write/context behavior, terminal and terminal-auth lifecycle, optional
 capability gates, Agent-owned cwd selection, early/late update isolation, bounded relay values,
 structured errors, cyclic pagination, session races, complete ContentBlock validation,

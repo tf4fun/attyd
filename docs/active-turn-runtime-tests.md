@@ -16,7 +16,7 @@ alone are not correctness evidence.
 | L3 | snapshot cut, suffix, Hub backpressure and shared payloads | in-memory observers |
 | L4 | stdio, HTTP/SSE and WebSocket Agent transports | production binary fixtures |
 | L5 | browser business commands and SSE rendering | reducer/component/Playwright |
-| L6 | memory and lifecycle regression | logical counters, drop probes and Goose soak |
+| L6 | memory and lifecycle regression | logical counters, drop probes and ACP fixture soak |
 
 ## P0 red tests
 
@@ -117,8 +117,8 @@ Run the common prompt-terminal-commit and idle-close cases over stdio, remote HT
 - `transport_matrix_browser_disconnect_does_not_cancel_prompt`
 - `transport_matrix_lost_prompt_response_is_uncertain_not_redispatched`
 - `transport_matrix_two_sessions_progress_independently`
-- `goose_tool_turn_commits_without_post_turn_load`
-- `goose_idle_close_then_cold_load_contains_the_completed_turn`
+- `acp_tool_turn_commits_without_post_turn_load`
+- `acp_idle_close_then_cold_load_contains_the_completed_turn`
 - `no_load_transport_matrix_reconnects_from_bridge_memory`
 
 ## Consistency oracle
@@ -181,7 +181,7 @@ zero-history assertion, and queued-prompt automatic dispatch must be replaced by
 2. L1 HistoryCache/state tests pass without browser code.
 3. L2 cold-load, turn-commit and idle-close tests pass with exact Agent call counts.
 4. L3 observation and memory-sharing tests pass.
-5. L4 transport matrix and Goose canary pass.
+5. L4 transport matrix and ACP conformance fixtures pass.
 6. L5 switches the browser from ACP-shaped lifecycle inference to business snapshots/commands.
 7. Old requester-private load, active-only cache and Bridge-owned queued-prompt paths are deleted;
    the browser-local send queue remains.

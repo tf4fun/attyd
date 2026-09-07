@@ -3,7 +3,6 @@ import {
   CLIENT_METHODS,
   PROTOCOL_METHODS,
   type ContentBlock,
-  type NesSuggestion,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 
@@ -87,10 +86,3 @@ export const CONTENT_BLOCK_COVERAGE = {
   resource_link: "supported",
   resource: "supported",
 } as const satisfies Record<ContentBlock["type"], CoverageStatus>;
-
-export const NES_SUGGESTION_COVERAGE = {
-  edit: "unadvertised",
-  jump: "unadvertised",
-  rename: "unadvertised",
-  searchAndReplace: "unadvertised",
-} as const satisfies Record<NesSuggestion["kind"], CoverageStatus>;

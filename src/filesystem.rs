@@ -6,7 +6,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Error, RequestCancellation};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use walkdir::WalkDir;
 
 const MAX_FILE_CONTENT_BYTES: usize = 4_000_000;
@@ -81,25 +81,32 @@ impl WorkspaceFileSystem {
         request: ReadTextFileRequest,
     ) -> Result<ReadTextFileResponse, Error> {
         let path = self.checked_existing_path(&request.path).await?;
-        if request.line.is_some() || request.limit.is_some() {
-            return self
-                .read_range(&path, request.line.unwrap_or(1), request.limit)
-                .await
-                .map(ReadTextFileResponse::new);
-        }
-
         let metadata = tokio::fs::metadata(&path).await.map_err(fs_error)?;
         if !metadata.is_file() {
             return Err(Error::invalid_params().data("ACP file read target must be a regular file"));
         }
+        if request.line.is_some() || request.limit.is_some() {
+            let file = tokio::fs::File::open(&path).await.map_err(fs_error)?;
+            return read_text_range(
+                BufReader::new(file),
+                request.line.unwrap_or(1),
+                request.limit,
+            )
+            .await
+            .map(ReadTextFileResponse::new);
+        }
+
         if metadata.len() > MAX_FILE_CONTENT_BYTES as u64 {
             return Err(Error::invalid_request().data(format!(
                 "ACP file read exceeds {MAX_FILE_CONTENT_BYTES} bytes"
             )));
         }
-        let mut file = tokio::fs::File::open(&path).await.map_err(fs_error)?;
+        let file = tokio::fs::File::open(&path).await.map_err(fs_error)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes).await.map_err(fs_error)?;
+        file.take(MAX_FILE_CONTENT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(fs_error)?;
         if bytes.len() > MAX_FILE_CONTENT_BYTES {
             return Err(Error::invalid_request().data(format!(
                 "ACP file read exceeds {MAX_FILE_CONTENT_BYTES} bytes"
@@ -293,7 +300,12 @@ impl WorkspaceFileSystem {
                 "workspace context exceeds {MAX_CONTEXT_BYTES} bytes"
             )));
         }
-        let bytes = tokio::fs::read(&target).await.map_err(fs_error)?;
+        let file = tokio::fs::File::open(&target).await.map_err(fs_error)?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_CONTEXT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(fs_error)?;
         if bytes.len() as u64 > MAX_CONTEXT_BYTES || bytes.contains(&0) {
             return Err(Error::invalid_request().data("workspace context is not a text file"));
         }
@@ -369,65 +381,56 @@ impl WorkspaceFileSystem {
             path.display()
         )))
     }
+}
 
-    async fn read_range(
-        &self,
-        path: &Path,
-        start_line: u32,
-        limit: Option<u32>,
-    ) -> Result<String, Error> {
-        if limit == Some(0) {
-            return Ok(String::new());
+async fn read_text_range(
+    mut reader: impl AsyncBufRead + Unpin,
+    start_line: u32,
+    limit: Option<u32>,
+) -> Result<String, Error> {
+    if limit == Some(0) {
+        return Ok(String::new());
+    }
+    let mut output = Vec::new();
+    let mut current_line = 1_u32;
+    let mut selected = 0_u32;
+    let mut scanned = 0_usize;
+
+    loop {
+        // Consume bounded chunks, including when a skipped line has no newline.
+        let chunk = reader.fill_buf().await.map_err(fs_error)?;
+        if chunk.is_empty() {
+            break;
         }
-        let file = tokio::fs::File::open(path).await.map_err(fs_error)?;
-        let mut reader = BufReader::new(file);
-        let mut line = Vec::new();
-        let mut output = Vec::new();
-        let mut current_line = 1_u32;
-        let mut selected = 0_u32;
-        let mut scanned = 0_usize;
-
-        loop {
-            line.clear();
-            let bytes = reader
-                .read_until(b'\n', &mut line)
-                .await
-                .map_err(fs_error)?;
-            if bytes == 0 {
-                break;
-            }
-            scanned = scanned.saturating_add(bytes);
-            if scanned > MAX_FILE_SCAN_BYTES {
+        let end = chunk.iter().position(|byte| *byte == b'\n');
+        let count = end.map_or(chunk.len(), |index| index + 1);
+        scanned = scanned.saturating_add(count);
+        if scanned > MAX_FILE_SCAN_BYTES {
+            return Err(Error::invalid_request().data(format!(
+                "ACP file range scan exceeds {MAX_FILE_SCAN_BYTES} bytes"
+            )));
+        }
+        if current_line >= start_line {
+            if count > MAX_FILE_CONTENT_BYTES - output.len() {
                 return Err(Error::invalid_request().data(format!(
-                    "ACP file range scan exceeds {MAX_FILE_SCAN_BYTES} bytes"
+                    "ACP file read exceeds {MAX_FILE_CONTENT_BYTES} bytes"
                 )));
             }
-            if current_line >= start_line {
-                if line.ends_with(b"\n") {
-                    line.pop();
-                    if line.ends_with(b"\r") {
-                        line.pop();
-                    }
-                }
-                if selected > 0 {
-                    output.push(b'\n');
-                }
-                output.extend_from_slice(&line);
-                selected = selected.saturating_add(1);
-                if output.len() > MAX_FILE_CONTENT_BYTES {
-                    return Err(Error::invalid_request().data(format!(
-                        "ACP file read exceeds {MAX_FILE_CONTENT_BYTES} bytes"
-                    )));
-                }
-                if limit.is_some_and(|limit| selected >= limit) {
-                    break;
-                }
+            output.extend_from_slice(&chunk[..count]);
+            if end.is_some() {
+                selected += 1;
             }
+        }
+        reader.consume(count);
+        if limit.is_some_and(|limit| selected >= limit) {
+            break;
+        }
+        if end.is_some() {
             current_line = current_line.saturating_add(1);
         }
-        String::from_utf8(output)
-            .map_err(|_| Error::invalid_request().data("ACP file is not valid UTF-8 text"))
     }
+    String::from_utf8(output)
+        .map_err(|_| Error::invalid_request().data("ACP file is not valid UTF-8 text"))
 }
 
 fn ensure_not_cancelled(cancellation: Option<&RequestCancellation>) -> Result<(), Error> {
@@ -628,7 +631,7 @@ mod tests {
             .read(ReadTextFileRequest::new("session", &file).line(2).limit(1))
             .await
             .unwrap();
-        assert_eq!(response.content, "two");
+        assert_eq!(response.content, "two\n");
         assert!(
             fs.read(ReadTextFileRequest::new(
                 "session",
@@ -645,6 +648,97 @@ mod tests {
             )
             .contains("1-based")
         );
+    }
+
+    #[tokio::test]
+    async fn ranges_preserve_line_endings_empty_lines_and_utf8_across_chunks() {
+        let content = "one\r\n\n🙂\r\nlast";
+        for (start, limit, expected) in [
+            (1, Some(1), "one\r\n"),
+            (2, Some(2), "\n🙂\r\n"),
+            (4, None, "last"),
+            (5, None, ""),
+            (1, Some(0), ""),
+            (1, None, content),
+        ] {
+            let reader = BufReader::with_capacity(1, content.as_bytes());
+            assert_eq!(
+                read_text_range(reader, start, limit).await.unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn range_reads_bound_both_returned_content_and_skipped_unterminated_lines() {
+        // An unending line must hit a budget without buffering the whole line.
+        for (start, expected) in [(1, "file read exceeds"), (2, "range scan exceeds")] {
+            let reader = BufReader::new(tokio::io::repeat(b'x'));
+            let error = read_text_range(reader, start, Some(1)).await.unwrap_err();
+            assert!(request_error_data(error).contains(expected));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("long-line.txt");
+        let content = "x".repeat(MAX_FILE_CONTENT_BYTES);
+        std::fs::write(&file, &content).unwrap();
+        let fs = WorkspaceFileSystem::new(directory.path(), false, &[]).unwrap();
+        assert_eq!(
+            fs.read(ReadTextFileRequest::new("session", &file).line(1).limit(1))
+                .await
+                .unwrap()
+                .content,
+            content
+        );
+        std::fs::write(&file, format!("{content}x")).unwrap();
+        assert!(
+            request_error_data(
+                fs.read(ReadTextFileRequest::new("session", &file).line(1).limit(1))
+                    .await
+                    .unwrap_err()
+            )
+            .contains("file read exceeds")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_directory_range_reads_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let fs = WorkspaceFileSystem::new(directory.path(), false, &[]).unwrap();
+        let error = fs
+            .read(ReadTextFileRequest::new("session", directory.path()).limit(1))
+            .await
+            .unwrap_err();
+        assert!(request_error_data(error).contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_fifo_range_reads_even_when_a_writer_is_available() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("pipe.txt");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Keep both ends open so a regression fails without hanging an OS worker.
+        let mut pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        pipe.write_all(b"not a regular file\n").unwrap();
+        let fs = WorkspaceFileSystem::new(directory.path(), false, &[]).unwrap();
+        let error = fs
+            .read(ReadTextFileRequest::new("session", &fifo).limit(1))
+            .await
+            .unwrap_err();
+        assert!(request_error_data(error).contains("regular file"));
     }
 
     #[tokio::test]
@@ -684,7 +778,7 @@ mod tests {
             .read(ReadTextFileRequest::new("session", &file).line(1).limit(1))
             .await
             .unwrap();
-        assert_eq!(response.content, "head");
+        assert_eq!(response.content, "head\n");
     }
 
     #[tokio::test]

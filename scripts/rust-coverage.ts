@@ -18,6 +18,8 @@ const reportPath = join(temporaryDirectory, "rust.json");
 const coverageTarget = join(workspace, "target", "llvm-cov-target");
 
 try {
+  // The browser suite must exercise the current client in the instrumented host.
+  run("npm", ["run", "build:client"]);
   run("cargo", ["llvm-cov", "clean", "--workspace", "--offline"]);
   run("cargo", ["llvm-cov", "--offline", "--all-targets", "--no-report"], {
     ATTYD_SKIP_WEB_BUILD: "1",
@@ -39,6 +41,20 @@ try {
     ATTYD_SMOKE_SKIP_OVERSIZED_LINE: "1",
   });
   run("node", ["--import", "tsx", "scripts/rust-remote-smoke.ts"], {
+    ...instrumentedEnvironment,
+    ATTYD_RUST_BINARY: rustBinary,
+  });
+  run("node", ["--import", "tsx", "scripts/server-boundary-smoke.ts"], {
+    ...instrumentedEnvironment,
+    ATTYD_RUST_BINARY: rustBinary,
+  });
+  run("node", ["--import", "tsx", "scripts/acp-protocol-smoke.ts"], {
+    ...instrumentedEnvironment,
+    ATTYD_RUST_BINARY: rustBinary,
+  });
+  // Invoke Playwright directly: test:browser would rebuild an uninstrumented host.
+  // Every fixture inherits both the binary override and LLVM_PROFILE_FILE.
+  run("node", ["node_modules/@playwright/test/cli.js", "test"], {
     ...instrumentedEnvironment,
     ATTYD_RUST_BINARY: rustBinary,
   });

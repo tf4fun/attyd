@@ -41,6 +41,10 @@ pub struct Options {
     #[arg(short, long, default_value_t = 7331)]
     pub port: u16,
 
+    /// Explicit browser origin for a custom domain or HTTPS reverse proxy. May be repeated.
+    #[arg(long = "allowed-origin", value_parser = normalize_origin)]
+    pub allowed_origins: Vec<String>,
+
     /// Stdio workspace default and local filesystem boundary.
     #[arg(short = 'c', long, default_value = ".", value_parser = absolute_or_resolve)]
     pub cwd: PathBuf,
@@ -82,20 +86,10 @@ impl Options {
         {
             self.command.remove(0);
         }
-        if self.command.is_empty() && self.transport == Transport::Stdio {
-            self.command = vec![
-                std::env::current_dir()
-                    .map_err(|error| error.to_string())?
-                    .join("bin/goose")
-                    .to_string_lossy()
-                    .into_owned(),
-                "acp".to_string(),
-            ];
-        }
         match self.transport {
             Transport::Stdio => {
                 if self.command.is_empty() {
-                    return Err("stdio transport requires an Agent command".to_string());
+                    return Err("stdio transport requires an Agent command; specify -- <agent-command> [args...]".to_string());
                 }
             }
             Transport::Http | Transport::Ws => {
@@ -130,11 +124,45 @@ impl Options {
         self.additional_directories.sort();
         self.additional_directories.dedup();
         self.additional_directories.retain(|path| path != &self.cwd);
+        self.allowed_origins = self
+            .allowed_origins
+            .iter()
+            .map(|origin| normalize_origin(origin))
+            .collect::<Result<_, _>>()?;
+        self.allowed_origins.sort();
+        self.allowed_origins.dedup();
         let (mcp_servers, acp_mcp_providers) = load_mcp_configs(&self.mcp_configs)?;
         self.mcp_servers = mcp_servers;
         self.acp_mcp_providers = acp_mcp_providers;
         Ok(self)
     }
+}
+
+pub(crate) fn normalize_origin(value: &str) -> Result<String, String> {
+    let invalid = || {
+        "allowed origin must be an HTTP(S) scheme and authority only, without credentials, path, query, or fragment".to_string()
+    };
+    let (_, authority) = value.split_once("://").ok_or_else(invalid)?;
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+        || authority.is_empty()
+        || authority.contains(['/', '\\', '?', '#', '@', '*'])
+    {
+        return Err(invalid());
+    }
+    let origin = url::Url::parse(value).map_err(|_| invalid())?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(origin.origin().ascii_serialization())
 }
 
 fn absolute_or_resolve(value: &str) -> Result<PathBuf, String> {
@@ -184,7 +212,7 @@ mod tests {
 
     #[test]
     fn accepts_an_ephemeral_port_for_integration_tests() {
-        let options = Options::try_parse_from(["attyd", "--port", "0"])
+        let options = Options::try_parse_from(["attyd", "--port", "0", "--", "fake-agent"])
             .unwrap()
             .normalized()
             .unwrap();
@@ -193,13 +221,13 @@ mod tests {
 
     #[test]
     fn defaults_to_stdio_and_accepts_remote_transport_aliases() {
-        let local = Options::try_parse_from(["attyd"])
+        let local = Options::try_parse_from(["attyd", "--", "example-agent", "acp"])
             .unwrap()
             .normalized()
             .unwrap();
         assert_eq!(local.transport, Transport::Stdio);
         assert_eq!(local.command.last().map(String::as_str), Some("acp"));
-        assert!(local.command[0].ends_with("bin/goose"));
+        assert_eq!(local.command[0], "example-agent");
 
         for (transport, endpoint, expected) in [
             ("http", "https://agent.example/acp", Transport::Http),
@@ -217,6 +245,41 @@ mod tests {
                 .unwrap();
             assert_eq!(options.transport, expected);
             assert_eq!(options.command, [endpoint]);
+        }
+    }
+
+    #[test]
+    fn requires_an_explicit_stdio_command() {
+        let error = Options::try_parse_from(["attyd"])
+            .unwrap()
+            .normalized()
+            .unwrap_err();
+        assert!(error.contains("-- <agent-command> [args...]"));
+    }
+
+    #[test]
+    fn accepts_only_explicit_http_origins_and_normalizes_default_ports() {
+        for (origin, expected) in [
+            ("https://agent.example:443", "https://agent.example"),
+            ("http://localhost:7331", "http://localhost:7331"),
+            ("http://[::1]:7331", "http://[::1]:7331"),
+        ] {
+            assert_eq!(normalize_origin(origin).unwrap(), expected);
+        }
+        for origin in [
+            "null",
+            "*",
+            "ftp://example.com",
+            "https://*.example.com",
+            "https://user:pass@example.com",
+            "https://example.com/",
+            "https://example.com/path",
+            "https://example.com?x=1",
+            "https://example.com#fragment",
+            " https://example.com",
+            "https://example.com\\other",
+        ] {
+            assert!(normalize_origin(origin).is_err(), "accepted {origin}");
         }
     }
 

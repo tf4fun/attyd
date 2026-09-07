@@ -26,7 +26,7 @@ use crate::mcp::McpManager;
 use crate::mcp_config::{server_name, server_type};
 use crate::options::{Options, Transport};
 use crate::runtime_state::{
-    IntentAck, RuntimeEffect, RuntimeState, SessionLifecycle,
+    RuntimeEffect, RuntimeState, SessionLifecycle,
     SessionOperationKind as RuntimeSessionOperationKind, UrlFlowStatus,
 };
 use crate::semantic::{
@@ -125,16 +125,6 @@ impl EventSink {
 
     fn error(&self, message: impl Into<String>, request_id: Option<&str>, operation: Option<&str>) {
         self.send(error_event(message, request_id, operation));
-    }
-
-    fn error_to(
-        &self,
-        subscriber_id: u64,
-        message: impl Into<String>,
-        request_id: Option<&str>,
-        operation: Option<&str>,
-    ) {
-        self.send_to(subscriber_id, error_event(message, request_id, operation));
     }
 
     fn acp_error(&self, error: Error, request_id: Option<&str>, operation: Option<&str>) {
@@ -666,18 +656,6 @@ fn agent_error_value(error: &Error) -> Value {
     })
 }
 
-fn admit_browser_intent(
-    state: &mut BridgeState,
-    subscriber_id: u64,
-    request_id: &str,
-    command: &Value,
-) -> Result<IntentAck, crate::runtime_state::RuntimeStateError> {
-    let epoch = state.runtime.epoch().to_string();
-    state
-        .runtime
-        .accept_intent(&epoch, subscriber_id, request_id, command.to_string())
-}
-
 fn settle_runtime_operation_request_error(
     state: &mut BridgeState,
     session_id: &str,
@@ -976,7 +954,6 @@ fn can_close_rejected_chat_session(state: &BridgeState, session_id: &str) -> boo
 
 #[derive(Clone)]
 struct CommandContext {
-    subscriber_id: u64,
     options: Arc<Options>,
     state: Arc<Mutex<BridgeState>>,
     sink: EventSink,
@@ -996,11 +973,6 @@ enum SessionOperation {
 }
 
 pub(crate) enum BridgeInput {
-    #[cfg(test)]
-    Command {
-        subscriber_id: u64,
-        raw: String,
-    },
     RuntimeSnapshotRequest,
     SessionViewRequest {
         session_id: String,
@@ -1945,7 +1917,7 @@ where
                     _ = cancellation.cancelled() => None,
                     input = commands.recv() => input,
                 };
-                let (subscriber_id, raw, turn_responder, business_responder) = match input {
+                let (command, turn_responder, business_responder) = match input {
                     Some(BridgeInput::RuntimeSnapshotRequest) => {
                         let mut state = state.lock().await;
                         let snapshot = state.runtime.snapshot();
@@ -1974,13 +1946,11 @@ where
                             continue;
                         }
                         (
-                            0,
                             json!({
                                 "type": "session/close",
                                 "requestId": format!("bridge-idle-close-{}", Uuid::new_v4()),
                                 "sessionId": session_id,
-                            })
-                            .to_string(),
+                            }),
                             None,
                             None,
                         )
@@ -2045,15 +2015,13 @@ where
                             continue;
                         };
                         (
-                            0,
                             json!({
                                 "type": "session/load",
                                 "requestId": format!("bridge-materialize-{}", Uuid::new_v4()),
                                 "sessionId": session_id,
                                 "bridgeManagedMaterialization": true,
                                 "bridgeMaterializationId": materialization_id,
-                            })
-                            .to_string(),
+                            }),
                             None,
                             None,
                         )
@@ -2065,7 +2033,6 @@ where
                         prompt,
                         response,
                     }) => (
-                        0,
                         json!({
                             "type": "session/prompt",
                             "requestId": client_intent_id,
@@ -2073,79 +2040,24 @@ where
                             "historyRevision": history_revision,
                             "sessionId": session_id,
                             "prompt": prompt,
-                        })
-                        .to_string(),
+                        }),
                         Some(TurnResponder::new(response)),
                         None,
                     ),
-                    Some(BridgeInput::BusinessRequest { command, response }) => (
-                        0,
-                        command.to_string(),
-                        None,
-                        Some(BusinessResponder::new(response)),
-                    ),
-                    #[cfg(test)]
-                    Some(BridgeInput::Command { subscriber_id, raw }) => {
-                        (subscriber_id, raw, None, None)
+                    Some(BridgeInput::BusinessRequest { command, response }) => {
+                        (command, None, Some(BusinessResponder::new(response)))
                     }
                     None => break,
-                };
-                if raw.len() > MAX_BRIDGE_MESSAGE_BYTES {
-                    sink.error_to(
-                        subscriber_id,
-                        format!("Bridge command exceeds {MAX_BRIDGE_MESSAGE_BYTES} bytes"),
-                        None,
-                        None,
-                    );
-                    continue;
-                }
-                let command = match serde_json::from_str::<Value>(&raw) {
-                    Ok(Value::Object(command)) => Value::Object(command),
-                    Ok(_) => {
-                        sink.error_to(
-                            subscriber_id,
-                            "Bridge command must be a JSON object",
-                            None,
-                            None,
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        sink.error_to(
-                            subscriber_id,
-                            format!("Invalid bridge command: {error}"),
-                            None,
-                            None,
-                        );
-                        continue;
-                    }
                 };
                 let operation = command
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if operation == "bridge/ping" {
-                    if let Some(nonce) = command.get("nonce").and_then(Value::as_str) {
-                        sink.send_to(
-                            subscriber_id,
-                            json!({ "type": "bridge/pong", "nonce": nonce }),
-                        );
-                    } else {
-                        sink.error_to(
-                            subscriber_id,
-                            "bridge/ping requires nonce",
-                            None,
-                            Some(&operation),
-                        );
-                    }
-                    continue;
-                }
                 let task_connection = connection.clone();
                 let prompt_start =
                     (operation == "session/prompt").then(|| prompt_lifecycle.register_start());
                 let context = CommandContext {
-                    subscriber_id,
                     options: options.clone(),
                     state: state.clone(),
                     sink: sink.clone(),
@@ -2156,7 +2068,6 @@ where
                     cancellation: cancellation.clone(),
                 };
                 connection.spawn(async move {
-                    let mut command = command;
                     let request_id = command
                         .get("requestId")
                         .and_then(Value::as_str)
@@ -2180,99 +2091,13 @@ where
                         let mut state = context.state.lock().await;
                         if !state.in_flight_request_ids.insert(request_id.to_string()) {
                             drop(state);
-                            task_sink.acp_error_to(
-                                subscriber_id,
-                                Error::invalid_request()
-                                    .data("requestId is already in flight on this bridge"),
-                                Some(request_id),
-                                Some(&operation),
-                            );
+                            if let Some(responder) = &business_responder {
+                                responder.error(
+                                    &Error::invalid_request()
+                                        .data("requestId is already in flight on this bridge"),
+                                );
+                            }
                             return Ok(());
-                        }
-                    }
-                    let mut runtime_operation_id = None;
-                    if operation == "session/prompt"
-                        && turn_responder.is_none()
-                        && let Some(request_id) = request_id.as_deref()
-                    {
-                        let admission = {
-                            let mut state = context.state.lock().await;
-                            admit_browser_intent(&mut state, subscriber_id, request_id, &command)
-                        };
-                        match admission {
-                            Ok(IntentAck::Accepted { operation_id }) => {
-                                command
-                                    .as_object_mut()
-                                    .expect("validated browser command is an object")
-                                    .insert(
-                                        "bridgeOperationId".to_string(),
-                                        json!(operation_id.clone()),
-                                    );
-                                runtime_operation_id = Some(operation_id);
-                                task_sink.send_to(
-                                    subscriber_id,
-                                    json!({
-                                        "type": "bridge/intent_ack",
-                                        "requestId": request_id,
-                                        "operationId": runtime_operation_id,
-                                        "disposition": "accepted",
-                                        "status": "accepted",
-                                    }),
-                                );
-                            }
-                            Ok(IntentAck::Duplicate {
-                                operation_id,
-                                status,
-                            }) => {
-                                context
-                                    .state
-                                    .lock()
-                                    .await
-                                    .in_flight_request_ids
-                                    .remove(request_id);
-                                task_sink.send_to(
-                                    subscriber_id,
-                                    json!({
-                                        "type": "bridge/intent_ack",
-                                        "requestId": request_id,
-                                        "operationId": operation_id,
-                                        "disposition": "duplicate",
-                                        "status": status,
-                                    }),
-                                );
-                                return Ok(());
-                            }
-                            Ok(IntentAck::Collision) => {
-                                context
-                                    .state
-                                    .lock()
-                                    .await
-                                    .in_flight_request_ids
-                                    .remove(request_id);
-                                task_sink.acp_error_to(
-                                    subscriber_id,
-                                    Error::invalid_request()
-                                        .data("requestId was reused with a different payload"),
-                                    Some(request_id),
-                                    Some(&operation),
-                                );
-                                return Ok(());
-                            }
-                            Err(error) => {
-                                context
-                                    .state
-                                    .lock()
-                                    .await
-                                    .in_flight_request_ids
-                                    .remove(request_id);
-                                task_sink.acp_error_to(
-                                    subscriber_id,
-                                    runtime_state_error(error),
-                                    Some(request_id),
-                                    Some(&operation),
-                                );
-                                return Ok(());
-                            }
                         }
                     }
                     let result = if bridge_managed_materialization {
@@ -2356,36 +2181,10 @@ where
                         .await;
                     {
                         let mut state = context.state.lock().await;
-                        if let (Some(operation_id), Err(error)) =
-                            (runtime_operation_id.as_deref(), result.as_ref())
-                            && state.runtime.intent_status(operation_id)
-                                == Some(crate::runtime_state::IntentStatus::Accepted)
-                        {
-                            let epoch = state.runtime.epoch().to_string();
-                            state
-                                .runtime
-                                .reject_intent(
-                                    &epoch,
-                                    operation_id,
-                                    intent_session_id.clone(),
-                                    agent_error_value(error),
-                                )
-                                .map_err(runtime_state_error)?;
-                        }
                         flush_runtime(&mut state, &task_sink);
                         if let Some(request_id) = request_id.as_deref() {
                             state.in_flight_request_ids.remove(request_id);
                         }
-                    }
-                    if let Err(error) = result
-                        && subscriber_id != 0
-                    {
-                        task_sink.acp_error_to(
-                            subscriber_id,
-                            error,
-                            request_id.as_deref(),
-                            Some(&operation),
-                        );
                     }
                     Ok(())
                 })?;
@@ -3064,8 +2863,12 @@ async fn handle_command(
     turn_responder: Option<TurnResponder>,
     business_responder: Option<BusinessResponder>,
 ) -> Result<(), Error> {
+    if serialized_value_len(&command) > MAX_BRIDGE_MESSAGE_BYTES {
+        return Err(Error::invalid_params().data(format!(
+            "Bridge command exceeds {MAX_BRIDGE_MESSAGE_BYTES} bytes"
+        )));
+    }
     let CommandContext {
-        subscriber_id,
         options,
         state,
         sink,
@@ -3322,7 +3125,7 @@ async fn handle_command(
                 .lock()
                 .await
                 .attachment_subscribers
-                .insert(session_id.clone(), subscriber_id);
+                .insert(session_id.clone(), 0);
             let attachment_incarnation = {
                 let mut state = state.lock().await;
                 let epoch = state.runtime.epoch().to_string();
@@ -3563,7 +3366,7 @@ async fn handle_command(
             let attachment_subscriber = state
                 .attachment_subscribers
                 .remove(&session_id)
-                .unwrap_or(subscriber_id);
+                .unwrap_or(0);
             state.attachment_update_counts.remove(&session_id);
             state.attachment_update_bytes.remove(&session_id);
             let mirror_view = (operation == "session/load")
@@ -4007,21 +3810,14 @@ async fn handle_command(
             }));
         }
         "session/prompt" => {
+            let turn_responder = turn_responder.ok_or_else(|| {
+                Error::invalid_request()
+                    .data("turns require a session revision and intent admission")
+            })?;
             let request_id = string_field(&command, "requestId")?.to_string();
-            let runtime_operation_id = command
-                .get("bridgeOperationId")
-                .and_then(Value::as_str)
-                .unwrap_or(&request_id)
-                .to_string();
-            let client_intent_id = command
-                .get("clientIntentId")
-                .and_then(Value::as_str)
-                .unwrap_or(&request_id)
-                .to_string();
-            let expected_history_revision = command
-                .get("historyRevision")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            let runtime_operation_id = request_id.clone();
+            let client_intent_id = string_field(&command, "clientIntentId")?.to_string();
+            let expected_history_revision = string_field(&command, "historyRevision")?;
             let session_id = string_field(&command, "sessionId")?.to_string();
             let prompt_value = command
                 .get("prompt")
@@ -4049,17 +3845,11 @@ async fn handle_command(
                         Error::invalid_params()
                             .data(format!("unknown or inactive session: {session_id}"))
                     })?;
-                let revision = expected_history_revision.clone().unwrap_or_else(|| {
-                    session_mirror(&mut state)
-                        .history_revision(&session_id, incarnation)
-                        .unwrap_or_default()
-                        .to_string()
-                });
                 let mirror_operation_id = match session_mirror(&mut state)
                     .start_turn(
                         &session_id,
                         incarnation,
-                        &revision,
+                        expected_history_revision,
                         &client_intent_id,
                         runtime_prompt.clone(),
                     )
@@ -4067,16 +3857,11 @@ async fn handle_command(
                 {
                     TurnAdmission::Accepted { operation_id } => operation_id,
                     TurnAdmission::Duplicate { operation_id } => {
-                        if let Some(responder) = &turn_responder {
-                            responder.success(json!({
-                                "operationId": operation_id,
-                                "disposition": "duplicate",
-                            }));
-                            return Ok(());
-                        }
-                        return Err(Error::invalid_request().data(format!(
-                            "turn intent was already accepted as {operation_id}"
-                        )));
+                        turn_responder.success(json!({
+                            "operationId": operation_id,
+                            "disposition": "duplicate",
+                        }));
+                        return Ok(());
                     }
                 };
                 if let Err(error) =
@@ -4109,12 +3894,10 @@ async fn handle_command(
                 let view = session_view_value(&mut state, &session_id, incarnation)?;
                 (incarnation, mirror_operation_id, view)
             };
-            if let Some(responder) = &turn_responder {
-                responder.success(json!({
-                    "operationId": mirror_operation_id,
-                    "disposition": "accepted",
-                }));
-            }
+            turn_responder.success(json!({
+                "operationId": mirror_operation_id,
+                "disposition": "accepted",
+            }));
             sink.send(json!({
                 "type": "bridge/session_view",
                 "sessionId": session_id,
@@ -4987,10 +4770,6 @@ async fn handle_command(
         }
         "auth/terminal_cancel" => {
             auth_terminal.cancel(string_field(&command, "requestId")?)?;
-        }
-        operation if operation.starts_with("nes/") || operation.starts_with("document/") => {
-            return Err(Error::method_not_found()
-                .data("attyd does not advertise the ACP NES/editor surface"));
         }
         _ => {
             return Err(
@@ -5939,6 +5718,53 @@ mod tests {
             .unwrap()
     }
 
+    async fn request(
+        commands: &mpsc::Sender<BridgeInput>,
+        command: Value,
+    ) -> Result<Value, String> {
+        if command["type"] == "session/prompt" {
+            let session_id = command["sessionId"].as_str().unwrap().to_string();
+            let history_revision = if let Some(revision) = command["historyRevision"].as_str() {
+                revision.to_string()
+            } else {
+                let (response, result) = oneshot::channel();
+                commands
+                    .send(BridgeInput::SessionViewRequest {
+                        session_id: session_id.clone(),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                let view = result.await.unwrap().unwrap();
+                view["session"]["historyRevision"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let (response, result) = oneshot::channel();
+            commands
+                .send(BridgeInput::TurnRequest {
+                    session_id,
+                    history_revision,
+                    client_intent_id: command["requestId"].as_str().unwrap().to_string(),
+                    prompt: command["prompt"].as_array().unwrap().clone(),
+                    response,
+                })
+                .await
+                .unwrap();
+            result.await.unwrap()
+        } else {
+            let (response, result) = oneshot::channel();
+            commands
+                .send(BridgeInput::BusinessRequest { command, response })
+                .await
+                .unwrap();
+            result.await.unwrap().map_err(|error| {
+                error.message + &error.data.map_or(String::new(), |data| data.to_string())
+            })
+        }
+    }
+
     fn session_info(session_id: &str, cwd: &str) -> SessionInfo {
         serde_json::from_value(json!({
             "sessionId": session_id,
@@ -6008,7 +5834,15 @@ mod tests {
         let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
         let fixture = fixture.to_string_lossy().into_owned();
         let options = Options::try_parse_from([
-            "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
+            "attyd",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
+            "--slow-control",
         ])
         .unwrap()
         .normalized()
@@ -6034,18 +5868,16 @@ mod tests {
         })
         .await
         .expect("bridge did not initialize");
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 1,
-                raw: json!({
-                    "type": "session/new",
-                    "requestId": "new",
-                    "cwd": cwd,
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/new",
+                "requestId": "new",
+                "cwd": cwd,
+            }),
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events
@@ -6062,19 +5894,17 @@ mod tests {
         .await
         .expect("session/new did not complete");
 
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 1,
-                raw: json!({
-                    "type": "session/prompt",
-                    "requestId": "first",
-                    "sessionId": "test-session",
-                    "prompt": [{ "type": "text", "text": "stream-follow-flow" }],
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        let first = request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "first",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "stream-follow-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events
@@ -6090,25 +5920,49 @@ mod tests {
         .await
         .expect("first prompt did not start");
 
+        let duplicate = request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "first",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "stream-follow-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(duplicate["disposition"], "duplicate");
+        assert_eq!(duplicate["operationId"], first["operationId"]);
+        let collision = request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "first",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "different payload" }],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(collision.contains("different turn"), "{collision}");
+
         // A queued prompt is browser-local. Submitting while the previous turn
         // is running must be rejected before it reaches the Agent.
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 2,
-                raw: json!({
-                    "type": "session/prompt",
-                    "requestId": "second",
-                    "sessionId": "test-session",
-                    "prompt": [{ "type": "text", "text": "message-actions-flow" }],
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        let rejection = request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "second",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(rejection.contains("not ready"), "{rejection}");
 
         let mut trace = Vec::new();
         tokio::time::timeout(Duration::from_secs(10), async {
-            let mut rejected = false;
             loop {
                 let raw = events
                     .recv()
@@ -6120,20 +5974,11 @@ mod tests {
                     "requestId": event.get("requestId"),
                     "event": event.get("event"),
                 }));
-                if event["type"] == "bridge/internal_direct"
-                    && event["event"]["type"] == "bridge/error"
-                    && event["event"]["requestId"] == "second"
-                    && event["event"]["operation"] == "session/prompt"
-                {
-                    rejected = true;
-                }
-                if event["type"] == "acp/prompt_started" && event["requestId"] == "second" {
-                    panic!("the rejected concurrent prompt reached the Agent");
-                }
-                if rejected
-                    && event["type"] == "acp/prompt_complete"
-                    && event["requestId"] == "first"
-                {
+                assert_ne!(
+                    event["type"], "acp/prompt_started",
+                    "duplicate, conflicting or concurrent prompt reached the Agent"
+                );
+                if event["type"] == "acp/prompt_complete" && event["requestId"] == "first" {
                     break;
                 }
             }
@@ -6141,19 +5986,31 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("concurrent rejection/reconcile did not finish: {trace:?}"));
 
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 2,
-                raw: json!({
-                    "type": "session/prompt",
-                    "requestId": "after-reconcile",
-                    "sessionId": "test-session",
-                    "prompt": [{ "type": "text", "text": "message-actions-flow" }],
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        let duplicate = request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "first",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "stream-follow-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(duplicate["disposition"], "duplicate");
+        assert_eq!(duplicate["operationId"], first["operationId"]);
+
+        request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "after-reconcile",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event: Value = serde_json::from_str(
@@ -6171,6 +6028,44 @@ mod tests {
         })
         .await
         .expect("browser-resubmitted prompt did not complete after reconciliation");
+
+        // Business requests also report an in-flight request collision through
+        // their REST responder; a private subscriber event cannot resolve HTTP.
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let (response, result) = oneshot::channel();
+            commands
+                .send(BridgeInput::BusinessRequest {
+                    command: json!({
+                        "type": "session/set_mode",
+                        "requestId": "same-control-request",
+                        "sessionId": "test-session",
+                        "modeId": "plan",
+                    }),
+                    response,
+                })
+                .await
+                .unwrap();
+            replies.push(result);
+        }
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut results = Vec::new();
+            for reply in replies {
+                results.push(reply.await.unwrap());
+            }
+            results
+        })
+        .await
+        .expect("a duplicate business request lost its response");
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let collision = results.into_iter().find_map(Result::err).unwrap();
+        assert!(
+            collision
+                .data
+                .unwrap()
+                .to_string()
+                .contains("already in flight")
+        );
 
         cancellation.cancel();
         tokio::time::timeout(Duration::from_secs(5), bridge)
@@ -6218,18 +6113,16 @@ mod tests {
         })
         .await
         .expect("bridge did not initialize");
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 1,
-                raw: json!({
-                    "type": "session/new",
-                    "requestId": "new",
-                    "cwd": cwd,
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/new",
+                "requestId": "new",
+                "cwd": cwd,
+            }),
+        )
+        .await
+        .unwrap();
         let initial_revision = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
@@ -6244,21 +6137,19 @@ mod tests {
         .await
         .expect("new session view was not published");
 
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 1,
-                raw: json!({
-                    "type": "session/prompt",
-                    "requestId": "turn",
-                    "clientIntentId": "stable-turn-intent",
-                    "historyRevision": initial_revision.clone(),
-                    "sessionId": "test-session",
-                    "prompt": [{ "type": "text", "text": "message-actions-flow" }],
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "turn",
+                "clientIntentId": "stable-turn-intent",
+                "historyRevision": initial_revision.clone(),
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
 
         let mut prompt_starts = 0;
         let mut saw_post_turn_load = false;
@@ -6352,18 +6243,16 @@ mod tests {
                 break;
             }
         }
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 1,
-                raw: json!({
-                    "type": "session/new",
-                    "requestId": "new",
-                    "cwd": cwd,
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/new",
+                "requestId": "new",
+                "cwd": cwd,
+            }),
+        )
+        .await
+        .unwrap();
         let initial_revision = loop {
             let event = next_event(&mut events).await;
             if event["type"] == "bridge/session_view"
@@ -6377,21 +6266,19 @@ mod tests {
             }
         };
 
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 1,
-                raw: json!({
-                    "type": "session/prompt",
-                    "requestId": "turn",
-                    "clientIntentId": "no-load-turn",
-                    "historyRevision": initial_revision,
-                    "sessionId": "test-session",
-                    "prompt": [{ "type": "text", "text": "message-actions-flow" }],
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "turn",
+                "clientIntentId": "no-load-turn",
+                "historyRevision": initial_revision,
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
 
         let completed = loop {
             let event = next_event(&mut events).await;
@@ -6443,21 +6330,19 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 2,
-                raw: json!({
-                    "type": "session/prompt",
-                    "requestId": "second-turn",
-                    "clientIntentId": "no-load-second-turn",
-                    "historyRevision": successor_revision,
-                    "sessionId": "test-session",
-                    "prompt": [{ "type": "text", "text": "attachment-input-flow" }],
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "second-turn",
+                "clientIntentId": "no-load-second-turn",
+                "historyRevision": successor_revision,
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "attachment-input-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
         let second = loop {
             let event = next_event(&mut events).await;
             if event["type"] == "bridge/session_view"
@@ -6538,68 +6423,52 @@ mod tests {
                 break;
             }
         }
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 7,
-                raw: json!({
-                    "type": "session/new",
-                    "requestId": "new",
-                    "cwd": cwd,
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/new",
+                "requestId": "new",
+                "cwd": cwd,
+            }),
+        )
+        .await
+        .unwrap();
         loop {
             if next_event(&mut events).await["type"] == "acp/session_created" {
                 break;
             }
         }
 
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 7,
-                raw: json!({
-                    "type": "session/load",
-                    "requestId": "reload",
-                    "sessionId": "test-session",
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
-        loop {
-            let event = next_event(&mut events).await;
+        let rejection = request(
+            &commands,
+            json!({
+                "type": "session/load",
+                "requestId": "reload",
+                "sessionId": "test-session",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(rejection.contains("Synthetic load failure"), "{rejection}");
+        while let Ok(raw) = events.try_recv() {
+            let event: Value = serde_json::from_str(&raw).unwrap();
             assert_ne!(
                 event["type"], "acp/session_attached",
                 "a rejected load must not commit replacement state"
             );
-            if event["type"] == "bridge/internal_direct"
-                && event["event"]["type"] == "bridge/error"
-                && event["event"]["requestId"] == "reload"
-            {
-                assert!(
-                    event["event"]
-                        .to_string()
-                        .contains("Synthetic load failure")
-                );
-                break;
-            }
         }
 
-        commands
-            .send(BridgeInput::Command {
-                subscriber_id: 7,
-                raw: json!({
-                    "type": "session/prompt",
-                    "requestId": "after-rejected-load",
-                    "sessionId": "test-session",
-                    "prompt": [{ "type": "text", "text": "message-actions-flow" }],
-                })
-                .to_string(),
-            })
-            .await
-            .unwrap();
+        request(
+            &commands,
+            json!({
+                "type": "session/prompt",
+                "requestId": "after-rejected-load",
+                "sessionId": "test-session",
+                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
+            }),
+        )
+        .await
+        .unwrap();
         loop {
             let event = next_event(&mut events).await;
             if event["type"] == "acp/prompt_complete" && event["requestId"] == "after-rejected-load"
@@ -6619,7 +6488,7 @@ mod tests {
     fn advertises_agent_interaction_capabilities_without_editor_features() {
         // Selected from Zed's `client_capabilities_include_elicitation_without_acp_beta`
         // contract: form and URL elicitation are stable client behavior.
-        let local = client_capabilities(&options(&["attyd"]));
+        let local = client_capabilities(&options(&["attyd", "--", "fixture-agent"]));
         assert!(
             local
                 .elicitation
@@ -6650,25 +6519,6 @@ mod tests {
         assert!(!remote.fs.read_text_file);
         assert!(!remote.terminal);
         assert!(!remote.auth.terminal);
-    }
-
-    #[test]
-    fn requester_error_is_wrapped_for_direct_delivery() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
-
-        sink.error_to(
-            42,
-            "requestId collision",
-            Some("request"),
-            Some("session/prompt"),
-        );
-
-        let envelope = serde_json::from_str::<Value>(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(envelope["type"], "bridge/internal_direct");
-        assert_eq!(envelope["subscriberId"], 42);
-        assert_eq!(envelope["event"]["type"], "bridge/error");
-        assert_eq!(envelope["event"]["requestId"], "request");
     }
 
     #[test]
@@ -7240,7 +7090,13 @@ mod tests {
 
     #[test]
     fn selects_session_cwd_by_transport_and_rejects_relative_paths() {
-        let local = options(&["attyd", "--cwd", "/tmp/local-workspace"]);
+        let local = options(&[
+            "attyd",
+            "--cwd",
+            "/tmp/local-workspace",
+            "--",
+            "fixture-agent",
+        ]);
         assert_eq!(
             new_session_cwd(&json!({}), &local).unwrap(),
             PathBuf::from("/tmp/local-workspace")
@@ -7489,60 +7345,6 @@ mod tests {
         assert!(!can_close_rejected_chat_session(&state, "new-allocation"));
     }
 
-    #[test]
-    fn completed_browser_intent_is_not_locally_deduplicated_after_retirement() {
-        let mut state = BridgeState::default();
-        let epoch = state.runtime.epoch().to_string();
-        let incarnation = state
-            .runtime
-            .open_new(
-                &epoch,
-                "session",
-                "/workspace",
-                json!({ "sessionId": "session" }),
-            )
-            .unwrap();
-        let command = json!({
-            "type": "session/prompt",
-            "requestId": "stable-intent",
-            "sessionId": "session",
-            "prompt": [{ "type": "text", "text": "hello" }],
-        });
-
-        let first = admit_browser_intent(&mut state, 1, "stable-intent", &command).unwrap();
-        let operation_id = match first {
-            IntentAck::Accepted { operation_id } => operation_id,
-            other => panic!("first delivery must be accepted, got {other:?}"),
-        };
-        state
-            .runtime
-            .start_prompt(
-                &epoch,
-                "session",
-                incarnation,
-                operation_id.clone(),
-                Vec::new(),
-            )
-            .unwrap();
-        state
-            .runtime
-            .complete_prompt(
-                &epoch,
-                "session",
-                incarnation,
-                &operation_id,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-
-        let replay = admit_browser_intent(&mut state, 2, "stable-intent", &command).unwrap();
-        let replay_operation_id = match replay {
-            IntentAck::Accepted { operation_id } => operation_id,
-            other => panic!("retired intent must be admitted as new work, got {other:?}"),
-        };
-        assert_ne!(replay_operation_id, operation_id);
-    }
-
     #[tokio::test]
     async fn prompt_completion_releases_exclusion_before_notifying_shutdown() {
         let state = Arc::new(Mutex::new(BridgeState::default()));
@@ -7699,7 +7501,13 @@ mod tests {
             assert!(require_agent_method(operation, &state).await.is_ok());
         }
 
-        let configured_roots = options(&["attyd", "--add-dir", "/tmp/additional"]);
+        let configured_roots = options(&[
+            "attyd",
+            "--add-dir",
+            "/tmp/additional",
+            "--",
+            "fixture-agent",
+        ]);
         assert!(
             validate_configured_capabilities(&AgentCapabilities::new(), &configured_roots).is_err()
         );
@@ -7709,7 +7517,7 @@ mod tests {
         );
         assert!(validate_configured_capabilities(&supports_roots, &configured_roots).is_ok());
 
-        let mut configured_mcp = options(&["attyd"]);
+        let mut configured_mcp = options(&["attyd", "--", "fixture-agent"]);
         configured_mcp.mcp_servers = vec![McpServer::Http(McpServerHttp::new(
             "remote",
             "https://example.test/mcp",

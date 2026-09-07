@@ -2,12 +2,32 @@ name: ci
 
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=low
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Audit Rust dependencies
+        run: cargo audit --file Cargo.lock
+
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -67,6 +87,44 @@ jobs:
         run: npm run test:remote
       - name: Test Rust-hosted REST/SSE bridge
         run: node --import tsx scripts/ui-smoke.ts
+      - name: Test HTTP trust boundaries and process cleanup
+        run: node --import tsx scripts/server-boundary-smoke.ts
+      - name: Test ACP protocol integration
+        run: node --import tsx scripts/acp-protocol-smoke.ts
+
+  coverage:
+    needs: web-client
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.0
+      - run: npm ci
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-client
+          path: dist/client
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+      - name: Install browser for instrumented integration coverage
+        run: npx playwright install --with-deps chromium
+      - name: Enforce Rust coverage
+        run: npm run test:coverage
+        env:
+          ATTYD_MIN_RUST_COVERAGE: "85"
 
   browser:
     needs: web-client
@@ -150,15 +208,15 @@ jobs:
           ATTYD_SKIP_WEB_BUILD: "1"
       - name: Verify release binary
         run: target/${{ matrix.target }}/release/attyd --version
-      - name: Set up Node.js for native smoke test
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Set up Node.js for license materials and smoke tests
         uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
-      - name: Install native smoke-test dependencies
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Install locked frontend dependencies
         run: npm ci
+      - name: Collect third-party license materials
+        run: npm run licenses -- ${{ matrix.target }}
       - name: Test standalone release binary
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: npm run test:binary
@@ -172,11 +230,57 @@ jobs:
       - name: Package release binary
         run: >-
           tar -C target/${{ matrix.target }}/release -czf
-          artifacts/${{ matrix.artifact }}.tar.gz attyd attyd.sha256
+          "$GITHUB_WORKSPACE/artifacts/${{ matrix.artifact }}.tar.gz"
+          attyd attyd.sha256 THIRD_PARTY_LICENSES.txt
+          -C "$GITHUB_WORKSPACE" LICENSE
       - name: Upload release binary
         uses: actions/upload-artifact@v7
         with:
+          name: ${{ matrix.artifact }}
           path: artifacts/${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
           retention-days: 14
-          archive: false
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [audit, frontend, backend, browser, coverage, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify tag matches package versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          tag = os.environ["RELEASE_TAG"]
+          rust = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"]
+          npm = json.loads(pathlib.Path("package.json").read_text())["version"]
+          if tag != f"v{rust}" or rust != npm:
+              raise SystemExit(f"Tag {tag} must match Cargo ({rust}) and npm ({npm}) versions")
+          PY
+      - name: Download release archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: attyd-linux-*
+          path: artifacts
+          merge-multiple: true
+      - name: Check all release targets and generate archive checksums
+        working-directory: artifacts
+        run: |
+          for target in x86_64-gnu aarch64-gnu x86_64-musl aarch64-musl; do
+            test -s "attyd-linux-$target.tar.gz"
+          done
+          sha256sum *.tar.gz > SHA256SUMS
+      - name: Publish versioned GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          options=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" artifacts/*.tar.gz artifacts/SHA256SUMS \
+            --verify-tag --title "$RELEASE_TAG" --generate-notes "${options[@]}"

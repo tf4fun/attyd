@@ -24,10 +24,6 @@
 html, body, #root { height: 100%; margin: 0; }
 button, textarea, select { font: inherit; }
 button { color: inherit; }
-.sr-only {
-  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
-  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
-}
 
 .app-shell { display: flex; height: 100%; overflow: hidden; background: var(--paper); }
 .sidebar-section { padding: 16px 7px; border-top: 1px solid var(--line); }
@@ -42,20 +38,7 @@ button { color: inherit; }
   display: block; margin-bottom: 11px; color: #84847f; font-size: 10px; font-weight: 700;
   letter-spacing: .105em; text-transform: uppercase;
 }
-.agent-name, .workspace-path, .safety-row { display: flex; align-items: center; gap: 8px; }
-.agent-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.agent-block > code {
-  display: block; margin: 9px 0 13px; padding: 7px 8px; overflow: hidden; color: #5e5e59;
-  border: 1px solid #e0e0dc; background: #f7f7f4; border-radius: 6px; font: 10px var(--mono);
-  text-overflow: ellipsis; white-space: nowrap;
-}
-.connection-status { display: flex; align-items: center; gap: 9px; }
-.connection-status > span { width: 7px; height: 7px; border-radius: 50%; background: #aaa; box-shadow: 0 0 0 3px #aaa2; }
-.connection-status.phase-ready > span { background: #71a200; box-shadow: 0 0 0 3px #71a20020; }
-.connection-status.phase-error > span { background: var(--danger); box-shadow: 0 0 0 3px #c23f3520; }
-.connection-status > div { display: flex; flex-direction: column; }
-.connection-status strong { font-size: 11px; font-weight: 600; }
-.connection-status small { margin-top: 1px; color: var(--muted); font-size: 10px; }
+.workspace-path, .safety-row { display: flex; align-items: center; gap: 8px; }
 .workspace-path { font-size: 11px; }
 .workspace-extra { margin: 6px 0 0 2px; color: var(--muted); font-size: 9px; }
 .workspace-path span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
@@ -67,8 +50,6 @@ button { color: inherit; }
   width: 100%; padding: 7px 27px 7px 8px; border: 1px solid #d8d8d3; border-radius: 6px;
   outline: none; background: #f9f9f7; font-size: 11px;
 }
-.controls .toggle-row { display: flex; align-items: center; justify-content: space-between; }
-.controls .toggle-row > span { margin: 0; }
 .controls input { accent-color: #1e1e1b; }
 .session-history { padding-bottom: 12px; }
 .session-history > p { margin: 2px 1px 6px; color: var(--muted); font-size: 10px; line-height: 1.45; }
@@ -148,13 +129,6 @@ button { color: inherit; }
 .new-thread-dialog > footer .secondary { background: #f6f6f3; }
 .new-thread-dialog > footer .primary { border-color: #20201e; background: #20201e; color: white; }
 .new-thread-dialog > footer button:disabled { cursor: default; opacity: .45; }
-.close-session, .fork-session {
-  display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 5px; padding: 7px;
-  border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 9px;
-}
-.fork-session:hover:not(:disabled) { color: var(--ink); }
-.close-session:hover:not(:disabled) { color: var(--danger); }
-.close-session:disabled, .fork-session:disabled { opacity: .4; cursor: default; }
 
 .main-panel { position: relative; flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; background: var(--paper); }
 .thread-body { position: relative; min-height: 0; flex: 1; }
@@ -268,20 +242,11 @@ button { color: inherit; }
 .auth-terminal-card .auth-terminal-cancel { color: #e7a19a; }
 
 .message { display: flex; gap: 11px; align-items: flex-start; }
-.message-avatar {
-  width: 27px; min-width: 27px; height: 27px; display: grid; place-items: center; border: 1px solid var(--line);
-  border-radius: 8px; background: white; color: #565651;
-}
 .message-user { flex-direction: row-reverse; }
-.message-user .message-avatar { background: #242421; color: white; border-color: #242421; }
 .message-shell { min-width: 0; max-width: calc(100% - 42px); }
 .message-user .message-shell { display: flex; flex-direction: column; align-items: flex-end; }
-.message-label { display: flex; align-items: center; gap: 8px; height: 22px; color: var(--muted); font-size: 10px; font-weight: 600; }
-.message-label code { max-width: 160px; overflow: hidden; font: 9px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .message-content { color: #262624; font-size: 13px; line-height: 1.68; }
 .message-user .message-content { padding: 10px 14px; border-radius: 13px 3px 13px 13px; background: #e9e9e5; }
-.message-thought .message-avatar { color: #7c6800; background: #fffae0; border-color: #e9dfac; }
-.message-thought .message-content { padding-left: 12px; border-left: 2px solid #e6d77e; color: #6e6850; font-size: 12px; }
 .message-protocol-user { opacity: .65; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
@@ -320,7 +285,6 @@ button { color: inherit; }
   display: inline-flex; align-items: center; gap: 3px; padding: 2px 4px;
   border: 1px solid #e0e0dc; border-radius: 4px; background: #f7f7f4;
 }
-.content-annotations .annotation-label { border-color: transparent; background: transparent; color: #a0a09a; padding-left: 0; }
 
 .raw-json { min-width: 0; margin-top: 7px; font-size: 10px; }
 .raw-json > summary { display: flex; align-items: center; gap: 5px; width: max-content; max-width: 100%; color: #969691; cursor: pointer; list-style: none; font: 9px var(--mono); }
@@ -695,7 +659,6 @@ button { color: inherit; }
 .icon-button { background: transparent; color: #999; }.icon-button:disabled { cursor: default; opacity: .5; }
 .send-button { background: #252523; color: var(--accent); }.send-button:disabled { opacity: .2; cursor: default; }
 .stop-button { background: #fff0ee; color: var(--danger); }
-.input-note { margin: 6px 0 0; color: #a2a29d; text-align: center; font: 8px var(--mono); }
 
 /* Thread-first shell, following Zed's interaction hierarchy. */
 .sidebar-section { padding: 10px 3px; border-top: 0; }
@@ -971,9 +934,7 @@ button { color: inherit; }
 .empty-state h2 { margin-top: 15px; font-size: 20px; }
 .empty-state p { font-size: 11px; }
 .message { display: block; }
-.message-avatar { display: none; }
 .message-shell { width: 100%; max-width: none; }
-.message-label { height: auto; margin-bottom: 6px; font-size: 9px; }
 .message-content { font-size: 13px; line-height: 1.7; }
 .message-user {
   padding: 11px 13px;
@@ -983,8 +944,6 @@ button { color: inherit; }
 }
 .message-user .message-shell { display: block; }
 .message-user .message-content { padding: 0; border-radius: 0; background: transparent; }
-.message-thought { padding-left: 12px; border-left: 2px solid #d9d1a1; }
-.message-thought .message-content { padding-left: 0; border-left: 0; }
 .tool-card, .plan-card, .compaction-card, .protocol-event, .turn-stop, .error-card, .agent-working { margin-left: 0; }
 .tool-card { border-radius: 7px; }
 .tool-card-header { min-height: 37px; }
@@ -1322,7 +1281,6 @@ button { color: inherit; }
 .message-protocol-user {
   opacity: 1;
 }
-.message-label { margin-bottom: 5px; color: #8a8a84; font-size: 8px; font-weight: 550; }
 .message-meta {
   min-width: 0;
   display: block;
@@ -1611,7 +1569,6 @@ button { color: inherit; }
   --text-micro: 10px;
 }
 
-.brand small,
 .section-kicker,
 .session-filter-status,
 .session-filter-scope,
@@ -1628,11 +1585,9 @@ button { color: inherit; }
 .agent-auth-sidebar .agent-auth-progress,
 .agent-auth-sidebar .agent-auth-error,
 .thread-heading > div:last-child > span,
-.session-metrics,
 .thread-search-navigation > output,
 .thread-search-error,
 .thread-search-limit,
-.message-label,
 .message-meta > code,
 .message-action,
 .thinking-actions > i,
@@ -1675,7 +1630,6 @@ button { color: inherit; }
 .attachment-error,
 .attachment-loading,
 .link-editor input,
-.input-note,
 .context-usage-popover header span,
 .context-usage-popover dt,
 .context-usage-popover dd,

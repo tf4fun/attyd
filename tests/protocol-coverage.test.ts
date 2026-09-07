@@ -4,7 +4,6 @@ import {
   AGENT_METHOD_COVERAGE,
   CLIENT_METHOD_COVERAGE,
   CONTENT_BLOCK_COVERAGE,
-  NES_SUGGESTION_COVERAGE,
   PROTOCOL_METHOD_COVERAGE,
   SESSION_UPDATE_COVERAGE,
 } from "../shared/protocol-coverage";
@@ -38,11 +37,5 @@ describe("ACP schema coverage guard", () => {
   it("classifies every generated UI union discriminator", () => {
     expect(Object.keys(SESSION_UPDATE_COVERAGE)).toHaveLength(15);
     expect(Object.keys(CONTENT_BLOCK_COVERAGE)).toHaveLength(5);
-    expect(NES_SUGGESTION_COVERAGE).toEqual({
-      edit: "unadvertised",
-      jump: "unadvertised",
-      rename: "unadvertised",
-      searchAndReplace: "unadvertised",
-    });
   });
 });

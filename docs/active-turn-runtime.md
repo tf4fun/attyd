@@ -283,4 +283,4 @@ Implementation follows TDD in this order:
 5. enforce CAS/idempotency and move unsent queued prompts entirely into the browser;
 6. move browser reads and commands to the business API/SSE surface;
 7. remove the old requester-private load replacement and active-only projection paths;
-8. pass transport, browser, fault-injection, memory and Goose compatibility gates.
+8. pass transport, browser, fault-injection, memory and ACP conformance gates.

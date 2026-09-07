@@ -734,11 +734,6 @@ impl SessionMirror {
         self.sessions.get(session_id)
     }
 
-    pub(crate) fn history_revision(&self, session_id: &str, incarnation: u64) -> Option<&str> {
-        let session = self.require_session(session_id, incarnation).ok()?;
-        session.history_revision.as_deref()
-    }
-
     pub(crate) fn load_attempt(&self, session_id: &str, incarnation: u64) -> Option<&str> {
         let session = self.require_session(session_id, incarnation).ok()?;
         session.load_attempt.as_deref()
@@ -1608,6 +1603,10 @@ mod tests {
                 operation_id: operation.clone()
             })
         );
+        assert_eq!(
+            mirror.start_turn("session", 1, &revision, "intent", text_prompt("changed")),
+            Err(MirrorError::IdempotencyConflict)
+        );
         mirror
             .complete_turn(
                 "session",
@@ -1634,6 +1633,16 @@ mod tests {
             mirror.start_turn("session", 1, successor.revision(), "intent", prompt),
             Ok(TurnAdmission::Duplicate { .. })
         ));
+        assert_eq!(
+            mirror.start_turn(
+                "session",
+                1,
+                successor.revision(),
+                "intent",
+                text_prompt("changed")
+            ),
+            Err(MirrorError::IdempotencyConflict)
+        );
     }
 
     #[test]
@@ -1933,7 +1942,12 @@ mod tests {
     fn overlay_accounting_does_not_reject_a_large_valid_turn() {
         let mut mirror = mirror();
         mirror.register_new("session", 1);
-        let revision = mirror.history_revision("session", 1).unwrap().to_string();
+        let revision = mirror
+            .state("session")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
         let operation = match mirror
             .start_turn("session", 1, &revision, "intent", text_prompt("prompt"))
             .unwrap()
@@ -1973,12 +1987,17 @@ mod tests {
     fn stale_incarnation_removal_cannot_drop_the_current_session() {
         let mut mirror = mirror();
         mirror.register_new("session", 2);
-        let revision = mirror.history_revision("session", 2).unwrap().to_string();
+        let revision = mirror
+            .state("session")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
 
         mirror.remove("session", 1);
 
         assert_eq!(
-            mirror.history_revision("session", 2),
+            mirror.state("session").unwrap().history_revision.as_deref(),
             Some(revision.as_str())
         );
         assert!(mirror.view("session", 2).is_ok());
