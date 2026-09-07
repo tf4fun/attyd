@@ -416,12 +416,15 @@ describe("ACP UI component contract", () => {
       />,
     );
 
-    expect(html).toContain("/workspace/fixture.ts:0");
-    expect(html).toContain("− before");
-    expect(html).toContain("+ after");
+    expect(html).toContain("Locations");
+    expect(html).toContain("&quot;line&quot;: 0");
+    expect(html).toContain('class="change-review-line line-removed"');
+    expect(html).toContain('class="change-review-line line-added"');
+    expect(html).toContain("before");
+    expect(html).toContain("after");
     expect(html).toContain("terminal-1");
     expect(html).toContain("command output");
-    expect(html).toContain("exit 0");
+    expect(html).toContain("Completed");
     expect(html).toContain("Earlier output was truncated.");
     expect(html).toContain('<div class="structured-scalar structured-markdown">');
     expect(html).toContain("<strong>literal tool output</strong>");
@@ -429,8 +432,10 @@ describe("ACP UI component contract", () => {
     expect(html).toContain('data-tool-status="completed"');
     expect(html).toContain('data-live="false"');
     expect(html).toContain('aria-label="Tool status: Completed"');
-    expect(html).toContain('<strong>shell</strong>');
-    expect(html).toContain("Description");
+    expect(html).toContain('<strong title="shell · cat /workspace/fixture.ts">shell · cat /workspace/fixture.ts</strong>');
+    expect(html).toContain('<strong title="fetch · Load project metadata">fetch · Load project metadata</strong>');
+    expect(html).not.toContain("Description");
+    expect(html).not.toContain('class="locations"');
     expect(html).toContain("Input");
     expect(html).toContain("command");
     expect(html).toContain("timeoutMs");

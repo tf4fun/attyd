@@ -15,7 +15,15 @@ export interface ReviewLine {
   newLine?: number;
 }
 
-export interface ReviewDiff {
+export interface ReviewDiffResult {
+  addedLines: number;
+  removedLines: number;
+  lines: ReviewLine[];
+  approximate: boolean;
+  truncated: boolean;
+}
+
+export interface ReviewDiff extends ReviewDiffResult {
   id: string;
   path: string;
   toolCallId: string;
@@ -23,11 +31,6 @@ export interface ReviewDiff {
   status?: ToolCallStatus;
   oldText?: string | null;
   newText: string;
-  addedLines: number;
-  removedLines: number;
-  lines: ReviewLine[];
-  approximate: boolean;
-  truncated: boolean;
 }
 
 export interface ReviewFile {
@@ -113,10 +116,10 @@ export function collectReviewChanges(timeline: TimelineItem[]): ReviewSummary {
   };
 }
 
-function buildReviewLines(oldText: string | null | undefined, newText: string): Pick<
-  ReviewDiff,
-  "lines" | "addedLines" | "removedLines" | "approximate" | "truncated"
-> {
+export function buildReviewLines(
+  oldText: string | null | undefined,
+  newText: string,
+): ReviewDiffResult {
   const oldLines = oldText == null ? [] : splitLines(oldText);
   const newLines = splitLines(newText);
   let lines: ReviewLine[];

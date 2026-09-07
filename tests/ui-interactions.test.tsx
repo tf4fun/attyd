@@ -168,6 +168,53 @@ describe("ACP interactive UI contract", () => {
     expect(thinking.dataset.open).toBe("true");
   });
 
+  it.each([
+    { title: "read: Inspect /workspace/config.ts", name: "read_file", kind: "read" as const },
+    { title: "write · Create /workspace/config.ts", name: "write_file", kind: "edit" as const },
+    { title: "edit: Update imports · /workspace/config.ts", name: "edit_file", kind: "edit" as const },
+  ])("preserves the Agent title and keeps $name locations in Tool info", async ({ title, name, kind }) => {
+    const path = "/workspace/config.ts";
+    const locations = [{ path, line: 0 }];
+    await render(root, <Conversation timeline={[{
+      id: "tool:file",
+      type: "tool",
+      call: {
+        toolCallId: "file",
+        title,
+        name,
+        kind,
+        status: "completed",
+        rawInput: { path },
+        rawOutput: { path, result: "File operation complete" },
+        locations,
+      },
+      raw: [],
+    }]} />);
+
+    const card = requireElement<HTMLElement>(container.querySelector(".tool-card"));
+    expect(card.querySelector(".tool-title strong")?.textContent).toBe(title);
+    expect(card.querySelector(".tool-title strong")?.getAttribute("title")).toBe(title);
+    await click(requireElement(card.querySelector(".tool-disclosure")));
+    const body = requireElement<HTMLElement>(card.querySelector(".tool-body"));
+    expect([...body.querySelectorAll(".tool-data-section > header")].map((header) => header.textContent))
+      .toEqual(["Input", "Output"]);
+    expect(body.querySelector(".tool-description")).toBeNull();
+    expect(body.querySelector(".locations")).toBeNull();
+    const displayedPaths = [...body.querySelectorAll("code")]
+      .filter((code) => code.textContent === path);
+    expect(displayedPaths).toHaveLength(2);
+    expect(displayedPaths.every((code) => code.closest(".tool-input, .tool-output"))).toBe(true);
+
+    const info = requireElement<HTMLElement>(body.querySelector('[aria-label="Tool debug information"]'));
+    expect(info.hasAttribute("hidden")).toBe(true);
+    await click(requireElement(body.querySelector('button[aria-label="Tool info"]')));
+    expect(info.hasAttribute("hidden")).toBe(false);
+    const locationEntry = requireElement([...info.querySelectorAll(".debug-info-entry")]
+      .find((entry) => entry.querySelector(".debug-info-label > span")?.textContent === "Locations") ?? null);
+    expect(JSON.parse(requireElement(locationEntry.querySelector("pre code")).textContent ?? "null"))
+      .toEqual(locations);
+  });
+
   it("keeps ACP tools collapsed by default and preserves manual disclosure", async () => {
     const pendingTool = {
       id: "tool:inspect",

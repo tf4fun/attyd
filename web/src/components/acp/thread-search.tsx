@@ -338,7 +338,8 @@ function collectSearchDocuments(root: HTMLElement): SearchDocument[] {
         if (
           !parent ||
           parent.closest("[data-thread-search-ignore]") ||
-          parent.closest("script, style")
+          parent.closest("script, style") ||
+          !searchElementIsVisible(parent)
         ) return NodeFilter.FILTER_REJECT;
         return node.textContent?.length ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
       },
@@ -364,10 +365,12 @@ function collectSearchDocuments(root: HTMLElement): SearchDocument[] {
 
 function searchElementIsVisible(element: HTMLElement): boolean {
   if (element.closest("[hidden]")) return false;
-  const closed = element.closest<HTMLDetailsElement>("details:not([open])");
-  if (!closed) return true;
-  const summary = closed.querySelector(":scope > summary");
-  return summary?.contains(element) === true;
+  let closed = element.closest<HTMLDetailsElement>("details:not([open])");
+  while (closed) {
+    if (!closed.querySelector(":scope > summary")?.contains(element)) return false;
+    closed = closed.parentElement?.closest<HTMLDetailsElement>("details:not([open])") ?? null;
+  }
+  return true;
 }
 
 function createDomRange(document: SearchDocument, start: number, end: number): Range | undefined {

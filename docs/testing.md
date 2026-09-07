@@ -73,7 +73,20 @@ infrastructure; they are upstream peers or drivers, not an attyd backend.
 
 ## Zed-derived cases
 
-We select behavior, not Zed implementation code:
+The ACP specification and negotiated capabilities remain the acceptance standard.
+Zed's external ACP client is the preferred design reference where the protocol
+leaves client behavior open. Record the source revision and test the resulting
+attyd behavior; Zed-specific choices do not become protocol requirements.
+
+For terminal lifecycle, use Zed's
+[`acp_thread` terminal implementation](https://github.com/zed-industries/zed/blob/ad51f6825c362d930c78a6579eecd21a06a7055d/crates/acp_thread/src/terminal.rs)
+at revision `ad51f6825c362d930c78a6579eecd21a06a7055d` as a reference for command
+completion and retained output. attyd keeps its pipe-based execution and
+[documented background-process policy](usage.md#terminal-command-semantics);
+tests must cover natural exit, explicit termination, release, and bounded output
+draining independently.
+
+Selected behavior cases:
 
 - Zed's `test_load_session_replays_notifications_sent_before_response` maps to the Rust bridge
   attachment tests: history updates sent before `session/load` returns must appear in the restored

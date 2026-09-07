@@ -1,6 +1,7 @@
 import { ChevronRight, FileDiff, Info } from "lucide-react";
 import { useId } from "react";
 import type { ReviewDiff, ReviewSummary } from "../../lib/review-changes";
+import { DiffLines } from "./diff-lines";
 
 export function ChangeReview({
   summary,
@@ -73,27 +74,9 @@ function ReviewDiffView({ diff }: { diff: ReviewDiff }) {
         <code>{diff.toolCallId}</code>
         <small className={`status-${diff.status ?? "pending"}`}>{formatStatus(diff.status)}</small>
       </div>
-      <div className="change-review-lines" role="table" aria-label={`Read-only diff for ${diff.path}`}>
-        {diff.lines.map((line, index) => (
-          <div className={`change-review-line line-${line.kind}`} role="row" key={`${line.kind}:${line.oldLine ?? ""}:${line.newLine ?? ""}:${index}`}>
-            <span role="cell">{line.oldLine ?? ""}</span>
-            <span role="cell">{line.newLine ?? ""}</span>
-            <span role="cell" aria-hidden="true">{lineMarker(line.kind)}</span>
-            <code role="cell">{line.text || " "}</code>
-          </div>
-        ))}
-      </div>
-      {diff.approximate || diff.truncated ? (
-        <footer>{diff.approximate ? "Large diff: line counts use a bounded approximation." : ""}{diff.approximate && diff.truncated ? " " : ""}{diff.truncated ? "Review rows were bounded for browser safety." : ""}</footer>
-      ) : null}
+      <DiffLines path={diff.path} diff={diff} />
     </article>
   );
-}
-
-function lineMarker(kind: ReviewDiff["lines"][number]["kind"]): string {
-  if (kind === "added") return "+";
-  if (kind === "removed") return "−";
-  return kind === "hunk" ? "·" : " ";
 }
 
 function formatStatus(status: ReviewDiff["status"]): string {

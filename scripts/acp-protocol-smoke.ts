@@ -7,8 +7,8 @@ import type {
 } from "../web/src/lib/business-api.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
-// SDK Agent -> ACP client -> MCP server, with the same REST/SSE observation used
-// by the browser. The fixtures report upstream results; assertions live here.
+// SDK Agent -> ACP client terminal/MCP services, with the same REST/SSE
+// observation used by the browser. Fixtures report results; assertions live here.
 const cwd = process.cwd();
 const server = await startRustTestServer({
   cwd,
@@ -91,7 +91,43 @@ try {
       disconnectRejectedPending: true,
       recoveredEcho: { recovered: true },
     });
-    console.log("ACP SDK protocol smoke passed (MCP bidirectional relay, errors, cancellation and reconnect)");
+    const terminals = await runFlow(sessionUrl, "terminal-command-flow", "terminal-command-result");
+    const compound = terminalOutput(terminals.compound, 0).trimEnd().split("\n");
+    assert.equal(compound.length, 3, "every statement in the compound shell command must run");
+    assert.equal(compound[0], "shell-ok");
+    assert.ok(compound[1].length > 0, "uname -a must produce system information");
+    assert.match(compound[2], /(?:^|\/)sh$/u, "command -v must resolve the shell builtin's argument");
+    assert.equal(
+      terminalOutput(terminals.literalArguments, 0),
+      "<two words>\n<$(printf expanded)>\n<a'b>\n<a\"b>\n<>\n<semi;colon>\n<*>\n",
+      "explicit arguments must retain literal spaces, substitutions, quotes and empty strings",
+    );
+    assert.match(terminalOutput(terminals.missing, 127), /attyd-fixture-command-does-not-exist/u);
+    assert.equal(terminalOutput(terminals.recovered, 0), "terminal-recovered\n");
+    const lifecycle = await runFlow(sessionUrl, "terminal-lifecycle-flow", "terminal-lifecycle-result");
+    assert.equal(asRecord(lifecycle.otherOutput).output, "OTHER_TASK_FINISHED\n");
+    assert.equal(asRecord(asRecord(lifecycle.otherOutput).exitStatus).exitCode, 0);
+    assert.equal(asRecord(lifecycle.beforeKill).output, "LONG_TASK_READY\n");
+    assert.ok(asRecord(lifecycle.beforeKill).exitStatus == null,
+      "a long-running terminal must survive other terminal requests");
+    assert.equal(asRecord(lifecycle.killedOutput).output, "LONG_TASK_READY\n",
+      "terminal/kill must retain the terminal ID and its output");
+    assert.equal(asRecord(lifecycle.killedOutput).truncated, false);
+    assert.deepEqual(asRecord(lifecycle.killedOutput).exitStatus, lifecycle.killedStatus);
+    assert.ok(asRecord(lifecycle.killedStatus).signal != null ||
+      asRecord(lifecycle.killedStatus).exitCode != null, "terminal/kill must publish an exit status");
+    assert.ok(Array.isArray(lifecycle.releasedErrors));
+    assert.equal(lifecycle.releasedErrors.length, 3);
+    for (const error of lifecycle.releasedErrors) {
+      assert.equal(asRecord(error).code, -32602,
+        "terminal/release must invalidate the ID for output, wait_for_exit and kill");
+    }
+    assert.equal(asRecord(lifecycle.shellStatus).exitCode, 0);
+    assert.equal(lifecycle.backgroundAfterExit, true,
+      "a redirected nohup service must survive its launching shell's normal exit");
+    assert.equal(lifecycle.backgroundAfterRelease, true,
+      "releasing an already completed terminal must not kill its background service");
+    console.log("ACP SDK protocol smoke passed (terminal scripts/argv/recovery/lifecycle; MCP relay, cancellation and reconnect)");
   } finally {
     observer.abort();
     await drain;
@@ -138,6 +174,15 @@ async function runFlow(
 function asRecord(value: unknown): Record<string, unknown> {
   assert.ok(value != null && typeof value === "object" && !Array.isArray(value));
   return value as Record<string, unknown>;
+}
+
+function terminalOutput(value: unknown, exitCode: number): string {
+  const terminal = asRecord(value);
+  assert.equal(asRecord(terminal.waitStatus).exitCode, exitCode);
+  assert.equal(asRecord(terminal.exitStatus).exitCode, exitCode);
+  assert.equal(terminal.truncated, false);
+  assert.equal(typeof terminal.output, "string");
+  return terminal.output as string;
 }
 
 async function getJson<T>(url: string): Promise<T> {

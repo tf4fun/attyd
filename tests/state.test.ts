@@ -852,6 +852,27 @@ describe("ACP UI state", () => {
     expect(state.terminalSnapshots.every(({ released }) => released)).toBe(true);
   });
 
+  it("preserves terminal results from authoritative history during live updates", () => {
+    const retained = Array.from({ length: 70 }, (_, index) => ({
+      sessionId: "current", terminalId: `old-${index}`, output: `Result ${index}`,
+      truncated: false, released: true,
+    }));
+    const state = appReducer({
+      ...initialState,
+      session: { sessionId: "current" },
+      sessionSyncPhase: "running",
+      terminalSnapshots: retained,
+    }, event({
+      type: "acp/terminal_state",
+      terminal: {
+        sessionId: "current", terminalId: "live", output: "Current output",
+        truncated: false, released: false, outputAppend: false,
+      },
+    }));
+    expect(state.terminalSnapshots).toHaveLength(71);
+    expect(state.terminalSnapshots.slice(0, 70)).toEqual(retained);
+  });
+
   it("uses the Agent's authoritative config response instead of the requested value", () => {
     const pending = appReducer({
       ...initialState,

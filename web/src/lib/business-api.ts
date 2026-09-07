@@ -15,6 +15,7 @@ import type {
   WorkspaceContextAttachment,
   WorkspaceContextMatch,
 } from "../../../shared/bridge";
+import { parseServerEvent } from "../../../shared/bridge";
 
 export type SessionSyncPhase =
   | "cold"
@@ -127,6 +128,9 @@ export type SessionBusinessEvent =
       fromRevision: number;
       viewRevision: number;
       change: {
+        kind: "terminal_update";
+        terminal: TerminalSnapshot;
+      } | {
         kind: "turn_update" | "sync_state" | "interaction_upsert" | "interaction_remove" | "control_update";
         update?: SessionUpdate;
         [key: string]: unknown;
@@ -273,6 +277,12 @@ export function parseSessionBusinessEvent(raw: string): SessionBusinessEvent {
     (!Number.isSafeInteger(value.fromRevision) || !isRecord(value.change))
   ) {
     throw new Error("Session delta has an invalid predecessor or change");
+  }
+  if (value.type === "bridge/session_delta" && isRecord(value.change) && value.change.kind === "terminal_update") {
+    const parsed = parseServerEvent(JSON.stringify({ type: "acp/terminal_state", terminal: value.change.terminal }));
+    if (parsed.type !== "acp/terminal_state" || parsed.terminal.sessionId !== value.sessionId) {
+      throw new Error("Terminal delta does not match its session identity");
+    }
   }
   return value as unknown as SessionBusinessEvent;
 }

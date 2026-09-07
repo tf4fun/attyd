@@ -95,6 +95,50 @@ Leaving a conversation does not cancel running work. Browser reconnection can
 recover the host's in-memory session state, but restarting attyd discards that
 state. Durable history and restoration support belong to the Agent.
 
+## Terminal command semantics
+
+For stdio Agents on Unix, ACP `terminal/create` runs through `/bin/sh` in the
+requested working directory with the supplied environment overrides. Execution
+uses pipes for output and `/dev/null` for standard input:
+
+- Omitted or empty `args`: `command` is a shell script, so pipelines, redirects,
+  and shell builtins work. For example, `{"command": "printf 'ok\\n'; uname -a"}`.
+- Nonempty `args`: `command` names an executable or builtin, and each argument
+  stays literal. `{"command": "printf", "args": ["%s\\n", "$(pwd)"]}` prints
+  `$(pwd)` without evaluating it.
+
+These examples show command fields; requests also require `sessionId`. To use a
+different shell or shell-specific syntax, request it explicitly, for example
+`{"command": "bash", "args": ["-c", "printf '%s\\n' \"$BASH_VERSION\""]}`.
+attyd does not load the user's interactive shell configuration or retry commands
+after failure. Command failures report shell output and the shell's exit status
+(`127` for a standalone missing command). Failure to start the shell or enter the
+working directory fails terminal creation.
+This is attyd's execution contract; ACP does not prescribe a quoting algorithm.
+
+When the main command exits, including with a nonzero status, attyd leaves
+surviving background processes running. `terminal/kill` and `terminal/release`
+check for completion before terminating a running command's process group;
+session close and bridge shutdown also clean up groups whose main command is
+still running. Release invalidates the terminal handle and preserves its output
+for tool presentation. Cleanup does not cover separate process groups.
+
+Keep services in the foreground when their lifetime should follow the terminal.
+For an independent background service, redirect all three standard streams:
+
+```sh
+nohup python3 -m http.server 8000 --bind 127.0.0.1 </dev/null >server.log 2>&1 &
+```
+
+Save the PID from `$!` and stop the service yourself. Once its launching command
+has ended, the terminal handle no longer manages that service. Output collection
+stops after a one-second drain if inherited pipes remain open; later writes to
+those pipes may fail. ACP `truncated` reports only byte-limit truncation, not a
+drain timeout.
+
+These process and pipe rules are attyd policy, not ACP requirements or a promise
+to reproduce Zed's PTY behavior. See [client reference rules](testing.md#zed-derived-cases).
+
 ## MCP configuration
 
 MCP configuration is supplied at launch, not edited in the browser:
@@ -183,7 +227,8 @@ execution, or terminal authentication. Agent-handled ACP sign-in remains
 available when supported.
 
 For implementation details, see [ACP support](acp-coverage.md),
-[session recovery](active-turn-runtime.md), and [testing](testing.md).
+[session recovery](active-turn-runtime.md), [tool card presentation](tool-card-presentation.md),
+and [testing](testing.md).
 
 ## Optional example: Goose
 

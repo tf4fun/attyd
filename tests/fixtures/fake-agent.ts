@@ -1,6 +1,8 @@
 import { Readable, Writable } from "node:stream";
 import { once } from "node:events";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 
 const minimal = process.argv.includes("--minimal");
@@ -1201,6 +1203,45 @@ const agent = acp
       });
       return { stopReason: "end_turn" };
     }
+    if (promptText.includes("tool-layout-flow")) {
+      const columns = Array.from({ length: 20 }, (_, index) => `Column_${index + 1}`);
+      const table = [
+        `| ${columns.join(" | ")} |`,
+        `| ${columns.map(() => "---").join(" | ")} |`,
+        `| ${columns.map((_, index) => `value_${index + 1}`).join(" | ")} |`,
+      ].join("\n");
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-layout",
+          title: "Inspect wide tool results",
+          kind: "read",
+          status: "completed",
+          content: [
+            { type: "content", content: { type: "text", text: table } },
+            {
+              type: "content",
+              content: {
+                type: "resource_link",
+                name: "x".repeat(300),
+                uri: "https://example.test/resource",
+                mimeType: "text/plain",
+              },
+            },
+          ],
+        },
+      });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "tool-layout-answer",
+          content: { type: "text", text: "Wide tool results complete." },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (promptText.includes("tool-content-flow")) {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
@@ -1389,6 +1430,168 @@ const agent = acp
       });
       return { stopReason: "end_turn" };
     }
+    if (promptText.includes("terminal-command-flow")) {
+      const runTerminal = async (request: Omit<acp.CreateTerminalRequest, "sessionId">) => {
+        const terminal = await client.request(acp.methods.client.terminal.create, {
+          ...request,
+          sessionId: params.sessionId,
+        });
+        try {
+          const waitStatus = await client.request(acp.methods.client.terminal.waitForExit, {
+            sessionId: params.sessionId,
+            terminalId: terminal.terminalId,
+          });
+          const output = await client.request(acp.methods.client.terminal.output, {
+            sessionId: params.sessionId,
+            terminalId: terminal.terminalId,
+          });
+          return { ...output, waitStatus };
+        } finally {
+          await client.request(acp.methods.client.terminal.release, {
+            sessionId: params.sessionId,
+            terminalId: terminal.terminalId,
+          });
+        }
+      };
+      const compound = await runTerminal({
+        command: "printf '%s\\n' 'shell-ok'; uname -a; command -v sh",
+      });
+      const literalArguments = await runTerminal({
+        command: "printf",
+        args: ["<%s>\\n", "two words", "$(printf expanded)", "a'b", 'a"b', "", "semi;colon", "*"],
+      });
+      const missing = await runTerminal({ command: "attyd-fixture-command-does-not-exist" });
+      const recovered = await runTerminal({ command: "printf '%s\\n' 'terminal-recovered'" });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "terminal-command-result",
+          content: {
+            type: "text",
+            text: JSON.stringify({ compound, literalArguments, missing, recovered }),
+          },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+    if (promptText.includes("terminal-lifecycle-flow")) {
+      const liveTerminals = new Set<string>();
+      const directory = mkdtempSync(join(tmpdir(), "attyd-terminal-lifecycle-"));
+      const readyPath = join(directory, "ready.json");
+      let backgroundPid: number | undefined;
+      const create = async (
+        request: Omit<acp.CreateTerminalRequest, "sessionId">,
+      ): Promise<acp.TerminalOutputRequest> => {
+        const { terminalId } = await client.request(acp.methods.client.terminal.create, {
+          ...request,
+          sessionId: params.sessionId,
+        });
+        liveTerminals.add(terminalId);
+        return { sessionId: params.sessionId, terminalId };
+      };
+      const release = async (terminal: acp.ReleaseTerminalRequest) => {
+        await client.request(acp.methods.client.terminal.release, terminal);
+        liveTerminals.delete(terminal.terminalId);
+      };
+      const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      try {
+        const longTask = await create({
+          command: process.execPath,
+          args: ["-e", "process.stdout.write('LONG_TASK_READY\\n'); setInterval(() => {}, 1000); setTimeout(() => process.exit(0), 30000)"],
+        });
+        const readyDeadline = Date.now() + 5_000;
+        while (true) {
+          const output = await client.request(acp.methods.client.terminal.output, longTask);
+          if (output.output.includes("LONG_TASK_READY")) break;
+          if (Date.now() >= readyDeadline) throw new Error("Long terminal did not become ready");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        const otherTask = await create({ command: "printf '%s\\n' 'OTHER_TASK_FINISHED'" });
+        await client.request(acp.methods.client.terminal.waitForExit, otherTask);
+        const otherOutput = await client.request(acp.methods.client.terminal.output, otherTask);
+        await release(otherTask);
+        const beforeKill = await client.request(acp.methods.client.terminal.output, longTask);
+        await client.request(acp.methods.client.terminal.kill, longTask);
+        const killedStatus = await client.request(acp.methods.client.terminal.waitForExit, longTask);
+        const killedOutput = await client.request(acp.methods.client.terminal.output, longTask);
+        await release(longTask);
+        const releasedErrors = [];
+        for (const method of [
+          acp.methods.client.terminal.output,
+          acp.methods.client.terminal.waitForExit,
+          acp.methods.client.terminal.kill,
+        ]) {
+          try {
+            await client.request(method, longTask);
+            releasedErrors.push(null);
+          } catch (error) {
+            releasedErrors.push(requestErrorDetails(error));
+          }
+        }
+
+        // Keep this service in the shell's process group: nohup alone does not
+        // detach it. Its independent watchdog also bounds failed-test cleanup.
+        const serviceScript = `const fs = require("node:fs"); const http = require("node:http"); const server = http.createServer((request, response) => response.end("BACKGROUND_SERVICE_READY:" + process.pid)); server.listen(0, "127.0.0.1", () => fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ pid: process.pid, port: server.address().port }))); setTimeout(() => process.exit(0), 30000);`;
+        const readyScript = `const fs = require("node:fs"); setInterval(() => { if (fs.existsSync(${JSON.stringify(readyPath)})) process.exit(0); }, 20); setTimeout(() => process.exit(1), 5000);`;
+        const shell = await create({
+          command: `nohup ${shellQuote(process.execPath)} -e ${shellQuote(serviceScript)} </dev/null >/dev/null 2>&1 & child=$!; ${shellQuote(process.execPath)} -e ${shellQuote(readyScript)}; ready=$?; printf '%s\\n' "$child"; exit "$ready"`,
+        });
+        const shellStatus = await client.request(acp.methods.client.terminal.waitForExit, shell);
+        const shellOutput = await client.request(acp.methods.client.terminal.output, shell);
+        backgroundPid = Number(shellOutput.output.trim());
+        const service = JSON.parse(readFileSync(readyPath, "utf8")) as { pid: number; port: number };
+        const probe = async () => {
+          try {
+            const response = await fetch(`http://127.0.0.1:${service.port}`, {
+              signal: AbortSignal.timeout(1_000),
+            });
+            return await response.text() === `BACKGROUND_SERVICE_READY:${backgroundPid}`;
+          } catch {
+            return false;
+          }
+        };
+        const backgroundAfterExit = await probe();
+        await release(shell);
+        const backgroundAfterRelease = await probe();
+        await client.notify(acp.methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            messageId: "terminal-lifecycle-result",
+            content: {
+              type: "text",
+              text: JSON.stringify({
+                otherOutput,
+                beforeKill,
+                killedStatus,
+                killedOutput,
+                releasedErrors,
+                shellStatus,
+                backgroundAfterExit,
+                backgroundAfterRelease,
+              }),
+            },
+          },
+        });
+        return { stopReason: "end_turn" };
+      } finally {
+        await Promise.allSettled([...liveTerminals].map((terminalId) =>
+          client.request(acp.methods.client.terminal.release, { sessionId: params.sessionId, terminalId })
+        ));
+        if (backgroundPid == null && existsSync(readyPath)) {
+          backgroundPid = (JSON.parse(readFileSync(readyPath, "utf8")) as { pid: number }).pid;
+        }
+        if (backgroundPid != null && Number.isSafeInteger(backgroundPid) && backgroundPid > 1) {
+          try {
+            process.kill(backgroundPid, "SIGKILL");
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          }
+        }
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
     if (promptText.includes("invalid-terminal-flow")) {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
@@ -1516,6 +1719,46 @@ const agent = acp
           sessionUpdate: "tool_call_update",
           toolCallId: "terminal-burst-tool",
           status: "completed",
+        },
+      });
+      await client.request(acp.methods.client.terminal.release, {
+        sessionId: params.sessionId,
+        terminalId: terminal.terminalId,
+      });
+      return { stopReason: "end_turn" };
+    }
+    if (promptText.startsWith("terminal-live-flow ")) {
+      const gatePath = promptText.slice("terminal-live-flow ".length).trim();
+      const terminal = await client.request(acp.methods.client.terminal.create, {
+        sessionId: params.sessionId,
+        command: process.execPath,
+        args: [
+          "-e",
+          `const fs = require("node:fs"); process.stdout.write("LIVE_START中😀\\n"); const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gatePath)})) { process.stdout.write("LIVE_END\\n"); clearInterval(timer); } }, 25);`,
+        ],
+      });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "terminal-live-tool",
+          title: "Run live terminal fixture",
+          kind: "execute",
+          status: "in_progress",
+          content: [{ type: "terminal", terminalId: terminal.terminalId }],
+        },
+      });
+      await client.request(acp.methods.client.terminal.waitForExit, {
+        sessionId: params.sessionId,
+        terminalId: terminal.terminalId,
+      });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "terminal-live-tool",
+          status: "completed",
+          rawOutput: { result: "agent-output" },
         },
       });
       await client.request(acp.methods.client.terminal.release, {

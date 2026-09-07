@@ -34,6 +34,7 @@ const MAX_TERMINAL_ARG_LENGTH: usize = 65_536;
 const MAX_TERMINAL_ENV: usize = 256;
 const MAX_TERMINAL_ENV_NAME_LENGTH: usize = 256;
 const MAX_TERMINAL_ENV_VALUE_LENGTH: usize = 65_536;
+const TERMINAL_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct TerminalManager {
@@ -55,6 +56,47 @@ struct Terminal {
     reader_tasks: Mutex<Vec<AbortHandle>>,
 }
 
+struct TerminalProcess {
+    child: Child,
+    #[cfg(unix)]
+    process_group: Option<rustix::process::Pid>,
+}
+
+impl TerminalProcess {
+    fn terminate(&mut self) {
+        // Completion and a kill/release request can become ready together.
+        // Once the command has exited, its background jobs no longer belong to
+        // this terminal. Forget the PGID before it can be reused by another job.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            #[cfg(unix)]
+            {
+                self.process_group = None;
+            }
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(group) = self.process_group.take() {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let _ = self.child.start_kill();
+    }
+}
+
+impl Drop for TerminalProcess {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+struct TerminalReader(Arc<Terminal>);
+
+impl Drop for TerminalReader {
+    fn drop(&mut self) {
+        self.0.readers_remaining.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_waiters();
+    }
+}
+
 #[derive(Default)]
 struct TerminalState {
     output: Vec<u8>,
@@ -63,9 +105,6 @@ struct TerminalState {
     truncated: bool,
     exit_status: Option<TerminalExitStatus>,
     released: bool,
-    internal_initialized: bool,
-    internal_exit_published: bool,
-    internal_release_published: bool,
 }
 
 impl TerminalManager {
@@ -106,9 +145,9 @@ impl TerminalManager {
             .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTES)
             .min(MAX_TERMINAL_OUTPUT_BYTES);
 
-        let mut child = spawn_command(&request, &cwd).map_err(terminal_spawn_error)?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let mut process = spawn_command(&request, &cwd).map_err(terminal_spawn_error)?;
+        let stdout = process.child.stdout.take();
+        let stderr = process.child.stderr.take();
         let reader_count = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
         let id = Uuid::new_v4().to_string();
         let terminal = Arc::new(Terminal {
@@ -137,7 +176,7 @@ impl TerminalManager {
             reader_tasks.push(self.spawn_reader(terminal.clone(), stderr));
         }
         *terminal.reader_tasks.lock().await = reader_tasks;
-        self.spawn_waiter(terminal.clone(), child, kill_rx);
+        self.spawn_waiter(terminal.clone(), process, kill_rx);
         self.emit_snapshot(&terminal).await;
         Ok(CreateTerminalResponse::new(id))
     }
@@ -288,7 +327,10 @@ impl TerminalManager {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
         let manager = self.clone();
+        // Construct before spawning so even an unpolled, aborted reader retires.
+        let completion = TerminalReader(terminal.clone());
         tokio::spawn(async move {
+            let _completion = completion;
             let mut buffer = [0_u8; 8 * 1024];
             loop {
                 let count = match reader.read(&mut buffer).await {
@@ -313,9 +355,6 @@ impl TerminalManager {
                 }
                 manager.emit_snapshot(&terminal).await;
             }
-            if terminal.readers_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                manager.emit_snapshot(&terminal).await;
-            }
         })
         .abort_handle()
     }
@@ -323,26 +362,52 @@ impl TerminalManager {
     fn spawn_waiter(
         &self,
         terminal: Arc<Terminal>,
-        mut child: Child,
+        mut process: TerminalProcess,
         mut kill_rx: oneshot::Receiver<()>,
     ) {
         let manager = self.clone();
         tokio::spawn(async move {
             let status = tokio::select! {
-                status = child.wait() => status,
+                status = process.child.wait() => status,
                 _ = &mut kill_rx => {
-                    let _ = child.kill().await;
-                    child.wait().await
+                    process.terminate();
+                    process.child.wait().await
                 }
             };
+            // Drop clears the PGID of an exited command without signalling its
+            // background jobs. Interrupted or failed waits still clean up a
+            // running command; no PGID is retained during output draining.
+            drop(process);
             let exit_status = match status {
                 Ok(status) => normalize_exit_status(status),
                 Err(error) => TerminalExitStatus::new().signal(error.to_string()),
             };
+            if tokio::time::timeout(
+                TERMINAL_OUTPUT_DRAIN_TIMEOUT,
+                Self::wait_for_readers(&terminal),
+            )
+            .await
+            .is_err()
+            {
+                // A background job can keep a pipe open after the command exits.
+                // Bound final draining without reporting byte-limit truncation.
+                Self::abort_readers(&terminal).await;
+                Self::wait_for_readers(&terminal).await;
+            }
             terminal.state.lock().await.exit_status = Some(exit_status);
             terminal.changed.notify_waiters();
             manager.emit_snapshot(&terminal).await;
         });
+    }
+
+    async fn wait_for_readers(terminal: &Terminal) {
+        loop {
+            let drained = terminal.changed.notified();
+            if terminal.readers_remaining.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
+        }
     }
 
     async fn signal_kill(terminal: &Arc<Terminal>) {
@@ -386,44 +451,7 @@ impl TerminalManager {
                 "released": state.released,
             });
 
-            let internal_snapshot = if !state.internal_initialized {
-                state.internal_initialized = true;
-                Some(json!({
-                    "sessionId": terminal.session_id,
-                    "terminalId": terminal.id,
-                    "output": String::from_utf8_lossy(&state.output),
-                    "truncated": state.truncated,
-                    "exitStatus": state.exit_status,
-                    "released": state.released,
-                }))
-            } else if state.released && !state.internal_release_published {
-                state.internal_release_published = true;
-                Some(json!({
-                    "sessionId": terminal.session_id,
-                    "terminalId": terminal.id,
-                    "output": "",
-                    "outputAppend": true,
-                    "retainedBytes": state.output.len(),
-                    "truncated": state.truncated,
-                    "exitStatus": state.exit_status,
-                    "released": true,
-                }))
-            } else if state.exit_status.is_some()
-                && terminal.readers_remaining.load(Ordering::Acquire) == 0
-                && !state.internal_exit_published
-            {
-                state.internal_exit_published = true;
-                Some(json!({
-                    "sessionId": terminal.session_id,
-                    "terminalId": terminal.id,
-                    "output": String::from_utf8_lossy(&state.output),
-                    "truncated": state.truncated,
-                    "exitStatus": state.exit_status,
-                    "released": false,
-                }))
-            } else {
-                None
-            };
+            let internal_snapshot = snapshot.clone();
             (snapshot, internal_snapshot)
         };
         let _ = self.events.send(
@@ -433,12 +461,13 @@ impl TerminalManager {
             })
             .to_string(),
         );
-        if let (Some(snapshots), Some(snapshot)) = (&self.snapshots, internal_snapshot) {
+        if let Some(snapshots) = &self.snapshots {
             if snapshots
-                .try_send(TerminalSnapshot {
+                .send(TerminalSnapshot {
                     incarnation: terminal.incarnation,
-                    value: snapshot,
+                    value: internal_snapshot,
                 })
+                .await
                 .is_err()
             {
                 self.events.cancel_generation();
@@ -447,10 +476,31 @@ impl TerminalManager {
     }
 }
 
-fn spawn_command(request: &CreateTerminalRequest, cwd: &Path) -> std::io::Result<Child> {
-    let mut command = Command::new(&request.command);
+fn spawn_command(request: &CreateTerminalRequest, cwd: &Path) -> std::io::Result<TerminalProcess> {
+    #[cfg(unix)]
+    let mut command = {
+        let mut shell = Command::new("/bin/sh");
+        shell.arg("-c");
+        if request.args.is_empty() {
+            shell.arg(&request.command);
+        } else {
+            // A fixed script expands positional parameters as literal words;
+            // neither the executable name nor argument data becomes shell source.
+            shell
+                .arg(r#""$0" "$@""#)
+                .arg(&request.command)
+                .args(&request.args);
+        }
+        shell.process_group(0);
+        shell
+    };
+    #[cfg(not(unix))]
+    let mut command = {
+        let mut command = Command::new(&request.command);
+        command.args(&request.args);
+        command
+    };
     command
-        .args(&request.args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -459,7 +509,14 @@ fn spawn_command(request: &CreateTerminalRequest, cwd: &Path) -> std::io::Result
     for variable in &request.env {
         command.env(&variable.name, &variable.value);
     }
-    command.spawn()
+    let child = command.spawn()?;
+    Ok(TerminalProcess {
+        #[cfg(unix)]
+        process_group: child
+            .id()
+            .and_then(|id| rustix::process::Pid::from_raw(id.cast_signed())),
+        child,
+    })
 }
 
 fn validate_create_request(request: &CreateTerminalRequest) -> Result<(), Error> {
@@ -699,20 +756,44 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn preserves_command_and_arguments_without_implicit_shell_execution() {
+    async fn executes_shell_commands_with_environment_and_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let (terminals, _events) = manager(root.path());
+        for script in [
+            "pwd",
+            "uname -a",
+            "command -v sh",
+            "printf '%s\\n' 'shell-ok'; uname -a; command -v sh; printf '%s' \"$ATTYD_TERMINAL_VALUE\" | tr 'a-z' 'A-Z' > result; cat result",
+        ] {
+            let created = create_terminal(
+                &terminals,
+                CreateTerminalRequest::new("session", script)
+                    .cwd(root.path().to_path_buf())
+                    .env(vec![EnvVariable::new("ATTYD_TERMINAL_VALUE", "two words")]),
+            )
+            .await
+            .expect("shell command must create a terminal");
+            let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
+            assert_eq!(output.exit_status.unwrap().exit_code, Some(0), "{script}");
+            assert!(!output.output.is_empty());
+            terminals
+                .release(ReleaseTerminalRequest::new("session", created.terminal_id))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("result")).unwrap(),
+            "TWO WORDS"
+        );
+        terminals.close_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_explicit_command_and_arguments_as_literal_values() {
         let root = tempfile::tempdir().unwrap();
         let (terminals, _events) = manager(root.path());
         let unexpected = root.path().join("unexpected");
-        assert!(
-            create_terminal(
-                &terminals,
-                CreateTerminalRequest::new("session", "touch unexpected")
-                    .cwd(root.path().to_path_buf()),
-            )
-            .await
-            .is_err()
-        );
-        assert!(!unexpected.exists());
 
         // Whitespace and shell metacharacters remain part of an executable path.
         let executable = root.path().join("printf with spaces;$VALUE");
@@ -721,16 +802,38 @@ mod tests {
             &terminals,
             CreateTerminalRequest::new("session", executable.to_string_lossy())
                 .args(vec![
-                    "%s".to_string(),
+                    "%s\\n".to_string(),
+                    String::new(),
                     "$(touch unexpected); $HOME".to_string(),
+                    "two words".to_string(),
+                    "'single' \"double\" \\ *".to_string(),
                 ])
                 .cwd(root.path().to_path_buf()),
         )
         .await
         .unwrap();
         let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
-        assert_eq!(output.output, "$(touch unexpected); $HOME");
+        assert_eq!(
+            output.output,
+            "\n$(touch unexpected); $HOME\ntwo words\n'single' \"double\" \\ *\n"
+        );
         assert!(!unexpected.exists());
+
+        let builtin = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", "command")
+                .args(vec!["-v".to_string(), "sh".to_string()]),
+        )
+        .await
+        .expect("explicit arguments also support shell builtins");
+        assert_eq!(
+            wait_until_exited(&terminals, "session", &builtin.terminal_id)
+                .await
+                .exit_status
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
 
         let shell = create_terminal(
             &terminals,
@@ -747,6 +850,380 @@ mod tests {
             "explicit-shell"
         );
         terminals.close_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_commands_report_shell_exit_status_and_allow_subsequent_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let (terminals, _events) = manager(root.path());
+        for args in [Vec::new(), vec!["literal argument".to_string()]] {
+            let created = create_terminal(
+                &terminals,
+                CreateTerminalRequest::new("session", "./missing-command")
+                    .args(args)
+                    .cwd(root.path().to_path_buf()),
+            )
+            .await
+            .expect("the shell starts even if the requested command does not exist");
+            let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
+            assert_eq!(output.exit_status.unwrap().exit_code, Some(127));
+            assert!(output.output.contains("missing-command"));
+            terminals
+                .release(ReleaseTerminalRequest::new("session", created.terminal_id))
+                .await
+                .unwrap();
+        }
+        let recovered = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", "./missing-command; printf recovered")
+                .cwd(root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let output = wait_until_exited(&terminals, "session", &recovered.terminal_id).await;
+        assert_eq!(output.exit_status.unwrap().exit_code, Some(0));
+        assert!(output.output.contains("recovered"));
+        terminals.close_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_exit_is_published_only_after_stdout_and_stderr_are_drained() {
+        let root = tempfile::tempdir().unwrap();
+        let (terminals, _events) = manager(root.path());
+        let created = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new(
+                "session",
+                "i=0; while [ \"$i\" -lt 2048 ]; do printf 'abcdefgh'; printf 'ABCDEFGH' >&2; i=$((i + 1)); done",
+            ),
+        )
+        .await
+        .unwrap();
+        let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
+        assert_eq!(output.exit_status.unwrap().exit_code, Some(0));
+        assert!(!output.truncated);
+        assert_eq!(output.output.len(), 2048 * 16);
+        for byte in b"abcdefghABCDEFGH" {
+            assert_eq!(
+                output.output.bytes().filter(|value| value == byte).count(),
+                2048
+            );
+        }
+        terminals.close_all().await;
+    }
+
+    #[cfg(unix)]
+    struct BackgroundProcess(u32);
+
+    #[cfg(unix)]
+    impl Drop for BackgroundProcess {
+        fn drop(&mut self) {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(self.0.cast_signed()).unwrap(),
+                rustix::process::Signal::KILL,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_running(pid: u32) {
+        let state = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .await
+            .expect("inspect the fixture's background process");
+        let state_text = String::from_utf8(state.stdout).unwrap();
+        assert!(
+            state.status.success()
+                && !state_text.trim().is_empty()
+                && !state_text.trim_start().starts_with('Z'),
+            "an exited terminal must not stop its background process: {state_text}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn terminal_child_pid(terminals: &TerminalManager, terminal_id: &TerminalId) -> u32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = terminals
+                    .output(output_request("session", terminal_id))
+                    .await
+                    .unwrap();
+                if let Some(line) = output.output.lines().next()
+                    && let Ok(pid) = line.trim().parse::<u32>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal did not report its child PID")
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_stopped(pid: u32) {
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "stat="])
+                    .output()
+                    .await
+                    .expect("inspect the terminal's child process");
+                assert!(state.status.success() || state.status.code() == Some(1));
+                let state = String::from_utf8(state.stdout).unwrap();
+                if state.trim().is_empty() || state.trim_start().starts_with('Z') {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if stopped.is_err() {
+            // A broken cleanup implementation must not leak the fixture child.
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(pid.cast_signed()).unwrap(),
+                rustix::process::Signal::KILL,
+            );
+        }
+        stopped.expect("terminal cleanup left its shell child running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_cleanup_terminates_shell_children_for_each_lifecycle_action() {
+        for action in ["kill", "release", "session", "shutdown"] {
+            let root = tempfile::tempdir().unwrap();
+            let (terminals, _events) = manager(root.path());
+            let created = create_terminal(
+                &terminals,
+                CreateTerminalRequest::new(
+                    "session",
+                    "sleep 60 & child=$!; printf '%s\\n' \"$child\"; wait \"$child\"",
+                ),
+            )
+            .await
+            .unwrap();
+            let pid = terminal_child_pid(&terminals, &created.terminal_id).await;
+            match action {
+                "kill" => {
+                    terminals
+                        .kill(KillTerminalRequest::new(
+                            "session",
+                            created.terminal_id.clone(),
+                        ))
+                        .await
+                        .unwrap();
+                    let output =
+                        wait_until_exited(&terminals, "session", &created.terminal_id).await;
+                    assert!(output.exit_status.unwrap().signal.is_some());
+                }
+                "release" => {
+                    terminals
+                        .release(ReleaseTerminalRequest::new(
+                            "session",
+                            created.terminal_id.clone(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                "session" => terminals.release_session("session").await,
+                "shutdown" => terminals.close_all().await,
+                _ => unreachable!(),
+            }
+            assert_process_stopped(pid).await;
+            terminals.close_all().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_exit_preserves_background_processes_after_terminal_release() {
+        for exit_code in [0, 7] {
+            let root = tempfile::tempdir().unwrap();
+            let (terminals, _events) = manager(root.path());
+            let created = create_terminal(
+                &terminals,
+                CreateTerminalRequest::new(
+                    "session",
+                    format!(
+                        "nohup sleep 60 </dev/null >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit {exit_code}"
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+            let child =
+                BackgroundProcess(terminal_child_pid(&terminals, &created.terminal_id).await);
+            let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
+            assert_eq!(
+                output.exit_status.as_ref().unwrap().exit_code,
+                Some(exit_code)
+            );
+            assert!(!output.truncated);
+            assert_process_running(child.0).await;
+
+            terminals
+                .kill(KillTerminalRequest::new(
+                    "session",
+                    created.terminal_id.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                terminals
+                    .output(output_request("session", &created.terminal_id))
+                    .await
+                    .unwrap(),
+                output
+            );
+            terminals
+                .release(ReleaseTerminalRequest::new(
+                    "session",
+                    created.terminal_id.clone(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                terminals
+                    .output(output_request("session", &created.terminal_id))
+                    .await
+                    .is_err()
+            );
+            terminals.release_session("session").await;
+            terminals.close_all().await;
+            assert_process_running(child.0).await;
+            let pid = child.0;
+            drop(child);
+            assert_process_stopped(pid).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_an_already_exited_process_does_not_signal_its_background_group() {
+        let root = tempfile::tempdir().unwrap();
+        let mut process = spawn_command(
+            &CreateTerminalRequest::new(
+                "session",
+                "nohup sleep 60 </dev/null >/dev/null 2>&1 & printf '%s\\n' \"$!\"",
+            ),
+            root.path(),
+        )
+        .unwrap();
+        let mut output = String::new();
+        process
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .await
+            .unwrap();
+        let child = BackgroundProcess(output.trim().parse().unwrap());
+        assert!(process.child.wait().await.unwrap().success());
+        // The kill request can win select! even when child.wait() is also ready.
+        process.terminate();
+        drop(process);
+        assert_process_running(child.0).await;
+        let pid = child.0;
+        drop(child);
+        assert_process_stopped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_output_writers_cannot_prevent_terminal_exit() {
+        for request in [
+            CreateTerminalRequest::new("session", "sleep 60 & printf '%s\\n' \"$!\""),
+            CreateTerminalRequest::new("session", "node").args(vec![
+                "-e".to_string(),
+                "const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'inherit' }); console.log(child.pid); child.unref();".to_string(),
+            ]),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (terminals, _events) = manager(root.path());
+            let created = create_terminal(&terminals, request).await.unwrap();
+            let child = BackgroundProcess(terminal_child_pid(&terminals, &created.terminal_id).await);
+            let terminal = terminals.require(&created.terminal_id.0, "session").await.unwrap();
+            let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
+            assert_eq!(output.exit_status.unwrap().exit_code, Some(0));
+            assert!(
+                !output.truncated,
+                "a pipe held open by a background process is not byte-limit truncation"
+            );
+            assert_eq!(terminal.readers_remaining.load(Ordering::Acquire), 0);
+            assert_process_running(child.0).await;
+            let pid = child.0;
+            drop(child);
+            assert_process_stopped(pid).await;
+            terminals.close_all().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn immediate_release_retires_unpolled_readers_and_waiter() {
+        let root = tempfile::tempdir().unwrap();
+        let (terminals, _events) = manager(root.path());
+        let created = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", "sleep 60"),
+        )
+        .await
+        .unwrap();
+        let terminal = terminals
+            .require(&created.terminal_id.0, "session")
+            .await
+            .unwrap();
+        terminals
+            .release(ReleaseTerminalRequest::new("session", created.terminal_id))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = terminal.changed.notified();
+                if terminal.state.lock().await.exit_status.is_some() {
+                    assert_eq!(terminal.readers_remaining.load(Ordering::Acquire), 0);
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("immediate release must not leave its waiter blocked");
+        terminals.close_all().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_runtime_terminates_the_terminal_process_group() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let pid = runtime.block_on(async {
+            let (terminals, _events) = manager(root.path());
+            let created = create_terminal(
+                &terminals,
+                CreateTerminalRequest::new(
+                    "session",
+                    "sleep 60 & child=$!; printf '%s\\n' \"$child\"; wait \"$child\"",
+                ),
+            )
+            .await
+            .unwrap();
+            terminal_child_pid(&terminals, &created.terminal_id).await
+        });
+        drop(runtime);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(assert_process_stopped(pid));
     }
 
     #[cfg(unix)]
@@ -776,10 +1253,8 @@ mod tests {
         assert!(
             create_terminal(
                 &terminals,
-                CreateTerminalRequest::new(
-                    "session",
-                    root.path().join("missing-command").to_string_lossy(),
-                )
+                CreateTerminalRequest::new("session", "pwd",)
+                    .cwd(root.path().join("missing-directory"))
             )
             .await
             .is_err()

@@ -59,6 +59,30 @@ describe("Zed-style Agent thread search UI", () => {
     expect(needle.matches[0]?.entry.dataset.threadEntryId).toBe("open-tool");
   });
 
+  it("excludes nested collapsed output and hidden descendants inside a searchable body", () => {
+    const thread = document.createElement("div");
+    thread.innerHTML = `
+      <section data-thread-entry-id="tool">
+        <div data-thread-searchable>
+          <p>Visible result</p>
+          <details id="additional"><summary>Additional output</summary>
+            <p>Additional result</p>
+            <details id="nested"><summary>Nested result</summary><p>Deep result</p></details>
+          </details>
+          <p hidden>Hidden result</p>
+        </div>
+      </section>
+    `;
+    const count = () => scanThreadSearchDom(thread, "result", defaults).matches.length;
+    expect(count()).toBe(1);
+    requireElement(thread.querySelector<HTMLDetailsElement>("#additional")).open = true;
+    expect(count()).toBe(3);
+    requireElement(thread.querySelector<HTMLDetailsElement>("#nested")).open = true;
+    expect(count()).toBe(4);
+    requireElement(thread.querySelector<HTMLDetailsElement>("#additional")).open = false;
+    expect(count()).toBe(1);
+  });
+
   it("navigates matches, toggles options, and restores control through close", async () => {
     const threadRef = createRef<HTMLDivElement>();
     const searchRef = createRef<HTMLDivElement>();

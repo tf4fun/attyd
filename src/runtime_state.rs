@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -157,6 +159,13 @@ pub(crate) enum RuntimeChange {
         revision: u64,
         operation_id: String,
         update: Value,
+    },
+    TerminalUpdated {
+        session_id: String,
+        incarnation: u64,
+        revision: u64,
+        terminal_id: String,
+        terminal: Value,
     },
     SessionRemoved {
         session_id: String,
@@ -1376,8 +1385,9 @@ impl RuntimeState {
         {
             return Ok(TerminalUpsert::Stale);
         }
+        let materialized = fold_terminal_snapshot(session.terminals.get(&terminal_id), &terminal);
         let outcome = match session.terminals.get(&terminal_id) {
-            Some(existing) if existing == &terminal => return Ok(TerminalUpsert::Duplicate),
+            Some(existing) if existing == &materialized => return Ok(TerminalUpsert::Duplicate),
             Some(_) => TerminalUpsert::Updated,
             None => TerminalUpsert::Inserted,
         };
@@ -1385,9 +1395,20 @@ impl RuntimeState {
             session.terminals.remove(&terminal_id);
             remember_resolved_interaction(&mut session.released_terminals, &terminal_id);
         } else {
-            session.terminals.insert(terminal_id, terminal);
+            session.terminals.insert(terminal_id.clone(), materialized);
         }
-        self.commit_session(session_id);
+        session.revision = session.revision.wrapping_add(1).max(1);
+        let revision = session.revision;
+        self.commit_delta(
+            Some(revision),
+            RuntimeChange::TerminalUpdated {
+                session_id: session_id.to_string(),
+                incarnation,
+                revision,
+                terminal_id,
+                terminal,
+            },
+        );
         Ok(outcome)
     }
 
@@ -1782,27 +1803,28 @@ impl RuntimeState {
         // A journal suffix must remain sequence-contiguous. Removing only this session's entries
         // would leave holes when sessions interleave, so invalidate the whole prefix through the
         // last delta that could own this turn's payload.
-        let discard_through =
-            self.delta_journal
-                .iter()
-                .filter(|delta| match &delta.change {
-                    RuntimeChange::SessionUpsert { session } => {
-                        session.session_id == session_id && session.incarnation == incarnation
-                    }
-                    RuntimeChange::TurnUpdateAppended {
-                        session_id: delta_session_id,
-                        incarnation: delta_incarnation,
-                        operation_id: delta_operation_id,
-                        ..
-                    } => {
-                        (delta_session_id == session_id && *delta_incarnation == incarnation)
-                            || delta_operation_id == operation_id
-                    }
-                    RuntimeChange::ConnectionUpsert { .. }
-                    | RuntimeChange::SessionRemoved { .. } => false,
-                })
-                .map(|delta| delta.seq)
-                .max();
+        let discard_through = self
+            .delta_journal
+            .iter()
+            .filter(|delta| match &delta.change {
+                RuntimeChange::SessionUpsert { session } => {
+                    session.session_id == session_id && session.incarnation == incarnation
+                }
+                RuntimeChange::TurnUpdateAppended {
+                    session_id: delta_session_id,
+                    incarnation: delta_incarnation,
+                    operation_id: delta_operation_id,
+                    ..
+                } => {
+                    (delta_session_id == session_id && *delta_incarnation == incarnation)
+                        || delta_operation_id == operation_id
+                }
+                RuntimeChange::TerminalUpdated { .. }
+                | RuntimeChange::ConnectionUpsert { .. }
+                | RuntimeChange::SessionRemoved { .. } => false,
+            })
+            .map(|delta| delta.seq)
+            .max();
         if let Some(discard_through) = discard_through {
             while self
                 .delta_journal
@@ -1894,6 +1916,60 @@ impl RuntimeState {
             self.delta_bytes = self.delta_bytes.saturating_sub(serialized_len(&removed));
         }
     }
+}
+
+pub(crate) fn fold_terminal_snapshot(previous: Option<&Value>, incoming: &Value) -> Value {
+    fn output_bytes(value: &Value) -> Vec<u8> {
+        value
+            .get("outputBytes")
+            .and_then(Value::as_str)
+            .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+            .unwrap_or_else(|| {
+                value
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec()
+            })
+    }
+    let append = incoming.get("outputAppend").and_then(Value::as_bool) == Some(true);
+    let mut output = if append {
+        previous.map(output_bytes).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    output.extend(output_bytes(incoming));
+    let limit = incoming
+        .get("retainedBytes")
+        .and_then(Value::as_u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .unwrap_or(output.len())
+        .min(crate::terminal::MAX_TERMINAL_OUTPUT_BYTES);
+    if output.len() > limit {
+        output.drain(..output.len() - limit);
+    }
+    while output.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
+        output.remove(0);
+    }
+    let mut snapshot = incoming.clone();
+    let visible = if incoming.get("exitStatus").is_none_or(Value::is_null)
+        && incoming.get("released").and_then(Value::as_bool) != Some(true)
+    {
+        match std::str::from_utf8(&output) {
+            Err(error) if error.error_len().is_none() => &output[..error.valid_up_to()],
+            _ => &output,
+        }
+    } else {
+        &output
+    };
+    snapshot["output"] = Value::String(String::from_utf8_lossy(visible).into_owned());
+    snapshot["outputBytes"] = Value::String(BASE64_STANDARD.encode(&output));
+    if let Some(snapshot) = snapshot.as_object_mut() {
+        snapshot.remove("outputAppend");
+        snapshot.remove("retainedBytes");
+    }
+    snapshot
 }
 
 fn extract_control_state(entries: Vec<Value>) -> BTreeMap<String, Value> {
@@ -3164,6 +3240,9 @@ mod tests {
                     assert_eq!(turn.operation_id, operation_id);
                     turn.updates.push(update);
                     session.revision = revision;
+                }
+                RuntimeChange::TerminalUpdated { .. } => {
+                    unreachable!("this case creates no terminals")
                 }
                 RuntimeChange::SessionRemoved { session_id, .. } => {
                     projection.remove(&session_id);
@@ -5342,6 +5421,80 @@ mod tests {
             TerminalUpsert::Stale
         );
         assert_eq!(state.seq(), released_seq);
+    }
+
+    #[test]
+    fn terminal_deltas_are_linear_and_reassemble_split_utf8_before_exit() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let start = state.seq();
+        let bytes = "中😀tail".as_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            state
+                .upsert_terminal(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    "terminal",
+                    json!({
+                        "sessionId": "session", "terminalId": "terminal",
+                        "output": String::from_utf8_lossy(&[*byte]),
+                        "outputBytes": BASE64_STANDARD.encode([*byte]),
+                        "outputAppend": true, "retainedBytes": index + 1,
+                        "released": false,
+                    }),
+                )
+                .unwrap();
+            let output = state.session("session").unwrap().terminals["terminal"]["output"]
+                .as_str()
+                .unwrap();
+            assert!(
+                !output.contains('\u{fffd}'),
+                "incomplete UTF-8 must wait for its next byte"
+            );
+        }
+        let terminal = &state.session("session").unwrap().terminals["terminal"];
+        assert_eq!(terminal["output"], "中😀tail");
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(terminal["outputBytes"].as_str().unwrap())
+                .unwrap(),
+            bytes
+        );
+        let deltas = state.deltas_after(start).unwrap();
+        assert_eq!(deltas.len(), bytes.len());
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| {
+                    let RuntimeChange::TerminalUpdated { terminal, .. } = &delta.change else {
+                        panic!("output must not republish a whole runtime session");
+                    };
+                    BASE64_STANDARD
+                        .decode(terminal["outputBytes"].as_str().unwrap())
+                        .unwrap()
+                        .len()
+                })
+                .sum::<usize>(),
+            bytes.len()
+        );
+
+        state
+            .upsert_terminal(
+                "epoch",
+                "session",
+                incarnation,
+                "terminal",
+                json!({
+                    "output": "!", "outputBytes": BASE64_STANDARD.encode(b"!"),
+                    "outputAppend": true, "retainedBytes": 8, "released": false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            state.session("session").unwrap().terminals["terminal"]["output"],
+            "tail!"
+        );
     }
 
     #[test]

@@ -12,6 +12,23 @@ import {
 } from "../web/src/lib/business-api";
 import { projectPath, sessionPath } from "../web/src/lib/session-route";
 import { useAcp } from "../web/src/lib/use-acp";
+import type { TerminalSnapshot } from "../shared/bridge";
+
+function terminalDelta(terminal: Record<string, unknown>, fromRevision = 1, overrides: Record<string, unknown> = {}) {
+  return {
+    type: "bridge/session_delta", bridgeEpoch: "epoch", sessionId: "alpha-one",
+    sessionIncarnation: 1, fromRevision, viewRevision: fromRevision + 1,
+    change: { kind: "terminal_update", terminal },
+    ...overrides,
+  };
+}
+
+function terminalSnapshot(overrides: Partial<TerminalSnapshot> = {}): TerminalSnapshot {
+  return {
+    sessionId: "alpha-one", terminalId: "terminal-1", output: "", truncated: false, released: false,
+    ...overrides,
+  };
+}
 
 describe("browser REST and SSE transport", () => {
   it("encodes the authoritative history revision as a strong If-Match value", () => {
@@ -84,6 +101,23 @@ describe("browser REST and SSE transport", () => {
       clientIntentId: "intent-1",
       response: "invalid",
     }))).toThrow("invalid payload");
+  });
+
+  it("validates terminal delta payloads and requires the envelope session identity", () => {
+    const terminal = terminalSnapshot({ output: "streamed", outputAppend: true, retainedBytes: 8 });
+    expect(parseSessionBusinessEvent(JSON.stringify(terminalDelta({ ...terminal }))))
+      .toMatchObject({ change: { kind: "terminal_update", terminal } });
+    for (const invalid of [
+      { ...terminal, sessionId: "beta-one" },
+      { ...terminal, terminalId: null },
+      { ...terminal, output: 1 },
+      { ...terminal, released: undefined },
+      { ...terminal, outputAppend: "yes" },
+      { ...terminal, retainedBytes: -1 },
+      { ...terminal, exitStatus: { exitCode: -1 } },
+    ]) {
+      expect(() => parseSessionBusinessEvent(JSON.stringify(terminalDelta(invalid)))).toThrow();
+    }
   });
 
 });
@@ -196,6 +230,108 @@ describe("project navigation", () => {
     expect(acp.projectCwd).toBe("/work/beta");
     expect(acp.state.cwd).toBe("/work/beta");
     expect(window.location.pathname).toBe(sessionPath("beta-one", "/work/beta"));
+  });
+
+  it("applies versioned terminal output and release without fetching the session for each delta", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const emit = async (event: unknown) => act(async () => source.onmessage?.({ data: JSON.stringify(event) }));
+    await emit(terminalDelta({ ...terminalSnapshot({ output: "starting\n" }) }));
+    expect(acp.state.terminalSnapshots).toHaveLength(1);
+    expect(acp.state.terminalSnapshots[0].output).toBe("starting\n");
+    await emit(terminalDelta({ ...terminalSnapshot({ output: "working\n", outputAppend: true, retainedBytes: 17 }) }, 2));
+    expect(acp.state.terminalSnapshots[0].output).toBe("starting\nworking\n");
+    expect(acp.state.terminalSnapshots[0].outputAppend).toBe(false);
+    await emit(terminalDelta({ ...terminalSnapshot({
+      output: "starting\nworking\n", released: true, exitStatus: { exitCode: 0 },
+    }) }, 3));
+    expect(acp.state.terminalSnapshots[0]).toMatchObject({
+      output: "starting\nworking\n", released: true, exitStatus: { exitCode: 0 },
+    });
+    await emit({
+      type: "bridge/session_reset", bridgeEpoch: "epoch", sessionId: "alpha-one",
+      sessionIncarnation: 1, viewRevision: 4,
+    });
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(1);
+  });
+
+  it("merges raw UTF-8 fragments and trims retained output by bytes", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const emit = async (terminal: TerminalSnapshot, revision: number) => act(async () =>
+      source.onmessage?.({ data: JSON.stringify(terminalDelta({ ...terminal }, revision)) }));
+    await emit(terminalSnapshot({ output: "old🙂" }), 1);
+    await emit(terminalSnapshot({ output: "好", outputAppend: true, retainedBytes: 7 }), 2);
+    expect(acp.state.terminalSnapshots[0].output).toBe("🙂好");
+    await emit(terminalSnapshot({ output: "", outputBytes: "5A==", outputAppend: false, retainedBytes: 1 }), 3);
+    expect(acp.state.terminalSnapshots[0].output).toBe("");
+    expect(acp.state.terminalSnapshots[0].outputBytes).toBe("5A==");
+    await emit(terminalSnapshot({ output: "", outputBytes: "uK0=", outputAppend: true, retainedBytes: 3 }), 4);
+    expect(acp.state.terminalSnapshots[0].output).toBe("中");
+    expect(acp.state.terminalSnapshots[0].outputBytes).toBe("5Lit");
+    await emit(terminalSnapshot({ output: "discard", outputAppend: true, retainedBytes: 0 }), 5);
+    expect(acp.state.terminalSnapshots[0].output).toBe("");
+    expect(acp.state.terminalSnapshots[0].outputBytes).toBe("");
+    await emit(terminalSnapshot({ output: "🙂好", retainedBytes: 5, truncated: true }), 6);
+    expect(acp.state.terminalSnapshots[0].output).toBe("好");
+    expect(acp.state.terminalSnapshots[0].retainedBytes).toBe(3);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(1);
+  });
+
+  it.each([
+    { fromRevision: 3 },
+    { bridgeEpoch: "replacement" },
+    { sessionIncarnation: 2 },
+  ])("refreshes terminal state after a delta version mismatch: %j", async (mismatch) => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    const authoritative = terminalSnapshot({ output: "authoritative output", released: true });
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one"
+      ? response({ ...sessionView("alpha-one"), viewRevision: 8, terminals: { "terminal-1": authoritative } })
+      : defaultFetch(input, init));
+    await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta(
+      { ...terminalSnapshot({ output: "out of order", outputAppend: true }) }, 1, mismatch,
+    )) }));
+    expect(acp.state.terminalSnapshots).toEqual([authoritative]);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(2);
+  });
+
+  it("recovers a missing append base and resumes from authoritative snapshot bytes", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one"
+      ? response({ ...sessionView("alpha-one"), viewRevision: 2, terminals: {
+        "terminal-1": terminalSnapshot({ output: "", outputBytes: "5A==" }),
+      } })
+      : defaultFetch(input, init));
+    await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta({
+      ...terminalSnapshot({ output: "unknown suffix", outputAppend: true }),
+    })) }));
+    await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta({
+      ...terminalSnapshot({ output: "", outputBytes: "uK0=", outputAppend: true, retainedBytes: 3 }),
+    }, 2)) }));
+    expect(acp.state.terminalSnapshots[0].output).toBe("中");
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(2);
+  });
+
+  it("rejects cross-session and malformed terminal deltas without advancing the active view", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.endsWith("alpha-one/events"))!;
+    await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta({
+      ...terminalSnapshot({ output: "different active session", sessionId: "beta-one" }),
+    }, 1, { sessionId: "beta-one" })) }));
+    for (const terminal of [
+      { ...terminalSnapshot({ output: "wrong session", sessionId: "beta-one" }) },
+      { ...terminalSnapshot(), output: 9 },
+    ]) {
+      await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta(terminal)) }));
+    }
+    expect(acp.state.terminalSnapshots).toEqual([]);
+    await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta({
+      ...terminalSnapshot({ output: "accepted" }),
+    })) }));
+    expect(acp.state.terminalSnapshots[0].output).toBe("accepted");
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one")).toHaveLength(1);
   });
 
   it("tracks home, project and session navigation without selecting project sessions", async () => {

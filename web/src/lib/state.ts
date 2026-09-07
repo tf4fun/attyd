@@ -1220,6 +1220,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
           terminalSnapshots: upsertTerminalSnapshot(
             state.terminalSnapshots,
             event.terminal,
+            state.sessionSyncPhase != null,
           ),
         };
       }
@@ -1231,6 +1232,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
           terminalSnapshots: upsertTerminalSnapshot(
             cached.terminalSnapshots,
             event.terminal,
+            cached.sessionSyncPhase != null,
           ),
         }),
         event,
@@ -2801,6 +2803,7 @@ function appendBackgroundEvent(state: AppState, event: unknown): AppState {
 function upsertTerminalSnapshot(
   snapshots: TerminalSnapshot[],
   incoming: TerminalSnapshot,
+  retainHistory = false,
 ): TerminalSnapshot[] {
   const previous = snapshots.find(
     ({ terminalId }) => terminalId === incoming.terminalId,
@@ -2812,10 +2815,13 @@ function upsertTerminalSnapshot(
     ? output.slice(-incoming.retainedBytes)
     : output;
   const merged = { ...incoming, output: retainedOutput };
-  return [
+  const next = [
     ...snapshots.filter(({ terminalId }) => terminalId !== incoming.terminalId),
     merged,
-  ].slice(-64);
+  ];
+  // A materialized business view owns its history retention. Live updates must
+  // not evict terminal results that are still referenced by that history.
+  return retainHistory ? next : next.slice(-64);
 }
 
 function resolveElicitation(

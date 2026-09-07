@@ -5,7 +5,7 @@ import type {
   RequestPermissionResponse,
   SessionInfo,
 } from "@agentclientprotocol/sdk";
-import type { ServerEvent } from "../../../shared/bridge";
+import type { ServerEvent, TerminalSnapshot } from "../../../shared/bridge";
 import {
   type BridgeSessionView,
   type CreatedSessionResult,
@@ -218,6 +218,24 @@ export function useAcp() {
         current.viewRevision !== event.fromRevision
       ) {
         refreshSessionRef.current(sessionId);
+        return;
+      }
+      if (event.change.kind === "terminal_update") {
+        const incoming = event.change.terminal;
+        const previous = Object.hasOwn(current.terminals, incoming.terminalId)
+          ? current.terminals[incoming.terminalId]
+          : undefined;
+        if (incoming.outputAppend && previous == null) {
+          refreshSessionRef.current(sessionId);
+          return;
+        }
+        const terminal = mergeTerminalSnapshot(previous, incoming);
+        sessionViewRef.current = {
+          ...current,
+          viewRevision: event.viewRevision,
+          terminals: { ...current.terminals, [terminal.terminalId]: terminal },
+        };
+        dispatch({ type: "server/event", event: { type: "acp/terminal_state", terminal } });
         return;
       }
       sessionViewRef.current = { ...current, viewRevision: event.viewRevision };
@@ -822,6 +840,44 @@ export function useAcp() {
     searchWorkspaceContext,
     readWorkspaceContext,
   };
+}
+
+function mergeTerminalSnapshot(
+  previous: TerminalSnapshot | undefined,
+  incoming: TerminalSnapshot,
+): TerminalSnapshot {
+  const appended = terminalOutputBytes(incoming);
+  let bytes = appended;
+  if (incoming.outputAppend && previous != null) {
+    const prefix = terminalOutputBytes(previous);
+    bytes = new Uint8Array(prefix.length + appended.length);
+    bytes.set(prefix);
+    bytes.set(appended, prefix.length);
+  }
+  let start = incoming.retainedBytes == null ? 0 : Math.max(0, bytes.length - incoming.retainedBytes);
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+  bytes = bytes.subarray(start);
+  // Keep the original bytes: a read can end in the middle of a UTF-8 character.
+  const output = new TextDecoder().decode(bytes, {
+    stream: incoming.exitStatus == null && !incoming.released,
+  });
+  const parts: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 16_384) {
+    parts.push(String.fromCharCode(...bytes.subarray(offset, offset + 16_384)));
+  }
+  return {
+    ...incoming,
+    output,
+    outputBytes: btoa(parts.join("")),
+    outputAppend: false,
+    retainedBytes: bytes.length,
+  };
+}
+
+function terminalOutputBytes(snapshot: TerminalSnapshot): Uint8Array {
+  return snapshot.outputBytes == null
+    ? new TextEncoder().encode(snapshot.output)
+    : Uint8Array.from(atob(snapshot.outputBytes), (character) => character.charCodeAt(0));
 }
 
 function advanceSessionViewToTurnOutcome(

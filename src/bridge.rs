@@ -876,21 +876,27 @@ fn apply_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) 
     if live_session_incarnation(state, &session_id) != Some(snapshot.incarnation) {
         return false;
     }
-    if snapshot
+    let retained = if snapshot
         .value
         .get("released")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        let _ = session_mirror(state).retain_terminal_output(
-            &session_id,
-            snapshot.incarnation,
-            &terminal_id,
+        let terminal = crate::runtime_state::fold_terminal_snapshot(
+            state
+                .runtime
+                .session(&session_id)
+                .and_then(|session| session.terminals.get(&terminal_id)),
             &snapshot.value,
         );
-    }
+        session_mirror(state)
+            .retain_terminal_output(&session_id, snapshot.incarnation, &terminal_id, &terminal)
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let epoch = state.runtime.epoch().to_string();
-    state
+    let updated = state
         .runtime
         .upsert_terminal(
             &epoch,
@@ -899,7 +905,64 @@ fn apply_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) 
             terminal_id,
             snapshot.value,
         )
-        .is_ok()
+        .is_ok_and(|result| {
+            matches!(
+                result,
+                crate::runtime_state::TerminalUpsert::Inserted
+                    | crate::runtime_state::TerminalUpsert::Updated
+            )
+        });
+    retained || updated
+}
+
+fn publish_terminal_snapshot(
+    state: &mut BridgeState,
+    sink: &EventSink,
+    snapshot: TerminalSnapshot,
+) {
+    let Some(session_id) = snapshot
+        .value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let prior_revision = state
+        .session_mirror
+        .as_ref()
+        .and_then(|mirror| mirror.state(&session_id))
+        .map(|session| session.view_revision);
+    let terminal = snapshot.value.clone();
+    let incarnation = snapshot.incarnation;
+    if !apply_terminal_snapshot(state, snapshot) {
+        return;
+    }
+    flush_runtime(state, sink);
+    let Some(current_revision) = state
+        .session_mirror
+        .as_ref()
+        .and_then(|mirror| mirror.state(&session_id))
+        .map(|session| session.view_revision)
+    else {
+        return;
+    };
+    if Some(current_revision) == prior_revision {
+        if session_mirror(state)
+            .touch(&session_id, incarnation)
+            .is_err()
+        {
+            return;
+        }
+    }
+    if let Ok(delta) = session_delta_value(
+        state,
+        &session_id,
+        incarnation,
+        json!({ "kind": "terminal_update", "terminal": terminal }),
+    ) {
+        sink.send(delta);
+    }
 }
 
 fn live_session_incarnation(state: &BridgeState, session_id: &str) -> Option<u64> {
@@ -1233,9 +1296,7 @@ where
         tokio::spawn(async move {
             while let Some(snapshot) = terminal_snapshot_rx.recv().await {
                 let mut state = state.lock().await;
-                if apply_terminal_snapshot(&mut state, snapshot) {
-                    flush_runtime(&mut state, &sink);
-                }
+                publish_terminal_snapshot(&mut state, &sink, snapshot);
             }
         });
     }
@@ -1803,9 +1864,7 @@ where
                             Some(terminals) => match terminals.release_with_snapshot(request).await {
                                 Ok((response, snapshot)) => {
                                     let mut state = state.lock().await;
-                                    if apply_terminal_snapshot(&mut state, snapshot) {
-                                        flush_runtime(&mut state, &sink);
-                                    }
+                                    publish_terminal_snapshot(&mut state, &sink, snapshot);
                                     Ok(response)
                                 }
                                 Err(error) => Err(error),
@@ -7800,6 +7859,88 @@ mod tests {
                 .contains("another prompt or session mutation")
         );
         assert!(!state.lock().await.pending_attachments.contains("session"));
+    }
+
+    #[test]
+    fn terminal_business_deltas_and_replacement_view_share_the_same_output() {
+        let mut state = BridgeState::default();
+        let epoch = state.runtime.epoch().to_string();
+        let incarnation = state
+            .runtime
+            .open_new(
+                &epoch,
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        state.active_sessions.insert(
+            "session".to_string(),
+            ActiveSession {
+                cwd: PathBuf::from("/workspace"),
+                modes: None,
+                config_options: json!([]),
+                incarnation,
+            },
+        );
+        let mirror = session_mirror(&mut state);
+        mirror.register_new("session", incarnation);
+        mirror.begin_load("session", incarnation, "load").unwrap();
+        mirror
+            .append_load_update(
+                "session",
+                incarnation,
+                "load",
+                json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "run",
+                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
+                    "rawOutput": { "agent": "original" },
+                }),
+            )
+            .unwrap();
+        mirror.commit_load("session", incarnation, "load").unwrap();
+        let revision = mirror.state("session").unwrap().view_revision;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink { tx: tx.into() };
+        for (output, released) in [("hello", false), (" world", false), ("", true)] {
+            publish_terminal_snapshot(
+                &mut state,
+                &sink,
+                TerminalSnapshot {
+                    incarnation,
+                    value: json!({
+                        "sessionId": "session", "terminalId": "terminal", "output": output,
+                        "outputAppend": true, "truncated": false, "released": released,
+                        "exitStatus": if released { json!({ "exitCode": 0 }) } else { Value::Null },
+                    }),
+                },
+            );
+        }
+        let deltas = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+            .filter(|event| event["type"] == "bridge/session_delta")
+            .collect::<Vec<_>>();
+        assert_eq!(deltas.len(), 3);
+        for (index, delta) in deltas.iter().enumerate() {
+            assert_eq!(delta["fromRevision"], revision + index as u64);
+            assert_eq!(delta["viewRevision"], revision + index as u64 + 1);
+            assert_eq!(delta["change"]["kind"], "terminal_update");
+        }
+        assert!(
+            state
+                .runtime
+                .session("session")
+                .unwrap()
+                .terminals
+                .is_empty()
+        );
+        let view = session_view_value(&mut state, "session", incarnation).unwrap();
+        assert_eq!(view["terminals"]["terminal"]["output"], "hello world");
+        assert_eq!(view["terminals"]["terminal"]["exitStatus"]["exitCode"], 0);
+        assert_eq!(
+            view["baseline"]["updates"][0]["rawOutput"],
+            json!({ "agent": "original" })
+        );
     }
 
     #[test]

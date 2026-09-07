@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -149,6 +149,10 @@ pub(crate) struct SessionMirror {
     sessions: HashMap<String, MirrorSessionState>,
     history: HistoryCache,
     overlay_bytes: usize,
+    // Process-local output attached to materialized history, outside the frequently
+    // cloned runtime/control metadata and the Agent's original tool payloads.
+    retained_terminals: HashMap<SessionKey, BTreeMap<String, Value>>,
+    retained_terminal_bytes: usize,
 }
 
 impl SessionMirror {
@@ -160,6 +164,8 @@ impl SessionMirror {
             next_operation: 0,
             sessions: HashMap::new(),
             overlay_bytes: 0,
+            retained_terminals: HashMap::new(),
+            retained_terminal_bytes: 0,
         }
     }
 
@@ -390,6 +396,7 @@ impl SessionMirror {
         session.load_attempt = None;
         session.sync_error = None;
         session.view_revision = next_revision(session.view_revision);
+        self.prune_retained_terminals(&key, snapshot.updates());
         Ok(snapshot)
     }
 
@@ -546,50 +553,51 @@ impl SessionMirror {
         terminal: &Value,
     ) -> Result<bool, MirrorError> {
         let session = self.require_session(session_id, incarnation)?;
-        if !matches!(
-            session.phase,
-            MirrorPhase::Running | MirrorPhase::Reconciling
-        ) {
+        if terminal.get("released").and_then(Value::as_bool) != Some(true)
+            || terminal.get("outputAppend").and_then(Value::as_bool) == Some(true)
+        {
             return Ok(false);
         }
-        let Some(turn) = session.active_turn.as_ref() else {
-            return Ok(false);
-        };
-        let old_bytes = session.active_overlay_bytes;
-        let mut candidate = turn.clone();
-        let mut changed = false;
-        for update in &mut candidate.updates {
-            if update.get("rawOutput").is_some() || !references_terminal(update, terminal_id) {
-                continue;
-            }
-            let Some(update) = update.as_object_mut() else {
-                continue;
-            };
-            update.insert(
-                "rawOutput".to_string(),
-                serde_json::json!({
-                    "terminalId": terminal_id,
-                    "output": terminal.get("output").cloned().unwrap_or(Value::String(String::new())),
-                    "truncated": terminal.get("truncated").cloned().unwrap_or(Value::Bool(false)),
-                    "exitStatus": terminal.get("exitStatus").cloned().unwrap_or(Value::Null),
-                }),
-            );
-            changed = true;
-        }
-        if !changed {
+        let key = SessionKey::new(session_id, incarnation);
+        if self
+            .retained_terminals
+            .get(&key)
+            .is_some_and(|terminals| terminals.contains_key(terminal_id))
+        {
             return Ok(false);
         }
-        let candidate_bytes = serialized_len(&candidate);
+        let referenced = session.active_turn.as_ref().is_some_and(|turn| {
+            turn.updates
+                .iter()
+                .any(|update| references_terminal(update, terminal_id))
+        }) || self.history.peek(&key).is_some_and(|history| {
+            history
+                .updates()
+                .iter()
+                .any(|update| references_terminal(update, terminal_id))
+        });
+        if !referenced {
+            return Ok(false);
+        }
+        let retained = serde_json::json!({
+            "sessionId": session_id,
+            "terminalId": terminal_id,
+            "output": terminal.get("output").cloned().unwrap_or(Value::String(String::new())),
+            "truncated": terminal.get("truncated").cloned().unwrap_or(Value::Bool(false)),
+            "exitStatus": terminal.get("exitStatus").cloned().unwrap_or(Value::Null),
+            "released": true,
+        });
+        self.retained_terminal_bytes = self
+            .retained_terminal_bytes
+            .saturating_add(serialized_len(&retained));
+        self.retained_terminals
+            .entry(key)
+            .or_default()
+            .insert(terminal_id.to_string(), retained);
         let session = self
             .sessions
             .get_mut(session_id)
             .expect("session was validated above");
-        session.active_turn = Some(candidate);
-        session.active_overlay_bytes = candidate_bytes;
-        self.overlay_bytes = self
-            .overlay_bytes
-            .saturating_sub(old_bytes)
-            .saturating_add(candidate_bytes);
         session.view_revision = next_revision(session.view_revision);
         Ok(true)
     }
@@ -824,6 +832,7 @@ impl SessionMirror {
         Ok(serde_json::json!({
             "bridgeEpoch": self.epoch,
             "session": view.session,
+            "terminals": self.retained_terminals.get(&SessionKey::new(session_id, incarnation)).cloned().unwrap_or_default(),
             "baseline": {
                 "revision": view.baseline.revision(),
                 "updates": view.baseline.updates(),
@@ -846,8 +855,37 @@ impl SessionMirror {
                 .overlay_bytes
                 .saturating_sub(session.active_overlay_bytes);
         }
+        self.remove_retained_terminals(&SessionKey::new(session_id, incarnation));
         self.history
             .remove(&SessionKey::new(session_id, incarnation));
+    }
+
+    fn remove_retained_terminals(&mut self, key: &SessionKey) {
+        if let Some(terminals) = self.retained_terminals.remove(key) {
+            for terminal in terminals.values() {
+                self.retained_terminal_bytes = self
+                    .retained_terminal_bytes
+                    .saturating_sub(serialized_len(terminal));
+            }
+        }
+    }
+
+    fn prune_retained_terminals(&mut self, key: &SessionKey, updates: &[Value]) {
+        if let Some(terminals) = self.retained_terminals.get_mut(key) {
+            terminals.retain(|terminal_id, terminal| {
+                if updates
+                    .iter()
+                    .any(|update| references_terminal(update, terminal_id))
+                {
+                    true
+                } else {
+                    self.retained_terminal_bytes = self
+                        .retained_terminal_bytes
+                        .saturating_sub(serialized_len(terminal));
+                    false
+                }
+            });
+        }
     }
 
     fn remove_existing_session(&mut self, session_id: &str) {
@@ -855,8 +893,9 @@ impl SessionMirror {
             self.overlay_bytes = self
                 .overlay_bytes
                 .saturating_sub(previous.active_overlay_bytes);
-            self.history
-                .remove(&SessionKey::new(previous.session_id, previous.incarnation));
+            let key = SessionKey::new(previous.session_id, previous.incarnation);
+            self.remove_retained_terminals(&key);
+            self.history.remove(&key);
         }
     }
 
@@ -1310,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn released_terminal_output_is_retained_in_its_active_tool_before_commit() {
+    fn released_terminal_output_survives_commit_without_rewriting_agent_fields() {
         let mut mirror = mirror();
         mirror.register_new("session", 1);
         let revision = mirror
@@ -1337,6 +1376,7 @@ mod tests {
                     "title": "shell",
                     "status": "completed",
                     "content": [{ "type": "terminal", "terminalId": "terminal" }],
+                    "rawOutput": { "agent": "original output" },
                 }),
             )
             .unwrap();
@@ -1382,8 +1422,111 @@ mod tests {
             .iter()
             .find(|update| update["sessionUpdate"] == "tool_call")
             .unwrap();
-        assert_eq!(tool["rawOutput"]["output"], "tool output");
-        assert_eq!(tool["rawOutput"]["exitStatus"]["exitCode"], 0);
+        assert_eq!(tool["rawOutput"], json!({ "agent": "original output" }));
+        let view = mirror.view_value("session", 1).unwrap();
+        assert_eq!(view["terminals"]["terminal"]["output"], "tool output");
+        assert_eq!(view["terminals"]["terminal"]["exitStatus"]["exitCode"], 0);
+        assert_eq!(view["terminals"]["terminal"]["sessionId"], "session");
+        assert_eq!(view["terminals"]["terminal"]["terminalId"], "terminal");
+        assert!(view["session"].get("terminals").is_none());
+        assert_eq!(mirror.overlay_bytes, 0);
+    }
+
+    #[test]
+    fn terminal_released_after_its_turn_is_retained_only_for_matching_history() {
+        let mut mirror = mirror();
+        mirror.register_new("session", 1);
+        mirror.begin_load("session", 1, "history").unwrap();
+        mirror
+            .append_load_update(
+                "session",
+                1,
+                "history",
+                json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "run",
+                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
+                }),
+            )
+            .unwrap();
+        mirror.commit_load("session", 1, "history").unwrap();
+        let output = json!({ "output": "retained", "released": true });
+        assert!(
+            !mirror
+                .retain_terminal_output("session", 1, "unreferenced", &output)
+                .unwrap()
+        );
+        assert!(
+            !mirror
+                .retain_terminal_output(
+                    "session",
+                    1,
+                    "terminal",
+                    &json!({
+                        "output": "", "outputAppend": true, "released": true,
+                    })
+                )
+                .unwrap()
+        );
+        assert!(
+            mirror
+                .retain_terminal_output("session", 1, "terminal", &output)
+                .unwrap()
+        );
+        let view = mirror.view_value("session", 1).unwrap();
+        assert_eq!(view["terminals"]["terminal"]["output"], "retained");
+        assert!(view["baseline"]["updates"][0].get("rawOutput").is_none());
+        assert_eq!(view["terminals"].as_object().unwrap().len(), 1);
+
+        mirror.begin_load("session", 1, "replacement").unwrap();
+        mirror.commit_load("session", 1, "replacement").unwrap();
+        assert_eq!(
+            mirror.view_value("session", 1).unwrap()["terminals"],
+            json!({})
+        );
+        assert_eq!(mirror.retained_terminal_bytes, 0);
+    }
+
+    #[test]
+    fn retained_terminal_output_is_accounted_and_removed_with_its_incarnation() {
+        let mut mirror = mirror();
+        mirror.register_new("session", 1);
+        mirror.begin_load("session", 1, "history").unwrap();
+        mirror
+            .append_load_update(
+                "session",
+                1,
+                "history",
+                json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "run",
+                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
+                }),
+            )
+            .unwrap();
+        mirror.commit_load("session", 1, "history").unwrap();
+        mirror
+            .retain_terminal_output(
+                "session",
+                1,
+                "terminal",
+                &json!({
+                    "output": "retained", "released": true,
+                }),
+            )
+            .unwrap();
+        assert!(mirror.retained_terminal_bytes >= "retained".len());
+        mirror.remove("session", 2);
+        assert!(mirror.retained_terminal_bytes > 0);
+        mirror.register_new("session", 2);
+        assert_eq!(mirror.retained_terminal_bytes, 0);
+        assert!(mirror.retained_terminals.is_empty());
+        assert_eq!(
+            mirror.view_value("session", 2).unwrap()["terminals"],
+            json!({})
+        );
+        assert_eq!(
+            mirror.retain_terminal_output("session", 1, "terminal", &json!({})),
+            Err(MirrorError::StaleIncarnation)
+        );
     }
 
     #[test]

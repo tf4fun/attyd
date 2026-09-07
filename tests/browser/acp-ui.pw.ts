@@ -4,7 +4,7 @@ import {
   type Locator,
   type Page,
 } from "@playwright/test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
@@ -743,16 +743,20 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
     "Tool status: Completed",
   );
   await expect(tool).toHaveAttribute("data-open", "false");
-  await expect(tool.locator(":scope > .tool-card-header .tool-title strong")).toHaveText("Read");
+  await expect(tool.locator(":scope > .tool-card-header .tool-title strong")).toHaveText(
+    "Inspect workspace dependencies and generated configuration files",
+  );
+  await expect(tool.locator(":scope > .tool-card-header .tool-title strong")).toHaveAttribute(
+    "title",
+    "Inspect workspace dependencies and generated configuration files",
+  );
   await expect(
     tool.locator(":scope > .tool-card-header").getByRole("button", { name: "Tool info" }),
   ).toHaveCount(0);
   await expect(tool.locator(":scope > .tool-body")).toBeHidden();
   await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
   await expect(tool).toHaveAttribute("data-open", "true");
-  await expect(tool.locator(".tool-description")).toContainText(
-    "Inspect workspace dependencies and generated configuration files",
-  );
+  await expect(tool.locator(".tool-description")).toHaveCount(0);
   await expect(tool.locator(".tool-input")).toContainText("path");
   await expect(tool.locator(".tool-input")).toContainText("/workspace");
   await expect(tool.locator(".tool-output")).toContainText("dependencies");
@@ -823,13 +827,15 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   const userMessage = page.locator(".message-user").filter({ hasText: "activity-flow" });
   for (const width of [390, 320]) {
     await page.setViewportSize({ width, height: 844 });
+    await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
+    await expect(tool).toHaveAttribute("data-open", "false");
     await expect(tool.locator(".tool-status")).toBeVisible();
     const layout = await toolSummaryLayout(tool);
     expect(layout.title.right).toBeLessThanOrEqual(layout.actions.left);
     expect(layout.actions.right).toBeLessThanOrEqual(layout.summary.right - 7);
     expect(layout.summary.height).toBeLessThanOrEqual(40);
     expect(layout.titleLineHeight).toBeLessThanOrEqual(16);
-    expect(layout.titleOverflow).toBe(false);
+    expect(layout.titleTextOverflow).toBe("ellipsis");
     const radii = await Promise.all([
       userMessage.evaluate((element) => getComputedStyle(element).borderRadius),
       thinking.evaluate((element) => getComputedStyle(element).borderRadius),
@@ -841,6 +847,13 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
       tool.locator(":scope > .tool-card-header").evaluate((element) => element.getBoundingClientRect().height),
     ]);
     expect(Math.abs(disclosureHeights[0] - disclosureHeights[1])).toBeLessThanOrEqual(1);
+    await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
+    await expect(tool).toHaveAttribute("data-open", "true");
+    const expandedLayout = await toolSummaryLayout(tool);
+    expect(expandedLayout.title.right).toBeLessThanOrEqual(expandedLayout.actions.left);
+    expect(expandedLayout.titleLineHeight).toBeGreaterThan(16);
+    expect(expandedLayout.titleOverflow).toBe(false);
+    expect(expandedLayout.titleHeightOverflow).toBe(false);
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   }
   expect(browserErrors).toEqual([]);
@@ -874,6 +887,70 @@ test("uses one visual language for structured tool input and Markdown tool outpu
     { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)", radius: "6px" },
     { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)", radius: "6px" },
   ]);
+  expect(browserErrors).toEqual([]);
+});
+
+test("keeps wide tool tables scrollable and long resource names fully readable", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/sessions/saved-session");
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("tool-layout-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Wide tool results complete.", { exact: true })).toBeVisible();
+  const tool = page.locator(".tool-card").filter({ hasText: "Inspect wide tool results" });
+  await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
+  const markdown = tool.locator(".structured-markdown > .markdown");
+  const resource = tool.locator(".resource-card");
+  await expect(markdown.locator("thead th")).toHaveCount(20);
+  await expect(resource.locator("strong")).toHaveText("x".repeat(300));
+
+  for (const width of [1280, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    await expect(markdown).toHaveCSS("overflow-x", "auto");
+    const tableLayout = await markdown.evaluate((element) => {
+      element.scrollLeft = element.scrollWidth;
+      const lastCell = element.querySelector("tbody td:last-child")!.getBoundingClientRect();
+      const viewport = element.getBoundingClientRect();
+      return {
+        clientWidth: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+        scrollLeft: element.scrollLeft,
+        lastCellLeft: lastCell.left,
+        lastCellRight: lastCell.right,
+        viewportLeft: viewport.left,
+        viewportRight: viewport.right,
+      };
+    });
+    if (width === 320) {
+      expect(tableLayout.scrollWidth).toBeGreaterThan(tableLayout.clientWidth);
+      expect(tableLayout.scrollLeft).toBeGreaterThan(0);
+    }
+    expect(Math.abs(tableLayout.scrollLeft - (tableLayout.scrollWidth - tableLayout.clientWidth)))
+      .toBeLessThanOrEqual(1);
+    expect(tableLayout.lastCellLeft).toBeGreaterThanOrEqual(tableLayout.viewportLeft - 1);
+    expect(tableLayout.lastCellRight).toBeLessThanOrEqual(tableLayout.viewportRight + 1);
+
+    const resourceLayout = await resource.evaluate((element) => {
+      const name = element.querySelector("strong")!;
+      const text = document.createRange();
+      text.selectNodeContents(name);
+      return {
+        width: name.clientWidth,
+        contentWidth: name.scrollWidth,
+        height: name.clientHeight,
+        contentHeight: name.scrollHeight,
+        nameBottom: name.getBoundingClientRect().bottom,
+        cardBottom: element.getBoundingClientRect().bottom,
+        renderedLines: text.getClientRects().length,
+      };
+    });
+    expect(resourceLayout.contentWidth).toBeLessThanOrEqual(resourceLayout.width + 1);
+    expect(resourceLayout.contentHeight).toBeLessThanOrEqual(resourceLayout.height + 1);
+    expect(resourceLayout.nameBottom).toBeLessThanOrEqual(resourceLayout.cardBottom);
+    expect(resourceLayout.renderedLines).toBeGreaterThan(1);
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+  }
   expect(browserErrors).toEqual([]);
 });
 
@@ -1215,7 +1292,7 @@ test("searches the visible ACP Agent thread with Zed-style match navigation", as
   expect(browserErrors).toEqual([]);
 });
 
-test("searches tool output only after the default-collapsed tool is expanded", async ({ page }) => {
+test("preserves terminal content beside additional output and searches only expanded content", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");
 
@@ -1237,8 +1314,91 @@ test("searches tool output only after the default-collapsed tool is expanded", a
 
   await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
   await expect(tool).toHaveAttribute("data-open", "true");
+  const terminal = tool.locator(".terminal-embed");
+  await expect(terminal).toBeVisible();
+  await expect(terminal.locator(".terminal-heading")).toHaveText("TerminalCompleted");
+  await expect(terminal.locator("pre")).toHaveText("TERMINAL_FLOW_OUTPUT");
+  const additional = tool.locator(".tool-output details").filter({ hasText: "Additional output" });
+  await expect(additional).not.toHaveAttribute("open", "");
+  await expect(additional.locator(".structured-data")).toBeHidden();
+  await expect(search.locator("output")).toHaveText("1/1");
+  await additional.locator("summary").click();
+  await expect(additional.locator(".structured-data")).toBeVisible();
+  await expect(additional).toContainText("TERMINAL_FLOW_OUTPUT");
+  await expect(search.locator("output")).toHaveText("1/2");
+  await additional.locator("summary").click();
+  await expect(search.locator("output")).toHaveText("1/1");
+  await expect(terminal).toBeVisible();
+
+  await tool.getByRole("button", { name: "Tool info" }).click();
+  const info = tool.getByRole("region", { name: "Tool debug information" });
+  await expect(info).toBeVisible();
+  await expect(info).toContainText("Locations");
+  await expect(info).toContainText('"terminalId"');
   await expect(search.locator("output")).toHaveText("1/1");
   expect(browserErrors).toEqual([]);
+});
+
+test("keeps live terminal output across reconnect and retains released output for every observer", async ({ browser, page }) => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-live-terminal-"));
+  const gatePath = join(temporaryDirectory, "finish");
+  const browserErrors = collectBrowserErrors(page);
+  let observer: Page | undefined;
+  let observerErrors: string[] = [];
+  const cardFor = (tab: Page) => tab.locator(".tool-card").filter({ hasText: "Run live terminal fixture" });
+  const openRunningCard = async (tab: Page) => {
+    const card = cardFor(tab);
+    await expect(card).toHaveAttribute("data-tool-status", "in_progress");
+    await card.locator(":scope > .tool-card-header .tool-disclosure").click();
+    await expect(card.locator(".terminal-heading")).toHaveText("TerminalRunning");
+    await expect(card.locator(".terminal-embed pre")).toContainText("LIVE_START中😀");
+    await expect(card.locator(".terminal-embed pre")).not.toContainText("LIVE_END");
+  };
+
+  try {
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill(`terminal-live-flow ${gatePath}`);
+    await composer.press("Enter");
+    await openRunningCard(page);
+    await page.reload();
+    await openRunningCard(page);
+
+    observer = await browser.newPage();
+    observerErrors = collectBrowserErrors(observer);
+    await observer.goto(page.url());
+    await openRunningCard(observer);
+    await writeFile(gatePath, "finish");
+    for (const tab of [page, observer]) {
+      const card = cardFor(tab);
+      await expect(card).toHaveAttribute("data-tool-status", "completed");
+      await expect(card.locator(".terminal-heading")).toHaveText("TerminalCompleted");
+      await expect(card.locator(".terminal-embed pre")).toHaveText("LIVE_START中😀\nLIVE_END\n");
+      await card.getByRole("button", { name: "Tool info" }).click();
+      const terminals = card.locator(".debug-info-entry").filter({
+        has: tab.locator(".debug-info-label > span", { hasText: "Terminals" }),
+      });
+      await expect(terminals).toContainText('"released": true');
+    }
+
+    await page.reload();
+    const restored = cardFor(page);
+    await expect(restored).toHaveAttribute("data-tool-status", "completed");
+    await restored.locator(":scope > .tool-card-header .tool-disclosure").click();
+    await expect(restored.locator(".terminal-heading")).toHaveText("TerminalCompleted");
+    await expect(restored.locator(".terminal-embed pre")).toHaveText("LIVE_START中😀\nLIVE_END\n");
+    const additional = restored.locator(".tool-additional-output");
+    await expect(additional.locator(".structured-data")).toBeHidden();
+    await additional.locator("summary").click();
+    await expect(additional.locator("dt")).toHaveText(["result"]);
+    await expect(additional.locator("dd")).toHaveText(["agent-output"]);
+    expect(browserErrors).toEqual([]);
+    expect(observerErrors).toEqual([]);
+  } finally {
+    await observer?.close();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
 });
 
 test("collapses completed ACP compaction summaries into a Zed-style thread disclosure", async ({ page }) => {
@@ -2289,7 +2449,9 @@ function toolSummaryLayout(tool: Locator) {
       title: title.toJSON(),
       actions: actions.toJSON(),
       titleLineHeight: strong.height,
+      titleTextOverflow: getComputedStyle(strongElement).textOverflow,
       titleOverflow: strongElement.scrollWidth > strongElement.clientWidth,
+      titleHeightOverflow: strongElement.scrollHeight > strongElement.clientHeight,
     };
   });
 }

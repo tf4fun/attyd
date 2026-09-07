@@ -409,6 +409,7 @@ describe("browser bridge messages", () => {
         sessionId: "session",
         terminalId: "terminal",
         output: "done",
+        outputBytes: "ZG9uZQ==",
         truncated: false,
         exitStatus: { exitCode: 0, signal: null },
         released: true,
@@ -417,6 +418,15 @@ describe("browser bridge messages", () => {
       type: "acp/terminal_state",
       terminal: { terminalId: "terminal", released: true },
     });
+    for (const outputBytes of ["%%%", "a===", "abcd\n", 5, "A".repeat(1_333_336)]) {
+      expect(() => parseServerEvent(JSON.stringify({
+        type: "acp/terminal_state",
+        terminal: {
+          sessionId: "session", terminalId: "terminal", output: "", outputBytes,
+          truncated: false, released: false,
+        },
+      }))).toThrow("outputBytes");
+    }
     for (const exitCode of [-1, 0x1_0000_0000]) {
       expect(() => parseServerEvent(JSON.stringify({
         type: "acp/terminal_state",

@@ -435,6 +435,39 @@ impl CanonicalProjection {
                 turn.updates = folded;
                 session.revision = revision;
             }
+            RuntimeChange::TerminalUpdated {
+                session_id,
+                incarnation,
+                revision,
+                terminal_id,
+                terminal,
+            } => {
+                if delta.scope_revision != Some(revision) {
+                    return false;
+                }
+                let Some(session) = snapshot.sessions.get_mut(&session_id) else {
+                    return false;
+                };
+                if session.incarnation != incarnation
+                    || revision != session.revision.saturating_add(1)
+                {
+                    return false;
+                }
+                if terminal
+                    .get("released")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    session.terminals.remove(&terminal_id);
+                } else {
+                    let terminal = crate::runtime_state::fold_terminal_snapshot(
+                        session.terminals.get(&terminal_id),
+                        &terminal,
+                    );
+                    session.terminals.insert(terminal_id, terminal);
+                }
+                session.revision = revision;
+            }
             RuntimeChange::SessionRemoved {
                 session_id,
                 incarnation,
@@ -1714,6 +1747,14 @@ fn business_response(result: Result<serde_json::Value, bridge::BridgeRequestErro
 fn business_session_view(view: &serde_json::Value) -> Option<serde_json::Value> {
     let session = view.get("session")?;
     let live = view.get("live").unwrap_or(&serde_json::Value::Null);
+    let mut terminals = view
+        .get("terminals")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(live_terminals) = live.get("terminals").and_then(serde_json::Value::as_object) {
+        terminals.extend(live_terminals.clone());
+    }
     Some(json!({
         "bridgeEpoch": view.get("bridgeEpoch")?,
         "sessionId": session.get("sessionId")?,
@@ -1736,7 +1777,7 @@ fn business_session_view(view: &serde_json::Value) -> Option<serde_json::Value> 
             "urlFlows": live.get("urlFlows").cloned().unwrap_or_else(|| json!({})),
         },
         "operation": live.get("operation").cloned().unwrap_or(serde_json::Value::Null),
-        "terminals": live.get("terminals").cloned().unwrap_or_else(|| json!({})),
+        "terminals": terminals,
     }))
 }
 
@@ -2256,6 +2297,10 @@ mod tests {
                 "bytes": 42,
                 "digest": "debug-only",
             },
+            "terminals": {
+                "released": { "output": "retained", "released": true },
+                "overlap": { "output": "old", "released": true },
+            },
             "live": {
                 "cwd": "/workspace",
                 "session": { "title": "Agent session" },
@@ -2263,7 +2308,10 @@ mod tests {
                 "permissions": { "permission": { "request": {} } },
                 "elicitations": {},
                 "urlFlows": {},
-                "terminals": {},
+                "terminals": {
+                    "live": { "output": "running", "released": false },
+                    "overlap": { "output": "current", "released": false },
+                },
             },
         });
         let view = business_session_view(&internal).expect("valid internal projection");
@@ -2273,8 +2321,53 @@ mod tests {
         assert_eq!(view["turnOutcomes"][0]["operationId"], "prior-turn");
         assert_eq!(view["activeTurn"]["operationId"], "turn");
         assert_eq!(view["workspace"]["cwd"], "/workspace");
+        assert_eq!(view["terminals"]["released"]["output"], "retained");
+        assert_eq!(view["terminals"]["live"]["output"], "running");
+        assert_eq!(view["terminals"]["overlap"]["output"], "current");
         assert!(view.get("baseline").is_none());
         assert!(view.get("live").is_none());
+    }
+
+    #[test]
+    fn canonical_terminal_deltas_reconstruct_live_output_without_session_copies() {
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        let mut projection = CanonicalProjection {
+            snapshot: Some(snapshot.clone()),
+        };
+        for output in ["first", "second"] {
+            runtime
+                .upsert_terminal(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    "terminal",
+                    json!({
+                        "sessionId": "session", "terminalId": "terminal",
+                        "output": output, "outputAppend": true, "released": false,
+                    }),
+                )
+                .unwrap();
+        }
+        for delta in runtime.deltas_after(snapshot.through_seq).unwrap() {
+            assert!(projection.apply_delta(delta));
+        }
+        assert_eq!(
+            projection.snapshot.as_ref().unwrap().sessions["session"].terminals["terminal"]["output"],
+            "firstsecond"
+        );
+        assert_eq!(
+            projection.snapshot.as_ref().unwrap().sessions,
+            runtime.snapshot().sessions
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ export interface TerminalSnapshot {
   sessionId: string;
   terminalId: string;
   output: string;
+  outputBytes?: string;
   truncated: boolean;
   exitStatus?: TerminalExitStatus | null;
   released: boolean;
@@ -518,6 +519,7 @@ function validateServerEventEnvelope(
           "connection_upsert",
           "session_upsert",
           "turn_update_appended",
+          "terminal_updated",
           "session_removed",
         ],
         "bridge/runtime_delta change kind",
@@ -702,6 +704,18 @@ function validateServerEventEnvelope(
       requireStringValue(terminal.output, "acp/terminal_state output");
       if (terminal.output.length > 1_000_000) {
         throw new Error("acp/terminal_state output exceeds 1000000 characters");
+      }
+      if (terminal.outputBytes != null) {
+        requireStringValue(terminal.outputBytes, "acp/terminal_state outputBytes");
+        const encoded = terminal.outputBytes;
+        const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+        if (
+          encoded.length > 1_333_336 || encoded.length % 4 !== 0 ||
+          !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded) ||
+          encoded.length / 4 * 3 - padding > 1_000_000
+        ) {
+          throw new Error("acp/terminal_state outputBytes must be base64 within 1000000 bytes");
+        }
       }
       if (typeof terminal.truncated !== "boolean") {
         throw new Error("acp/terminal_state requires truncated");

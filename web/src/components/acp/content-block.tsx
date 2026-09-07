@@ -36,7 +36,7 @@ export function ContentBlockView({
   switch (block.type) {
     case "text":
       return (
-        <ContentBlockFrame block={block}>
+        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
           {presentation === "tool" ? (
             <div className="structured-scalar structured-markdown">
               <div className="markdown">
@@ -53,10 +53,10 @@ export function ContentBlockView({
     case "image": {
       const source = safeMediaDataUrl(block);
       if (!source) {
-        return <ContentBlockFrame block={block}><InvalidMedia kind="image" /></ContentBlockFrame>;
+        return <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}><InvalidMedia kind="image" /></ContentBlockFrame>;
       }
       return (
-        <ContentBlockFrame block={block}>
+        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
           <figure className="media-block">
             <img src={source} alt="ACP image content" />
             <figcaption>
@@ -70,10 +70,10 @@ export function ContentBlockView({
     case "audio": {
       const source = safeMediaDataUrl(block);
       if (!source) {
-        return <ContentBlockFrame block={block}><InvalidMedia kind="audio" /></ContentBlockFrame>;
+        return <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}><InvalidMedia kind="audio" /></ContentBlockFrame>;
       }
       return (
-        <ContentBlockFrame block={block}>
+        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
           <div className="resource-card audio-resource">
             <Music2 size={16} />
             <span><strong>Audio</strong><small>{block.mimeType}</small></span>
@@ -102,7 +102,7 @@ export function ContentBlockView({
       );
       const href = safeHttpUrl(block.uri);
       return (
-        <ContentBlockFrame block={block}>
+        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
           {href ? (
             <a className="resource-card" href={href} target="_blank" rel="noreferrer">
               {contents}
@@ -116,7 +116,7 @@ export function ContentBlockView({
     case "resource": {
       const resource = block.resource;
       return (
-        <ContentBlockFrame block={block}>
+        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
           <div className="embedded-resource">
             <div className="resource-heading">
               <FileText size={15} />
@@ -142,14 +142,16 @@ export function ContentBlockView({
 function ContentBlockFrame({
   block,
   children,
+  showAnnotations = true,
 }: {
   block: ContentBlock;
   children: ReactNode;
+  showAnnotations?: boolean;
 }) {
   return (
     <div className={`content-block content-block-${block.type}`}>
       {children}
-      <ContentAnnotations annotations={block.annotations} />
+      {showAnnotations ? <ContentAnnotations annotations={block.annotations} /> : null}
     </div>
   );
 }
