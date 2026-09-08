@@ -61,6 +61,7 @@ Place attyd options before `--` and the Agent command or endpoint after it.
 | `-t, --transport <transport>` | `stdio` (default), `http` (Streamable HTTP/SSE), or `ws`. |
 | `--add-dir <path>` | Additional stdio workspace root; repeatable and unavailable with remote transports. |
 | `--mcp-config <file>` | Static MCP configuration file; repeatable. |
+| `--session-unobserved-timeout <seconds>` | Close an unobserved session after this interval; defaults to `1800` (30 minutes). Any negative value disables recycling; `0` closes immediately. Requires Agent close support. |
 | `--read-only` | Disable attyd's ACP `fs/write_text_file` capability and handler. |
 | `--allowed-origin <origin>` | Allow a browser origin and its hostname for a reverse proxy or custom domain; repeatable. |
 | `--help`, `--version` | Show CLI help or the executable version. |
@@ -88,23 +89,55 @@ Existing sessions keep their Agent-owned directory when loaded or forked;
 discovery is not filtered by attyd's startup directory. A known project/session
 link can load history even when the Agent does not provide a session list.
 
-Cold history recovery requires `loadSession`. The browser does not currently
-offer a transcript-free `session/resume` flow, and its fork action requires both
-fork and load support so that the inherited history can be shown. These are
-explicit experience choices; see [difference decisions](acp-difference-decisions.md).
+Opening a cold session uses `session/load` when available, otherwise negotiated
+`session/resume`. History is best effort: Agent replay takes priority, followed by
+available memory context, then a visible missing-history notice. A successful
+empty replay remains authoritative. Resume and fork do not require load support;
+a failed history lookup after attachment does not undo a successful resume or fork.
+A branch may display a labelled source snapshot without changing the Agent's context.
 
 Projects and sessions are ordered by recent activity. Homepage search and counts
 cover loaded metadata; use **Load more** to discover additional projects.
 Project and conversation routes fetch further metadata pages as needed.
 
-Leaving a conversation does not cancel running work. Browser reconnection can
-recover the host's in-memory session state, but restarting attyd discards that
-state. Durable history and restoration support belong to the Agent.
+**Close thread** asks for confirmation, including for idle sessions: closing may
+stop Agent tasks and managed terminal processes, including development servers.
+Only a successful Agent close clears local messages and terminal output. Detached
+services can outlive the session. Settings may be sent while a prompt runs; the
+Agent decides when a changed mode or configuration takes effect.
+
+Leaving a conversation starts the unobserved-session timer. Only that session's
+SSE observers count; project/home pages do not keep it open. Returning cancels the
+timer, and leaving again starts the full interval. Output does not reset it, and
+expiry may close a running task. Newly materialized sessions with no observer also
+count; mere list entries do not. Failed or unsupported close retains the projection.
+
+```bash
+attyd --session-unobserved-timeout 600 -- your-agent acp # ten minutes
+attyd --session-unobserved-timeout -1 -- your-agent acp # manual close only
+```
+
+Browser reconnection uses the host's in-memory session state. Restarting attyd
+loses that state; durable history and restoration support belong to the Agent.
 
 attyd does not provide a persistent conversation database, an editor with unsaved
 buffers, NES/document synchronization, model-provider credential management, or
 vendor-specific tool/history interpretation. Missing historical terminal output
 is shown as unavailable; old commands are never re-executed to reconstruct it.
+
+## Files and attachments
+
+ACP file writes replace the file's contents in place. Missing files can be created,
+but parent directories must already exist. attyd does not format text, add newlines,
+retry failed writes or create directories automatically. Errors identify the path,
+stage and OS cause. A failure after mutation starts can leave partial content;
+the Agent decides how to recover. Cancellation is checked before mutation, then
+an ongoing write finishes and reports its actual result.
+
+Images and audio have previews, including embedded resources. Binary attachments
+show their name, MIME type and decoded size, with a download action for available
+bytes. Links without bytes open only on a user click; attyd does not fetch them to
+make previews. Downloads are exports, not a persistent conversation cache.
 
 ## Terminal command semantics
 

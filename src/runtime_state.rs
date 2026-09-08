@@ -1443,7 +1443,15 @@ impl RuntimeState {
         if !allowed_lifecycle {
             return Err(RuntimeStateError::SessionNotActive);
         }
-        if session.active_turn.is_some() || session.operation.is_some() {
+        if session.operation.is_some()
+            || (session.active_turn.is_some()
+                && !matches!(
+                    kind,
+                    SessionOperationKind::Close
+                        | SessionOperationKind::SetMode
+                        | SessionOperationKind::SetConfig
+                ))
+        {
             return Err(RuntimeStateError::BusySession);
         }
         session.operation = Some(SessionOperationState {
@@ -3397,6 +3405,61 @@ mod tests {
     }
 
     #[test]
+    fn controls_and_close_coexist_with_an_active_prompt() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        for kind in [
+            SessionOperationKind::SetMode,
+            SessionOperationKind::SetConfig,
+        ] {
+            state
+                .start_operation("epoch", "session", incarnation, "control", kind, "changing")
+                .unwrap();
+            assert!(state.session("session").unwrap().active_turn.is_some());
+            state
+                .fail_operation(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    "control",
+                    kind,
+                    json!({"message":"rejected"}),
+                )
+                .unwrap();
+        }
+        state
+            .start_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "close",
+                SessionOperationKind::Close,
+                "closing",
+            )
+            .unwrap();
+        state
+            .complete_prompt(
+                "epoch",
+                "session",
+                incarnation,
+                "prompt",
+                json!({"stopReason":"cancelled"}),
+            )
+            .unwrap();
+        assert_eq!(
+            state.session("session").unwrap().lifecycle,
+            SessionLifecycle::Closing
+        );
+        state
+            .close_session("epoch", "session", incarnation, "close")
+            .unwrap();
+        assert!(state.session("session").is_none());
+    }
+
+    #[test]
     fn different_sessions_progress_independently() {
         let mut state = state();
         let a = open(&mut state, "a");
@@ -3416,7 +3479,7 @@ mod tests {
                 SessionOperationKind::Close,
                 "closing",
             ),
-            Err(RuntimeStateError::BusySession),
+            Ok(()),
         );
         state
             .complete_prompt(

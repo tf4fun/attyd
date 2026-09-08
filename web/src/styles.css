@@ -1945,3 +1945,30 @@ button { color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+.history-notice {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.binary-attachment > audio { width: 100%; }
+.binary-attachment .resource-card > span { min-width: 0; flex: 1; }
+.attachment-download {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--control-surface);
+  color: var(--control-ink);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  font-size: 12px;
+}
+.attachment-download:disabled { cursor: default; opacity: 0.5; }
+.close-session-effects { color: var(--ink-soft); font-size: 13px; line-height: 1.6; }

@@ -267,15 +267,6 @@ fn opened_runtime_session_id(event: &str) -> Option<String> {
     }
 }
 
-fn terminal_session_id(event: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
-    matches!(
-        value.get("type").and_then(serde_json::Value::as_str),
-        Some("bridge/session_turn_complete" | "bridge/session_turn_failed")
-    )
-    .then(|| value.get("sessionId")?.as_str().map(str::to_string))?
-}
-
 fn is_internal_direct_event(event: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(event)
         .ok()
@@ -517,6 +508,7 @@ struct BridgeHubState {
     canonical: CanonicalProjection,
     canonical_resync_pending: bool,
     shutting_down: bool,
+    unobserved: HashMap<String, (u64, crate::auto_close::AutoClosePermit)>,
 }
 
 struct BridgeHub {
@@ -692,12 +684,98 @@ impl BridgeHub {
         })
     }
 
+    fn update_auto_close(&self, state: &mut BridgeHubState) {
+        use crate::runtime_state::SessionLifecycle;
+        let enabled = self.options.session_unobserved_timeout >= 0
+            && !state.shutting_down
+            && state.input.is_some();
+        let sessions = state
+            .canonical
+            .snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.sessions);
+        state.unobserved.retain(|id, (incarnation, permit)| {
+            let retain = enabled
+                && !state
+                    .session_subscribers
+                    .values()
+                    .any(|(observed, _)| observed == id)
+                && sessions.is_none_or(|sessions| {
+                    sessions.get(id).is_some_and(|session| {
+                        session.incarnation == *incarnation
+                            && !matches!(
+                                session.lifecycle,
+                                SessionLifecycle::Closed | SessionLifecycle::Deleting
+                            )
+                    })
+                });
+            if !retain {
+                permit.cancel();
+            }
+            retain
+        });
+        if !enabled {
+            return;
+        }
+        let Some(sessions) = sessions else {
+            return;
+        };
+        for (id, session) in sessions {
+            if session.lifecycle != SessionLifecycle::Active
+                || state.unobserved.contains_key(id)
+                || state
+                    .session_subscribers
+                    .values()
+                    .any(|(observed, _)| observed == id)
+            {
+                continue;
+            }
+            let permit = crate::auto_close::AutoClosePermit::default();
+            state
+                .unobserved
+                .insert(id.clone(), (session.incarnation, permit.clone()));
+            let input = state.input.as_ref().unwrap().clone();
+            let id = id.clone();
+            let incarnation = session.incarnation;
+            let mut remaining = self.options.session_unobserved_timeout as u64;
+            tokio::spawn(async move {
+                // Chunk very large positive values so Instant arithmetic cannot overflow.
+                while remaining > 0 {
+                    let seconds = remaining.min(86_400);
+                    tokio::select! {
+                        _ = permit.cancelled.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                    }
+                    remaining -= seconds;
+                }
+                while permit.pending() {
+                    tokio::select! {
+                        _ = permit.cancelled.cancelled() => return,
+                        result = input.send(bridge::BridgeInput::RetireUnobservedSession {
+                            session_id: id.clone(), incarnation, permit: permit.clone(),
+                        }) => { if result.is_err() { return; } }
+                    }
+                    // Loading/control transactions may still own the session. Retry
+                    // admission without resetting the completed absence interval.
+                    tokio::select! {
+                        _ = permit.cancelled.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                }
+            });
+        }
+    }
+
     async fn ensure_runtime(self: &Arc<Self>) {
         let runtime = {
             let mut state = self.state.lock().await;
             if state.shutting_down || state.input.is_some() {
                 None
             } else {
+                for (_, permit) in state.unobserved.values() {
+                    permit.cancel();
+                }
+                state.unobserved.clear();
                 state.generation = state.generation.wrapping_add(1).max(1);
                 state.bootstrap = BridgeBootstrap::default();
                 state.runtime = ActiveRuntimeProjection::default();
@@ -780,6 +858,7 @@ impl BridgeHub {
             }
             let generation = state.generation;
             state.session_subscribers.insert(id, (session_id, event_tx));
+            self.update_auto_close(&mut state);
             generation
         };
         Some(BridgeSubscription {
@@ -829,6 +908,7 @@ impl BridgeHub {
                     let public_event: Arc<str> = public_event.into();
                     publish_shared_event(&mut state, public_event);
                 }
+                self.update_auto_close(&mut state);
                 if recognized
                     && state.canonical.snapshot.is_none()
                     && !state.canonical_resync_pending
@@ -861,14 +941,13 @@ impl BridgeHub {
             return;
         }
         let restart = terminal_auth_succeeded(&event);
-        let (restart_input, idle_retire) = {
+        let restart_input = {
             let mut state = self.state.lock().await;
             if state.generation != generation || state.input.is_none() {
                 return;
             }
             state.bootstrap.update(&event);
             let event = state.runtime.update_and_normalize(&event);
-            let terminal_session_id = terminal_session_id(&event);
             let session_live_suffix = opened_runtime_session_id(&event)
                 .map(|session_id| state.runtime.replay_session_live_suffix(&session_id))
                 .unwrap_or_default()
@@ -893,24 +972,9 @@ impl BridgeHub {
             for live_event in session_live_suffix {
                 publish_to_session_subscribers(&mut state, live_event);
             }
-            let idle_retire = terminal_session_id
-                .filter(|session_id| {
-                    !state
-                        .session_subscribers
-                        .values()
-                        .any(|(subscribed_session_id, _)| subscribed_session_id == session_id)
-                })
-                .and_then(|session_id| state.input.clone().map(|input| (input, session_id)));
-            (
-                restart.then(|| state.cancellation.clone()).flatten(),
-                idle_retire,
-            )
+            self.update_auto_close(&mut state);
+            restart.then(|| state.cancellation.clone()).flatten()
         };
-        if let Some((input, session_id)) = idle_retire {
-            let _ = input
-                .send(bridge::BridgeInput::RetireIdleSession { session_id })
-                .await;
-        }
         if let Some(cancellation) = restart_input {
             cancellation.cancel();
         }
@@ -924,6 +988,7 @@ impl BridgeHub {
             }
             state.input = None;
             state.cancellation = None;
+            self.update_auto_close(&mut state);
             (
                 std::mem::take(&mut state.subscribers),
                 std::mem::take(&mut state.session_subscribers),
@@ -1061,6 +1126,7 @@ impl BridgeHub {
         if state.generation == generation {
             state.subscribers.remove(&subscriber_id);
             state.session_subscribers.remove(&subscriber_id);
+            self.update_auto_close(&mut state);
         }
     }
 
@@ -1068,6 +1134,7 @@ impl BridgeHub {
         let cancellation = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
+            self.update_auto_close(&mut state);
             // Event streams must finish before HTTP graceful draining can
             // complete, including when no Agent runtime is currently active.
             state.subscribers.clear();
@@ -1780,6 +1847,7 @@ fn business_session_view(view: &serde_json::Value) -> Option<serde_json::Value> 
         "historyRevision": session.get("historyRevision").cloned().unwrap_or(serde_json::Value::Null),
         "phase": session.get("phase")?,
         "syncError": session.get("syncError").cloned().unwrap_or(serde_json::Value::Null),
+        "historyNotice": session.get("historyNotice").cloned().unwrap_or(serde_json::Value::Null),
         "timeline": view.pointer("/baseline/updates").cloned().unwrap_or_else(|| json!([])),
         "turnOutcomes": session.get("turnOutcomes").cloned().unwrap_or_else(|| json!([])),
         "activeTurn": session.get("activeTurn").cloned().unwrap_or(serde_json::Value::Null),
@@ -2470,90 +2538,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_turn_retires_only_when_its_session_has_no_subscriber() {
-        let hub = test_hub();
+    async fn unobserved_close_cancels_on_return_and_rearms_after_disconnect() {
+        let mut options = (*test_hub().options).clone();
+        options.session_unobserved_timeout = 0;
+        let hub = BridgeHub::new(Arc::new(options));
         let (input, mut commands) = mpsc::channel(4);
+        let mut runtime = crate::runtime_state::RuntimeState::new("test", Default::default());
+        runtime
+            .open_new_with_replay(
+                "test",
+                "session",
+                "/tmp",
+                json!({"sessionId":"session"}),
+                Vec::new(),
+            )
+            .unwrap();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
             state.input = Some(input);
+            state.canonical.snapshot = Some(runtime.snapshot());
+            hub.update_auto_close(&mut state);
         }
-        let subscription = hub
-            .subscribe_session("observed".to_string())
-            .await
-            .expect("session subscription");
-        let global_subscription = hub.subscribe().await.expect("global subscription");
-
-        hub.publish(
-            1,
-            json!({
-                "type": "bridge/session_turn_complete",
-                "sessionId": "observed",
-                "operationId": "observed-turn",
-            })
-            .to_string(),
-        )
-        .await;
+        let command = commands.recv().await.unwrap();
+        let bridge::BridgeInput::RetireUnobservedSession { permit: old, .. } = command else {
+            panic!("expected close");
+        };
+        let first = hub.subscribe_session("session".into()).await.unwrap();
+        let second = hub.subscribe_session("session".into()).await.unwrap();
+        assert!(!old.claim(), "return cancels even a queued close");
+        hub.unsubscribe(first.id, first.generation).await;
+        assert!(hub.state.lock().await.unobserved.is_empty());
+        hub.unsubscribe(second.id, second.generation).await;
+        let command = commands.recv().await.unwrap();
+        let bridge::BridgeInput::RetireUnobservedSession { permit, .. } = command else {
+            panic!("expected close");
+        };
         assert!(
-            commands.try_recv().is_err(),
-            "an observed session must remain in bridge memory"
+            permit.claim(),
+            "last observer leaving starts a fresh interval"
         );
+        hub.shutdown().await;
+    }
 
-        hub.publish(
-            1,
-            json!({
-                "type": "bridge/session_turn_failed",
-                "sessionId": "observed",
-                "operationId": "observed-failed-turn",
-            })
-            .to_string(),
-        )
-        .await;
-        assert!(
-            commands.try_recv().is_err(),
-            "an observed session must remain available after a failed turn"
-        );
+    async fn timer_hub(timeout: i64) -> (Arc<BridgeHub>, mpsc::Receiver<bridge::BridgeInput>) {
+        let mut options = (*test_hub().options).clone();
+        options.session_unobserved_timeout = timeout;
+        let hub = BridgeHub::new(Arc::new(options));
+        let (input, commands) = mpsc::channel(32);
+        let mut runtime = crate::runtime_state::RuntimeState::new("test", Default::default());
+        runtime
+            .open_new_with_replay(
+                "test",
+                "session",
+                "/tmp",
+                json!({"sessionId":"session"}),
+                vec![],
+            )
+            .unwrap();
+        let mut state = hub.state.lock().await;
+        state.generation = 1;
+        state.input = Some(input);
+        state.canonical.snapshot = Some(runtime.snapshot());
+        hub.update_auto_close(&mut state);
+        drop(state);
+        tokio::task::yield_now().await;
+        (hub, commands)
+    }
 
-        hub.publish(
-            1,
-            json!({
-                "type": "bridge/session_turn_complete",
-                "sessionId": "unobserved",
-                "operationId": "unobserved-turn",
-            })
-            .to_string(),
-        )
-        .await;
-        assert!(matches!(
-            commands.recv().await,
-            Some(bridge::BridgeInput::RetireIdleSession { session_id })
-                if session_id == "unobserved"
-        ));
+    #[tokio::test(start_paused = true)]
+    async fn unobserved_timeout_measures_absence_not_output_and_global_observers_do_not_count() {
+        let (hub, mut commands) = timer_hub(30).await;
+        let global = hub.subscribe().await.unwrap();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        hub.publish(1, json!({"type":"acp/session_update","sessionId":"session", "update": {"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"output"}}}).to_string()).await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(commands.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let bridge::BridgeInput::RetireUnobservedSession { permit, .. } =
+            commands.try_recv().unwrap()
+        else {
+            panic!("expected timer close");
+        };
+        assert!(permit.claim());
+        hub.unsubscribe(global.id, global.generation).await;
+        hub.shutdown().await;
+    }
 
-        hub.publish(
-            1,
-            json!({
-                "type": "bridge/session_turn_failed",
-                "sessionId": "failed-unobserved",
-                "operationId": "failed-turn",
-            })
-            .to_string(),
-        )
-        .await;
-        assert!(matches!(
-            commands.recv().await,
-            Some(bridge::BridgeInput::RetireIdleSession { session_id })
-                if session_id == "failed-unobserved"
-        ));
+    #[tokio::test(start_paused = true)]
+    async fn observer_return_restarts_the_full_timeout_and_shutdown_cancels_it() {
+        let (hub, mut commands) = timer_hub(30).await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let observer = hub.subscribe_session("session".into()).await.unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(commands.try_recv().is_err());
+        hub.unsubscribe(observer.id, observer.generation).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(commands.try_recv().is_err());
+        hub.shutdown().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(commands.try_recv().is_err());
+    }
 
-        hub.unsubscribe(subscription.id, subscription.generation)
-            .await;
-        assert!(
-            commands.try_recv().is_err(),
-            "disconnecting after completion must not retroactively retire the session"
-        );
-        hub.unsubscribe(global_subscription.id, global_subscription.generation)
-            .await;
+    #[tokio::test(start_paused = true)]
+    async fn negative_timeouts_disable_recycling_and_huge_values_do_not_overflow() {
+        for timeout in [i64::MIN, -2, -1, i64::MAX] {
+            let (hub, mut commands) = timer_hub(timeout).await;
+            tokio::time::advance(Duration::from_secs(1_000_000)).await;
+            tokio::task::yield_now().await;
+            assert!(commands.try_recv().is_err());
+            hub.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn changed_incarnation_invalidates_a_queued_timer() {
+        let (hub, mut commands) = timer_hub(0).await;
+        let bridge::BridgeInput::RetireUnobservedSession {
+            permit: old,
+            incarnation,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected close");
+        };
+        {
+            let mut state = hub.state.lock().await;
+            state
+                .canonical
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .sessions
+                .get_mut("session")
+                .unwrap()
+                .incarnation += 1;
+            hub.update_auto_close(&mut state);
+        }
+        assert!(!old.claim());
+        tokio::task::yield_now().await;
+        let bridge::BridgeInput::RetireUnobservedSession {
+            permit,
+            incarnation: next,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected new timer");
+        };
+        assert_eq!(next, incarnation + 1);
+        assert!(permit.claim());
+        hub.shutdown().await;
     }
 
     #[test]
@@ -2814,13 +2953,21 @@ mod tests {
     }
 
     async fn capability_fixture(flags: &[&str]) -> (Arc<BridgeHub>, BridgeSubscription) {
+        capability_fixture_with_timeout(flags, 1800).await
+    }
+
+    async fn capability_fixture_with_timeout(
+        flags: &[&str],
+        timeout: i64,
+    ) -> (Arc<BridgeHub>, BridgeSubscription) {
         let cwd = env!("CARGO_MANIFEST_DIR");
         let fixture = format!("{cwd}/tests/fixtures/session-capabilities-agent.ts");
         let mut args = vec![
             "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
         ];
         args.extend_from_slice(flags);
-        let options = Options::try_parse_from(args).unwrap().normalized().unwrap();
+        let mut options = Options::try_parse_from(args).unwrap().normalized().unwrap();
+        options.session_unobserved_timeout = timeout;
         let hub = BridgeHub::new(Arc::new(options));
         let mut observer = hub.subscribe().await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -2970,35 +3117,291 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_session_fork_rejects_missing_history_before_agent_dispatch() {
+    async fn resume_and_fork_work_without_history_loading() {
         let (hub, observer) = capability_fixture(&["--no-load"]).await;
         hub.business_request(json!({ "type": "session/new", "requestId": "new" }))
             .await
             .unwrap();
-        let error = hub
+        let fork = hub
             .business_request(json!({
                 "type": "session/fork", "requestId": "fork", "sessionId": "created",
             }))
             .await
-            .unwrap_err();
-        assert!(error.message.contains("history loading"), "{error:?}");
-        let error = hub
-            .business_request(json!({
-                "type": "session/resume", "requestId": "resume", "sessionId": "saved",
-                "cwd": env!("CARGO_MANIFEST_DIR"),
-            }))
-            .await
-            .unwrap_err();
-        assert!(error.message.contains("history loading"), "{error:?}");
-        let listed = hub
-            .business_request(json!({ "type": "session/list", "requestId": "list" }))
+            .expect("fork capability is independent of load");
+        assert_eq!(fork["sessionId"], "forked");
+        assert_eq!(fork["view"]["session"]["phase"], "ready");
+        assert!(
+            fork["view"]["session"]["historyNotice"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable")
+        );
+        hub.business_request(json!({ "type": "session/list", "requestId": "list" }))
             .await
             .unwrap();
-        assert_eq!(listed["_meta"]["forks"], 0);
-        assert_eq!(listed["_meta"]["resumes"], 0);
+        let resumed = hub
+            .session_view("saved".into())
+            .await
+            .expect("cold observation uses resume when load is absent");
+        assert_eq!(resumed["session"]["phase"], "ready");
+        assert!(resumed["session"]["historyNotice"].is_string());
+        let listed = hub
+            .business_request(json!({ "type": "session/list", "requestId": "counts" }))
+            .await
+            .unwrap();
+        assert_eq!(listed["_meta"]["forks"], 1);
+        assert_eq!(listed["_meta"]["resumes"], 1);
         assert_eq!(listed["_meta"]["loads"], 0);
+        let revision = resumed["session"]["historyRevision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        hub.start_turn(
+            "saved".into(),
+            revision,
+            "continue".into(),
+            vec![json!({"type":"text","text":"Continue"})],
+        )
+        .await
+        .expect("missing earlier history must not block prompting");
         hub.unsubscribe(observer.id, observer.generation).await;
         hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fork_history_failure_uses_source_cache_and_empty_success_is_authoritative() {
+        for empty in [false, true] {
+            let flags = if empty {
+                vec!["--empty-fork-history"]
+            } else {
+                vec![]
+            };
+            let (hub, observer) = capability_fixture(&flags).await;
+            hub.business_request(json!({ "type": "session/list", "requestId": "list" }))
+                .await
+                .unwrap();
+            let source = hub.session_view("saved".into()).await.unwrap();
+            let fork = hub
+                .business_request(json!({
+                    "type": "session/fork", "requestId": "fork", "sessionId": "saved",
+                }))
+                .await
+                .expect("a successful fork survives a failed history load");
+            assert_eq!(fork["sessionId"], "forked");
+            assert_eq!(fork["view"]["session"]["phase"], "ready");
+            if empty {
+                assert_eq!(fork["view"]["baseline"]["updates"], json!([]));
+                assert!(fork["view"]["session"]["historyNotice"].is_null());
+            } else {
+                assert_eq!(
+                    fork["view"]["baseline"]["updates"],
+                    source["baseline"]["updates"]
+                );
+                assert!(
+                    fork["view"]["session"]["historyNotice"]
+                        .as_str()
+                        .unwrap()
+                        .contains("source session")
+                );
+            }
+            for _ in 0..2 {
+                hub.session_view("forked".into()).await.unwrap();
+            }
+            let counts = hub
+                .business_request(json!({ "type": "session/list", "requestId": "counts" }))
+                .await
+                .unwrap();
+            assert_eq!(
+                counts["_meta"]["forks"], 1,
+                "view refresh must not fork again"
+            );
+            assert_eq!(
+                counts["_meta"]["loads"], 2,
+                "view refresh reuses materialized memory"
+            );
+            hub.unsubscribe(observer.id, observer.generation).await;
+            hub.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn active_prompt_controls_and_close_preserve_a_reopened_incarnation() {
+        let (hub, observer) = capability_fixture(&["--no-load", "--close"]).await;
+        let created = hub
+            .business_request(json!({"type":"session/new", "requestId":"new"}))
+            .await
+            .unwrap();
+        let initial = created["view"]["session"]["incarnation"].as_u64().unwrap();
+        hub.start_turn(
+            "created".into(),
+            created["view"]["session"]["historyRevision"]
+                .as_str()
+                .unwrap()
+                .into(),
+            "old-turn".into(),
+            vec![json!({"type":"text","text":"wait-close"})],
+        )
+        .await
+        .unwrap();
+        // Both controls are sent without cancelling or redispatching the prompt.
+        hub.business_request(json!({"type":"session/set_mode", "requestId":"mode", "sessionId":"created", "modeId":"plan"})).await.unwrap();
+        hub.business_request(json!({"type":"session/set_config_option", "requestId":"config", "sessionId":"created", "configId":"verbose", "value":true})).await.unwrap();
+        assert_eq!(
+            hub.session_view("created".into()).await.unwrap()["session"]["phase"],
+            "running"
+        );
+        hub.business_request(
+            json!({"type":"session/close", "requestId":"close", "sessionId":"created"}),
+        )
+        .await
+        .unwrap();
+        hub.business_request(json!({"type":"session/resume", "requestId":"resume", "sessionId":"created", "cwd":env!("CARGO_MANIFEST_DIR")})).await.unwrap();
+        let reopened = hub.session_view("created".into()).await.unwrap();
+        assert!(reopened["session"]["incarnation"].as_u64().unwrap() > initial);
+        hub.start_turn(
+            "created".into(),
+            reopened["session"]["historyRevision"]
+                .as_str()
+                .unwrap()
+                .into(),
+            "new-turn".into(),
+            vec![json!({"type":"text","text":"wait-close"})],
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let current = hub.session_view("created".into()).await.unwrap();
+        assert_eq!(
+            current["session"]["phase"], "running",
+            "late old response must not finish the new turn"
+        );
+        assert_eq!(
+            current["session"]["activeTurn"]["clientIntentId"],
+            "new-turn"
+        );
+        let counts = hub
+            .business_request(json!({"type":"session/list", "requestId":"counts"}))
+            .await
+            .unwrap();
+        assert_eq!(counts["_meta"]["prompts"], 2);
+        assert_eq!(counts["_meta"]["controls"], 2);
+        assert_eq!(counts["_meta"]["closes"], 1);
+        hub.business_request(
+            json!({"type":"session/close", "requestId":"close-new", "sessionId":"created"}),
+        )
+        .await
+        .unwrap();
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn close_refusal_keeps_running_turn_and_cached_messages() {
+        let (hub, observer) = capability_fixture(&["--close", "--fail-close"]).await;
+        let created = hub
+            .business_request(json!({"type":"session/new", "requestId":"new"}))
+            .await
+            .unwrap();
+        hub.start_turn(
+            "created".into(),
+            created["view"]["session"]["historyRevision"]
+                .as_str()
+                .unwrap()
+                .into(),
+            "turn".into(),
+            vec![json!({"type":"text","text":"wait-close"})],
+        )
+        .await
+        .unwrap();
+        let error = hub
+            .business_request(
+                json!({"type":"session/close", "requestId":"close", "sessionId":"created"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("Close refused"));
+        let current = hub.session_view("created".into()).await.unwrap();
+        assert_eq!(current["session"]["phase"], "running");
+        assert_eq!(current["session"]["activeTurn"]["clientIntentId"], "turn");
+        assert!(current["live"]["operation"].is_null());
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn expired_unobserved_timer_closes_running_work_and_does_not_retry_refusal() {
+        for refused in [false, true] {
+            let flags = if refused {
+                vec!["--close", "--fail-close"]
+            } else {
+                vec!["--close"]
+            };
+            let (hub, observer) = capability_fixture_with_timeout(&flags, 0).await;
+            // Observe before creation so zero means exactly the subsequent disconnect.
+            let session_stream = hub.subscribe_session("created".into()).await.unwrap();
+            let created = hub
+                .business_request(json!({"type":"session/new", "requestId":"new"}))
+                .await
+                .unwrap();
+            hub.start_turn(
+                "created".into(),
+                created["view"]["session"]["historyRevision"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                "turn".into(),
+                vec![json!({"type":"text","text":"wait-close"})],
+            )
+            .await
+            .unwrap();
+            hub.unsubscribe(session_stream.id, session_stream.generation)
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let counts = hub
+                        .business_request(json!({"type":"session/list", "requestId":"count"}))
+                        .await
+                        .unwrap();
+                    if counts["_meta"]["closes"] == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("expiry must not wait for the running prompt to finish");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let counts = hub
+                .business_request(json!({"type":"session/list", "requestId":"later-count"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                counts["_meta"]["closes"], 1,
+                "a dispatched close is not repeated automatically"
+            );
+            assert_eq!(counts["_meta"]["prompts"], 1);
+            let lifecycle = hub
+                .state
+                .lock()
+                .await
+                .canonical
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .sessions
+                .get("created")
+                .map(|session| session.lifecycle.clone());
+            assert_eq!(
+                lifecycle,
+                if refused {
+                    Some(crate::runtime_state::SessionLifecycle::Active)
+                } else {
+                    None
+                }
+            );
+            hub.unsubscribe(observer.id, observer.generation).await;
+            hub.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -3379,7 +3782,16 @@ mod tests {
         let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
         let fixture = fixture.to_string_lossy().into_owned();
         let options = Options::try_parse_from([
-            "attyd", "--cwd", cwd, "--", "node", "--import", "tsx", &fixture,
+            "attyd",
+            "--session-unobserved-timeout",
+            "2",
+            "--cwd",
+            cwd,
+            "--",
+            "node",
+            "--import",
+            "tsx",
+            &fixture,
         ])
         .unwrap()
         .normalized()

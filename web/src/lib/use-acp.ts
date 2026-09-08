@@ -626,7 +626,7 @@ export function useAcp() {
 
   const setMode = useCallback((modeId: string) => {
     const sessionId = activeSessionIdRef.current;
-    if (sessionId == null || sessionViewRef.current?.phase !== "ready") return;
+    if (sessionId == null || !["ready", "running", "reconciling"].includes(sessionViewRef.current?.phase ?? "")) return;
     const requestId = randomId();
     dispatch({ type: "session/control_start", kind: "mode", requestId, sessionId });
     void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/mode`, {
@@ -639,7 +639,7 @@ export function useAcp() {
 
   const setConfig = useCallback((configId: string, value: string | boolean) => {
     const sessionId = activeSessionIdRef.current;
-    if (sessionId == null || sessionViewRef.current?.phase !== "ready") return;
+    if (sessionId == null || !["ready", "running", "reconciling"].includes(sessionViewRef.current?.phase ?? "")) return;
     const requestId = randomId();
     dispatch({ type: "session/control_start", kind: "config", requestId, sessionId });
     void requestJson(
@@ -765,7 +765,7 @@ export function useAcp() {
 
   const closeSession = useCallback(() => {
     const sessionId = activeSessionIdRef.current;
-    if (sessionId == null || stateRef.current.running) return;
+    if (sessionId == null || stateRef.current.sessionTransition || stateRef.current.pendingSessionControl || stateRef.current.runtimeOperation) return;
     const requestId = randomId();
     dispatch({ type: "session/transition_start", kind: "close", requestId, sessionId });
     void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/close`, {
@@ -779,10 +779,6 @@ export function useAcp() {
   const forkSession = useCallback(() => {
     const sessionId = activeSessionIdRef.current;
     if (sessionId == null || stateRef.current.running) return;
-    if (stateRef.current.initialized?.agentCapabilities?.loadSession !== true) {
-      reportError(new Error("Forking requires Agent history loading in this client."));
-      return;
-    }
     const navigation = ++navigationRef.current;
     const requestId = randomId();
     dispatch({ type: "session/transition_start", kind: "fork", requestId, sessionId });

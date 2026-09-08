@@ -24,7 +24,9 @@ the Agent. No browser state, local database, temporary file or mmap file is a re
 
 ## Agent compatibility profile
 
-`loadSession` is used to cold-materialize an existing session, but it is not required for a newly
+`loadSession` is preferred for cold materialization. Without it, negotiated resume can open
+the session with available memory context or an explicit missing-history notice. History loading
+is independent of successful resume/fork attachment. It is not required for a newly
 created, continuously materialized session. The bridge deliberately performs no post-turn load.
 It atomically promotes the exact accepted prompt plus observed turn updates into its in-memory
 baseline for every Agent, including Agents that advertise load.
@@ -40,11 +42,12 @@ cold-materialize old history or recover it after bridge restart. The bridge does
 database, browser-backed history, temporary persistence or a private protocol extension to hide
 that ACP limitation.
 
-When a terminal turn is committed with no subscriber for that session, the bridge performs a
-capability-gated `session/close` and drops its projection. Its next observer starts a fresh
-materialization from the Agent. If close is unavailable or fails, the bridge keeps the projection
-in memory. This avoids repeatedly loading an already-open session while still returning to Agent
-authority at a natural idle boundary.
+Unobserved materialized sessions use `--session-unobserved-timeout`: default 1800 seconds,
+any negative value disables recycling, zero attempts immediate close. Only session-specific
+observers count. Return cancels the queued timer; renewed absence starts a full interval.
+Agent output and turn completion never reset it. Expiry can close a running task when negotiated.
+Unsupported or failed close keeps the projection; successful close releases it. Timers check the
+incarnation and cancellable admission so a returning observer or reopened ID defeats a stale task.
 
 While a session is materialized by a bridge, that bridge is assumed to be its only writer. ACP v1
 provides no revision or lease that can prevent a different ACP client from concurrently appending to
@@ -76,8 +79,8 @@ Browser
 ```
 
 The baseline is a process-local projection, not a second persistent authority. It begins with an
-Agent load or an empty newly created session and is then derived only from prompts accepted by this
-bridge and ACP updates it directly observed. It is never persisted. Releasing a projection requires
+Agent load, a labelled attachment fallback, or an empty new session, then extends with accepted
+prompts and observed ACP updates. It is never persisted. Releasing a projection requires
 a successful upstream close when available; cold recovery then returns to the Agent's replay.
 
 ## Session state machine
@@ -99,7 +102,7 @@ Reconciling(Bn + completed overlay) --------+
   | atomic local overlay promotion
   v
 Ready(Bn+1, Hn+1)
-  | terminal turn committed without a session subscriber
+  | configured observer-absence deadline (also applies while Running)
   v
 Closing -- successful session/close --> Cold / released
 ```
@@ -124,8 +127,12 @@ visible `Blocked` states rather than hot retry loops. If the Agent returns `Reso
 during initial materialization, the bridge discards that failed candidate and stale list entry,
 returns HTTP 404 and lets the browser return home. It does not retain a blocked phantom session.
 
-If the Agent does not advertise load, a Cold historical session cannot be materialized. This does
-not affect a new or already materialized no-load session whose baseline is still in bridge memory.
+Without load, negotiated resume can materialize the session independently of its earlier history.
+Any context received during resume is retained with a notice; otherwise the UI explicitly marks
+earlier messages unavailable. Fork follows the same policy and may use a labelled snapshot of its
+source. If optional load fails after resume/fork succeeds, the attached ID stays usable; refresh
+never repeats fork. Successful empty Agent replay replaces cached context. No cached messages are
+sent back to the Agent or synchronized from the source after forking.
 
 ### Turn admission and idempotency
 
@@ -186,12 +193,14 @@ exposes `Blocked`; success advances the opaque revision/idempotency ledger, reco
 an empty or textually identical result advances the revision so the consumed append slot cannot be
 reused.
 
-After the completion event is delivered, the Hub checks session-specific subscribers. With at
-least one subscriber, the Ready projection remains in memory and accepts the next turn. With none,
-it requests `session/close`; the running turn was never cancelled merely because its subscriber
-left. A successful close drops the baseline, completion boundaries, overlay metadata and live
-resources. A later observer therefore follows the normal Cold load path and receives a fresh
-Agent-authoritative replay without historical completion markers.
+Completion commits history without changing the observation deadline. Manual close asks the user
+to confirm task, managed process and cache effects. The unobserved timer can also request close
+while a prompt runs. Success drops baseline, outcomes, overlay and live resources; failure keeps
+recoverable state. A later observation loads Agent history or resumes with best-effort context.
+Late prompt responses from a closed incarnation cannot mutate a newly opened one with the same ID.
+
+Mode/config controls can coexist with one prompt; the Agent decides when settings take effect.
+Competing control and lifecycle transactions remain serialized. No implicit cancel/reissue occurs.
 
 ## Live resources
 
@@ -230,10 +239,11 @@ the bridge does not infer that context window or reinterpret it as an ACP admiss
 sizing and session lifecycle remain deployment/user concerns unless a future ACP capability makes
 them explicit.
 
-The current implementation releases baselines and candidates on close, delete and bridge shutdown.
-It also closes and releases a Ready session immediately after terminal turn commit when that
-session has no subscriber. `Loading`, `Running`, `Reconciling`, observed and interaction-bearing
-sessions remain pinned; there is no pressure-based or timer-based eviction policy.
+Baselines and candidates are released on close, delete and bridge shutdown. Observation-based
+recycling uses the configured timeout, including for never-observed materialized sessions;
+list-only records do not start timers. No cumulative history clipping or memory-pressure eviction
+is introduced. Busy attachment/control transactions defer close admission without restarting the
+deadline. A refused/uncertain dispatched close is not retried automatically within that interval.
 
 ## Browser API direction
 
@@ -271,8 +281,8 @@ surface never owns ACP lifecycle semantics, history folding or reconnect decisio
 - **H11 Live-resource independence:** baseline replacement cannot retire unrelated live resources.
 - **H12 Faithful retention:** baseline, overlay and candidate are byte-accounted but have no
   bridge-defined cumulative admission cap.
-- **H13 Idle release:** only a terminal commit with no session subscriber schedules close and
-  release; running work is never closed because observers disconnect.
+- **H13 Unobserved release:** only continuous session-specific absence schedules automatic close;
+  return cancels admission, incarnation changes invalidate it, and expiry can close running work.
 - **H14 Honest uncertainty:** lost non-idempotent outcomes are never blindly redispatched.
 - **H15 No persistence:** bridge history state disappears with the bridge process.
 

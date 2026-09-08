@@ -984,8 +984,8 @@ describe("ACP UI state", () => {
       },
     }));
     expect(state.configOptions).toHaveLength(2);
-    expect(state.configOptions[0]).toMatchObject({ id: "verbose", currentValue: false });
-    expect(state.configOptions[1]).toMatchObject({ id: "model", currentValue: "agent-default" });
+    expect(state.configOptions![0]).toMatchObject({ id: "verbose", currentValue: false });
+    expect(state.configOptions![1]).toMatchObject({ id: "model", currentValue: "agent-default" });
   });
 
   it("accepts Bridge-owned lifecycle events while isolating unmatched controls", () => {
@@ -1052,7 +1052,7 @@ describe("ACP UI state", () => {
     );
     expect(isolated.session).toBeUndefined();
     expect(isolated.modeId).toBeUndefined();
-    expect(isolated.configOptions).toEqual([]);
+    expect(isolated.configOptions).toBeNull();
     expect(isolated.sessions.map(({ sessionId }) => sessionId).sort())
       .toEqual(["created", "forked"]);
     expect(isolated.cachedSessions.has("created")).toBe(true);

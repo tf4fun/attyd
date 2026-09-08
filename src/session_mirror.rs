@@ -54,6 +54,8 @@ pub(crate) struct MirrorSessionState {
     pub active_turn: Option<TurnOverlay>,
     pub turn_outcomes: Vec<CompletedTurnOutcome>,
     pub sync_error: Option<String>,
+    #[serde(default)]
+    pub history_notice: Option<String>,
     #[serde(skip)]
     active_payload_digest: Option<[u8; 32]>,
     #[serde(skip)]
@@ -186,6 +188,7 @@ impl SessionMirror {
                 active_turn: None,
                 turn_outcomes: Vec::new(),
                 sync_error: None,
+                history_notice: None,
                 active_payload_digest: None,
                 recent_consumptions: VecDeque::new(),
                 consumed_intents: ConsumedIntentFilter::default(),
@@ -211,6 +214,7 @@ impl SessionMirror {
                 active_turn: None,
                 turn_outcomes: Vec::new(),
                 sync_error: None,
+                history_notice: None,
                 active_payload_digest: None,
                 recent_consumptions: VecDeque::new(),
                 consumed_intents: ConsumedIntentFilter::default(),
@@ -366,6 +370,7 @@ impl SessionMirror {
             // A fresh authoritative replay has no historical PromptResponse data.
             // Do not retain outcome offsets from the baseline it replaced.
             session.turn_outcomes.clear();
+            session.history_notice = None;
         } else if let Some(mut outcome) = completed_outcome {
             outcome.after_update = after_update;
             session.turn_outcomes.push(outcome);
@@ -398,6 +403,41 @@ impl SessionMirror {
         session.view_revision = next_revision(session.view_revision);
         self.prune_retained_terminals(&key, snapshot.updates());
         Ok(snapshot)
+    }
+
+    // Resume notifications are useful context, but do not promise a full replay.
+    pub(crate) fn commit_attachment_cache(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        attempt_id: &str,
+    ) -> Result<Arc<HistorySnapshot>, MirrorError> {
+        let snapshot = self.commit_load(session_id, incarnation, attempt_id)?;
+        self.require_session_mut(session_id, incarnation)?.phase = MirrorPhase::Cold;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn use_cached_history(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        updates: &[Value],
+        notice: String,
+    ) -> Result<(), MirrorError> {
+        let session = self.require_session_mut(session_id, incarnation)?;
+        if session.active_turn.is_some() || session.load_attempt.is_some() {
+            return Err(MirrorError::WrongPhase);
+        }
+        session.phase = MirrorPhase::Cold;
+        let attempt = "bridge-cache-fallback";
+        self.begin_load(session_id, incarnation, attempt)?;
+        for update in updates {
+            self.append_load_update(session_id, incarnation, attempt, update.clone())?;
+        }
+        self.commit_load(session_id, incarnation, attempt)?;
+        self.require_session_mut(session_id, incarnation)?
+            .history_notice = Some(notice);
+        Ok(())
     }
 
     pub(crate) fn fail_load(

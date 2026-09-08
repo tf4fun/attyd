@@ -73,6 +73,11 @@ pub struct Options {
     #[arg(long)]
     pub read_only: bool,
 
+    /// Close sessions after this many unobserved seconds: negative disables, zero closes immediately.
+    /// Closing may stop Agent tasks and managed terminals; history recovery depends on the Agent.
+    #[arg(long, default_value_t = 1800, allow_negative_numbers = true)]
+    pub session_unobserved_timeout: i64,
+
     /// Agent command for stdio, or one endpoint URL for a remote transport.
     pub command: Vec<String>,
 }
@@ -179,6 +184,32 @@ fn absolute_or_resolve(value: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_all_signed_unobserved_timeout_policies() {
+        for seconds in [
+            "-9223372036854775808",
+            "-42",
+            "-1",
+            "0",
+            "1800",
+            "9223372036854775807",
+        ] {
+            let options = Options::try_parse_from([
+                "attyd",
+                "--session-unobserved-timeout",
+                seconds,
+                "--",
+                "agent",
+            ])
+            .unwrap();
+            assert_eq!(
+                options.session_unobserved_timeout,
+                seconds.parse::<i64>().unwrap()
+            );
+            assert_eq!(options.command, ["agent"]);
+        }
+    }
 
     #[test]
     fn keeps_the_existing_cli_surface() {

@@ -356,7 +356,7 @@ describe("ACP UI component contract", () => {
     expect(html).toContain("Intended for assistant");
     expect(html).not.toContain('href="file:///workspace/README.md"');
     expect(html).toContain("Embedded note");
-    expect(html).toContain("Invalid ACP image content");
+    expect(html).toContain("Invalid attachment data");
     expect(html).not.toContain("not-base64");
   });
 

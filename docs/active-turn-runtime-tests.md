@@ -71,9 +71,9 @@ alone are not correctness evidence.
 - `second_turn_preserves_the_first_turn_baseline`
 - `rejected_local_promotion_preserves_baseline_and_completed_overlay`
 - `observed_completion_keeps_the_session_in_memory`
-- `subscriber_loss_while_running_does_not_close_or_cancel`
-- `unobserved_completion_closes_then_next_observer_cold_loads`
-- `idle_close_failure_keeps_the_in_memory_projection`
+- `observer_return_restarts_the_full_timeout_and_shutdown_cancels_it`
+- `session_subscriber_disconnect_keeps_running_turn_then_reloads_after_idle_close`
+- `close_refusal_keeps_running_turn_and_cached_messages`
 
 ### Live resources
 
@@ -92,7 +92,7 @@ alone are not correctness evidence.
 - `candidate_growth_is_accounted_without_admission_rejection`
 - `large_protocol_valid_history_is_not_rejected_by_cache_accounting`
 - `large_protocol_valid_active_overlay_is_not_rejected`
-- `unobserved_completion_releases_baseline_after_successful_close`
+- `unobserved_timeout_measures_absence_not_output_and_global_observers_do_not_count`
 - `observed_running_reconciling_and_live_resource_sessions_are_pinned`
 - `released_session_next_observer_starts_one_load`
 - `close_delete_and_shutdown_release_cache_candidate_and_retry_task`
@@ -186,3 +186,15 @@ zero-history assertion, and queued-prompt automatic dispatch must be replaced by
 7. Old requester-private load, active-only cache and Bridge-owned queued-prompt paths are deleted;
    the browser-local send queue remains.
 8. Full Rust, TypeScript, browser, smoke and bounded soak suites pass.
+
+## Confirmed tradeoff regressions
+
+- `resume_and_fork_work_without_history_loading`: no load request, one fork/resume, usable prompts.
+- `fork_history_failure_uses_source_cache_and_empty_success_is_authoritative`: explicit cache provenance,
+  successful empty replay, stable fork ID and no duplicate fork/load on refresh.
+- `active_prompt_controls_and_close_preserve_a_reopened_incarnation`: live settings, manual close,
+  a reopened ID and late old prompt completion without changing the new turn.
+- Timer tests use paused Tokio time for disabled/zero/positive/extreme values, continuous absence,
+  observer return, global observer exclusion, generation changes and shutdown cancellation.
+- `tests/acp-presentation.test.tsx`: close consent/focus, empty configOptions precedence,
+  embedded media reuse, decoded attachment export, preview failure and invalid-data fallback.

@@ -29,6 +29,17 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
 - Preserve output after release and indicate truncation. See [ACP terminals](https://agentclientprotocol.com/protocol/v1/terminals).
 - Terminal output snapshots are display data held only in bridge memory while the session remains materialized. Closing the session or ending the bridge process clears them. Cold history restoration depends on the Agent; unavailable output is not reconstructed or written into Agent message fields.
 
+## Media and attachments
+
+- Native image/audio and embedded resources with those MIME types share previews. A failed preview
+  retains download when valid bytes are present.
+- Other binary resources use an attachment card with a filename, MIME type and decoded byte size.
+  Download is a user-triggered export from memory; temporary object URLs are released afterward.
+- Do not embed PDF/Office viewers. Invalid or missing payloads have no enabled download action.
+- Resource links show the supplied name/address and open HTTP(S) URLs on click. Do not fetch remote
+  bytes for previews or promise downloads when only a link was supplied.
+- Raw JSON and Base64 remain in folded technical details, not the ordinary result summary.
+
 ## Technical details
 
 Keep IDs, file locations, content annotations, and raw message events in **Tool info**. These remain available for diagnosis without appearing as ordinary task results. Hiding an annotation never removes its associated content.

@@ -19,25 +19,20 @@ export function SessionControls({
   onMode,
   onConfig,
 }: {
-  options: SessionConfigOption[];
+  options: SessionConfigOption[] | null;
   modes: LegacyModes | null | undefined;
   currentMode?: string;
   disabled: boolean;
   onMode: (id: string) => void;
   onConfig: (id: string, value: string | boolean) => void;
 }) {
-  // ACP configOptions supersede the legacy modes field. Rendering both produces
-  // duplicate controls for agents that support the current and legacy shapes.
-  const hasConfigMode = options.some(
-    (option) => option.id === "mode" || option.category === "mode",
-  );
-
-  if ((!modes || hasConfigMode) && options.length === 0) return null;
+  const hasConfigOptions = options != null;
+  if (hasConfigOptions ? options.length === 0 : !modes) return null;
 
   return (
     <div className="session-config-strip" aria-label="Session controls">
       <SlidersHorizontal className="config-strip-icon" size={14} aria-hidden="true" />
-      {modes && !hasConfigMode ? (
+      {modes && !hasConfigOptions ? (
         <SelectControl
           id="legacy-mode"
           name="Mode"
@@ -50,7 +45,7 @@ export function SessionControls({
           onChange={onMode}
         />
       ) : null}
-      {options.map((option) => (
+      {options?.map((option) => (
         <ConfigControl
           key={option.id}
           option={option}

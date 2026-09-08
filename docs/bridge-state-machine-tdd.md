@@ -53,7 +53,7 @@ and revision metadata; observers access the shared snapshot through the history 
 
 | From | Intent/event | To | Agent I/O |
 | --- | --- | --- | --- |
-| Cold | first observer | Loading | one joined `session/load` |
+| Cold | first observer | Loading | one joined `session/load`, or negotiated resume fallback |
 | Loading | valid response | Ready | none |
 | Loading | retryable failure | Loading | one delayed retry after termination |
 | Loading | deterministic incompatibility | Blocked | none |
@@ -62,10 +62,11 @@ and revision metadata; observers access the shared snapshot through the history 
 | Running | observer churn | Running | none |
 | Running | PromptResponse | Reconciling | none |
 | Reconciling | atomic local promotion | Ready | none |
-| Ready after completion | no session subscriber | closing/closed | capability-gated `session/close` |
+| Active, including Running | configured absence deadline expires | closing/closed | capability-gated `session/close` |
 | any live | close/delete/shutdown | closing/closed | capability-gated lifecycle I/O |
 
-Same-session prompt, load, close, delete, fork and config mutations are mutually exclusive.
+Mode/config controls and close may coexist with a prompt. Competing controls, attachment, fork,
+close and delete remain mutually exclusive; fork/delete still require no running prompt.
 Different sessions may progress concurrently under request, transport and delivery backpressure
 bounds.
 
@@ -105,10 +106,15 @@ Failure before step 4 cannot alter the installed baseline or completed overlay. 
 Agent request and is identical whether or not the Agent advertises load. The projection survives
 browser replacement but not bridge replacement; Cold history remains unavailable without load.
 
-After a terminal turn commit is published, zero session-specific subscribers schedules a
-capability-gated upstream close. A successful close releases the projection, making the next
-observer cold-load from the Agent. Subscriber loss while Running never cancels or closes the turn.
-If close is unavailable or fails, the projection remains in memory.
+Session-specific observer absence starts the CLI-configured close interval. Return cancels queued
+admission; output/completion do not reset it. The default is 1800 seconds; negatives disable, zero
+attempts immediate close. Expiry may close running work. Unsupported/refused close keeps state,
+and uncertain outcomes remain explicit. Never-observed materialized sessions count; list rows do
+not. Queued timers and late prompt responses must respect incarnation identity.
+
+Successful resume/fork is retained even if optional load fails. Use Agent replay (including empty),
+then available memory context, then a missing-history notice. Cached source context is never sent
+to the Agent or treated as a live branch subscription.
 
 ## Observer contract
 
@@ -146,8 +152,8 @@ history, invents missing Agent data or silently treats a partial replay as autho
 - Protocol-valid baseline, candidate and overlay growth has no bridge-defined cumulative cap.
 - Wire values, live resources and subscriber delivery retain their independent safety and
   backpressure limits.
-- Successful completion with no session subscriber closes and releases the session when supported.
-- Running, Reconciling, observed and interaction-bearing sessions are pinned.
+- Continuous unobserved intervals recycle sessions through negotiated close, including running work.
+- Observed sessions remain materialized; attachment/control admission defers an expired close.
 - Close/delete/generation shutdown drops baselines, candidates and retry tasks.
 - No history payload is persisted.
 

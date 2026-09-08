@@ -201,7 +201,7 @@ test("pastes and drops negotiated ACP context into the Zed-style composer", asyn
   await expect(page.getByText("Received prompt blocks: text,image,resource.", { exact: true }))
     .toBeVisible();
   const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow" });
-  await expect(prompt.getByAltText("ACP image content")).toBeVisible();
+  await expect(prompt.getByAltText("clipboard.png")).toBeVisible();
   await expect(prompt).toContainText("# Project context");
 
   await editor.press("ArrowUp");
@@ -1922,11 +1922,56 @@ test("puts created and forked sessions in the URL and returns home on close", as
     await page.getByRole("button", { name: "Thread actions" }).click();
   }
   await page.getByRole("button", { name: "Close thread" }).click();
+  await page.getByRole("alertdialog", { name: "Close session?" }).getByRole("button", { name: "Close session", exact: true }).click();
   await expect(page).toHaveURL(/\/$/u);
   await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
   await expect(page.getByRole("alert")).toHaveCount(0);
   expect(browserErrors).toEqual([]);
+});
+
+test("confirms closing a running session and permits live configuration changes", async ({ page }) => {
+  const server = await startRustTestServer({
+    command: [process.execPath, "--import", "tsx", join(process.cwd(), "tests/fixtures/session-capabilities-agent.ts"), "--no-load", "--close"],
+  });
+  const origin = `http://127.0.0.1:${server.port}`;
+  const errors = collectBrowserErrors(page);
+  let closeRequests = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/close")) closeRequests += 1;
+  });
+  try {
+    await page.goto(origin);
+    await page.getByRole("button", { name: "New project", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Create project" }).click();
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill("wait-close");
+    await composer.press("Enter");
+    await expect(page.getByText("Waiting for close.", { exact: true })).toBeVisible();
+    const verbose = page.getByRole("switch", { name: "Verbose" });
+    await expect(verbose).toBeEnabled();
+    await verbose.click();
+    await expect(verbose).toHaveAttribute("aria-checked", "true");
+    await page.getByRole("button", { name: "Thread actions" }).click();
+    await page.getByRole("button", { name: "Close thread" }).click();
+    const dialog = page.getByRole("alertdialog", { name: "Close session?" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Keep session" })).toBeFocused();
+    await expect(dialog).toContainText("child processes");
+    expect(closeRequests).toBe(0);
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    expect(closeRequests).toBe(0);
+    await expect(page.getByText("Waiting for close.", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Close thread" }).click();
+    await dialog.getByRole("button", { name: "Close session", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    expect(closeRequests).toBe(1);
+    expect(errors).toEqual([]);
+  } finally {
+    await server.close();
+  }
 });
 
 test("creates a session in the selected project instead of the startup directory", async ({ page }) => {
@@ -2085,6 +2130,7 @@ test("browses cross-workspace projects and restores a shared session with its ow
       response.status() === 200
     );
     await page.getByRole("button", { name: "Close thread" }).click();
+    await page.getByRole("alertdialog", { name: "Close session?" }).getByRole("button", { name: "Close session", exact: true }).click();
     await expect(page).toHaveURL(/\/$/u);
     await refreshedList;
     const shared = await browser.newPage();

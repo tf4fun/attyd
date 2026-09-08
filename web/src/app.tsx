@@ -25,6 +25,7 @@ import { Conversation } from "./components/acp/conversation";
 import { ElicitationCard, ExternalFlowCard } from "./components/acp/elicitation";
 import { PermissionCard } from "./components/acp/permission";
 import { PlanCard } from "./components/acp/plan";
+import { CloseSessionDialog } from "./components/acp/close-session-dialog";
 import { NewSessionDialog } from "./components/acp/new-session-dialog";
 import {
   PromptComposer,
@@ -53,6 +54,7 @@ const AuthTerminalCard = lazy(() => import("./components/acp/auth-terminal").the
 ));
 
 export default function App() {
+  const [closingSessionId, setClosingSessionId] = useState<string>();
   const {
     state,
     reconnect,
@@ -416,6 +418,7 @@ export default function App() {
   }, [measureThreadScroll, state.session?.sessionId]);
 
   useEffect(() => {
+    setClosingSessionId(undefined);
     setComposerDraft(undefined);
     setQueuedPrompts([]);
     setQueueError(undefined);
@@ -788,10 +791,10 @@ export default function App() {
                         onClick={openActiveThreadMarkdown}
                       ><FileText size={14} /> Open as Markdown</button>
                       {sessionCapabilities?.fork != null ? (
-                        <button type="button" disabled={state.initialized?.agentCapabilities?.loadSession !== true || state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> {state.initialized?.agentCapabilities?.loadSession === true ? "Fork thread" : "Fork requires history loading"}</button>
+                        <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> Fork thread</button>
                       ) : null}
                       {sessionCapabilities?.close != null ? (
-                        <button type="button" className="danger" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={closeSession}><LogOut size={14} /> Close thread</button>
+                        <button type="button" className="danger" disabled={transitioning || changingControl || state.runtimeOperation != null} onClick={() => setClosingSessionId(state.session?.sessionId)}><LogOut size={14} /> Close thread</button>
                       ) : null}
                       {sessionCapabilities?.delete != null ? (
                         <button
@@ -912,6 +915,7 @@ export default function App() {
           >
             <div className="conversation-wrap">
               {authContent}
+              {state.historyNotice ? <p className="history-notice" role="status">{state.historyNotice}</p> : null}
               {(!showAuthCard && !terminalAuthOwnsInteraction) || state.timeline.length > 0 ? <Conversation
                 timeline={state.timeline}
                 terminalSnapshots={state.terminalSnapshots}
@@ -1038,7 +1042,7 @@ export default function App() {
                   options={state.configOptions}
                   modes={state.session?.modes}
                   currentMode={state.modeId}
-                  disabled={!ready || state.running}
+                  disabled={state.phase !== "ready" || !state.session || transitioning || changingControl || state.runtimeOperation != null || authBlocksCurrent || !["ready", "running", "reconciling"].includes(state.sessionSyncPhase ?? "")}
                   onMode={setMode}
                   onConfig={setConfig}
                 />
@@ -1056,6 +1060,17 @@ export default function App() {
         </div>
         </>}
       </main>
+      {closingSessionId && closingSessionId === state.session?.sessionId ? (
+        <CloseSessionDialog
+          disabled={transitioning || changingControl || state.runtimeOperation != null}
+          onCancel={() => setClosingSessionId(undefined)}
+          onConfirm={() => {
+            setClosingSessionId(undefined);
+            setQueuePaused(true);
+            closeSession();
+          }}
+        />
+      ) : null}
       {newThreadOpen ? (
         <NewSessionDialog
           transport={state.transport}

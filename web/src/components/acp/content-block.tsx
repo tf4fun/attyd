@@ -3,17 +3,17 @@ import {
   Bot,
   CircleAlert,
   Clock3,
+  Download,
   FileText,
   Gauge,
   Link2,
-  Music2,
   UserRound,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { safeHttpUrl } from "../../lib/safe-url";
-import { safeMediaDataUrl } from "../../../../shared/content-validation";
+import { safeMediaDataUrl, validateContentBlockSemantics } from "../../../../shared/content-validation";
 import { assertNever } from "../../../../shared/exhaustive";
 
 export function ContentBlocks({ blocks }: { blocks: ContentBlock[] }) {
@@ -50,38 +50,14 @@ export function ContentBlockView({
           )}
         </ContentBlockFrame>
       );
-    case "image": {
-      const source = safeMediaDataUrl(block);
-      if (!source) {
-        return <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}><InvalidMedia kind="image" /></ContentBlockFrame>;
-      }
+    case "image":
+    case "audio":
       return (
         <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
-          <figure className="media-block">
-            <img src={source} alt="ACP image content" />
-            <figcaption>
-              <span>{block.mimeType}</span>
-              {block.uri ? <code title={block.uri}>{block.uri}</code> : null}
-            </figcaption>
-          </figure>
+          <BinaryAttachment data={block.data} mimeType={block.mimeType} mediaKind={block.type}
+            uri={block.type === "image" ? block.uri ?? undefined : undefined} />
         </ContentBlockFrame>
       );
-    }
-    case "audio": {
-      const source = safeMediaDataUrl(block);
-      if (!source) {
-        return <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}><InvalidMedia kind="audio" /></ContentBlockFrame>;
-      }
-      return (
-        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
-          <div className="resource-card audio-resource">
-            <Music2 size={16} />
-            <span><strong>Audio</strong><small>{block.mimeType}</small></span>
-            <audio controls src={source} />
-          </div>
-        </ContentBlockFrame>
-      );
-    }
     case "resource_link": {
       const details = [
         block.mimeType,
@@ -115,6 +91,13 @@ export function ContentBlockView({
     }
     case "resource": {
       const resource = block.resource;
+      if ("blob" in resource) {
+        return (
+          <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
+            <BinaryAttachment data={resource.blob} mimeType={resource.mimeType ?? "application/octet-stream"} uri={resource.uri} />
+          </ContentBlockFrame>
+        );
+      }
       return (
         <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
           <div className="embedded-resource">
@@ -123,14 +106,7 @@ export function ContentBlockView({
               <span title={resource.uri}>{resource.uri}</span>
               {resource.mimeType ? <code>{resource.mimeType}</code> : null}
             </div>
-            {"text" in resource ? (
-              <pre>{resource.text}</pre>
-            ) : (
-              <small>
-                Embedded {resource.mimeType ?? "binary resource"} · {resource.blob.length} base64
-                characters
-              </small>
-            )}
+            <pre>{resource.text}</pre>
           </div>
         </ContentBlockFrame>
       );
@@ -224,14 +200,75 @@ function formatBytes(value: number): string {
   return `${amount.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${unit}`;
 }
 
-function InvalidMedia({ kind }: { kind: "image" | "audio" }) {
+function BinaryAttachment({ data, mimeType, uri, mediaKind }: {
+  data: string;
+  mimeType: string;
+  uri?: string;
+  mediaKind?: "image" | "audio";
+}) {
+  const [failedPreview, setFailedPreview] = useState<string>();
+  const [downloadError, setDownloadError] = useState(false);
+  let valid = true;
+  try {
+    validateContentBlockSemantics(mediaKind
+      ? { type: mediaKind, mimeType, data }
+      : { type: "resource", resource: { uri: uri ?? "attachment:content", mimeType, blob: data } });
+  } catch { valid = false; }
+  const kind = mimeType.toLowerCase().startsWith("image/") ? "image"
+    : mimeType.toLowerCase().startsWith("audio/") ? "audio" : undefined;
+  const source = valid && kind ? safeMediaDataUrl({ type: kind, mimeType, data }) : undefined;
+  const name = attachmentName(uri, mimeType);
+  const bytes = data.length / 4 * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+  const download = () => {
+    if (!valid) return;
+    setDownloadError(false);
+    try {
+      const decoded = Uint8Array.from(atob(data), (character) => character.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([decoded], { type: mimeType }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = name;
+      document.body.append(link);
+      try { link.click(); } finally {
+        link.remove();
+        // Let the browser consume the click before releasing the temporary export.
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+      }
+    } catch { setDownloadError(true); }
+  };
   return (
-    <div className="resource-card invalid-content" role="status">
-      <CircleAlert size={16} />
-      <span>
-        <strong>Invalid ACP {kind} content</strong>
-        <small>The media payload was not rendered.</small>
-      </span>
+    <div className="binary-attachment">
+      {source && source !== failedPreview ? (
+        kind === "image"
+          ? <figure className="media-block"><img src={source} alt={uri ? name : "ACP image content"} onError={() => setFailedPreview(source)} /></figure>
+          : <audio controls preload="metadata" src={source} onError={() => setFailedPreview(source)} />
+      ) : null}
+      <div className={`resource-card${valid ? "" : " invalid-content"}`}>
+        {valid ? <FileText size={16} /> : <CircleAlert size={16} />}
+        <span>
+          <strong title={uri}>{name}</strong>
+          <small>{mimeType}{valid ? ` · ${formatBytes(bytes)}` : " · Invalid attachment data"}</small>
+          {source && source === failedPreview ? <small>Preview unavailable. You can still download this attachment.</small> : null}
+          {downloadError ? <small role="status">Download failed. Try again.</small> : null}
+        </span>
+        <button type="button" className="attachment-download" disabled={!valid} onClick={download} aria-label={`Download ${name}`}>
+          <Download size={15} /> Download
+        </button>
+      </div>
     </div>
   );
+}
+
+function attachmentName(uri: string | undefined, mimeType: string): string {
+  if (uri) {
+    const segment = uri.split(/[?#]/, 1)[0].split("/").filter(Boolean).at(-1);
+    if (segment) {
+      let name = segment;
+      try { name = decodeURIComponent(segment); } catch { /* Retain a malformed URI label. */ }
+      name = name.replace(/[\/\\\u0000-\u001f\u007f]/g, "_");
+      if (name !== "." && name !== "..") return name;
+    }
+  }
+  const extension = mimeType.split(";", 1)[0].split("/")[1];
+  return `attachment${extension && /^[a-z0-9]+$/i.test(extension) && extension !== "octet-stream" ? `.${extension}` : ""}`;
 }

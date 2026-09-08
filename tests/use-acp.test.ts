@@ -282,7 +282,7 @@ describe("project navigation", () => {
     expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha");
   });
 
-  it("explains why a fork without history loading is unavailable before posting", async () => {
+  it("allows a negotiated fork without history loading", async () => {
     fetchMock.mockImplementation(async (input, init) => {
       if (String(input) === "/api/v1/runtime") return response({
         connected: true, generation: 1, hello: null,
@@ -294,8 +294,7 @@ describe("project navigation", () => {
     });
     await mount(sessionPath("created", "/work/alpha"));
     await act(async () => acp.forkSession());
-    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/fork"))).toBe(false);
-    expect(JSON.stringify(acp.state.timeline)).toContain("Forking requires Agent history loading");
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/fork"))).toBe(true);
   });
 
   it("canonicalizes legacy and mismatched project links using the Agent workspace", async () => {

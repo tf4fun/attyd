@@ -134,7 +134,7 @@ export interface ActiveSessionSnapshot {
   session?: NewSessionResponse;
   availableCommands: AvailableCommand[];
   modeId?: string;
-  configOptions: SessionConfigOption[];
+  configOptions: SessionConfigOption[] | null;
   timeline: TimelineItem[];
   permissions: PendingPermission[];
   elicitations: PendingElicitation[];
@@ -147,6 +147,7 @@ export interface ActiveSessionSnapshot {
   activePlan?: AppState["activePlan"];
   terminalSnapshots: TerminalSnapshot[];
   historyStatus?: HistoryStatus;
+  historyNotice?: string;
 }
 
 export type HistoryStatus =
@@ -243,6 +244,7 @@ export interface AppState {
   lastAuthResponse?: AgentAuthResponse;
   session?: NewSessionResponse;
   historyStatus?: HistoryStatus;
+  historyNotice?: string;
   cachedSessions: Map<string, ActiveSessionSnapshot>;
   attentionSessionIds: string[];
   pendingSessionId?: string;
@@ -255,7 +257,7 @@ export interface AppState {
   nextSessionCursor?: string | null;
   availableCommands: AvailableCommand[];
   modeId?: string;
-  configOptions: SessionConfigOption[];
+  configOptions: SessionConfigOption[] | null;
   timeline: TimelineItem[];
   terminalSnapshots: TerminalSnapshot[];
   permissions: PendingPermission[];
@@ -360,7 +362,7 @@ export const initialState: AppState = {
   sessions: [],
   pendingSessionDeletions: [],
   availableCommands: [],
-  configOptions: [],
+  configOptions: null,
   timeline: [],
   terminalSnapshots: [],
   permissions: [],
@@ -580,8 +582,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         (
           state.session == null ||
           action.sessionId !== state.session.sessionId ||
-          state.running ||
-          state.pendingPrompt != null ||
+          (action.kind === "fork" && (state.running || state.pendingPrompt != null)) ||
           state.runtimeOperation != null
         )
       ) return state;
@@ -675,7 +676,6 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       if (
         state.pendingSessionControl != null ||
         state.sessionTransition != null ||
-        state.running ||
         state.runtimeOperation != null ||
         state.session?.sessionId !== action.sessionId
       ) return state;
@@ -1115,7 +1115,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         pendingSessionId: undefined,
         sessionTransition: undefined,
         modeId: event.response.modes?.currentModeId,
-        configOptions: event.response.configOptions ?? [],
+        configOptions: event.response.configOptions ?? null,
       }, event.response, event.earlyUpdates);
     case "acp/sessions_listed": {
       const listedActive = state.session == null
@@ -1164,7 +1164,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         pendingSessionId: undefined,
         sessionTransition: undefined,
         modeId: event.response.modes?.currentModeId,
-        configOptions: event.response.configOptions ?? [],
+        configOptions: event.response.configOptions ?? null,
         title: state.title ?? listed?.title ?? undefined,
       };
     }
@@ -1193,7 +1193,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         pendingSessionId: undefined,
         sessionTransition: undefined,
         modeId: event.response.modes?.currentModeId,
-        configOptions: event.response.configOptions ?? [],
+        configOptions: event.response.configOptions ?? null,
         permissions: [],
         elicitations: requestScopedElicitations(settled.elicitations),
         running: false,
@@ -1769,7 +1769,7 @@ function applyEarlySessionUpdates(
     ...next,
     session: response,
     modeId: response.modes?.currentModeId,
-    configOptions: response.configOptions ?? [],
+    configOptions: response.configOptions ?? null,
   };
 }
 
@@ -2250,10 +2250,11 @@ function resetActiveSession(state: AppState, title?: string): AppState {
     cwd: state.defaultCwd,
     session: undefined,
     historyStatus: undefined,
+    historyNotice: undefined,
     pendingSessionId: undefined,
     sessionTransition: undefined,
     modeId: undefined,
-    configOptions: [],
+    configOptions: null,
     availableCommands: [],
     timeline: [],
     terminalSnapshots: [],
@@ -2297,9 +2298,10 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
           requestId: `bridge:${view.sessionIncarnation}:${view.viewRevision}`,
         }
       : { state: "available", sessionId: view.sessionId },
+    historyNotice: view.historyNotice ?? undefined,
     sessionSyncPhase: view.phase,
     modeId: session.modes?.currentModeId,
-    configOptions: session.configOptions ?? [],
+    configOptions: session.configOptions ?? null,
     permissions: Object.values(view.interactions.permissions).map((pending) => ({
       permissionId: pending.interactionId,
       request: pending.request,
@@ -2549,7 +2551,7 @@ function runtimeSessionSnapshot(
     session: event.session,
     availableCommands: [],
     modeId: event.session.modes?.currentModeId,
-    configOptions: event.session.configOptions ?? [],
+    configOptions: event.session.configOptions ?? null,
     timeline: event.truncated
       ? [{
           id: randomId(),
@@ -2734,6 +2736,7 @@ function captureActiveSession(state: AppState): ActiveSessionSnapshot {
     activePlan: state.activePlan,
     terminalSnapshots: state.terminalSnapshots,
     historyStatus: state.historyStatus,
+    historyNotice: state.historyNotice,
   };
 }
 

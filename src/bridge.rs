@@ -1121,6 +1121,7 @@ fn can_close_rejected_chat_session(state: &BridgeState, session_id: &str) -> boo
 
 #[derive(Clone)]
 struct CommandContext {
+    auto_close: Option<crate::auto_close::AutoClosePermit>,
     options: Arc<Options>,
     state: Arc<Mutex<BridgeState>>,
     sink: EventSink,
@@ -1146,8 +1147,10 @@ pub(crate) enum BridgeInput {
         cwd: Option<String>,
         response: oneshot::Sender<Result<Value, SessionViewError>>,
     },
-    RetireIdleSession {
+    RetireUnobservedSession {
         session_id: String,
+        incarnation: u64,
+        permit: crate::auto_close::AutoClosePermit,
     },
     TurnRequest {
         session_id: String,
@@ -2087,6 +2090,7 @@ where
                     _ = cancellation.cancelled() => None,
                     input = commands.recv() => input,
                 };
+                let mut auto_close = None;
                 let (command, turn_responder, business_responder) = match input {
                     Some(BridgeInput::RuntimeSnapshotRequest) => {
                         let mut state = state.lock().await;
@@ -2095,31 +2099,35 @@ where
                         sink.internal_typed("bridge/internal_runtime_snapshot", snapshot);
                         continue;
                     }
-                    Some(BridgeInput::RetireIdleSession { session_id }) => {
-                        let ready = {
-                            let state = state.lock().await;
-                            state
-                                .active_sessions
-                                .get(&session_id)
-                                .is_some_and(|session| {
-                                    state
-                                        .session_mirror
-                                        .as_ref()
-                                        .and_then(|mirror| mirror.state(&session_id))
-                                        .is_some_and(|mirror| {
-                                            mirror.incarnation == session.incarnation
-                                                && mirror.phase == MirrorPhase::Ready
-                                        })
-                                })
-                        };
-                        if !ready {
+                    Some(BridgeInput::RetireUnobservedSession {
+                        session_id,
+                        incarnation,
+                        permit,
+                    }) => {
+                        if !permit.pending() {
                             continue;
                         }
+                        let state = state.lock().await;
+                        if state
+                            .active_sessions
+                            .get(&session_id)
+                            .is_none_or(|session| session.incarnation != incarnation)
+                            || !state
+                                .agent_capabilities
+                                .as_ref()
+                                .is_some_and(|caps| caps.session_capabilities.close.is_some())
+                        {
+                            permit.cancel();
+                            continue;
+                        }
+                        drop(state);
+                        auto_close = Some(permit);
                         (
                             json!({
                                 "type": "session/close",
-                                "requestId": format!("bridge-idle-close-{}", Uuid::new_v4()),
+                                "requestId": format!("bridge-unobserved-close-{}", Uuid::new_v4()),
                                 "sessionId": session_id,
+                                "expectedIncarnation": incarnation,
                             }),
                             None,
                             None,
@@ -2187,9 +2195,20 @@ where
                         let Some((session_id, materialization_id)) = materialize else {
                             continue;
                         };
+                        let method = if state
+                            .lock()
+                            .await
+                            .agent_capabilities
+                            .as_ref()
+                            .is_some_and(|caps| caps.load_session)
+                        {
+                            "session/load"
+                        } else {
+                            "session/resume"
+                        };
                         (
                             json!({
-                                "type": "session/load",
+                                "type": method,
                                 "requestId": format!("bridge-materialize-{}", Uuid::new_v4()),
                                 "sessionId": session_id,
                                 "cwd": cwd,
@@ -2232,6 +2251,7 @@ where
                 let prompt_start =
                     (operation == "session/prompt").then(|| prompt_lifecycle.register_start());
                 let context = CommandContext {
+                    auto_close,
                     options: options.clone(),
                     state: state.clone(),
                     sink: sink.clone(),
@@ -2328,7 +2348,7 @@ where
                         )
                         .await
                     };
-                    if operation == "session/load"
+                    if matches!(operation.as_str(), "session/load" | "session/resume")
                         && bridge_managed_materialization
                         && let Some(session_id) = intent_session_id.as_deref()
                         && let Some(materialization_id) = bridge_materialization_id.as_deref()
@@ -3066,6 +3086,7 @@ async fn handle_command(
         )));
     }
     let CommandContext {
+        auto_close,
         options,
         state,
         sink,
@@ -3294,9 +3315,6 @@ async fn handle_command(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             require_agent_method(operation, &state).await?;
-            if operation == "session/resume" {
-                require_history_attachment_support(operation, &state).await?;
-            }
             let attachment_kind = if operation == "session/load" {
                 RuntimeSessionOperationKind::Load
             } else {
@@ -3358,7 +3376,7 @@ async fn handle_command(
                 if !reload {
                     session_mirror(&mut state).register_cold(session_id.clone(), incarnation);
                 }
-                if operation == "session/load" {
+                {
                     let mirror = session_mirror(&mut state);
                     if let Err(error) = mirror.begin_load(&session_id, incarnation, &request_id) {
                         let error = mirror_error(error);
@@ -3427,7 +3445,7 @@ async fn handle_command(
                         reload,
                         &error,
                     )?;
-                    if operation == "session/load" {
+                    {
                         fail_mirror_attachment(
                             &mut state,
                             &session_id,
@@ -3460,7 +3478,7 @@ async fn handle_command(
                     reload,
                     &error,
                 )?;
-                if operation == "session/load" {
+                {
                     fail_mirror_attachment(
                         &mut state,
                         &session_id,
@@ -3519,7 +3537,7 @@ async fn handle_command(
                         reload,
                         &error,
                     )?;
-                    if operation == "session/load" {
+                    {
                         fail_mirror_attachment(
                             &mut state,
                             &session_id,
@@ -3536,11 +3554,18 @@ async fn handle_command(
                 }
             };
             let epoch = state.runtime.epoch().to_string();
-            if operation == "session/load" {
+            let resume_cache = if operation == "session/load" {
                 session_mirror(&mut state)
                     .commit_load(&session_id, attachment_incarnation, &request_id)
                     .map_err(mirror_error)?;
-            }
+                None
+            } else {
+                Some(
+                    session_mirror(&mut state)
+                        .commit_attachment_cache(&session_id, attachment_incarnation, &request_id)
+                        .map_err(mirror_error)?,
+                )
+            };
             let completed = if reload {
                 state.runtime.complete_reload(
                     &epoch,
@@ -3593,7 +3618,7 @@ async fn handle_command(
                 }));
             }
             if operation == "session/resume" {
-                synchronize_authoritative_history(
+                synchronize_attached_history(
                     &connection,
                     &options,
                     &bridge_state,
@@ -3601,6 +3626,8 @@ async fn handle_command(
                     &cancellation,
                     &session_id,
                     attachment_incarnation,
+                    resume_cache.as_ref().map(|snapshot| snapshot.updates()).unwrap_or(&[]),
+                    "Only context received while resuming is available; earlier history may be missing.",
                 )
                 .await?;
             }
@@ -3620,7 +3647,6 @@ async fn handle_command(
             let request_id = string_field(&command, "requestId")?.to_string();
             let source_id = string_field(&command, "sessionId")?.to_string();
             require_agent_method("session/fork", &state).await?;
-            require_history_attachment_support("session/fork", &state).await?;
             let (cwd, source_incarnation) = {
                 let mut state = state.lock().await;
                 let source = state.active_sessions.get(&source_id).ok_or_else(|| {
@@ -3733,6 +3759,21 @@ async fn handle_command(
                 clear_pending_creation_replays(&mut state);
             }
             let target_replay = conversation_notification_values(&early_updates);
+            let fork_cache = if target_replay.is_empty() {
+                session_mirror(&mut state)
+                    .view(&source_id, source_incarnation)
+                    .map_err(mirror_error)?
+                    .baseline
+                    .updates()
+                    .to_vec()
+            } else {
+                target_replay.clone()
+            };
+            let cache_notice = if target_replay.is_empty() {
+                "Showing a snapshot of the source session from memory; branch history may differ."
+            } else {
+                "Only context received while forking is available; earlier branch history may be missing."
+            };
             let target_replay = (!target_replay.is_empty()).then_some(target_replay);
             let epoch = state.runtime.epoch().to_string();
             let runtime_result = state.runtime.open_forked(
@@ -3782,7 +3823,7 @@ async fn handle_command(
                 .map_err(runtime_state_error)?;
             release_session_operation(&mut state, &source_id, SessionOperation::Fork);
             drop(state);
-            synchronize_authoritative_history(
+            synchronize_attached_history(
                 &connection,
                 &options,
                 &bridge_state,
@@ -3790,6 +3831,8 @@ async fn handle_command(
                 &cancellation,
                 &session_id,
                 incarnation,
+                &fork_cache,
+                cache_notice,
             )
             .await?;
             if let Some(responder) = &business_responder {
@@ -3822,6 +3865,21 @@ async fn handle_command(
             require_agent_method("session/close", &state).await?;
             {
                 let mut state = state.lock().await;
+                if command
+                    .get("expectedIncarnation")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|expected| {
+                        state
+                            .active_sessions
+                            .get(&session_id)
+                            .is_none_or(|session| session.incarnation != expected)
+                    })
+                {
+                    if let Some(permit) = &auto_close {
+                        permit.cancel();
+                    }
+                    return Ok(());
+                }
                 reserve_session_operation(&mut state, &session_id, SessionOperation::Close)?;
                 let incarnation = state.active_sessions[&session_id].incarnation;
                 let epoch = state.runtime.epoch().to_string();
@@ -3835,6 +3893,23 @@ async fn handle_command(
                 ) {
                     release_session_operation(&mut state, &session_id, SessionOperation::Close);
                     return Err(runtime_state_error(error));
+                }
+                if let Some(permit) = &auto_close {
+                    if !permit.claim() {
+                        state
+                            .runtime
+                            .fail_operation(
+                                &epoch,
+                                &session_id,
+                                incarnation,
+                                &request_id,
+                                RuntimeSessionOperationKind::Close,
+                                json!({"message":"observer returned"}),
+                            )
+                            .map_err(runtime_state_error)?;
+                        release_session_operation(&mut state, &session_id, SessionOperation::Close);
+                        return Ok(());
+                    }
                 }
                 flush_runtime(&mut state, &sink);
             }
@@ -3873,6 +3948,7 @@ async fn handle_command(
                 session_mirror(&mut state).remove(&session_id, incarnation);
                 state.sync_control_candidates.remove(&session_id);
                 state.active_sessions.remove(&session_id);
+                state.prompts.remove(&session_id);
                 state.session_updates.remove(&session_id);
                 state.replay_validation_backups.remove(&session_id);
             }
@@ -4136,6 +4212,14 @@ async fn handle_command(
                 Ok(response) => response,
                 Err(error) => {
                     let mut state = state.lock().await;
+                    if state
+                        .active_sessions
+                        .get(&session_id)
+                        .is_none_or(|session| session.incarnation != incarnation)
+                    {
+                        prompt_lifecycle.prompt_finished();
+                        return Ok(());
+                    }
                     settle_runtime_prompt_request_error(
                         &mut state,
                         &session_id,
@@ -4165,7 +4249,12 @@ async fn handle_command(
                             }),
                         )?;
                         sink.send(outcome);
-                        finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
+                        finish_prompt_operation(
+                            &mut state,
+                            &session_id,
+                            incarnation,
+                            &prompt_lifecycle,
+                        );
                         return Err(error);
                     }
                     session_mirror(&mut state)
@@ -4194,7 +4283,20 @@ async fn handle_command(
                     )
                     .await;
                     let mut state = bridge_state.lock().await;
-                    finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
+                    if state
+                        .active_sessions
+                        .get(&session_id)
+                        .is_none_or(|session| session.incarnation != incarnation)
+                    {
+                        prompt_lifecycle.prompt_finished();
+                        return Ok(());
+                    }
+                    finish_prompt_operation(
+                        &mut state,
+                        &session_id,
+                        incarnation,
+                        &prompt_lifecycle,
+                    );
                     if let Err(sync_error) = commit {
                         tracing::warn!(
                             session_id,
@@ -4223,6 +4325,14 @@ async fn handle_command(
                 let error = semantic_error(message);
                 let reconciling_view = {
                     let mut state = state.lock().await;
+                    if state
+                        .active_sessions
+                        .get(&session_id)
+                        .is_none_or(|session| session.incarnation != incarnation)
+                    {
+                        prompt_lifecycle.prompt_finished();
+                        return Ok(());
+                    }
                     let epoch = state.runtime.epoch().to_string();
                     state
                         .runtime
@@ -4259,7 +4369,15 @@ async fn handle_command(
                 )
                 .await;
                 let mut state = state.lock().await;
-                finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
+                if state
+                    .active_sessions
+                    .get(&session_id)
+                    .is_none_or(|session| session.incarnation != incarnation)
+                {
+                    prompt_lifecycle.prompt_finished();
+                    return Ok(());
+                }
+                finish_prompt_operation(&mut state, &session_id, incarnation, &prompt_lifecycle);
                 if let Err(sync_error) = commit {
                     tracing::warn!(
                         session_id,
@@ -4285,6 +4403,14 @@ async fn handle_command(
             }
             let reconciling_view = {
                 let mut state = state.lock().await;
+                if state
+                    .active_sessions
+                    .get(&session_id)
+                    .is_none_or(|session| session.incarnation != incarnation)
+                {
+                    prompt_lifecycle.prompt_finished();
+                    return Ok(());
+                }
                 let epoch = state.runtime.epoch().to_string();
                 let response_value = serde_json::to_value(&response)?;
                 state
@@ -4323,11 +4449,27 @@ async fn handle_command(
             .await;
             {
                 let mut state = state.lock().await;
-                finish_prompt_operation(&mut state, &session_id, &prompt_lifecycle);
+                if state
+                    .active_sessions
+                    .get(&session_id)
+                    .is_none_or(|session| session.incarnation != incarnation)
+                {
+                    prompt_lifecycle.prompt_finished();
+                    return Ok(());
+                }
+                finish_prompt_operation(&mut state, &session_id, incarnation, &prompt_lifecycle);
             }
             commit?;
             let outcome = {
                 let mut state = state.lock().await;
+                if state
+                    .active_sessions
+                    .get(&session_id)
+                    .is_none_or(|session| session.incarnation != incarnation)
+                {
+                    prompt_lifecycle.prompt_finished();
+                    return Ok(());
+                }
                 session_turn_outcome_value(
                     &mut state,
                     "bridge/session_turn_complete",
@@ -5027,6 +5169,13 @@ async fn commit_completed_turn_history(
 ) -> Result<(), Error> {
     let (result, view) = {
         let mut state = state.lock().await;
+        if state
+            .active_sessions
+            .get(session_id)
+            .is_none_or(|session| session.incarnation != incarnation)
+        {
+            return Ok(());
+        }
         let result = session_mirror(&mut state)
             .commit_completed_turn_from_memory(session_id, incarnation, operation_id)
             .map(|_| ())
@@ -5067,6 +5216,55 @@ async fn commit_completed_turn_history(
             Err(error)
         }
     }
+}
+
+// Attachment success is independent of the Agent's ability to replay history.
+async fn synchronize_attached_history(
+    connection: &ConnectionTo<Agent>,
+    options: &Options,
+    state: &Arc<Mutex<BridgeState>>,
+    sink: &EventSink,
+    cancellation: &CancellationToken,
+    session_id: &str,
+    incarnation: u64,
+    cached_updates: &[Value],
+    cache_notice: &str,
+) -> Result<(), Error> {
+    if synchronize_authoritative_history(
+        connection,
+        options,
+        state,
+        sink,
+        cancellation,
+        session_id,
+        incarnation,
+    )
+    .await
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let mut state = state.lock().await;
+    // A concurrent close or runtime shutdown must never resurrect an attachment.
+    if state
+        .active_sessions
+        .get(session_id)
+        .is_none_or(|session| session.incarnation != incarnation)
+    {
+        return Err(Error::invalid_request().data("session closed while retrieving history"));
+    }
+    let notice = if cached_updates.is_empty() {
+        "Earlier messages are unavailable from the Agent and memory cache. You can continue this session."
+    } else {
+        cache_notice
+    };
+    session_mirror(&mut state)
+        .use_cached_history(session_id, incarnation, cached_updates, notice.to_string())
+        .map_err(mirror_error)?;
+    let view = session_view_value(&mut state, session_id, incarnation)?;
+    sink.send(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": view }));
+    sink.send(json!({ "type": "bridge/session_sync", "sessionId": session_id, "phase": "ready" }));
+    Ok(())
 }
 
 async fn synchronize_authoritative_history(
@@ -5612,7 +5810,11 @@ fn reserve_session_operation(
         );
     }
     if session_history_loading(state, session_id)
-        || state.prompts.contains(session_id)
+        || (state.prompts.contains(session_id)
+            && !matches!(
+                operation,
+                SessionOperation::Control | SessionOperation::Close
+            ))
         || state.pending_attachments.contains(session_id)
         || state.pending_forks.contains(session_id)
         || state.pending_closes.contains(session_id)
@@ -5647,7 +5849,20 @@ fn release_session_operation(
     .remove(session_id);
 }
 
-fn finish_prompt_operation(state: &mut BridgeState, session_id: &str, lifecycle: &PromptLifecycle) {
+fn finish_prompt_operation(
+    state: &mut BridgeState,
+    session_id: &str,
+    incarnation: u64,
+    lifecycle: &PromptLifecycle,
+) {
+    if state
+        .active_sessions
+        .get(session_id)
+        .is_none_or(|session| session.incarnation != incarnation)
+    {
+        lifecycle.prompt_finished();
+        return;
+    }
     release_session_operation(state, session_id, SessionOperation::Prompt);
     if let Some(validation) = state.session_updates.get_mut(session_id) {
         validation.retire_turn();
@@ -5941,25 +6156,6 @@ fn validate_auth_methods(methods: &[AuthMethod], terminal_supported: bool) -> Re
             }
             validate_terminal_auth_method(method)?;
         }
-    }
-    Ok(())
-}
-
-async fn require_history_attachment_support(
-    operation: &str,
-    state: &Arc<Mutex<BridgeState>>,
-) -> Result<(), Error> {
-    if !state
-        .lock()
-        .await
-        .agent_capabilities
-        .as_ref()
-        .is_some_and(|capabilities| capabilities.load_session)
-    {
-        return Err(Error::new(
-            agent_client_protocol::ErrorCode::InvalidRequest.into(),
-            format!("{operation} requires Agent history loading in this client"),
-        ));
     }
     Ok(())
 }
@@ -7926,10 +8122,13 @@ mod tests {
         assert_eq!(state.prompts.len(), 2);
         assert!(reserve_session_operation(&mut state, "active", SessionOperation::Prompt).is_err());
         assert!(reserve_session_operation(&mut state, "active", SessionOperation::Fork).is_err());
+        reserve_session_operation(&mut state, "active", SessionOperation::Control).unwrap();
+        assert!(state.prompts.contains("active"));
         assert!(reserve_session_operation(&mut state, "active", SessionOperation::Close).is_err());
-        assert!(
-            reserve_session_operation(&mut state, "active", SessionOperation::Control).is_err()
-        );
+        release_session_operation(&mut state, "active", SessionOperation::Control);
+        reserve_session_operation(&mut state, "active", SessionOperation::Close).unwrap();
+        assert!(state.prompts.contains("active"));
+        release_session_operation(&mut state, "active", SessionOperation::Close);
         release_session_operation(&mut state, "other", SessionOperation::Prompt);
         release_session_operation(&mut state, "active", SessionOperation::Prompt);
         reserve_session_operation(&mut state, "active", SessionOperation::Control).unwrap();
@@ -8030,7 +8229,7 @@ mod tests {
         tokio::task::yield_now().await;
         {
             let mut state = state.lock().await;
-            finish_prompt_operation(&mut state, "session", &lifecycle);
+            finish_prompt_operation(&mut state, "session", 1, &lifecycle);
         }
         tokio::time::timeout(Duration::from_millis(100), waiter)
             .await

@@ -1,5 +1,6 @@
 mod agent_process;
 mod auth_terminal;
+mod auto_close;
 mod bridge;
 mod elicitation_validation;
 mod event_queue;

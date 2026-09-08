@@ -54,6 +54,7 @@ export interface BridgeSessionView {
   historyRevision: string | null;
   phase: SessionSyncPhase;
   syncError: string | null;
+  historyNotice?: string | null;
   timeline: SessionUpdate[];
   turnOutcomes?: BridgeTurnOutcome[];
   activeTurn: BridgeTurnOverlay | null;

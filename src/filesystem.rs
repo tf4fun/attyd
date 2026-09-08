@@ -165,23 +165,29 @@ impl WorkspaceFileSystem {
                 let parent = lexical.parent().ok_or_else(|| {
                     Error::invalid_params().data("ACP file write target has no parent")
                 })?;
-                let canonical_parent = tokio::fs::canonicalize(parent).await.map_err(fs_error)?;
+                let canonical_parent = tokio::fs::canonicalize(parent).await.map_err(|error| {
+                    write_error(error, &request.path, "resolve parent directory", false)
+                })?;
                 self.assert_canonical_within(&canonical_parent)?;
                 canonical_parent.join(lexical.file_name().ok_or_else(|| {
                     Error::invalid_params().data("ACP file write target has no file name")
                 })?)
             }
-            Err(error) => return Err(fs_error(error)),
+            Err(error) => return Err(write_error(error, &request.path, "resolve target", false)),
         };
         // Cancellation is honored until the filesystem mutation starts.
         // Once an in-place write begins it must finish, otherwise the peer could leave
         // a previously valid file truncated or partially written.
         ensure_not_cancelled(cancellation)?;
-        let mut file = tokio::fs::File::create(target).await.map_err(fs_error)?;
+        let mut file = tokio::fs::File::create(target)
+            .await
+            .map_err(|error| write_error(error, &request.path, "open or truncate file", true))?;
         file.write_all(request.content.as_bytes())
             .await
-            .map_err(fs_error)?;
-        file.flush().await.map_err(fs_error)?;
+            .map_err(|error| write_error(error, &request.path, "write content", true))?;
+        file.flush()
+            .await
+            .map_err(|error| write_error(error, &request.path, "flush content", true))?;
         Ok(WriteTextFileResponse::new())
     }
 
@@ -469,6 +475,29 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
+fn write_error(
+    error: std::io::Error,
+    path: &Path,
+    stage: &str,
+    content_may_have_changed: bool,
+) -> Error {
+    let reason = error.to_string();
+    let mut response = fs_error(error);
+    response.message = format!(
+        "Failed to {stage} ({}): {reason}{}",
+        path.display(),
+        if content_may_have_changed {
+            "; file content may have changed partially"
+        } else {
+            ""
+        }
+    );
+    response.data = Some(
+        json!({"path": path, "stage": stage, "reason": reason, "contentMayHaveChanged": content_may_have_changed}),
+    );
+    response
+}
+
 fn fs_error(error: std::io::Error) -> Error {
     if error.kind() == std::io::ErrorKind::NotFound {
         Error::resource_not_found(None).data(error.to_string())
@@ -746,6 +775,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(request_error_data(error).contains("regular file"));
+    }
+
+    #[tokio::test]
+    async fn write_errors_identify_path_stage_and_possible_partial_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let fs = WorkspaceFileSystem::new(directory.path(), false, &[]).unwrap();
+        let path = directory.path().join("missing/file.txt");
+        let error = fs
+            .write(WriteTextFileRequest::new("session", &path, "text"))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("resolve parent directory"));
+        assert_eq!(error.data.as_ref().unwrap()["contentMayHaveChanged"], false);
+        assert!(!path.parent().unwrap().exists());
+        let partial = write_error(
+            std::io::Error::from_raw_os_error(28),
+            &path,
+            "write content",
+            true,
+        );
+        assert!(partial.message.contains("partially"));
+        assert_eq!(
+            partial.data.as_ref().unwrap()["path"],
+            path.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            partial.data.as_ref().unwrap()["contentMayHaveChanged"],
+            true
+        );
     }
 
     #[tokio::test]
