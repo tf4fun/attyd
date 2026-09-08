@@ -1920,18 +1920,27 @@ button { color: inherit; }
   .browse-panel { padding: 30px 18px 40px; }
   .thread-agent-icon { display: none; }
   .thread-heading h1 { max-width: none; }
-  .session-header { width: calc(100% - 36px); margin-top: 20px; padding-bottom: 18px; }
-  .session-header > .page-navigation { margin-bottom: 20px; }
-  .session-header-main { flex-direction: column; align-items: stretch; gap: 16px; }
-  .session-header h1 { font-size: 23px; }
-  .session-header-actions { justify-content: flex-end; gap: 8px; }
+  .session-header {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px;
+    width: calc(100% - 24px); margin-top: 8px; padding-bottom: 8px;
+  }
+  .session-header > .page-navigation { grid-area: 1 / 1; margin-bottom: 0; gap: 8px; }
+  .session-header .workspace-breadcrumbs > a:first-child,
+  .session-header .workspace-breadcrumbs > svg { display: none; }
+  .session-header-main { display: contents; }
+  .session-header .thread-heading { grid-area: 2 / 1 / auto / -1; }
+  .session-header h1 { font-size: 17px; line-height: 24px; letter-spacing: -.02em; }
+  .session-header-actions { grid-area: 1 / 2; gap: 6px; }
   .session-header .thread-heading > div:last-child { width: 100%; }
-  .session-title-row, .session-switcher, .agent-details { position: static; }
+  .session-header .thread-heading > div:last-child > span { display: none; }
+  .session-header .session-switcher > summary { width: 32px; height: 32px; }
+  .session-title-row, .session-switcher, .agent-details, .session-header .thread-actions { position: static; }
   .session-switcher-panel, .agent-details-body { position: absolute; top: calc(100% + 12px); left: 0; right: 0; width: auto; max-height: min(55dvh, 440px, var(--menu-space, 55dvh)); }
+  .session-header .thread-actions > div { top: calc(100% + 12px); right: 0; }
   .project-browser-navigation { margin-bottom: 24px; }
   .workspace-breadcrumbs { font-size: 12px; }
   .thread-search-bar { width: calc(100% - 36px); }
-  .composer.composer-expanded { inset: var(--session-heading-end, 224px) 10px 12px; }
+  .composer.composer-expanded { inset: var(--session-heading-end, 104px) 10px 12px; }
   .workspace-breadcrumbs { gap: 7px; }
   .project-browser-header { gap: 18px; margin-bottom: 22px; }
   .project-browser-header h1 { font-size: 27px; }
