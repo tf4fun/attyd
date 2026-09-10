@@ -999,6 +999,7 @@ impl BridgeHub {
         self.stopped.notify_waiters();
     }
 
+    #[cfg(test)]
     async fn session_view(
         &self,
         session_id: String,
@@ -2179,6 +2180,8 @@ async fn static_asset(uri: Uri) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type.as_ref())
+        .header(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")
+        .header(header::X_FRAME_OPTIONS, "DENY")
         .body(Body::from(asset.data))
         .expect("valid embedded asset response")
 }

@@ -137,11 +137,6 @@ impl TerminalManager {
         incarnation: u64,
     ) -> Result<CreateTerminalResponse, Error> {
         validate_create_request(&request)?;
-        if self.terminals.lock().await.len() >= MAX_TERMINALS {
-            return Err(
-                Error::invalid_request().data(format!("terminal limit reached ({MAX_TERMINALS})"))
-            );
-        }
         let cwd = self
             .filesystem
             .checked_directory(request.cwd.as_deref())
@@ -152,11 +147,20 @@ impl TerminalManager {
             .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTES)
             .min(MAX_TERMINAL_OUTPUT_BYTES);
 
+        // Admission, process creation, and registration share one critical
+        // section, including managers scoped to different workspaces.
+        let mut terminals = self.terminals.lock().await;
+        if terminals.len() >= MAX_TERMINALS {
+            return Err(
+                Error::invalid_request().data(format!("terminal limit reached ({MAX_TERMINALS})"))
+            );
+        }
         let mut process = spawn_command(&request, &cwd).map_err(terminal_spawn_error)?;
         let stdout = process.child.stdout.take();
         let stderr = process.child.stderr.take();
         let reader_count = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
         let id = Uuid::new_v4().to_string();
+        let (kill_tx, kill_rx) = oneshot::channel();
         let terminal = Arc::new(Terminal {
             id: id.clone(),
             session_id: request.session_id.0.to_string(),
@@ -164,16 +168,12 @@ impl TerminalManager {
             output_limit,
             state: Mutex::new(TerminalState::default()),
             changed: Notify::new(),
-            kill: Mutex::new(None),
+            kill: Mutex::new(Some(kill_tx)),
             readers_remaining: AtomicUsize::new(reader_count),
             reader_tasks: Mutex::new(Vec::with_capacity(reader_count)),
         });
-        let (kill_tx, kill_rx) = oneshot::channel();
-        *terminal.kill.lock().await = Some(kill_tx);
-        self.terminals
-            .lock()
-            .await
-            .insert(id.clone(), terminal.clone());
+        terminals.insert(id.clone(), terminal.clone());
+        drop(terminals);
 
         let mut reader_tasks = Vec::with_capacity(reader_count);
         if let Some(stdout) = stdout {
@@ -1359,6 +1359,60 @@ mod tests {
             "recovered"
         );
         terminals.close_all().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_terminal_creation_respects_capacity_and_release_restores_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (terminals, _events) = manager(root.path());
+            let other =
+                terminals.in_workspace(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
+            // Hold filesystem work until all requests are in flight, so the
+            // admission race is exercised independently of disk/scheduler speed.
+            let (resume, paused) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || paused.recv().unwrap());
+            let mut requests = (0..MAX_TERMINALS + 1)
+                .map(|index| {
+                    let manager = if index % 2 == 0 { &terminals } else { &other };
+                    Box::pin(create_terminal(
+                        manager,
+                        CreateTerminalRequest::new(format!("session-{index}"), "true"),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for request in &mut requests {
+                assert!(futures::poll!(request.as_mut()).is_pending());
+            }
+            resume.send(()).unwrap();
+            blocker.await.unwrap();
+            let results = futures::future::join_all(requests).await;
+            let accepted = results.iter().filter(|result| result.is_ok()).count();
+            let rejected = results.iter().filter_map(|result| result.as_ref().err());
+            terminals.close_all().await;
+            assert_eq!(accepted, MAX_TERMINALS);
+            for error in rejected {
+                assert!(
+                    error
+                        .data
+                        .as_ref()
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .contains("terminal limit reached")
+                );
+            }
+            create_terminal(&other, CreateTerminalRequest::new("recovered", "true"))
+                .await
+                .expect("closing terminals must restore capacity across manager clones");
+            other.close_all().await;
+        });
     }
 
     #[cfg(unix)]

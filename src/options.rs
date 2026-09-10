@@ -27,7 +27,7 @@ impl Transport {
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "attyd",
-    version,
+    version = crate::VERSION,
     about = "Expose an ACP agent as a web workspace",
     trailing_var_arg = true,
     disable_help_subcommand = true
@@ -184,6 +184,14 @@ fn absolute_or_resolve(value: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_build_version_without_an_agent_command() {
+        let result = Options::try_parse_from(["attyd", "--version"]).unwrap_err();
+        assert_eq!(result.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(result.to_string(), format!("attyd {}\n", crate::VERSION));
+        assert!(!result.use_stderr());
+    }
 
     #[test]
     fn accepts_all_signed_unobserved_timeout_policies() {

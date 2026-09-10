@@ -21,6 +21,11 @@ use clap::Parser;
 use options::Options;
 use tracing_subscriber::EnvFilter;
 
+const VERSION: &str = match option_env!("ATTYD_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()

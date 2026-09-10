@@ -2056,8 +2056,7 @@ where
             let initialize = InitializeRequest::new(ProtocolVersion::V1)
                 .client_capabilities(client_capabilities(&options))
                 .client_info(
-                    Implementation::new("attyd", env!("CARGO_PKG_VERSION"))
-                        .title("attyd web client"),
+                    Implementation::new("attyd", crate::VERSION).title("attyd web client"),
                 );
             let response = connection.send_request(initialize).block_task().await?;
             ensure_relay_size(&response, "initialize response")?;

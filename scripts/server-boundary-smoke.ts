@@ -50,6 +50,25 @@ try {
   const list = () => fetch(`${origin}/api/v1/sessions`);
   assert.equal((await list()).status, 200);
 
+  // Iframe navigations can omit Origin, so request-origin checks alone cannot
+  // prevent another site from presenting the Agent controls inside a frame.
+  const documentPaths = ["/", "/index.html", "/projects/%2Fworkspace/sessions/frame-regression"];
+  const framingHeaders = [];
+  for (const path of documentPaths) {
+    const response = await fetch(`${origin}${path}`);
+    assert.equal(response.status, 200, `HTML navigation must work at ${path}`);
+    assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/u);
+    await response.text();
+    framingHeaders.push({
+      path,
+      csp: response.headers.get("content-security-policy"),
+      xFrameOptions: response.headers.get("x-frame-options"),
+    });
+  }
+  assert.deepEqual(framingHeaders, documentPaths.map((path) => ({
+    path, csp: "frame-ancestors 'none'", xFrameOptions: "DENY",
+  })), "entry HTML and SPA routes must deny framing even without Origin");
+
   for (const attackOrigin of ["http://127.0.0.1:1", "https://evil.example", "null"]) {
     const attack = await fetch(`${origin}/api/v1/auth/logout`, {
       method: "POST",

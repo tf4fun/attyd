@@ -23,6 +23,7 @@ tenant isolation. It binds to loopback by default. Host and browser Origin check
 reduce DNS-rebinding and cross-origin exposure; `--allowed-origin` supports
 explicit proxy origins and does not authenticate users. Protect non-local
 deployments with a trusted network boundary or authenticated reverse proxy.
+Embedding the web interface in an iframe is unsupported and blocked by response headers.
 
 Configured filesystem roots and `--read-only` apply to attyd's client operations.
 They do not sandbox Agent processes, MCP providers, or terminal commands. ACP

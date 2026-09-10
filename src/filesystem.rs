@@ -156,10 +156,10 @@ impl WorkspaceFileSystem {
         }
         ensure_not_cancelled(cancellation)?;
         let lexical = self.checked_lexical_path(&request.path)?;
-        let target = match tokio::fs::canonicalize(&lexical).await {
+        let (target, create_new) = match tokio::fs::canonicalize(&lexical).await {
             Ok(existing) => {
                 self.assert_canonical_within(&existing)?;
-                existing
+                (existing, false)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let parent = lexical.parent().ok_or_else(|| {
@@ -169,9 +169,12 @@ impl WorkspaceFileSystem {
                     write_error(error, &request.path, "resolve parent directory", false)
                 })?;
                 self.assert_canonical_within(&canonical_parent)?;
-                canonical_parent.join(lexical.file_name().ok_or_else(|| {
-                    Error::invalid_params().data("ACP file write target has no file name")
-                })?)
+                (
+                    canonical_parent.join(lexical.file_name().ok_or_else(|| {
+                        Error::invalid_params().data("ACP file write target has no file name")
+                    })?),
+                    true,
+                )
             }
             Err(error) => return Err(write_error(error, &request.path, "resolve target", false)),
         };
@@ -179,9 +182,26 @@ impl WorkspaceFileSystem {
         // Once an in-place write begins it must finish, otherwise the peer could leave
         // a previously valid file truncated or partially written.
         ensure_not_cancelled(cancellation)?;
-        let mut file = tokio::fs::File::create(target)
+        // NotFound can also mean a dangling symlink. Exclusive creation never
+        // follows that link or overwrites a target created since validation.
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(!create_new)
+            .create_new(create_new)
+            .open(target)
             .await
-            .map_err(|error| write_error(error, &request.path, "open or truncate file", true))?;
+            .map_err(|error| {
+                write_error(
+                    error,
+                    &request.path,
+                    if create_new {
+                        "create new file"
+                    } else {
+                        "open or truncate file"
+                    },
+                    !create_new,
+                )
+            })?;
         file.write_all(request.content.as_bytes())
             .await
             .map_err(|error| write_error(error, &request.path, "write content", true))?;
@@ -1015,6 +1035,50 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_dangling_symlink_writes_without_creating_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("must-not-exist.txt");
+        let link = directory.path().join("dangling.txt");
+        symlink(&target, &link).unwrap();
+        let fs = WorkspaceFileSystem::new(directory.path(), false, &[]).unwrap();
+
+        let error = fs
+            .write(WriteTextFileRequest::new(
+                "session",
+                &link,
+                "must not escape",
+            ))
+            .await
+            .unwrap_err();
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(
+            error.data.as_ref().unwrap()["path"],
+            link.to_string_lossy().as_ref()
+        );
+        assert_eq!(error.data.as_ref().unwrap()["stage"], "create new file");
+        assert_eq!(error.data.as_ref().unwrap()["contentMayHaveChanged"], false);
+
+        // A rejected write must not prevent ordinary new files or in-place
+        // writes through existing workspace-local symbolic links.
+        let local = directory.path().join("local.txt");
+        fs.write(WriteTextFileRequest::new("session", &local, "created"))
+            .await
+            .unwrap();
+        let local_link = directory.path().join("local-link.txt");
+        symlink(&local, &local_link).unwrap();
+        fs.write(WriteTextFileRequest::new("session", &local_link, "updated"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), "updated");
+        assert_eq!(std::fs::read_link(&local_link).unwrap(), local);
     }
 
     #[cfg(unix)]

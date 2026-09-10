@@ -32,6 +32,14 @@ npm run build
 `target/release/attyd` embeds the frontend assets. Keep the Agent and any tools it
 needs available on the machine where you run it.
 
+For GitHub releases, push a `v<SemVer>` tag: `v1.2.0` produces an executable whose
+`--version` reports `attyd 1.2.0`; `v1.2.0-rc.1` produces a prerelease reporting
+`attyd 1.2.0-rc.1`. CI validates the tag and injects its version during compilation,
+without changing package manifests or lockfiles. You do not need to bump the
+Cargo/npm versions for each tag. The ACP client identification uses the same version.
+Local and branch builds use the development version in `Cargo.toml` by default;
+`ATTYD_BUILD_VERSION` can override it at build time, not when running the executable.
+
 ## Remote agents
 
 attyd supports Streamable HTTP/SSE and WebSocket endpoints through the pinned
