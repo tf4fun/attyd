@@ -2052,6 +2052,7 @@ where
 
     builder
         .connect_with(transport, async move |connection| {
+            let _auth_terminal_cleanup = auth_terminal.close_on_drop();
             sink.send(json!({ "type": "bridge/phase", "phase": "initializing" }));
             let initialize = InitializeRequest::new(ProtocolVersion::V1)
                 .client_capabilities(client_capabilities(&options))
@@ -2387,7 +2388,6 @@ where
                 terminals.close_all().await;
             }
             mcp.close_all().await;
-            auth_terminal.close();
             Ok(())
         })
         .await

@@ -26,6 +26,14 @@ pub struct AuthTerminalManager {
     events: EventSender,
 }
 
+struct AuthTerminalCleanup<'a>(&'a AuthTerminalManager);
+
+impl Drop for AuthTerminalCleanup<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 struct ActiveAuthTerminal {
     request_id: String,
     method_id: String,
@@ -98,13 +106,15 @@ impl AuthTerminalManager {
             failure: Mutex::new(None),
         });
         *self.active.lock().map_err(lock_error)? = Some(active.clone());
-        self.spawn_reader(active.clone(), reader);
-        self.spawn_waiter(active, child);
+        // Publish the lifecycle boundary before either blocking worker can
+        // publish output or completion, even if the process exits immediately.
         self.send(json!({
             "type": "bridge/auth_terminal_started",
             "requestId": request_id,
             "methodId": method.id,
         }));
+        self.spawn_reader(active.clone(), reader);
+        self.spawn_waiter(active, child);
         Ok(())
     }
 
@@ -155,6 +165,12 @@ impl AuthTerminalManager {
                 let _ = killer.kill();
             }
         }
+    }
+
+    /// Keep this guard in the owning connection scope, not in reader/waiter clones.
+    #[must_use]
+    pub fn close_on_drop(&self) -> impl Drop + '_ {
+        AuthTerminalCleanup(self)
     }
 
     fn require_active(&self, request_id: &str) -> Result<Arc<ActiveAuthTerminal>, Error> {
@@ -358,12 +374,40 @@ mod tests {
         receiver: &mut mpsc::UnboundedReceiver<String>,
         event_type: &str,
     ) -> Value {
-        loop {
-            let event = next_event(receiver).await;
-            if event["type"] == event_type {
-                return event;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = next_event(receiver).await;
+                if event["type"] == event_type {
+                    return event;
+                }
             }
-        }
+        })
+        .await
+        .expect("timed out waiting for the expected auth terminal event")
+    }
+
+    async fn output_until(
+        receiver: &mut mpsc::UnboundedReceiver<String>,
+        expected: &str,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = String::new();
+            loop {
+                let event = next_event(receiver).await;
+                assert_ne!(
+                    event["type"], "bridge/auth_terminal_exited",
+                    "auth terminal exited before {expected:?}; output={output:?}; event={event}"
+                );
+                if event["type"] == "bridge/auth_terminal_output" {
+                    output.push_str(event["data"].as_str().unwrap());
+                    if output.contains(expected) {
+                        return output;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for complete auth terminal output")
     }
 
     #[cfg(unix)]
@@ -371,6 +415,7 @@ mod tests {
     async fn appends_agent_arguments_and_environment_to_base_invocation() {
         let (events, mut receiver) = mpsc::unbounded_channel();
         let manager = AuthTerminalManager::new(events);
+        let _cleanup = manager.close_on_drop();
         let login = method(json!({
             "id": "terminal-login",
             "name": "Terminal login",
@@ -395,15 +440,10 @@ mod tests {
             )
             .unwrap();
 
-        let started = event_of_type(&mut receiver, "bridge/auth_terminal_started").await;
+        let started = next_event(&mut receiver).await;
+        assert_eq!(started["type"], "bridge/auth_terminal_started");
         assert_eq!(started["requestId"], "auth");
-        let output = event_of_type(&mut receiver, "bridge/auth_terminal_output").await;
-        assert!(
-            output["data"]
-                .as_str()
-                .unwrap()
-                .contains("base-arg|terminal-arg:method-env>")
-        );
+        output_until(&mut receiver, "base-arg|terminal-arg:method-env>").await;
         manager.resize("auth", 100, 30).unwrap();
         manager.write("auth", "ok\n").unwrap();
         let exited = event_of_type(&mut receiver, "bridge/auth_terminal_exited").await;
@@ -417,6 +457,7 @@ mod tests {
     async fn reports_cancellation_and_rejects_stale_input() {
         let (events, mut receiver) = mpsc::unbounded_channel();
         let manager = AuthTerminalManager::new(events);
+        let _cleanup = manager.close_on_drop();
         let login = method(json!({
             "id": "terminal-login",
             "name": "Terminal login",
@@ -436,11 +477,122 @@ mod tests {
                 24,
             )
             .unwrap();
-        event_of_type(&mut receiver, "bridge/auth_terminal_started").await;
+        assert_eq!(
+            next_event(&mut receiver).await["type"],
+            "bridge/auth_terminal_started"
+        );
         manager.cancel("cancel-auth").unwrap();
         let exited = event_of_type(&mut receiver, "bridge/auth_terminal_exited").await;
         assert_eq!(exited["status"], "cancelled");
         assert!(manager.write("cancel-auth", "late").is_err());
+    }
+
+    #[tokio::test]
+    async fn collects_authentication_output_across_pty_chunks() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        for data in ["base-", "arg|terminal-arg:", "method-env>"] {
+            events
+                .send(
+                    json!({
+                        "type": "bridge/auth_terminal_output",
+                        "data": data,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+        drop(events);
+        assert_eq!(
+            output_until(&mut receiver, "base-arg|terminal-arg:method-env>").await,
+            "base-arg|terminal-arg:method-env>"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publishes_started_before_immediate_output_and_exit() {
+        for _ in 0..32 {
+            let (events, mut receiver) = mpsc::unbounded_channel();
+            let manager = AuthTerminalManager::new(events);
+            let _cleanup = manager.close_on_drop();
+            manager
+                .start(
+                    "immediate-auth".into(),
+                    method(json!({ "id": "login", "name": "Login", "type": "terminal" })),
+                    &["/bin/sh".into(), "-c".into(), "printf ready".into()],
+                    Path::new("/tmp"),
+                    80,
+                    24,
+                )
+                .unwrap();
+            let first = next_event(&mut receiver).await;
+            assert_eq!(first["type"], "bridge/auth_terminal_started");
+            assert_eq!(first["requestId"], "immediate-auth");
+            assert_eq!(
+                event_of_type(&mut receiver, "bridge/auth_terminal_exited").await["status"],
+                "succeeded"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_unwind_closes_authentication_and_allows_runtime_shutdown() {
+        const CHILD_ENV: &str = "ATTYD_TEST_AUTH_OWNER_UNWIND";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // A broken cleanup must fail this regression, not hang the CI runtime.
+            assert_cmd::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "auth_terminal::tests::owner_unwind_closes_authentication_and_allows_runtime_shutdown", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .timeout(Duration::from_secs(15))
+                .assert()
+                .success();
+            return;
+        }
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (events, mut receiver) = mpsc::unbounded_channel();
+            let manager = AuthTerminalManager::new(events);
+            let result = AssertUnwindSafe(async {
+                let _cleanup = manager.close_on_drop();
+                manager
+                    .start(
+                        "unwind-auth".into(),
+                        method(json!({ "id": "login", "name": "Login", "type": "terminal" })),
+                        &[
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            "printf ready; read answer".into(),
+                        ],
+                        Path::new("/tmp"),
+                        80,
+                        24,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    next_event(&mut receiver).await["type"],
+                    "bridge/auth_terminal_started"
+                );
+                output_until(&mut receiver, "ready").await;
+                panic!("simulate an assertion failure before terminal input");
+            })
+            .catch_unwind()
+            .await;
+            assert_eq!(
+                result.unwrap_err().downcast_ref::<&str>(),
+                Some(&"simulate an assertion failure before terminal input")
+            );
+            let exited = event_of_type(&mut receiver, "bridge/auth_terminal_exited").await;
+            assert_eq!(exited["status"], "cancelled");
+            assert!(manager.write("unwind-auth", "late").is_err());
+        });
+        drop(runtime);
     }
 
     #[test]
