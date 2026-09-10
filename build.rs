@@ -3,6 +3,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEV");
+    if env::var_os("CARGO_FEATURE_DEV").is_some() {
+        // Development serves the frontend through Vite. Do not watch frontend
+        // sources here: changing them must not invalidate the Rust build.
+        return;
+    }
+
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let client_index = manifest.join("dist/client/index.html");
 
@@ -11,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=package.json");
     println!("cargo:rerun-if-changed=package-lock.json");
     println!("cargo:rerun-if-changed=vite.config.ts");
+    println!("cargo:rerun-if-changed=scripts/dev-options.ts");
     println!("cargo:rerun-if-env-changed=ATTYD_SKIP_WEB_BUILD");
 
     if env::var_os("ATTYD_SKIP_WEB_BUILD").is_some() && client_index.is_file() {

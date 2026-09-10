@@ -72,9 +72,57 @@ npm ci
 npm run dev -- -- your-agent acp
 ```
 
-Replace `your-agent acp` with your installed Agent's command. This builds the
-frontend and Rust host, then serves the workspace at `http://127.0.0.1:7331`.
+Replace `your-agent acp` with your installed Agent's command. This starts Vite,
+builds the Rust host with the `dev` feature, then serves the workspace at
+`http://127.0.0.1:7331`. Frontend assets are loaded from Vite without bundling or
+embedding them into Rust.
 Pass the Agent command explicitly; attyd does not choose or install one for you.
+
+## Local development
+
+`npm run dev -- -- your-agent acp` manages both development processes. Open the
+**attyd URL** (`http://127.0.0.1:7331` by default), where API requests stay with Rust
+and frontend requests, including the hot-update WebSocket, are proxied to Vite.
+React and CSS changes update without restarting Rust. Restart the command after
+Rust changes; Cargo reuses unchanged build artifacts. Ctrl+C stops both processes.
+
+Vite listens on `127.0.0.1:5173`. An occupied port is an error. Set `ATTYD_DEV_PORT`
+to choose another port between `1` and `65535`:
+
+```bash
+ATTYD_DEV_PORT=5180 npm run dev -- --port 7334 -- your-agent acp
+```
+
+In PowerShell, set `$env:ATTYD_DEV_PORT = "5180"` before running the npm command.
+The frontend port and attyd's `--port` are independent.
+
+For separate terminals, start Vite first, then point attyd at it:
+
+```bash
+# Terminal 1
+npm run dev:client -- --port 5180
+
+# Terminal 2
+cargo run --features dev -- --dev-server http://127.0.0.1:5180 -- your-agent acp
+```
+
+After the initial compilation, you can also launch the development binary directly:
+
+```bash
+./target/debug/attyd --dev-server http://127.0.0.1:5180 -- your-agent acp
+```
+
+Use the executable path reported by Cargo if you configured another target
+directory; on Windows the filename is `attyd.exe`. The one-command runner resolves
+that path automatically. To reuse an existing frontend server with the runner,
+pass `npm run dev -- --dev-server http://127.0.0.1:5180 -- your-agent acp`; stopping
+the runner leaves that externally managed server running.
+
+`--dev-server` takes an HTTP origin, without a path, query, or credentials; use a
+trusted local development server. HTTPS upstreams are not supported.
+The `dev` Cargo feature skips frontend build and embedding, so that binary requires
+`--dev-server` to serve the interface. Normal `npm run build` builds and embeds the
+production frontend as before; development mode adds no release runtime dependency.
 
 ## Release binaries
 
@@ -156,6 +204,7 @@ Place attyd options before `--` and the Agent command or endpoint after it.
 | --- | --- |
 | `-H, --host <address>` | Bind address; defaults to `127.0.0.1`. |
 | `-p, --port <port>` | HTTP port; defaults to `7331`. |
+| `--dev-server <origin>` | Proxy frontend HTTP and hot updates to a local Vite server; API requests stay with attyd. See [local development](#local-development). |
 | `-c, --cwd <path>` | Default stdio session directory and configured local filesystem root; defaults to the launch directory. |
 | `-t, --transport <transport>` | `stdio` (default), `http` (Streamable HTTP/SSE), or `ws`. |
 | `--add-dir <path>` | Additional stdio workspace root; repeatable and unavailable with remote transports. |

@@ -24,6 +24,7 @@ drivers; there is no second backend implementation.
 | Release metadata | `python3 tests/release-metadata.test.py` | Validates tag-derived versions, prerelease classification, branch fallback, and rejection of invalid or injected workflow values; requires Python 3.11+ and runs in CI before artifact builds |
 | Release packaging | `python3 tests/package-release.test.py` | Verifies all seven target filenames, tar/zip contents, executable permissions, checksums, and failure on missing release inputs; runs on every binary runner |
 | Browser interaction | `npm run test:browser` | Runs the production Rust host with the fake Agent and verifies Zed-style Agent interaction and mobile behavior in Chromium |
+| Frontend development proxy | `npx playwright test dev-server.pw.ts` | Uses the built Rust host with Vite; verifies same-origin HMR, React/CSS updates, preserved drafts and sessions, API/SSE routing, and upstream failure handling |
 | Optional backend example | `npm run test:goose` | Diagnostic smoke for a separately installed Goose executable at `bin/goose`; not a protocol conformance gate |
 
 `npm run check` runs type checking, frontend/shared tests, and the production client build. CI
@@ -38,6 +39,7 @@ Windows x86_64 runners. Every target checks `--version`, runs the standalone
 HTTP/assets smoke, and packages license materials before release. The complete
 backend and browser suites run on Linux; binary smoke coverage does not imply
 identical OS-specific terminal behavior. See [terminal semantics](usage.md#terminal-command-semantics).
+CI also checks the `dev` Cargo feature, which compiles without embedded frontend assets.
 Some test commands above use POSIX shell syntax and Unix-specific fixtures;
 run those suites on Linux or macOS. Windows CI validates the native build and
 standalone executable.
@@ -48,12 +50,21 @@ To explore the interface without installing an Agent or configuring a model prov
 
 ```bash
 npm ci
+npm run dev -- -- node --import tsx tests/fixtures/fake-agent.ts
+```
+
+Open `http://127.0.0.1:7331`. Frontend edits update through Vite without rebuilding
+the Rust host; see [local development](usage.md#local-development). For testing the
+embedded production bundle and configured MCP fixture instead:
+
+```bash
 npm run build:client
 ATTYD_SKIP_WEB_BUILD=1 cargo build --locked
 npm run test:browser:serve -- 7332
 ```
 
-Open `http://127.0.0.1:7332`, create a project, and send one of these fixture prompts:
+Open `http://127.0.0.1:7332` for the embedded fixture. In either instance, create a
+project and send one of these fixture prompts:
 
 | Prompts | Behavior |
 | --- | --- |

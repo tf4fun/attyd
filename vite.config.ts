@@ -1,9 +1,16 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath } from "node:url";
+import { devPort } from "./scripts/dev-options";
 
-export default defineConfig({
-  root: "web",
+export default defineConfig(({ command }) => ({
+  root: fileURLToPath(new URL("./web", import.meta.url)),
   plugins: [react()],
+  server: {
+    host: "127.0.0.1",
+    port: command === "serve" ? devPort(process.env.ATTYD_DEV_PORT) : undefined,
+    strictPort: true,
+  },
   build: {
     outDir: "../dist/client",
     emptyOutDir: true,
@@ -18,4 +25,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

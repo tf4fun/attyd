@@ -7,13 +7,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
+#[cfg(any(test, not(feature = "dev")))]
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+#[cfg(not(feature = "dev"))]
+use axum::http::Method;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+#[cfg(not(feature = "dev"))]
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::json;
@@ -25,6 +29,7 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::bridge;
+use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventQueueLimits, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
 use crate::runtime_cache::ActiveRuntimeProjection;
@@ -39,6 +44,7 @@ const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
 const BRIDGE_EVENT_QUEUE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
 const BRIDGE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(not(feature = "dev"))]
 #[derive(RustEmbed)]
 #[folder = "dist/client/"]
 struct ClientAssets;
@@ -1200,15 +1206,76 @@ async fn forward_generation_events(
 
 pub async fn serve(options: Options) -> Result<()> {
     let options = Arc::new(options.normalized().map_err(anyhow::Error::msg)?);
+    #[cfg(feature = "dev")]
+    if options.dev_server.is_none() {
+        anyhow::bail!(
+            "this development build requires --dev-server <http://host:port>; use a normal build for embedded frontend assets"
+        );
+    }
     if options.transport == crate::options::Transport::Stdio {
         std::env::set_current_dir(&options.cwd).with_context(|| {
             format!("failed to enter Agent workspace {}", options.cwd.display())
         })?;
     }
     let address = SocketAddr::new(options.host, options.port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind http://{address}"))?;
+    let actual = listener.local_addr()?;
+    if let Some(origin) = &options.dev_server {
+        reject_self_proxy(origin, actual).await?;
+    }
     let bridge = BridgeHub::new(options.clone());
     bridge.ensure_runtime().await;
-    let app = Router::new()
+    let app = app_router(&options, bridge.clone());
+
+    println!("attyd listening on http://{actual}");
+    if let Some(origin) = &options.dev_server {
+        println!("frontend development server: {origin}");
+    }
+    println!(
+        "agent ({}): {}",
+        options.transport.as_str(),
+        options.command.join(" ")
+    );
+    if options.transport == crate::options::Transport::Stdio {
+        println!("default Agent workspace: {}", options.cwd.display());
+    } else {
+        println!("Agent workspace: selected per new thread in the web UI");
+    }
+
+    let http_shutdown = CancellationToken::new();
+    let server = async {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(http_shutdown.clone().cancelled_owned())
+            .await
+    };
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => {
+            bridge.shutdown().await;
+            result.context("HTTP server failed")
+        }
+        _ = shutdown_signal() => {
+            http_shutdown.cancel();
+            let ((), result) = tokio::join!(
+                bridge.shutdown(),
+                tokio::time::timeout(HTTP_SHUTDOWN_GRACE_PERIOD, &mut server),
+            );
+            match result {
+                Ok(result) => result.context("HTTP server failed"),
+                Err(_) => {
+                    tracing::warn!("HTTP drain deadline reached; closing remaining connections");
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
+    let dev_proxy = options.dev_server.as_deref().map(DevProxy::new);
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/v1/runtime", get(get_runtime))
         .route("/api/v1/events", get(global_events))
@@ -1257,7 +1324,7 @@ pub async fn serve(options: Options) -> Result<()> {
             post(respond_to_interaction),
         )
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
-        .fallback(get(static_asset))
+        .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(bridge::MAX_BRIDGE_MESSAGE_BYTES))
         .layer(CompressionLayer::new())
@@ -1268,53 +1335,7 @@ pub async fn serve(options: Options) -> Result<()> {
             },
             enforce_origin,
         ))
-        .with_state(AppState {
-            bridge: bridge.clone(),
-        });
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .with_context(|| format!("failed to bind http://{address}"))?;
-    let actual = listener.local_addr()?;
-
-    println!("attyd listening on http://{actual}");
-    println!(
-        "agent ({}): {}",
-        options.transport.as_str(),
-        options.command.join(" ")
-    );
-    if options.transport == crate::options::Transport::Stdio {
-        println!("default Agent workspace: {}", options.cwd.display());
-    } else {
-        println!("Agent workspace: selected per new thread in the web UI");
-    }
-
-    let http_shutdown = CancellationToken::new();
-    let server = async {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(http_shutdown.clone().cancelled_owned())
-            .await
-    };
-    tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => {
-            bridge.shutdown().await;
-            result.context("HTTP server failed")
-        }
-        _ = shutdown_signal() => {
-            http_shutdown.cancel();
-            let ((), result) = tokio::join!(
-                bridge.shutdown(),
-                tokio::time::timeout(HTTP_SHUTDOWN_GRACE_PERIOD, &mut server),
-            );
-            match result {
-                Ok(result) => result.context("HTTP server failed"),
-                Err(_) => {
-                    tracing::warn!("HTTP drain deadline reached; closing remaining connections");
-                    Ok(())
-                }
-            }
-        }
-    }
+        .with_state(AppState { bridge })
 }
 
 async fn shutdown_signal() {
@@ -2162,7 +2183,41 @@ fn session_event_position(event: &str) -> Option<(String, u64, u64)> {
     ))
 }
 
-async fn static_asset(uri: Uri) -> Response {
+async fn frontend(proxy: Option<DevProxy>, request: Request) -> Response {
+    if request.uri().path() == "/api" || request.uri().path().starts_with("/api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({ "error": "API route not found" })),
+        )
+            .into_response();
+    }
+    if let Some(proxy) = proxy {
+        return proxy.forward(request).await;
+    }
+    #[cfg(feature = "dev")]
+    {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Development builds require --dev-server",
+        )
+            .into_response()
+    }
+    #[cfg(not(feature = "dev"))]
+    {
+        if !matches!(*request.method(), Method::GET | Method::HEAD) {
+            return (
+                StatusCode::METHOD_NOT_ALLOWED,
+                [(header::ALLOW, "GET, HEAD")],
+            )
+                .into_response();
+        }
+        // Axum strips HEAD bodies after deriving the corresponding GET length.
+        static_asset(request.uri().clone()).await
+    }
+}
+
+#[cfg(not(feature = "dev"))]
+async fn static_asset(uri: axum::http::Uri) -> Response {
     let requested = uri.path().trim_start_matches('/');
     let path = if requested.is_empty() {
         "index.html"
@@ -2191,6 +2246,99 @@ mod tests {
     use super::*;
     use crate::runtime_state::{RuntimeLimits, RuntimeState};
     use clap::Parser;
+    use tower::ServiceExt;
+
+    #[cfg(not(feature = "dev"))]
+    #[tokio::test]
+    async fn embedded_frontend_head_keeps_the_get_content_length() {
+        let options = Options::try_parse_from(["attyd", "--", "fake-agent"]).unwrap();
+        let app = app_router(&options, BridgeHub::new(Arc::new(options.clone())));
+        let request = |method| {
+            Request::builder()
+                .method(method)
+                .uri("/")
+                .header(header::HOST, "localhost:7331")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let get = app.clone().oneshot(request("GET")).await.unwrap();
+        let head = app.oneshot(request("HEAD")).await.unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            get.headers()[header::CONTENT_LENGTH],
+            head.headers()[header::CONTENT_LENGTH]
+        );
+        assert_ne!(head.headers()[header::CONTENT_LENGTH], "0");
+        assert!(
+            axum::body::to_bytes(head.into_body(), 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "dev")]
+    #[tokio::test]
+    async fn development_build_requires_an_explicit_frontend_server() {
+        let options = Options::try_parse_from(["attyd", "--", "fake-agent"]).unwrap();
+        assert!(
+            serve(options)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("requires --dev-server")
+        );
+    }
+
+    #[tokio::test]
+    async fn development_proxy_keeps_api_routes_and_origin_checks_in_rust() {
+        let options = Options::try_parse_from([
+            "attyd",
+            "--dev-server",
+            "http://127.0.0.1:5173",
+            "--",
+            "fake-agent",
+        ])
+        .unwrap();
+        let app = app_router(&options, BridgeHub::new(Arc::new(options.clone())));
+        for (path, method, origin, expected) in [
+            ("/api/health", "GET", None, StatusCode::OK),
+            ("/api/health", "POST", None, StatusCode::METHOD_NOT_ALLOWED),
+            ("/api", "GET", None, StatusCode::NOT_FOUND),
+            ("/api/unknown", "GET", None, StatusCode::NOT_FOUND),
+            ("/api/unknown", "POST", None, StatusCode::NOT_FOUND),
+            (
+                "/api/health",
+                "GET",
+                Some("http://localhost:5173"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/src/app.tsx",
+                "GET",
+                Some("http://localhost:5173"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .uri(path)
+                .method(method)
+                .header(header::HOST, "localhost:7331");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+            if expected == StatusCode::NOT_FOUND {
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            }
+        }
+    }
 
     impl CanonicalProjection {
         fn update(&mut self, event: &str) -> bool {

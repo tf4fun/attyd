@@ -106,6 +106,8 @@ jobs:
         run: node --import tsx scripts/server-boundary-smoke.ts
       - name: Test ACP protocol integration
         run: node --import tsx scripts/acp-protocol-smoke.ts
+      - name: Check development build without embedded frontend
+        run: cargo check --locked --features dev
 
   coverage:
     needs: web-client

@@ -46,7 +46,9 @@ npm ci
 npm run dev -- -- your-agent acp
 ```
 
-The first run compiles the web interface and Rust host, then starts the server.
+The first run compiles the Rust host and starts Vite for the web interface.
+Frontend edits update immediately; restart the command after Rust changes.
+See [local development](docs/usage.md#local-development) for separate processes and custom ports.
 
 ### Run a compiled executable
 

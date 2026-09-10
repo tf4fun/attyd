@@ -41,6 +41,10 @@ pub struct Options {
     #[arg(short, long, default_value_t = 7331)]
     pub port: u16,
 
+    /// Proxy frontend requests and HMR to an HTTP development server (for example http://127.0.0.1:5173).
+    #[arg(long, value_parser = normalize_dev_server)]
+    pub dev_server: Option<String>,
+
     /// Explicit browser origin for a custom domain or HTTPS reverse proxy. May be repeated.
     #[arg(long = "allowed-origin", value_parser = normalize_origin)]
     pub allowed_origins: Vec<String>,
@@ -136,11 +140,29 @@ impl Options {
             .collect::<Result<_, _>>()?;
         self.allowed_origins.sort();
         self.allowed_origins.dedup();
+        self.dev_server = self
+            .dev_server
+            .as_deref()
+            .map(normalize_dev_server)
+            .transpose()?;
         let (mcp_servers, acp_mcp_providers) = load_mcp_configs(&self.mcp_configs)?;
         self.mcp_servers = mcp_servers;
         self.acp_mcp_providers = acp_mcp_providers;
         Ok(self)
     }
+}
+
+fn normalize_dev_server(value: &str) -> Result<String, String> {
+    let invalid = || {
+        "development server must be an HTTP origin with a nonzero port, without credentials, path, query, or fragment (for example http://127.0.0.1:5173)".to_string()
+    };
+    let origin =
+        normalize_origin(value.strip_suffix('/').unwrap_or(value)).map_err(|_| invalid())?;
+    let parsed = url::Url::parse(&origin).map_err(|_| invalid())?;
+    if parsed.scheme() != "http" || parsed.port_or_known_default() == Some(0) {
+        return Err(invalid());
+    }
+    Ok(origin)
 }
 
 pub(crate) fn normalize_origin(value: &str) -> Result<String, String> {
@@ -179,6 +201,39 @@ fn absolute_or_resolve(value: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_only_http_origins_for_the_frontend_development_server() {
+        for (input, expected) in [
+            ("http://localhost:5173", "http://localhost:5173"),
+            ("http://127.0.0.1:5173/", "http://127.0.0.1:5173"),
+            ("http://[::1]:5173/", "http://[::1]:5173"),
+            ("http://localhost:80", "http://localhost"),
+        ] {
+            let options =
+                Options::try_parse_from(["attyd", "--dev-server", input, "--", "agent"]).unwrap();
+            assert_eq!(options.dev_server.as_deref(), Some(expected));
+        }
+        for input in [
+            "https://localhost:5173",
+            "ws://localhost:5173",
+            "localhost:5173",
+            "http://localhost:0",
+            "http://user:pass@localhost:5173",
+            "http://localhost:5173/path",
+            "http://localhost:5173//",
+            "http://localhost:5173?x=1",
+            "http://localhost:5173#x",
+            "http://localhost:5173/../",
+            "http://localhost:5173\\",
+            " http://localhost:5173",
+        ] {
+            assert!(
+                Options::try_parse_from(["attyd", "--dev-server", input, "--", "agent"]).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
 
     #[test]
     fn serializes_default_and_explicit_current_workspaces_without_a_dot_suffix() {

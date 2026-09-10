@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "cargo run --",
+    "dev": "node --import tsx scripts/dev.ts",
+    "dev:client": "vite --host 127.0.0.1 --strictPort",
     "build:client": "vite build",
     "build": "npm run build:rust",
     "build:rust": "cargo build --release",

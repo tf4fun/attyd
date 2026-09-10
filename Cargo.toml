@@ -8,6 +8,7 @@ description = "Expose an ACP agent as a lightweight web workspace"
 
 [features]
 default = []
+dev = []
 
 [dependencies]
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "754d5aa1ce2cfa54ba2c2a6d3edc7e7b6bce28eb", features = ["unstable"] }
@@ -17,6 +18,8 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
+hyper = { version = "1.11", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 mime_guess = "2.0"
 portable-pty = "0.9"
 regex = "1.11"
@@ -41,6 +44,7 @@ tokio = { version = "1.47", features = ["test-util"] }
 assert_cmd = "2.0"
 tempfile = "3.20"
 tokio-tungstenite = "0.27"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

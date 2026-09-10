@@ -2,6 +2,7 @@ mod agent_process;
 mod auth_terminal;
 mod auto_close;
 mod bridge;
+mod dev_proxy;
 mod elicitation_validation;
 mod event_queue;
 mod filesystem;
