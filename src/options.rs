@@ -171,19 +171,66 @@ pub(crate) fn normalize_origin(value: &str) -> Result<String, String> {
 }
 
 fn absolute_or_resolve(value: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .map_err(|error| error.to_string())
-    }
+    // Normalize current-directory components without resolving symlinks or
+    // requiring the path to exist; keep platform-specific path semantics.
+    std::path::absolute(value).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serializes_default_and_explicit_current_workspaces_without_a_dot_suffix() {
+        let cwd = std::env::current_dir().unwrap();
+        let explicit = cwd.join(".").to_string_lossy().into_owned();
+        for args in [
+            vec!["attyd", "--", "agent"],
+            vec!["attyd", "--cwd", ".", "--", "agent"],
+            vec!["attyd", "--cwd", explicit.as_str(), "--", "agent"],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            // Path equality ignores `.` already; check the actual browser value.
+            assert_eq!(
+                serde_json::to_value(&options.cwd).unwrap(),
+                serde_json::to_value(&cwd).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_paths_before_creation_and_rejects_empty_path_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = directory.path().join("not-created");
+        let input = directory.path().join(".").join("not-created");
+        assert_eq!(
+            absolute_or_resolve(input.to_str().unwrap())
+                .unwrap()
+                .as_os_str(),
+            expected.as_os_str()
+        );
+        assert!(!expected.exists());
+        assert!(Options::try_parse_from(["attyd", "--cwd", "", "--", "agent"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_parent_components_that_can_traverse_symbolic_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("real/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&nested, directory.path().join("link")).unwrap();
+        let input = directory.path().join("link/./..");
+        let resolved = absolute_or_resolve(input.to_str().unwrap()).unwrap();
+        assert_eq!(
+            resolved.as_os_str(),
+            directory.path().join("link/..").as_os_str()
+        );
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            nested.parent().unwrap().canonicalize().unwrap()
+        );
+    }
 
     #[test]
     fn reports_build_version_without_an_agent_command() {
