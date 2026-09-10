@@ -18,6 +18,8 @@ the coding; attyd gives you a clear place to interact with it.
 
 Models and sign-in stay with your agent. Features such as attachments and saved sessions
 depend on its [ACP capabilities](docs/acp-coverage.md).
+The interface supports English and 简体中文, follows your browser by default, and lets you
+switch languages in Agent settings. [Contribute another language](docs/i18n.md).
 
 ## Get started
 

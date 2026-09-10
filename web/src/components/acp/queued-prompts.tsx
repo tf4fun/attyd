@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-react";
 import { assertNever } from "../../../../shared/exhaustive";
+import { useTranslation } from "../../i18n";
 
 export const MAX_QUEUED_PROMPTS = 8;
 
@@ -39,21 +40,24 @@ export function QueuedPrompts({
   onClear: () => void;
   onSendNow: (id: string) => void;
 }) {
+  const { t } = useTranslation("workspace");
   if (prompts.length === 0 && !error) return null;
   return (
-    <section className="queued-prompts" aria-label="Queued messages">
+    <section className="queued-prompts" aria-label={t("queue.label")}>
       <header>
-        <span><Clock3 size={12} /> {prompts.length} queued{paused ? " · paused" : ""}</span>
+        <span><Clock3 size={12} /> {paused
+          ? t("queue.pausedCount", { count: prompts.length })
+          : t("queue.count", { count: prompts.length })}</span>
         {prompts.length > 0 ? (
-          <button type="button" aria-label="Clear queued messages" onClick={onClear}>
-            <X size={11} /> Clear
+          <button type="button" aria-label={t("queue.clearLabel")} onClick={onClear}>
+            <X size={11} /> {t("queue.clear")}
           </button>
         ) : null}
       </header>
       {error ? <p role="alert">{error}</p> : null}
       <div className="queued-prompt-list">
         {prompts.map((prompt, index) => (
-          <article key={prompt.id} aria-label={`Queued message ${index + 1}`}>
+          <article key={prompt.id} aria-label={t("queue.messageLabel", { index: index + 1 })}>
             <span className="queue-index">{index + 1}</span>
             <div className="queued-prompt-preview">
               {prompt.blocks.map((block, blockIndex) => (
@@ -61,26 +65,26 @@ export function QueuedPrompts({
               ))}
             </div>
             <footer>
-              <span>{paused ? "Paused" : "Queued"}</span>
+              <span>{paused ? t("queue.paused") : t("queue.queued")}</span>
               <button
                 type="button"
-                aria-label={`Edit queued message ${index + 1}`}
-                title="Edit queued message"
+                aria-label={t("queue.editLabel", { index: index + 1 })}
+                title={t("queue.editTitle")}
                 onClick={() => onEdit(prompt)}
-              ><Pencil size={11} /> Edit</button>
+              ><Pencil size={11} /> {t("queue.edit")}</button>
               <button
                 type="button"
-                aria-label={`Send queued message ${index + 1} now`}
-                title="Cancel the current ACP turn, then send this message"
+                aria-label={t("queue.sendNowLabel", { index: index + 1 })}
+                title={t("queue.sendNowTitle")}
                 disabled={!canSendNow}
                 onClick={() => onSendNow(prompt.id)}
-              ><FastForward size={11} /> Send now</button>
+              ><FastForward size={11} /> {t("queue.sendNow")}</button>
               <button
                 type="button"
-                aria-label={`Remove queued message ${index + 1}`}
-                title="Remove queued message"
+                aria-label={t("queue.removeLabel", { index: index + 1 })}
+                title={t("queue.removeTitle")}
                 onClick={() => onRemove(prompt.id)}
-              ><Trash2 size={11} /> Remove</button>
+              ><Trash2 size={11} /> {t("queue.remove")}</button>
             </footer>
           </article>
         ))}

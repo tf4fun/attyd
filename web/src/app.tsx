@@ -1,3 +1,7 @@
+import type { TFunction } from "i18next";
+import { useTranslation } from "./i18n";
+import { translateHistoryNotice } from "./i18n/history-notice";
+import { LanguageSelector } from "./components/language-selector";
 import type { ContentBlock, SessionInfo, ToolCall } from "@agentclientprotocol/sdk";
 import {
   Activity,
@@ -54,6 +58,7 @@ const AuthTerminalCard = lazy(() => import("./components/acp/auth-terminal").the
 ));
 
 export default function App() {
+  const { t } = useTranslation("app");
   const [closingSessionId, setClosingSessionId] = useState<string>();
   const {
     state,
@@ -86,7 +91,7 @@ export default function App() {
   const [newThreadOpen, setNewThreadOpen] = useState(false);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>();
   const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
-  const [queueError, setQueueError] = useState<string>();
+  const [queueError, setQueueError] = useState<"queue.sessionChanged" | "queue.sendFailed" | "queue.limit">();
   const [queuePaused, setQueuePaused] = useState(false);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchFocusRequest, setThreadSearchFocusRequest] = useState(0);
@@ -502,7 +507,7 @@ export default function App() {
   const authContent = <>
     {showAuthCard && state.authStatus ? (
       <AgentAuthCard
-        agentName={agent?.title ?? agent?.name ?? "Agent"}
+        agentName={agent?.title ?? agent?.name ?? t("agent")}
         methods={authMethods}
         status={state.authStatus}
         pending={state.pendingAuth}
@@ -513,7 +518,7 @@ export default function App() {
       />
     ) : null}
     {state.authTerminal && authTerminalMethod ? (
-      <Suspense fallback={<div className="auth-terminal-loading" role="status">Opening Agent terminal…</div>}>
+      <Suspense fallback={<div className="auth-terminal-loading" role="status">{t("openingTerminal")}</div>}>
         <AuthTerminalCard
           terminalState={state.authTerminal}
           method={authTerminalMethod}
@@ -528,7 +533,7 @@ export default function App() {
   </>;
   const openActiveThreadMarkdown = useCallback(() => {
     openThreadMarkdown(timelineToMarkdown(state.timeline, {
-      title: state.title ?? "Agent thread",
+      title: state.title ?? t("agentThread"),
       agentName: agent?.title ?? agent?.name,
       sessionId: state.session?.sessionId,
       cwd: state.cwd,
@@ -542,23 +547,24 @@ export default function App() {
     state.terminalSnapshots,
     state.timeline,
     state.title,
+    t,
   ]);
   const requestSessionDeletion = useCallback((sessionId: string) => {
-    if (window.confirm("Close and delete this session from the agent?")) {
+    if (window.confirm(t("deleteConfirm"))) {
       deleteSession(sessionId);
     }
-  }, [deleteSession]);
+  }, [deleteSession, t]);
 
   useEffect(() => {
     if (!ready || state.running || queuePaused || queuedPrompts.length === 0) return;
     const next = queuedPrompts[0];
     if (next.sessionId !== state.session?.sessionId) {
       setQueuedPrompts((current) => current.filter(({ id }) => id !== next.id));
-      setQueueError("A queued message was discarded because its ACP session changed.");
+      setQueueError("queue.sessionChanged");
       return;
     }
     if (!prompt(next.blocks)) {
-      setQueueError("The queued message could not be sent to the Agent.");
+      setQueueError("queue.sendFailed");
       return;
     }
     setQueuedPrompts((current) => current[0]?.id === next.id
@@ -591,7 +597,7 @@ export default function App() {
     const sessionId = state.session?.sessionId;
     if (!sessionId) return false;
     if (queuedPrompts.length >= MAX_QUEUED_PROMPTS) {
-      setQueueError(`Only ${MAX_QUEUED_PROMPTS} messages can be queued for one ACP turn.`);
+      setQueueError("queue.limit");
       return false;
     }
     setQueuedPrompts((current) => [
@@ -608,8 +614,8 @@ export default function App() {
       <a
         className="page-back"
         href={state.session ? projectPath(selectedProjectCwd) : "/"}
-        aria-label={state.session ? "Back to project" : "Back to projects"}
-        title={state.session ? "Back to project" : "Back to projects"}
+        aria-label={state.session ? t("backProject") : t("backProjects")}
+        title={state.session ? t("backProject") : t("backProjects")}
         onClick={(event) => {
           if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
           event.preventDefault();
@@ -617,15 +623,15 @@ export default function App() {
           else browseHome();
         }}
       ><ArrowLeft size={18} aria-hidden="true" /></a>
-      <nav className="workspace-breadcrumbs" aria-label="Breadcrumb">
-        <a href="/" aria-label="All projects" onClick={(event) => {
+      <nav className="workspace-breadcrumbs" aria-label={t("breadcrumb")}>
+        <a href="/" aria-label={t("allProjects")} onClick={(event) => {
           if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
           event.preventDefault();
           browseHome();
-        }}>Projects</a>
+        }}>{t("projects")}</a>
         {selectedProjectCwd != null ? <>
           <ChevronRight size={12} aria-hidden="true" />
-          <a href={projectPath(selectedProjectCwd)} aria-label="Project sessions" title={selectedProjectCwd}
+          <a href={projectPath(selectedProjectCwd)} aria-label={t("projectSessions")} title={selectedProjectCwd}
             aria-current={!state.session ? "page" : undefined} onClick={(event) => {
               if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
               event.preventDefault();
@@ -639,26 +645,27 @@ export default function App() {
     <details className="agent-details" ref={agentSettings} onToggle={(event) => {
       if (event.currentTarget.open && sessionSwitcher.current) sessionSwitcher.current.open = false;
     }}>
-      <summary role="button" aria-label="Agent settings" title="Agent settings">
+      <summary role="button" aria-label={t("agentSettings")} title={t("agentSettings")}>
         <StatusDot phase={state.phase} /><Settings2 size={17} />
       </summary>
       <div className="agent-details-body">
+        <LanguageSelector />
         <div className="agent-settings-heading">
-          <strong>{agent?.title ?? agent?.name ?? "Starting agent"}</strong>
-          <small>{phaseLabel(state.phase)} · ACP v{state.initialized?.protocolVersion ?? "–"}</small>
+          <strong>{agent?.title ?? agent?.name ?? t("startingAgent")}</strong>
+          <small>{phaseLabel(state.phase, t)} · ACP v{state.initialized?.protocolVersion ?? "–"}</small>
         </div>
         <div className="workspace-path"><FolderGit2 size={14} /><span title={state.cwd}>{state.cwd || "…"}</span></div>
         {state.additionalDirectories.map((directory) => (
           <div className="workspace-path workspace-extra" key={directory}><Plus size={12} /><span title={directory}>{directory}</span></div>
         ))}
-        <div className="safety-row"><ShieldCheck size={14} />{state.readOnly ? "Read only" : "Filesystem confined"}</div>
+        <div className="safety-row"><ShieldCheck size={14} />{state.readOnly ? t("readOnly") : t("filesystemConfined")}</div>
         <code className="agent-command" title={state.command.join(" ")}>
-          {state.transport} · {state.command.join(" ") || "Connecting…"}
+          {state.transport} · {state.command.join(" ") || t("connecting")}
         </code>
         {state.mcpServers.length > 0 ? (
           <div className="mcp-summary" title={state.mcpServers.map(({ name, type }) => `${name} (${type})`).join("\n")}>
-            {state.mcpServers.length} MCP server{state.mcpServers.length === 1 ? "" : "s"}
-            {state.mcpConnections.length > 0 ? ` · ${state.mcpConnections.length} active` : ""}
+            {t("mcpServers", { count: state.mcpServers.length })}
+            {state.mcpConnections.length > 0 ? ` · ${t("mcpActive", { count: state.mcpConnections.length })}` : ""}
           </div>
         ) : null}
         {(authMethods.length > 0 || agentCapabilities?.auth?.logout != null) && state.authStatus ? (
@@ -672,32 +679,32 @@ export default function App() {
             disabled={state.phase !== "ready"}
             onAuthenticate={authenticate}
             onLogout={() => {
-              if (window.confirm("Sign out of this ACP Agent? Active sessions may behave differently afterward.")) logout();
+              if (window.confirm(t("signOutConfirm"))) logout();
             }}
           />
         ) : null}
         {state.initialized ? (
           <details className="sidebar-details">
-            <summary><Settings2 size={13} /> Capabilities <ChevronDown size={12} /></summary>
-            <RawJson label="initialize response" value={state.initialized} />
+            <summary><Settings2 size={13} /> {t("capabilities")} <ChevronDown size={12} /></summary>
+            <RawJson label={t("initializeResponse")} value={state.initialized} />
           </details>
         ) : null}
         {state.stderr ? (
           <details className="sidebar-details logs">
-            <summary><ScrollText size={13} /> Agent stderr <ChevronDown size={12} /></summary>
+            <summary><ScrollText size={13} /> {t("stderr")} <ChevronDown size={12} /></summary>
             <pre>{state.stderr}</pre>
           </details>
         ) : null}
         {state.backgroundEvents.length > 0 ? (
           <details className="sidebar-details">
-            <summary><ScrollText size={13} /> Background events ({state.backgroundEvents.length}) <ChevronDown size={12} /></summary>
-            <RawJson label="non-current session events" value={state.backgroundEvents} />
+            <summary><ScrollText size={13} /> {t("backgroundEvents", { count: state.backgroundEvents.length })} <ChevronDown size={12} /></summary>
+            <RawJson label={t("otherSessionEvents")} value={state.backgroundEvents} />
           </details>
         ) : null}
         {state.mcpActivity.length > 0 ? (
           <details className="sidebar-details">
             <summary><Activity size={13} /> MCP-over-ACP ({state.mcpActivity.length}) <ChevronDown size={12} /></summary>
-            <RawJson label="MCP transport activity" value={{ activeConnections: state.mcpConnections, messages: state.mcpActivity }} />
+            <RawJson label={t("mcpActivity")} value={{ activeConnections: state.mcpConnections, messages: state.mcpActivity }} />
           </details>
         ) : null}
       </div>
@@ -729,21 +736,21 @@ export default function App() {
                 <div className="thread-agent-icon"><Bot size={16} /></div>
                 <div>
                   <div className="session-title-row">
-                    <h1>{state.title ?? "New agent session"}</h1>
+                    <h1>{state.title ?? t("newSession")}</h1>
                     <details className="session-switcher" ref={sessionSwitcher} onToggle={(event) => {
                       if (!event.currentTarget.open) return;
                       if (agentSettings.current) agentSettings.current.open = false;
                       sessionSwitcher.current?.querySelector<HTMLInputElement>("input")?.focus();
                     }}>
-                      <summary role="button" aria-label="Switch project session" title="Switch project session">
+                      <summary role="button" aria-label={t("switchSession")} title={t("switchSession")}>
                         <ChevronDown size={14} />
                       </summary>
-                      <div className="session-switcher-panel" role="dialog" aria-label="Project sessions">
+                      <div className="session-switcher-panel" role="dialog" aria-label={t("projectSessions")}>
                         <SessionHistory
                           key={selectedProjectCwd}
                           sessions={projectSessions}
                           activeSessionId={state.session?.sessionId}
-                          activeTitle={state.title ?? (state.session ? "New agent session" : undefined)}
+                          activeTitle={state.title ?? (state.session ? t("newSession") : undefined)}
                           activeCwd={state.cwd}
                           canList={sessionCapabilities?.list != null}
                           nextCursor={state.nextSessionCursor}
@@ -762,12 +769,12 @@ export default function App() {
                       </div>
                     </details>
                   </div>
-                  <span>{agent?.title ?? agent?.name ?? "Agent"}{state.cwd ? ` · ${workspaceName(state.cwd)}` : ""}</span>
+                  <span>{agent?.title ?? agent?.name ?? t("agent")}{state.cwd ? ` · ${workspaceName(state.cwd)}` : ""}</span>
                 </div>
               </div>
               <div className="session-header-actions page-actions">
                 {state.session ? (
-                  <button type="button" className="page-icon-button" aria-label="New thread" title="New thread"
+                  <button type="button" className="page-icon-button" aria-label={t("newThread")} title={t("newThread")}
                     disabled={state.phase !== "ready" || navigationDisabled || authBlocksNewSession}
                     onClick={openNewThread}><Plus size={16} /></button>
                 ) : null}
@@ -775,26 +782,26 @@ export default function App() {
                   <button
                     type="button"
                     className={threadSearchOpen ? "page-icon-button active" : "page-icon-button"}
-                    aria-label="Search Agent thread"
+                    aria-label={t("searchThread")}
                     aria-keyshortcuts="Control+F Meta+F"
                     aria-pressed={threadSearchOpen}
-                    title="Search thread · Ctrl/⌘F"
+                    title={t("searchShortcut")}
                     onClick={toggleThreadSearch}
                   ><SearchIcon size={15} /></button>
                 ) : null}
                 {state.session ? (
                   <details className="thread-actions" ref={threadActions}>
-                    <summary role="button" aria-label="Thread actions" title="Thread actions"><Ellipsis size={17} /></summary>
+                    <summary role="button" aria-label={t("threadActions")} title={t("threadActions")}><Ellipsis size={17} /></summary>
                     <div>
                       <button
                         type="button"
                         onClick={openActiveThreadMarkdown}
-                      ><FileText size={14} /> Open as Markdown</button>
+                      ><FileText size={14} /> {t("openMarkdown")}</button>
                       {sessionCapabilities?.fork != null ? (
-                        <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> Fork thread</button>
+                        <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> {t("forkThread")}</button>
                       ) : null}
                       {sessionCapabilities?.close != null ? (
-                        <button type="button" className="danger" disabled={transitioning || changingControl || state.runtimeOperation != null} onClick={() => setClosingSessionId(state.session?.sessionId)}><LogOut size={14} /> Close thread</button>
+                        <button type="button" className="danger" disabled={transitioning || changingControl || state.runtimeOperation != null} onClick={() => setClosingSessionId(state.session?.sessionId)}><LogOut size={14} /> {t("closeThread")}</button>
                       ) : null}
                       {sessionCapabilities?.delete != null ? (
                         <button
@@ -802,7 +809,7 @@ export default function App() {
                           className="danger"
                           disabled={state.running || transitioning || changingControl || deletingCurrentSession || queuedPrompts.length > 0}
                           onClick={() => state.session && requestSessionDeletion(state.session.sessionId)}
-                        ><Trash2 size={14} /> Delete thread</button>
+                        ><Trash2 size={14} /> {t("deleteThread")}</button>
                       ) : null}
                     </div>
                   </details>
@@ -830,7 +837,7 @@ export default function App() {
           {state.elicitations.map((pending) => (
             <ElicitationCard
               key={pending.elicitationId}
-              agentName={agent?.title ?? agent?.name ?? "Agent"}
+              agentName={agent?.title ?? agent?.name ?? t("agent")}
               pending={pending}
               onRespond={(response) => respondElicitation(pending.elicitationId, response)}
             />
@@ -844,7 +851,7 @@ export default function App() {
           ) : null}
           {state.phase === "stopped" || state.phase === "error" ? (
             <div className="project-connection-error" role="status">
-              <span>Connection interrupted.</span><button type="button" onClick={reconnect}>Reconnect</button>
+              <span>{t("connectionInterrupted")}</span><button type="button" onClick={reconnect}>{t("reconnect")}</button>
             </div>
           ) : null}
           <ProjectBrowser
@@ -874,7 +881,7 @@ export default function App() {
             className="scroll-region"
             ref={scroll}
             role="region"
-            aria-label="Conversation thread"
+            aria-label={t("conversationThread")}
             aria-keyshortcuts="Escape Home End Shift+PageUp Shift+PageDown"
             tabIndex={0}
             onScroll={handleThreadScroll}
@@ -915,7 +922,7 @@ export default function App() {
           >
             <div className="conversation-wrap">
               {authContent}
-              {state.historyNotice ? <p className="history-notice" role="status">{state.historyNotice}</p> : null}
+              {state.historyNotice ? <p className="history-notice" role="status">{translateHistoryNotice(state.historyNotice, t)}</p> : null}
               {(!showAuthCard && !terminalAuthOwnsInteraction) || state.timeline.length > 0 ? <Conversation
                 timeline={state.timeline}
                 terminalSnapshots={state.terminalSnapshots}
@@ -931,24 +938,24 @@ export default function App() {
               /> : null}
               {state.running && state.timeline.at(-1)?.type !== "stop" ? (
                 <div className="agent-working" role="status">
-                  <Activity size={14} /> {agentActivityLabel(state.agentActivity, state.permissions.length > 0 || state.elicitations.length > 0)}<span /><span /><span />
+                  <Activity size={14} /> {agentActivityLabel(state.agentActivity, state.permissions.length > 0 || state.elicitations.length > 0, t)}<span /><span /><span />
                 </div>
               ) : null}
             </div>
           </div>
           {threadScroll.overflow ? (
-            <nav className="thread-scroll-controls" aria-label="Thread navigation">
+            <nav className="thread-scroll-controls" aria-label={t("threadNavigation")}>
               <button
                 type="button"
-                aria-label="Jump to top of thread"
-                title="Jump to top"
+                aria-label={t("jumpTopThread")}
+                title={t("jumpTop")}
                 disabled={threadScroll.atTop}
                 onClick={() => navigateThread("top")}
               ><ArrowUpToLine size={14} /></button>
               <button
                 type="button"
-                aria-label="Jump to bottom of thread"
-                title="Jump to bottom"
+                aria-label={t("jumpBottomThread")}
+                title={t("jumpBottom")}
                 disabled={threadScroll.atBottom}
                 onClick={() => navigateThread("bottom")}
               ><ArrowDownToLine size={14} /></button>
@@ -969,7 +976,7 @@ export default function App() {
             {state.elicitations.map((pending) => (
               <ElicitationCard
                 key={pending.elicitationId}
-                agentName={agent?.title ?? agent?.name ?? "Agent"}
+                agentName={agent?.title ?? agent?.name ?? t("agent")}
                 pending={pending}
                 onRespond={(response) => respondElicitation(pending.elicitationId, response)}
               />
@@ -986,7 +993,7 @@ export default function App() {
             ) : null}
             <QueuedPrompts
               prompts={queuedPrompts}
-              error={queueError}
+              error={queueError ? t(queueError, { count: MAX_QUEUED_PROMPTS }) : undefined}
               paused={queuePaused}
               canSendNow={composerAvailable && state.running}
               onEdit={(queued) => {
@@ -1032,8 +1039,8 @@ export default function App() {
               connectionRecovery={state.phase === "error" || state.phase === "stopped"
                 ? {
                     message: state.phase === "error"
-                      ? "The ACP bridge failed. Reconnect before sending another message."
-                      : "The ACP connection stopped. Reconnect before continuing.",
+                      ? t("bridgeFailed")
+                      : t("connectionStopped"),
                     onReconnect: reconnect,
                   }
                 : undefined}
@@ -1114,22 +1121,22 @@ function StatusDot({ phase }: { phase: string }) {
   return <span className={`status-dot-small phase-${phase}`} aria-hidden="true" />;
 }
 
-function phaseLabel(phase: string): string {
-  if (phase === "ready") return "Connected";
-  if (phase === "starting") return "Starting process";
-  if (phase === "initializing") return "Initializing ACP";
-  if (phase === "error") return "Connection error";
-  return "Agent stopped";
+function phaseLabel(phase: string, t: TFunction<"app">): string {
+  if (phase === "ready") return t("phase.ready");
+  if (phase === "starting") return t("phase.starting");
+  if (phase === "initializing") return t("phase.initializing");
+  if (phase === "error") return t("phase.error");
+  return t("phase.stopped");
 }
 
-function agentActivityLabel(activity: AgentActivity | undefined, waitingForInput: boolean): string {
-  if (waitingForInput) return "Agent is waiting for input";
-  if (activity?.kind === "thinking") return "Agent is thinking";
-  if (activity?.kind === "tool") return `Running ${activity.title}`;
-  if (activity?.kind === "planning") return "Agent is planning";
-  if (activity?.kind === "compacting") return "Agent is compacting context";
-  if (activity?.kind === "responding") return "Agent is responding";
-  return "Agent is working";
+function agentActivityLabel(activity: AgentActivity | undefined, waitingForInput: boolean, t: TFunction<"app">): string {
+  if (waitingForInput) return t("activity.waiting");
+  if (activity?.kind === "thinking") return t("activity.thinking");
+  if (activity?.kind === "tool") return t("activity.tool", { title: activity.title });
+  if (activity?.kind === "planning") return t("activity.planning");
+  if (activity?.kind === "compacting") return t("activity.compacting");
+  if (activity?.kind === "responding") return t("activity.responding");
+  return t("activity.working");
 }
 
 function workspaceName(path: string): string {

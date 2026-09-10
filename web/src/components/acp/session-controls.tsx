@@ -5,6 +5,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { Check, ChevronDown, Search, SlidersHorizontal } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "../../i18n";
 
 type LegacyModes = {
   availableModes: Array<{ id: string; name: string }>;
@@ -26,16 +27,17 @@ export function SessionControls({
   onMode: (id: string) => void;
   onConfig: (id: string, value: string | boolean) => void;
 }) {
+  const { t } = useTranslation("workspace");
   const hasConfigOptions = options != null;
   if (hasConfigOptions ? options.length === 0 : !modes) return null;
 
   return (
-    <div className="session-config-strip" aria-label="Session controls">
+    <div className="session-config-strip" aria-label={t("controls.label")}>
       <SlidersHorizontal className="config-strip-icon" size={14} aria-hidden="true" />
       {modes && !hasConfigOptions ? (
         <SelectControl
           id="legacy-mode"
-          name="Mode"
+          name={t("controls.mode")}
           value={currentMode ?? modes.currentModeId}
           options={modes.availableModes.map((mode) => ({
             value: mode.id,
@@ -113,6 +115,7 @@ function SelectControl({
   disabled: boolean;
   onChange: (value: string) => void;
 }) {
+  const { t } = useTranslation("workspace");
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const root = useRef<HTMLDivElement>(null);
@@ -171,7 +174,7 @@ function SelectControl({
         aria-expanded={open}
         aria-controls={`config-options-${id}`}
         disabled={disabled}
-        title={description ?? `${name}: ${current?.name ?? value}`}
+        title={description ?? t("controls.currentValue", { name, value: current?.name ?? value })}
         onClick={() => {
           setQuery("");
           setOpen((value) => !value);
@@ -192,9 +195,9 @@ function SelectControl({
               <Search size={13} aria-hidden="true" />
               <input
                 ref={search}
-                aria-label={`Search ${name}`}
+                aria-label={t("controls.search", { name })}
                 value={query}
-                placeholder={`Search ${options.length} options`}
+                placeholder={t("controls.searchOptions", { count: options.length })}
                 onChange={(event) => setQuery(event.target.value)}
               />
             </label>
@@ -215,7 +218,7 @@ function SelectControl({
                 {option.value === value ? <Check size={14} aria-hidden="true" /> : null}
               </button>
             ))}
-            {filtered.length === 0 ? <p>No matching options</p> : null}
+            {filtered.length === 0 ? <p>{t("controls.noMatchingOptions")}</p> : null}
           </div>
         </div>
       ) : null}

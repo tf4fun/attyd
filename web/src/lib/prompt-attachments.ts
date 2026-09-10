@@ -1,7 +1,32 @@
 import type { ContentBlock, PromptCapabilities } from "@agentclientprotocol/sdk";
+import i18n from "../i18n";
 import { randomId } from "./id";
 
 export const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
+
+type PromptAttachmentErrorKey =
+  | "sizeLimit"
+  | "unsupportedFile"
+  | "preparing"
+  | "inactiveSession"
+  | "unsupportedInput"
+  | "absoluteUri";
+
+export class PromptAttachmentError extends Error {
+  constructor(
+    readonly key: PromptAttachmentErrorKey,
+    readonly values: Record<string, string | number> = {},
+  ) {
+    super(i18n.t(`attachments.errors.${key}`, { ns: "conversation", ...values }));
+    this.name = "PromptAttachmentError";
+  }
+}
+
+export function promptAttachmentErrorMessage(error: Error | string): string {
+  return error instanceof PromptAttachmentError
+    ? i18n.t(`attachments.errors.${error.key}`, { ns: "conversation", ...error.values })
+    : error instanceof Error ? error.message : error;
+}
 
 export interface PromptAttachment {
   id: string;
@@ -16,7 +41,7 @@ export async function createPromptAttachments(
 ): Promise<PromptAttachment[]> {
   const total = files.reduce((sum, file) => sum + file.size, 0);
   if (total > MAX_ATTACHMENT_BYTES) {
-    throw new Error("Attachments are limited to 3 MB per prompt");
+    throw new PromptAttachmentError("sizeLimit");
   }
 
   return Promise.all(
@@ -53,7 +78,7 @@ async function fileToContentBlock(
     return { type: "resource", resource };
   }
 
-  throw new Error(`The agent cannot accept ${name}`);
+  throw new PromptAttachmentError("unsupportedFile", { name });
 }
 
 function promptFileName(file: File, index: number): string {

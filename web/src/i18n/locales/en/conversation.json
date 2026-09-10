@@ -1,0 +1,199 @@
+{
+  "empty": {
+    "title": "Agent, not just a model.",
+    "description": "Send a task. attyd will render the ACP session exactly as the agent reports it."
+  },
+  "debug": {
+    "notification": "Notification",
+    "turnResponse": "Turn response",
+    "errorDetails": "ACP error details",
+    "messageId": "Message ID",
+    "messageEvents": "Message events"
+  },
+  "message": {
+    "editAndResendLabel": "Edit and resend user message",
+    "editAndResend": "Edit and resend",
+    "responseActions": "Agent response actions",
+    "copyResponseLabel": "Copy agent response",
+    "copyResponse": "Copy response",
+    "info": "Message info",
+    "debug": "Message debug information",
+    "copySelection": "Copy Selection",
+    "copyThisResponse": "Copy This Agent Response",
+    "scrollTop": "Scroll to Top",
+    "scrollBottom": "Scroll to Bottom",
+    "openMarkdown": "Open Thread as Markdown"
+  },
+  "thinking": {
+    "info": "Thinking info",
+    "debug": "Thinking debug information",
+    "liveTitle": "Thinking…",
+    "title": "Thinking",
+    "collapse": "Collapse thinking",
+    "expand": "Expand thinking",
+    "live": "Live"
+  },
+  "errors": {
+    "agentTurnFailed": "Agent turn failed",
+    "requestFailed": "ACP request failed",
+    "retry": "Retry",
+    "editPrompt": "Edit prompt"
+  },
+  "stop": {
+    "end_turn": "turn complete",
+    "cancelled": "turn cancelled",
+    "refusal": "request refused",
+    "max_tokens": "token limit reached",
+    "max_turn_requests": "turn request limit reached"
+  },
+  "usage": {
+    "input": "{{value}} input",
+    "output": "{{value}} output",
+    "reasoning": "{{value}} reasoning",
+    "cacheRead": "{{value}} cache read",
+    "cacheWrite": "{{value}} cache write",
+    "tokens_one": "{{value}} tokens",
+    "tokens_other": "{{value}} tokens"
+  },
+  "search": {
+    "region": "Search this Agent thread",
+    "input": "Search this thread",
+    "placeholder": "Search this thread…",
+    "matchCase": "Match case",
+    "wholeWord": "Match whole word",
+    "regex": "Use regular expression",
+    "previous": "Previous thread search match",
+    "previousHint": "Previous match · Shift+Enter",
+    "next": "Next thread search match",
+    "nextHint": "Next match · Enter",
+    "close": "Close thread search",
+    "closeHint": "Close search · Escape",
+    "counter": "{{current}}/{{total}}",
+    "limit_one": "Showing the first {{value}} matches",
+    "limit_other": "Showing the first {{value}} matches",
+    "queryLimit": "Search is limited to {{count, number}} characters"
+  },
+  "attachments": {
+    "errors": {
+      "sizeLimit": "Attachments are limited to 3 MB per prompt",
+      "unsupportedFile": "The agent cannot accept {{name}}",
+      "preparing": "Wait for attachments to finish preparing before sending",
+      "inactiveSession": "Wait for an active ACP session before attaching files",
+      "unsupportedInput": "This Agent did not advertise image, audio, or embedded-resource input",
+      "absoluteUri": "Resource links must be absolute URIs"
+    },
+    "remove": "Remove {{name}}",
+    "preparing_one": "Preparing {{count, number}} file…",
+    "preparing_other": "Preparing {{count, number}} files…",
+    "bytes": "{{value}} B",
+    "kilobytes": "{{value}} KB",
+    "kind": {
+      "link": "link",
+      "context": "context",
+      "image": "image",
+      "audio": "audio",
+      "text": "text"
+    },
+    "description": "{{kind}} · {{size}}"
+  },
+  "composer": {
+    "connectionUnavailable": "Agent connection unavailable",
+    "context": {
+      "files": "Files from this workspace",
+      "noMatches": "No matching text files",
+      "searching": "Searching…",
+      "label": "Workspace context",
+      "navigate": "navigate",
+      "add": "add context",
+      "close": "close"
+    },
+    "reconnect": "Reconnect",
+    "drop": {
+      "add": "Drop files to add context",
+      "unavailable": "File input unavailable",
+      "supported": "ACP image, audio, or embedded resource",
+      "unsupported": "The Agent did not advertise attachment support"
+    },
+    "placeholder": {
+      "disabled": "Create or open a thread to start…",
+      "running": "Queue a follow-up…",
+      "ready": "Give the agent a task…"
+    },
+    "attachments": {
+      "unavailable": "Agent did not advertise attachment support",
+      "attach": "Attach ACP content"
+    },
+    "expand": {
+      "collapseLabel": "Collapse message composer",
+      "expandLabel": "Expand message composer",
+      "pending": "Resolve the Agent interaction before expanding",
+      "collapseHint": "Collapse message composer · Shift+Alt+Escape",
+      "expandHint": "Expand message composer · Shift+Alt+Escape"
+    },
+    "hint": {
+      "queue": "Enter to queue",
+      "filesAndCommands": "Type @ for files · / for commands",
+      "commands": "Type / for agent commands",
+      "send": "Enter to send"
+    },
+    "commands": "Agent commands",
+    "link": {
+      "uri": "Resource URI",
+      "uriPlaceholder": "https://… or file://…",
+      "name": "Resource name",
+      "namePlaceholder": "Name (optional)",
+      "add": "Add resource link",
+      "addAcp": "Add ACP resource link"
+    },
+    "stop": "Stop current turn",
+    "cancel": "Cancel turn",
+    "send": "Send prompt",
+    "history_one": "{{index}} of {{count, number}} previous prompts",
+    "history_other": "{{index}} of {{count, number}} previous prompts"
+  },
+  "markdown": {
+    "metadata": {
+      "agent": "Agent: {{name}}",
+      "session": "Session: {{id}}",
+      "workspace": "Workspace: {{path}}"
+    },
+    "messageId": "Message ID: {{id}}",
+    "compactionDetails": "Status: {{status}} · ID: {{id}}",
+    "toolHeading": "Tool · {{title}}",
+    "eventHeading": "ACP event · {{event}}",
+    "turnComplete": "Turn complete · {{reason}}{{usage}}",
+    "embeddedImage": "Embedded image · {{mimeType}} · {{size}} bytes",
+    "embeddedAudio": "Embedded audio · {{mimeType}} · {{size}} bytes",
+    "bytes": "{{size}} bytes",
+    "binary": "Binary · {{mimeType}} · {{size}} bytes",
+    "exit": "exit {{code}}",
+    "id": "ID: {{id}}",
+    "annotations": {
+      "audience": "audience: {{audience}}",
+      "priority": "priority: {{priority}}",
+      "modified": "modified: {{date}}",
+      "details": "ACP annotations · {{details}}"
+    },
+    "you": "You",
+    "thinking": "Thinking",
+    "agent": "Agent",
+    "input": "Input",
+    "output": "Output",
+    "compaction": "Context compaction",
+    "error": "Error:",
+    "image": "ACP image",
+    "resource": "Embedded resource:",
+    "diff": "Diff:",
+    "terminal": "Terminal:",
+    "outputUnavailable": "output unavailable",
+    "planRemoved": "Plan removed",
+    "planFile": "Plan file",
+    "planEvent": "ACP plan event",
+    "plan": "Plan",
+    "released": "released",
+    "running": "running",
+    "serializationFailed": "Unable to serialize ACP value",
+    "unknownMimeType": "unknown MIME type",
+    "usage": " · {{total}} tokens ({{input}} input, {{output}} output)"
+  }
+}

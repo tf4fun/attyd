@@ -14,6 +14,7 @@ import {
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import i18n, { useTranslation } from "../../i18n";
 import type {
   AgentActivity,
   AssistantMessageChunk,
@@ -49,13 +50,14 @@ export function Conversation({
   onNavigateThread?: (target: "top" | "bottom") => void;
   onOpenThreadMarkdown?: () => void;
 }) {
+  const { t } = useTranslation("conversation");
   const turns = useMemo(() => collectTurnReviewChanges(timeline), [timeline]);
   if (timeline.length === 0) {
     return (
       <div className="empty-state">
         <div className="empty-mark"><Bot size={25} /></div>
-        <h2>Agent, not just a model.</h2>
-        <p>Send a task. attyd will render the ACP session exactly as the agent reports it.</p>
+        <h2>{t("empty.title")}</h2>
+        <p>{t("empty.description")}</p>
       </div>
     );
   }
@@ -120,6 +122,7 @@ function TimelineEntry({
   onNavigateThread?: (target: "top" | "bottom") => void;
   onOpenThreadMarkdown?: () => void;
 }) {
+  const { t, i18n } = useTranslation("conversation");
   if (item.type === "tool") {
     return <ToolCallCard item={item} terminalSnapshots={terminalSnapshots} />;
   }
@@ -129,7 +132,7 @@ function TimelineEntry({
     return (
       <div className="protocol-event" data-thread-entry data-thread-entry-id={item.id}>
         <span>{item.notification.update.sessionUpdate}</span>
-        <RawJson label="Notification" value={item.notification} />
+        <RawJson label={t("debug.notification")} value={item.notification} />
       </div>
     );
   }
@@ -143,23 +146,23 @@ function TimelineEntry({
           <span
             className="turn-usage"
             title={[
-              `${usage.inputTokens.toLocaleString()} input`,
-              `${usage.outputTokens.toLocaleString()} output`,
+              t("usage.input", { value: usage.inputTokens.toLocaleString(i18n.language) }),
+              t("usage.output", { value: usage.outputTokens.toLocaleString(i18n.language) }),
               usage.thoughtTokens != null
-                ? `${usage.thoughtTokens.toLocaleString()} reasoning`
+                ? t("usage.reasoning", { value: usage.thoughtTokens.toLocaleString(i18n.language) })
                 : undefined,
               usage.cachedReadTokens != null
-                ? `${usage.cachedReadTokens.toLocaleString()} cache read`
+                ? t("usage.cacheRead", { value: usage.cachedReadTokens.toLocaleString(i18n.language) })
                 : undefined,
               usage.cachedWriteTokens != null
-                ? `${usage.cachedWriteTokens.toLocaleString()} cache write`
+                ? t("usage.cacheWrite", { value: usage.cachedWriteTokens.toLocaleString(i18n.language) })
                 : undefined,
             ].filter(Boolean).join(" · ")}
           >
-            {usage.totalTokens.toLocaleString()} tokens
+            {t("usage.tokens", { count: usage.totalTokens, value: usage.totalTokens.toLocaleString(i18n.language) })}
           </span>
         ) : null}
-        <RawJson label="Turn response" value={item.response} />
+        <RawJson label={t("debug.turnResponse")} value={item.response} />
       </div>
     );
   }
@@ -193,11 +196,11 @@ function TimelineEntry({
 
 function stopReasonLabel(reason: Extract<TimelineItem, { type: "stop" }>["response"]["stopReason"]): string {
   switch (reason) {
-    case "end_turn": return "turn complete";
-    case "cancelled": return "turn cancelled";
-    case "refusal": return "request refused";
-    case "max_tokens": return "token limit reached";
-    case "max_turn_requests": return "turn request limit reached";
+    case "end_turn": return i18n.t("stop.end_turn", { ns: "conversation" });
+    case "cancelled": return i18n.t("stop.cancelled", { ns: "conversation" });
+    case "refusal": return i18n.t("stop.refusal", { ns: "conversation" });
+    case "max_tokens": return i18n.t("stop.max_tokens", { ns: "conversation" });
+    case "max_turn_requests": return i18n.t("stop.max_turn_requests", { ns: "conversation" });
   }
 }
 
@@ -212,6 +215,7 @@ function ErrorCard({
   onEdit?: (blocks: ContentBlock[]) => void;
   onRetry?: (blocks: ContentBlock[]) => void;
 }) {
+  const { t } = useTranslation("conversation");
   const retryable = item.retryBlocks != null && item.retryBlocks.length > 0;
   const details = item.code != null || item.data !== undefined || item.dataTruncated
     ? {
@@ -232,7 +236,7 @@ function ErrorCard({
       <CircleAlert size={16} aria-hidden="true" />
       <div className="error-card-body">
         <header>
-          <strong>{item.operation === "session/prompt" ? "Agent turn failed" : "ACP request failed"}</strong>
+          <strong>{item.operation === "session/prompt" ? t("errors.agentTurnFailed") : t("errors.requestFailed")}</strong>
           {item.code != null ? <code>{item.code}</code> : null}
         </header>
         <p data-thread-searchable>{item.message}</p>
@@ -243,18 +247,18 @@ function ErrorCard({
                 type="button"
                 disabled={!canRetry}
                 onClick={() => onRetry(item.retryBlocks!)}
-              ><RotateCcw size={12} /> Retry</button>
+              ><RotateCcw size={12} /> {t("errors.retry")}</button>
             ) : null}
             {onEdit ? (
               <button
                 type="button"
                 disabled={!canRetry}
                 onClick={() => onEdit(item.retryBlocks!)}
-              ><Pencil size={12} /> Edit prompt</button>
+              ><Pencil size={12} /> {t("errors.editPrompt")}</button>
             ) : null}
           </div>
         ) : null}
-        {details ? <RawJson label="ACP error details" value={details} /> : null}
+        {details ? <RawJson label={t("debug.errorDetails")} value={details} /> : null}
       </div>
     </section>
   );
@@ -269,6 +273,7 @@ function MessageEntry({
   canReusePrompt: boolean;
   onReusePrompt?: (blocks: ContentBlock[]) => void;
 }) {
+  const { t } = useTranslation("conversation");
   const isProtocolUser = item.role === "protocol-user";
   const canReuse = (item.role === "user" || item.role === "protocol-user") && onReusePrompt != null;
 
@@ -288,8 +293,8 @@ function MessageEntry({
               <button
                 type="button"
                 className="message-action message-icon-action"
-                aria-label="Edit and resend user message"
-                title="Edit and resend"
+                aria-label={t("message.editAndResendLabel")}
+                title={t("message.editAndResend")}
                 disabled={!canReusePrompt}
                 onClick={() => onReusePrompt(item.blocks)}
               ><Pencil size={12} aria-hidden="true" /></button>
@@ -311,6 +316,7 @@ function AssistantEntry({
   onNavigateThread?: (target: "top" | "bottom") => void;
   onOpenThreadMarkdown?: () => void;
 }) {
+  const { t } = useTranslation("conversation");
   const article = useRef<HTMLElement>(null);
   const menu = useRef<HTMLDivElement>(null);
   const [contextMenu, setContextMenu] = useState<{
@@ -421,27 +427,27 @@ function AssistantEntry({
           ref={menu}
           className="message-context-menu"
           role="menu"
-          aria-label="Agent response actions"
+          aria-label={t("message.responseActions")}
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           {contextMenu.selection ? (
             <button type="button" role="menuitem" onClick={() => runMenuAction(() => copyText(contextMenu.selection!))}>
-              <TextSelect size={13} /> Copy Selection
+              <TextSelect size={13} /> {t("message.copySelection")}
             </button>
           ) : null}
           {answerBlocks.length > 0 ? (
             <button type="button" role="menuitem" onClick={() => runMenuAction(() => copyBlocks(answerBlocks))}>
-              <Copy size={13} /> Copy This Agent Response
+              <Copy size={13} /> {t("message.copyThisResponse")}
             </button>
           ) : null}
           {onNavigateThread ? (
             <>
               <div role="separator" />
               <button type="button" role="menuitem" onClick={() => runMenuAction(() => onNavigateThread("top"))}>
-                <ArrowUpToLine size={13} /> Scroll to Top
+                <ArrowUpToLine size={13} /> {t("message.scrollTop")}
               </button>
               <button type="button" role="menuitem" onClick={() => runMenuAction(() => onNavigateThread("bottom"))}>
-                <ArrowDownToLine size={13} /> Scroll to Bottom
+                <ArrowDownToLine size={13} /> {t("message.scrollBottom")}
               </button>
             </>
           ) : null}
@@ -449,7 +455,7 @@ function AssistantEntry({
             <>
               <div role="separator" />
               <button type="button" role="menuitem" onClick={() => runMenuAction(onOpenThreadMarkdown)}>
-                <FileText size={13} /> Open Thread as Markdown
+                <FileText size={13} /> {t("message.openMarkdown")}
               </button>
             </>
           ) : null}
@@ -467,6 +473,7 @@ function AssistantChunk({
   item: AssistantMessageChunk;
   copyableBlocks?: ContentBlock[];
 }) {
+  const { t } = useTranslation("conversation");
   return (
     <div className="message message-agent assistant-chunk">
       <div className="message-shell">
@@ -478,8 +485,8 @@ function AssistantChunk({
             <button
               type="button"
               className="message-action message-icon-action"
-              aria-label="Copy agent response"
-              title="Copy response"
+              aria-label={t("message.copyResponseLabel")}
+              title={t("message.copyResponse")}
               onClick={() => void copyBlocks(copyableBlocks)}
             ><Copy size={12} aria-hidden="true" /></button>
           ) : null}
@@ -496,6 +503,7 @@ function ThinkingBlock({
   item: AssistantMessageChunk;
   live: boolean;
 }) {
+  const { t } = useTranslation("conversation");
   const [open, setOpen] = useState(live);
   const [debugOpen, setDebugOpen] = useState(false);
   const disclosure = useRef<HTMLElement>(null);
@@ -534,14 +542,14 @@ function ThinkingBlock({
           }}
         >
           <span className="thinking-icon"><Brain size={14} aria-hidden="true" /></span>
-          <span className="thinking-title">{live ? "Thinking…" : "Thinking"}</span>
+          <span className="thinking-title">{live ? t("thinking.liveTitle") : t("thinking.title")}</span>
         </button>
         <span className="thinking-actions">
-          {live ? <i>Live</i> : null}
+          {live ? <i>{t("thinking.live")}</i> : null}
           <button
             type="button"
             className="component-disclosure-button"
-            aria-label={open ? "Collapse thinking" : "Expand thinking"}
+            aria-label={open ? t("thinking.collapse") : t("thinking.expand")}
             aria-expanded={open}
             onClick={() => {
               setOpen((value) => {
@@ -560,16 +568,16 @@ function ThinkingBlock({
           <div className="message-meta-actions">
             <DebugInfoButton
               expanded={debugOpen}
-              label="Thinking info"
+              label={t("thinking.info")}
               onClick={() => setDebugOpen((value) => !value)}
             />
           </div>
           <DebugInfoPanel
-            label="Thinking debug information"
+            label={t("thinking.debug")}
             hidden={!debugOpen}
             entries={[
-              { label: "Message ID", value: item.messageId, format: "text" },
-              { label: "Message events", value: item.raw, count: item.raw.length },
+              { label: t("debug.messageId"), value: item.messageId, format: "text" },
+              { label: t("debug.messageEvents"), value: item.raw, count: item.raw.length },
             ]}
           />
         </footer>
@@ -587,6 +595,7 @@ function MessageMeta({
   events: unknown[];
   children?: ReactNode;
 }) {
+  const { t } = useTranslation("conversation");
   const [open, setOpen] = useState(false);
 
   return (
@@ -594,17 +603,17 @@ function MessageMeta({
       <div className="message-meta-actions">
         <DebugInfoButton
           expanded={open}
-          label="Message info"
+          label={t("message.info")}
           onClick={() => setOpen((value) => !value)}
         />
         {children}
       </div>
       <DebugInfoPanel
-        label="Message debug information"
+        label={t("message.debug")}
         hidden={!open}
         entries={[
-          { label: "Message ID", value: messageId, format: "text" },
-          { label: "Message events", value: events, count: events.length },
+          { label: t("debug.messageId"), value: messageId, format: "text" },
+          { label: t("debug.messageEvents"), value: events, count: events.length },
         ]}
       />
     </footer>

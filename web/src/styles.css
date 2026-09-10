@@ -1832,6 +1832,10 @@ button { color: inherit; }
 .agent-settings-heading { display: flex; flex-direction: column; gap: 5px; padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid #e0e3d9; }
 .agent-settings-heading strong { font-size: 14px; color: #454b3a; }
 .agent-settings-heading small { font-size: 11px; color: var(--page-muted); }
+.language-setting { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; color: var(--page-muted); font-size: 12px; }
+.language-setting > span { display: flex; align-items: center; gap: 7px; }
+.language-setting select { min-width: 0; max-width: 65%; padding: 6px 8px; border: 1px solid var(--page-border); border-radius: 6px; background: var(--page-surface); color: var(--control-ink); font: inherit; }
+.language-setting select:focus-visible { outline: 2px solid #9ba985; outline-offset: 2px; }
 .session-title-row { position: relative; min-width: 0; display: flex; align-items: center; gap: 8px; }
 .session-switcher { flex: 0 0 auto; }
 .session-switcher > summary { width: 28px; height: 28px; display: grid; place-items: center; list-style: none; cursor: pointer; border: 1px solid transparent; border-radius: 7px; color: var(--control-ink); }

@@ -14,6 +14,7 @@ import {
   type RefObject,
   type ReactNode,
 } from "react";
+import { useTranslation } from "../../i18n";
 import {
   MAX_THREAD_SEARCH_CHARS,
   MAX_THREAD_SEARCH_MATCHES,
@@ -68,6 +69,7 @@ export function ThreadSearchBar({
   onNavigate?: () => void;
   onClose: () => void;
 }) {
+  const { t, i18n } = useTranslation("conversation");
   const [query, setQuery] = useState("");
   const [options, setOptions] = useState<ThreadSearchOptions>({
     caseSensitive: false,
@@ -123,10 +125,10 @@ export function ThreadSearchBar({
       onNavigate?.();
       scrollToEntry(result.matches[nextIndex]?.entry);
     }
-  }, [applyActiveMatch, onNavigate, options, query, rootRef]);
+  }, [applyActiveMatch, i18n.language, onNavigate, options, query, rootRef]);
 
   useEffect(() => {
-    const config = `${query}\u0000${Number(options.caseSensitive)}${Number(options.wholeWord)}${Number(options.regex)}`;
+    const config = `${i18n.language}\u0000${query}\u0000${Number(options.caseSensitive)}${Number(options.wholeWord)}${Number(options.regex)}`;
     const immediate = previousConfig.current !== config;
     previousConfig.current = config;
     if (immediate) {
@@ -135,7 +137,7 @@ export function ThreadSearchBar({
     }
     const timer = window.setTimeout(scan, STREAM_UPDATE_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [contentVersion, disclosureVersion, options, query, scan, terminalVersion]);
+  }, [contentVersion, disclosureVersion, i18n.language, options, query, scan, terminalVersion]);
 
   useEffect(() => {
     input.current?.focus();
@@ -178,14 +180,17 @@ export function ThreadSearchBar({
   const invalid = error != null || (query.length > 0 && !hasMatches);
   const counter = query.length === 0
     ? ""
-    : `${activeIndex == null ? 0 : activeIndex + 1}/${matches.length}`;
+    : t("search.counter", {
+      current: (activeIndex == null ? 0 : activeIndex + 1).toLocaleString(i18n.language),
+      total: matches.length.toLocaleString(i18n.language),
+    });
 
   return (
     <div
       ref={containerRef}
       className="thread-search-bar"
       role="search"
-      aria-label="Search this Agent thread"
+      aria-label={t("search.region")}
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.preventDefault();
@@ -204,56 +209,56 @@ export function ThreadSearchBar({
           ref={input}
           autoFocus
           type="search"
-          aria-label="Search this thread"
+          aria-label={t("search.input")}
           aria-invalid={error != null}
           aria-describedby={error || limited ? "thread-search-status" : undefined}
-          placeholder="Search this thread…"
+          placeholder={t("search.placeholder")}
           value={query}
           maxLength={MAX_THREAD_SEARCH_QUERY_CHARS + 1}
           onChange={(event) => setQuery(event.target.value)}
         />
         <SearchOptionButton
           active={options.caseSensitive}
-          label="Match case"
+          label={t("search.matchCase")}
           onClick={() => toggleOption("caseSensitive")}
         ><CaseSensitive size={14} /></SearchOptionButton>
         <SearchOptionButton
           active={options.wholeWord}
-          label="Match whole word"
+          label={t("search.wholeWord")}
           onClick={() => toggleOption("wholeWord")}
         ><WholeWord size={14} /></SearchOptionButton>
         <SearchOptionButton
           active={options.regex}
-          label="Use regular expression"
+          label={t("search.regex")}
           onClick={() => toggleOption("regex")}
         ><Regex size={13} /></SearchOptionButton>
       </div>
       <div className="thread-search-navigation">
         <button
           type="button"
-          aria-label="Previous thread search match"
-          title="Previous match · Shift+Enter"
+          aria-label={t("search.previous")}
+          title={t("search.previousHint")}
           disabled={!hasMatches}
           onClick={() => activate(-1)}
         ><ChevronLeft size={15} /></button>
         <button
           type="button"
-          aria-label="Next thread search match"
-          title="Next match · Enter"
+          aria-label={t("search.next")}
+          title={t("search.nextHint")}
           disabled={!hasMatches}
           onClick={() => activate(1)}
         ><ChevronRight size={15} /></button>
         <output aria-live="polite">{counter}</output>
         <button
           type="button"
-          aria-label="Close thread search"
-          title="Close search · Escape"
+          aria-label={t("search.close")}
+          title={t("search.closeHint")}
           onClick={onClose}
         ><X size={15} /></button>
       </div>
       {error || limited ? (
         <div id="thread-search-status" className={error ? "thread-search-error" : "thread-search-limit"} role="status">
-          {error ?? `Showing the first ${MAX_THREAD_SEARCH_MATCHES.toLocaleString()} matches`}
+          {error ?? t("search.limit", { count: MAX_THREAD_SEARCH_MATCHES, value: MAX_THREAD_SEARCH_MATCHES.toLocaleString(i18n.language) })}
         </div>
       ) : null}
     </div>

@@ -1,3 +1,4 @@
+import type { TFunction } from "i18next";
 import type { ToolCall, ToolCallContent, ToolKind } from "@agentclientprotocol/sdk";
 import {
   Check,
@@ -16,6 +17,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
+import { useTranslation } from "../../i18n";
 import type { TimelineItem } from "../../lib/state";
 import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { ContentBlockView } from "./content-block";
@@ -42,6 +44,7 @@ export function ToolCallCard({
   item: Extract<TimelineItem, { type: "tool" }>;
   terminalSnapshots?: TerminalSnapshot[];
 }) {
+  const { t } = useTranslation("cards");
   const { call } = item;
   const Icon = kindIcons[call.kind ?? "other"] ?? Wrench;
   const status = item.cancelled ? "cancelled" : call.status;
@@ -51,8 +54,8 @@ export function ToolCallCard({
   const bodyId = useId();
   const disclosure = useRef<HTMLElement>(null);
   const disclosureMounted = useRef(false);
-  const kind = toolKindLabel(call.kind);
-  const title = call.title.trim() || call.name?.trim() || kind || "Tool";
+  const kind = toolKindLabel(call.kind, t);
+  const title = call.title.trim() || call.name?.trim() || kind || t("tool.fallbackTitle");
   const content = call.content ?? [];
   const visibleContent = content.flatMap((item, index) =>
     item.type === "content" && item.content.type === "text" && item.content.text.trim().length === 0
@@ -119,7 +122,7 @@ export function ToolCallCard({
           <button
             type="button"
             className="component-disclosure-button"
-            aria-label={open ? "Collapse tool details" : "Expand tool details"}
+            aria-label={open ? t("tool.collapse") : t("tool.expand")}
             aria-expanded={open}
             aria-controls={bodyId}
             onClick={toggleOpen}
@@ -129,12 +132,12 @@ export function ToolCallCard({
       <div id={bodyId} className="tool-body" data-thread-searchable hidden={!open}>
         {call.rawInput !== undefined ? (
           <section className="tool-data-section tool-input">
-            <header>Input</header>
+            <header>{t("tool.input")}</header>
             <StructuredData value={call.rawInput} />
           </section>
         ) : null}
         <section className="tool-data-section tool-output">
-          <header>Output</header>
+          <header>{t("tool.output")}</header>
           {visibleContent.length > 0 ? (
             <>
               <div className="tool-output-content">
@@ -144,7 +147,7 @@ export function ToolCallCard({
               </div>
               {call.rawOutput !== undefined ? (
                 <details className="tool-additional-output">
-                  <summary><ChevronRight size={12} />Additional output</summary>
+                  <summary><ChevronRight size={12} />{t("tool.additionalOutput")}</summary>
                   <StructuredData value={call.rawOutput} />
                 </details>
               ) : null}
@@ -152,27 +155,27 @@ export function ToolCallCard({
           ) : call.rawOutput !== undefined ? (
             <StructuredData value={call.rawOutput} />
           ) : (
-            <p className="tool-output-empty">{emptyOutputMessage(status)}</p>
+            <p className="tool-output-empty">{emptyOutputMessage(status, t)}</p>
           )}
         </section>
         <footer className={debugOpen ? "message-meta message-meta-open component-debug-meta" : "message-meta component-debug-meta"}>
           <div className="message-meta-actions">
             <DebugInfoButton
               expanded={debugOpen}
-              label="Tool info"
+              label={t("tool.info")}
               onClick={() => setDebugOpen((value) => !value)}
             />
           </div>
           <DebugInfoPanel
-            label="Tool debug information"
+            label={t("tool.debugInfo")}
             hidden={!debugOpen}
             entries={[
-              { label: "Tool call ID", value: call.toolCallId, format: "text" },
-              ...(call.name ? [{ label: "Tool name", value: call.name, format: "text" as const }] : []),
-              ...(call.locations?.length ? [{ label: "Locations", value: call.locations }] : []),
-              ...(annotations.length ? [{ label: "Content annotations", value: annotations }] : []),
-              ...(terminals.length ? [{ label: "Terminals", value: terminals }] : []),
-              { label: "Message events", value: item.raw, count: item.raw.length },
+              { label: t("tool.callId"), value: call.toolCallId, format: "text" },
+              ...(call.name ? [{ label: t("tool.name"), value: call.name, format: "text" as const }] : []),
+              ...(call.locations?.length ? [{ label: t("tool.locations"), value: call.locations }] : []),
+              ...(annotations.length ? [{ label: t("tool.annotations"), value: annotations }] : []),
+              ...(terminals.length ? [{ label: t("tool.terminals"), value: terminals }] : []),
+              { label: t("tool.events"), value: item.raw, count: item.raw.length },
             ]}
           />
         </footer>
@@ -181,29 +184,24 @@ export function ToolCallCard({
   );
 }
 
-function toolKindLabel(kind: ToolKind | undefined): string | undefined {
+function toolKindLabel(kind: ToolKind | undefined, t: TFunction<"cards">): string | undefined {
   if (!kind || kind === "other") return undefined;
-  return kind.split("_").map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ");
+  return t(`tool.kind.${kind}`);
 }
 
-function emptyOutputMessage(status: ToolCall["status"] | "cancelled"): string {
-  if (status === "cancelled") return "Cancelled before the tool finished.";
-  if (status === "completed") return "Completed without output.";
-  if (status === "failed") return "No error details were provided.";
-  return status === "in_progress" ? "Waiting for output…" : "Waiting for the tool…";
+function emptyOutputMessage(status: ToolCall["status"] | "cancelled", t: TFunction<"cards">): string {
+  if (status === "cancelled") return t("tool.empty.cancelled");
+  if (status === "completed") return t("tool.empty.completed");
+  if (status === "failed") return t("tool.empty.failed");
+  return status === "in_progress" ? t("tool.empty.waitingOutput") : t("tool.empty.waitingTool");
 }
 
 function ToolStatus({ status }: { status: ToolCall["status"] | "cancelled" }) {
+  const { t } = useTranslation("cards");
   const state = status ?? "pending";
-  const label = state === "in_progress"
-    ? "Running"
-    : state === "completed"
-      ? "Completed"
-      : state === "failed"
-        ? "Failed"
-        : state === "cancelled" ? "Cancelled" : "Pending";
+  const label = t(`tool.status.${state}`);
   return (
-    <span className={`tool-status tool-status-${state}`} aria-label={`Tool status: ${label}`}>
+    <span className={`tool-status tool-status-${state}`} aria-label={t("tool.statusLabel", { status: label })}>
       {state === "cancelled" ? (
         <CircleMinus className="status-icon" size={14} aria-hidden="true" />
       ) : state === "completed" ? (
@@ -227,6 +225,7 @@ function ToolContentView({
   content: ToolCallContent;
   terminalSnapshots: TerminalSnapshot[];
 }) {
+  const { t } = useTranslation("cards");
   if (content.type === "content") {
     return <ContentBlockView block={content.content} presentation="tool" />;
   }
@@ -238,18 +237,18 @@ function ToolContentView({
       <div className="terminal-embed">
         <div className="terminal-heading">
           <TerminalSquare size={14} />
-          <strong>Terminal</strong>
-          <span>{terminalStatus(snapshot)}</span>
+          <strong>{t("terminal.title")}</strong>
+          <span>{terminalStatus(snapshot, t)}</span>
         </div>
         {snapshot ? (
           <>
             <pre>{snapshot.output || (snapshot.exitStatus != null || snapshot.released
-              ? "No output."
-              : "Waiting for terminal output…")}</pre>
-            {snapshot.truncated ? <small>Earlier output was truncated.</small> : null}
+              ? t("terminal.noOutput")
+              : t("terminal.waitingOutput"))}</pre>
+            {snapshot.truncated ? <small>{t("terminal.truncated")}</small> : null}
           </>
         ) : (
-          <small>Terminal output is unavailable.</small>
+          <small>{t("terminal.outputUnavailable")}</small>
         )}
       </div>
     );
@@ -257,13 +256,13 @@ function ToolContentView({
   return <FileDiff content={content} />;
 }
 
-function terminalStatus(snapshot: TerminalSnapshot | undefined): string {
-  if (!snapshot) return "Unavailable";
+function terminalStatus(snapshot: TerminalSnapshot | undefined, t: TFunction<"cards">): string {
+  if (!snapshot) return t("terminal.unavailable");
   if (snapshot.exitStatus?.exitCode != null) {
-    return snapshot.exitStatus.exitCode === 0 ? "Completed" : `Failed (exit ${snapshot.exitStatus.exitCode})`;
+    return snapshot.exitStatus.exitCode === 0 ? t("terminal.completed") : t("terminal.failedExit", { code: snapshot.exitStatus.exitCode });
   }
-  if (snapshot.exitStatus?.signal) return `Stopped (${snapshot.exitStatus.signal})`;
-  if (snapshot.exitStatus != null) return "Ended";
-  if (snapshot.released) return "Stopped";
-  return "Running";
+  if (snapshot.exitStatus?.signal) return t("terminal.stoppedSignal", { signal: snapshot.exitStatus.signal });
+  if (snapshot.exitStatus != null) return t("terminal.ended");
+  if (snapshot.released) return t("terminal.stopped");
+  return t("terminal.running");
 }

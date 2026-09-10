@@ -1,9 +1,11 @@
 import type { AuthMethod } from "@agentclientprotocol/sdk";
+import type { TFunction } from "i18next";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { RotateCcw, SquareTerminal, X } from "lucide-react";
 import { useEffect, useRef } from "react";
+import { useTranslation } from "../../i18n";
 import type { AuthTerminalState } from "../../lib/state";
 
 export function AuthTerminalCard({
@@ -23,6 +25,7 @@ export function AuthTerminalCard({
   onRetry: (methodId: string) => void;
   onDismiss: () => void;
 }) {
+  const { t } = useTranslation("workspace");
   const host = useRef<HTMLDivElement>(null);
   const xterm = useRef<Terminal | undefined>(undefined);
   const writtenOutput = useRef("");
@@ -69,7 +72,6 @@ export function AuthTerminalCard({
     const fit = new FitAddon();
     instance.loadAddon(fit);
     instance.open(element);
-    instance.textarea?.setAttribute("aria-label", "Agent terminal authentication input");
     xterm.current = instance;
     writtenOutput.current = "";
     const fitAndReport = () => {
@@ -106,6 +108,10 @@ export function AuthTerminalCard({
   }, [terminalState.requestId]);
 
   useEffect(() => {
+    xterm.current?.textarea?.setAttribute("aria-label", t("terminal.inputLabel"));
+  }, [t, terminalState.requestId]);
+
+  useEffect(() => {
     const instance = xterm.current;
     if (!instance) return;
     if (terminalState.output.startsWith(writtenOutput.current)) {
@@ -130,16 +136,16 @@ export function AuthTerminalCard({
       <header>
         <span className="auth-terminal-mark"><SquareTerminal size={15} /></span>
         <div>
-          <span className="eyebrow">Agent terminal authentication</span>
+          <span className="eyebrow">{t("terminal.title")}</span>
           <h2 id="auth-terminal-heading">{method.name}</h2>
         </div>
         <span className={`auth-terminal-status status-${terminalState.status}`} role="status">
-          {terminalStatusLabel(terminalState.status)}
+          {terminalStatusLabel(terminalState.status, t)}
         </span>
       </header>
       {method.description ? <p className="auth-terminal-description">{method.description}</p> : null}
       {terminalState.truncated ? (
-        <p className="auth-terminal-notice">Earlier terminal output was truncated.</p>
+        <p className="auth-terminal-notice">{t("terminal.truncatedOutput")}</p>
       ) : null}
       <div className="auth-terminal-host" ref={host} />
       {terminalState.message ? (
@@ -148,19 +154,19 @@ export function AuthTerminalCard({
         </p>
       ) : null}
       <footer>
-        <span>This terminal is ephemeral; the Agent process controls input echo and credential handling.</span>
+        <span>{t("terminal.ephemeralNotice")}</span>
         <div>
           {active ? (
             <button type="button" className="auth-terminal-cancel" onClick={() => onCancel(terminalState.requestId)}>
-              <X size={12} /> Cancel
+              <X size={12} /> {t("cancel")}
             </button>
           ) : terminalState.status === "failed" || terminalState.status === "cancelled" ? (
             <button type="button" onClick={() => onRetry(method.id)}>
-              <RotateCcw size={12} /> Retry
+              <RotateCcw size={12} /> {t("terminal.retry")}
             </button>
           ) : null}
           {!active && terminalState.status !== "succeeded" ? (
-            <button type="button" onClick={onDismiss}>Close</button>
+            <button type="button" onClick={onDismiss}>{t("terminal.close")}</button>
           ) : null}
         </div>
       </footer>
@@ -168,10 +174,10 @@ export function AuthTerminalCard({
   );
 }
 
-function terminalStatusLabel(status: AuthTerminalState["status"]): string {
-  if (status === "starting") return "Opening…";
-  if (status === "running") return "Interactive";
-  if (status === "succeeded") return "Signed in · reconnecting…";
-  if (status === "cancelled") return "Cancelled";
-  return "Failed";
+function terminalStatusLabel(status: AuthTerminalState["status"], t: TFunction<"workspace">): string {
+  if (status === "starting") return t("terminal.status.opening");
+  if (status === "running") return t("terminal.status.interactive");
+  if (status === "succeeded") return t("terminal.status.reconnecting");
+  if (status === "cancelled") return t("terminal.status.cancelled");
+  return t("terminal.status.failed");
 }

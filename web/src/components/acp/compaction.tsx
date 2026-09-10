@@ -1,3 +1,4 @@
+import type { TFunction } from "i18next";
 import {
   Archive,
   Check,
@@ -7,6 +8,7 @@ import {
   LoaderCircle,
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { useTranslation } from "../../i18n";
 import type { TimelineItem } from "../../lib/state";
 import { ContentBlocks } from "./content-block";
 import { RawJson } from "./raw-json";
@@ -16,6 +18,7 @@ export function CompactionCard({
 }: {
   item: Extract<TimelineItem, { type: "compaction" }>;
 }) {
+  const { t } = useTranslation("cards");
   const live = item.status === "in_progress";
   const completed = item.status === "completed";
   const failed = item.status === "failed";
@@ -31,14 +34,14 @@ export function CompactionCard({
   }, [failed, live]);
 
   const label = live
-    ? "Compacting context…"
+    ? t("compaction.running")
     : completed
-      ? "Context compacted"
+      ? t("compaction.completed")
       : failed
-        ? "Context compaction failed"
+        ? t("compaction.failed")
         : cancelled
-          ? "Context compaction cancelled"
-          : "Context compaction";
+          ? t("compaction.cancelled")
+          : t("compaction.title");
   const statusClass = live || completed || failed || cancelled
     ? item.status
     : "other";
@@ -57,7 +60,7 @@ export function CompactionCard({
         <Archive size={15} aria-hidden="true" />
         <span>
           <strong>{label}</strong>
-          <small>{compactionStatusLabel(item.status, item.blocks.length)}</small>
+          <small>{compactionStatusLabel(item.status, item.blocks.length, t)}</small>
         </span>
         <code>{item.compactionId}</code>
         {completed ? (
@@ -75,22 +78,20 @@ export function CompactionCard({
         {item.blocks.length > 0 ? (
           <div className="compaction-summary"><ContentBlocks blocks={item.blocks} /></div>
         ) : (
-          <p className="compaction-empty">No retained summary was supplied by the Agent.</p>
+          <p className="compaction-empty">{t("compaction.noSummarySupplied")}</p>
         )}
         {item.error ? <p className="compaction-error">{item.error}</p> : null}
-        <RawJson label="Compaction events" value={item.raw} />
+        <RawJson label={t("compaction.events")} value={item.raw} />
       </div>
     </details>
   );
 }
 
-function compactionStatusLabel(status: string, blockCount: number): string {
-  const summary = blockCount === 0
-    ? "no retained summary"
-    : `${blockCount} summary block${blockCount === 1 ? "" : "s"}`;
-  if (status === "in_progress") return `streaming · ${summary}`;
+function compactionStatusLabel(status: string, blockCount: number, t: TFunction<"cards">): string {
+  const summary = t("compaction.summary", { count: blockCount });
   if (status === "completed") return summary;
-  if (status === "failed") return `failed · ${summary}`;
-  if (status === "cancelled") return `cancelled · ${summary}`;
-  return `${status} · ${summary}`;
+  if (status === "in_progress") return t("compaction.streamingSummary", { summary });
+  if (status === "failed") return t("compaction.failedSummary", { summary });
+  if (status === "cancelled") return t("compaction.cancelledSummary", { summary });
+  return t("compaction.otherSummary", { status, summary });
 }

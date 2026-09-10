@@ -1,6 +1,8 @@
 import type { AuthMethod } from "@agentclientprotocol/sdk";
+import type { TFunction } from "i18next";
 import { ChevronRight, KeyRound, LogOut, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, type RefObject } from "react";
+import { useTranslation } from "../../i18n";
 import type {
   AgentAuthResponse,
   AgentAuthStatus,
@@ -27,6 +29,7 @@ export function AgentAuthCard({
   disabled: boolean;
   onAuthenticate: (methodId: string) => void;
 }) {
+  const { t } = useTranslation("workspace");
   const firstAction = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (!focusAction || pending) return;
@@ -38,13 +41,12 @@ export function AgentAuthCard({
     <section className="agent-auth-card" aria-labelledby="agent-auth-heading">
       <div className="agent-auth-icon"><KeyRound size={18} /></div>
       <div className="agent-auth-copy">
-        <span className="eyebrow">ACP Agent authentication</span>
+        <span className="eyebrow">{t("auth.eyebrow")}</span>
         <h2 id="agent-auth-heading">
-          {status === "logged_out" ? `Signed out of ${agentName}` : "Sign in to continue"}
+          {status === "logged_out" ? t("auth.signedOutOf", { agentName }) : t("auth.signInToContinue")}
         </h2>
         <p>
-          {agentName} owns its account, provider, and billing. attyd only invokes the
-          authentication method the Agent advertised through ACP.
+          {t("auth.description", { agentName })}
         </p>
       </div>
       <AuthMethodButtons
@@ -55,10 +57,10 @@ export function AgentAuthCard({
         onAuthenticate={onAuthenticate}
       />
       {pending?.kind === "authenticate" ? (
-        <p className="agent-auth-progress" role="status">Waiting for the Agent to finish sign-in…</p>
+        <p className="agent-auth-progress" role="status">{t("auth.waitingToFinish")}</p>
       ) : null}
       {error ? <p className="agent-auth-error" role="alert">{error}</p> : null}
-      <footer><ShieldCheck size={12} /> Authentication stays inside the Agent-provided flow.</footer>
+      <footer><ShieldCheck size={12} /> {t("auth.flowNotice")}</footer>
     </section>
   );
 }
@@ -84,15 +86,16 @@ export function AgentAuthControls({
   onAuthenticate: (methodId: string) => void;
   onLogout: () => void;
 }) {
+  const { t } = useTranslation("workspace");
   return (
     <details className="sidebar-details agent-auth-details">
       <summary>
-        <KeyRound size={13} /> Agent authentication
-        <span className={`agent-auth-state state-${status}`}>{authStatusLabel(status)}</span>
+        <KeyRound size={13} /> {t("auth.title")}
+        <span className={`agent-auth-state state-${status}`}>{authStatusLabel(status, t)}</span>
         <ChevronRight size={12} />
       </summary>
       <div className="agent-auth-sidebar">
-        <p>Authentication and provider access stay with the ACP Agent.</p>
+        <p>{t("auth.sidebarDescription")}</p>
         <AuthMethodButtons
           methods={methods}
           pending={pending}
@@ -108,16 +111,16 @@ export function AgentAuthControls({
             onClick={onLogout}
           >
             <LogOut size={12} />
-            {pending?.kind === "logout" ? "Signing out…" : "Sign out of Agent"}
+            {pending?.kind === "logout" ? t("auth.signingOut") : t("auth.signOut")}
           </button>
         ) : null}
         {pending?.kind === "authenticate" ? (
-          <p className="agent-auth-progress" role="status">Waiting for Agent sign-in…</p>
+          <p className="agent-auth-progress" role="status">{t("auth.waitingForSignIn")}</p>
         ) : null}
         {error ? <p className="agent-auth-error" role="alert">{error}</p> : null}
         {lastResponse ? (
           <RawJson
-            label={`${lastResponse.kind === "authenticate" ? "Authenticate" : "Logout"} response`}
+            label={lastResponse.kind === "authenticate" ? t("auth.authenticateResponse") : t("auth.logoutResponse")}
             value={lastResponse.response}
           />
         ) : null}
@@ -141,6 +144,7 @@ function AuthMethodButtons({
   onAuthenticate: (methodId: string) => void;
   compact?: boolean;
 }) {
+  const { t } = useTranslation("workspace");
   return (
     <div className={compact ? "agent-auth-methods compact" : "agent-auth-methods"}>
       {methods.map((method, index) => {
@@ -153,19 +157,19 @@ function AuthMethodButtons({
             key={method.id}
             ref={index === 0 ? firstActionRef : undefined}
             disabled={disabled || pending != null}
-            aria-label={`Authenticate with ${method.name}`}
+            aria-label={t("auth.authenticateWith", { method: method.name })}
             onClick={() => onAuthenticate(method.id)}
           >
             <span>
               <strong>{method.name}</strong>
               <small>{terminal
-                ? method.description || "Open the Agent-provided interactive login terminal"
-                : method.description || "Continue with this Agent-provided method"}</small>
+                ? method.description || t("auth.terminalMethodDescription")
+                : method.description || t("auth.methodDescription")}</small>
             </span>
             <span>{active
-              ? terminal ? "Open…" : "Waiting…"
-              : terminal ? compact ? "Open" : "Open terminal"
-              : compact ? "Use" : "Continue"}</span>
+              ? terminal ? t("auth.opening") : t("auth.waiting")
+              : terminal ? compact ? t("auth.open") : t("auth.openTerminal")
+              : compact ? t("auth.use") : t("auth.continue")}</span>
           </button>
         );
       })}
@@ -173,9 +177,9 @@ function AuthMethodButtons({
   );
 }
 
-function authStatusLabel(status: AgentAuthStatus): string {
-  if (status === "required") return "Required";
-  if (status === "authenticated") return "Signed in";
-  if (status === "logged_out") return "Signed out";
-  return "Agent managed";
+function authStatusLabel(status: AgentAuthStatus, t: TFunction<"workspace">): string {
+  if (status === "required") return t("auth.status.required");
+  if (status === "authenticated") return t("auth.status.signedIn");
+  if (status === "logged_out") return t("auth.status.signedOut");
+  return t("auth.status.agentManaged");
 }

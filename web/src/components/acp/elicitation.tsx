@@ -11,6 +11,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { CircleCheck, CircleX, ExternalLink, ListTodo, LoaderCircle, X } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
+import { useTranslation } from "../../i18n";
 import type { ExternalElicitationFlow, PendingElicitation } from "../../lib/state";
 import { safeHttpUrl } from "../../lib/safe-url";
 import { useInteractionFocus } from "../../lib/use-interaction-focus";
@@ -18,8 +19,16 @@ import { RawJson } from "./raw-json";
 
 type FormValue = string | number | boolean | string[];
 
+type FormValidationError = {
+  key: "elicitation.validation.unsupported" | "elicitation.validation.required"
+    | "elicitation.validation.minLength" | "elicitation.validation.maxLength"
+    | "elicitation.validation.minItems" | "elicitation.validation.maxItems";
+  name: string;
+  count?: number;
+};
+
 export function ElicitationCard({
-  agentName = "Agent",
+  agentName,
   pending,
   onRespond,
 }: {
@@ -27,6 +36,7 @@ export function ElicitationCard({
   pending: PendingElicitation;
   onRespond: (response: CreateElicitationResponse) => void;
 }) {
+  const { t } = useTranslation("cards");
   const { request } = pending;
   const formRequest = request.mode === "form" && "requestedSchema" in request
     ? (request as typeof request & { requestedSchema: ElicitationSchema })
@@ -39,7 +49,7 @@ export function ElicitationCard({
   const [values, setValues] = useState<Record<string, FormValue>>(() =>
     defaults(properties, new Set(formRequest?.requestedSchema.required ?? [])),
   );
-  const [formError, setFormError] = useState<string>();
+  const [formError, setFormError] = useState<FormValidationError>();
   const responding = pending.responseRequestId != null;
   const card = useInteractionFocus<HTMLFormElement>();
 
@@ -72,7 +82,7 @@ export function ElicitationCard({
       ref={card}
       className="elicitation-card"
       role="dialog"
-      aria-label="Agent input request"
+      aria-label={t("elicitation.label")}
       aria-busy={responding}
       onSubmit={submit}
       onKeyDown={(event) => {
@@ -84,7 +94,7 @@ export function ElicitationCard({
     >
       <div className="permission-title">
         <span className="permission-icon"><ListTodo size={17} /></span>
-        <div><strong>{agentName} needs input</strong><p>{request.message}</p></div>
+        <div><strong>{t("elicitation.needsInput", { agent: agentName ?? t("common.agent") })}</strong><p>{request.message}</p></div>
       </div>
 
       {formRequest ? (
@@ -108,7 +118,7 @@ export function ElicitationCard({
           ))}
         </fieldset>
       ) : null}
-      {formError ? <p className="elicitation-form-error" role="alert">{formError}</p> : null}
+      {formError ? <p className="elicitation-form-error" role="alert">{t(formError.key, { name: formError.name, count: formError.count })}</p> : null}
 
       {urlRequest ? (
         externalUrl ? (
@@ -131,22 +141,22 @@ export function ElicitationCard({
                 onRespond({ action: "accept" });
               }}
             >
-              Open external flow <ExternalLink size={14} />
+              {t("elicitation.openExternal")} <ExternalLink size={14} />
             </a>
           </>
         ) : (
-          <p className="elicitation-url-error">Blocked non-HTTP elicitation URL.</p>
+          <p className="elicitation-url-error">{t("elicitation.blockedUrl")}</p>
         )
       ) : null}
 
       <div className="permission-actions">
-        {formRequest ? <button type="submit" disabled={responding}>Submit</button> : null}
-        <button type="button" className="ghost" disabled={responding} onClick={() => onRespond({ action: "decline" })}>Decline</button>
-        <button type="button" className="ghost" disabled={responding} onClick={() => onRespond({ action: "cancel" })}>Cancel</button>
+        {formRequest ? <button type="submit" disabled={responding}>{t("elicitation.submit")}</button> : null}
+        <button type="button" className="ghost" disabled={responding} onClick={() => onRespond({ action: "decline" })}>{t("elicitation.decline")}</button>
+        <button type="button" className="ghost" disabled={responding} onClick={() => onRespond({ action: "cancel" })}>{t("common.cancel")}</button>
       </div>
-      {responding ? <p className="interaction-status" role="status">Sending response…</p> : null}
+      {responding ? <p className="interaction-status" role="status">{t("common.sending")}</p> : null}
       {pending.responseError ? <p className="interaction-error" role="alert">{pending.responseError}</p> : null}
-      <RawJson label="Input request" value={request} />
+      <RawJson label={t("elicitation.request")} value={request} />
     </form>
   );
 }
@@ -174,6 +184,7 @@ export function ExternalFlowCard({
   flow: ExternalElicitationFlow;
   onDismiss: () => void;
 }) {
+  const { t } = useTranslation("cards");
   const completed = flow.status === "completed";
   const cancelled = flow.status === "cancelled";
   const ended = completed || cancelled;
@@ -186,14 +197,14 @@ export function ExternalFlowCard({
           : <LoaderCircle className="spin" size={16} />}
       <span>
         <strong>{completed
-          ? "External flow completed"
+          ? t("externalFlow.completed")
           : cancelled
-            ? "External flow cancelled"
-            : "Waiting for external flow"}</strong>
+            ? t("externalFlow.cancelled")
+            : t("externalFlow.waiting")}</strong>
         <small>{flow.message} · {flow.elicitationId}</small>
       </span>
-      {flow.url && safeHttpUrl(flow.url) ? <a href={safeHttpUrl(flow.url)} target="_blank" rel="noreferrer">Open <ExternalLink size={11} /></a> : null}
-      {ended ? <button type="button" aria-label="Dismiss external flow" onClick={onDismiss}><X size={13} /></button> : null}
+      {flow.url && safeHttpUrl(flow.url) ? <a href={safeHttpUrl(flow.url)} target="_blank" rel="noreferrer">{t("common.open")} <ExternalLink size={11} /></a> : null}
+      {ended ? <button type="button" aria-label={t("externalFlow.dismiss")} onClick={onDismiss}><X size={13} /></button> : null}
     </div>
   );
 }
@@ -213,6 +224,7 @@ function ElicitationField({
   value: FormValue | undefined;
   onChange: (value: FormValue | undefined) => void;
 }) {
+  const { t } = useTranslation("cards");
   const common = schema as { title?: string | null; description?: string | null };
   const title = common.title ?? name;
   const description = common.description;
@@ -276,7 +288,7 @@ function ElicitationField({
         <strong>{title}{required ? " *" : ""}</strong>
         {description ? <small>{description}</small> : null}
         <select disabled={disabled} aria-required={required} value={value === undefined ? unspecified : String(value)} onChange={(event) => onChange(event.target.value === unspecified ? undefined : event.target.value)}>
-          {!required ? <option value={unspecified}>Not specified</option> : null}
+          {!required ? <option value={unspecified}>{t("elicitation.unspecified")}</option> : null}
           {choices.map((choice) => <option value={choice.value} key={choice.value}>{choice.label}</option>)}
         </select>
       </label>
@@ -313,7 +325,7 @@ function ElicitationField({
           disabled={disabled}
           aria-required={required}
           type={stringSchema.format === "email" ? "email" : stringSchema.format === "uri" ? "url" : stringSchema.format === "date" ? "date" : "text"}
-          placeholder={stringSchema.format === "date-time" ? "2026-08-30T12:30:00Z" : undefined}
+          placeholder={stringSchema.format === "date-time" ? t("elicitation.dateTimePlaceholder") : undefined}
           value={typeof value === "string" ? value : ""}
           onChange={(event) => {
             const input = event.target.value;
@@ -365,11 +377,11 @@ function validateForm(
   properties: Record<string, ElicitationPropertySchema>,
   required: Set<string>,
   values: Record<string, FormValue>,
-): string | undefined {
+): FormValidationError | undefined {
   for (const name of required) {
     const schema = properties[name];
-    if (!schema || !supportedField(schema)) return `Required field ${name} is not supported by this client.`;
-    if (!(name in values)) return `Complete required field ${name}.`;
+    if (!schema || !supportedField(schema)) return { key: "elicitation.validation.unsupported", name };
+    if (!(name in values)) return { key: "elicitation.validation.required", name };
   }
   for (const [name, value] of Object.entries(values)) {
     const schema = properties[name];
@@ -378,19 +390,19 @@ function validateForm(
       const stringSchema = schema as StringPropertySchema;
       const length = Array.from(value).length;
       if (stringSchema.minLength != null && length < stringSchema.minLength) {
-        return `Enter at least ${stringSchema.minLength} character${stringSchema.minLength === 1 ? "" : "s"} for ${name}.`;
+        return { key: "elicitation.validation.minLength", name, count: stringSchema.minLength };
       }
       if (stringSchema.maxLength != null && length > stringSchema.maxLength) {
-        return `Enter at most ${stringSchema.maxLength} character${stringSchema.maxLength === 1 ? "" : "s"} for ${name}.`;
+        return { key: "elicitation.validation.maxLength", name, count: stringSchema.maxLength };
       }
     }
     if (schema?.type !== "array" || !Array.isArray(value)) continue;
     const arraySchema = schema as MultiSelectPropertySchema;
     if (arraySchema.minItems != null && value.length < arraySchema.minItems) {
-      return `Select at least ${arraySchema.minItems} option${arraySchema.minItems === 1 ? "" : "s"} for ${name}.`;
+      return { key: "elicitation.validation.minItems", name, count: arraySchema.minItems };
     }
     if (arraySchema.maxItems != null && value.length > arraySchema.maxItems) {
-      return `Select no more than ${arraySchema.maxItems} options for ${name}.`;
+      return { key: "elicitation.validation.maxItems", name, count: arraySchema.maxItems };
     }
   }
   return undefined;

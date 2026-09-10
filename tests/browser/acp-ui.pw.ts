@@ -33,6 +33,56 @@ const test = baseTest.extend<{ isolatedAttydUrl: string }>({
   baseURL: async ({ isolatedAttydUrl }, use) => use(isolatedAttydUrl),
 });
 
+test.describe("interface localization", () => {
+  test.use({ locale: "zh-CN" });
+
+  test("detects Chinese and remembers an explicit language across reloads", async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "项目", exact: true })).toBeVisible();
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+    await page.getByRole("button", { name: "Agent 设置", exact: true }).click();
+    await page.getByRole("combobox", { name: "界面语言", exact: true }).selectOption("en");
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await page.reload();
+    await expect(page.locator("html")).toHaveAttribute("lang", "en");
+    await page.getByRole("button", { name: "Agent settings", exact: true }).click();
+    await expect(page.getByRole("combobox", { name: "Language", exact: true })).toHaveValue("en");
+    await page.getByRole("combobox", { name: "Language", exact: true }).selectOption("system");
+    await expect(page.getByRole("heading", { name: "项目", exact: true })).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem("attyd.language"))).toBeNull();
+    expect(browserErrors).toEqual([]);
+  });
+
+  test("switches language on mobile without reloading the session or losing its draft", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const browserErrors = collectBrowserErrors(page);
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
+    await composer.fill("保留我的草稿 — keep this draft");
+    const originalUrl = page.url();
+    let sessionRequests = 0;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname.startsWith("/api/v1/sessions/")) sessionRequests += 1;
+    });
+    await page.getByRole("button", { name: "Agent 设置", exact: true }).click();
+    await page.getByRole("combobox", { name: "界面语言", exact: true }).selectOption("en");
+    await expect(page.locator("html")).toHaveAttribute("lang", "en");
+    await expect(composer).toHaveValue("保留我的草稿 — keep this draft");
+    await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
+    await page.getByRole("combobox", { name: "Language", exact: true }).selectOption("zh-CN");
+    await expect(composer).toHaveValue("保留我的草稿 — keep this draft");
+    expect(page.url()).toBe(originalUrl);
+    expect(sessionRequests).toBe(0);
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    await page.screenshot({ path: testInfo.outputPath("i18n-mobile.png") });
+    expect(browserErrors).toEqual([]);
+  });
+});
+
 test("drives permission and form ACP interactions with real focus restoration", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");

@@ -1,10 +1,12 @@
 import { useEffect, useRef } from "react";
+import { useTranslation } from "../../i18n";
 
 export function CloseSessionDialog({ disabled, onCancel, onConfirm }: {
   disabled: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const { t } = useTranslation("workspace");
   const keep = useRef<HTMLButtonElement>(null);
   const close = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -26,14 +28,14 @@ export function CloseSessionDialog({ disabled, onCancel, onConfirm }: {
             else keep.current?.focus();
           }
         }}>
-        <header><div><h2 id="close-session-title">Close session?</h2></div></header>
+        <header><div><h2 id="close-session-title">{t("closeSession.title")}</h2></div></header>
         <div id="close-session-effects" className="close-session-effects">
-          <p>This asks the Agent to stop this session's tasks and release its resources. Managed terminal commands and their child processes may stop, including development servers.</p>
-          <p>Temporary messages and terminal output will be cleared. History recovery depends on the Agent. Detached background services may keep running.</p>
+          <p>{t("closeSession.resourcesWarning")}</p>
+          <p>{t("closeSession.historyWarning")}</p>
         </div>
         <footer>
-          <button ref={keep} type="button" className="secondary" onClick={onCancel}>Keep session</button>
-          <button ref={close} type="button" className="danger" disabled={disabled} onClick={onConfirm}>Close session</button>
+          <button ref={keep} type="button" className="secondary" onClick={onCancel}>{t("closeSession.keep")}</button>
+          <button ref={close} type="button" className="danger" disabled={disabled} onClick={onConfirm}>{t("closeSession.close")}</button>
         </footer>
       </section>
     </div>

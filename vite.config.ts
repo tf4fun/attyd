@@ -11,6 +11,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           "react-vendor": ["react", "react-dom"],
+          i18n: ["i18next", "react-i18next", "i18next-browser-languagedetector"],
           markdown: ["react-markdown", "remark-gfm"],
           terminal: ["@xterm/xterm", "@xterm/addon-fit"],
         },

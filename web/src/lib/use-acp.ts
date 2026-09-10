@@ -1,3 +1,4 @@
+import i18n from "../i18n";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type {
   ContentBlock,
@@ -318,7 +319,7 @@ export function useAcp() {
     let listed = await readSessionList(cursor);
     const cursors = new Set<string>();
     while (discoverProject && listed.nextCursor != null && window.location.pathname === pathname) {
-      if (cursors.has(listed.nextCursor)) throw new Error("Agent session list repeated a cursor");
+      if (cursors.has(listed.nextCursor)) throw new Error(i18n.t("errors.repeatedCursor"));
       cursors.add(listed.nextCursor);
       listed = await readSessionList(listed.nextCursor);
     }
@@ -357,7 +358,7 @@ export function useAcp() {
         // Complete this page's discovery before choosing its session workspace.
         const cursors = new Set<string>();
         while (listed.nextCursor != null) {
-          if (cursors.has(listed.nextCursor)) throw new Error("Agent session list repeated a cursor");
+          if (cursors.has(listed.nextCursor)) throw new Error(i18n.t("errors.repeatedCursor"));
           cursors.add(listed.nextCursor);
           listed = await readSessionList(listed.nextCursor);
           if (!stillCurrent()) return;
@@ -536,7 +537,7 @@ export function useAcp() {
   const searchWorkspaceContext = useCallback(async (query: string) => {
     const sessionId = activeSessionIdRef.current;
     if (sessionId == null) {
-      throw new Error("Wait for an active ACP session before searching workspace context");
+      throw new Error(i18n.t("errors.searchNotReady"));
     }
     const response = await requestJson<{ matches: WorkspaceContextMatch[] }>(
       workspaceContextSearchPath(query, sessionId),
@@ -547,7 +548,7 @@ export function useAcp() {
   const readWorkspaceContext = useCallback(async (path: string) => {
     const sessionId = activeSessionIdRef.current;
     if (sessionId == null) {
-      throw new Error("Wait for an active ACP session before adding workspace context");
+      throw new Error(i18n.t("errors.contextNotReady"));
     }
     const response = await requestJson<{ attachment: WorkspaceContextAttachment }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/context/read`,
@@ -583,7 +584,7 @@ export function useAcp() {
         latest.sessionId !== sessionId || latest.phase !== "ready" ||
         latest.historyRevision == null
       ) {
-        throw new Error("The ACP session is not ready to accept this prompt");
+        throw new Error(i18n.t("errors.promptNotReady"));
       }
       const admission = promptAdmissionsRef.current.get(sessionId);
       if (admission?.requestId === requestId) {

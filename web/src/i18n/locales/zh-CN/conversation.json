@@ -1,0 +1,199 @@
+{
+  "empty": {
+    "title": "是 Agent，不只是模型。",
+    "description": "发送一个任务，attyd 将按 Agent 报告的内容呈现 ACP 会话。"
+  },
+  "debug": {
+    "notification": "通知",
+    "turnResponse": "轮次响应",
+    "errorDetails": "ACP 错误详情",
+    "messageId": "消息 ID",
+    "messageEvents": "消息事件"
+  },
+  "message": {
+    "editAndResendLabel": "编辑并重新发送用户消息",
+    "editAndResend": "编辑并重新发送",
+    "responseActions": "Agent 回复操作",
+    "copyResponseLabel": "复制 Agent 回复",
+    "copyResponse": "复制回复",
+    "info": "消息信息",
+    "debug": "消息调试信息",
+    "copySelection": "复制选中内容",
+    "copyThisResponse": "复制此 Agent 回复",
+    "scrollTop": "滚动到顶部",
+    "scrollBottom": "滚动到底部",
+    "openMarkdown": "以 Markdown 打开对话"
+  },
+  "thinking": {
+    "info": "思考信息",
+    "debug": "思考调试信息",
+    "liveTitle": "正在思考…",
+    "title": "思考",
+    "collapse": "收起思考",
+    "expand": "展开思考",
+    "live": "实时"
+  },
+  "errors": {
+    "agentTurnFailed": "Agent 轮次失败",
+    "requestFailed": "ACP 请求失败",
+    "retry": "重试",
+    "editPrompt": "编辑提示词"
+  },
+  "stop": {
+    "end_turn": "轮次完成",
+    "cancelled": "轮次已取消",
+    "refusal": "请求被拒绝",
+    "max_tokens": "已达到 token 上限",
+    "max_turn_requests": "已达到轮次请求上限"
+  },
+  "usage": {
+    "input": "{{value}} 输入",
+    "output": "{{value}} 输出",
+    "reasoning": "{{value}} 推理",
+    "cacheRead": "{{value}} 缓存读取",
+    "cacheWrite": "{{value}} 缓存写入",
+    "tokens_one": "{{value}} 个 token",
+    "tokens_other": "{{value}} 个 token"
+  },
+  "search": {
+    "region": "搜索此 Agent 对话",
+    "input": "搜索此对话",
+    "placeholder": "搜索此对话…",
+    "matchCase": "区分大小写",
+    "wholeWord": "全词匹配",
+    "regex": "使用正则表达式",
+    "previous": "上一个对话搜索结果",
+    "previousHint": "上一个结果 · Shift+Enter",
+    "next": "下一个对话搜索结果",
+    "nextHint": "下一个结果 · Enter",
+    "close": "关闭对话搜索",
+    "closeHint": "关闭搜索 · Escape",
+    "counter": "{{current}}/{{total}}",
+    "limit_one": "显示前 {{value}} 个结果",
+    "limit_other": "显示前 {{value}} 个结果",
+    "queryLimit": "搜索内容最多为 {{count, number}} 个字符"
+  },
+  "attachments": {
+    "errors": {
+      "sizeLimit": "每条提示词的附件总大小不能超过 3 MB",
+      "unsupportedFile": "Agent 无法接收 {{name}}",
+      "preparing": "请等待附件准备完成后再发送",
+      "inactiveSession": "请在 ACP 会话激活后再添加附件",
+      "unsupportedInput": "此 Agent 未声明支持图片、音频或嵌入资源输入",
+      "absoluteUri": "资源链接必须是绝对 URI"
+    },
+    "remove": "移除 {{name}}",
+    "preparing_one": "正在准备 {{count, number}} 个文件…",
+    "preparing_other": "正在准备 {{count, number}} 个文件…",
+    "bytes": "{{value}} B",
+    "kilobytes": "{{value}} KB",
+    "kind": {
+      "link": "链接",
+      "context": "上下文",
+      "image": "图片",
+      "audio": "音频",
+      "text": "文本"
+    },
+    "description": "{{kind}} · {{size}}"
+  },
+  "composer": {
+    "connectionUnavailable": "Agent 连接不可用",
+    "context": {
+      "files": "此工作区中的文件",
+      "noMatches": "没有匹配的文本文件",
+      "searching": "正在搜索…",
+      "label": "工作区上下文",
+      "navigate": "选择",
+      "add": "添加上下文",
+      "close": "关闭"
+    },
+    "reconnect": "重新连接",
+    "drop": {
+      "add": "拖放文件以添加上下文",
+      "unavailable": "文件输入不可用",
+      "supported": "ACP 图片、音频或嵌入资源",
+      "unsupported": "Agent 未声明支持附件"
+    },
+    "placeholder": {
+      "disabled": "创建或打开对话以开始…",
+      "running": "将后续消息加入队列…",
+      "ready": "给 Agent 一个任务…"
+    },
+    "attachments": {
+      "unavailable": "Agent 未声明支持附件",
+      "attach": "添加 ACP 内容"
+    },
+    "expand": {
+      "collapseLabel": "收起消息输入框",
+      "expandLabel": "展开消息输入框",
+      "pending": "请先处理 Agent 交互，再展开输入框",
+      "collapseHint": "收起消息输入框 · Shift+Alt+Escape",
+      "expandHint": "展开消息输入框 · Shift+Alt+Escape"
+    },
+    "hint": {
+      "queue": "按 Enter 加入队列",
+      "filesAndCommands": "输入 @ 选择文件 · / 使用命令",
+      "commands": "输入 / 使用 Agent 命令",
+      "send": "按 Enter 发送"
+    },
+    "commands": "Agent 命令",
+    "link": {
+      "uri": "资源 URI",
+      "uriPlaceholder": "https://… 或 file://…",
+      "name": "资源名称",
+      "namePlaceholder": "名称（可选）",
+      "add": "添加资源链接",
+      "addAcp": "添加 ACP 资源链接"
+    },
+    "stop": "停止当前轮次",
+    "cancel": "取消轮次",
+    "send": "发送提示词",
+    "history_one": "历史提示词 {{index}} / {{count, number}}",
+    "history_other": "历史提示词 {{index}} / {{count, number}}"
+  },
+  "markdown": {
+    "metadata": {
+      "agent": "Agent：{{name}}",
+      "session": "会话：{{id}}",
+      "workspace": "工作区：{{path}}"
+    },
+    "messageId": "消息 ID：{{id}}",
+    "compactionDetails": "状态：{{status}} · ID：{{id}}",
+    "toolHeading": "工具 · {{title}}",
+    "eventHeading": "ACP 事件 · {{event}}",
+    "turnComplete": "轮次完成 · {{reason}}{{usage}}",
+    "embeddedImage": "嵌入图片 · {{mimeType}} · {{size}} 字节",
+    "embeddedAudio": "嵌入音频 · {{mimeType}} · {{size}} 字节",
+    "bytes": "{{size}} 字节",
+    "binary": "二进制 · {{mimeType}} · {{size}} 字节",
+    "exit": "退出码 {{code}}",
+    "id": "ID：{{id}}",
+    "annotations": {
+      "audience": "受众：{{audience}}",
+      "priority": "优先级：{{priority}}",
+      "modified": "修改时间：{{date}}",
+      "details": "ACP 注解 · {{details}}"
+    },
+    "you": "你",
+    "thinking": "思考",
+    "agent": "Agent",
+    "input": "输入",
+    "output": "输出",
+    "compaction": "上下文压缩",
+    "error": "错误：",
+    "image": "ACP 图片",
+    "resource": "嵌入资源：",
+    "diff": "差异：",
+    "terminal": "终端：",
+    "outputUnavailable": "输出不可用",
+    "planRemoved": "计划已移除",
+    "planFile": "计划文件",
+    "planEvent": "ACP 计划事件",
+    "plan": "计划",
+    "released": "已释放",
+    "running": "运行中",
+    "serializationFailed": "无法序列化 ACP 值",
+    "unknownMimeType": "未知 MIME 类型",
+    "usage": " · {{total}} 个 token（{{input}} 输入，{{output}} 输出）"
+  }
+}

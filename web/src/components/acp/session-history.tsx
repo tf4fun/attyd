@@ -1,6 +1,8 @@
 import type { SessionInfo } from "@agentclientprotocol/sdk";
+import type { TFunction } from "i18next";
 import { FolderOpen, History, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
+import { useTranslation } from "../../i18n";
 import {
   filterSessions,
   groupSessionsByWorkspace,
@@ -43,6 +45,7 @@ export function SessionHistory({
   onRefresh: () => void;
   onMore: (cursor: string) => void;
 }) {
+  const { t } = useTranslation("workspace");
   const [query, setQuery] = useState("");
   const activeSession = useMemo(() => {
     if (!activeSessionId) return undefined;
@@ -77,9 +80,9 @@ export function SessionHistory({
   return (
     <section className="sidebar-section session-history" aria-labelledby="threads-heading">
       <div className="section-heading">
-        <span className="section-kicker" id="threads-heading">Threads</span>
+        <span className="section-kicker" id="threads-heading">{t("history.title")}</span>
         {canList ? (
-          <button type="button" aria-label="Refresh Agent threads" onClick={onRefresh}>
+          <button type="button" aria-label={t("history.refresh")} onClick={onRefresh}>
             <RefreshCw size={12} />
           </button>
         ) : null}
@@ -93,8 +96,8 @@ export function SessionHistory({
             maxLength={256}
             autoComplete="off"
             spellCheck="false"
-            placeholder="Filter threads"
-            aria-label="Filter loaded Agent threads"
+            placeholder={t("history.filter")}
+            aria-label={t("history.filterLoaded")}
             aria-describedby="session-filter-status"
             onChange={(event) => setQuery(event.currentTarget.value)}
             onKeyDown={(event) => {
@@ -105,21 +108,23 @@ export function SessionHistory({
             }}
           />
           {query ? (
-            <button type="button" className="session-filter-clear" aria-label="Clear thread filter" onClick={() => setQuery("")}>
+            <button type="button" className="session-filter-clear" aria-label={t("history.clearFilter")} onClick={() => setQuery("")}>
               <X size={11} />
             </button>
           ) : null}
         </div>
       ) : null}
       <p className="session-filter-status" id="session-filter-status" aria-live="polite">
-        {filtering ? `${visibleCount} of ${totalCount} loaded threads` : `${totalCount} loaded ${totalCount === 1 ? "thread" : "threads"}`}
+        {filtering
+          ? t("history.filteredThreads", { count: totalCount, visible: visibleCount })
+          : t("history.loadedThreads", { count: totalCount })}
       </p>
       <div className="session-list">
         {groups.map((group) => (
           <div className="session-group" key={group.cwd}>
             <h3 className="session-group-label" title={group.cwd || undefined}>
               <FolderOpen size={12} aria-hidden="true" />
-              <span>{group.label}</span>
+              <span>{group.cwd || t("unknownWorkspace")}</span>
             </h3>
             {group.sessions.map((session) => (
               <SessionRow
@@ -141,17 +146,17 @@ export function SessionHistory({
         ))}
       </div>
       {canList && !filtering && totalCount === (activeSession ? 1 : 0) ? (
-        <p className="no-saved-threads">No other sessions in this project.</p>
+        <p className="no-saved-threads">{t("history.noOtherSessions")}</p>
       ) : null}
       {filtering && visibleCount === 0 ? (
-        <p className="no-saved-threads">No loaded Agent threads match this filter.</p>
+        <p className="no-saved-threads">{t("history.noMatchingThreads")}</p>
       ) : null}
       {filtering && nextCursor ? (
-        <p className="session-filter-scope">Filter covers loaded threads only.</p>
+        <p className="session-filter-scope">{t("history.filterScope")}</p>
       ) : null}
       {nextCursor ? (
         <button type="button" className="load-more" disabled={disabled} onClick={() => onMore(nextCursor)}>
-          Load more from Agent
+          {t("history.loadMore")}
         </button>
       ) : null}
     </section>
@@ -183,6 +188,7 @@ function SessionRow({
   onAttach: (session: SessionInfo) => void;
   onDelete: (sessionId: string) => void;
 }) {
+  const { t, i18n } = useTranslation("workspace");
   const title = session.title || shortId(session.sessionId);
   return (
     <div className={`session-row ${active ? "active current-thread" : ""} ${attention ? "attention" : ""}`}>
@@ -191,18 +197,18 @@ function SessionRow({
         className="session-open"
         disabled={disabled || active || deleting || (!open && !canAttach)}
         aria-current={active ? "page" : undefined}
-        title={active || open || canAttach ? session.sessionId : "Agent can list sessions but cannot load or resume them"}
+        title={active || open || canAttach ? session.sessionId : t("history.cannotAttach")}
         onClick={() => onAttach(session)}
       >
         <History size={13} />
         <span>
           <strong>{title}</strong>
           <small>{active
-            ? `${shortId(session.sessionId)} · active`
-            : formatSessionDate(session.updatedAt)}</small>
+            ? t("history.activeSession", { id: shortId(session.sessionId) })
+            : formatSessionDate(session.updatedAt, t, i18n.resolvedLanguage)}</small>
         </span>
         {attention ? (
-          <i className="session-attention" aria-label="Agent input required" title="Agent input required" />
+          <i className="session-attention" aria-label={t("history.inputRequired")} title={t("history.inputRequired")} />
         ) : null}
       </button>
       {canDelete ? (
@@ -210,11 +216,11 @@ function SessionRow({
           type="button"
           className="session-delete"
           disabled={disabled || busy || deleting}
-          aria-label={`${deleting ? "Deleting" : "Delete"} ${title}`}
+          aria-label={deleting ? t("deletingSession", { title }) : t("deleteSession", { title })}
           title={busy
-            ? "Stop this thread before deleting it"
+            ? t("history.stopBeforeDelete")
             : open || active
-              ? "Close and delete this thread"
+              ? t("history.closeAndDelete")
               : undefined}
           onClick={() => onDelete(session.sessionId)}
         >
@@ -229,10 +235,10 @@ function shortId(value: string): string {
   return value.length > 14 ? `${value.slice(0, 7)}…${value.slice(-5)}` : value;
 }
 
-function formatSessionDate(value: string | null | undefined): string {
-  if (!value) return "Saved by Agent";
+function formatSessionDate(value: string | null | undefined, t: TFunction<"workspace">, language?: string): string {
+  if (!value) return t("history.savedByAgent");
   const date = new Date(value);
   return Number.isNaN(date.valueOf())
-    ? "Saved by Agent"
-    : date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+    ? t("history.savedByAgent")
+    : date.toLocaleString(language, { dateStyle: "medium", timeStyle: "short" });
 }

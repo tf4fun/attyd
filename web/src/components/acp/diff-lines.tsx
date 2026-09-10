@@ -1,3 +1,4 @@
+import { useTranslation } from "../../i18n";
 import type { ReviewDiffResult, ReviewLineKind } from "../../lib/review-changes";
 
 export function DiffLines({
@@ -7,9 +8,10 @@ export function DiffLines({
   path: string;
   diff: Pick<ReviewDiffResult, "lines" | "approximate" | "truncated">;
 }) {
+  const { t } = useTranslation("cards");
   return (
     <>
-      <div className="change-review-lines" role="table" aria-label={`Read-only diff for ${path}`}>
+      <div className="change-review-lines" role="table" aria-label={t("diff.readOnlyFor", { path })}>
         {diff.lines.map((line, index) => (
           <div className={`change-review-line line-${line.kind}`} role="row" key={`${line.kind}:${line.oldLine ?? ""}:${line.newLine ?? ""}:${index}`}>
             <span role="cell">{line.oldLine ?? ""}</span>
@@ -20,7 +22,7 @@ export function DiffLines({
         ))}
       </div>
       {diff.approximate || diff.truncated ? (
-        <footer>{diff.approximate ? "Large file: change counts are approximate." : ""}{diff.approximate && diff.truncated ? " " : ""}{diff.truncated ? "Some diff lines are omitted." : ""}</footer>
+        <footer>{t(diff.approximate && diff.truncated ? "diff.approximateAndTruncated" : diff.approximate ? "diff.approximateNotice" : "diff.truncatedNotice")}</footer>
       ) : null}
     </>
   );

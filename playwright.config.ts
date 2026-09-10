@@ -14,6 +14,7 @@ export default defineConfig({
   expect: { timeout: 8_000 },
   use: {
     channel: localChannel,
+    locale: "en-US",
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },

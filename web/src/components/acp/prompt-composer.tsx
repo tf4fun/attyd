@@ -32,8 +32,9 @@ import type {
   WorkspaceContextAttachment,
   WorkspaceContextMatch,
 } from "../../../../shared/bridge";
+import i18n, { useTranslation } from "../../i18n";
 import { randomId } from "../../lib/id";
-import { MAX_ATTACHMENT_BYTES, createPromptAttachments, type PromptAttachment } from "../../lib/prompt-attachments";
+import { MAX_ATTACHMENT_BYTES, createPromptAttachments, PromptAttachmentError, promptAttachmentErrorMessage, type PromptAttachment } from "../../lib/prompt-attachments";
 import { ContextUsage, type ContextUsageValue } from "./context-usage";
 
 export interface ComposerDraft {
@@ -92,9 +93,10 @@ export function PromptComposer({
   onSearchWorkspaceContext?: (query: string) => Promise<WorkspaceContextMatch[]>;
   onReadWorkspaceContext?: (path: string) => Promise<WorkspaceContextAttachment>;
 }) {
+  const { t } = useTranslation("conversation");
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
-  const [attachmentError, setAttachmentError] = useState<string>();
+  const [attachmentError, setAttachmentError] = useState<Error | string>();
   const [linkOpen, setLinkOpen] = useState(false);
   const [linkUrl, setLinkUrl] = useState("");
   const [linkName, setLinkName] = useState("");
@@ -257,7 +259,7 @@ export function PromptComposer({
           if (contextSearchSequence.current !== sequence) return;
           setContextMatches([]);
           setContextLoading(false);
-          setAttachmentError(error instanceof Error ? error.message : String(error));
+          setAttachmentError(error instanceof Error ? error : String(error));
         });
     }, 120);
     return () => window.clearTimeout(timer);
@@ -287,7 +289,7 @@ export function PromptComposer({
     const currentAttachments = attachmentsRef.current;
     if ((!text && currentAttachments.length === 0) || disabled) return;
     if (pendingFileCount.current > 0) {
-      setAttachmentError("Wait for attachments to finish preparing before sending");
+      setAttachmentError(new PromptAttachmentError("preparing"));
       return;
     }
     const currentBlocks = currentAttachments.map(({ block }) => block);
@@ -312,11 +314,11 @@ export function PromptComposer({
   const attachFiles = async (files: File[]) => {
     if (files.length === 0) return;
     if (disabled) {
-      setAttachmentError("Wait for an active ACP session before attaching files");
+      setAttachmentError(new PromptAttachmentError("inactiveSession"));
       return;
     }
     if (!attachmentsSupported) {
-      setAttachmentError("This Agent did not advertise image, audio, or embedded-resource input");
+      setAttachmentError(new PromptAttachmentError("unsupportedInput"));
       return;
     }
     const incomingBytes = files.reduce((sum, file) => sum + file.size, 0);
@@ -330,7 +332,7 @@ export function PromptComposer({
         attachedBytes + pendingAttachmentBytes.current + incomingBytes >
         MAX_ATTACHMENT_BYTES
       ) {
-        throw new Error("Attachments are limited to 3 MB per prompt");
+        throw new PromptAttachmentError("sizeLimit");
       }
       pendingAttachmentBytes.current += incomingBytes;
       pendingFileCount.current += files.length;
@@ -343,7 +345,7 @@ export function PromptComposer({
       setAttachments(combined);
       setAttachmentError(undefined);
     } catch (error) {
-      setAttachmentError(error instanceof Error ? error.message : String(error));
+      setAttachmentError(error instanceof Error ? error : String(error));
     } finally {
       if (reserved) {
         pendingAttachmentBytes.current = Math.max(
@@ -370,7 +372,7 @@ export function PromptComposer({
         attachedBytes + pendingAttachmentBytes.current + incomingBytes >
         MAX_ATTACHMENT_BYTES
       ) {
-        throw new Error("Attachments are limited to 3 MB per prompt");
+        throw new PromptAttachmentError("sizeLimit");
       }
       pendingAttachmentBytes.current += incomingBytes;
       pendingFileCount.current += 1;
@@ -387,7 +389,7 @@ export function PromptComposer({
         0,
       );
       if (currentBytes + otherPendingBytes + attachment.size > MAX_ATTACHMENT_BYTES) {
-        throw new Error("Attachments are limited to 3 MB per prompt");
+        throw new PromptAttachmentError("sizeLimit");
       }
       pendingAttachmentBytes.current += attachment.size - reservedBytes;
       reservedBytes = attachment.size;
@@ -403,7 +405,7 @@ export function PromptComposer({
       setAttachments(combined);
       setAttachmentError(undefined);
     } catch (error) {
-      setAttachmentError(error instanceof Error ? error.message : String(error));
+      setAttachmentError(error instanceof Error ? error : String(error));
     } finally {
       if (reserved) {
         pendingAttachmentBytes.current = Math.max(
@@ -486,7 +488,7 @@ export function PromptComposer({
     try {
       new URL(uri);
     } catch {
-      setAttachmentError("Resource links must be absolute URIs");
+      setAttachmentError(new PromptAttachmentError("absoluteUri"));
       return;
     }
     const fallbackName = uri.split("/").filter(Boolean).at(-1) ?? uri;
@@ -606,21 +608,21 @@ export function PromptComposer({
         <div className="composer-reconnect" role="status" aria-live="polite">
           <WifiOff size={17} aria-hidden="true" />
           <span>
-            <strong>Agent connection unavailable</strong>
+            <strong>{t("composer.connectionUnavailable")}</strong>
             <small>{connectionRecovery.message}</small>
           </span>
           <button type="button" onClick={connectionRecovery.onReconnect}>
-            <RefreshCw size={13} aria-hidden="true" /> Reconnect
+            <RefreshCw size={13} aria-hidden="true" /> {t("composer.reconnect")}
           </button>
         </div>
       ) : null}
       {dragActive ? (
         <div className="attachment-drop-target" role="status">
           <Paperclip size={18} />
-          <strong>{attachmentsSupported ? "Drop files to add context" : "File input unavailable"}</strong>
+          <strong>{attachmentsSupported ? t("composer.drop.add") : t("composer.drop.unavailable")}</strong>
           <span>{attachmentsSupported
-            ? "ACP image, audio, or embedded resource"
-            : "The Agent did not advertise attachment support"}</span>
+            ? t("composer.drop.supported")
+            : t("composer.drop.unsupported")}</span>
         </div>
       ) : null}
       {contextMenuOpen ? (
@@ -628,12 +630,12 @@ export function PromptComposer({
           className="context-menu"
           id="workspace-context-menu"
           role="listbox"
-          aria-label="Workspace context"
+          aria-label={t("composer.context.label")}
         >
-          <header><AtSign size={13} /><span>Files from this workspace</span></header>
+          <header><AtSign size={13} /><span>{t("composer.context.files")}</span></header>
           {contextLoading ? (
             <div className="context-menu-state" role="status">
-              <LoaderCircle className="spin" size={12} /> Searching…
+              <LoaderCircle className="spin" size={12} /> {t("composer.context.searching")}
             </div>
           ) : contextMatches.length > 0 ? contextMatches.map((match, index) => (
             <button
@@ -651,13 +653,13 @@ export function PromptComposer({
               <code>{formatBytes(match.size)}</code>
             </button>
           )) : (
-            <div className="context-menu-state">No matching text files</div>
+            <div className="context-menu-state">{t("composer.context.noMatches")}</div>
           )}
-          <footer><kbd>↑↓</kbd> navigate <kbd>Enter</kbd> add context <kbd>Esc</kbd> close</footer>
+          <footer><kbd>↑↓</kbd> {t("composer.context.navigate")} <kbd>Enter</kbd> {t("composer.context.add")} <kbd>Esc</kbd> {t("composer.context.close")}</footer>
         </div>
       ) : null}
       {commandMatches.length > 0 ? (
-        <div className="command-menu" id="agent-command-menu" role="listbox" aria-label="Agent commands">
+        <div className="command-menu" id="agent-command-menu" role="listbox" aria-label={t("composer.commands")}>
           {commandMatches.map((command, index) => (
             <button
               key={command.name}
@@ -684,7 +686,7 @@ export function PromptComposer({
               <small>{attachmentLabel(attachment)}</small>
               <button
                 type="button"
-                aria-label={`Remove ${attachment.name}`}
+                aria-label={t("attachments.remove", { name: attachment.name })}
                 onClick={() => {
                   const next = attachmentsRef.current.filter(({ id }) => id !== attachment.id);
                   markRestoredBlocksChanged();
@@ -698,18 +700,18 @@ export function PromptComposer({
           ))}
         </div>
       ) : null}
-      {attachmentError ? <div className="attachment-error">{attachmentError}</div> : null}
+      {attachmentError ? <div className="attachment-error">{promptAttachmentErrorMessage(attachmentError)}</div> : null}
       {pendingFiles > 0 ? (
         <div className="attachment-loading" role="status">
           <LoaderCircle className="spin" size={12} />
-          Preparing {pendingFiles} file{pendingFiles === 1 ? "" : "s"}…
+          {t("attachments.preparing", { count: pendingFiles })}
         </div>
       ) : null}
       {linkOpen ? (
         <div className="link-editor">
-          <input aria-label="Resource URI" placeholder="https://… or file://…" value={linkUrl} onChange={(event) => setLinkUrl(event.target.value)} />
-          <input aria-label="Resource name" placeholder="Name (optional)" value={linkName} onChange={(event) => setLinkName(event.target.value)} />
-          <button type="button" aria-label="Add resource link" disabled={!linkUrl.trim()} onClick={addResourceLink}><Plus size={13} /></button>
+          <input aria-label={t("composer.link.uri")} placeholder={t("composer.link.uriPlaceholder")} value={linkUrl} onChange={(event) => setLinkUrl(event.target.value)} />
+          <input aria-label={t("composer.link.name")} placeholder={t("composer.link.namePlaceholder")} value={linkName} onChange={(event) => setLinkName(event.target.value)} />
+          <button type="button" aria-label={t("composer.link.add")} disabled={!linkUrl.trim()} onClick={addResourceLink}><Plus size={13} /></button>
         </div>
       ) : null}
       <textarea
@@ -728,10 +730,10 @@ export function PromptComposer({
             ? `agent-command-${activeCommandIndex}`
             : undefined}
         placeholder={disabled
-          ? "Create or open a thread to start…"
+          ? t("composer.placeholder.disabled")
           : running
-            ? "Queue a follow-up…"
-            : "Give the agent a task…"}
+            ? t("composer.placeholder.running")
+            : t("composer.placeholder.ready")}
         onChange={(event) => {
           markRestoredBlocksChanged();
           setValue(event.target.value);
@@ -757,9 +759,9 @@ export function PromptComposer({
         <button
           type="button"
           className="icon-button"
-          aria-label="Attach ACP content"
+          aria-label={t("composer.attachments.attach")}
           disabled={disabled || !attachmentsSupported}
-          title={attachmentsSupported ? "Attach ACP content" : "Agent did not advertise attachment support"}
+          title={attachmentsSupported ? t("composer.attachments.attach") : t("composer.attachments.unavailable")}
           onClick={() => picker.current?.click()}
         >
           <Paperclip size={16} />
@@ -767,9 +769,9 @@ export function PromptComposer({
         <button
           type="button"
           className="icon-button"
-          aria-label="Add ACP resource link"
+          aria-label={t("composer.link.addAcp")}
           disabled={disabled}
-          title="Add ACP resource link"
+          title={t("composer.link.addAcp")}
           onClick={() => setLinkOpen((open) => !open)}
         >
           <Link2 size={15} />
@@ -779,40 +781,40 @@ export function PromptComposer({
         <button
           type="button"
           className="icon-button composer-expand-button"
-          aria-label={expanded ? "Collapse message composer" : "Expand message composer"}
+          aria-label={expanded ? t("composer.expand.collapseLabel") : t("composer.expand.expandLabel")}
           aria-keyshortcuts="Alt+Shift+Escape"
           aria-pressed={expanded}
           disabled={interactionPending}
           title={interactionPending
-            ? "Resolve the Agent interaction before expanding"
-            : `${expanded ? "Collapse" : "Expand"} message composer · Shift+Alt+Escape`}
+            ? t("composer.expand.pending")
+            : t(expanded ? "composer.expand.collapseHint" : "composer.expand.expandHint")}
           onClick={toggleExpanded}
         >
           {expanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
         </button>
         <span>{historyIndex != null
-          ? `${historyIndex + 1} of ${history.length} previous prompts`
+          ? t("composer.history", { index: historyIndex + 1, count: history.length })
           : running
-          ? "Enter to queue"
+          ? t("composer.hint.queue")
           : capabilities?.embeddedContext
-            ? "Type @ for files · / for commands"
+            ? t("composer.hint.filesAndCommands")
             : commands.length > 0
-              ? "Type / for agent commands"
-            : "Enter to send"}</span>
+              ? t("composer.hint.commands")
+            : t("composer.hint.send")}</span>
         {running ? (
           <button
             type="button"
             className="send-button stop-button"
-            aria-label="Stop current turn"
+            aria-label={t("composer.stop")}
             onClick={onCancel}
-            title="Cancel turn"
+            title={t("composer.cancel")}
           >
             <Square size={13} fill="currentColor" />
           </button>
         ) : (
           <button
             className="send-button"
-            aria-label="Send prompt"
+            aria-label={t("composer.send")}
             disabled={disabled || pendingFiles > 0 || (!value.trim() && attachments.length === 0)}
             onClick={submit}
           >
@@ -858,7 +860,13 @@ function workspaceContextMention(
 }
 
 function formatBytes(value: number): string {
-  return value < 1024 ? `${value} B` : `${(value / 1024).toFixed(value < 10240 ? 1 : 0)} KB`;
+  const digits = value < 10240 ? 1 : 0;
+  return value < 1024
+    ? i18n.t("attachments.bytes", { ns: "conversation", value: value.toLocaleString(i18n.language) })
+    : i18n.t("attachments.kilobytes", {
+        ns: "conversation",
+        value: (value / 1024).toLocaleString(i18n.language, { minimumFractionDigits: digits, maximumFractionDigits: digits }),
+      });
 }
 
 function AttachmentIcon({ block }: { block: ContentBlock }) {
@@ -877,7 +885,10 @@ function attachmentLabel(attachment: PromptAttachment): string {
     : attachment.block.type === "resource"
       ? "context"
       : attachment.block.type;
-  return attachment.size ? `${kind} · ${formatBytes(attachment.size)}` : kind;
+  const label = i18n.t(`attachments.kind.${kind}`, { ns: "conversation" });
+  return attachment.size
+    ? i18n.t("attachments.description", { ns: "conversation", kind: label, size: formatBytes(attachment.size) })
+    : label;
 }
 
 function promptAttachment(block: Exclude<ContentBlock, { type: "text" }>, index: number): PromptAttachment {

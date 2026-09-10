@@ -1,0 +1,216 @@
+{
+  "common": {
+    "cancel": "Cancel",
+    "sending": "Sending response…",
+    "agent": "Agent",
+    "open": "Open",
+    "empty": "Empty",
+    "emptyString": "Empty string",
+    "notReported": "Not reported"
+  },
+  "diff": {
+    "approximate": "approx.",
+    "counts": "{{added}} added and {{removed}} removed lines",
+    "approximateCounts": "approximately {{added}} added and {{removed}} removed lines",
+    "newFile": "New file",
+    "emptyFile": "Empty file.",
+    "noChanges": "No content changes.",
+    "readOnlyFor": "Read-only diff for {{path}}",
+    "approximateNotice": "Large file: change counts are approximate.",
+    "truncatedNotice": "Some diff lines are omitted.",
+    "approximateAndTruncated": "Large file: change counts are approximate. Some diff lines are omitted."
+  },
+  "review": {
+    "label": "Agent-reported changes",
+    "title": "Changes",
+    "fileCount_one": "{{count, number}} file",
+    "fileCount_other": "{{count, number}} files",
+    "action": "Review",
+    "diffs": "Agent-reported ACP diffs",
+    "readOnly": "Read-only. ACP reports display diffs but does not define client rollback.",
+    "diffFrom": "Diff from {{title}}",
+    "status": {
+      "pending": "pending",
+      "in_progress": "in progress",
+      "completed": "completed",
+      "failed": "failed",
+      "cancelled": "cancelled"
+    }
+  },
+  "json": {
+    "payload": "ACP payload",
+    "serializeError": "Unable to serialize payload: {{error}}"
+  },
+  "debug": {
+    "hide": "Hide debug information",
+    "show": "Show debug information",
+    "title": "Debug information"
+  },
+  "plan": {
+    "removed": "Plan {{id}} removed",
+    "file": "Plan file",
+    "event": "Plan event",
+    "title": "Plan",
+    "progress": "{{completed}}/{{total}}",
+    "priority": {
+      "high": "high",
+      "medium": "medium",
+      "low": "low"
+    }
+  },
+  "compaction": {
+    "running": "Compacting context…",
+    "completed": "Context compacted",
+    "failed": "Context compaction failed",
+    "cancelled": "Context compaction cancelled",
+    "title": "Context compaction",
+    "noSummarySupplied": "No retained summary was supplied by the Agent.",
+    "events": "Compaction events",
+    "summary_zero": "no retained summary",
+    "summary_one": "{{count, number}} summary block",
+    "summary_other": "{{count, number}} summary blocks",
+    "streamingSummary": "streaming · {{summary}}",
+    "failedSummary": "failed · {{summary}}",
+    "cancelledSummary": "cancelled · {{summary}}",
+    "otherSummary": "{{status}} · {{summary}}"
+  },
+  "permission": {
+    "fallbackTitle": "The agent wants to run a tool",
+    "label": "Agent permission request",
+    "title": "Permission required",
+    "input": "Tool input",
+    "uninspectable": "The Agent did not provide inspectable tool input or locations.",
+    "request": "Permission request",
+    "kind": {
+      "read": "read",
+      "edit": "edit",
+      "delete": "delete",
+      "move": "move",
+      "search": "search",
+      "execute": "execute",
+      "think": "think",
+      "fetch": "fetch",
+      "switch_mode": "switch_mode",
+      "other": "other"
+    }
+  },
+  "tool": {
+    "fallbackTitle": "Tool",
+    "collapse": "Collapse tool details",
+    "expand": "Expand tool details",
+    "input": "Input",
+    "output": "Output",
+    "additionalOutput": "Additional output",
+    "info": "Tool info",
+    "debugInfo": "Tool debug information",
+    "callId": "Tool call ID",
+    "name": "Tool name",
+    "locations": "Locations",
+    "annotations": "Content annotations",
+    "terminals": "Terminals",
+    "events": "Message events",
+    "kind": {
+      "read": "Read",
+      "edit": "Edit",
+      "delete": "Delete",
+      "move": "Move",
+      "search": "Search",
+      "execute": "Execute",
+      "think": "Think",
+      "fetch": "Fetch",
+      "switch_mode": "Switch Mode",
+      "other": "Other"
+    },
+    "empty": {
+      "cancelled": "Cancelled before the tool finished.",
+      "completed": "Completed without output.",
+      "failed": "No error details were provided.",
+      "waitingOutput": "Waiting for output…",
+      "waitingTool": "Waiting for the tool…"
+    },
+    "status": {
+      "pending": "Pending",
+      "in_progress": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "statusLabel": "Tool status: {{status}}"
+  },
+  "terminal": {
+    "title": "Terminal",
+    "noOutput": "No output.",
+    "waitingOutput": "Waiting for terminal output…",
+    "truncated": "Earlier output was truncated.",
+    "outputUnavailable": "Terminal output is unavailable.",
+    "unavailable": "Unavailable",
+    "completed": "Completed",
+    "ended": "Ended",
+    "stopped": "Stopped",
+    "running": "Running",
+    "failedExit": "Failed (exit {{code}})",
+    "stoppedSignal": "Stopped ({{signal}})"
+  },
+  "content": {
+    "annotations": "ACP content annotations",
+    "intendedFor": "Intended for {{role}}",
+    "audience": {
+      "user": "user",
+      "assistant": "assistant"
+    },
+    "priorityLabel": "ACP content priority",
+    "priority": "priority {{value}}",
+    "modified": "modified {{timestamp}}",
+    "imageAlt": "ACP image content",
+    "attachmentDetails": "{{mimeType}} · {{size}}",
+    "invalidAttachment": "{{mimeType}} · Invalid attachment data",
+    "previewUnavailable": "Preview unavailable. You can still download this attachment.",
+    "downloadFailed": "Download failed. Try again.",
+    "downloadNamed": "Download {{name}}",
+    "download": "Download"
+  },
+  "elicitation": {
+    "label": "Agent input request",
+    "needsInput": "{{agent}} needs input",
+    "openExternal": "Open external flow",
+    "blockedUrl": "Blocked non-HTTP elicitation URL.",
+    "submit": "Submit",
+    "decline": "Decline",
+    "request": "Input request",
+    "unspecified": "Not specified",
+    "dateTimePlaceholder": "2026-08-30T12:30:00Z",
+    "validation": {
+      "unsupported": "Required field {{name}} is not supported by this client.",
+      "required": "Complete required field {{name}}.",
+      "minLength_one": "Enter at least {{count, number}} character for {{name}}.",
+      "minLength_other": "Enter at least {{count, number}} characters for {{name}}.",
+      "maxLength_one": "Enter at most {{count, number}} character for {{name}}.",
+      "maxLength_other": "Enter at most {{count, number}} characters for {{name}}.",
+      "minItems_one": "Select at least {{count, number}} option for {{name}}.",
+      "minItems_other": "Select at least {{count, number}} options for {{name}}.",
+      "maxItems_one": "Select no more than {{count, number}} options for {{name}}.",
+      "maxItems_other": "Select no more than {{count, number}} options for {{name}}."
+    }
+  },
+  "externalFlow": {
+    "completed": "External flow completed",
+    "cancelled": "External flow cancelled",
+    "waiting": "Waiting for external flow",
+    "dismiss": "Dismiss external flow"
+  },
+  "context": {
+    "exactUsage": "{{used}} of {{size}} context tokens",
+    "usageLabel": "Context usage: {{percentage}}% · {{usage}}",
+    "label": "ACP context usage",
+    "title": "Context window",
+    "percentUsed": "{{percentage}}% used",
+    "usedLabel": "Context window used",
+    "inContext": "In context",
+    "windowSize": "Window size",
+    "remaining": "Remaining",
+    "sessionCost": "Session cost",
+    "tokens_one": "{{value}} tokens",
+    "tokens_other": "{{value}} tokens",
+    "reportedBy": "Reported by the Agent via ACP <code>usage_update</code>."
+  }
+}

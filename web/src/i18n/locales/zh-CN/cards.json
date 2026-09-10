@@ -1,0 +1,216 @@
+{
+  "common": {
+    "cancel": "取消",
+    "sending": "正在发送回复…",
+    "agent": "Agent",
+    "open": "打开",
+    "empty": "空",
+    "emptyString": "空字符串",
+    "notReported": "未报告"
+  },
+  "diff": {
+    "approximate": "约",
+    "counts": "新增 {{added}} 行，删除 {{removed}} 行",
+    "approximateCounts": "约新增 {{added}} 行，删除 {{removed}} 行",
+    "newFile": "新文件",
+    "emptyFile": "空文件。",
+    "noChanges": "内容没有更改。",
+    "readOnlyFor": "{{path}} 的只读差异",
+    "approximateNotice": "文件较大：更改行数为估算值。",
+    "truncatedNotice": "部分差异行已省略。",
+    "approximateAndTruncated": "文件较大：更改行数为估算值。部分差异行已省略。"
+  },
+  "review": {
+    "label": "Agent 报告的更改",
+    "title": "更改",
+    "fileCount_one": "{{count, number}} 个文件",
+    "fileCount_other": "{{count, number}} 个文件",
+    "action": "查看",
+    "diffs": "Agent 报告的 ACP 差异",
+    "readOnly": "只读。ACP 报告用于显示差异，但未定义客户端回滚操作。",
+    "diffFrom": "来自 {{title}} 的差异",
+    "status": {
+      "pending": "待处理",
+      "in_progress": "进行中",
+      "completed": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消"
+    }
+  },
+  "json": {
+    "payload": "ACP 数据",
+    "serializeError": "无法序列化数据：{{error}}"
+  },
+  "debug": {
+    "hide": "隐藏调试信息",
+    "show": "显示调试信息",
+    "title": "调试信息"
+  },
+  "plan": {
+    "removed": "计划 {{id}} 已移除",
+    "file": "计划文件",
+    "event": "计划事件",
+    "title": "计划",
+    "progress": "{{completed}}/{{total}}",
+    "priority": {
+      "high": "高",
+      "medium": "中",
+      "low": "低"
+    }
+  },
+  "compaction": {
+    "running": "正在压缩上下文…",
+    "completed": "上下文已压缩",
+    "failed": "上下文压缩失败",
+    "cancelled": "上下文压缩已取消",
+    "title": "上下文压缩",
+    "noSummarySupplied": "Agent 未提供保留的摘要。",
+    "events": "压缩事件",
+    "summary_zero": "没有保留的摘要",
+    "summary_one": "{{count, number}} 个摘要块",
+    "summary_other": "{{count, number}} 个摘要块",
+    "streamingSummary": "接收中 · {{summary}}",
+    "failedSummary": "失败 · {{summary}}",
+    "cancelledSummary": "已取消 · {{summary}}",
+    "otherSummary": "{{status}} · {{summary}}"
+  },
+  "permission": {
+    "fallbackTitle": "Agent 希望运行工具",
+    "label": "Agent 权限请求",
+    "title": "需要授权",
+    "input": "工具输入",
+    "uninspectable": "Agent 未提供可供检查的工具输入或位置。",
+    "request": "权限请求",
+    "kind": {
+      "read": "读取",
+      "edit": "编辑",
+      "delete": "删除",
+      "move": "移动",
+      "search": "搜索",
+      "execute": "执行",
+      "think": "思考",
+      "fetch": "获取",
+      "switch_mode": "切换模式",
+      "other": "其他"
+    }
+  },
+  "tool": {
+    "fallbackTitle": "工具",
+    "collapse": "收起工具详情",
+    "expand": "展开工具详情",
+    "input": "输入",
+    "output": "输出",
+    "additionalOutput": "附加输出",
+    "info": "工具信息",
+    "debugInfo": "工具调试信息",
+    "callId": "工具调用 ID",
+    "name": "工具名称",
+    "locations": "位置",
+    "annotations": "内容注解",
+    "terminals": "终端",
+    "events": "消息事件",
+    "kind": {
+      "read": "读取",
+      "edit": "编辑",
+      "delete": "删除",
+      "move": "移动",
+      "search": "搜索",
+      "execute": "执行",
+      "think": "思考",
+      "fetch": "获取",
+      "switch_mode": "切换模式",
+      "other": "其他"
+    },
+    "empty": {
+      "cancelled": "工具完成前已取消。",
+      "completed": "已完成，没有输出。",
+      "failed": "未提供错误详情。",
+      "waitingOutput": "正在等待输出…",
+      "waitingTool": "正在等待工具…"
+    },
+    "status": {
+      "pending": "待处理",
+      "in_progress": "运行中",
+      "completed": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消"
+    },
+    "statusLabel": "工具状态：{{status}}"
+  },
+  "terminal": {
+    "title": "终端",
+    "noOutput": "没有输出。",
+    "waitingOutput": "正在等待终端输出…",
+    "truncated": "较早的输出已被截断。",
+    "outputUnavailable": "终端输出不可用。",
+    "unavailable": "不可用",
+    "completed": "已完成",
+    "ended": "已结束",
+    "stopped": "已停止",
+    "running": "运行中",
+    "failedExit": "失败（退出码 {{code}}）",
+    "stoppedSignal": "已停止（{{signal}}）"
+  },
+  "content": {
+    "annotations": "ACP 内容注解",
+    "intendedFor": "面向{{role}}",
+    "audience": {
+      "user": "用户",
+      "assistant": "助手"
+    },
+    "priorityLabel": "ACP 内容优先级",
+    "priority": "优先级 {{value}}",
+    "modified": "修改于 {{timestamp}}",
+    "imageAlt": "ACP 图片内容",
+    "attachmentDetails": "{{mimeType}} · {{size}}",
+    "invalidAttachment": "{{mimeType}} · 附件数据无效",
+    "previewUnavailable": "无法预览。你仍可下载此附件。",
+    "downloadFailed": "下载失败，请重试。",
+    "downloadNamed": "下载 {{name}}",
+    "download": "下载"
+  },
+  "elicitation": {
+    "label": "Agent 输入请求",
+    "needsInput": "{{agent}}需要你提供信息",
+    "openExternal": "打开外部流程",
+    "blockedUrl": "已阻止使用非 HTTP 地址的输入请求。",
+    "submit": "提交",
+    "decline": "拒绝",
+    "request": "输入请求",
+    "unspecified": "未指定",
+    "dateTimePlaceholder": "2026-08-30T12:30:00Z",
+    "validation": {
+      "unsupported": "此客户端不支持必填字段 {{name}}。",
+      "required": "请填写必填字段 {{name}}。",
+      "minLength_one": "请为 {{name}} 输入至少 {{count, number}} 个字符。",
+      "minLength_other": "请为 {{name}} 输入至少 {{count, number}} 个字符。",
+      "maxLength_one": "请为 {{name}} 输入不超过 {{count, number}} 个字符。",
+      "maxLength_other": "请为 {{name}} 输入不超过 {{count, number}} 个字符。",
+      "minItems_one": "请为 {{name}} 选择至少 {{count, number}} 个选项。",
+      "minItems_other": "请为 {{name}} 选择至少 {{count, number}} 个选项。",
+      "maxItems_one": "请为 {{name}} 选择不超过 {{count, number}} 个选项。",
+      "maxItems_other": "请为 {{name}} 选择不超过 {{count, number}} 个选项。"
+    }
+  },
+  "externalFlow": {
+    "completed": "外部流程已完成",
+    "cancelled": "外部流程已取消",
+    "waiting": "正在等待外部流程",
+    "dismiss": "关闭外部流程提示"
+  },
+  "context": {
+    "exactUsage": "上下文词元用量 {{used}} / {{size}}",
+    "usageLabel": "上下文用量：{{percentage}}% · {{usage}}",
+    "label": "ACP 上下文用量",
+    "title": "上下文窗口",
+    "percentUsed": "已使用 {{percentage}}%",
+    "usedLabel": "已使用的上下文窗口",
+    "inContext": "当前上下文",
+    "windowSize": "窗口大小",
+    "remaining": "剩余",
+    "sessionCost": "会话费用",
+    "tokens_one": "{{value}} 个词元",
+    "tokens_other": "{{value}} 个词元",
+    "reportedBy": "由 Agent 通过 ACP <code>usage_update</code> 报告。"
+  }
+}

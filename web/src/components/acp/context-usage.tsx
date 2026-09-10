@@ -1,4 +1,6 @@
+import { Trans } from "react-i18next";
 import { useEffect, useId, useRef, useState } from "react";
+import { useTranslation } from "../../i18n";
 
 export interface ContextUsageValue {
   used: number;
@@ -7,6 +9,7 @@ export interface ContextUsageValue {
 }
 
 export function ContextUsage({ usage }: { usage?: ContextUsageValue }) {
+  const { t, i18n } = useTranslation("cards");
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -43,8 +46,8 @@ export function ContextUsage({ usage }: { usage?: ContextUsageValue }) {
   const boundedUsed = Math.max(0, Math.min(usage.used, usage.size));
   const level = ratio >= 1 ? "critical" : ratio >= 0.8 ? "warning" : "normal";
   const remaining = Math.max(usage.size - usage.used, 0);
-  const exactUsage = `${formatInteger(usage.used)} of ${formatInteger(usage.size)} context tokens`;
-  const label = `Context usage: ${percentage}% · ${exactUsage}`;
+  const exactUsage = t("context.exactUsage", { used: formatInteger(usage.used, i18n.resolvedLanguage), size: formatInteger(usage.size, i18n.resolvedLanguage) });
+  const label = t("context.usageLabel", { percentage: percentage.toLocaleString(i18n.resolvedLanguage), usage: exactUsage });
 
   return (
     <div className="context-usage" ref={root}>
@@ -75,16 +78,16 @@ export function ContextUsage({ usage }: { usage?: ContextUsageValue }) {
           id={popoverId}
           className="context-usage-popover"
           role="region"
-          aria-label="ACP context usage"
+          aria-label={t("context.label")}
         >
           <header>
-            <strong>Context window</strong>
-            <span>{percentage}% used</span>
+            <strong>{t("context.title")}</strong>
+            <span>{t("context.percentUsed", { percentage: percentage.toLocaleString(i18n.resolvedLanguage) })}</span>
           </header>
           <div
             className="context-usage-progress"
             role="progressbar"
-            aria-label="Context window used"
+            aria-label={t("context.usedLabel")}
             aria-valuemin={0}
             aria-valuemax={usage.size}
             aria-valuenow={boundedUsed}
@@ -92,26 +95,26 @@ export function ContextUsage({ usage }: { usage?: ContextUsageValue }) {
             <i style={{ width: `${boundedPercentage}%` }} />
           </div>
           <dl>
-            <div><dt>In context</dt><dd>{formatInteger(usage.used)} tokens</dd></div>
-            <div><dt>Window size</dt><dd>{formatInteger(usage.size)} tokens</dd></div>
-            <div><dt>Remaining</dt><dd>{formatInteger(remaining)} tokens</dd></div>
+            <div><dt>{t("context.inContext")}</dt><dd>{t("context.tokens", { count: usage.used, value: formatInteger(usage.used, i18n.resolvedLanguage) })}</dd></div>
+            <div><dt>{t("context.windowSize")}</dt><dd>{t("context.tokens", { count: usage.size, value: formatInteger(usage.size, i18n.resolvedLanguage) })}</dd></div>
+            <div><dt>{t("context.remaining")}</dt><dd>{t("context.tokens", { count: remaining, value: formatInteger(remaining, i18n.resolvedLanguage) })}</dd></div>
             {usage.cost ? (
-              <div><dt>Session cost</dt><dd>{formatCost(usage.cost)}</dd></div>
+              <div><dt>{t("context.sessionCost")}</dt><dd>{formatCost(usage.cost, i18n.resolvedLanguage)}</dd></div>
             ) : null}
           </dl>
-          <p>Reported by the Agent via ACP <code>usage_update</code>.</p>
+          <p><Trans t={t} i18nKey="context.reportedBy" components={{ code: <code /> }} /></p>
         </section>
       ) : null}
     </div>
   );
 }
 
-function formatInteger(value: number): string {
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
+function formatInteger(value: number, language: string | undefined): string {
+  return new Intl.NumberFormat(language, { maximumFractionDigits: 0 }).format(value);
 }
 
-function formatCost(cost: NonNullable<ContextUsageValue["cost"]>): string {
-  const amount = new Intl.NumberFormat("en-US", {
+function formatCost(cost: NonNullable<ContextUsageValue["cost"]>, language: string | undefined): string {
+  const amount = new Intl.NumberFormat(language, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 6,
   }).format(cost.amount);

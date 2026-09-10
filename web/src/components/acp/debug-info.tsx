@@ -1,5 +1,6 @@
 import { Info } from "lucide-react";
 import type { MouseEventHandler } from "react";
+import { useTranslation } from "../../i18n";
 import { formatJson } from "./raw-json";
 
 export function DebugInfoButton({
@@ -11,13 +12,14 @@ export function DebugInfoButton({
   label: string;
   onClick: MouseEventHandler<HTMLButtonElement>;
 }) {
+  const { t } = useTranslation("cards");
   return (
     <button
       type="button"
       className="debug-info-button"
       aria-label={label}
       aria-expanded={expanded}
-      title={expanded ? "Hide debug information" : "Show debug information"}
+      title={expanded ? t("debug.hide") : t("debug.show")}
       onClick={onClick}
     >
       <Info size={12} aria-hidden="true" />
@@ -40,6 +42,7 @@ export function DebugInfoPanel({
   }>;
   hidden: boolean;
 }) {
+  const { t, i18n } = useTranslation("cards");
   return (
     <section
       className="debug-info-panel"
@@ -47,21 +50,21 @@ export function DebugInfoPanel({
       data-thread-search-ignore
       hidden={hidden}
     >
-      <header><Info size={13} aria-hidden="true" /><strong>Debug information</strong></header>
+      <header><Info size={13} aria-hidden="true" /><strong>{t("debug.title")}</strong></header>
       {entries.map((entry) => (
         <div className="debug-info-entry" key={entry.label}>
           <div className="debug-info-label">
             <span>{entry.label}</span>
-            {entry.count != null ? <em>{entry.count}</em> : null}
+            {entry.count != null ? <em>{entry.count.toLocaleString(i18n.resolvedLanguage)}</em> : null}
           </div>
           {entry.format === "text" ? (
             <code title={entry.value == null ? undefined : String(entry.value)}>
               {entry.value == null || entry.value === ""
-                ? entry.emptyText ?? "Not reported"
+                ? entry.emptyText ?? t("common.notReported")
                 : String(entry.value)}
             </code>
           ) : (
-            <pre><code>{formatJson(entry.value)}</code></pre>
+            <pre><code>{formatJson(entry.value, t)}</code></pre>
           )}
         </div>
       ))}
@@ -70,9 +73,10 @@ export function DebugInfoPanel({
 }
 
 export function StructuredData({ value }: { value: unknown }) {
+  const { t } = useTranslation("cards");
   const entries = structuredEntries(value);
   if (!entries) return <div className="structured-scalar"><StructuredLeaf value={value} /></div>;
-  if (entries.length === 0) return <div className="structured-scalar"><code>Empty</code></div>;
+  if (entries.length === 0) return <div className="structured-scalar"><code>{t("common.empty")}</code></div>;
   return (
     <dl className="structured-data">
       {entries.map(([key, item]) => (
@@ -86,15 +90,16 @@ export function StructuredData({ value }: { value: unknown }) {
 }
 
 function StructuredLeaf({ value }: { value: unknown }) {
+  const { t } = useTranslation("cards");
   if (typeof value === "string") {
     return value.includes("\n")
       ? <pre><code>{value}</code></pre>
-      : <code>{value || "Empty string"}</code>;
+      : <code>{value || t("common.emptyString")}</code>;
   }
   if (value == null || typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
     return <code>{value == null ? "null" : String(value)}</code>;
   }
-  return <pre><code>{formatJson(value)}</code></pre>;
+  return <pre><code>{formatJson(value, t)}</code></pre>;
 }
 
 function structuredEntries(value: unknown): Array<[string, unknown]> | undefined {

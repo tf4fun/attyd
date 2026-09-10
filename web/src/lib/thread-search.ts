@@ -1,3 +1,5 @@
+import i18n from "../i18n";
+
 export const MAX_THREAD_SEARCH_QUERY_CHARS = 256;
 export const MAX_THREAD_SEARCH_MATCHES = 10_000;
 export const MAX_THREAD_SEARCH_CHARS = 2_000_000;
@@ -31,7 +33,7 @@ export function compileThreadSearch(
 ): CompiledThreadSearch {
   if (query.length === 0) return emptySearch();
   if (query.length > MAX_THREAD_SEARCH_QUERY_CHARS) {
-    return invalidSearch(`Search is limited to ${MAX_THREAD_SEARCH_QUERY_CHARS} characters`);
+    return invalidSearch(i18n.t("search.queryLimit", { ns: "conversation", count: MAX_THREAD_SEARCH_QUERY_CHARS }));
   }
 
   let expression: RegExp;

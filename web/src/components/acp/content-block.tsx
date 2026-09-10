@@ -12,6 +12,7 @@ import {
 import { useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useTranslation } from "../../i18n";
 import { safeHttpUrl } from "../../lib/safe-url";
 import { safeMediaDataUrl, validateContentBlockSemantics } from "../../../../shared/content-validation";
 import { assertNever } from "../../../../shared/exhaustive";
@@ -33,6 +34,7 @@ export function ContentBlockView({
   block: ContentBlock;
   presentation?: "message" | "tool";
 }) {
+  const { i18n } = useTranslation("cards");
   switch (block.type) {
     case "text":
       return (
@@ -61,7 +63,7 @@ export function ContentBlockView({
     case "resource_link": {
       const details = [
         block.mimeType,
-        block.size != null ? formatBytes(block.size) : undefined,
+        block.size != null ? formatBytes(block.size, i18n.resolvedLanguage) : undefined,
       ].filter(Boolean).join(" · ");
       const contents = (
         <>
@@ -137,6 +139,7 @@ function ContentAnnotations({
 }: {
   annotations?: Annotations | null;
 }) {
+  const { t, i18n } = useTranslation("cards");
   if (
     annotations == null ||
     ((annotations.audience?.length ?? 0) === 0 &&
@@ -147,49 +150,49 @@ function ContentAnnotations({
   const audience = [...new Set(annotations.audience ?? [])];
   const timestamp = annotations.lastModified == null
     ? undefined
-    : readableTimestamp(annotations.lastModified);
+    : readableTimestamp(annotations.lastModified, i18n.resolvedLanguage);
   return (
     <div
       className="content-annotations"
-      aria-label="ACP content annotations"
+      aria-label={t("content.annotations")}
     >
       {audience.map((role) => (
-        <span key={role} title={`Intended for ${role}`}>
+        <span key={role} title={t("content.intendedFor", { role: t(`content.audience.${role}`) })}>
           {role === "user" ? <UserRound size={10} /> : <Bot size={10} />}
-          {role}
+          {t(`content.audience.${role}`)}
         </span>
       ))}
       {annotations.priority != null ? (
-        <span title="ACP content priority">
-          <Gauge size={10} /> priority {formatPriority(annotations.priority)}
+        <span title={t("content.priorityLabel")}>
+          <Gauge size={10} /> {t("content.priority", { value: formatPriority(annotations.priority, i18n.resolvedLanguage) })}
         </span>
       ) : null}
       {timestamp ? (
         <time dateTime={annotations.lastModified ?? undefined} title={annotations.lastModified ?? undefined}>
-          <Clock3 size={10} /> modified {timestamp}
+          <Clock3 size={10} /> {t("content.modified", { timestamp })}
         </time>
       ) : null}
     </div>
   );
 }
 
-function readableTimestamp(value: string): string {
+function readableTimestamp(value: string, language: string | undefined): string {
   const milliseconds = Date.parse(value);
   if (!Number.isFinite(milliseconds)) return value;
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(language, {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(milliseconds));
 }
 
-function formatPriority(value: number): string {
-  return Number.isInteger(value) ? String(value) : value.toLocaleString(undefined, {
+function formatPriority(value: number, language: string | undefined): string {
+  return value.toLocaleString(language, {
     maximumFractionDigits: 3,
   });
 }
 
-function formatBytes(value: number): string {
-  if (value < 1_024) return `${value} B`;
+function formatBytes(value: number, language: string | undefined): string {
+  if (value < 1_024) return `${value.toLocaleString(language)} B`;
   const units = ["KiB", "MiB", "GiB", "TiB"];
   let amount = value / 1_024;
   let unit = units[0];
@@ -197,7 +200,7 @@ function formatBytes(value: number): string {
     amount /= 1_024;
     unit = units[index];
   }
-  return `${amount.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${unit}`;
+  return `${amount.toLocaleString(language, { maximumFractionDigits: 1 })} ${unit}`;
 }
 
 function BinaryAttachment({ data, mimeType, uri, mediaKind }: {
@@ -206,6 +209,7 @@ function BinaryAttachment({ data, mimeType, uri, mediaKind }: {
   uri?: string;
   mediaKind?: "image" | "audio";
 }) {
+  const { t, i18n } = useTranslation("cards");
   const [failedPreview, setFailedPreview] = useState<string>();
   const [downloadError, setDownloadError] = useState(false);
   let valid = true;
@@ -240,19 +244,19 @@ function BinaryAttachment({ data, mimeType, uri, mediaKind }: {
     <div className="binary-attachment">
       {source && source !== failedPreview ? (
         kind === "image"
-          ? <figure className="media-block"><img src={source} alt={uri ? name : "ACP image content"} onError={() => setFailedPreview(source)} /></figure>
+          ? <figure className="media-block"><img src={source} alt={uri ? name : t("content.imageAlt")} onError={() => setFailedPreview(source)} /></figure>
           : <audio controls preload="metadata" src={source} onError={() => setFailedPreview(source)} />
       ) : null}
       <div className={`resource-card${valid ? "" : " invalid-content"}`}>
         {valid ? <FileText size={16} /> : <CircleAlert size={16} />}
         <span>
           <strong title={uri}>{name}</strong>
-          <small>{mimeType}{valid ? ` · ${formatBytes(bytes)}` : " · Invalid attachment data"}</small>
-          {source && source === failedPreview ? <small>Preview unavailable. You can still download this attachment.</small> : null}
-          {downloadError ? <small role="status">Download failed. Try again.</small> : null}
+          <small>{valid ? t("content.attachmentDetails", { mimeType, size: formatBytes(bytes, i18n.resolvedLanguage) }) : t("content.invalidAttachment", { mimeType })}</small>
+          {source && source === failedPreview ? <small>{t("content.previewUnavailable")}</small> : null}
+          {downloadError ? <small role="status">{t("content.downloadFailed")}</small> : null}
         </span>
-        <button type="button" className="attachment-download" disabled={!valid} onClick={download} aria-label={`Download ${name}`}>
-          <Download size={15} /> Download
+        <button type="button" className="attachment-download" disabled={!valid} onClick={download} aria-label={t("content.downloadNamed", { name })}>
+          <Download size={15} /> {t("content.download")}
         </button>
       </div>
     </div>
