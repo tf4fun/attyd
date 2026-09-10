@@ -2,52 +2,75 @@
 
 **Your ACP agent, in the browser.**
 
-attyd is a lightweight web client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
-Connect a local or remote agent, organize conversations by project, and follow its work from one workspace.
-Your agent handles models, sign-in, and saved conversations; attyd gives you the interface.
+attyd is a web workspace for coding agents that support the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
+Connect a local or remote agent to keep conversations, tool activity, and file changes together,
+with layouts for desktop and mobile.
 
 ![An attyd demo session showing tool activity and file changes](docs/assets/session.png)
 
-## What you can do
+## In the workspace
 
-- **Move between projects and conversations.** Sessions are grouped by working directory, with direct links to each conversation.
-- **Follow the work.** Read responses, inspect tool activity, and review file changes alongside the turn that produced them.
-- **Stay in control.** Approve permissions, answer the agent's questions, stop a task, or queue a follow-up while it works.
-- **Bring context and find it again.** Attach files and images, mention workspace files with `@`, search a conversation, and export it as Markdown.
+- **Projects and sessions.** Group conversations by working directory, switch between sessions, and open them through direct links.
+- **Tools and changes.** Follow replies as they arrive, inspect tool output, and review reported file diffs alongside each turn.
+- **Permissions and follow-ups.** Respond to approval requests, answer questions, ask the agent to stop, or queue your next message.
+- **Context and search.** Attach files and images, mention workspace files with `@`, search a conversation, and export it as Markdown.
 
-Available features, including attachments and restoring saved sessions, depend on your agent's capabilities.
-See the [compatibility guide](docs/acp-coverage.md) for supported behavior and known limits.
+Models and sign-in stay with your agent. Features such as attachments and saved sessions
+depend on its [ACP capabilities](docs/acp-coverage.md).
 
 ## Get started
 
-Install and configure an ACP-compatible agent of your choice. To run attyd from this repository,
-use Rust **1.88+** and Node.js **22.12+**:
+Install and configure an ACP-compatible agent, then choose **one** launch method below.
+Replace `your-agent acp` with its actual command and arguments. For an existing remote service,
+see [remote agent connections](docs/usage.md#remote-agents).
+
+After starting attyd, open **http://127.0.0.1:7331**. Choose **New project** and enter a working
+directory to start a conversation, or open an existing project to browse its sessions.
+
+### Run from source
+
+Building attyd requires both the Rust and Node.js toolchains:
+
+- **Rust 1.88+ with Cargo** — install using [rustup](https://rust-lang.org/tools/install/).
+- **Node.js 22 LTS (22.12+) or 24 LTS, with npm** — [install Node.js](https://nodejs.org/en/download).
+- **Git and native build tools** — see [platform setup](docs/usage.md#build-prerequisites) for Linux and macOS.
 
 ```bash
+git clone https://github.com/tf4fun/attyd.git
+cd attyd
 npm ci
 npm run dev -- -- your-agent acp
 ```
 
-Replace `your-agent acp` with your agent's ACP launch command and arguments.
-Open **http://127.0.0.1:7331**, choose **New project**, and enter a working directory to start a conversation.
-Open an existing project to return to its sessions.
+The first run compiles the web interface and Rust host, then starts the server.
 
-You can also [connect to a remote agent](docs/usage.md#remote-agents) over HTTP/SSE or WebSocket,
-or [build a standalone executable](docs/usage.md#standalone-build) with the web interface included.
-The built executable does not need Node.js at runtime.
+### Run a compiled executable
 
-## Running it safely
+If you have a [Linux release archive](https://github.com/tf4fun/attyd/releases), extract it and run:
 
-attyd listens on localhost by default and has no application access login.
-The connected agent can read files and run commands; provide access control through your infrastructure
-before making the service available remotely. See [deployment and trust boundaries](docs/usage.md#deployment-and-trust-boundaries).
+```bash
+./attyd -- your-agent acp
+```
+
+The attyd executable includes the web interface and needs neither Rust nor Node.js at runtime.
+Your agent may have its own dependencies. See [release binaries](docs/usage.md#release-binaries)
+or [build your own executable](docs/usage.md#standalone-build).
+
+## History and access
+
+attyd keeps conversation state in memory. Restarting attyd clears that state;
+restoring earlier messages depends on history your agent can provide.
+
+attyd is a single-user service that listens on localhost by default and has no application login.
+Agent sign-in does not protect access to the web interface. The agent can read files and run commands;
+use access control such as an authenticated reverse proxy before exposing attyd remotely.
+See [deployment guidance](docs/usage.md#deployment-and-trust-boundaries).
 
 ## Documentation
 
-- [Usage and configuration](docs/usage.md) — local and remote agents, CLI options, MCP, and optional backend examples.
-- [ACP compatibility](docs/acp-coverage.md) — supported capabilities, experimental features, and remaining verification work.
-- [Contributing](AGENTS.md) — repository structure, coding conventions, and development commands.
-- [Testing](docs/testing.md) — unit, integration, browser, and real-agent checks.
-- [Runtime architecture](docs/active-turn-runtime.md) — session ownership, history, and reconnect behavior.
+- [Usage](docs/usage.md) — installation, configuration, remote connections, and agent examples.
+- [ACP compatibility](docs/acp-coverage.md) — supported features and protocol boundaries.
+- [Contributor guide](AGENTS.md), [tests](docs/testing.md), and [architecture](docs/active-turn-runtime.md) — development and verification.
+- [Security policy](SECURITY.md) — reporting vulnerabilities and support scope.
 
 Licensed under [Apache-2.0](LICENSE).

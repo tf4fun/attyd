@@ -4,14 +4,39 @@
 to use separately, then give attyd its ACP command or endpoint. Available session
 controls depend on the capabilities that Agent advertises.
 
-## Run from source
+## Build prerequisites
 
-Use Rust 1.88 or newer and a supported Node.js release (22.12+ recommended).
-The supported Node ranges are listed in `package.json`. Node is needed to build the
-frontend; the attyd executable does not require it at runtime. Your Agent may
-have its own runtime requirements.
+To build from source, install:
+
+- **Rust 1.88+ and Cargo** through [rustup](https://rust-lang.org/tools/install/).
+  Cargo compiles the Rust host.
+- **Node.js with npm** from [Node.js downloads](https://nodejs.org/en/download).
+  Node.js 22 LTS (22.12+) or 24 LTS is recommended; the full supported ranges are in
+  [`package.json`](../package.json). Node builds the web interface.
+- **Git**, to clone the repository, and a **C compiler/linker** for native dependencies.
+  On Debian/Ubuntu, install `build-essential`; on macOS, run `xcode-select --install`.
+  See the [Rust installation guide](https://doc.rust-lang.org/book/ch01-01-installation.html)
+  for platform details.
+
+After installation, open a new terminal and check that the tools are on your PATH:
 
 ```bash
+rustc --version
+cargo --version
+node --version
+npm --version
+```
+
+These are build dependencies. The compiled attyd executable requires neither the
+Rust toolchain nor Node.js; your chosen Agent may have separate runtime requirements.
+
+## Run from source
+
+With the [build prerequisites](#build-prerequisites) installed:
+
+```bash
+git clone https://github.com/tf4fun/attyd.git
+cd attyd
 npm ci
 npm run dev -- -- your-agent acp
 ```
@@ -20,9 +45,28 @@ Replace `your-agent acp` with your installed Agent's command. This builds the
 frontend and Rust host, then serves the workspace at `http://127.0.0.1:7331`.
 Pass the Agent command explicitly; attyd does not choose or install one for you.
 
+## Release binaries
+
+When a release is available, download an archive from
+[GitHub Releases](https://github.com/tf4fun/attyd/releases) that matches your Linux
+architecture: `x86_64` or `aarch64`. The release workflow produces GNU and musl
+variants; musl builds avoid a dependency on the host's glibc version.
+
+For example, after downloading the Linux x86_64 musl archive:
+
+```bash
+tar -xzf attyd-linux-x86_64-musl.tar.gz
+./attyd --version
+./attyd -- your-agent acp
+```
+
+Rust, Cargo, Node.js, and npm are not needed to run the attyd binary. Install your
+Agent and its dependencies separately, or use a remote Agent endpoint. For macOS,
+build from source; the current release workflow packages Linux binaries only.
+
 ## Standalone build
 
-Build and run the release executable:
+After cloning the repository and running `npm ci`, build and run the release executable:
 
 ```bash
 npm run build
@@ -31,14 +75,6 @@ npm run build
 
 `target/release/attyd` embeds the frontend assets. Keep the Agent and any tools it
 needs available on the machine where you run it.
-
-For GitHub releases, push a `v<SemVer>` tag: `v1.2.0` produces an executable whose
-`--version` reports `attyd 1.2.0`; `v1.2.0-rc.1` produces a prerelease reporting
-`attyd 1.2.0-rc.1`. CI validates the tag and injects its version during compilation,
-without changing package manifests or lockfiles. You do not need to bump the
-Cargo/npm versions for each tag. The ACP client identification uses the same version.
-Local and branch builds use the development version in `Cargo.toml` by default;
-`ATTYD_BUILD_VERSION` can override it at build time, not when running the executable.
 
 ## Remote agents
 
@@ -302,3 +338,13 @@ goose serve --dangerously-unauthenticated
 Keep the unauthenticated endpoint local. A Goose endpoint requiring an upstream
 authorization header cannot currently receive that header from attyd's CLI;
 this is separate from Agent account sign-in and attyd application access.
+
+## Release versions
+
+For GitHub releases, push a `v<SemVer>` tag: `v1.2.0` produces an executable whose
+`--version` reports `attyd 1.2.0`; `v1.2.0-rc.1` produces a prerelease reporting
+`attyd 1.2.0-rc.1`. CI validates the tag and injects its version during compilation,
+without changing package manifests or lockfiles. You do not need to bump the
+Cargo/npm versions for each tag. The ACP client identification uses the same version.
+Local and branch builds use the development version in `Cargo.toml` by default;
+`ATTYD_BUILD_VERSION` can override it at build time, not when running the executable.
