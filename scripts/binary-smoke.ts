@@ -4,11 +4,12 @@ import { chmod, copyFile, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const source = process.env.ATTYD_RUST_BINARY ?? join(process.cwd(), "target/release/attyd");
+const binaryName = process.platform === "win32" ? "attyd.exe" : "attyd";
+const source = process.env.ATTYD_RUST_BINARY ?? join(process.cwd(), "target", "release", binaryName);
 const directory = await mkdtemp(join(tmpdir(), "attyd-binary-smoke-"));
-const executable = join(directory, "attyd");
+const executable = join(directory, binaryName);
 await copyFile(source, executable);
-await chmod(executable, 0o755);
+if (process.platform !== "win32") await chmod(executable, 0o755);
 
 const child = spawn(executable, [
   "--host",
@@ -24,6 +25,7 @@ const child = spawn(executable, [
   env: process.env,
   stdio: ["ignore", "pipe", "pipe"],
 });
+const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
 
 try {
   const port = await listeningPort();
@@ -46,12 +48,10 @@ try {
   const { size } = await stat(executable);
   console.log(`standalone Rust binary passed (${(size / 1_048_576).toFixed(1)} MiB)`);
 } finally {
-  child.kill("SIGTERM");
-  await Promise.race([
-    new Promise<void>((resolve) => child.once("exit", () => resolve())),
-    new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-  ]);
-  if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
+  if (child.exitCode == null && child.signalCode == null) child.kill("SIGTERM");
+  const timeout = setTimeout(() => child.kill("SIGKILL"), 2_000);
+  await closed;
+  clearTimeout(timeout);
   await rm(directory, { recursive: true, force: true });
 }
 
@@ -67,9 +67,12 @@ function listeningPort(): Promise<number> {
       child.stdout.removeAllListeners("data");
       child.stderr.removeAllListeners("data");
       child.removeAllListeners("exit");
+      child.removeListener("error", onError);
       if (error) reject(error);
       else resolve(port!);
     };
+    const onError = (error: Error) => finish(error);
+    child.once("error", onError);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
       const match = stdout.match(/attyd listening on http:\/\/127\.0\.0\.1:(\d+)/u);

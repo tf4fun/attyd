@@ -22,6 +22,7 @@ drivers; there is no second backend implementation.
 | Rust coverage gate | `npm run test:coverage` | Combines native tests, instrumented API/protocol suites, and browser interactions; requires at least 85% Rust line coverage and `cargo-llvm-cov` |
 | Standalone artifact | `npm run test:binary` | Copies only the release executable to an empty directory and verifies embedded HTML, JavaScript, health metadata, and static MIME types |
 | Release metadata | `python3 tests/release-metadata.test.py` | Validates tag-derived versions, prerelease classification, branch fallback, and rejection of invalid or injected workflow values; requires Python 3.11+ and runs in CI before artifact builds |
+| Release packaging | `python3 tests/package-release.test.py` | Verifies all seven target filenames, tar/zip contents, executable permissions, checksums, and failure on missing release inputs; runs on every binary runner |
 | Browser interaction | `npm run test:browser` | Runs the production Rust host with the fake Agent and verifies Zed-style Agent interaction and mobile behavior in Chromium |
 | Optional backend example | `npm run test:goose` | Diagnostic smoke for a separately installed Goose executable at `bin/goose`; not a protocol conformance gate |
 
@@ -31,6 +32,15 @@ unit, remote-transport, REST/SSE host-smoke, release-build, and standalone-binar
 separate steps so failures identify their layer directly. See the workflow for CI gates.
 Conformance follows the [ACP compatibility contract](acp-coverage.md#compatibility-contract);
 backend-specific smoke tests remain optional.
+
+The binary matrix uses native Linux x86_64/ARM64, macOS Intel/Apple silicon, and
+Windows x86_64 runners. Every target checks `--version`, runs the standalone
+HTTP/assets smoke, and packages license materials before release. The complete
+backend and browser suites run on Linux; binary smoke coverage does not imply
+identical OS-specific terminal behavior. See [terminal semantics](usage.md#terminal-command-semantics).
+Some test commands above use POSIX shell syntax and Unix-specific fixtures;
+run those suites on Linux or macOS. Windows CI validates the native build and
+standalone executable.
 
 ## Interactive fixture
 

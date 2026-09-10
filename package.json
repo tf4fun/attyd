@@ -7,7 +7,7 @@
     "dev": "cargo run --",
     "build:client": "vite build",
     "build": "npm run build:rust",
-    "build:rust": "npm run build:client && ATTYD_SKIP_WEB_BUILD=1 cargo build --release",
+    "build:rust": "cargo build --release",
     "start": "./target/release/attyd",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tools.json --noEmit && tsc -p tsconfig.browser.json --noEmit",
     "test": "vitest run",

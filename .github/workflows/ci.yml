@@ -174,32 +174,45 @@ jobs:
           if-no-files-found: ignore
 
   binaries:
-    name: binary (${{ matrix.artifact }})
+    name: binary (${{ matrix.target }})
     needs: [web-client, metadata]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            artifact: attyd-linux-x86_64-gnu
             runner: ubuntu-24.04
             musl: false
           - target: aarch64-unknown-linux-gnu
-            artifact: attyd-linux-aarch64-gnu
             runner: ubuntu-24.04-arm
             musl: false
           - target: x86_64-unknown-linux-musl
-            artifact: attyd-linux-x86_64-musl
             runner: ubuntu-24.04
             musl: true
           - target: aarch64-unknown-linux-musl
-            artifact: attyd-linux-aarch64-musl
             runner: ubuntu-24.04-arm
             musl: true
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            musl: false
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            musl: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            musl: false
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Test release packaging
+        run: python tests/package-release.test.py
       - name: Download frontend bundle
         uses: actions/download-artifact@v8
         with:
@@ -225,8 +238,9 @@ jobs:
       - name: Verify release binary
         env:
           EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
+          BINARY: target/${{ matrix.target }}/release/attyd${{ runner.os == 'Windows' && '.exe' || '' }}
         run: |
-          actual="$(target/${{ matrix.target }}/release/attyd --version)"
+          actual="$("$BINARY" --version | tr -d '\r')"
           if [[ "$actual" != "attyd $EXPECTED_VERSION" ]]; then
             printf 'Version mismatch: expected "%s", got "%s"\n' "attyd $EXPECTED_VERSION" "$actual" >&2
             exit 1
@@ -242,26 +256,16 @@ jobs:
       - name: Collect third-party license materials
         run: npm run licenses -- ${{ matrix.target }}
       - name: Test standalone release binary
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: npm run test:binary
         env:
-          ATTYD_RUST_BINARY: target/${{ matrix.target }}/release/attyd
-      - name: Generate checksum
-        working-directory: target/${{ matrix.target }}/release
-        run: sha256sum attyd > attyd.sha256
-      - name: Create artifact directory
-        run: mkdir -p artifacts
+          ATTYD_RUST_BINARY: target/${{ matrix.target }}/release/attyd${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: Package release binary
-        run: >-
-          tar -C target/${{ matrix.target }}/release -czf
-          "$GITHUB_WORKSPACE/artifacts/${{ matrix.artifact }}.tar.gz"
-          attyd attyd.sha256 THIRD_PARTY_LICENSES.txt
-          -C "$GITHUB_WORKSPACE" LICENSE
+        run: python scripts/package-release.py ${{ matrix.target }}
       - name: Upload release binary
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
-          path: artifacts/${{ matrix.artifact }}.tar.gz
+          name: attyd-${{ matrix.target }}
+          path: artifacts/attyd-${{ matrix.target }}.*
           if-no-files-found: error
           retention-days: 14
 
@@ -277,16 +281,11 @@ jobs:
       - name: Download release archives
         uses: actions/download-artifact@v8
         with:
-          pattern: attyd-linux-*
+          pattern: attyd-*
           path: artifacts
           merge-multiple: true
       - name: Check all release targets and generate archive checksums
-        working-directory: artifacts
-        run: |
-          for target in x86_64-gnu aarch64-gnu x86_64-musl aarch64-musl; do
-            test -s "attyd-linux-$target.tar.gz"
-          done
-          sha256sum *.tar.gz > SHA256SUMS
+        run: python3 scripts/package-release.py --checksums
       - name: Publish versioned GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -295,5 +294,5 @@ jobs:
         run: |
           options=()
           if [[ "$PRERELEASE" == "true" ]]; then options+=(--prerelease); fi
-          gh release create "$RELEASE_TAG" artifacts/*.tar.gz artifacts/SHA256SUMS \
+          gh release create "$RELEASE_TAG" artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS \
             --verify-tag --title "$RELEASE_TAG" --generate-notes "${options[@]}"

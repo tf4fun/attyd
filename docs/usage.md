@@ -15,6 +15,8 @@ To build from source, install:
   [`package.json`](../package.json). Node builds the web interface.
 - **Git**, to clone the repository, and a **C compiler/linker** for native dependencies.
   On Debian/Ubuntu, install `build-essential`; on macOS, run `xcode-select --install`.
+  On Windows, install Visual Studio Build Tools with **Desktop development with C++**
+  and a Windows SDK, and use Rust's `x86_64-pc-windows-msvc` toolchain.
   See the [Rust installation guide](https://doc.rust-lang.org/book/ch01-01-installation.html)
   for platform details.
 
@@ -47,22 +49,44 @@ Pass the Agent command explicitly; attyd does not choose or install one for you.
 
 ## Release binaries
 
-When a release is available, download an archive from
-[GitHub Releases](https://github.com/tf4fun/attyd/releases) that matches your Linux
-architecture: `x86_64` or `aarch64`. The release workflow produces GNU and musl
-variants; musl builds avoid a dependency on the host's glibc version.
+Download an archive from [GitHub Releases](https://github.com/tf4fun/attyd/releases)
+that matches your operating system and CPU. CI builds these seven targets natively
+and names archives using Rust target triples:
+
+| Platform | Archive |
+| --- | --- |
+| macOS, Apple silicon | `attyd-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `attyd-x86_64-apple-darwin.tar.gz` |
+| Linux, x86_64, musl | `attyd-x86_64-unknown-linux-musl.tar.gz` |
+| Linux, x86_64, GNU | `attyd-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, ARM64, GNU | `attyd-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux, ARM64, musl | `attyd-aarch64-unknown-linux-musl.tar.gz` |
+| Windows, x86_64, MSVC | `attyd-x86_64-pc-windows-msvc.zip` |
+
+Linux musl builds avoid a dependency on the host's glibc version. Each archive
+includes the executable, its SHA-256 checksum, and license materials; releases also
+include `SHA256SUMS` for the archives. Available downloads depend on the release:
+v0.1.0 has Linux-only assets with the older `attyd-linux-<arch>-<libc>` names.
 
 For example, after downloading the Linux x86_64 musl archive:
 
 ```bash
-tar -xzf attyd-linux-x86_64-musl.tar.gz
+tar -xzf attyd-x86_64-unknown-linux-musl.tar.gz
 ./attyd --version
 ./attyd -- your-agent acp
 ```
 
+On Windows, extract and run from PowerShell:
+
+```powershell
+Expand-Archive attyd-x86_64-pc-windows-msvc.zip -DestinationPath attyd
+cd attyd
+.\attyd.exe --version
+.\attyd.exe -- your-agent acp
+```
+
 Rust, Cargo, Node.js, and npm are not needed to run the attyd binary. Install your
-Agent and its dependencies separately, or use a remote Agent endpoint. For macOS,
-build from source; the current release workflow packages Linux binaries only.
+Agent and its dependencies separately, or use a remote Agent endpoint.
 
 ## Standalone build
 
@@ -74,7 +98,9 @@ npm run build
 ```
 
 `target/release/attyd` embeds the frontend assets. Keep the Agent and any tools it
-needs available on the machine where you run it.
+needs available on the machine where you run it. On Windows, the same
+`npm run build` command produces `target\release\attyd.exe`; launch it with
+`.\target\release\attyd.exe -- your-agent acp`.
 
 ## Remote agents
 
@@ -184,6 +210,12 @@ bytes. Links without bytes open only on a user click; attyd does not fetch them 
 make previews. Downloads are exports, not a persistent conversation cache.
 
 ## Terminal command semantics
+
+On Windows, ACP `terminal/create` launches `command` directly with its `args`;
+shell scripts and builtins require an explicit shell, for example
+`{"command": "cmd.exe", "args": ["/C", "echo ok"]}`. The command inherits the
+requested directory and environment overrides. Termination stops the direct
+child; Unix process-group cleanup described below does not apply on Windows.
 
 For stdio Agents on Unix, ACP `terminal/create` runs through `/bin/sh` in the
 requested working directory with the supplied environment overrides. Execution
@@ -320,8 +352,10 @@ and [testing](testing.md).
 
 ## Optional example: Goose
 
-Goose is one possible ACP backend, not an attyd dependency. If you have already
-installed and configured Goose separately, start it explicitly:
+Goose is one possible ACP backend, not an attyd dependency.
+[Install its CLI](https://goose-docs.ai/docs/getting-started/installation/) and run
+`goose configure` to select a model provider, then start its
+[ACP mode](https://goose-docs.ai/docs/gdk/acp/) explicitly:
 
 ```bash
 ./target/release/attyd -- goose acp

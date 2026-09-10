@@ -2,9 +2,10 @@
 
 **Your ACP agent, in the browser.**
 
-attyd is a web workspace for coding agents that support the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
-Connect a local or remote agent to keep conversations, tool activity, and file changes together,
-with layouts for desktop and mobile.
+attyd is a lightweight web client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
+Connect a local or remote coding agent and follow conversations, tool activity, and file changes
+from desktop or mobile. Its focus is a simple Web ACP client, not a Web IDE: the agent handles
+the coding; attyd gives you a clear place to interact with it.
 
 ![An attyd demo session showing tool activity and file changes](docs/assets/session.png)
 
@@ -33,7 +34,7 @@ Building attyd requires both the Rust and Node.js toolchains:
 
 - **Rust 1.88+ with Cargo** — install using [rustup](https://rust-lang.org/tools/install/).
 - **Node.js 22 LTS (22.12+) or 24 LTS, with npm** — [install Node.js](https://nodejs.org/en/download).
-- **Git and native build tools** — see [platform setup](docs/usage.md#build-prerequisites) for Linux and macOS.
+- **Git and native build tools** — see [platform setup](docs/usage.md#build-prerequisites) for Linux, macOS, and Windows.
 
 ```bash
 git clone https://github.com/tf4fun/attyd.git
@@ -46,15 +47,32 @@ The first run compiles the web interface and Rust host, then starts the server.
 
 ### Run a compiled executable
 
-If you have a [Linux release archive](https://github.com/tf4fun/attyd/releases), extract it and run:
+Download an archive for your platform from [GitHub Releases](https://github.com/tf4fun/attyd/releases),
+extract it, and run:
 
 ```bash
 ./attyd -- your-agent acp
 ```
 
-The attyd executable includes the web interface and needs neither Rust nor Node.js at runtime.
+On Windows, use `.\attyd.exe` in place of `./attyd`.
+The executable includes the web interface and needs neither Rust nor Node.js at runtime.
 Your agent may have its own dependencies. See [release binaries](docs/usage.md#release-binaries)
 or [build your own executable](docs/usage.md#standalone-build).
+
+### Example: Goose
+
+[Install the Goose CLI](https://goose-docs.ai/docs/getting-started/installation/), then configure
+its model provider and launch it through attyd:
+
+```bash
+goose configure
+./attyd -- goose acp
+```
+
+From a source checkout, use `npm run dev -- -- goose acp` instead of the second command.
+Goose is an optional backend; any compatible ACP agent can be used.
+See [Goose's ACP guide](https://goose-docs.ai/docs/gdk/acp/) and the
+[remote Goose example](docs/usage.md#optional-example-goose) for other connection options.
 
 ## History and access
 

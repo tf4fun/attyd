@@ -4,6 +4,7 @@ coverage/
 playwright-report/
 test-results/
 target/
+artifacts/
 *.profraw
 /bin/goose
 .DS_Store

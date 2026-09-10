@@ -17,7 +17,8 @@ fn main() {
         return;
     }
 
-    let status = Command::new("npm")
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let status = Command::new(npm)
         .args(["run", "build:client"])
         .current_dir(&manifest)
         .status()

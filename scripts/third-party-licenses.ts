@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 interface CargoPackage {
   id: string;
@@ -123,15 +123,20 @@ async function appendPackage(
   if (repository) sections.push(`Source: ${repository}`);
   if (authors.length) sections.push(`Authors: ${authors.join(", ")}`);
   for (const file of [...new Set(files)].sort()) {
-    const label = file.startsWith(root + "/") ? relative(root, file) : relative(workspace, file);
-    if (label.startsWith("../")) {
+    const packagePath = relative(root, file);
+    const label = outsideDirectory(packagePath) ? relative(workspace, file) : packagePath;
+    if (outsideDirectory(label)) {
       // Cargo's SDK workspace license is outside its member crate, but no local path is published.
       sections.push("\n--- upstream workspace LICENSE ---\n");
     } else {
-      sections.push(`\n--- ${label} ---\n`);
+      sections.push(`\n--- ${label.split(sep).join("/")} ---\n`);
     }
     sections.push((await readFile(file, "utf8")).trimEnd(), "");
   }
+}
+
+function outsideDirectory(path: string): boolean {
+  return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
 }
 
 async function licenseFiles(root: string): Promise<string[]> {
