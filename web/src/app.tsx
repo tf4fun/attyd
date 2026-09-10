@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 import { useTranslation } from "./i18n";
 import { translateHistoryNotice } from "./i18n/history-notice";
-import { LanguageSelector } from "./components/language-selector";
+import { InterfaceSettings } from "./components/interface-settings";
 import type { ContentBlock, SessionInfo, ToolCall } from "@agentclientprotocol/sdk";
 import {
   Activity,
@@ -105,6 +105,7 @@ export default function App() {
   const newThreadOpener = useRef<HTMLElement | null>(null);
   const sessionSwitcher = useRef<HTMLDetailsElement>(null);
   const agentSettings = useRef<HTMLDetailsElement>(null);
+  const interfaceSettings = useRef<HTMLDetailsElement>(null);
   const threadActions = useRef<HTMLDetailsElement>(null);
   const sessionHeading = useRef<HTMLElement>(null);
   const lastPositionedSession = useRef<string | undefined>(undefined);
@@ -311,7 +312,7 @@ export default function App() {
   }, [closeThreadSearch, threadSearchOpen]);
 
   useEffect(() => {
-    const popovers = () => [sessionSwitcher.current, agentSettings.current, threadActions.current];
+    const popovers = () => [sessionSwitcher.current, agentSettings.current, interfaceSettings.current, threadActions.current];
     const fitPopovers = () => {
       const viewport = window.visualViewport;
       const bottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
@@ -502,6 +503,7 @@ export default function App() {
     newThreadOpener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (sessionSwitcher.current) sessionSwitcher.current.open = false;
     if (agentSettings.current) agentSettings.current.open = false;
+    if (interfaceSettings.current) interfaceSettings.current.open = false;
     setNewThreadOpen(true);
   };
   const authContent = <>
@@ -646,10 +648,9 @@ export default function App() {
       if (event.currentTarget.open && sessionSwitcher.current) sessionSwitcher.current.open = false;
     }}>
       <summary role="button" aria-label={t("agentSettings")} title={t("agentSettings")}>
-        <StatusDot phase={state.phase} /><Settings2 size={17} />
+        <StatusDot phase={state.phase} /><Bot size={17} />
       </summary>
       <div className="agent-details-body">
-        <LanguageSelector />
         <div className="agent-settings-heading">
           <strong>{agent?.title ?? agent?.name ?? t("startingAgent")}</strong>
           <small>{phaseLabel(state.phase, t)} · ACP v{state.initialized?.protocolVersion ?? "–"}</small>
@@ -718,7 +719,7 @@ export default function App() {
         onKeyDownCapture={(event) => {
           if (
             state.session &&
-            !(event.target instanceof Element && event.target.closest(".session-switcher, .agent-details")) &&
+            !(event.target instanceof Element && event.target.closest(".session-switcher, .agent-details, .interface-settings")) &&
             event.key.toLowerCase() === "f" &&
             (event.ctrlKey || event.metaKey) &&
             !event.altKey
@@ -815,6 +816,7 @@ export default function App() {
                   </details>
                 ) : null}
                 {agentSettingsMenu}
+                <InterfaceSettings menuRef={interfaceSettings} />
               </div>
             </div>
           </header>
@@ -856,7 +858,7 @@ export default function App() {
           ) : null}
           <ProjectBrowser
             navigation={parentNavigation}
-            actions={agentSettingsMenu}
+            actions={<>{agentSettingsMenu}<InterfaceSettings menuRef={interfaceSettings} /></>}
             sessions={knownSessions}
             projectCwd={selectedProjectCwd}
             nextCursor={state.nextSessionCursor}

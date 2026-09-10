@@ -82,5 +82,13 @@
     "forkPartial": "Only context received while forking is available; earlier branch history may be missing.",
     "unavailable": "Earlier messages are unavailable from the Agent and memory cache. You can continue this session.",
     "loadUnsupported": "History unavailable: this Agent does not support loading saved session history."
+  },
+  "interfaceSettings": {
+    "title": "Interface settings",
+    "appearance": "Appearance",
+    "system": "Follow system",
+    "light": "Light",
+    "dark": "Dark",
+    "localNotice": "Preferences are saved in this browser."
   }
 }

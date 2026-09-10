@@ -3,7 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#f7f7f5" />
+    <meta name="theme-color" content="#f5f5f7" />
+    <script>
+      // Restore appearance before the application bundle loads. Keep defaults in sync with lib/theme.ts.
+      (() => {
+        let preference;
+        try { preference = localStorage.getItem("attyd.theme"); } catch {}
+        const theme = preference === "light" || preference === "dark"
+          ? preference : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document.documentElement.style.backgroundColor = theme === "dark" ? "#161617" : "#f5f5f7";
+        document.querySelector('meta[name="theme-color"]').content = document.documentElement.style.backgroundColor;
+      })();
+    </script>
     <title>attyd · ACP workspace</title>
   </head>
   <body>

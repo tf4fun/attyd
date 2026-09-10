@@ -82,5 +82,13 @@
     "forkPartial": "当前仅包含创建分支时收到的上下文，可能缺少更早的分支历史消息。",
     "unavailable": "Agent 和内存缓存均无法提供更早的消息，你仍可继续此会话。",
     "loadUnsupported": "历史消息不可用：此 Agent 不支持加载已保存的会话历史。"
+  },
+  "interfaceSettings": {
+    "title": "界面设置",
+    "appearance": "外观",
+    "system": "跟随系统",
+    "light": "浅色",
+    "dark": "深色",
+    "localNotice": "偏好设置保存在当前浏览器中。"
   }
 }

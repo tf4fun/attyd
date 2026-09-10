@@ -4,6 +4,17 @@
 to use separately, then give attyd its ACP command or endpoint. Available session
 controls depend on the capabilities that Agent advertises.
 
+## Interface preferences
+
+Open **Interface settings** (the gear icon) on any project or session page to choose
+your language and appearance. Language follows the browser by default; appearance
+follows the system, with explicit **Light** and **Dark** options. Explicit choices
+are saved in this browser. If browser storage is unavailable, choices last for the
+current page. Switching preferences preserves the current session and draft.
+
+**Agent settings** (the robot icon) contains Agent connection details, authentication,
+and capabilities. Interface preferences are independent of the Agent.
+
 ## Build prerequisites
 
 To build from source, install:

@@ -41,12 +41,12 @@ test.describe("interface localization", () => {
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "项目", exact: true })).toBeVisible();
     await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
-    await page.getByRole("button", { name: "Agent 设置", exact: true }).click();
+    await page.getByRole("button", { name: "界面设置", exact: true }).click();
     await page.getByRole("combobox", { name: "界面语言", exact: true }).selectOption("en");
     await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
     await page.reload();
     await expect(page.locator("html")).toHaveAttribute("lang", "en");
-    await page.getByRole("button", { name: "Agent settings", exact: true }).click();
+    await page.getByRole("button", { name: "Interface settings", exact: true }).click();
     await expect(page.getByRole("combobox", { name: "Language", exact: true })).toHaveValue("en");
     await page.getByRole("combobox", { name: "Language", exact: true }).selectOption("system");
     await expect(page.getByRole("heading", { name: "项目", exact: true })).toBeVisible();
@@ -67,7 +67,7 @@ test.describe("interface localization", () => {
     page.on("request", (request) => {
       if (new URL(request.url()).pathname.startsWith("/api/v1/sessions/")) sessionRequests += 1;
     });
-    await page.getByRole("button", { name: "Agent 设置", exact: true }).click();
+    await page.getByRole("button", { name: "界面设置", exact: true }).click();
     await page.getByRole("combobox", { name: "界面语言", exact: true }).selectOption("en");
     await expect(page.locator("html")).toHaveAttribute("lang", "en");
     await expect(composer).toHaveValue("保留我的草稿 — keep this draft");
@@ -79,6 +79,166 @@ test.describe("interface localization", () => {
     expect(sessionRequests).toBe(0);
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
     await page.screenshot({ path: testInfo.outputPath("i18n-mobile.png") });
+    expect(browserErrors).toEqual([]);
+  });
+});
+
+test.describe("interface appearance", () => {
+  test("separates interface preferences from Agent settings and follows the selected theme", async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+    const interfaceSettings = page.getByRole("button", { name: "Interface settings", exact: true });
+    const agentSettings = page.getByRole("button", { name: "Agent settings", exact: true });
+    const interfacePanel = page.locator(".interface-settings-body");
+    const appearance = interfacePanel.getByRole("combobox", { name: "Appearance", exact: true });
+    await agentSettings.click();
+    await expect(page.locator(".agent-details-body")).toBeVisible();
+    await expect(page.locator(".agent-details-body").getByRole("combobox", { name: "Language", exact: true }))
+      .toHaveCount(0);
+    await expect(page.locator(".agent-details-body").getByRole("combobox", { name: "Appearance", exact: true }))
+      .toHaveCount(0);
+    await interfaceSettings.click();
+    await expect(page.locator(".agent-details")).not.toHaveAttribute("open", "");
+    await expect(interfacePanel.getByRole("combobox", { name: "Language", exact: true })).toBeVisible();
+    await expect(appearance).toHaveValue("system");
+    expect(await page.evaluate(() => localStorage.getItem("attyd.theme"))).toBeNull();
+
+    const lightBackground = await page.locator("html").evaluate((element) => getComputedStyle(element).backgroundColor);
+    await appearance.selectOption("dark");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect.poll(() => page.locator("html").evaluate((element) => getComputedStyle(element).backgroundColor))
+      .not.toBe(lightBackground);
+    expect(await page.evaluate(() => localStorage.getItem("attyd.theme"))).toBe("dark");
+    await page.reload();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await interfaceSettings.click();
+    await expect(appearance).toHaveValue("dark");
+
+    await appearance.selectOption("light");
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    expect(await page.evaluate(() => localStorage.getItem("attyd.theme"))).toBe("light");
+    await appearance.selectOption("system");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    expect(await page.evaluate(() => localStorage.getItem("attyd.theme"))).toBeNull();
+    await page.emulateMedia({ colorScheme: "light" });
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+    await agentSettings.click();
+    await expect(page.locator(".interface-settings")).not.toHaveAttribute("open", "");
+    await expect(page.locator(".agent-details-body")).toBeVisible();
+    expect(browserErrors).toEqual([]);
+  });
+
+  test("keeps interface settings visible on desktop and mobile and restores keyboard focus", async ({ page }, testInfo) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.goto("/sessions/saved-session");
+    await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+    const trigger = page.getByRole("button", { name: "Interface settings", exact: true });
+    const settings = page.locator(".interface-settings");
+    const panel = page.locator(".interface-settings-body");
+    for (const viewport of [
+      { width: 1280, height: 900 },
+      { width: 390, height: 844 },
+      { width: 390, height: 400 },
+      { width: 667, height: 375 },
+      { width: 850, height: 300 },
+    ]) {
+      await page.setViewportSize(viewport);
+      await trigger.focus();
+      await trigger.press("Enter");
+      await expect(settings).toHaveAttribute("open", "");
+      await expectWithinViewport(panel, viewport.width);
+      await expect.poll(() => panel.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        return bounds.top >= 0 && bounds.bottom <= window.innerHeight + 1 && bounds.height > 0;
+      })).toBe(true);
+      const appearance = panel.getByRole("combobox", { name: "Appearance", exact: true });
+      await appearance.scrollIntoViewIfNeeded();
+      await expect(appearance).toBeInViewport({ ratio: 0.98 });
+      if (viewport.height >= 800) {
+        for (const theme of ["light", "dark"]) {
+          await appearance.selectOption(theme);
+          await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+          const device = viewport.width < 600 ? "mobile" : "desktop";
+          await page.screenshot({ path: testInfo.outputPath(`interface-${device}-${theme}.png`) });
+        }
+      }
+      await appearance.focus();
+      await page.keyboard.press("Escape");
+      await expect(settings).not.toHaveAttribute("open", "");
+      await expect(trigger).toBeFocused();
+      expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    }
+    expect(browserErrors).toEqual([]);
+  });
+
+  test("preserves the session, draft and reading position when changing theme", async ({ page }, testInfo) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    const thread = page.getByRole("region", { name: "Conversation thread" });
+    await expect(composer).toBeEnabled();
+    await composer.fill("stream-follow-flow");
+    await composer.press("Enter");
+    await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+    await composer.fill("Keep this unsent draft — 保留草稿");
+    const composerNode = await composer.elementHandle();
+    const originalUrl = page.url();
+    let sessionRequests = 0;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname.startsWith("/api/v1/sessions/")) sessionRequests += 1;
+    });
+
+    for (const viewport of [
+      { width: 1280, height: 900 },
+      { width: 390, height: 844 },
+    ]) {
+      await page.setViewportSize(viewport);
+      const jumpToBottom = page.getByRole("button", { name: "Jump to bottom of thread" });
+      if (await jumpToBottom.isEnabled()) await jumpToBottom.click();
+      await expect.poll(() => thread.evaluate((element) =>
+        element.scrollHeight - element.clientHeight - element.scrollTop
+      )).toBeLessThan(3);
+      await page.getByRole("button", { name: "Interface settings", exact: true }).click();
+      const appearance = page.getByRole("combobox", { name: "Appearance", exact: true });
+      for (const theme of ["light", "dark"]) {
+        await appearance.selectOption(theme);
+        await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+        await expect.poll(() => thread.evaluate((element) =>
+          element.scrollHeight - element.clientHeight - element.scrollTop
+        )).toBeLessThan(3);
+      }
+      await page.keyboard.press("Escape");
+      await thread.evaluate((element) => {
+        element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -300 }));
+        element.scrollTop = Math.max(0, (element.scrollHeight - element.clientHeight) / 2);
+      });
+      await expect(jumpToBottom).toBeEnabled();
+      const readingTop = await thread.evaluate((element) => element.scrollTop);
+      await page.getByRole("button", { name: "Interface settings", exact: true }).click();
+      for (const theme of ["light", "dark"]) {
+        await appearance.selectOption(theme);
+        await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+        await expect.poll(() => thread.evaluate((element) => element.scrollTop))
+          .toBeCloseTo(readingTop, 0);
+        await expect(composer).toHaveValue("Keep this unsent draft — 保留草稿");
+        expect(await composerNode!.evaluate((element) => element.isConnected)).toBe(true);
+        const device = viewport.width < 600 ? "mobile" : "desktop";
+        await page.screenshot({ path: testInfo.outputPath(`reading-${device}-${theme}.png`) });
+      }
+      await page.keyboard.press("Escape");
+      expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    }
+    await expect(page.getByText("Loaded history.", { exact: true })).toHaveCount(1);
+    expect(page.url()).toBe(originalUrl);
+    expect(sessionRequests).toBe(0);
     expect(browserErrors).toEqual([]);
   });
 });
@@ -813,7 +973,7 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   await expect(tool.locator(".tool-output")).toContainText("12");
   await expect(tool.locator(".tool-input > .structured-data")).toBeVisible();
   await expect(tool.locator(".tool-output > .structured-data")).toBeVisible();
-  expect(await Promise.all([
+  const [inputAppearance, outputAppearance] = await Promise.all([
     tool.locator(".tool-input > .structured-data").evaluate((element) => ({
       background: getComputedStyle(element).backgroundColor,
       border: getComputedStyle(element).borderColor,
@@ -822,10 +982,9 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
       background: getComputedStyle(element).backgroundColor,
       border: getComputedStyle(element).borderColor,
     })),
-  ])).toEqual([
-    { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)" },
-    { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)" },
   ]);
+  expect(outputAppearance).toEqual(inputAppearance);
+  expect(inputAppearance.background).not.toBe("rgba(0, 0, 0, 0)");
   const toolInfo = tool.locator(":scope > .tool-body .component-debug-meta")
     .getByRole("button", { name: "Tool info" });
   const toolDebug = tool.locator('[aria-label="Tool debug information"]');
@@ -929,14 +1088,14 @@ test("uses one visual language for structured tool input and Markdown tool outpu
   await expect(output).toBeVisible();
   await expect(output.locator("strong")).toHaveText("2 matches");
   await expect(output.locator("li")).toHaveText(["package.json", "Cargo.toml"]);
-  expect(await Promise.all([input, output].map((locator) => locator.evaluate((element) => ({
+  const [inputAppearance, outputAppearance] = await Promise.all([input, output].map((locator) => locator.evaluate((element) => ({
     background: getComputedStyle(element).backgroundColor,
     border: getComputedStyle(element).borderColor,
     radius: getComputedStyle(element).borderRadius,
-  }))))).toEqual([
-    { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)", radius: "6px" },
-    { background: "rgb(248, 248, 246)", border: "rgb(228, 228, 223)", radius: "6px" },
-  ]);
+  }))));
+  expect(outputAppearance).toEqual(inputAppearance);
+  expect(inputAppearance.background).not.toBe("rgba(0, 0, 0, 0)");
+  expect(inputAppearance.radius).toBe("6px");
   expect(browserErrors).toEqual([]);
 });
 

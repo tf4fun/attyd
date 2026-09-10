@@ -1,0 +1,29 @@
+.interface-settings { position: relative; flex: 0 0 auto; }
+.interface-settings > summary {
+  display: flex; align-items: center; justify-content: center; width: 36px; height: 36px;
+  padding: 0; border: 1px solid var(--page-border); border-radius: 9px;
+  background: var(--control-surface); color: var(--control-ink); list-style: none; cursor: pointer;
+}
+.interface-settings > summary::-webkit-details-marker { display: none; }
+.interface-settings > summary:hover, .interface-settings[open] > summary {
+  border-color: var(--control-ink); color: var(--page-ink);
+}
+.interface-settings > summary:focus-visible { outline: 2px solid var(--theme-accent-border); outline-offset: 3px; }
+.interface-settings-body {
+  position: absolute; z-index: 40; right: 0; top: calc(100% + 12px);
+  width: min(320px, calc(100vw - 36px)); max-height: min(60dvh, var(--menu-space, 60dvh));
+  overflow-y: auto; padding: 18px; border: 1px solid var(--page-border); border-radius: 12px;
+  background: var(--page-surface); color: var(--page-ink); box-shadow: 0 14px 36px var(--theme-shadow-strong);
+}
+.interface-settings-body h2 { margin: 0 0 20px; font-size: 14px; font-weight: 600; }
+.interface-settings-body .language-setting { color: var(--ink-soft); }
+.interface-settings-body .language-setting > span { flex-shrink: 0; }
+.interface-settings-body p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.project-browser-header:has(.interface-settings[open]),
+.session-header:has(.interface-settings[open]) { z-index: 20; }
+@media (max-width: 760px) {
+  .interface-settings { position: static; }
+  .interface-settings-body { left: 0; right: 0; width: auto; max-height: min(55dvh, var(--menu-space, 55dvh)); }
+  .session-header .session-header-actions { gap: 4px; }
+  .session-header .agent-details > summary { width: 40px; gap: 5px; }
+}
