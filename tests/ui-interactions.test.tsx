@@ -185,9 +185,12 @@ describe("ACP interactive UI contract", () => {
     expect(reviews).toHaveLength(2);
     expect(reviews[0]).toBe(firstReview);
     expect(firstTrigger.getAttribute("aria-expanded")).toBe("true");
-    expect(firstReview.previousElementSibling?.getAttribute("data-thread-entry-id")).toBe("first-stop");
-    expect(firstReview.nextElementSibling?.getAttribute("data-thread-entry-id")).toBe("second");
-    expect(reviews[1].nextElementSibling?.getAttribute("data-thread-entry-id")).toBe("third");
+    const firstTurn = firstReview.closest(".conversation-turn")!;
+    const secondTurn = reviews[1].closest(".conversation-turn")!;
+    expect(firstTurn.querySelector(".message-user")?.getAttribute("data-thread-entry-id")).toBe("first");
+    expect(firstTurn.querySelector(".turn-stop")?.getAttribute("data-thread-entry-id")).toBe("first-stop");
+    expect(secondTurn.querySelector(".message-user")?.getAttribute("data-thread-entry-id")).toBe("second");
+    expect(secondTurn.nextElementSibling?.querySelector(".message-user")?.getAttribute("data-thread-entry-id")).toBe("third");
     expect(firstReview.querySelector(".change-review-lines")?.textContent).not.toContain("three");
 
     const secondTrigger = requireElement<HTMLButtonElement>(reviews[1].querySelector(".change-review-trigger"));

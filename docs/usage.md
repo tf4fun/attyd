@@ -4,6 +4,24 @@
 to use separately, then give attyd its ACP command or endpoint. Available session
 controls depend on the capabilities that Agent advertises.
 
+## Reading conversations
+
+Numbered separators group each prompt with its Agent response. The numbers follow
+the currently available history. Prompts and replies share a flat reading layout
+with clear role labels. Prompt actions sit beside the role label, leaving the full
+column for content; code blocks retain their monospace treatment.
+
+While a turn runs, its messages remain visible. Completed turns keep the last
+available Agent response visible and group earlier replies, thinking, tools, and
+file changes under **Execution process**. Expand it to inspect or search those
+details; Markdown export still includes the full available history. If you scroll up while a turn
+runs, automatic folding waits until you return to the bottom. Stop reasons and
+errors remain visible.
+
+The **Execution process** row shows the number of intermediate entries and an
+explicit **Show / Hide** action. Counts describe the available messages and events,
+not an estimate of the Agent's work or a complete audit log.
+
 ## Interface preferences
 
 Open **Interface settings** (the gear icon) on any project or session page to choose

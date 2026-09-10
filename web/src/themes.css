@@ -17,6 +17,8 @@
   --theme-accent-ink: #0062c4;
   --theme-accent-surface: #eaf3ff;
   --theme-accent-border: #3d83cf;
+  --theme-role-user-ink: #7446b3;
+  --theme-role-agent-ink: #0062c4;
   --theme-success-ink: #247044;
   --theme-success-surface: #eaf5ee;
   --theme-success-border: #a8cfb5;
@@ -78,6 +80,8 @@
   --theme-accent-ink: #74b2ff;
   --theme-accent-surface: #202f45;
   --theme-accent-border: #6397d3;
+  --theme-role-user-ink: #c5a3f5;
+  --theme-role-agent-ink: #74b2ff;
   --theme-success-ink: #86d19c;
   --theme-success-surface: #203329;
   --theme-success-border: #42664e;

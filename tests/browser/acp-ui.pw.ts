@@ -839,6 +839,7 @@ test("reviews Agent-reported ACP diffs without inventing editor actions", async 
   await expect(page.getByText("Reported two workspace changes.", { exact: true })).toBeVisible();
 
   const review = page.getByLabel("Agent-reported changes");
+  await revealTurnProcess(review);
   const trigger = review.locator(".change-review-trigger");
   await expect(trigger).toContainText("2 files");
   await expect(trigger).toContainText("+4");
@@ -880,6 +881,7 @@ test("keeps file changes with their original turns across later prompts", async 
   await composer.press("Enter");
   await expect(reviews).toHaveCount(1);
   const firstReview = reviews.first();
+  await revealTurnProcess(firstReview);
   await firstReview.locator(".change-review-trigger").click();
   await expect(firstReview.locator(".change-review-panel")).toBeVisible();
 
@@ -946,6 +948,7 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   await expect(thinking).toHaveAttribute("data-open", "false");
 
   await expect(page.getByText("Activity flow complete.", { exact: true })).toBeVisible();
+  await revealTurnProcess(page.locator(".thinking-block"));
   await expect(tool).toHaveAttribute("data-live", "false");
   await expect(tool).toHaveAttribute("data-tool-status", "completed");
   await expect(tool.locator(".tool-status")).toHaveAttribute(
@@ -1050,7 +1053,8 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
       thinking.evaluate((element) => getComputedStyle(element).borderRadius),
       tool.evaluate((element) => getComputedStyle(element).borderRadius),
     ]);
-    expect(radii).toEqual(["7px", "7px", "7px"]);
+    expect(radii[0]).not.toBe(radii[1]);
+    expect(radii[1]).toBe(radii[2]);
     const disclosureHeights = await Promise.all([
       thinking.locator(":scope > .thinking-header").evaluate((element) => element.getBoundingClientRect().height),
       tool.locator(":scope > .tool-card-header").evaluate((element) => element.getBoundingClientRect().height),
@@ -1079,6 +1083,7 @@ test("uses one visual language for structured tool input and Markdown tool outpu
   await expect(page.getByText("Formatted tool content complete.", { exact: true })).toBeVisible();
 
   const tool = page.locator(".tool-card").filter({ hasText: "Inspect formatted tool output" });
+  await revealTurnProcess(tool);
   await expect(tool).toHaveAttribute("data-tool-status", "completed");
   await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
 
@@ -1108,6 +1113,7 @@ test("keeps wide tool tables scrollable and long resource names fully readable",
   await composer.press("Enter");
   await expect(page.getByText("Wide tool results complete.", { exact: true })).toBeVisible();
   const tool = page.locator(".tool-card").filter({ hasText: "Inspect wide tool results" });
+  await revealTurnProcess(tool);
   await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
   const markdown = tool.locator(".structured-markdown > .markdown");
   const resource = tool.locator(".resource-card");
@@ -1453,6 +1459,7 @@ test("searches the visible ACP Agent thread with Zed-style match navigation", as
   await composer.fill("activity-flow");
   await composer.press("Enter");
   await expect(page.getByText("Activity flow complete.", { exact: true })).toBeVisible();
+  await revealTurnProcess(page.locator(".thinking-block"));
 
   const thinking = page.locator(".thinking-block").filter({ hasText: "Thinking" });
   await expect(thinking).toHaveAttribute("data-open", "false");
@@ -1511,6 +1518,7 @@ test("preserves terminal content beside additional output and searches only expa
   await composer.press("Enter");
 
   const tool = page.locator(".tool-card").filter({ hasText: "Run terminal fixture" });
+  await revealTurnProcess(tool);
   await expect(tool).toHaveAttribute("data-tool-status", "completed");
   await expect(tool).toHaveAttribute("data-open", "false");
 
@@ -1582,6 +1590,7 @@ test("keeps live terminal output across reconnect and retains released output fo
     for (const tab of [page, observer]) {
       const card = cardFor(tab);
       await expect(card).toHaveAttribute("data-tool-status", "completed");
+      await revealTurnProcess(card);
       await expect(card.locator(".terminal-heading")).toHaveText("TerminalCompleted");
       await expect(card.locator(".terminal-embed pre")).toHaveText("LIVE_START中😀\nLIVE_END\n");
       await card.getByRole("button", { name: "Tool info" }).click();
@@ -1593,6 +1602,7 @@ test("keeps live terminal output across reconnect and retains released output fo
 
     await page.reload();
     const restored = cardFor(page);
+    await revealTurnProcess(restored);
     await expect(restored).toHaveAttribute("data-tool-status", "completed");
     await restored.locator(":scope > .tool-card-header .tool-disclosure").click();
     await expect(restored.locator(".terminal-heading")).toHaveText("TerminalCompleted");
@@ -1620,6 +1630,7 @@ test("collapses completed ACP compaction summaries into a Zed-style thread discl
   await composer.press("Enter");
 
   const compaction = page.locator(".compaction-card").filter({ hasText: "Context compacted" });
+  await revealTurnProcess(compaction);
   await expect(compaction).toBeVisible();
   await expect(compaction).toHaveAttribute("data-compaction-status", "completed");
   await expect(compaction).toHaveAttribute("data-live", "false");
@@ -1673,7 +1684,8 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page 
     justifyContent: "flex-start",
     order: ["Message info", "Edit and resend user message"],
   });
-  const thinking = response.locator(".thinking-block");
+  const thinking = page.locator(".thinking-block");
+  await revealTurnProcess(thinking);
   const answer = response.locator(".assistant-chunk");
   const inlineCopy = response.getByRole("button", { name: "Copy agent response" });
   const answerInfo = answer.getByRole("button", { name: "Message info" });
@@ -2709,4 +2721,11 @@ function toolSummaryLayout(tool: Locator) {
       titleHeightOverflow: strongElement.scrollHeight > strongElement.clientHeight,
     };
   });
+}
+
+async function revealTurnProcess(entry: Locator): Promise<void> {
+  const turn = entry.locator("xpath=ancestor::div[@class='conversation-turn']");
+  await expect(turn.locator(".turn-stop")).toBeVisible();
+  const expand = turn.getByRole("button", { name: "Expand execution process", exact: true });
+  if (await expand.count()) await expand.click();
 }

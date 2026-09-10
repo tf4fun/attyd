@@ -40,6 +40,8 @@ const oversizedStdoutLine = process.argv.includes("--oversized-stdout-line");
 const terminalAuthFile = process.env.ATTYD_FAKE_AUTH_FILE;
 const disconnectCancelFile = process.env.ATTYD_FAKE_DISCONNECT_CANCEL_FILE;
 const processMarkerFile = process.env.ATTYD_FAKE_PROCESS_MARKER_FILE;
+const turnCollapseGate = process.env.ATTYD_FAKE_TURN_COLLAPSE_GATE;
+const turnDesign = process.env.ATTYD_FAKE_TURN_DESIGN === "1";
 
 if (processMarkerFile) writeFileSync(processMarkerFile, `${process.pid}\n`);
 
@@ -619,6 +621,43 @@ const agent = acp
       });
     }
     sessionHistory.set(params.sessionId, history);
+    if (turnDesign) {
+      const turn = history.filter((update) => update.sessionUpdate === "user_message_chunk").length;
+      const answers = [
+        "The launch page can stay simple: a short introduction, one primary action, and a small example. Keep the conversation as the main reading surface.",
+        "Use one launch command in the quick start:\n\n```sh\nattyd -- goose acp\n```\n\nThe browser opens the ACP conversation. Goose remains an optional backend; the same client works with other ACP agents.",
+        "The copy now explains the project in plain language. The setup command stays in a code block, and each question remains next to its answer.",
+      ];
+      const notify = (update: acp.SessionUpdate) => client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update,
+      });
+      await notify({
+        sessionUpdate: "agent_message_chunk",
+        messageId: `design-progress-${requestId}`,
+        content: { type: "text", text: "I’ll review the existing copy and check the launch instructions." },
+      });
+      await notify({
+        sessionUpdate: "agent_thought_chunk",
+        messageId: `design-thought-${requestId}`,
+        content: { type: "text", text: "Keep the introduction concise and preserve the distinction between the client and its optional backend." },
+      });
+      await notify({
+        sessionUpdate: "tool_call",
+        toolCallId: `design-tool-${requestId}`,
+        title: "Read quick-start instructions",
+        kind: "read",
+        status: "completed",
+        locations: [{ path: `${process.cwd()}/README.md` }],
+        content: [{ type: "content", content: { type: "text", text: "The quick start contains the client launch command and an optional Goose example." } }],
+      });
+      await notify({
+        sessionUpdate: "agent_message_chunk",
+        messageId: `design-answer-${requestId}`,
+        content: { type: "text", text: answers[(turn - 1) % answers.length]! },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (promptText.includes("disconnect-flow")) {
       setTimeout(() => process.exit(0), 25);
       await new Promise(() => {});
@@ -1249,6 +1288,52 @@ const agent = acp
           content: { type: "text", text: "Considering possible follow-up work." },
         },
       });
+      return { stopReason: "end_turn" };
+    }
+    if (promptText === "turn-collapse-flow") {
+      const notify = (update: acp.SessionUpdate) => client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update,
+      });
+      const waitForStage = async (stage: string) => {
+        if (!turnCollapseGate) throw new Error("turn-collapse-flow requires a test gate");
+        const deadline = Date.now() + 15_000;
+        while (!existsSync(`${turnCollapseGate}.${stage}`)) {
+          if (Date.now() >= deadline) throw new Error(`Timed out waiting for turn collapse stage ${stage}`);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      };
+      await notify({
+        sessionUpdate: "agent_message_chunk",
+        messageId: `collapse-process-${requestId}`,
+        content: {
+          type: "text",
+          text: Array.from({ length: 20 }, (_, index) =>
+            `Process paragraph ${index + 1}: ${"Inspecting the repository before writing the final answer. ".repeat(3)}`,
+          ).join("\n\n"),
+        },
+      });
+      await notify({
+        sessionUpdate: "agent_thought_chunk",
+        messageId: `collapse-thought-${requestId}`,
+        content: { type: "text", text: "Considering the execution details before replying." },
+      });
+      await notify({
+        sessionUpdate: "tool_call",
+        toolCallId: `collapse-tool-${requestId}`,
+        title: "Inspect collapse fixture",
+        kind: "read",
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: "Process inspection complete." } }],
+      });
+      // The browser controls these bounded gates so CI speed cannot race a turn's end.
+      await waitForStage("append");
+      await notify({
+        sessionUpdate: "agent_message_chunk",
+        messageId: `collapse-final-${requestId}`,
+        content: { type: "text", text: "The final answer is ready." },
+      });
+      await waitForStage("finish");
       return { stopReason: "end_turn" };
     }
     if (promptText.includes("stream-follow-flow")) {

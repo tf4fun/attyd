@@ -22,7 +22,9 @@
     "copyThisResponse": "Copy This Agent Response",
     "scrollTop": "Scroll to Top",
     "scrollBottom": "Scroll to Bottom",
-    "openMarkdown": "Open Thread as Markdown"
+    "openMarkdown": "Open Thread as Markdown",
+    "senderYou": "You",
+    "senderAgent": "Agent"
   },
   "thinking": {
     "info": "Thinking info",
@@ -195,5 +197,17 @@
     "serializationFailed": "Unable to serialize ACP value",
     "unknownMimeType": "unknown MIME type",
     "usage": " · {{total}} tokens ({{input}} input, {{output}} output)"
+  },
+  "process": {
+    "title": "Execution process",
+    "expand": "Expand execution process",
+    "collapse": "Collapse execution process",
+    "show": "Show",
+    "hide": "Hide",
+    "count_one": "{{count, number}} item",
+    "count_other": "{{count, number}} items"
+  },
+  "turn": {
+    "label": "Turn {{number}}"
   }
 }

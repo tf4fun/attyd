@@ -118,6 +118,8 @@ export default function App() {
     followLatestOnViewport.current = false;
   }, []);
 
+  const canAutoCollapseTurn = useCallback(() => followLatestContent.current, []);
+
   const measureThreadScroll = useCallback(() => {
     const element = scroll.current;
     if (!element) return;
@@ -166,7 +168,8 @@ export default function App() {
     const selector = target === "previous-prompt" || target === "next-prompt" || target === "latest-prompt"
       ? '[data-thread-role="user"]'
       : "[data-thread-entry]";
-    const entries = [...element.querySelectorAll<HTMLElement>(selector)];
+    const entries = [...element.querySelectorAll<HTMLElement>(selector)]
+      .filter((entry) => entry.getClientRects().length > 0);
     if (entries.length === 0) {
       if (target === "latest-prompt") {
         element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
@@ -926,7 +929,12 @@ export default function App() {
               {authContent}
               {state.historyNotice ? <p className="history-notice" role="status">{translateHistoryNotice(state.historyNotice, t)}</p> : null}
               {(!showAuthCard && !terminalAuthOwnsInteraction) || state.timeline.length > 0 ? <Conversation
+                key={state.session?.sessionId}
                 timeline={state.timeline}
+                settled={!state.running && state.sessionSyncPhase === "ready" && !state.sessionTransition}
+                atBottom={threadScroll.atBottom}
+                canAutoCollapse={canAutoCollapseTurn}
+                onProcessToggle={pauseThreadFollowing}
                 terminalSnapshots={state.terminalSnapshots}
                 agentActivity={state.agentActivity}
                 onNavigateThread={navigateThread}
