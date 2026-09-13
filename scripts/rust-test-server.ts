@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface RustTestServerOptions {
   command: string[];
@@ -21,7 +22,7 @@ export interface RustTestServer {
 export async function startRustTestServer(
   options: RustTestServerOptions,
 ): Promise<RustTestServer> {
-  const cwd = options.cwd ?? process.cwd();
+  const cwd = resolve(options.cwd ?? process.cwd());
   const temporaryDirectory = options.mcpConfig == null
     ? undefined
     : await mkdtemp(join(tmpdir(), "attyd-rust-test-"));
@@ -32,7 +33,12 @@ export async function startRustTestServer(
     await writeFile(mcpConfig, JSON.stringify(options.mcpConfig), "utf8");
   }
 
-  const binary = process.env.ATTYD_RUST_BINARY ?? join(cwd, "target/debug/attyd");
+  // The Agent workspace may be outside the checkout. Resolve the host binary
+  // independently, before spawn changes into that workspace.
+  const workspace = fileURLToPath(new URL("../", import.meta.url));
+  const binary = resolve(process.env.ATTYD_RUST_BINARY ?? join(
+    workspace, "target", "debug", process.platform === "win32" ? "attyd.exe" : "attyd",
+  ));
   const args = [
     "--host",
     options.host ?? "127.0.0.1",

@@ -4,10 +4,10 @@ import {
   type Locator,
   type Page,
 } from "@playwright/test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startRustTestServer } from "../../scripts/rust-test-server";
+import { startRustTestServer, type RustTestServer } from "../../scripts/rust-test-server";
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
 
 const test = baseTest.extend<{ isolatedAttydUrl: string }>({
@@ -803,11 +803,8 @@ test("runs different ACP sessions concurrently without treating running as a glo
 });
 
 test("deletes an unopened session from its project without creating or opening a session", async ({ page }) => {
-  const cwd = join(process.cwd(), "bin");
-  const server = await startRustTestServer({
-    cwd,
-    command: [process.execPath, "--import", "tsx", join(process.cwd(), "tests/fixtures/fake-agent.ts")],
-  });
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), "attyd-catalog-delete-")));
+  let server: RustTestServer | undefined;
   const browserErrors = collectBrowserErrors(page);
   const sessionRequests: string[] = [];
   page.on("request", (request) => {
@@ -818,6 +815,10 @@ test("deletes an unopened session from its project without creating or opening a
     }
   });
   try {
+    server = await startRustTestServer({
+      cwd,
+      command: [process.execPath, "--import", import.meta.resolve("tsx"), join(process.cwd(), "tests/fixtures/fake-agent.ts")],
+    });
     await page.goto(`http://127.0.0.1:${server.port}${projectPath(cwd)}`);
     await expect(page.locator(".project-browser-path")).toHaveText(cwd);
     await page.getByRole("button", { name: "Delete Saved ACP session", exact: true }).click();
@@ -840,7 +841,8 @@ test("deletes an unopened session from its project without creating or opening a
     expect(browserErrors).toEqual([]);
     await page.screenshot({ path: test.info().outputPath("project-after-cold-delete.png") });
   } finally {
-    await server.close();
+    await server?.close();
+    await rm(cwd, { recursive: true, force: true });
   }
 });
 
