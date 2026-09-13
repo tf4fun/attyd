@@ -90,6 +90,12 @@
     "keep": "保留会话",
     "close": "关闭会话"
   },
+  "deleteSessionDialog": {
+    "title": "删除会话？",
+    "resourcesWarning": "此操作会关闭会话，并将其从 Agent 中删除。",
+    "historyWarning": "此会话已保存的历史记录将被删除。此操作无法撤销。",
+    "delete": "删除会话"
+  },
   "controls": {
     "label": "会话设置",
     "mode": "模式",

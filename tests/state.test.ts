@@ -2406,7 +2406,7 @@ describe("ACP UI state", () => {
     expect(deleted.pendingSessionDeletions).toEqual([]);
   });
 
-  it("deselects the current session and advances close-before-delete atomically", () => {
+  it("keeps the current session until authoritative close-before-delete completes", () => {
     const active = {
       ...initialState,
       session: { sessionId: "current" },
@@ -2425,9 +2425,9 @@ describe("ACP UI state", () => {
       sessionId: "current",
       stage: "closing",
     });
-    expect(closing.session).toBeUndefined();
-    expect(closing.title).toBeUndefined();
-    expect(closing.cachedSessions.get("current")?.timeline).toEqual(active.timeline);
+    expect(closing.session).toEqual(active.session);
+    expect(closing.title).toBe(active.title);
+    expect(closing.timeline).toEqual(active.timeline);
     expect(closing.pendingSessionDeletions).toEqual([{
       requestId: "close-current-for-delete",
       sessionId: "current",
@@ -2463,7 +2463,7 @@ describe("ACP UI state", () => {
     expect(deleted.pendingSessionDeletions).toEqual([]);
   });
 
-  it("keeps a current-session snapshot recoverable when delete close fails", () => {
+  it("keeps the current session selected when delete close fails", () => {
     const active = {
       ...initialState,
       session: { sessionId: "current" },
@@ -2483,9 +2483,9 @@ describe("ACP UI state", () => {
       operation: "session/close",
       message: "Synthetic close failure",
     }));
-    expect(failed.session).toBeUndefined();
+    expect(failed.session).toEqual(active.session);
     expect(failed.pendingSessionDeletions).toEqual([]);
-    expect(failed.cachedSessions.get("current")?.timeline).toEqual(active.timeline);
+    expect(failed.timeline.slice(0, -1)).toEqual(active.timeline);
     expect(failed.timeline.at(-1)).toMatchObject({
       type: "error",
       message: "Synthetic close failure",
@@ -2496,7 +2496,7 @@ describe("ACP UI state", () => {
       sessionId: "current",
     });
     expect(restored.session?.sessionId).toBe("current");
-    expect(restored.timeline).toEqual(active.timeline);
+    expect(restored.timeline).toEqual(failed.timeline);
   });
 
   it("tracks URL consent and completion as separate states", () => {

@@ -84,6 +84,10 @@ alone are not correctness evidence.
 - `live_url_or_mcp_resource_can_cross_reconciliation`
 - `late_old_generation_resource_event_is_ignored`
 
+The pending-interaction reconnect cases in `server.rs` also require `session/list` to finish
+before the user responds, preserve the original interaction ID, and perform zero extra loads.
+`acp-ui.pw.ts` verifies page reload and Agent cancellation through the production REST/SSE path.
+
 ### Memory and eviction
 
 - `history_snapshot_is_shared_not_cloned_by_runtime_delta`

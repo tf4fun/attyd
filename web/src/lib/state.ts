@@ -29,8 +29,10 @@ import { assertNever } from "../../../shared/exhaustive";
 import type {
   BridgeSessionView,
   SessionBusinessEvent,
+  SessionOwner,
   SessionSyncPhase,
 } from "./business-api";
+import { sameSessionOwner } from "./business-api";
 import { randomId } from "./id";
 import { timelineTurnStarts } from "./timeline-turns";
 
@@ -132,6 +134,7 @@ export interface ActiveMcpConnection {
 export interface ActiveSessionSnapshot {
   cwd: string;
   session?: NewSessionResponse;
+  sessionOwner?: SessionOwner;
   availableCommands: AvailableCommand[];
   modeId?: string;
   configOptions: SessionConfigOption[] | null;
@@ -222,6 +225,7 @@ export interface AuthTerminalState {
 }
 
 export interface AppState {
+  sessionOwner?: SessionOwner;
   phase: ConnectionPhase;
   socketOpen: boolean;
   runtimeReplaying: boolean;
@@ -274,6 +278,9 @@ export interface AppState {
 }
 
 export type AppAction =
+  | { type: "bridge/connection_replaced" }
+  | { type: "session/retired"; owner: SessionOwner; deleted: boolean }
+  | { type: "session/management_complete"; sessionId: string; requestId: string; owner?: SessionOwner; deleted: boolean }
   | { type: "socket/open" }
   | { type: "socket/closed" }
   | { type: "bridge/session_hydrate"; view: BridgeSessionView }
@@ -457,6 +464,22 @@ function isRuntimeReplacementEvent(event: ServerEvent): boolean {
 
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
+    case "bridge/connection_replaced":
+      return { ...terminateBridgeState(state, "stopped", false), sessionSyncPhase: "loading" };
+    case "session/retired":
+      return removeAuthoritativeSessionRuntime(state, action.owner.sessionId, action.deleted, action.owner);
+    case "session/management_complete": {
+      const next = action.owner == null ? state : removeAuthoritativeSessionRuntime(
+        state, action.sessionId, action.deleted, action.owner,
+      );
+      return {
+        ...next,
+        sessions: action.deleted && action.owner == null
+          ? next.sessions.filter(({ sessionId }) => sessionId !== action.sessionId)
+          : next.sessions,
+        pendingSessionDeletions: next.pendingSessionDeletions.filter(({ requestId }) => requestId !== action.requestId),
+      };
+    }
     case "socket/open":
       return state.runtimeReplacement == null
         ? { ...state, socketOpen: true }
@@ -633,13 +656,10 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           requestId === action.requestId || sessionId === action.sessionId,
       )) return state;
       {
-        const next = state.session?.sessionId === action.sessionId
-          ? resetActiveSession(cacheCurrentSession(state))
-          : state;
         return {
-          ...next,
+          ...state,
           pendingSessionDeletions: [
-            ...next.pendingSessionDeletions,
+            ...state.pendingSessionDeletions,
             {
               requestId: action.requestId,
               sessionId: action.sessionId,
@@ -2249,6 +2269,7 @@ function resetActiveSession(state: AppState, title?: string): AppState {
     ...state,
     cwd: state.defaultCwd,
     session: undefined,
+    sessionOwner: undefined,
     historyStatus: undefined,
     historyNotice: undefined,
     pendingSessionId: undefined,
@@ -2291,6 +2312,7 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
     cachedSessions: withoutCachedSession(cached.cachedSessions, view.sessionId),
     cwd: view.workspace.cwd ?? listed?.cwd ?? cached.defaultCwd,
     session,
+    sessionOwner: { bridgeEpoch: view.bridgeEpoch, sessionId: view.sessionId, sessionIncarnation: view.sessionIncarnation },
     historyStatus: view.historyRevision == null
       ? {
           state: "loading",
@@ -2678,14 +2700,16 @@ function removeAuthoritativeSessionRuntime(
   state: AppState,
   sessionId: string,
   deleted: boolean,
+  owner?: SessionOwner,
 ): AppState {
+  const matches = (candidate?: SessionOwner) => owner == null || sameSessionOwner(candidate, owner);
   let next = state;
-  if (next.sessionTransition?.targetSessionId === sessionId) {
+  if (next.sessionTransition?.targetSessionId === sessionId && matches(next.sessionTransition.backup.sessionOwner)) {
     next = rollbackSessionTransition(next);
   }
-  if (next.session?.sessionId === sessionId) {
+  if (next.session?.sessionId === sessionId && matches(next.sessionOwner)) {
     next = resetActiveSession(next);
-  } else if (next.sessionTransition?.backup.session?.sessionId === sessionId) {
+  } else if (next.sessionTransition?.backup.session?.sessionId === sessionId && matches(next.sessionTransition.backup.sessionOwner)) {
     next = {
       ...next,
       sessionTransition: {
@@ -2694,13 +2718,15 @@ function removeAuthoritativeSessionRuntime(
       },
     };
   }
-  next = removeCachedSession(next, sessionId);
+  if (matches(next.cachedSessions.get(sessionId)?.sessionOwner)) next = removeCachedSession(next, sessionId);
+  const replacement = state.session?.sessionId === sessionId && !matches(state.sessionOwner) ||
+    state.cachedSessions.has(sessionId) && !matches(state.cachedSessions.get(sessionId)?.sessionOwner);
   return {
     ...next,
-    sessions: deleted
+    sessions: deleted && !replacement
       ? next.sessions.filter((session) => session.sessionId !== sessionId)
       : next.sessions,
-    pendingSessionDeletions: deleted
+    pendingSessionDeletions: deleted && !replacement
       ? next.pendingSessionDeletions.filter((pending) => pending.sessionId !== sessionId)
       : next.pendingSessionDeletions,
   };
@@ -2719,6 +2745,7 @@ function captureActiveSession(state: AppState): ActiveSessionSnapshot {
   return {
     cwd: state.cwd,
     session: state.session,
+    sessionOwner: state.sessionOwner,
     availableCommands: state.availableCommands,
     modeId: state.modeId,
     configOptions: state.configOptions,

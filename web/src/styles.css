@@ -117,6 +117,13 @@ button, input, textarea, select { color: inherit; }
 }
 .new-thread-dialog > footer .secondary { background: var(--theme-surface-panel); }
 .new-thread-dialog > footer .primary { border-color: var(--theme-primary-surface); background: var(--theme-primary-surface); color: var(--theme-primary-ink); }
+.new-thread-dialog > footer .danger {
+  border-color: var(--theme-danger-primary-surface);
+  background: var(--theme-danger-primary-surface);
+  color: var(--theme-danger-primary-ink);
+}
+.new-thread-dialog > footer .danger:hover:not(:disabled) { filter: brightness(.92); }
+.new-thread-dialog > footer .danger:focus-visible { outline: 2px solid var(--theme-danger-ink); outline-offset: 3px; }
 .new-thread-dialog > footer button:disabled { cursor: default; opacity: .45; }
 
 .main-panel { position: relative; flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; background: var(--paper); }
@@ -2007,7 +2014,8 @@ button, input, textarea, select { color: inherit; }
   font-size: 12px;
 }
 .attachment-download:disabled { cursor: default; opacity: 0.5; }
-.close-session-effects { color: var(--ink-soft); font-size: 13px; line-height: 1.6; }
+.session-action-effects { color: var(--ink-soft); font-size: 13px; line-height: 1.6; }
+.session-action-target { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
 
 /* Translucency belongs to floating controls; reading surfaces stay opaque. */
 @supports (backdrop-filter: blur(16px)) {

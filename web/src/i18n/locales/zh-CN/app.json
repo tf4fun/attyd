@@ -7,7 +7,6 @@
   "agent": "Agent",
   "openingTerminal": "正在打开 Agent 终端…",
   "agentThread": "Agent 会话",
-  "deleteConfirm": "关闭此会话，并从 Agent 中删除它？",
   "queue": {
     "sessionChanged": "ACP 会话已改变，一条排队消息已被丢弃。",
     "sendFailed": "未能向 Agent 发送排队消息。",

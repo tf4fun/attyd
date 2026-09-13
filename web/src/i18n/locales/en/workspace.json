@@ -90,6 +90,12 @@
     "keep": "Keep session",
     "close": "Close session"
   },
+  "deleteSessionDialog": {
+    "title": "Delete session?",
+    "resourcesWarning": "This closes the session and deletes it from the Agent.",
+    "historyWarning": "The session's saved history will be deleted. This action cannot be undone.",
+    "delete": "Delete session"
+  },
   "controls": {
     "label": "Session controls",
     "mode": "Mode",

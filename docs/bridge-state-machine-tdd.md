@@ -124,9 +124,29 @@ registration and snapshot cut are one operation. A subscriber sees either:
 - a full reset containing baseline + overlay + live resources; or
 - deltas whose first `fromRevision` exactly equals the subscriber cursor.
 
-A gap, old epoch/incarnation, expired suffix or ordering error forces reset. Slow subscribers are
-evicted without affecting Agent work. Baseline payload is shared/chunked rather than cloned into
-every subscriber queue.
+A revision gap, expired suffix or ordering error within the same owner forces reset. Recovery of
+an old incarnation in the same epoch returns an explicit retirement conflict; it cannot
+cold-materialize the same session ID. An epoch change instead returns `bridge_replaced` and is
+handled by global connection recovery: preserve the route and draft, discard the old observation,
+and restore Agent-owned history on the new connection. `/api/v1/runtime` exposes the canonical
+epoch; a numeric generation counter alone does not identify a host restart. View refreshes and SSE
+subscriptions carry `expectedEpoch` / `expectedIncarnation`; native SSE retries also carry their
+`Last-Event-ID`. A confirmed close/delete publishes `bridge/session_retired` before ending the
+observation stream. A successful close preceding a failed delete still retires the observation.
+Slow subscribers are evicted without affecting Agent work. Baseline payload is shared/chunked
+rather than cloned into every subscriber queue.
+
+Directory management is global. Cold deletion reserves only a bounded catalog ID, with no session
+runtime allocation. Deleting an existing runtime coordinates its lifecycle and resource cleanup.
+List operations hold an independent bounded permit while waiting for Agent list serialization;
+they release the execution turn so other global operations can proceed. New/fork/delete advance
+the catalog revision and publish a lightweight invalidation. List responses return `catalogRevision`;
+business pagination sends it as `expectedCatalogRevision`. A changed revision rejects the old
+page before cache installation or response publication, and the browser restarts from page one.
+
+The browser keeps projection identity, not lifecycle authority. Pending deletion preserves the
+current view until a confirmed lifecycle result. Retirement and management completions only
+remove matching owner projections; delayed HTTP replies cannot discard a reopened incarnation.
 
 ## Authority and compatibility
 

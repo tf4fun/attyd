@@ -7,7 +7,6 @@
   "agent": "Agent",
   "openingTerminal": "Opening Agent terminal…",
   "agentThread": "Agent thread",
-  "deleteConfirm": "Close and delete this session from the agent?",
   "queue": {
     "sessionChanged": "A queued message was discarded because its ACP session changed.",
     "sendFailed": "The queued message could not be sent to the Agent.",

@@ -46,10 +46,18 @@ interface PendingInteraction<T> {
   respondingOperationId?: string | null;
 }
 
-export interface BridgeSessionView {
+export interface SessionOwner {
   bridgeEpoch: string;
   sessionId: string;
   sessionIncarnation: number;
+}
+
+export function sameSessionOwner(left: SessionOwner | undefined, right: SessionOwner | undefined): boolean {
+  return left != null && right != null && left.sessionId === right.sessionId &&
+    left.bridgeEpoch === right.bridgeEpoch && left.sessionIncarnation === right.sessionIncarnation;
+}
+
+export interface BridgeSessionView extends SessionOwner {
   viewRevision: number;
   historyRevision: string | null;
   phase: SessionSyncPhase;
@@ -78,6 +86,7 @@ export interface BridgeSessionView {
 
 export interface RuntimeView {
   generation: number;
+  bridgeEpoch?: string | null;
   connected: boolean;
   hello: {
     type: "bridge/hello";
@@ -94,6 +103,7 @@ export interface RuntimeView {
 }
 
 export type GlobalBusinessEvent =
+  | { type: "bridge/catalog_changed"; bridgeEpoch: string; revision: number }
   | { type: "bridge/connection"; phase: ConnectionPhase }
   | { type: "bridge/connection_error"; message: string; code?: number; data?: unknown }
   | { type: "acp/authenticated"; requestId: string; methodId: string; response: unknown }
@@ -111,6 +121,7 @@ export type GlobalBusinessEvent =
     };
 
 export type SessionBusinessEvent =
+  | (SessionOwner & { type: "bridge/session_retired"; reason: "closed" | "deleted" })
   | {
       type: "bridge/session_reset";
       bridgeEpoch: string;
@@ -170,6 +181,7 @@ export type SessionBusinessEvent =
 export interface SessionListResult {
   sessions: SessionInfo[];
   nextCursor?: string | null;
+  catalogRevision?: string;
 }
 
 export interface CreatedSessionResult {
@@ -225,6 +237,11 @@ export async function requestJson<T>(
 export function parseGlobalBusinessEvent(raw: string): GlobalBusinessEvent {
   const value = parseEventObject(raw);
   switch (value.type) {
+    case "bridge/catalog_changed":
+      if (typeof value.bridgeEpoch !== "string" || !Number.isSafeInteger(value.revision) || Number(value.revision) < 0) {
+        throw new Error("Catalog event has an invalid revision");
+      }
+      return value as unknown as GlobalBusinessEvent;
     case "bridge/connection":
     case "bridge/connection_error":
     case "acp/authenticated":
@@ -240,6 +257,14 @@ export function parseGlobalBusinessEvent(raw: string): GlobalBusinessEvent {
 
 export function parseSessionBusinessEvent(raw: string): SessionBusinessEvent {
   const value = parseEventObject(raw);
+  if (value.type === "bridge/session_retired") {
+    if (typeof value.bridgeEpoch !== "string" || typeof value.sessionId !== "string" ||
+      !Number.isSafeInteger(value.sessionIncarnation) || Number(value.sessionIncarnation) < 1 ||
+      (value.reason !== "closed" && value.reason !== "deleted")) {
+      throw new Error("Session retirement has an invalid identity or reason");
+    }
+    return value as unknown as SessionBusinessEvent;
+  }
   if (
     value.type === "bridge/session_turn_complete" ||
     value.type === "bridge/session_turn_failed"

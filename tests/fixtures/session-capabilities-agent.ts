@@ -4,6 +4,7 @@ import * as acp from "@agentclientprotocol/sdk";
 const noList = process.argv.includes("--no-list");
 const noLoad = process.argv.includes("--no-load");
 const splitList = process.argv.includes("--split-list");
+const forkSourceUpdateBeforeResponse = process.argv.includes("--fork-source-update-before-response");
 const listDiagnostics = process.argv.includes("--large-list-meta") ? "x".repeat(2_000_000) : undefined;
 let page = 0;
 let forks = 0;
@@ -12,7 +13,12 @@ let loads = 0;
 let closes = 0;
 let prompts = 0;
 let controls = 0;
+let newSessions = 0;
+let deletes = 0;
+const deletedSessions = new Set<string>();
 const waitingPrompts = new Map<string, () => void>();
+let releaseForkResponse: (() => void) | undefined;
+let releaseDeleteResponse: (() => void) | undefined;
 
 const agent = acp.agent({ name: "session-capabilities-fixture" })
   .onRequest(acp.methods.agent.initialize, () => ({
@@ -20,21 +26,33 @@ const agent = acp.agent({ name: "session-capabilities-fixture" })
     agentCapabilities: {
       loadSession: !noLoad,
       auth: { logout: {} },
-      sessionCapabilities: { ...(!noList ? { list: {} } : {}), fork: {}, resume: {}, ...(process.argv.includes("--close") ? { close: {} } : {}) },
+      sessionCapabilities: { ...(!noList ? { list: {} } : {}), fork: {}, resume: {}, ...(process.argv.includes("--close") ? { close: {} } : {}), ...(process.argv.includes("--delete") ? { delete: {} } : {}) },
     },
     authMethods: [],
   }))
-  .onRequest(acp.methods.agent.session.new, () => ({ sessionId: "created",
-    modes: { currentModeId: "chat", availableModes: [{ id: "chat", name: "Chat" }, { id: "plan", name: "Plan" }] },
-    configOptions: [{ type: "boolean", id: "verbose", name: "Verbose", currentValue: false }],
-  }))
+  .onRequest(acp.methods.agent.session.new, () => {
+    newSessions += 1;
+    return { sessionId: "created",
+      modes: { currentModeId: "chat", availableModes: [{ id: "chat", name: "Chat" }, { id: "plan", name: "Plan" }] },
+      configOptions: [{ type: "boolean", id: "verbose", name: "Verbose", currentValue: false }],
+    };
+  })
   .onRequest(acp.methods.agent.session.list, async ({ params }) => {
     if (noList) throw acp.RequestError.methodNotFound("session/list");
+    if (params.cursor === "release-fork") {
+      releaseForkResponse?.();
+      releaseForkResponse = undefined;
+    }
+    if (params.cursor === "release-delete") {
+      releaseDeleteResponse?.();
+      releaseDeleteResponse = undefined;
+    }
     await new Promise((resolve) => setTimeout(resolve, 15));
     return {
-      sessions: [{ sessionId: splitList && params.cursor == null ? "first" : "saved", cwd: process.cwd() }],
+      sessions: [{ sessionId: splitList && params.cursor == null ? "first" : "saved", cwd: process.cwd() }]
+        .filter(({ sessionId }) => !deletedSessions.has(sessionId)),
       ...(params.cursor == null ? { nextCursor: `page-${++page}` } : {}),
-      _meta: { forks, resumes, loads, closes, prompts, controls, requestedCursor: params.cursor ?? null, listDiagnostics },
+      _meta: { forks, resumes, loads, closes, prompts, controls, deletes, newSessions, requestedCursor: params.cursor ?? null, listDiagnostics },
     };
   })
   .onRequest(acp.methods.agent.session.load, async ({ params, client }) => {
@@ -48,10 +66,45 @@ const agent = acp.agent({ name: "session-capabilities-fixture" })
     });
     return {};
   })
-  .onRequest(acp.methods.agent.session.fork, () => { forks += 1; return { sessionId: "forked" }; })
+  .onRequest(acp.methods.agent.session.fork, async ({ params, client }) => {
+    forks += 1;
+    if (forkSourceUpdateBeforeResponse) {
+      const released = new Promise<void>((resolve) => { releaseForkResponse = resolve; });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "source-update-during-fork",
+          content: { type: "text", text: "Source changed after fork admission." },
+        },
+      });
+      await released;
+    }
+    return { sessionId: "forked" };
+  })
   .onRequest(acp.methods.agent.session.resume, () => { resumes += 1; return {}; })
   .onRequest(acp.methods.agent.session.prompt, async ({ params, client }) => {
     prompts += 1;
+    const interaction = params.prompt.find((block) => block.type === "text" &&
+      ["wait-permission", "wait-elicitation"].includes(block.text));
+    if (interaction?.type === "text") {
+      const response = interaction.text === "wait-permission"
+        ? await client.request(acp.methods.client.session.requestPermission, {
+          sessionId: params.sessionId,
+          toolCall: { toolCallId: "waiting-tool", title: "Await permission", status: "pending" },
+          options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+        })
+        : await client.request(acp.methods.client.elicitation.create, {
+          sessionId: params.sessionId,
+          mode: "form",
+          message: "Await input",
+          requestedSchema: { type: "object", properties: {} },
+        });
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(response) } },
+      });
+    }
     if (params.prompt.some((block) => block.type === "text" && block.text === "wait-close")) {
       const wait = new Promise<void>((resolve) => waitingPrompts.set(params.sessionId, resolve));
       await client.notify(acp.methods.client.session.update, {
@@ -79,6 +132,17 @@ const agent = acp.agent({ name: "session-capabilities-fixture" })
     waitingPrompts.delete(params.sessionId);
     // The response to a cancelled prompt can arrive after close has acknowledged.
     if (finish) setTimeout(finish, 200);
+    return {};
+  })
+  .onRequest(acp.methods.agent.session.delete, async ({ params }) => {
+    deletes += 1;
+    if (process.argv.includes("--hold-delete")) {
+      await new Promise<void>((resolve) => { releaseDeleteResponse = resolve; });
+    }
+    if (process.argv.includes("--fail-delete-once") && deletes === 1) {
+      throw new acp.RequestError(-32603, "Synthetic delete failure");
+    }
+    deletedSessions.add(params.sessionId);
     return {};
   })
   .onRequest(acp.methods.agent.logout, () => ({}));

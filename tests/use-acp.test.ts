@@ -263,23 +263,202 @@ describe("project navigation", () => {
     expect(window.location.pathname).toBe(projectPath("/work/alpha"));
   });
 
-  it("offers the route workspace for an ID absent from an available session list", async () => {
+  it("restarts directory pagination when a mutation invalidates the saved cursor", async () => {
+    let firstPages = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/v1/sessions") {
+        if (!url.searchParams.has("cursor")) {
+          firstPages += 1;
+          return response({ sessions: firstPages === 1 ? [list[0]] : [list[1]],
+            nextCursor: firstPages === 1 ? "old-page" : null, catalogRevision: `epoch:${firstPages}` });
+        }
+        expect(url.searchParams.get("expectedCatalogRevision")).toBe("epoch:1");
+        return response({ error: "Directory changed", code: -32000,
+          data: { kind: "session_catalog_changed", catalogRevision: "epoch:2" } }, 409);
+      }
+      return defaultFetch(input, init);
+    });
+    await mount(projectPath("/work/alpha"));
+    expect(firstPages).toBe(2);
+    expect(acp.state.sessions).toEqual([list[1]]);
+    expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
+    expect(acp.state.session).toBeUndefined();
+  });
+
+  it("coalesces catalog invalidation bursts without opening sessions", async () => {
+    await mount(projectPath("/work/alpha"));
+    let finishList!: (value: Response) => void;
+    let requests = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/sessions") {
+        requests += 1;
+        if (requests === 1) return new Promise<Response>((resolve) => { finishList = resolve; });
+        return response({ sessions: [list[1]], catalogRevision: "epoch:10" });
+      }
+      return defaultFetch(input, init);
+    });
+    const global = TestEventSource.instances.find(({ url }) => url === "/api/v1/events")!;
+    const invalidate = (revision: number) => global.onmessage?.({ data: JSON.stringify({
+      type: "bridge/catalog_changed", bridgeEpoch: "epoch", revision,
+    }) });
+    await act(async () => invalidate(1));
+    await act(async () => { for (let revision = 2; revision <= 10; revision++) invalidate(revision); });
+    expect(requests).toBe(1);
+    await act(async () => finishList(response({ sessions: [list[1]], catalogRevision: "epoch:10" })));
+    // One admitted refresh, one stale-page retry and at most one coalesced follow-up.
+    expect(requests).toBeLessThanOrEqual(3);
+    expect(acp.state.sessions).toEqual([list[1]]);
+    expect(acp.state.session).toBeUndefined();
+    expect(TestEventSource.instances.some(({ url }) => url.includes("/sessions/"))).toBe(false);
+  });
+
+  it.each(["/api/v1/sessions", "/api/v1/sessions?cursor=more"])(
+    "restores a materialized session before the list request %s completes",
+    async (heldPath) => {
+      let finishList!: (value: Response) => void;
+      fetchMock.mockImplementation(async (input, init) => {
+        if (String(input) === heldPath) {
+          return new Promise<Response>((resolve) => { finishList = resolve; });
+        }
+        return defaultFetch(input, init);
+      });
+      await mount(sessionPath("alpha-one", "/work/alpha"));
+      expect(acp.state.session?.sessionId).toBe("alpha-one");
+      expect(TestEventSource.instances.map(({ url }) => url))
+        .toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha&expectedEpoch=epoch&expectedIncarnation=1");
+      await act(async () => finishList(await defaultFetch(heldPath)));
+      expect(acp.state.sessions).toHaveLength(3);
+    },
+  );
+
+  it("keeps a restored session connected when independent listing fails", async () => {
+    let finishList!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/sessions") {
+        return new Promise<Response>((resolve) => { finishList = resolve; });
+      }
+      return defaultFetch(input, init);
+    });
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    await act(async () => finishList(response({ error: "Session listing timed out" }, 503)));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(acp.state.socketOpen).toBe(true);
+    expect(acp.state.phase).toBe("ready");
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+  });
+
+  it("retries a cold bare session link only after workspace discovery completes", async () => {
+    let finishPage!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/sessions?cursor=more") {
+        return new Promise<Response>((resolve) => { finishPage = resolve; });
+      }
+      if (path === "/api/v1/sessions/alpha-two") {
+        return response({ error: "Not materialized or listed", code: "session_not_found" }, 404);
+      }
+      return defaultFetch(input, init);
+    });
+    await mount("/sessions/alpha-two");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-two");
+    expect(window.location.pathname).toBe("/sessions/alpha-two");
+    expect(acp.state.session).toBeUndefined();
+    expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
+    await act(async () => finishPage(response({ sessions: list.slice(2) })));
+    expect(fetchMock.mock.calls.map(([path]) => path))
+      .toContain("/api/v1/sessions/alpha-two?cwd=%2Fwork%2Falpha");
+    expect(acp.state.session?.sessionId).toBe("alpha-two");
+    expect(window.location.pathname).toBe(sessionPath("alpha-two", "/work/alpha"));
+  });
+
+  it("ignores a late session view from before the latest runtime refresh", async () => {
+    let finishView!: (value: Response) => void;
+    let held = false;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).split("?")[0] === "/api/v1/sessions/alpha-one" && !held) {
+        held = true;
+        return new Promise<Response>((resolve) => { finishView = resolve; });
+      }
+      if (held && String(input) === "/api/v1/runtime") {
+        const runtime = await (await defaultFetch(input, init)).json();
+        return response({ ...runtime, generation: 2 });
+      }
+      if (String(input).split("?")[0] === "/api/v1/sessions/alpha-one") {
+        return response({ ...sessionView("alpha-one"), bridgeEpoch: "replacement-epoch" });
+      }
+      return defaultFetch(input, init);
+    });
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    await act(async () => TestEventSource.instances[0].onopen?.());
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    await act(async () => finishView(response(sessionView("alpha-one", "/work/stale"))));
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.state.cwd).toBe("/work/alpha");
+  });
+
+  it("refreshes an active session after reconnect without waiting for its older query", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    let finishView!: (value: Response) => void;
+    let held = false;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).split("?")[0] === "/api/v1/sessions/alpha-one") {
+        if (!held) {
+          held = true;
+          return new Promise<Response>((resolve) => { finishView = resolve; });
+        }
+        return response({ ...sessionView("alpha-one", "/work/replaced"), bridgeEpoch: "replacement-epoch" });
+      }
+      if (String(input) === "/api/v1/runtime" && held) {
+        const runtime = await (await defaultFetch(input, init)).json();
+        return response({ ...runtime, generation: 2 });
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => TestEventSource.instances[0].onopen?.());
+    await act(async () => TestEventSource.instances[0].onopen?.());
+    expect(acp.state.cwd).toBe("/work/replaced");
+    await act(async () => finishView(response(sessionView("alpha-one", "/work/stale"))));
+    expect(acp.state.cwd).toBe("/work/replaced");
+  });
+
+  it("keeps a cold bare link when listing fails after the initial local miss", async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/sessions") return response({ error: "Listing timed out" }, 503);
+      if (String(input) === "/api/v1/sessions/alpha-two") {
+        return response({ code: "session_not_found" }, 404);
+      }
+      return defaultFetch(input, init);
+    });
+    await mount("/sessions/alpha-two");
+    expect(window.location.pathname).toBe("/sessions/alpha-two");
+    expect(acp.state.socketOpen).toBe(true);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-two")).toHaveLength(1);
+  });
+
+  it("offers the route workspace for a cold ID absent from an available session list", async () => {
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/unlisted"
+      ? response({ code: "session_not_found" }, 404)
+      : defaultFetch(input, init));
     await mount(sessionPath("unlisted", "/work/alpha"));
     expect(acp.state.session?.sessionId).toBe("unlisted");
     expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/unlisted?cwd=%2Fwork%2Falpha");
   });
 
-  it("keeps listed route workspaces available to both view and stream after other observers refresh", async () => {
+  it("uses the listed workspace to cold-load a mismatched route and subscribe", async () => {
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one"
+      ? response({ code: "session_not_found" }, 404)
+      : defaultFetch(input, init));
     await mount(sessionPath("alpha-one", "/work/wrong"));
     expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
-    expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha");
+    expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha&expectedEpoch=epoch&expectedIncarnation=1");
   });
 
   it("passes the selected workspace on ordinary session clicks for view and stream", async () => {
     await mount(projectPath("/work/alpha"));
     await act(async () => acp.attachSession(list[0]));
     expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
-    expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha");
+    expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha&expectedEpoch=epoch&expectedIncarnation=1");
   });
 
   it("allows a negotiated fork without history loading", async () => {
@@ -345,7 +524,7 @@ describe("project navigation", () => {
       type: "bridge/session_reset", bridgeEpoch: "epoch", sessionId: "alpha-one",
       sessionIncarnation: 1, viewRevision: 4,
     });
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-one")).toHaveLength(1);
   });
 
   it("merges raw UTF-8 fragments and trims retained output by bytes", async () => {
@@ -368,7 +547,7 @@ describe("project navigation", () => {
     await emit(terminalSnapshot({ output: "🙂好", retainedBytes: 5, truncated: true }), 6);
     expect(acp.state.terminalSnapshots[0].output).toBe("好");
     expect(acp.state.terminalSnapshots[0].retainedBytes).toBe(3);
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-one")).toHaveLength(1);
   });
 
   it.each([
@@ -379,20 +558,20 @@ describe("project navigation", () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
     const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
     const authoritative = terminalSnapshot({ output: "authoritative output", released: true });
-    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha"
+    fetchMock.mockImplementation(async (input, init) => String(input).split("?")[0] === "/api/v1/sessions/alpha-one"
       ? response({ ...sessionView("alpha-one"), viewRevision: 8, terminals: { "terminal-1": authoritative } })
       : defaultFetch(input, init));
     await act(async () => source.onmessage?.({ data: JSON.stringify(terminalDelta(
       { ...terminalSnapshot({ output: "out of order", outputAppend: true }) }, 1, mismatch,
     )) }));
     expect(acp.state.terminalSnapshots).toEqual([authoritative]);
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(2);
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-one")).toHaveLength(2);
   });
 
   it("recovers a missing append base and resumes from authoritative snapshot bytes", async () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
     const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
-    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha"
+    fetchMock.mockImplementation(async (input, init) => String(input).split("?")[0] === "/api/v1/sessions/alpha-one"
       ? response({ ...sessionView("alpha-one"), viewRevision: 2, terminals: {
         "terminal-1": terminalSnapshot({ output: "", outputBytes: "5A==" }),
       } })
@@ -404,7 +583,7 @@ describe("project navigation", () => {
       ...terminalSnapshot({ output: "", outputBytes: "uK0=", outputAppend: true, retainedBytes: 3 }),
     }, 2)) }));
     expect(acp.state.terminalSnapshots[0].output).toBe("中");
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(2);
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-one")).toHaveLength(2);
   });
 
   it("rejects cross-session and malformed terminal deltas without advancing the active view", async () => {
@@ -424,7 +603,7 @@ describe("project navigation", () => {
       ...terminalSnapshot({ output: "accepted" }),
     })) }));
     expect(acp.state.terminalSnapshots[0].output).toBe("accepted");
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-one")).toHaveLength(1);
   });
 
   it("tracks home, project and session navigation without selecting project sessions", async () => {
@@ -443,6 +622,222 @@ describe("project navigation", () => {
     await restore("/");
     expect(acp.projectCwd).toBeUndefined();
     expect(acp.state.session).toBeUndefined();
+  });
+
+  it.each(["close", "delete"] as const)("returns to the current session's project after %s", async (action) => {
+    await mount(sessionPath("beta-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("beta-one/events"))!;
+    await act(async () => {
+      if (action === "close") acp.closeSession();
+      else acp.deleteSession("beta-one");
+    });
+    expect(window.location.pathname).toBe(projectPath("/work/beta"));
+    expect(acp.projectCwd).toBe("/work/beta");
+    expect(acp.state.session).toBeUndefined();
+    expect(acp.state.cachedSessions.has("beta-one")).toBe(false);
+    expect(source.readyState).toBe(TestEventSource.CLOSED);
+  });
+
+  it.each(["close", "delete"] as const)("keeps the project when session refresh reports removal before %s completes", async (action) => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    let finishAction!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).split("?")[0].startsWith("/api/v1/sessions/alpha-one")) {
+        if (init?.method === "POST" || init?.method === "DELETE") {
+          return new Promise<Response>((resolve) => { finishAction = resolve; });
+        }
+        return response({ code: "session_not_found" }, 404);
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => {
+      if (action === "close") acp.closeSession();
+      else acp.deleteSession("alpha-one");
+    });
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
+    await act(async () => source.onmessage?.({ data: JSON.stringify({
+      type: "bridge/session_reset", bridgeEpoch: "epoch", sessionId: "alpha-one",
+      sessionIncarnation: 1, viewRevision: 2,
+    }) }));
+    expect(window.location.pathname).toBe(projectPath("/work/alpha"));
+    expect(acp.state.session).toBeUndefined();
+    await act(async () => finishAction(response({})));
+    expect(window.location.pathname).toBe(projectPath("/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+  });
+
+  it.each(["close", "delete"] as const)("does not let a delayed %s override later project navigation", async (action) => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    let finishAction!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (init?.method === "POST" || init?.method === "DELETE") {
+        return new Promise<Response>((resolve) => { finishAction = resolve; });
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => {
+      if (action === "close") acp.closeSession();
+      else acp.deleteSession("alpha-one");
+    });
+    await act(async () => acp.openProject("/work/beta"));
+    await act(async () => finishAction(response({})));
+    expect(window.location.pathname).toBe(projectPath("/work/beta"));
+    expect(acp.projectCwd).toBe("/work/beta");
+    expect(acp.state.session).toBeUndefined();
+  });
+
+  it.each(["close", "delete"] as const)("does not change the route when %s fails", async (action) => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    fetchMock.mockImplementation(async (input, init) => {
+      if (init?.method === "POST" || init?.method === "DELETE") {
+        return response({ message: "Operation failed" }, 500);
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => {
+      if (action === "close") acp.closeSession();
+      else acp.deleteSession("alpha-one");
+    });
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(acp.state.sessionSyncPhase).toBe("ready");
+    expect(acp.state.pendingSessionDeletions).toEqual([]);
+    expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(true);
+  });
+
+  it.each(["close", "delete"] as const)("ignores an old %s reply after reopening the same ID", async (action) => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    let finishAction!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (init?.method === "POST" || init?.method === "DELETE") {
+        return new Promise<Response>((resolve) => { finishAction = resolve; });
+      }
+      if (String(input).split("?")[0] === "/api/v1/sessions/alpha-one") {
+        return response({ ...sessionView("alpha-one"), sessionIncarnation: 2 });
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => {
+      if (action === "close") acp.closeSession();
+      else acp.deleteSession("alpha-one");
+    });
+    await restore(projectPath("/work/alpha"));
+    await restore(sessionPath("alpha-one", "/work/alpha"));
+    await act(async () => finishAction(response({})));
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(acp.state.sessionSyncPhase).toBe("ready");
+    expect(acp.state.pendingSessionDeletions).toEqual([]);
+  });
+
+  it("ends only the matching observation when a session is retired", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
+    const emit = async (sessionIncarnation: number) => act(async () => source.onmessage?.({ data: JSON.stringify({
+      type: "bridge/session_retired", bridgeEpoch: "epoch", sessionId: "alpha-one",
+      sessionIncarnation, reason: "closed",
+    }) }));
+    await emit(2);
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    const getsBefore = fetchMock.mock.calls.length;
+    await emit(1);
+    expect(source.readyState).toBe(TestEventSource.CLOSED);
+    expect(window.location.pathname).toBe(projectPath("/work/alpha"));
+    expect(acp.state.session).toBeUndefined();
+    expect(fetchMock.mock.calls.slice(getsBefore).some(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-one")).toBe(false);
+  });
+
+  it("recovers a missed retirement using an owner-bound view request", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
+    expect(new URL(source.url, window.location.href).searchParams.get("expectedIncarnation")).toBe("1");
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).split("?")[0] === "/api/v1/sessions/alpha-one") {
+        const query = new URL(String(input), window.location.href).searchParams;
+        expect(query.get("expectedEpoch")).toBe("epoch");
+        expect(query.get("expectedIncarnation")).toBe("1");
+        return response({ code: "session_retired", sessionId: "alpha-one", bridgeEpoch: "epoch", sessionIncarnation: 1 }, 409);
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => source.onerror?.());
+    expect(window.location.pathname).toBe(projectPath("/work/alpha"));
+    expect(acp.state.session).toBeUndefined();
+    expect(source.readyState).toBe(TestEventSource.CLOSED);
+  });
+
+  it("checks connection health before session recovery when the Agent stops", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.includes("alpha-one/events"))!;
+    const before = fetchMock.mock.calls.length;
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/runtime"
+      ? response({ connected: false, generation: 1, bridgeEpoch: "epoch", hello: null, initialized: null,
+        phase: { type: "bridge/phase", phase: "stopped" }, error: null })
+      : defaultFetch(input, init));
+    await act(async () => source.onerror?.());
+    expect(fetchMock.mock.calls.slice(before).every(([path]) => String(path) === "/api/v1/runtime")).toBe(true);
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(acp.state.phase).toBe("stopped");
+  });
+
+  it.each(["runtime", "session-refresh"] as const)("restores history after connection replacement discovered by %s", async (discovery) => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    let runtimeReads = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/v1/runtime") {
+        const runtime = await (await defaultFetch(input, init)).json();
+        runtimeReads += 1;
+        // A host restart can reuse the numeric generation. Only epoch identifies
+        // replacement; same-epoch retirement must continue to leave the session.
+        return response({ ...runtime, bridgeEpoch: discovery === "session-refresh" && runtimeReads === 1
+          ? "epoch" : "replacement", generation: 1 });
+      }
+      if (url.pathname === "/api/v1/sessions/alpha-one") {
+        if (url.searchParams.get("expectedEpoch") === "epoch") {
+          return response({ code: "bridge_replaced", sessionId: "alpha-one", bridgeEpoch: "epoch",
+            sessionIncarnation: 1, currentBridgeEpoch: "replacement" }, 409);
+        }
+        return response({ ...sessionView("alpha-one"), bridgeEpoch: "replacement" });
+      }
+      return defaultFetch(input, init);
+    });
+    if (discovery === "runtime") {
+      const source = TestEventSource.instances.find(({ url }) => url === "/api/v1/events")!;
+      await act(async () => source.onopen?.());
+    } else {
+      const source = TestEventSource.instances.find(({ url }) => url.includes("alpha-one/events"))!;
+      await act(async () => source.onerror?.());
+    }
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(acp.state.sessionSyncPhase).toBe("ready");
+    expect(TestEventSource.instances.at(-1)?.url).toContain("expectedEpoch=replacement");
+  });
+
+  it("keeps the current session selected when deleting a different session", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    await act(async () => acp.deleteSession("beta-one"));
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+    expect(acp.projectCwd).toBe("/work/alpha");
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+  });
+
+  it("preserves the view while deletion is pending and rejects new prompts", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    let finishDelete!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => init?.method === "DELETE"
+      ? new Promise<Response>((resolve) => { finishDelete = resolve; })
+      : defaultFetch(input, init));
+    await act(async () => acp.deleteSession("alpha-one"));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    await act(async () => { expect(acp.prompt([{ type: "text", text: "Do not send" }])).toBe(false); });
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+    await act(async () => finishDelete(response({ error: "Close refused" }, 409)));
+    expect(acp.state.session?.sessionId).toBe("alpha-one");
+    expect(acp.state.pendingSessionDeletions).toEqual([]);
   });
 
   it("returns missing and malformed session links home", async () => {
@@ -495,7 +890,7 @@ describe("project navigation", () => {
         intentId = new Headers(init?.headers).get("Idempotency-Key");
         return response({ operationId: "turn-1", disposition: "accepted", status: "running" });
       }
-      if (String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha" && admitted) {
+      if (String(input).split("?")[0] === "/api/v1/sessions/alpha-one" && admitted) {
         const view = sessionView("alpha-one");
         view.viewRevision = completed ? 3 : 2;
         view.phase = completed ? "ready" : "running";
@@ -552,6 +947,9 @@ describe("project navigation", () => {
       if (String(input) === "/api/v1/sessions?cursor=more") {
         return new Promise<Response>((resolve) => { finishPage = resolve; });
       }
+      if (String(input) === "/api/v1/sessions/alpha-two") {
+        return response({ code: "session_not_found" }, 404);
+      }
       return defaultFetch(input, init);
     });
     await mount(sessionPath("alpha-two", "/work/alpha"));
@@ -560,7 +958,9 @@ describe("project navigation", () => {
     expect(window.location.pathname).toBe("/");
     expect(acp.projectCwd).toBeUndefined();
     expect(acp.state.session).toBeUndefined();
-    expect(fetchMock.mock.calls.some(([path]) => path === "/api/v1/sessions/alpha-two")).toBe(false);
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-two"))
+      .toHaveLength(1);
+    expect(TestEventSource.instances.some(({ url }) => url.includes("alpha-two/events"))).toBe(false);
   });
 
   it("lets the newer popstate win over an in-flight project's paginated discovery", async () => {
@@ -575,6 +975,7 @@ describe("project navigation", () => {
     });
     await mount(projectPath("/work/alpha"));
     await restore(sessionPath("beta-one", "/work/beta"));
+    expect(acp.state.session?.sessionId).toBe("beta-one");
     await act(async () => finishPage(response({ sessions: list.slice(2) })));
     expect(window.location.pathname).toBe(sessionPath("beta-one", "/work/beta"));
     expect(acp.projectCwd).toBe("/work/beta");

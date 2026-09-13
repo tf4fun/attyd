@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CloseSessionDialog } from "../web/src/components/acp/close-session-dialog";
+import { SessionActionDialog } from "../web/src/components/acp/session-action-dialog";
 import { ContentBlockView } from "../web/src/components/acp/content-block";
 import { SessionControls } from "../web/src/components/acp/session-controls";
 
@@ -25,14 +25,13 @@ describe("ACP presentation boundaries", () => {
     vi.useRealTimers();
   });
 
-  it("requires explicit close confirmation and keeps focus on the safe action", async () => {
+  it.each(["close", "delete"] as const)("requires explicit %s confirmation and keeps focus on the safe action", async (action) => {
     const cancel = vi.fn();
     const confirm = vi.fn();
-    await act(async () => root.render(<CloseSessionDialog disabled={false} onCancel={cancel} onConfirm={confirm} />));
+    await act(async () => root.render(<SessionActionDialog action={action} disabled={false} onCancel={cancel} onConfirm={confirm} />));
     const [keep, close] = container.querySelectorAll("button");
     expect(document.activeElement).toBe(keep);
-    expect(container.textContent).toContain("child processes");
-    expect(container.textContent).toContain("Detached background services");
+    expect(container.textContent).toContain(action === "close" ? "child processes" : "cannot be undone");
     await act(async () => keep.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(cancel).toHaveBeenCalledOnce();
     expect(confirm).not.toHaveBeenCalled();

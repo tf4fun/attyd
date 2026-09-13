@@ -1,10 +1,18 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use uuid::Uuid;
+
+use crate::session_mirror::TurnOverlay;
+use crate::session_registry::{SessionEntry, SessionRegistry};
+use crate::session_state::{MirrorError, SessionAdmission, SessionState, TurnAdmission};
+
+#[cfg(test)]
+pub(crate) use crate::session_registry::SessionRegistry as RuntimeState;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuntimeLimits {
@@ -48,18 +56,50 @@ pub(crate) struct SessionRuntime {
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
-    #[serde(skip)]
+}
+
+/// Mutable live resources and lifecycle. Operation and turn execution belong to SessionState.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SessionLiveState {
+    pub revision: u64,
+    pub cwd: PathBuf,
+    pub session: Value,
+    pub control_state: BTreeMap<String, Value>,
+    pub lifecycle: SessionLifecycle,
+    pub permissions: BTreeMap<String, PendingInteraction>,
+    pub elicitations: BTreeMap<String, PendingInteraction>,
+    pub url_flows: BTreeMap<String, UrlFlow>,
+    pub terminals: BTreeMap<String, Value>,
     resolved_permissions: VecDeque<String>,
-    #[serde(skip)]
     resolved_elicitations: VecDeque<String>,
-    #[serde(skip)]
     resolved_url_flows: VecDeque<String>,
-    #[serde(skip)]
     released_terminals: VecDeque<String>,
-    #[serde(skip)]
     attachment_candidate: Vec<Value>,
-    #[serde(skip)]
     attachment_candidate_bytes: usize,
+}
+
+impl SessionLiveState {
+    pub(crate) fn modes(&self) -> Option<&Value> {
+        self.session.get("modes").filter(|value| !value.is_null())
+    }
+
+    pub(crate) fn current_mode_id(&self) -> Option<&str> {
+        self.control_state
+            .get("current_mode_update")
+            .and_then(|update| update.get("currentModeId"))
+            .or_else(|| self.modes().and_then(|modes| modes.get("currentModeId")))
+            .and_then(Value::as_str)
+    }
+
+    pub(crate) fn config_options(&self) -> &Value {
+        static EMPTY: Value = Value::Array(Vec::new());
+        self.control_state
+            .get("config_option_update")
+            .and_then(|update| update.get("configOptions"))
+            .or_else(|| self.session.get("configOptions"))
+            .filter(|value| value.is_array())
+            .unwrap_or(&EMPTY)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,8 +119,8 @@ pub(crate) enum SessionLifecycle {
 pub(crate) struct ActiveTurn {
     pub operation_id: String,
     pub turn_id: String,
-    pub prompt: Vec<Value>,
-    pub updates: Vec<Value>,
+    pub prompt: Arc<Vec<Value>>,
+    pub updates: Arc<Vec<Value>>,
     pub cancel_requested: bool,
 }
 
@@ -109,6 +149,35 @@ pub(crate) enum SessionOperationKind {
     SetConfig,
 }
 
+impl SessionOperationKind {
+    pub(crate) fn admission(self) -> SessionAdmission {
+        match self {
+            Self::Load | Self::Resume => SessionAdmission::Attachment,
+            Self::Fork => SessionAdmission::Fork,
+            Self::Close => SessionAdmission::Close,
+            Self::Delete => SessionAdmission::Delete,
+            Self::SetMode | Self::SetConfig => SessionAdmission::Control,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionTurnError {
+    History(MirrorError),
+    Live(RuntimeStateError),
+}
+
+impl From<MirrorError> for SessionTurnError {
+    fn from(error: MirrorError) -> Self {
+        Self::History(error)
+    }
+}
+impl From<RuntimeStateError> for SessionTurnError {
+    fn from(error: RuntimeStateError) -> Self {
+        Self::Live(error)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PendingInteraction {
@@ -122,6 +191,8 @@ pub(crate) struct PendingInteraction {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UrlFlow {
     pub elicitation_id: String,
+    #[serde(skip)]
+    pub(crate) registration_id: String,
     pub request: Value,
     pub status: UrlFlowStatus,
 }
@@ -189,6 +260,7 @@ pub(crate) enum InteractionResponseStart {
 pub(crate) enum UrlFlowResolution {
     Applied,
     AlreadyTerminal,
+    StaleRegistration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,17 +280,29 @@ pub(crate) enum TerminalUpsert {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeEffect {
+    ResourcesCancelled {
+        session_id: String,
+        incarnation: u64,
+        permission_ids: Vec<String>,
+        elicitation_ids: Vec<String>,
+        url_ids: Vec<(String, String)>,
+        reason: String,
+    },
     CancelPermissionResponder {
         session_id: String,
+        incarnation: u64,
         interaction_id: String,
     },
     CancelElicitationResponder {
         session_id: Option<String>,
+        incarnation: Option<u64>,
         interaction_id: String,
     },
     AbortUrlFlow {
         session_id: Option<String>,
+        incarnation: Option<u64>,
         elicitation_id: String,
+        registration_id: String,
     },
     ReleaseTerminal {
         session_id: String,
@@ -241,75 +325,39 @@ pub(crate) enum RuntimeStateError {
     ResourceLimit,
 }
 
-pub(crate) struct RuntimeState {
-    epoch: String,
+/// Retains the published delta suffix without owning session business state.
+/// The caller supplies committed changes and decides when a turn is retired.
+pub(crate) struct RuntimeJournal {
     seq: u64,
-    connection_revision: u64,
-    next_incarnation: u64,
-    sessions: BTreeMap<String, SessionRuntime>,
-    request_elicitations: BTreeMap<String, PendingInteraction>,
-    request_url_flows: BTreeMap<String, UrlFlow>,
-    resolved_request_elicitations: VecDeque<String>,
-    resolved_request_url_flows: VecDeque<String>,
-    effects: VecDeque<RuntimeEffect>,
-    delta_journal: VecDeque<RuntimeDelta>,
-    delta_bytes: usize,
+    deltas: VecDeque<RuntimeDelta>,
+    bytes: usize,
     limits: RuntimeLimits,
 }
 
-impl Default for RuntimeState {
-    fn default() -> Self {
-        Self::new(Uuid::new_v4().to_string(), RuntimeLimits::default())
-    }
-}
-
-impl RuntimeState {
-    pub(crate) fn new(epoch: impl Into<String>, limits: RuntimeLimits) -> Self {
+impl RuntimeJournal {
+    pub(crate) fn new(limits: RuntimeLimits) -> Self {
         Self {
-            epoch: epoch.into(),
             seq: 0,
-            connection_revision: 0,
-            next_incarnation: 0,
-            sessions: BTreeMap::new(),
-            request_elicitations: BTreeMap::new(),
-            request_url_flows: BTreeMap::new(),
-            resolved_request_elicitations: VecDeque::new(),
-            resolved_request_url_flows: VecDeque::new(),
-            effects: VecDeque::new(),
-            delta_journal: VecDeque::new(),
-            delta_bytes: 0,
+            deltas: VecDeque::new(),
+            bytes: 0,
             limits,
         }
     }
 
-    pub(crate) fn epoch(&self) -> &str {
-        &self.epoch
+    fn through_seq(&self) -> u64 {
+        self.seq
     }
 
-    pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
-        RuntimeSnapshot {
-            epoch: self.epoch.clone(),
-            through_seq: self.seq,
-            connection_revision: self.connection_revision,
-            sessions: self.sessions.clone(),
-            request_elicitations: self.request_elicitations.clone(),
-            request_url_flows: self.request_url_flows.clone(),
-        }
-    }
-
-    pub(crate) fn deltas_after(&self, seq: u64) -> Option<Vec<RuntimeDelta>> {
+    fn deltas_after(&self, seq: u64) -> Option<Vec<RuntimeDelta>> {
         if seq > self.seq {
             return None;
         }
-        let first = self
-            .delta_journal
-            .front()
-            .map_or(self.seq + 1, |delta| delta.seq);
+        let first = self.deltas.front().map_or(self.seq + 1, |delta| delta.seq);
         if seq.saturating_add(1) < first {
             return None;
         }
         Some(
-            self.delta_journal
+            self.deltas
                 .iter()
                 .filter(|delta| delta.seq > seq)
                 .cloned()
@@ -317,8 +365,130 @@ impl RuntimeState {
         )
     }
 
-    pub(crate) fn session(&self, session_id: &str) -> Option<&SessionRuntime> {
-        self.sessions.get(session_id)
+    fn commit(&mut self, epoch: &str, scope_revision: Option<u64>, change: RuntimeChange) {
+        self.seq = self.seq.wrapping_add(1).max(1);
+        let delta = RuntimeDelta {
+            epoch: epoch.to_string(),
+            seq: self.seq,
+            scope_revision,
+            change,
+        };
+        self.bytes = self.bytes.saturating_add(serialized_len(&delta));
+        self.deltas.push_back(delta);
+        while self.deltas.len() > self.limits.max_delta_events
+            || self.bytes > self.limits.max_delta_bytes
+        {
+            let Some(removed) = self.deltas.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(serialized_len(&removed));
+        }
+    }
+
+    fn retire_turn_payload(&mut self, session_id: &str, incarnation: u64, operation_id: &str) {
+        // A journal suffix must remain sequence-contiguous. Removing only this session's entries
+        // would leave holes when sessions interleave, so invalidate the whole prefix through the
+        // last delta that could own this turn's payload.
+        let discard_through = self
+            .deltas
+            .iter()
+            .filter(|delta| match &delta.change {
+                RuntimeChange::SessionUpsert { session } => {
+                    session.session_id == session_id && session.incarnation == incarnation
+                }
+                RuntimeChange::TurnUpdateAppended {
+                    session_id: delta_session_id,
+                    incarnation: delta_incarnation,
+                    operation_id: delta_operation_id,
+                    ..
+                } => {
+                    (delta_session_id == session_id && *delta_incarnation == incarnation)
+                        || delta_operation_id == operation_id
+                }
+                RuntimeChange::TerminalUpdated { .. }
+                | RuntimeChange::ConnectionUpsert { .. }
+                | RuntimeChange::SessionRemoved { .. } => false,
+            })
+            .map(|delta| delta.seq)
+            .max();
+        if let Some(discard_through) = discard_through {
+            while self
+                .deltas
+                .front()
+                .is_some_and(|delta| delta.seq <= discard_through)
+            {
+                self.deltas.pop_front();
+            }
+        }
+        self.bytes = self.deltas.iter().map(serialized_len).sum();
+    }
+}
+
+impl SessionRegistry {
+    pub(crate) fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            epoch: self.epoch.clone(),
+            through_seq: self.journal.through_seq(),
+            connection_revision: self.connection_revision,
+            sessions: self
+                .sessions
+                .iter()
+                .filter_map(|(id, _state)| self.session(id).map(|session| (id.clone(), session)))
+                .collect(),
+            request_elicitations: self.request_elicitations.clone(),
+            request_url_flows: self.request_url_flows.clone(),
+        }
+    }
+
+    pub(crate) fn deltas_after(&self, seq: u64) -> Option<Vec<RuntimeDelta>> {
+        self.journal.deltas_after(seq)
+    }
+
+    /// Build a disposable wire projection from the one mutable session owner.
+    pub(crate) fn session(&self, session_id: &str) -> Option<SessionRuntime> {
+        let state = &self.sessions.get(session_id)?.state;
+        let live = state.live.as_ref()?;
+        if live.lifecycle == SessionLifecycle::Closed
+            && state
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.stage == "cleanup")
+        {
+            return None;
+        }
+        Some(SessionRuntime {
+            session_id: state.session_id.clone(),
+            incarnation: state.incarnation,
+            revision: live.revision,
+            cwd: live.cwd.to_string_lossy().into_owned(),
+            session: live.session.clone(),
+            control_state: live.control_state.clone(),
+            lifecycle: live.lifecycle.clone(),
+            active_turn: state.active_turn.as_ref().and_then(|turn| {
+                turn.execution.as_ref().map(|execution| ActiveTurn {
+                    operation_id: execution.rpc_operation_id.clone(),
+                    turn_id: execution.rpc_operation_id.clone(),
+                    prompt: turn.prompt.clone(),
+                    updates: turn.updates.clone(),
+                    cancel_requested: execution.cancel_requested,
+                })
+            }),
+            operation: state.operation.clone(),
+            permissions: live.permissions.clone(),
+            elicitations: live.elicitations.clone(),
+            url_flows: live.url_flows.clone(),
+            terminals: live.terminals.clone(),
+        })
+    }
+
+    pub(crate) fn live(&self, session_id: &str) -> Option<&SessionLiveState> {
+        self.sessions
+            .get(session_id)
+            .and_then(|entry| entry.state.live.as_ref())
     }
 
     pub(crate) fn take_effects(&mut self) -> Vec<RuntimeEffect> {
@@ -329,7 +499,7 @@ impl RuntimeState {
         &mut self,
         expected_epoch: &str,
         session_id: impl Into<String>,
-        cwd: impl Into<String>,
+        cwd: impl Into<PathBuf>,
         session: Value,
         replay: Vec<Value>,
     ) -> Result<u64, RuntimeStateError> {
@@ -347,7 +517,7 @@ impl RuntimeState {
         &mut self,
         expected_epoch: &str,
         session_id: impl Into<String>,
-        cwd: impl Into<String>,
+        cwd: impl Into<PathBuf>,
         operation_id: impl Into<String>,
         kind: SessionOperationKind,
     ) -> Result<u64, RuntimeStateError> {
@@ -363,31 +533,27 @@ impl RuntimeState {
         if self.operation_in_use(&operation_id) {
             return Err(RuntimeStateError::OperationCollision);
         }
-        if let Some(existing) = self.sessions.get(&session_id) {
-            if existing.lifecycle != SessionLifecycle::Closed {
-                return Err(RuntimeStateError::BusySession);
-            }
-            self.sessions.remove(&session_id);
+        if self.sessions.get(&session_id).is_some_and(|entry| {
+            let state = &entry.state;
+            state.operation.is_some()
+                || state
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.lifecycle != SessionLifecycle::Closed)
+        }) {
+            return Err(RuntimeStateError::BusySession);
         }
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
-        self.sessions.insert(
-            session_id.clone(),
-            SessionRuntime {
-                session_id: session_id.clone(),
-                incarnation,
+        self.install_live(
+            &session_id,
+            incarnation,
+            SessionLiveState {
                 revision: 0,
                 cwd: cwd.into(),
                 session: Value::Null,
                 control_state: BTreeMap::new(),
                 lifecycle: SessionLifecycle::Attaching,
-                active_turn: None,
-                operation: Some(SessionOperationState {
-                    operation_id: operation_id.clone(),
-                    kind,
-                    stage: "attaching".to_string(),
-                    uncertainty_reason: None,
-                }),
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
@@ -400,6 +566,16 @@ impl RuntimeState {
                 attachment_candidate_bytes: 0,
             },
         );
+        self.sessions
+            .get_mut(&session_id)
+            .expect("installed attachment")
+            .state
+            .operation = Some(SessionOperationState {
+            operation_id,
+            kind,
+            stage: "attaching".to_string(),
+            uncertainty_reason: None,
+        });
 
         self.commit_session(&session_id);
         Ok(incarnation)
@@ -418,15 +594,30 @@ impl RuntimeState {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let operation_id = operation_id.into();
-        if self.operation_in_use(&operation_id) {
+        if self
+            .operation_in_use_except_reserved(&operation_id, Some((session_id, incarnation, kind)))
+        {
             return Err(RuntimeStateError::OperationCollision);
         }
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        if owner.operation.is_none() {
+            owner
+                .can_begin(SessionAdmission::Attachment)
+                .map_err(|_| RuntimeStateError::BusySession)?;
+        }
+        let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive);
         }
-        if session.active_turn.is_some()
-            || session.operation.is_some()
+        if owner
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.execution.is_some())
+            || owner.operation.as_ref().is_some_and(|operation| {
+                operation.operation_id != operation_id
+                    || operation.kind != kind
+                    || operation.stage != "reserved"
+            })
             || !session.permissions.is_empty()
             || !session.elicitations.is_empty()
             || !session.url_flows.is_empty()
@@ -435,7 +626,7 @@ impl RuntimeState {
         {
             return Err(RuntimeStateError::BusySession);
         }
-        session.operation = Some(SessionOperationState {
+        owner.operation = Some(SessionOperationState {
             operation_id: operation_id.clone(),
             kind,
             stage: "reloading".to_string(),
@@ -455,9 +646,10 @@ impl RuntimeState {
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
         let collecting_attachment = session.lifecycle == SessionLifecycle::Attaching
-            && session.operation.as_ref().is_some_and(|operation| {
+            && owner.operation.as_ref().is_some_and(|operation| {
                 operation.stage == "attaching"
                     && matches!(
                         operation.kind,
@@ -465,7 +657,7 @@ impl RuntimeState {
                     )
             });
         let collecting_reload = session.lifecycle == SessionLifecycle::Active
-            && session.operation.as_ref().is_some_and(|operation| {
+            && owner.operation.as_ref().is_some_and(|operation| {
                 operation.stage == "reloading" && operation.kind == SessionOperationKind::Load
             });
         if !collecting_attachment && !collecting_reload {
@@ -496,9 +688,10 @@ impl RuntimeState {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let response = retain_session_metadata(session_id, response);
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active
-            || session.operation.as_ref().is_none_or(|operation| {
+            || owner.operation.as_ref().is_none_or(|operation| {
                 operation.operation_id != operation_id
                     || operation.kind != SessionOperationKind::Load
                     || operation.stage != "reloading"
@@ -510,7 +703,7 @@ impl RuntimeState {
         session.attachment_candidate_bytes = 0;
         session.control_state = extract_control_state(candidate);
         session.session = response;
-        session.operation = None;
+        owner.operation = None;
 
         self.commit_session(session_id);
         Ok(())
@@ -525,9 +718,10 @@ impl RuntimeState {
         _error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active
-            || session.operation.as_ref().is_none_or(|operation| {
+            || owner.operation.as_ref().is_none_or(|operation| {
                 operation.operation_id != operation_id
                     || operation.kind != SessionOperationKind::Load
                     || operation.stage != "reloading"
@@ -537,7 +731,7 @@ impl RuntimeState {
         }
         session.attachment_candidate.clear();
         session.attachment_candidate_bytes = 0;
-        session.operation = None;
+        owner.operation = None;
 
         self.commit_session(session_id);
         Ok(())
@@ -555,9 +749,10 @@ impl RuntimeState {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let response = retain_session_metadata(session_id, response);
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Attaching
-            || session.operation.as_ref().is_none_or(|operation| {
+            || owner.operation.as_ref().is_none_or(|operation| {
                 operation.operation_id != operation_id || operation.kind != kind
             })
             || !matches!(
@@ -573,7 +768,7 @@ impl RuntimeState {
         session.control_state.extend(controls);
         session.session = response;
         session.lifecycle = SessionLifecycle::Active;
-        session.operation = None;
+        owner.operation = None;
 
         self.commit_session(session_id);
         Ok(())
@@ -591,20 +786,22 @@ impl RuntimeState {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         {
-            let session = self.require_session(session_id, incarnation)?;
+            let owner = self.require_live_owner(session_id, incarnation)?;
+            let session = owner.live.as_ref().expect("live owner checked");
             if session.lifecycle != SessionLifecycle::Attaching
-                || session.operation.as_ref().is_none_or(|operation| {
+                || owner.operation.as_ref().is_none_or(|operation| {
                     operation.operation_id != operation_id || operation.kind != kind
                 })
             {
                 return Err(RuntimeStateError::OperationMismatch);
             }
         }
+        self.require_live_owner_mut(session_id, incarnation)?
+            .operation = None;
         let mut session = self
-            .sessions
-            .remove(session_id)
+            .take_live_for_retirement(session_id, incarnation)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        let effects = drain_session_liveness(session_id, &mut session);
+        let effects = drain_session_liveness(session_id, incarnation, &mut session);
 
         self.effects.extend(effects);
 
@@ -616,7 +813,7 @@ impl RuntimeState {
         &mut self,
         expected_epoch: &str,
         session_id: impl Into<String>,
-        cwd: impl Into<String>,
+        cwd: impl Into<PathBuf>,
         session: Value,
         source: (&str, u64),
         target_replay: Option<Vec<Value>>,
@@ -624,7 +821,7 @@ impl RuntimeState {
         self.require_epoch(expected_epoch)?;
         let (source_session_id, source_incarnation) = source;
         {
-            let source = self.require_session(source_session_id, source_incarnation)?;
+            let source = self.require_live(source_session_id, source_incarnation)?;
             if source.lifecycle != SessionLifecycle::Active {
                 return Err(RuntimeStateError::SessionNotActive);
             }
@@ -643,32 +840,33 @@ impl RuntimeState {
         &mut self,
         expected_epoch: &str,
         session_id: String,
-        cwd: String,
+        cwd: PathBuf,
         session: Value,
         control_state: BTreeMap<String, Value>,
     ) -> Result<u64, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        if let Some(existing) = self.sessions.get(&session_id) {
-            if existing.lifecycle != SessionLifecycle::Closed {
-                return Err(RuntimeStateError::BusySession);
-            }
-            self.sessions.remove(&session_id);
+        if self.sessions.get(&session_id).is_some_and(|entry| {
+            let state = &entry.state;
+            state.operation.is_some()
+                || state
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.lifecycle != SessionLifecycle::Closed)
+        }) {
+            return Err(RuntimeStateError::BusySession);
         }
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
         let session = retain_session_metadata(&session_id, session);
-        self.sessions.insert(
-            session_id.clone(),
-            SessionRuntime {
-                session_id: session_id.clone(),
-                incarnation,
+        self.install_live(
+            &session_id,
+            incarnation,
+            SessionLiveState {
                 revision: 0,
                 cwd,
                 session,
                 control_state,
                 lifecycle: SessionLifecycle::Active,
-                active_turn: None,
-                operation: None,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
@@ -685,6 +883,47 @@ impl RuntimeState {
         Ok(incarnation)
     }
 
+    /// Atomically admit a canonical turn and publish its live projection before Agent dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_session_turn(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        expected_history_revision: &str,
+        client_intent_id: &str,
+        prompt: Vec<Value>,
+    ) -> Result<TurnAdmission, SessionTurnError> {
+        self.require_epoch(expected_epoch)?;
+        let owner = self.require_live_owner(session_id, incarnation)?;
+        if let Some(duplicate) =
+            owner.check_turn_admission(expected_history_revision, client_intent_id, &prompt)?
+        {
+            return Ok(duplicate);
+        }
+        if owner.live.as_ref().expect("live owner checked").lifecycle != SessionLifecycle::Active {
+            return Err(RuntimeStateError::SessionNotActive.into());
+        }
+        if owner.turn_execution().is_some() || owner.operation.is_some() {
+            return Err(RuntimeStateError::BusySession.into());
+        }
+        if self.operation_in_use(client_intent_id) {
+            return Err(RuntimeStateError::OperationCollision.into());
+        }
+        let admission = self.start_turn(
+            session_id,
+            incarnation,
+            expected_history_revision,
+            client_intent_id,
+            prompt,
+        )?;
+        self.commit_session(session_id);
+        Ok(admission)
+    }
+
+    /// A runtime reducer fixture: installs a turn in the same canonical overlay,
+    /// without inventing a second runtime tail or requiring a history baseline.
+    #[cfg(test)]
     pub(crate) fn start_prompt(
         &mut self,
         expected_epoch: &str,
@@ -698,28 +937,34 @@ impl RuntimeState {
         if self.operation_in_use(&operation_id) {
             return Err(RuntimeStateError::OperationCollision);
         }
-        let turn_id = operation_id.clone();
-        let active_turn = ActiveTurn {
-            operation_id: operation_id.clone(),
-            turn_id: turn_id.clone(),
-            prompt,
-            updates: Vec::new(),
-            cancel_requested: false,
-        };
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session.lifecycle != SessionLifecycle::Active {
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        if owner.live.as_ref().expect("live owner checked").lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive);
         }
-        if session.active_turn.is_some() || session.operation.is_some() {
+        if owner.turn_execution().is_some() || owner.operation.is_some() {
             return Err(RuntimeStateError::BusySession);
         }
-        session.active_turn = Some(active_turn);
-
+        let old_bytes = owner.active_overlay_bytes;
+        owner.active_turn = None;
+        owner.phase = crate::session_state::MirrorPhase::Ready;
+        let revision = owner
+            .history_revision
+            .get_or_insert_with(|| "runtime-fixture".to_string())
+            .clone();
+        owner
+            .admit_turn(operation_id.clone(), &revision, &operation_id, prompt)
+            .map_err(|_| RuntimeStateError::BusySession)?;
+        let new_bytes = owner.active_overlay_bytes;
+        self.overlay_bytes = self
+            .overlay_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
         self.commit_session(session_id);
-        Ok(turn_id)
+        Ok(operation_id)
     }
 
-    pub(crate) fn append_turn_update(
+    #[cfg(test)]
+    pub(crate) fn append_runtime_update_for_test(
         &mut self,
         expected_epoch: &str,
         session_id: &str,
@@ -727,14 +972,45 @@ impl RuntimeState {
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let turn = session
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let turn = owner
             .active_turn
             .as_mut()
             .ok_or(RuntimeStateError::NoActiveTurn)?;
-        let folded_updates = fold_active_turn_update(&turn.updates, &update)?;
-        let operation_id = turn.operation_id.clone();
-        turn.updates = folded_updates;
+        let execution = turn
+            .execution
+            .as_ref()
+            .ok_or(RuntimeStateError::NoActiveTurn)?;
+        let operation_id = execution.rpc_operation_id.clone();
+        turn.updates = Arc::new(fold_active_turn_update(&turn.updates, &update)?);
+        self.commit_turn_update(session_id, incarnation, operation_id, update);
+        Ok(())
+    }
+
+    pub(crate) fn project_turn_update(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        overlay: &TurnOverlay,
+        update: Value,
+    ) -> Result<(), RuntimeStateError> {
+        self.require_epoch(expected_epoch)?;
+        let owner = self.require_live_owner(session_id, incarnation)?;
+        let turn = owner
+            .active_turn
+            .as_ref()
+            .ok_or(RuntimeStateError::NoActiveTurn)?;
+        let execution = turn
+            .execution
+            .as_ref()
+            .ok_or(RuntimeStateError::NoActiveTurn)?;
+        if turn.operation_id != overlay.operation_id
+            || execution.rpc_operation_id != overlay.client_intent_id
+        {
+            return Err(RuntimeStateError::OperationMismatch);
+        }
+        let operation_id = execution.rpc_operation_id.clone();
         self.commit_turn_update(session_id, incarnation, operation_id, update);
         Ok(())
     }
@@ -748,7 +1024,7 @@ impl RuntimeState {
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let session = self.require_live_mut(session_id, incarnation)?;
         if !matches!(
             session.lifecycle,
             SessionLifecycle::Active
@@ -778,8 +1054,14 @@ impl RuntimeState {
         self.require_epoch(expected_epoch)?;
         let response = retain_session_metadata(session_id, response);
         let controls = extract_control_state(replay);
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session.lifecycle != SessionLifecycle::Active || session.active_turn.is_some() {
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
+        if session.lifecycle != SessionLifecycle::Active
+            || owner
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.execution.is_some())
+        {
             return Err(RuntimeStateError::BusySession);
         }
         session.session = response;
@@ -795,15 +1077,16 @@ impl RuntimeState {
         incarnation: u64,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let turn = session
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let execution = owner
             .active_turn
             .as_mut()
+            .and_then(|turn| turn.execution.as_mut())
             .ok_or(RuntimeStateError::NoActiveTurn)?;
-        if turn.cancel_requested {
+        if execution.cancel_requested {
             return Ok(());
         }
-        turn.cancel_requested = true;
+        execution.cancel_requested = true;
         self.commit_session(session_id);
         Ok(())
     }
@@ -872,56 +1155,25 @@ impl RuntimeState {
         operation_id: &str,
         terminal: TurnTerminal,
     ) -> Result<(), RuntimeStateError> {
-        let TurnTerminal { lifecycle } = terminal;
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let active = session
-            .active_turn
-            .take()
-            .ok_or(RuntimeStateError::NoActiveTurn)?;
-        if active.operation_id != operation_id {
-            session.active_turn = Some(active);
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        drop(active);
-        if let Some(lifecycle) = lifecycle {
-            session.lifecycle = lifecycle;
-        }
-        let resolved_permissions = session
-            .permissions
-            .iter()
-            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
-            .map(|(interaction_id, _)| interaction_id.clone())
-            .collect::<Vec<_>>();
-        for interaction_id in &resolved_permissions {
-            session.permissions.remove(interaction_id);
-            remember_resolved_permission(session, interaction_id);
-        }
-        let resolved_elicitations = session
-            .elicitations
-            .iter()
-            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
-            .map(|(interaction_id, _)| interaction_id.clone())
-            .collect::<Vec<_>>();
-        for interaction_id in &resolved_elicitations {
-            session.elicitations.remove(interaction_id);
-            remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
-        }
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let retired = session_live::seal_turn(owner, operation_id, terminal)?;
         self.effects
-            .extend(resolved_permissions.into_iter().map(|interaction_id| {
+            .extend(retired.permissions.into_iter().map(|interaction_id| {
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: session_id.to_string(),
+                    incarnation: incarnation,
                     interaction_id,
                 }
             }));
         self.effects
-            .extend(resolved_elicitations.into_iter().map(|interaction_id| {
+            .extend(retired.elicitations.into_iter().map(|interaction_id| {
                 RuntimeEffect::CancelElicitationResponder {
                     session_id: Some(session_id.to_string()),
+                    incarnation: Some(incarnation),
                     interaction_id,
                 }
             }));
-
         self.drop_turn_delivery_payload(session_id, incarnation, operation_id);
         self.commit_session(session_id);
         Ok(())
@@ -936,37 +1188,21 @@ impl RuntimeState {
         request: Value,
     ) -> Result<InteractionUpsert, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let interaction_id = interaction_id.into();
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session
-            .resolved_permissions
-            .iter()
-            .any(|resolved| resolved == &interaction_id)
-        {
-            return Ok(InteractionUpsert::AlreadyResolved);
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let active_operation = owner
+            .turn_execution()
+            .map(|execution| execution.rpc_operation_id.clone());
+        let session = owner.live.as_mut().expect("live owner checked");
+        let outcome = session_live::upsert_permission(
+            session,
+            interaction_id.into(),
+            request,
+            active_operation,
+        )?;
+        if outcome == InteractionUpsert::Inserted {
+            self.commit_session(session_id);
         }
-        let active_operation = session
-            .active_turn
-            .as_ref()
-            .map(|turn| turn.operation_id.clone());
-        if let Some(existing) = session.permissions.get(&interaction_id) {
-            return if existing.request == request && existing.operation_id == active_operation {
-                Ok(InteractionUpsert::Duplicate)
-            } else {
-                Err(RuntimeStateError::InteractionCollision)
-            };
-        }
-        session.permissions.insert(
-            interaction_id.clone(),
-            PendingInteraction {
-                interaction_id,
-                request,
-                operation_id: active_operation,
-                responding_operation_id: None,
-            },
-        );
-        self.commit_session(session_id);
-        Ok(InteractionUpsert::Inserted)
+        Ok(outcome)
     }
 
     pub(crate) fn resolve_permission(
@@ -977,21 +1213,12 @@ impl RuntimeState {
         interaction_id: &str,
     ) -> Result<InteractionResolution, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session
-            .resolved_permissions
-            .iter()
-            .any(|resolved| resolved == interaction_id)
-        {
-            return Ok(InteractionResolution::AlreadyResolved);
+        let session = self.require_live_mut(session_id, incarnation)?;
+        let outcome = session_live::resolve_permission(session, interaction_id)?;
+        if outcome == InteractionResolution::Applied {
+            self.commit_session(session_id);
         }
-        session
-            .permissions
-            .remove(interaction_id)
-            .ok_or(RuntimeStateError::UnknownInteraction)?;
-        remember_resolved_permission(session, interaction_id);
-        self.commit_session(session_id);
-        Ok(InteractionResolution::Applied)
+        Ok(outcome)
     }
 
     pub(crate) fn begin_permission_response(
@@ -1004,32 +1231,18 @@ impl RuntimeState {
     ) -> Result<InteractionResponseStart, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let operation_id = operation_id.into();
-        {
-            let session = self.require_session(session_id, incarnation)?;
-            let pending = session
-                .permissions
-                .get(interaction_id)
-                .ok_or(RuntimeStateError::UnknownInteraction)?;
-            match pending.responding_operation_id.as_deref() {
-                Some(existing) if existing == operation_id => {
-                    return Ok(InteractionResponseStart::Duplicate);
-                }
-                Some(_) => return Err(RuntimeStateError::InteractionCollision),
-                None => {}
-            }
+        let operation_in_use = self.operation_in_use(&operation_id);
+        let session = self.require_live_mut(session_id, incarnation)?;
+        let outcome = session_live::begin_permission_response(
+            session,
+            interaction_id,
+            operation_id,
+            operation_in_use,
+        )?;
+        if outcome == InteractionResponseStart::Applied {
+            self.commit_session(session_id);
         }
-        if self.operation_in_use(&operation_id) {
-            return Err(RuntimeStateError::OperationCollision);
-        }
-
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let pending = session
-            .permissions
-            .get_mut(interaction_id)
-            .ok_or(RuntimeStateError::UnknownInteraction)?;
-        pending.responding_operation_id = Some(operation_id);
-        self.commit_session(session_id);
-        Ok(InteractionResponseStart::Applied)
+        Ok(outcome)
     }
 
     pub(crate) fn complete_permission_response(
@@ -1041,26 +1254,13 @@ impl RuntimeState {
         operation_id: &str,
     ) -> Result<InteractionResolution, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session
-            .resolved_permissions
-            .iter()
-            .any(|resolved| resolved == interaction_id)
-        {
-            return Ok(InteractionResolution::AlreadyResolved);
+        let session = self.require_live_mut(session_id, incarnation)?;
+        let outcome =
+            session_live::complete_permission_response(session, interaction_id, operation_id)?;
+        if outcome == InteractionResolution::Applied {
+            self.commit_session(session_id);
         }
-        let pending = session
-            .permissions
-            .get(interaction_id)
-            .ok_or(RuntimeStateError::UnknownInteraction)?;
-        if pending.responding_operation_id.as_deref() != Some(operation_id) {
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        session.permissions.remove(interaction_id);
-        remember_resolved_permission(session, interaction_id);
-
-        self.commit_session(session_id);
-        Ok(InteractionResolution::Applied)
+        Ok(outcome)
     }
 
     pub(crate) fn upsert_elicitation(
@@ -1074,7 +1274,8 @@ impl RuntimeState {
         let interaction_id = interaction_id.into();
         match scope {
             Some((session_id, incarnation)) => {
-                let session = self.require_session_mut(session_id, incarnation)?;
+                let owner = self.require_live_owner_mut(session_id, incarnation)?;
+                let session = owner.live.as_mut().expect("live owner checked");
                 if session
                     .resolved_elicitations
                     .iter()
@@ -1082,10 +1283,11 @@ impl RuntimeState {
                 {
                     return Ok(InteractionUpsert::AlreadyResolved);
                 }
-                let active_operation = session
+                let active_operation = owner
                     .active_turn
                     .as_ref()
-                    .map(|turn| turn.operation_id.clone());
+                    .and_then(|turn| turn.execution.as_ref())
+                    .map(|execution| execution.rpc_operation_id.clone());
                 if let Some(existing) = session.elicitations.get(&interaction_id) {
                     return if existing.request == request
                         && existing.operation_id == active_operation
@@ -1147,7 +1349,7 @@ impl RuntimeState {
         match scope {
             Some((session_id, incarnation)) => {
                 if self
-                    .require_session(session_id, incarnation)?
+                    .require_live(session_id, incarnation)?
                     .resolved_elicitations
                     .iter()
                     .any(|resolved| resolved == interaction_id)
@@ -1159,7 +1361,7 @@ impl RuntimeState {
                 {
                     return Err(RuntimeStateError::InteractionCollision);
                 }
-                let session = self.require_session_mut(session_id, incarnation)?;
+                let session = self.require_live_mut(session_id, incarnation)?;
                 let pending = session
                     .elicitations
                     .remove(interaction_id)
@@ -1174,6 +1376,7 @@ impl RuntimeState {
                         elicitation_id.to_string(),
                         UrlFlow {
                             elicitation_id: elicitation_id.to_string(),
+                            registration_id: interaction_id.to_string(),
                             request,
                             status: UrlFlowStatus::Waiting,
                         },
@@ -1210,6 +1413,7 @@ impl RuntimeState {
                         elicitation_id.to_string(),
                         UrlFlow {
                             elicitation_id: elicitation_id.to_string(),
+                            registration_id: interaction_id.to_string(),
                             request,
                             status: UrlFlowStatus::Waiting,
                         },
@@ -1232,7 +1436,7 @@ impl RuntimeState {
         let operation_id = operation_id.into();
         let responding_operation_id = match scope {
             Some((session_id, incarnation)) => self
-                .require_session(session_id, incarnation)?
+                .require_live(session_id, incarnation)?
                 .elicitations
                 .get(interaction_id)
                 .ok_or(RuntimeStateError::UnknownInteraction)?
@@ -1258,7 +1462,7 @@ impl RuntimeState {
 
         match scope {
             Some((session_id, incarnation)) => {
-                self.require_session_mut(session_id, incarnation)?
+                self.require_live_mut(session_id, incarnation)?
                     .elicitations
                     .get_mut(interaction_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?
@@ -1287,7 +1491,7 @@ impl RuntimeState {
         self.require_epoch(expected_epoch)?;
         let already_resolved = match scope {
             Some((session_id, incarnation)) => self
-                .require_session(session_id, incarnation)?
+                .require_live(session_id, incarnation)?
                 .resolved_elicitations
                 .iter()
                 .any(|resolved| resolved == interaction_id),
@@ -1301,7 +1505,7 @@ impl RuntimeState {
         }
         let responding_operation_id = match scope {
             Some((session_id, incarnation)) => self
-                .require_session(session_id, incarnation)?
+                .require_live(session_id, incarnation)?
                 .elicitations
                 .get(interaction_id)
                 .ok_or(RuntimeStateError::UnknownInteraction)?
@@ -1320,7 +1524,29 @@ impl RuntimeState {
         self.resolve_elicitation(expected_epoch, scope, interaction_id, accepted_url_id)
     }
 
-    pub(crate) fn settle_url_flow(
+    pub(crate) fn settle_url_registration(
+        &mut self,
+        expected_epoch: &str,
+        scope: Option<(&str, u64)>,
+        elicitation_id: &str,
+        registration_id: &str,
+        status: UrlFlowStatus,
+    ) -> Result<UrlFlowResolution, RuntimeStateError> {
+        self.require_epoch(expected_epoch)?;
+        let flow = match scope {
+            Some((session_id, incarnation)) => self
+                .require_live(session_id, incarnation)?
+                .url_flows
+                .get(elicitation_id),
+            None => self.request_url_flows.get(elicitation_id),
+        };
+        if flow.is_some_and(|flow| flow.registration_id != registration_id) {
+            return Ok(UrlFlowResolution::StaleRegistration);
+        }
+        self.settle_url_flow(expected_epoch, scope, elicitation_id, status)
+    }
+
+    fn settle_url_flow(
         &mut self,
         expected_epoch: &str,
         scope: Option<(&str, u64)>,
@@ -1333,7 +1559,7 @@ impl RuntimeState {
         }
         match scope {
             Some((session_id, incarnation)) => {
-                let session = self.require_session_mut(session_id, incarnation)?;
+                let session = self.require_live_mut(session_id, incarnation)?;
                 if session
                     .resolved_url_flows
                     .iter()
@@ -1382,7 +1608,7 @@ impl RuntimeState {
         terminal: Value,
     ) -> Result<TerminalUpsert, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let session = self.require_live_mut(session_id, incarnation)?;
         let terminal_id = terminal_id.into();
         if session
             .released_terminals
@@ -1429,56 +1655,13 @@ impl RuntimeState {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let operation_id = operation_id.into();
-        if self.operation_in_use(&operation_id) {
+        if self
+            .operation_in_use_except_reserved(&operation_id, Some((session_id, incarnation, kind)))
+        {
             return Err(RuntimeStateError::OperationCollision);
         }
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let allowed_lifecycle = match kind {
-            SessionOperationKind::Delete => matches!(
-                session.lifecycle,
-                SessionLifecycle::Active | SessionLifecycle::Closed
-            ),
-            _ => session.lifecycle == SessionLifecycle::Active,
-        };
-        if !allowed_lifecycle {
-            return Err(RuntimeStateError::SessionNotActive);
-        }
-        if session.operation.is_some()
-            || (session.active_turn.is_some()
-                && !matches!(
-                    kind,
-                    SessionOperationKind::Close
-                        | SessionOperationKind::SetMode
-                        | SessionOperationKind::SetConfig
-                ))
-        {
-            return Err(RuntimeStateError::BusySession);
-        }
-        session.operation = Some(SessionOperationState {
-            operation_id: operation_id.clone(),
-            kind,
-            stage: stage.into(),
-            uncertainty_reason: None,
-        });
-        match kind {
-            SessionOperationKind::Close => session.lifecycle = SessionLifecycle::Closing,
-            SessionOperationKind::Delete if session.lifecycle == SessionLifecycle::Closed => {
-                session.lifecycle = SessionLifecycle::Deleting;
-            }
-            SessionOperationKind::Delete
-                if session
-                    .operation
-                    .as_ref()
-                    .is_some_and(|operation| operation.stage == "deleting_active") =>
-            {
-                session.lifecycle = SessionLifecycle::Deleting;
-            }
-            SessionOperationKind::Delete => {
-                session.lifecycle = SessionLifecycle::ClosingForDelete;
-            }
-            _ => {}
-        }
-
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        session_live::start_operation(owner, operation_id, kind, stage.into())?;
         self.commit_session(session_id);
         Ok(())
     }
@@ -1490,7 +1673,7 @@ impl RuntimeState {
         incarnation: u64,
         operation_id: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
-        let stage = match self.require_session(session_id, incarnation)?.lifecycle {
+        let stage = match self.require_live(session_id, incarnation)?.lifecycle {
             SessionLifecycle::Active => "closing",
             SessionLifecycle::Closed => "deleting",
             _ => return Err(RuntimeStateError::SessionNotActive),
@@ -1512,7 +1695,7 @@ impl RuntimeState {
         incarnation: u64,
         operation_id: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
-        if self.require_session(session_id, incarnation)?.lifecycle != SessionLifecycle::Active {
+        if self.require_live(session_id, incarnation)?.lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive);
         }
         self.start_operation(
@@ -1533,8 +1716,9 @@ impl RuntimeState {
         operation_id: &str,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let Some(operation) = session.operation.as_mut() else {
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
+        let Some(operation) = owner.operation.as_mut() else {
             return Err(RuntimeStateError::OperationMismatch);
         };
         if operation.operation_id != operation_id
@@ -1546,7 +1730,12 @@ impl RuntimeState {
         }
         operation.stage = "deleting".to_string();
         session.lifecycle = SessionLifecycle::Deleting;
-        let effects = drain_session_liveness(session_id, session);
+        let effects = {
+            if let Some(turn) = owner.active_turn.as_mut() {
+                turn.execution = None;
+            }
+            drain_session_liveness(session_id, incarnation, session)
+        };
 
         self.effects.extend(effects);
         self.commit_session(session_id);
@@ -1562,9 +1751,10 @@ impl RuntimeState {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         {
-            let session = self.require_session(session_id, incarnation)?;
+            let owner = self.require_live_owner(session_id, incarnation)?;
+            let session = owner.live.as_ref().expect("live owner checked");
             if session.lifecycle != SessionLifecycle::Deleting
-                || session.operation.as_ref().is_none_or(|operation| {
+                || owner.operation.as_ref().is_none_or(|operation| {
                     operation.operation_id != operation_id
                         || operation.kind != SessionOperationKind::Delete
                         || !matches!(operation.stage.as_str(), "deleting" | "deleting_active")
@@ -1573,11 +1763,19 @@ impl RuntimeState {
                 return Err(RuntimeStateError::OperationMismatch);
             }
         }
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        owner
+            .operation
+            .as_mut()
+            .expect("matched delete owner")
+            .stage = "cleanup".to_string();
+        if let Some(turn) = owner.active_turn.as_mut() {
+            turn.execution = None;
+        }
         let mut session = self
-            .sessions
-            .remove(session_id)
+            .take_live_for_retirement(session_id, incarnation)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        let effects = drain_session_liveness(session_id, &mut session);
+        let effects = drain_session_liveness(session_id, incarnation, &mut session);
 
         self.effects.extend(effects);
 
@@ -1596,8 +1794,9 @@ impl RuntimeState {
         self.require_epoch(expected_epoch)?;
         let reason = reason.into();
         let effects = {
-            let session = self.require_session_mut(session_id, incarnation)?;
-            let Some(operation) = session.operation.as_mut() else {
+            let owner = self.require_live_owner_mut(session_id, incarnation)?;
+            let session = owner.live.as_mut().expect("live owner checked");
+            let Some(operation) = owner.operation.as_mut() else {
                 return Err(RuntimeStateError::OperationMismatch);
             };
             if operation.operation_id != operation_id {
@@ -1606,7 +1805,7 @@ impl RuntimeState {
             operation.stage = "uncertain".to_string();
             operation.uncertainty_reason = Some(reason.clone());
             session.lifecycle = SessionLifecycle::Uncertain;
-            drain_session_liveness(session_id, session)
+            drain_session_liveness(session_id, incarnation, session)
         };
 
         self.effects.extend(effects);
@@ -1625,16 +1824,16 @@ impl RuntimeState {
         _result: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
         if matches!(
             kind,
             SessionOperationKind::Close | SessionOperationKind::Delete
-        ) || session.operation.as_ref().is_none_or(|operation| {
+        ) || owner.operation.as_ref().is_none_or(|operation| {
             operation.operation_id != operation_id || operation.kind != kind
         }) {
             return Err(RuntimeStateError::OperationMismatch);
         }
-        session.operation = None;
+        owner.operation = None;
 
         self.commit_session(session_id);
         Ok(())
@@ -1659,8 +1858,9 @@ impl RuntimeState {
         ) {
             return Err(RuntimeStateError::OperationMismatch);
         }
-        let session = self.require_session_mut(session_id, incarnation)?;
-        if session.operation.as_ref().is_none_or(|operation| {
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
+        if owner.operation.as_ref().is_none_or(|operation| {
             operation.operation_id != operation_id || operation.kind != kind
         }) {
             return Err(RuntimeStateError::OperationMismatch);
@@ -1668,7 +1868,7 @@ impl RuntimeState {
         session
             .control_state
             .insert(control_key.into(), control_update);
-        session.operation = None;
+        owner.operation = None;
 
         self.commit_session(session_id);
         Ok(())
@@ -1684,15 +1884,16 @@ impl RuntimeState {
         _error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_session_mut(session_id, incarnation)?;
-        let Some(operation) = session.operation.as_ref() else {
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let session = owner.live.as_mut().expect("live owner checked");
+        let Some(operation) = owner.operation.as_ref() else {
             return Err(RuntimeStateError::OperationMismatch);
         };
         if operation.operation_id != operation_id || operation.kind != kind {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let stage = operation.stage.clone();
-        session.operation = None;
+        owner.operation = None;
         session.lifecycle = match kind {
             SessionOperationKind::Close => SessionLifecycle::Active,
             SessionOperationKind::Delete if stage == "deleting" => SessionLifecycle::Closed,
@@ -1712,24 +1913,56 @@ impl RuntimeState {
         operation_id: &str,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
+        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let operation = owner
+            .operation
+            .as_mut()
+            .ok_or(RuntimeStateError::OperationMismatch)?;
+        if operation.operation_id != operation_id
+            || operation.kind != SessionOperationKind::Close
+            || operation.stage == "cleanup"
         {
-            let session = self.require_session(session_id, incarnation)?;
-            if session.operation.as_ref().is_none_or(|operation| {
-                operation.operation_id != operation_id
-                    || operation.kind != SessionOperationKind::Close
-            }) {
-                return Err(RuntimeStateError::OperationMismatch);
-            }
+            return Err(RuntimeStateError::OperationMismatch);
         }
-        let mut session = self
-            .sessions
-            .remove(session_id)
-            .ok_or(RuntimeStateError::UnknownSession)?;
-        let effects = drain_session_liveness(session_id, &mut session);
-
+        operation.stage = "cleanup".to_string();
+        if let Some(turn) = owner.active_turn.as_mut() {
+            turn.execution = None;
+        }
+        let live = owner.live.as_mut().expect("live owner checked");
+        live.lifecycle = SessionLifecycle::Closed;
+        let effects = drain_session_liveness(session_id, incarnation, live);
         self.effects.extend(effects);
+        self.commit_removal(session_id, incarnation);
+        Ok(())
+    }
 
-        self.commit_removal(session_id, session.incarnation);
+    /// Called only after external resource cleanup; the exact owner fences late callbacks.
+    pub(crate) fn finish_session_cleanup(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        kind: SessionAdmission,
+        operation_id: &str,
+    ) -> Result<(), MirrorError> {
+        let owner = self
+            .sessions
+            .get_mut(session_id)
+            .map(|entry| &mut entry.state)
+            .ok_or(MirrorError::UnknownSession)?;
+        if owner.incarnation != incarnation {
+            return Err(MirrorError::StaleIncarnation);
+        }
+        if owner.operation.as_ref().is_none_or(|operation| {
+            operation.operation_id != operation_id || operation.kind.admission() != kind
+        }) || owner
+            .live
+            .as_ref()
+            .is_some_and(|live| live.lifecycle != SessionLifecycle::Closed)
+        {
+            return Err(MirrorError::OperationMismatch);
+        }
+        owner.operation = None;
+        owner.live = None;
         Ok(())
     }
 
@@ -1741,51 +1974,139 @@ impl RuntimeState {
         }
     }
 
-    fn require_session_mut(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<&mut SessionRuntime, RuntimeStateError> {
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(RuntimeStateError::UnknownSession)?;
-        if session.incarnation != incarnation {
-            return Err(RuntimeStateError::StaleIncarnation);
-        }
-        Ok(session)
-    }
-
-    fn require_session(
+    fn require_live_owner(
         &self,
         session_id: &str,
         incarnation: u64,
-    ) -> Result<&SessionRuntime, RuntimeStateError> {
-        let session = self
+    ) -> Result<&SessionState, RuntimeStateError> {
+        let owner = self
             .sessions
             .get(session_id)
+            .map(|entry| &entry.state)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        if session.incarnation != incarnation {
+        if owner.incarnation != incarnation {
             return Err(RuntimeStateError::StaleIncarnation);
         }
-        Ok(session)
+        if owner.live.is_none()
+            || owner
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.stage == "cleanup")
+        {
+            return Err(RuntimeStateError::UnknownSession);
+        }
+        Ok(owner)
     }
 
-    fn operation_in_use(&self, operation_id: &str) -> bool {
-        self.sessions.values().any(|session| {
-            session
-                .active_turn
+    fn require_live_owner_mut(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+    ) -> Result<&mut SessionState, RuntimeStateError> {
+        let owner = self
+            .sessions
+            .get_mut(session_id)
+            .map(|entry| &mut entry.state)
+            .ok_or(RuntimeStateError::UnknownSession)?;
+        if owner.incarnation != incarnation {
+            return Err(RuntimeStateError::StaleIncarnation);
+        }
+        if owner.live.is_none()
+            || owner
+                .operation
                 .as_ref()
-                .is_some_and(|turn| turn.operation_id == operation_id)
-                || session
-                    .operation
-                    .as_ref()
-                    .is_some_and(|operation| operation.operation_id == operation_id)
-                || session.permissions.values().any(|interaction| {
-                    interaction.responding_operation_id.as_deref() == Some(operation_id)
+                .is_some_and(|operation| operation.stage == "cleanup")
+        {
+            return Err(RuntimeStateError::UnknownSession);
+        }
+        Ok(owner)
+    }
+
+    fn require_live_mut(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+    ) -> Result<&mut SessionLiveState, RuntimeStateError> {
+        Ok(self
+            .require_live_owner_mut(session_id, incarnation)?
+            .live
+            .as_mut()
+            .expect("live owner checked"))
+    }
+
+    fn require_live(
+        &self,
+        session_id: &str,
+        incarnation: u64,
+    ) -> Result<&SessionLiveState, RuntimeStateError> {
+        Ok(self
+            .require_live_owner(session_id, incarnation)?
+            .live
+            .as_ref()
+            .expect("live owner checked"))
+    }
+
+    fn install_live(&mut self, session_id: &str, incarnation: u64, live: SessionLiveState) {
+        if let Some(previous) = self
+            .sessions
+            .get(session_id)
+            .map(|entry| entry.state.incarnation)
+            && previous != incarnation
+        {
+            self.clear_history_for_replacement(session_id, previous);
+            self.retire_entry(session_id, previous, "session incarnation was replaced");
+        }
+        self.sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionEntry::new(SessionState::cold(session_id, incarnation)))
+            .state
+            .live = Some(live);
+    }
+
+    fn take_live_for_retirement(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+    ) -> Option<SessionLiveState> {
+        let entry = self.sessions.get_mut(session_id)?;
+        if entry.state.incarnation != incarnation {
+            return None;
+        }
+        // Resources may still own materialization waiters or cleanup handles.
+        // Only explicit final removal or incarnation replacement may retire them.
+        entry.state.live.take()
+    }
+
+    pub(crate) fn operation_in_use(&self, operation_id: &str) -> bool {
+        self.operation_in_use_except_reserved(operation_id, None)
+    }
+
+    fn operation_in_use_except_reserved(
+        &self,
+        operation_id: &str,
+        reservation: Option<(&str, u64, SessionOperationKind)>,
+    ) -> bool {
+        self.sessions.values().any(|entry| {
+            let owner = &entry.state;
+            owner
+                .turn_execution()
+                .is_some_and(|execution| execution.rpc_operation_id == operation_id)
+                || owner.operation.as_ref().is_some_and(|operation| {
+                    operation.operation_id == operation_id
+                        && !reservation.is_some_and(|(session_id, incarnation, kind)| {
+                            owner.session_id == session_id
+                                && owner.incarnation == incarnation
+                                && operation.kind == kind
+                                && operation.stage == "reserved"
+                        })
                 })
-                || session.elicitations.values().any(|interaction| {
-                    interaction.responding_operation_id.as_deref() == Some(operation_id)
+                || owner.live.as_ref().is_some_and(|live| {
+                    live.permissions
+                        .values()
+                        .chain(live.elicitations.values())
+                        .any(|interaction| {
+                            interaction.responding_operation_id.as_deref() == Some(operation_id)
+                        })
                 })
         }) || self
             .request_elicitations
@@ -1798,6 +2119,7 @@ impl RuntimeState {
             || self
                 .sessions
                 .values()
+                .filter_map(|entry| entry.state.live.as_ref())
                 .any(|session| session.url_flows.contains_key(elicitation_id))
     }
 
@@ -1807,50 +2129,23 @@ impl RuntimeState {
         incarnation: u64,
         operation_id: &str,
     ) {
-        // A journal suffix must remain sequence-contiguous. Removing only this session's entries
-        // would leave holes when sessions interleave, so invalidate the whole prefix through the
-        // last delta that could own this turn's payload.
-        let discard_through = self
-            .delta_journal
-            .iter()
-            .filter(|delta| match &delta.change {
-                RuntimeChange::SessionUpsert { session } => {
-                    session.session_id == session_id && session.incarnation == incarnation
-                }
-                RuntimeChange::TurnUpdateAppended {
-                    session_id: delta_session_id,
-                    incarnation: delta_incarnation,
-                    operation_id: delta_operation_id,
-                    ..
-                } => {
-                    (delta_session_id == session_id && *delta_incarnation == incarnation)
-                        || delta_operation_id == operation_id
-                }
-                RuntimeChange::TerminalUpdated { .. }
-                | RuntimeChange::ConnectionUpsert { .. }
-                | RuntimeChange::SessionRemoved { .. } => false,
-            })
-            .map(|delta| delta.seq)
-            .max();
-        if let Some(discard_through) = discard_through {
-            while self
-                .delta_journal
-                .front()
-                .is_some_and(|delta| delta.seq <= discard_through)
-            {
-                self.delta_journal.pop_front();
-            }
-        }
-        self.delta_bytes = self.delta_journal.iter().map(serialized_len).sum();
+        self.journal
+            .retire_turn_payload(session_id, incarnation, operation_id);
     }
 
     fn commit_session(&mut self, session_id: &str) {
-        let Some(session) = self.sessions.get_mut(session_id) else {
+        let Some(session) = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|entry| entry.state.live.as_mut())
+        else {
             return;
         };
         session.revision = session.revision.wrapping_add(1).max(1);
         let revision = session.revision;
-        let session = session.clone();
+        let session = self
+            .session(session_id)
+            .expect("published session remains live");
         self.commit_delta(
             Some(revision),
             RuntimeChange::SessionUpsert {
@@ -1877,7 +2172,11 @@ impl RuntimeState {
         operation_id: String,
         update: Value,
     ) {
-        let Some(session) = self.sessions.get_mut(session_id) else {
+        let Some(session) = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|entry| entry.state.live.as_mut())
+        else {
             return;
         };
         session.revision = session.revision.wrapping_add(1).max(1);
@@ -1905,23 +2204,248 @@ impl RuntimeState {
     }
 
     fn commit_delta(&mut self, scope_revision: Option<u64>, change: RuntimeChange) {
-        self.seq = self.seq.wrapping_add(1).max(1);
-        let delta = RuntimeDelta {
-            epoch: self.epoch.clone(),
-            seq: self.seq,
-            scope_revision,
-            change,
-        };
-        self.delta_bytes = self.delta_bytes.saturating_add(serialized_len(&delta));
-        self.delta_journal.push_back(delta);
-        while self.delta_journal.len() > self.limits.max_delta_events
-            || self.delta_bytes > self.limits.max_delta_bytes
-        {
-            let Some(removed) = self.delta_journal.pop_front() else {
-                break;
-            };
-            self.delta_bytes = self.delta_bytes.saturating_sub(serialized_len(&removed));
+        self.journal.commit(&self.epoch, scope_revision, change);
+    }
+}
+
+// Single-session reducers borrow the existing live state. They neither access the
+// registry or publication journal nor perform I/O, and can move with its owner.
+mod session_live {
+    use super::{
+        InteractionResolution, InteractionResponseStart, InteractionUpsert, PendingInteraction,
+        RuntimeStateError, SessionLifecycle, SessionLiveState, SessionOperationKind,
+        SessionOperationState, SessionState, TurnTerminal, remember_resolved_interaction,
+        remember_resolved_permission,
+    };
+
+    pub(super) struct TurnRetirement {
+        pub(super) permissions: Vec<String>,
+        pub(super) elicitations: Vec<String>,
+    }
+
+    pub(super) fn start_operation(
+        owner: &mut SessionState,
+        operation_id: String,
+        kind: SessionOperationKind,
+        stage: String,
+    ) -> Result<(), RuntimeStateError> {
+        if owner.operation.is_none() {
+            owner
+                .can_begin(kind.admission())
+                .map_err(|_| RuntimeStateError::BusySession)?;
         }
+        let session = owner
+            .live
+            .as_mut()
+            .ok_or(RuntimeStateError::UnknownSession)?;
+        let allowed_lifecycle = match kind {
+            SessionOperationKind::Delete => matches!(
+                session.lifecycle,
+                SessionLifecycle::Active | SessionLifecycle::Closed
+            ),
+            _ => session.lifecycle == SessionLifecycle::Active,
+        };
+        if !allowed_lifecycle {
+            return Err(RuntimeStateError::SessionNotActive);
+        }
+        if owner.operation.as_ref().is_some_and(|operation| {
+            operation.operation_id != operation_id
+                || operation.kind != kind
+                || operation.stage != "reserved"
+        }) || (owner
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.execution.is_some())
+            && !matches!(
+                kind,
+                SessionOperationKind::Close
+                    | SessionOperationKind::SetMode
+                    | SessionOperationKind::SetConfig
+            ))
+        {
+            return Err(RuntimeStateError::BusySession);
+        }
+        owner.operation = Some(SessionOperationState {
+            operation_id,
+            kind,
+            stage,
+            uncertainty_reason: None,
+        });
+        match kind {
+            SessionOperationKind::Close => session.lifecycle = SessionLifecycle::Closing,
+            SessionOperationKind::Delete if session.lifecycle == SessionLifecycle::Closed => {
+                session.lifecycle = SessionLifecycle::Deleting;
+            }
+            SessionOperationKind::Delete
+                if owner
+                    .operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.stage == "deleting_active") =>
+            {
+                session.lifecycle = SessionLifecycle::Deleting;
+            }
+            SessionOperationKind::Delete => {
+                session.lifecycle = SessionLifecycle::ClosingForDelete;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn seal_turn(
+        owner: &mut SessionState,
+        operation_id: &str,
+        terminal: TurnTerminal,
+    ) -> Result<TurnRetirement, RuntimeStateError> {
+        let session = owner
+            .live
+            .as_mut()
+            .ok_or(RuntimeStateError::UnknownSession)?;
+        let TurnTerminal { lifecycle } = terminal;
+        let overlay = owner
+            .active_turn
+            .as_mut()
+            .ok_or(RuntimeStateError::NoActiveTurn)?;
+        let execution = overlay
+            .execution
+            .as_ref()
+            .ok_or(RuntimeStateError::NoActiveTurn)?;
+        if execution.rpc_operation_id != operation_id {
+            return Err(RuntimeStateError::OperationMismatch);
+        }
+        overlay.execution = None;
+        if let Some(lifecycle) = lifecycle {
+            session.lifecycle = lifecycle;
+        }
+        let resolved_permissions = session
+            .permissions
+            .iter()
+            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
+            .map(|(interaction_id, _)| interaction_id.clone())
+            .collect::<Vec<_>>();
+        for interaction_id in &resolved_permissions {
+            session.permissions.remove(interaction_id);
+            remember_resolved_permission(session, interaction_id);
+        }
+        let resolved_elicitations = session
+            .elicitations
+            .iter()
+            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
+            .map(|(interaction_id, _)| interaction_id.clone())
+            .collect::<Vec<_>>();
+        for interaction_id in &resolved_elicitations {
+            session.elicitations.remove(interaction_id);
+            remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
+        }
+        Ok(TurnRetirement {
+            permissions: resolved_permissions,
+            elicitations: resolved_elicitations,
+        })
+    }
+
+    pub(super) fn upsert_permission(
+        session: &mut SessionLiveState,
+        interaction_id: String,
+        request: serde_json::Value,
+        active_operation: Option<String>,
+    ) -> Result<InteractionUpsert, RuntimeStateError> {
+        if session
+            .resolved_permissions
+            .iter()
+            .any(|resolved| resolved == &interaction_id)
+        {
+            return Ok(InteractionUpsert::AlreadyResolved);
+        }
+        if let Some(existing) = session.permissions.get(&interaction_id) {
+            return if existing.request == request && existing.operation_id == active_operation {
+                Ok(InteractionUpsert::Duplicate)
+            } else {
+                Err(RuntimeStateError::InteractionCollision)
+            };
+        }
+        session.permissions.insert(
+            interaction_id.clone(),
+            PendingInteraction {
+                interaction_id,
+                request,
+                operation_id: active_operation,
+                responding_operation_id: None,
+            },
+        );
+        Ok(InteractionUpsert::Inserted)
+    }
+
+    pub(super) fn resolve_permission(
+        session: &mut SessionLiveState,
+        interaction_id: &str,
+    ) -> Result<InteractionResolution, RuntimeStateError> {
+        if session
+            .resolved_permissions
+            .iter()
+            .any(|resolved| resolved == interaction_id)
+        {
+            return Ok(InteractionResolution::AlreadyResolved);
+        }
+        session
+            .permissions
+            .remove(interaction_id)
+            .ok_or(RuntimeStateError::UnknownInteraction)?;
+        remember_resolved_permission(session, interaction_id);
+        Ok(InteractionResolution::Applied)
+    }
+
+    pub(super) fn begin_permission_response(
+        session: &mut SessionLiveState,
+        interaction_id: &str,
+        operation_id: String,
+        operation_in_use: bool,
+    ) -> Result<InteractionResponseStart, RuntimeStateError> {
+        let pending = session
+            .permissions
+            .get(interaction_id)
+            .ok_or(RuntimeStateError::UnknownInteraction)?;
+        match pending.responding_operation_id.as_deref() {
+            Some(existing) if existing == operation_id => {
+                return Ok(InteractionResponseStart::Duplicate);
+            }
+            Some(_) => return Err(RuntimeStateError::InteractionCollision),
+            None => {}
+        }
+        if operation_in_use {
+            return Err(RuntimeStateError::OperationCollision);
+        }
+        let pending = session
+            .permissions
+            .get_mut(interaction_id)
+            .expect("permission was checked before mutation");
+        pending.responding_operation_id = Some(operation_id);
+        Ok(InteractionResponseStart::Applied)
+    }
+
+    pub(super) fn complete_permission_response(
+        session: &mut SessionLiveState,
+        interaction_id: &str,
+        operation_id: &str,
+    ) -> Result<InteractionResolution, RuntimeStateError> {
+        if session
+            .resolved_permissions
+            .iter()
+            .any(|resolved| resolved == interaction_id)
+        {
+            return Ok(InteractionResolution::AlreadyResolved);
+        }
+        let pending = session
+            .permissions
+            .get(interaction_id)
+            .ok_or(RuntimeStateError::UnknownInteraction)?;
+        if pending.responding_operation_id.as_deref() != Some(operation_id) {
+            return Err(RuntimeStateError::OperationMismatch);
+        }
+        session.permissions.remove(interaction_id);
+        remember_resolved_permission(session, interaction_id);
+
+        Ok(InteractionResolution::Applied)
     }
 }
 
@@ -2058,7 +2582,7 @@ fn terminal_released(terminal: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn remember_resolved_permission(session: &mut SessionRuntime, interaction_id: &str) {
+fn remember_resolved_permission(session: &mut SessionLiveState, interaction_id: &str) {
     remember_resolved_interaction(&mut session.resolved_permissions, interaction_id);
 }
 
@@ -2069,12 +2593,17 @@ fn remember_resolved_interaction(resolved: &mut VecDeque<String>, interaction_id
     }
 }
 
-fn drain_session_liveness(session_id: &str, session: &mut SessionRuntime) -> Vec<RuntimeEffect> {
+fn drain_session_liveness(
+    session_id: &str,
+    incarnation: u64,
+    session: &mut SessionLiveState,
+) -> Vec<RuntimeEffect> {
     let permissions = std::mem::take(&mut session.permissions);
     let mut effects = permissions
         .into_keys()
         .map(|interaction_id| RuntimeEffect::CancelPermissionResponder {
             session_id: session_id.to_string(),
+            incarnation: incarnation,
             interaction_id,
         })
         .collect::<Vec<_>>();
@@ -2082,6 +2611,7 @@ fn drain_session_liveness(session_id: &str, session: &mut SessionRuntime) -> Vec
     effects.extend(elicitations.into_keys().map(|interaction_id| {
         RuntimeEffect::CancelElicitationResponder {
             session_id: Some(session_id.to_string()),
+            incarnation: Some(incarnation),
             interaction_id,
         }
     }));
@@ -2089,9 +2619,11 @@ fn drain_session_liveness(session_id: &str, session: &mut SessionRuntime) -> Vec
         std::mem::take(&mut session.url_flows)
             .into_iter()
             .filter(|(_, flow)| flow.status == UrlFlowStatus::Waiting)
-            .map(|(elicitation_id, _)| RuntimeEffect::AbortUrlFlow {
+            .map(|(elicitation_id, flow)| RuntimeEffect::AbortUrlFlow {
                 session_id: Some(session_id.to_string()),
+                incarnation: Some(incarnation),
                 elicitation_id,
+                registration_id: flow.registration_id,
             }),
     );
     effects.extend(
@@ -2297,25 +2829,28 @@ fn replace_tool_fields(target: &mut Value, patch: &Value) -> Result<(), RuntimeS
 }
 
 #[cfg(test)]
-impl RuntimeState {
+impl SessionRegistry {
     pub(crate) fn seq(&self) -> u64 {
-        self.seq
+        self.journal.through_seq()
     }
 
     pub(crate) fn open_new(
         &mut self,
         expected_epoch: &str,
         session_id: impl Into<String>,
-        cwd: impl Into<String>,
+        cwd: impl Into<PathBuf>,
         session: Value,
     ) -> Result<u64, RuntimeStateError> {
-        self.open_session(
+        let session_id = session_id.into();
+        let incarnation = self.open_session(
             expected_epoch,
-            session_id.into(),
+            session_id.clone(),
             cwd.into(),
             session,
             BTreeMap::new(),
-        )
+        )?;
+        self.register_new(session_id, incarnation);
+        Ok(incarnation)
     }
 }
 
@@ -2366,6 +2901,464 @@ mod tests {
     }
 
     #[test]
+    fn close_cleanup_rejects_late_live_resources_without_publication_or_resurrection() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state
+            .start_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "close",
+                SessionOperationKind::Close,
+                "closing",
+            )
+            .unwrap();
+        state
+            .close_session("epoch", "session", incarnation, "close")
+            .unwrap();
+        let before = state.state("session").unwrap().clone();
+        let published = state.snapshot();
+        assert_eq!(
+            state.upsert_permission("epoch", "session", incarnation, "late", json!({})),
+            Err(RuntimeStateError::UnknownSession)
+        );
+        assert_eq!(
+            state.upsert_elicitation("epoch", Some(("session", incarnation)), "late", json!({})),
+            Err(RuntimeStateError::UnknownSession)
+        );
+        assert_eq!(
+            state.upsert_terminal(
+                "epoch",
+                "session",
+                incarnation,
+                "late",
+                json!({ "output": "late" })
+            ),
+            Err(RuntimeStateError::UnknownSession)
+        );
+        assert_eq!(state.state("session").unwrap(), &before);
+        assert_eq!(state.snapshot(), published);
+        assert!(state.take_effects().is_empty());
+    }
+
+    #[test]
+    fn direct_operation_entry_cannot_bypass_canonical_history_admission() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let revision = state
+            .state("session")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
+        let TurnAdmission::Accepted { operation_id } = state
+            .admit_session_turn("epoch", "session", incarnation, &revision, "prompt", vec![])
+            .unwrap()
+        else {
+            panic!("accepted");
+        };
+        state
+            .complete_prompt("epoch", "session", incarnation, "prompt", json!({}))
+            .unwrap();
+        state
+            .complete_turn(
+                "session",
+                incarnation,
+                &operation_id,
+                json!({ "stopReason": "end_turn" }),
+            )
+            .unwrap();
+        let before = state.snapshot();
+        assert_eq!(
+            state.start_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "control",
+                SessionOperationKind::SetMode,
+                "request"
+            ),
+            Err(RuntimeStateError::BusySession)
+        );
+        assert_eq!(
+            state.start_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "load",
+                SessionOperationKind::Load
+            ),
+            Err(RuntimeStateError::BusySession)
+        );
+        assert_eq!(state.snapshot(), before);
+        state
+            .block_turn("session", incarnation, &operation_id, "history unavailable")
+            .unwrap();
+        let before = state.snapshot();
+        assert_eq!(
+            state.start_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "fork",
+                SessionOperationKind::Fork,
+                "request"
+            ),
+            Err(RuntimeStateError::BusySession)
+        );
+        assert_eq!(state.snapshot(), before);
+    }
+
+    #[test]
+    fn history_terminal_requires_live_retirement_and_dto_mutation_cannot_change_owner() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state.register_new("session", incarnation);
+        let revision = state
+            .state("session")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
+        let TurnAdmission::Accepted { operation_id } = state
+            .admit_session_turn("epoch", "session", incarnation, &revision, "intent", vec![])
+            .unwrap()
+        else {
+            panic!("accepted");
+        };
+        state
+            .upsert_permission("epoch", "session", incarnation, "permission", json!({}))
+            .unwrap();
+        let before = state.state("session").unwrap().clone();
+        assert_eq!(
+            state.complete_turn(
+                "session",
+                incarnation,
+                &operation_id,
+                json!({ "stopReason": "end_turn" })
+            ),
+            Err(MirrorError::OperationMismatch)
+        );
+        assert_eq!(state.state("session").unwrap(), &before);
+        let mut disposable = state.session("session").unwrap();
+        disposable.active_turn.as_mut().unwrap().cancel_requested = true;
+        disposable.permissions.clear();
+        assert_eq!(state.state("session").unwrap(), &before);
+        state
+            .complete_prompt("epoch", "session", incarnation, "intent", json!({}))
+            .unwrap();
+        assert_eq!(
+            state.take_effects(),
+            vec![RuntimeEffect::CancelPermissionResponder {
+                session_id: "session".to_string(),
+                incarnation: incarnation,
+                interaction_id: "permission".to_string()
+            }]
+        );
+        state
+            .complete_turn(
+                "session",
+                incarnation,
+                &operation_id,
+                json!({ "stopReason": "end_turn" }),
+            )
+            .unwrap();
+        assert!(state.state("session").unwrap().turn_execution().is_none());
+        assert!(state.session("session").unwrap().active_turn.is_none());
+        assert_eq!(
+            state.state("session").unwrap().phase,
+            crate::session_state::MirrorPhase::Reconciling
+        );
+    }
+
+    #[test]
+    fn unified_turn_admission_is_atomic_and_duplicate_publication_is_neutral() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state.register_new("session", incarnation);
+        let revision = state
+            .state("session")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
+        state
+            .require_live_mut("session", incarnation)
+            .unwrap()
+            .lifecycle = SessionLifecycle::Closed;
+        let before = state.state("session").unwrap().clone();
+        let seq = state.seq();
+        let next_operation = state.next_operation;
+        assert_eq!(
+            state.admit_session_turn(
+                "epoch",
+                "session",
+                incarnation,
+                &revision,
+                "intent",
+                vec![json!("hello")]
+            ),
+            Err(SessionTurnError::Live(RuntimeStateError::SessionNotActive))
+        );
+        assert_eq!(state.state("session").unwrap(), &before);
+        assert_eq!(state.seq(), seq);
+        assert_eq!(state.next_operation, next_operation);
+        state
+            .require_live_mut("session", incarnation)
+            .unwrap()
+            .lifecycle = SessionLifecycle::Active;
+        let accepted = state
+            .admit_session_turn(
+                "epoch",
+                "session",
+                incarnation,
+                &revision,
+                "intent",
+                vec![json!("hello")],
+            )
+            .unwrap();
+        let TurnAdmission::Accepted { operation_id } = accepted else {
+            panic!("first intent is accepted");
+        };
+        assert_eq!(
+            state
+                .state("session")
+                .unwrap()
+                .turn_execution()
+                .unwrap()
+                .rpc_operation_id,
+            "intent"
+        );
+        let before = state.snapshot();
+        assert_eq!(
+            state.admit_session_turn(
+                "epoch",
+                "session",
+                incarnation,
+                &revision,
+                "intent",
+                vec![json!("hello")]
+            ),
+            Ok(TurnAdmission::Duplicate { operation_id })
+        );
+        assert_eq!(state.snapshot(), before);
+    }
+
+    #[test]
+    fn a_reserved_operation_exempts_only_itself_from_global_identity_checks() {
+        for kind in [SessionOperationKind::SetMode, SessionOperationKind::Load] {
+            let mut state = state();
+            let first = open(&mut state, "first");
+            let second = open(&mut state, "second");
+            state
+                .start_prompt("epoch", "first", first, "shared-id", vec![])
+                .unwrap();
+            state.register_new("second", second);
+            state
+                .sessions
+                .get_mut("second")
+                .unwrap()
+                .state
+                .begin_exclusive(kind, "shared-id")
+                .unwrap();
+            let before = state.snapshot();
+            let result = if kind == SessionOperationKind::Load {
+                state.start_reload("epoch", "second", second, "shared-id", kind)
+            } else {
+                state.start_operation("epoch", "second", second, "shared-id", kind, "request")
+            };
+            assert_eq!(result, Err(RuntimeStateError::OperationCollision));
+            assert_eq!(state.snapshot(), before);
+            assert_eq!(
+                state
+                    .state("second")
+                    .unwrap()
+                    .operation
+                    .as_ref()
+                    .unwrap()
+                    .stage,
+                "reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_operation_still_checks_request_response_identities() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state.register_new("session", incarnation);
+        state
+            .upsert_elicitation("epoch", None, "elicitation", json!({}))
+            .unwrap();
+        state
+            .begin_elicitation_response("epoch", None, "elicitation", "response-id")
+            .unwrap();
+        state
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .state
+            .begin_exclusive(SessionOperationKind::SetMode, "response-id")
+            .unwrap();
+        assert_eq!(
+            state.start_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "response-id",
+                SessionOperationKind::SetMode,
+                "request"
+            ),
+            Err(RuntimeStateError::OperationCollision)
+        );
+    }
+
+    #[test]
+    fn close_confirmation_keeps_the_unique_owner_until_exact_cleanup_finishes() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state.register_new("session", incarnation);
+        state
+            .begin_exclusive("session", incarnation, SessionOperationKind::Close, "close")
+            .unwrap();
+        state
+            .start_operation(
+                "epoch",
+                "session",
+                incarnation,
+                "close",
+                SessionOperationKind::Close,
+                "closing",
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .state("session")
+                .unwrap()
+                .operation
+                .as_ref()
+                .unwrap()
+                .stage,
+            "closing"
+        );
+        state
+            .close_session("epoch", "session", incarnation, "close")
+            .unwrap();
+        assert_eq!(
+            state.live("session").unwrap().lifecycle,
+            SessionLifecycle::Closed
+        );
+        assert_eq!(
+            state
+                .state("session")
+                .unwrap()
+                .operation
+                .as_ref()
+                .unwrap()
+                .stage,
+            "cleanup"
+        );
+        assert!(state.session("session").is_none());
+        assert!(!state.snapshot().sessions.contains_key("session"));
+        assert_eq!(
+            state.open_new("epoch", "session", "/new", json!({})),
+            Err(RuntimeStateError::BusySession)
+        );
+        assert_eq!(
+            state.start_attachment(
+                "epoch",
+                "session",
+                "/new",
+                "attach",
+                SessionOperationKind::Load
+            ),
+            Err(RuntimeStateError::BusySession)
+        );
+        assert_eq!(
+            state.finish_session_cleanup("session", incarnation, SessionAdmission::Close, "stale"),
+            Err(MirrorError::OperationMismatch)
+        );
+        assert_eq!(
+            state.finish_session_cleanup(
+                "session",
+                incarnation + 1,
+                SessionAdmission::Close,
+                "close"
+            ),
+            Err(MirrorError::StaleIncarnation)
+        );
+        state
+            .finish_session_cleanup("session", incarnation, SessionAdmission::Close, "close")
+            .unwrap();
+        state.remove("session", incarnation);
+        assert!(state.state("session").is_none());
+        assert!(open(&mut state, "session") > incarnation);
+    }
+
+    #[test]
+    fn operation_and_prompt_uncertainty_retire_in_either_order_without_losing_owner() {
+        for operation_first in [true, false] {
+            let mut state = state();
+            let incarnation = open(&mut state, "session");
+            state.register_new("session", incarnation);
+            let revision = state
+                .state("session")
+                .unwrap()
+                .history_revision
+                .clone()
+                .unwrap();
+            let TurnAdmission::Accepted { operation_id } = state
+                .admit_session_turn("epoch", "session", incarnation, &revision, "prompt", vec![])
+                .unwrap()
+            else {
+                panic!("accepted");
+            };
+            state
+                .begin_exclusive(
+                    "session",
+                    incarnation,
+                    SessionOperationKind::SetMode,
+                    "control",
+                )
+                .unwrap();
+            state
+                .start_operation(
+                    "epoch",
+                    "session",
+                    incarnation,
+                    "control",
+                    SessionOperationKind::SetMode,
+                    "request",
+                )
+                .unwrap();
+            if operation_first {
+                state
+                    .mark_operation_uncertain("epoch", "session", incarnation, "control", "EOF")
+                    .unwrap();
+                assert!(state.state("session").unwrap().turn_execution().is_some());
+            }
+            state
+                .mark_prompt_uncertain("epoch", "session", incarnation, "prompt", "EOF")
+                .unwrap();
+            state
+                .block_turn("session", incarnation, &operation_id, "EOF")
+                .unwrap();
+            if !operation_first {
+                state
+                    .mark_operation_uncertain("epoch", "session", incarnation, "control", "EOF")
+                    .unwrap();
+            }
+            let owner = state.state("session").unwrap();
+            assert_eq!(owner.phase, crate::session_state::MirrorPhase::Blocked);
+            assert!(owner.active_turn.as_ref().unwrap().terminal.is_none());
+            assert!(owner.turn_execution().is_none());
+            assert_eq!(owner.operation.as_ref().unwrap().stage, "uncertain");
+            assert!(state.session("session").unwrap().active_turn.is_none());
+        }
+    }
+
+    #[test]
     fn active_turn_folds_only_adjacent_compatible_text_chunks_but_publishes_raw_deltas() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
@@ -2407,15 +3400,14 @@ mod tests {
         ];
         for update in updates.clone() {
             state
-                .append_turn_update("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", incarnation, update)
                 .unwrap();
         }
 
-        let retained = &state
+        let retained = state
             .session("session")
             .unwrap()
             .active_turn
-            .as_ref()
             .unwrap()
             .updates;
         assert_eq!(retained.len(), 4);
@@ -2475,15 +3467,14 @@ mod tests {
         ];
         for update in updates.clone() {
             state
-                .append_turn_update("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", incarnation, update)
                 .unwrap();
         }
 
-        let retained = &state
+        let retained = state
             .session("session")
             .unwrap()
             .active_turn
-            .as_ref()
             .unwrap()
             .updates;
         assert_eq!(retained.len(), 2);
@@ -2536,14 +3527,13 @@ mod tests {
             }),
         ] {
             state
-                .append_turn_update("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", incarnation, update)
                 .unwrap();
         }
-        let retained = &state
+        let retained = state
             .session("session")
             .unwrap()
             .active_turn
-            .as_ref()
             .unwrap()
             .updates;
         assert_eq!(retained.len(), 3);
@@ -2564,15 +3554,14 @@ mod tests {
             }),
         ] {
             state
-                .append_turn_update("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", incarnation, update)
                 .unwrap();
         }
 
-        let retained = &state
+        let retained = state
             .session("session")
             .unwrap()
             .active_turn
-            .as_ref()
             .unwrap()
             .updates;
         assert_eq!(retained.len(), 3);
@@ -2598,7 +3587,7 @@ mod tests {
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2611,7 +3600,7 @@ mod tests {
             .unwrap();
         let before_invalid = state.snapshot();
         assert_eq!(
-            state.append_turn_update(
+            state.append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2628,7 +3617,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.append_turn_update(
+            state.append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2649,7 +3638,7 @@ mod tests {
 
         let before_large = state.snapshot();
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2678,7 +3667,7 @@ mod tests {
                 .start_prompt("epoch", "session", incarnation, &operation_id, Vec::new())
                 .unwrap();
             state
-                .append_turn_update(
+                .append_runtime_update_for_test(
                     "epoch",
                     "session",
                     incarnation,
@@ -2703,7 +3692,7 @@ mod tests {
         }
 
         assert!(
-            !serde_json::to_string(&state.delta_journal)
+            !serde_json::to_string(&state.journal.deltas)
                 .unwrap()
                 .contains("turn-payload-")
         );
@@ -2716,9 +3705,9 @@ mod tests {
         markers: &[&str],
     ) {
         let session = state.session(session_id).unwrap();
-        let session_payload = serde_json::to_string(session).unwrap();
+        let session_payload = serde_json::to_string(&session).unwrap();
         let active_turn = serde_json::to_string(&session.active_turn).unwrap();
-        let delta_journal = serde_json::to_string(&state.delta_journal).unwrap();
+        let delta_journal = serde_json::to_string(&state.journal.deltas).unwrap();
         let mut retained_by = Vec::new();
 
         assert!(!state.operation_in_use(operation_id));
@@ -2760,7 +3749,7 @@ mod tests {
             })],
         );
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2808,7 +3797,7 @@ mod tests {
             vec![json!({ "type": "text", "text": "error-prompt-marker" })],
         );
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2855,7 +3844,7 @@ mod tests {
             })],
         );
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2900,7 +3889,7 @@ mod tests {
             vec![json!("first-prompt-marker")],
         );
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2912,7 +3901,7 @@ mod tests {
             )
             .unwrap();
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2941,7 +3930,7 @@ mod tests {
             vec![json!("second prompt")],
         );
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2953,7 +3942,7 @@ mod tests {
             )
             .unwrap();
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -2969,7 +3958,7 @@ mod tests {
         let active = session.active_turn.as_ref().unwrap();
         assert_eq!(active.operation_id, second_operation_id);
         assert_eq!(active.updates.len(), 2);
-        let session_payload = serde_json::to_string(session).unwrap();
+        let session_payload = serde_json::to_string(&session).unwrap();
         assert!(!session_payload.contains("first-message-marker"));
         assert!(!session_payload.contains("first-tool-marker"));
     }
@@ -3059,7 +4048,7 @@ mod tests {
                 vec![json!({ "type": "text", "text": marker })],
             );
             state
-                .append_turn_update(
+                .append_runtime_update_for_test(
                     "epoch",
                     "session",
                     incarnation,
@@ -3084,7 +4073,7 @@ mod tests {
         assert!(session.active_turn.is_none());
 
         assert!(
-            !serde_json::to_string(&state.delta_journal)
+            !serde_json::to_string(&state.journal.deltas)
                 .unwrap()
                 .contains("sequential-turn-payload"),
             "delivery storage must not retain completed turn payloads"
@@ -3105,7 +4094,7 @@ mod tests {
             )
             .unwrap();
         state
-            .append_turn_update("epoch", "session", incarnation, json!("answer"))
+            .append_runtime_update_for_test("epoch", "session", incarnation, json!("answer"))
             .unwrap();
         state
             .complete_prompt(
@@ -3171,12 +4160,12 @@ mod tests {
         );
         assert_eq!(session.session["modes"]["currentModeId"], "plan");
         assert!(
-            !serde_json::to_string(session)
+            !serde_json::to_string(&session)
                 .unwrap()
                 .contains("conversation-must-not-be-stored")
         );
         assert!(
-            !serde_json::to_string(session)
+            !serde_json::to_string(&session)
                 .unwrap()
                 .contains("session-meta-must-not-be-retained")
         );
@@ -3193,17 +4182,89 @@ mod tests {
             .request_cancel("epoch", "session", incarnation)
             .unwrap();
         state
-            .append_turn_update("epoch", "session", incarnation, json!("after cancel"))
+            .append_runtime_update_for_test("epoch", "session", incarnation, json!("after cancel"))
             .unwrap();
 
-        let active = state
+        let active = state.session("session").unwrap().active_turn.unwrap();
+        assert!(active.cancel_requested);
+        assert_eq!(*active.updates, vec![json!("after cancel")]);
+    }
+
+    #[test]
+    fn runtime_delivery_shares_the_authoritative_turn_payload() {
+        use crate::session_mirror::TurnAdmission;
+
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        state.register_new("session", incarnation);
+        let revision = state
+            .state("session")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
+        let TurnAdmission::Accepted { operation_id } = state
+            .admit_session_turn(
+                "epoch",
+                "session",
+                incarnation,
+                &revision,
+                "intent",
+                vec![json!({ "type": "text", "text": "hello" })],
+            )
+            .unwrap()
+        else {
+            panic!("new turn must be accepted");
+        };
+        let overlay = state
+            .state("session")
+            .unwrap()
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .clone();
+        let published = state.snapshot();
+        let projected = published.sessions["session"].active_turn.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&projected.prompt, &overlay.prompt));
+        assert!(Arc::ptr_eq(&projected.updates, &overlay.updates));
+
+        let update = json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "answer" } });
+        state
+            .append_turn_update("session", incarnation, &operation_id, update.clone())
+            .unwrap();
+        let overlay = state
+            .state("session")
+            .unwrap()
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .clone();
+        state
+            .project_turn_update("epoch", "session", incarnation, &overlay, update.clone())
+            .unwrap();
+        let current = state
             .session("session")
             .unwrap()
             .active_turn
             .as_ref()
-            .unwrap();
-        assert!(active.cancel_requested);
-        assert_eq!(active.updates, vec![json!("after cancel")]);
+            .unwrap()
+            .clone();
+        assert!(Arc::ptr_eq(&current.prompt, &overlay.prompt));
+        assert!(Arc::ptr_eq(&current.updates, &overlay.updates));
+        assert_eq!(current.updates.as_slice(), &[update]);
+        assert!(
+            projected.updates.is_empty(),
+            "an already published view is immutable"
+        );
+
+        let mut stale = overlay.clone();
+        stale.client_intent_id = "another-intent".to_string();
+        let before = state.snapshot();
+        assert_eq!(
+            state.project_turn_update("epoch", "session", incarnation, &stale, json!({})),
+            Err(RuntimeStateError::OperationMismatch)
+        );
+        assert_eq!(state.snapshot(), before);
     }
 
     #[test]
@@ -3254,7 +4315,7 @@ mod tests {
                     assert_eq!(session.revision + 1, revision);
                     let turn = session.active_turn.as_mut().unwrap();
                     assert_eq!(turn.operation_id, operation_id);
-                    turn.updates.push(update);
+                    Arc::make_mut(&mut turn.updates).push(update);
                     session.revision = revision;
                 }
                 RuntimeChange::TerminalUpdated { .. } => {
@@ -3340,7 +4401,7 @@ mod tests {
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
         state
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -3382,7 +4443,7 @@ mod tests {
         let before = state.seq();
         for index in 0..100 {
             state
-                .append_turn_update(
+                .append_runtime_update_for_test(
                     "epoch",
                     "session",
                     incarnation,
@@ -3565,7 +4626,7 @@ mod tests {
             )
             .unwrap();
         state
-            .append_turn_update("epoch", "session", incarnation, json!("partial"))
+            .append_runtime_update_for_test("epoch", "session", incarnation, json!("partial"))
             .unwrap();
         state
             .fail_prompt(
@@ -3581,7 +4642,7 @@ mod tests {
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
         assert_eq!(
-            state.append_turn_update("epoch", "session", incarnation, json!("late")),
+            state.append_runtime_update_for_test("epoch", "session", incarnation, json!("late")),
             Err(RuntimeStateError::NoActiveTurn),
         );
     }
@@ -3802,6 +4863,9 @@ mod tests {
         state
             .close_session("epoch", "session", first, "close")
             .unwrap();
+        state
+            .finish_session_cleanup("session", first, SessionAdmission::Close, "close")
+            .unwrap();
         let second = open(&mut state, "session");
 
         assert_ne!(first, second);
@@ -3813,6 +4877,78 @@ mod tests {
     }
 
     #[test]
+    fn canonical_control_accessors_apply_updates_and_preserve_available_choices() {
+        let mut state = state();
+        let modes = json!({ "currentModeId": "build", "availableModes": [
+            { "id": "build", "name": "Build" }, { "id": "plan", "name": "Plan" }
+        ] });
+        let options = json!([{ "id": "verbose", "name": "Verbose", "type": "boolean", "currentValue": false }]);
+        let incarnation = state
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "modes": modes, "configOptions": options }),
+            )
+            .unwrap();
+        assert_eq!(state.live("session").unwrap().config_options(), &options);
+        state
+            .update_control_state(
+                "epoch",
+                "session",
+                incarnation,
+                "current_mode_update",
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
+            )
+            .unwrap();
+        state
+            .update_control_state(
+                "epoch",
+                "session",
+                incarnation,
+                "config_option_update",
+                json!({ "sessionUpdate": "config_option_update", "configOptions": [] }),
+            )
+            .unwrap();
+        let live = state.live("session").unwrap();
+        assert_eq!(live.modes(), Some(&modes));
+        assert_eq!(live.current_mode_id(), Some("plan"));
+        assert_eq!(live.config_options(), &json!([]));
+        crate::semantic::validate_session_mode_reference(live.modes(), "build").unwrap();
+        crate::semantic::validate_session_mode_reference(live.modes(), "plan").unwrap();
+        assert!(
+            crate::semantic::validate_session_config_reference(
+                live.config_options(),
+                "verbose",
+                &json!(true)
+            )
+            .is_err()
+        );
+        // An authoritative response replaces both the baseline and its overlay.
+        state
+            .start_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "reload",
+                SessionOperationKind::Load,
+            )
+            .unwrap();
+        state
+            .complete_reload(
+                "epoch",
+                "session",
+                incarnation,
+                "reload",
+                json!({ "modes": modes, "configOptions": options }),
+            )
+            .unwrap();
+        let live = state.live("session").unwrap();
+        assert_eq!(live.current_mode_id(), Some("build"));
+        assert_eq!(live.config_options(), &options);
+    }
+
+    #[test]
     fn fork_keeps_only_target_control_metadata() {
         let mut state = state();
         let source = open(&mut state, "source");
@@ -3820,7 +4956,7 @@ mod tests {
             .start_prompt("epoch", "source", source, "prompt", vec![json!("Q")])
             .unwrap();
         state
-            .append_turn_update("epoch", "source", source, json!("A"))
+            .append_runtime_update_for_test("epoch", "source", source, json!("A"))
             .unwrap();
         state
             .complete_prompt(
@@ -3864,7 +5000,7 @@ mod tests {
         assert!(derived.permissions.is_empty());
         assert!(derived.terminals.is_empty());
         assert!(derived.active_turn.is_none());
-        let derived_payload = serde_json::to_string(derived).unwrap();
+        let derived_payload = serde_json::to_string(&derived).unwrap();
         assert!(!derived_payload.contains("Q"));
         assert!(!derived_payload.contains("A"));
 
@@ -3893,7 +5029,7 @@ mod tests {
             "plan"
         );
         assert!(
-            !serde_json::to_string(replayed)
+            !serde_json::to_string(&replayed)
                 .unwrap()
                 .contains("target-conversation")
         );
@@ -4018,10 +5154,12 @@ mod tests {
             vec![
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: "session".to_string(),
+                    incarnation: incarnation,
                     interaction_id: "permission".to_string(),
                 },
                 RuntimeEffect::CancelElicitationResponder {
                     session_id: Some("session".to_string()),
+                    incarnation: Some(incarnation),
                     interaction_id: "elicitation".to_string(),
                 },
             ]
@@ -4154,7 +5292,7 @@ mod tests {
             .close_session("epoch", "session", incarnation, "close")
             .unwrap();
 
-        assert!(!state.operation_in_use("close"));
+        assert!(state.operation_in_use("close"));
         let close_delta = &state.deltas_after(before_close).unwrap()[0];
         assert!(matches!(
             close_delta.change,
@@ -4168,6 +5306,10 @@ mod tests {
             }]
         );
         assert!(state.take_effects().is_empty());
+        state
+            .finish_session_cleanup("session", incarnation, SessionAdmission::Close, "close")
+            .unwrap();
+        assert!(!state.operation_in_use("close"));
     }
 
     #[test]
@@ -4252,6 +5394,7 @@ mod tests {
             vec![
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: "session".to_string(),
+                    incarnation: incarnation,
                     interaction_id: "permission".to_string(),
                 },
                 RuntimeEffect::ReleaseTerminal {
@@ -4280,6 +5423,9 @@ mod tests {
 
         assert_eq!(state.seq(), before + 1);
         assert!(state.session("session").is_none());
+        state
+            .finish_session_cleanup("session", first, SessionAdmission::Delete, "delete")
+            .unwrap();
         let second = open(&mut state, "session");
         assert_ne!(first, second);
         assert_eq!(
@@ -4411,7 +5557,7 @@ mod tests {
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
         state
-            .append_turn_update("epoch", "session", incarnation, json!("answer"))
+            .append_runtime_update_for_test("epoch", "session", incarnation, json!("answer"))
             .unwrap();
         state
             .start_prompt(
@@ -4423,7 +5569,12 @@ mod tests {
             )
             .unwrap();
         state
-            .append_turn_update("epoch", "other", other_incarnation, json!("other answer"))
+            .append_runtime_update_for_test(
+                "epoch",
+                "other",
+                other_incarnation,
+                json!("other answer"),
+            )
             .unwrap();
         state
             .complete_prompt(
@@ -4624,9 +5775,9 @@ mod tests {
         assert_eq!(state.seq(), started_seq);
         let attaching = state.session("session").unwrap();
         assert_eq!(attaching.lifecycle, SessionLifecycle::Attaching);
-        assert_eq!(attaching.attachment_candidate.len(), 1);
+        assert_eq!(state.live("session").unwrap().attachment_candidate.len(), 1);
         assert!(
-            !serde_json::to_string(&attaching.attachment_candidate)
+            !serde_json::to_string(&state.live("session").unwrap().attachment_candidate)
                 .unwrap()
                 .contains("partial")
         );
@@ -4657,7 +5808,7 @@ mod tests {
             loaded.control_state["current_mode_update"]["currentModeId"],
             "plan"
         );
-        assert!(!serde_json::to_string(loaded).unwrap().contains("partial"));
+        assert!(!serde_json::to_string(&loaded).unwrap().contains("partial"));
     }
 
     #[test]
@@ -4704,7 +5855,7 @@ mod tests {
                 session.control_state["current_mode_update"]["currentModeId"],
                 "plan"
             );
-            assert!(!serde_json::to_string(session).unwrap().contains("history"));
+            assert!(!serde_json::to_string(&session).unwrap().contains("history"));
         }
     }
 
@@ -4773,7 +5924,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !serde_json::to_string(state.session("resumed").unwrap())
+            !serde_json::to_string(&state.session("resumed").unwrap())
                 .unwrap()
                 .contains("compatibility update")
         );
@@ -4843,11 +5994,14 @@ mod tests {
             vec![
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: "session".to_string(),
+                    incarnation: incarnation,
                     interaction_id: "permission".to_string(),
                 },
                 RuntimeEffect::AbortUrlFlow {
                     session_id: Some("session".to_string()),
+                    incarnation: Some(incarnation),
                     elicitation_id: "url".to_string(),
+                    registration_id: "elicitation".to_string(),
                 },
                 RuntimeEffect::ReleaseTerminal {
                     session_id: "session".to_string(),
@@ -5128,7 +6282,7 @@ mod tests {
             staging.control_state["current_mode_update"]["currentModeId"],
             "old"
         );
-        assert_eq!(staging.attachment_candidate.len(), 1);
+        assert_eq!(state.live("session").unwrap().attachment_candidate.len(), 1);
         let before_complete = state.seq();
 
         state
@@ -5152,7 +6306,7 @@ mod tests {
         assert_eq!(reloaded.incarnation, incarnation);
         assert_eq!(reloaded.session["modes"]["currentModeId"], "new");
         assert!(
-            !serde_json::to_string(reloaded)
+            !serde_json::to_string(&reloaded)
                 .unwrap()
                 .contains("must-not-survive-reload")
         );
@@ -5162,8 +6316,14 @@ mod tests {
         );
         assert!(!reloaded.control_state.contains_key("config_option_update"));
         assert!(reloaded.operation.is_none());
-        assert!(reloaded.attachment_candidate.is_empty());
-        assert_eq!(reloaded.attachment_candidate_bytes, 0);
+        assert!(
+            state
+                .live("session")
+                .unwrap()
+                .attachment_candidate
+                .is_empty()
+        );
+        assert_eq!(state.live("session").unwrap().attachment_candidate_bytes, 0);
         assert!(!state.operation_in_use(&operation_id));
         assert_eq!(state.seq(), before_complete + 1);
         assert!(
@@ -5262,11 +6422,17 @@ mod tests {
         assert_eq!(session.session, old_session);
         assert_eq!(session.control_state, old_controls);
         assert!(session.operation.is_none());
-        assert!(session.attachment_candidate.is_empty());
-        assert_eq!(session.attachment_candidate_bytes, 0);
+        assert!(
+            state
+                .live("session")
+                .unwrap()
+                .attachment_candidate
+                .is_empty()
+        );
+        assert_eq!(state.live("session").unwrap().attachment_candidate_bytes, 0);
         assert!(!state.operation_in_use("reload"));
         assert!(
-            !serde_json::to_string(&state.delta_journal)
+            !serde_json::to_string(&state.journal.deltas)
                 .unwrap()
                 .contains("load rejected")
         );
@@ -5436,6 +6602,75 @@ mod tests {
     }
 
     #[test]
+    fn url_registration_fences_reuse_without_exposing_internal_identity() {
+        for request_scoped in [false, true] {
+            let mut state = state();
+            let incarnation = open(&mut state, "session");
+            let scope = (!request_scoped).then_some(("session", incarnation));
+            for interaction in ["old-registration", "new-registration"] {
+                state
+                    .upsert_elicitation("epoch", scope, interaction, json!({ "mode": "url" }))
+                    .unwrap();
+                state
+                    .resolve_elicitation("epoch", scope, interaction, Some("reusable-url"))
+                    .unwrap();
+                if interaction == "old-registration" {
+                    assert_eq!(
+                        state
+                            .settle_url_registration(
+                                "epoch",
+                                scope,
+                                "reusable-url",
+                                interaction,
+                                UrlFlowStatus::Completed
+                            )
+                            .unwrap(),
+                        UrlFlowResolution::Applied
+                    );
+                }
+            }
+            let seq = state.seq();
+            assert_eq!(
+                state
+                    .settle_url_registration(
+                        "epoch",
+                        scope,
+                        "reusable-url",
+                        "old-registration",
+                        UrlFlowStatus::Cancelled
+                    )
+                    .unwrap(),
+                UrlFlowResolution::StaleRegistration
+            );
+            assert_eq!(state.seq(), seq);
+            let flow = if request_scoped {
+                state.request_url_flows["reusable-url"].clone()
+            } else {
+                state.session("session").unwrap().url_flows["reusable-url"].clone()
+            };
+            assert_eq!(flow.registration_id, "new-registration");
+            assert_eq!(
+                serde_json::to_value(flow).unwrap(),
+                json!({
+                    "elicitationId": "reusable-url", "request": { "mode": "url" }, "status": "waiting"
+                })
+            );
+            assert_eq!(
+                state
+                    .settle_url_registration(
+                        "epoch",
+                        scope,
+                        "reusable-url",
+                        "new-registration",
+                        UrlFlowStatus::Cancelled
+                    )
+                    .unwrap(),
+                UrlFlowResolution::Applied
+            );
+        }
+    }
+
+    #[test]
     fn settled_url_flows_are_removed_from_live_state_but_remain_idempotent() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
@@ -5579,9 +6814,8 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            let output = state.session("session").unwrap().terminals["terminal"]["output"]
-                .as_str()
-                .unwrap();
+            let live = state.live("session").unwrap();
+            let output = live.terminals["terminal"]["output"].as_str().unwrap();
             assert!(
                 !output.contains('\u{fffd}'),
                 "incomplete UTF-8 must wait for its next byte"

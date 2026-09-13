@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,11 +34,15 @@ use crate::event_queue::{self, EventQueueLimits, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
 use crate::runtime_cache::ActiveRuntimeProjection;
 use crate::runtime_state::{RuntimeChange, RuntimeDelta, RuntimeSnapshot, fold_active_turn_update};
+use crate::session_observation::ObservationLease;
+use crate::session_resources::SessionResourceOwner;
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const HTTP_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(6);
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
 const SUBSCRIBER_QUEUE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
+const MAX_AUTH_REPLAY_EVENTS: usize = 1_024;
+const MAX_AUTH_REPLAY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUBSCRIBERS: usize = 64;
 const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
 const BRIDGE_EVENT_QUEUE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
@@ -131,12 +135,39 @@ struct StartTurnBody {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ListSessionsQuery {
     cursor: Option<String>,
+    expected_catalog_revision: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionViewQuery {
     cwd: Option<String>,
+    expected_epoch: Option<String>,
+    expected_incarnation: Option<u64>,
+}
+
+impl SessionViewQuery {
+    fn expected_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionResourceOwner>, &'static str> {
+        match (&self.expected_epoch, self.expected_incarnation) {
+            (None, None) => Ok(None),
+            (Some(epoch), Some(incarnation))
+                if !epoch.is_empty()
+                    && epoch.len() <= 1024
+                    && !epoch.contains('\0')
+                    && incarnation != 0 =>
+            {
+                Ok(Some(SessionResourceOwner::new(
+                    epoch.clone(),
+                    session_id,
+                    incarnation,
+                )))
+            }
+            _ => Err("expectedEpoch and expectedIncarnation must identify one session owner"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -206,6 +237,8 @@ struct BridgeBootstrap {
     error: Option<String>,
     phase: Option<String>,
     terminal_error: bool,
+    auth_events: VecDeque<String>,
+    auth_event_bytes: usize,
 }
 
 impl BridgeBootstrap {
@@ -229,6 +262,24 @@ impl BridgeBootstrap {
                     self.error = None;
                 }
             }
+            Some(
+                "acp/authenticated"
+                | "acp/logged_out"
+                | "bridge/auth_terminal_started"
+                | "bridge/auth_terminal_output"
+                | "bridge/auth_terminal_exited",
+            ) => {
+                self.auth_event_bytes = self.auth_event_bytes.saturating_add(event.len());
+                self.auth_events.push_back(event.to_string());
+                while self.auth_events.len() > MAX_AUTH_REPLAY_EVENTS
+                    || self.auth_event_bytes > MAX_AUTH_REPLAY_BYTES
+                {
+                    let Some(removed) = self.auth_events.pop_front() else {
+                        break;
+                    };
+                    self.auth_event_bytes = self.auth_event_bytes.saturating_sub(removed.len());
+                }
+            }
             _ => {}
         }
     }
@@ -242,6 +293,13 @@ impl BridgeBootstrap {
             .iter()
             .chain(self.error.iter().filter(|_| self.terminal_error))
             .chain(self.phase.iter())
+    }
+
+    fn global_events(&self) -> impl Iterator<Item = String> {
+        self.auth_events.iter().cloned().chain(
+            self.events_after_runtime()
+                .filter_map(|event| global_business_event(event)),
+        )
     }
 
     #[cfg(test)]
@@ -436,7 +494,7 @@ impl CanonicalProjection {
                 let Ok(folded) = fold_active_turn_update(&turn.updates, &update) else {
                     return false;
                 };
-                turn.updates = folded;
+                turn.updates = folded.into();
                 session.revision = revision;
             }
             RuntimeChange::TerminalUpdated {
@@ -508,13 +566,13 @@ struct BridgeHubState {
     input: Option<mpsc::Sender<bridge::BridgeInput>>,
     cancellation: Option<CancellationToken>,
     subscribers: HashMap<u64, SubscriberSender>,
-    session_subscribers: HashMap<u64, (String, SubscriberSender)>,
+    global_subscribers: HashMap<u64, SubscriberSender>,
+    session_subscribers: HashMap<u64, SessionSubscriber>,
     bootstrap: BridgeBootstrap,
     runtime: ActiveRuntimeProjection,
     canonical: CanonicalProjection,
     canonical_resync_pending: bool,
     shutting_down: bool,
-    unobserved: HashMap<String, (u64, crate::auto_close::AutoClosePermit)>,
 }
 
 struct BridgeHub {
@@ -522,6 +580,12 @@ struct BridgeHub {
     state: Mutex<BridgeHubState>,
     next_subscriber_id: AtomicU64,
     stopped: Notify,
+}
+
+impl BridgeHubState {
+    fn subscriber_count(&self) -> usize {
+        self.subscribers.len() + self.global_subscribers.len() + self.session_subscribers.len()
+    }
 }
 
 struct BridgeSubscription {
@@ -535,16 +599,56 @@ struct SubscriptionGuard {
     bridge: Arc<BridgeHub>,
     id: u64,
     generation: u64,
+    lease: Option<ObservationLease>,
 }
 
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
+        if let Some(lease) = &self.lease {
+            lease.cancel();
+        }
         let bridge = self.bridge.clone();
         let id = self.id;
         let generation = self.generation;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 bridge.unsubscribe(id, generation).await;
+            });
+        }
+    }
+}
+
+struct SessionSubscriber {
+    id: u64,
+    session_id: String,
+    sender: SubscriberSender,
+    lease: Option<ObservationLease>,
+    input: Option<mpsc::Sender<bridge::BridgeInput>>,
+    ready: Option<oneshot::Sender<()>>,
+    owner: Option<(String, u64)>,
+}
+
+impl Drop for SessionSubscriber {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        lease.cancel();
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let command = bridge::BridgeInput::UnobserveSession {
+            session_id: self.session_id.clone(),
+            observer_id: self.id,
+            lease,
+        };
+        if let Err(mpsc::error::TrySendError::Full(command)) = input.try_send(command)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            // Keep the original generation's sender. A full command queue must
+            // delay cleanup, never silently discard it or target a new runtime.
+            runtime.spawn(async move {
+                let _ = input.send(command).await;
             });
         }
     }
@@ -628,9 +732,32 @@ fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
     let Some((event_session_id, event)) = business_session_event(&event) else {
         return;
     };
+    let event_owner = session_event_owner(&event);
     let mut failed = Vec::new();
-    for (&subscriber_id, (session_id, subscriber)) in &state.session_subscribers {
-        if session_id == &event_session_id && subscriber.try_send(event.clone()).is_err() {
+    for (&subscriber_id, subscriber) in &state.session_subscribers {
+        if subscriber.session_id != event_session_id {
+            continue;
+        }
+        if subscriber
+            .lease
+            .as_ref()
+            .is_some_and(ObservationLease::is_cancelled)
+        {
+            failed.push(subscriber_id);
+            continue;
+        }
+        if subscriber.lease.is_some() && subscriber.owner.is_none() {
+            // The owner's ready marker establishes the delivery cut. Events
+            // before that marker are represented by its reset, not queued here.
+            continue;
+        }
+        if let Some(owner) = &subscriber.owner
+            && event_owner.as_ref() != Some(owner)
+        {
+            failed.push(subscriber_id);
+            continue;
+        }
+        if subscriber.sender.try_send(event.clone()).is_err() {
             failed.push(subscriber_id);
         }
     }
@@ -639,10 +766,23 @@ fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
     }
 }
 
+fn publish_to_global_subscribers(state: &mut BridgeHubState, event: &str) {
+    if state.global_subscribers.is_empty() {
+        return;
+    }
+    let Some(event) = global_business_event(event) else {
+        return;
+    };
+    let event: Arc<str> = event.into();
+    state
+        .global_subscribers
+        .retain(|_, subscriber| subscriber.try_send(event.clone()).is_ok());
+}
+
 fn business_session_event(event: &str) -> Option<(String, Arc<str>)> {
     let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
     match value.get("type").and_then(serde_json::Value::as_str)? {
-        "bridge/session_delta" => {
+        "bridge/session_delta" | "bridge/session_retired" => {
             let session_id = value.get("sessionId")?.as_str()?.to_string();
             Some((session_id, Arc::from(event)))
         }
@@ -690,98 +830,12 @@ impl BridgeHub {
         })
     }
 
-    fn update_auto_close(&self, state: &mut BridgeHubState) {
-        use crate::runtime_state::SessionLifecycle;
-        let enabled = self.options.session_unobserved_timeout >= 0
-            && !state.shutting_down
-            && state.input.is_some();
-        let sessions = state
-            .canonical
-            .snapshot
-            .as_ref()
-            .map(|snapshot| &snapshot.sessions);
-        state.unobserved.retain(|id, (incarnation, permit)| {
-            let retain = enabled
-                && !state
-                    .session_subscribers
-                    .values()
-                    .any(|(observed, _)| observed == id)
-                && sessions.is_none_or(|sessions| {
-                    sessions.get(id).is_some_and(|session| {
-                        session.incarnation == *incarnation
-                            && !matches!(
-                                session.lifecycle,
-                                SessionLifecycle::Closed | SessionLifecycle::Deleting
-                            )
-                    })
-                });
-            if !retain {
-                permit.cancel();
-            }
-            retain
-        });
-        if !enabled {
-            return;
-        }
-        let Some(sessions) = sessions else {
-            return;
-        };
-        for (id, session) in sessions {
-            if session.lifecycle != SessionLifecycle::Active
-                || state.unobserved.contains_key(id)
-                || state
-                    .session_subscribers
-                    .values()
-                    .any(|(observed, _)| observed == id)
-            {
-                continue;
-            }
-            let permit = crate::auto_close::AutoClosePermit::default();
-            state
-                .unobserved
-                .insert(id.clone(), (session.incarnation, permit.clone()));
-            let input = state.input.as_ref().unwrap().clone();
-            let id = id.clone();
-            let incarnation = session.incarnation;
-            let mut remaining = self.options.session_unobserved_timeout as u64;
-            tokio::spawn(async move {
-                // Chunk very large positive values so Instant arithmetic cannot overflow.
-                while remaining > 0 {
-                    let seconds = remaining.min(86_400);
-                    tokio::select! {
-                        _ = permit.cancelled.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
-                    }
-                    remaining -= seconds;
-                }
-                while permit.pending() {
-                    tokio::select! {
-                        _ = permit.cancelled.cancelled() => return,
-                        result = input.send(bridge::BridgeInput::RetireUnobservedSession {
-                            session_id: id.clone(), incarnation, permit: permit.clone(),
-                        }) => { if result.is_err() { return; } }
-                    }
-                    // Loading/control transactions may still own the session. Retry
-                    // admission without resetting the completed absence interval.
-                    tokio::select! {
-                        _ = permit.cancelled.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                    }
-                }
-            });
-        }
-    }
-
     async fn ensure_runtime(self: &Arc<Self>) {
         let runtime = {
             let mut state = self.state.lock().await;
             if state.shutting_down || state.input.is_some() {
                 None
             } else {
-                for (_, permit) in state.unobserved.values() {
-                    permit.cancel();
-                }
-                state.unobserved.clear();
                 state.generation = state.generation.wrapping_add(1).max(1);
                 state.bootstrap = BridgeBootstrap::default();
                 state.runtime = ActiveRuntimeProjection::default();
@@ -812,6 +866,9 @@ impl BridgeHub {
         }
     }
 
+    // Retain the aggregate stream for compatibility checks while business SSE
+    // uses subscriptions that only receive their own scope.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn subscribe(self: &Arc<Self>) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
@@ -821,7 +878,7 @@ impl BridgeHub {
             if state.shutting_down || state.input.is_none() {
                 return None;
             }
-            if state.subscribers.len() + state.session_subscribers.len() >= MAX_SUBSCRIBERS {
+            if state.subscriber_count() >= MAX_SUBSCRIBERS {
                 return None;
             }
             let mut initial_events = Vec::new();
@@ -850,6 +907,167 @@ impl BridgeHub {
         })
     }
 
+    async fn subscribe_global(self: &Arc<Self>) -> Option<BridgeSubscription> {
+        self.ensure_runtime().await;
+        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
+        let (event_tx, event_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (generation, initial_events) = {
+            let mut state = self.state.lock().await;
+            if state.shutting_down
+                || state.input.is_none()
+                || state.subscriber_count() >= MAX_SUBSCRIBERS
+            {
+                return None;
+            }
+            // Global recovery never captures session state or constructs its replay.
+            // Registration and the bounded authentication/connection bootstrap share
+            // this lock, so later global events form a continuous suffix.
+            let initial_events = state.bootstrap.global_events().collect();
+            state.global_subscribers.insert(id, event_tx);
+            (state.generation, initial_events)
+        };
+        Some(BridgeSubscription {
+            id,
+            generation,
+            initial_events,
+            events: event_rx,
+        })
+    }
+
+    #[cfg(test)]
+    async fn observe_session(
+        self: &Arc<Self>,
+        session_id: String,
+        cwd: Option<String>,
+    ) -> Result<(BridgeSubscription, SubscriptionGuard), bridge::SessionViewError> {
+        self.observe_session_for_owner(session_id, cwd, None).await
+    }
+
+    async fn observe_session_for_owner(
+        self: &Arc<Self>,
+        session_id: String,
+        cwd: Option<String>,
+        expected_owner: Option<SessionResourceOwner>,
+    ) -> Result<(BridgeSubscription, SubscriptionGuard), bridge::SessionViewError> {
+        self.ensure_runtime().await;
+        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
+        let lease = ObservationLease::new();
+        let (sender, events) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (ready, activated) = oneshot::channel();
+        let (input, generation) = {
+            let mut state = self.state.lock().await;
+            let input = state
+                .input
+                .clone()
+                .filter(|_| !state.shutting_down)
+                .ok_or_else(|| bridge::SessionViewError::unavailable("bridge is not ready"))?;
+            if state.subscriber_count() >= MAX_SUBSCRIBERS {
+                return Err(bridge::SessionViewError::unavailable(
+                    "too many event subscribers",
+                ));
+            }
+            state.session_subscribers.insert(
+                id,
+                SessionSubscriber {
+                    id,
+                    session_id: session_id.clone(),
+                    sender,
+                    lease: Some(lease.clone()),
+                    input: Some(input.clone()),
+                    ready: Some(ready),
+                    owner: None,
+                },
+            );
+            (input, state.generation)
+        };
+        // Cancellation owns the pending slot before either bridge admission or
+        // materialization can await. Dropping the HTTP future cancels immediately.
+        let guard = SubscriptionGuard {
+            bridge: self.clone(),
+            id,
+            generation,
+            lease: Some(lease.clone()),
+        };
+        let hub = Arc::downgrade(self);
+        let watched_lease = lease.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = watched_lease.finished() => return,
+                _ = watched_lease.cancelled() => {}
+            }
+            if let Some(hub) = hub.upgrade() {
+                hub.unsubscribe(id, generation).await;
+            }
+        });
+        let (reply, result) = oneshot::channel();
+        let registration = async {
+            input
+                .send(bridge::BridgeInput::ObserveSession {
+                    session_id,
+                    cwd,
+                    expected_owner,
+                    observer_id: id,
+                    lease: lease.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| {
+                    bridge::SessionViewError::unavailable(
+                        "bridge stopped before accepting the observer",
+                    )
+                })?;
+            result.await.map_err(|_| {
+                bridge::SessionViewError::unavailable(
+                    "bridge stopped before registering the observer",
+                )
+            })??;
+            activated.await.map_err(|_| {
+                bridge::SessionViewError::unavailable(
+                    "observer delivery stopped before its snapshot cut",
+                )
+            })?;
+            if lease.is_cancelled() {
+                return Err(bridge::SessionViewError::unavailable(
+                    "observer delivery ended during registration",
+                ));
+            }
+            Ok::<_, bridge::SessionViewError>(())
+        };
+        let handshake = async {
+            tokio::select! {
+                // Preserve a concrete owner error (for example NotFound) when
+                // cancellation and its reply were committed together.
+                biased;
+                result = registration => result,
+                _ = lease.cancelled() => Err(bridge::SessionViewError::unavailable(
+                    "session observation was cancelled",
+                )),
+            }
+        };
+        if let Err(error) = tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, handshake)
+            .await
+            .unwrap_or_else(|_| {
+                Err(bridge::SessionViewError::unavailable(
+                    "bridge session observation timed out",
+                ))
+            })
+        {
+            self.unsubscribe(id, generation).await;
+            return Err(error);
+        }
+        Ok((
+            BridgeSubscription {
+                id,
+                generation,
+                initial_events: Vec::new(),
+                events,
+            },
+            guard,
+        ))
+    }
+
+    #[cfg(test)]
     async fn subscribe_session(self: &Arc<Self>, session_id: String) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
@@ -859,12 +1077,22 @@ impl BridgeHub {
             if state.shutting_down || state.input.is_none() {
                 return None;
             }
-            if state.subscribers.len() + state.session_subscribers.len() >= MAX_SUBSCRIBERS {
+            if state.subscriber_count() >= MAX_SUBSCRIBERS {
                 return None;
             }
             let generation = state.generation;
-            state.session_subscribers.insert(id, (session_id, event_tx));
-            self.update_auto_close(&mut state);
+            state.session_subscribers.insert(
+                id,
+                SessionSubscriber {
+                    id,
+                    session_id,
+                    sender: event_tx,
+                    lease: None,
+                    input: None,
+                    ready: None,
+                    owner: None,
+                },
+            );
             generation
         };
         Some(BridgeSubscription {
@@ -900,6 +1128,109 @@ impl BridgeHub {
     }
 
     async fn publish(&self, generation: u64, event: String) {
+        if let Ok(marker) = serde_json::from_str::<serde_json::Value>(&event)
+            && marker.get("type").and_then(serde_json::Value::as_str)
+                == Some("bridge/internal_observer_ready")
+        {
+            let mut state = self.state.lock().await;
+            if state.generation != generation || state.input.is_none() {
+                return;
+            }
+            let Some(id) = marker.get("observerId").and_then(serde_json::Value::as_u64) else {
+                return;
+            };
+            let known_epoch = state
+                .canonical
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.epoch.clone());
+            let Some(subscriber) = state.session_subscribers.get_mut(&id) else {
+                return;
+            };
+            if subscriber.owner.is_some() {
+                return;
+            }
+            let reset = marker.get("reset");
+            let reset_event = reset.map(serde_json::Value::to_string);
+            let position = reset_event.as_deref().and_then(session_event_position);
+            let valid = marker.get("sessionId").and_then(serde_json::Value::as_str)
+                == Some(subscriber.session_id.as_str())
+                && reset.is_some_and(|reset| {
+                    reset.get("type").and_then(serde_json::Value::as_str)
+                        == Some("bridge/session_reset")
+                        && reset.get("sessionId").and_then(serde_json::Value::as_str)
+                            == Some(subscriber.session_id.as_str())
+                })
+                && position.as_ref().is_some_and(|position| {
+                    known_epoch
+                        .as_ref()
+                        .is_none_or(|epoch| epoch == &position.0)
+                })
+                && subscriber
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| !lease.is_cancelled());
+            if !valid {
+                state.session_subscribers.remove(&id);
+                return;
+            }
+            let position = position.unwrap();
+            let delivered = subscriber
+                .sender
+                .try_send(Arc::<str>::from(reset_event.unwrap()))
+                .is_ok();
+            subscriber.owner = Some((position.0, position.1));
+            if !delivered
+                || subscriber
+                    .ready
+                    .take()
+                    .is_none_or(|ready| ready.send(()).is_err())
+            {
+                state.session_subscribers.remove(&id);
+            }
+            return;
+        }
+        if let Ok(marker) = serde_json::from_str::<serde_json::Value>(&event)
+            && marker.get("type").and_then(serde_json::Value::as_str)
+                == Some("bridge/internal_observer_end")
+        {
+            let mut state = self.state.lock().await;
+            if state.generation != generation || state.input.is_none() {
+                return;
+            }
+            let Some(id) = marker.get("observerId").and_then(serde_json::Value::as_u64) else {
+                return;
+            };
+            let matches = state
+                .session_subscribers
+                .get(&id)
+                .is_some_and(|subscriber| {
+                    marker.get("sessionId").and_then(serde_json::Value::as_str)
+                        == Some(subscriber.session_id.as_str())
+                        && subscriber
+                            .owner
+                            .as_ref()
+                            .is_some_and(|(epoch, incarnation)| {
+                                marker
+                                    .get("bridgeEpoch")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(epoch.as_str())
+                                    && marker
+                                        .get("sessionIncarnation")
+                                        .and_then(serde_json::Value::as_u64)
+                                        == Some(*incarnation)
+                            })
+                });
+            if matches && let Some(mut subscriber) = state.session_subscribers.remove(&id) {
+                // End the sending side without aborting the receiving side. Its
+                // already committed prefix drains before the HTTP stream ends.
+                if let Some(lease) = subscriber.lease.take() {
+                    lease.finish();
+                }
+                subscriber.input.take();
+            }
+            return;
+        }
         if is_internal_runtime_event(&event) {
             let snapshot_request = {
                 let mut state = self.state.lock().await;
@@ -914,7 +1245,6 @@ impl BridgeHub {
                     let public_event: Arc<str> = public_event.into();
                     publish_shared_event(&mut state, public_event);
                 }
-                self.update_auto_close(&mut state);
                 if recognized
                     && state.canonical.snapshot.is_none()
                     && !state.canonical_resync_pending
@@ -974,11 +1304,11 @@ impl BridgeHub {
             for subscriber_id in failed_subscribers {
                 state.subscribers.remove(&subscriber_id);
             }
+            publish_to_global_subscribers(&mut state, &event);
             publish_to_session_subscribers(&mut state, event);
             for live_event in session_live_suffix {
                 publish_to_session_subscribers(&mut state, live_event);
             }
-            self.update_auto_close(&mut state);
             restart.then(|| state.cancellation.clone()).flatten()
         };
         if let Some(cancellation) = restart_input {
@@ -987,20 +1317,21 @@ impl BridgeHub {
     }
 
     async fn finish_generation(&self, generation: u64) {
-        let (subscribers, session_subscribers) = {
+        let (subscribers, global_subscribers, session_subscribers) = {
             let mut state = self.state.lock().await;
             if state.generation != generation {
                 return;
             }
             state.input = None;
             state.cancellation = None;
-            self.update_auto_close(&mut state);
             (
                 std::mem::take(&mut state.subscribers),
+                std::mem::take(&mut state.global_subscribers),
                 std::mem::take(&mut state.session_subscribers),
             )
         };
         drop(subscribers);
+        drop(global_subscribers);
         drop(session_subscribers);
         self.stopped.notify_waiters();
     }
@@ -1013,10 +1344,20 @@ impl BridgeHub {
         self.session_view_with_cwd(session_id, None).await
     }
 
+    #[cfg(test)]
     async fn session_view_with_cwd(
         &self,
         session_id: String,
         cwd: Option<String>,
+    ) -> Result<serde_json::Value, bridge::SessionViewError> {
+        self.session_view_for_owner(session_id, cwd, None).await
+    }
+
+    async fn session_view_for_owner(
+        &self,
+        session_id: String,
+        cwd: Option<String>,
+        expected_owner: Option<SessionResourceOwner>,
     ) -> Result<serde_json::Value, bridge::SessionViewError> {
         let input = {
             let state = self.state.lock().await;
@@ -1030,6 +1371,7 @@ impl BridgeHub {
             .send(bridge::BridgeInput::SessionViewRequest {
                 session_id,
                 cwd,
+                expected_owner,
                 response,
             })
             .await
@@ -1110,6 +1452,7 @@ impl BridgeHub {
         };
         json!({
             "generation": state.generation,
+            "bridgeEpoch": state.canonical.snapshot.as_ref().map(|snapshot| &snapshot.epoch),
             "connected": state.input.is_some(),
             "hello": parse(&state.bootstrap.hello),
             "initialized": parse(&state.bootstrap.initialized),
@@ -1132,8 +1475,8 @@ impl BridgeHub {
         let mut state = self.state.lock().await;
         if state.generation == generation {
             state.subscribers.remove(&subscriber_id);
+            state.global_subscribers.remove(&subscriber_id);
             state.session_subscribers.remove(&subscriber_id);
-            self.update_auto_close(&mut state);
         }
     }
 
@@ -1141,10 +1484,10 @@ impl BridgeHub {
         let cancellation = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
-            self.update_auto_close(&mut state);
             // Event streams must finish before HTTP graceful draining can
             // complete, including when no Agent runtime is currently active.
             state.subscribers.clear();
+            state.global_subscribers.clear();
             state.session_subscribers.clear();
             state.cancellation.clone()
         };
@@ -1386,7 +1729,8 @@ fn global_business_event(event: &str) -> Option<String> {
             })
             .to_string(),
         ),
-        "acp/authenticated"
+        "bridge/catalog_changed"
+        | "acp/authenticated"
         | "acp/logged_out"
         | "bridge/auth_terminal_started"
         | "bridge/auth_terminal_output"
@@ -1407,13 +1751,14 @@ fn global_business_event(event: &str) -> Option<String> {
 }
 
 async fn global_events(State(state): State<AppState>) -> Response {
-    let Some(subscription) = state.bridge.subscribe().await else {
+    let Some(subscription) = state.bridge.subscribe_global().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let guard = SubscriptionGuard {
         bridge: state.bridge,
         id: subscription.id,
         generation: subscription.generation,
+        lease: None,
     };
     let stream = futures::stream::unfold(
         (
@@ -1422,20 +1767,15 @@ async fn global_events(State(state): State<AppState>) -> Response {
             guard,
         ),
         |(mut bootstrap, mut events, guard)| async move {
-            loop {
-                let event = if let Some(event) = bootstrap.next() {
-                    event
-                } else {
-                    events.recv().await?.into_string()
-                };
-                let Some(event) = global_business_event(&event) else {
-                    continue;
-                };
-                return Some((
-                    Ok::<_, Infallible>(SseEvent::default().data(event)),
-                    (bootstrap, events, guard),
-                ));
-            }
+            let event = if let Some(event) = bootstrap.next() {
+                event
+            } else {
+                events.recv().await?.into_string()
+            };
+            Some((
+                Ok::<_, Infallible>(SseEvent::default().data(event)),
+                (bootstrap, events, guard),
+            ))
         },
     );
     Sse::new(stream)
@@ -1623,6 +1963,9 @@ async fn list_sessions(
     });
     if let Some(cursor) = query.cursor {
         command["cursor"] = json!(cursor);
+    }
+    if let Some(revision) = query.expected_catalog_revision {
+        command["expectedCatalogRevision"] = json!(revision);
     }
     business_response(state.bridge.business_request(command).await)
 }
@@ -1911,9 +2254,13 @@ async fn get_session_view(
     }) {
         return api_bad_request("invalid session cwd");
     }
+    let expected_owner = match query.expected_owner(&session_id) {
+        Ok(owner) => owner,
+        Err(message) => return api_bad_request(message),
+    };
     match state
         .bridge
-        .session_view_with_cwd(session_id, query.cwd)
+        .session_view_for_owner(session_id, query.cwd, expected_owner)
         .await
     {
         Ok(view) => {
@@ -1946,6 +2293,33 @@ async fn get_session_view(
 
 fn session_view_error(error: bridge::SessionViewError) -> Response {
     match error {
+        bridge::SessionViewError::ConnectionReplaced {
+            owner,
+            current_epoch,
+        } => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": "the observed Agent connection has been replaced",
+                "code": "bridge_replaced",
+                "sessionId": owner.session_id,
+                "bridgeEpoch": owner.epoch,
+                "sessionIncarnation": owner.incarnation,
+                "currentBridgeEpoch": current_epoch,
+            })),
+        )
+            .into_response(),
+        bridge::SessionViewError::Retired(owner) => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": "the observed session owner has retired",
+                "code": "session_retired",
+                "sessionId": owner.session_id,
+                "bridgeEpoch": owner.epoch,
+                "sessionIncarnation": owner.incarnation,
+                "reason": "owner_retired",
+            })),
+        )
+            .into_response(),
         bridge::SessionViewError::NotFound => (
             StatusCode::NOT_FOUND,
             axum::Json(json!({
@@ -2041,10 +2415,45 @@ fn parse_strong_etag(value: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn session_observation_owner(
+    session_id: &str,
+    query: &SessionViewQuery,
+    headers: &HeaderMap,
+) -> Result<Option<SessionResourceOwner>, &'static str> {
+    let expected = query.expected_owner(session_id)?;
+    let resumed = headers
+        .get("last-event-id")
+        .map(|value| {
+            let value = value.to_str().map_err(|_| "invalid Last-Event-ID")?;
+            if value.len() > 2048 {
+                return Err("invalid Last-Event-ID");
+            }
+            let mut parts = value.rsplitn(3, ':');
+            let revision = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let incarnation = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let epoch = parts
+                .next()
+                .filter(|value| !value.is_empty() && value.len() <= 1024 && !value.contains('\0'));
+            match (epoch, incarnation, revision) {
+                (Some(epoch), Some(incarnation), Some(revision))
+                    if incarnation != 0 && revision != 0 =>
+                {
+                    Ok(SessionResourceOwner::new(epoch, session_id, incarnation))
+                }
+                _ => Err("invalid Last-Event-ID"),
+            }
+        })
+        .transpose()?;
+    // Validate the header even when the initial URL already carried an owner.
+    // Malformed recovery input must never silently become a fresh open.
+    Ok(expected.or(resumed))
+}
+
 async fn session_events(
     Path(session_id): Path<String>,
     State(state): State<AppState>,
     Query(query): Query<SessionViewQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
         return StatusCode::BAD_REQUEST.into_response();
@@ -2054,56 +2463,51 @@ async fn session_events(
     }) {
         return api_bad_request("invalid session cwd");
     }
-    let Some(subscription) = state.bridge.subscribe_session(session_id.clone()).await else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let expected_owner = match session_observation_owner(&session_id, &query, &headers) {
+        Ok(owner) => owner,
+        Err(message) => return api_bad_request(message),
     };
-    let initial = match state
+    let (subscription, guard) = match state
         .bridge
-        .session_view_with_cwd(session_id.clone(), query.cwd)
+        .observe_session_for_owner(session_id.clone(), query.cwd, expected_owner)
         .await
     {
-        Ok(view) => match session_reset_value(&session_id, &view) {
-            Some(reset) => reset.to_string(),
-            None => {
-                state
-                    .bridge
-                    .unsubscribe(subscription.id, subscription.generation)
-                    .await;
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        },
-        Err(error) => {
-            state
-                .bridge
-                .unsubscribe(subscription.id, subscription.generation)
-                .await;
-            return session_view_error(error);
-        }
+        Ok(observed) => observed,
+        Err(error) => return session_view_error(error),
     };
-    let guard = SubscriptionGuard {
-        bridge: state.bridge,
-        id: subscription.id,
-        generation: subscription.generation,
-    };
-    let initial_position = session_event_position(&initial);
     let stream = futures::stream::unfold(
         (
-            Some(initial),
+            None::<String>,
             subscription.initial_events.into_iter(),
             subscription.events,
             session_id,
-            initial_position,
+            None::<(String, u64, u64)>,
             guard,
         ),
         |(mut initial, mut bootstrap, mut events, session_id, mut position, guard)| async move {
             loop {
+                if guard
+                    .lease
+                    .as_ref()
+                    .is_some_and(ObservationLease::is_cancelled)
+                {
+                    return None;
+                }
                 let is_initial = initial.is_some();
                 let event = if let Some(initial_event) = initial.take() {
                     initial_event
                 } else if let Some(event) = bootstrap.next() {
                     event
                 } else {
-                    let event = events.recv().await?;
+                    let event = if let Some(lease) = &guard.lease {
+                        tokio::select! {
+                            biased;
+                            _ = lease.cancelled() => return None,
+                            event = events.recv() => event?,
+                        }
+                    } else {
+                        events.recv().await?
+                    };
                     event.into_string()
                 };
                 if !session_event_matches(&event, &session_id) {
@@ -2153,6 +2557,7 @@ fn session_event_id(event: &str) -> Option<String> {
                 | "bridge/session_delta"
                 | "bridge/session_turn_complete"
                 | "bridge/session_turn_failed"
+                | "bridge/session_retired"
         )
     ) {
         return None;
@@ -2166,6 +2571,14 @@ fn session_event_id(event: &str) -> Option<String> {
 fn session_event_cursor(event: &str) -> Option<String> {
     let (epoch, incarnation, revision) = session_event_position(event)?;
     Some(format!("{epoch}:{incarnation}:{revision}"))
+}
+
+fn session_event_owner(event: &str) -> Option<(String, u64)> {
+    let event = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    Some((
+        event.get("bridgeEpoch")?.as_str()?.to_string(),
+        event.get("sessionIncarnation")?.as_u64()?,
+    ))
 }
 
 fn session_event_position(event: &str) -> Option<(String, u64, u64)> {
@@ -2433,23 +2846,36 @@ mod tests {
     #[tokio::test]
     async fn shutdown_closes_event_streams_without_an_active_agent() {
         let hub = test_hub();
+        let (aggregate_tx, mut aggregate_rx) = SubscriberSender::channel(4);
         let (global_tx, mut global_rx) = SubscriberSender::channel(4);
         let (session_tx, mut session_rx) = SubscriberSender::channel(4);
         {
             let mut state = hub.state.lock().await;
-            state.subscribers.insert(1, global_tx);
-            state
-                .session_subscribers
-                .insert(2, ("session".to_string(), session_tx));
+            state.subscribers.insert(1, aggregate_tx);
+            state.global_subscribers.insert(3, global_tx);
+            state.session_subscribers.insert(
+                2,
+                SessionSubscriber {
+                    id: 2,
+                    session_id: "session".into(),
+                    sender: session_tx,
+                    lease: None,
+                    input: None,
+                    ready: None,
+                    owner: None,
+                },
+            );
         }
         hub.shutdown().await;
         tokio::time::timeout(Duration::from_millis(100), async {
+            assert!(aggregate_rx.recv().await.is_none());
             assert!(global_rx.recv().await.is_none());
             assert!(session_rx.recv().await.is_none());
         })
         .await
         .expect("shutdown must close every SSE source before HTTP draining");
         assert!(hub.subscribe().await.is_none());
+        assert!(hub.subscribe_global().await.is_none());
         assert!(hub.subscribe_session("session".to_string()).await.is_none());
     }
 
@@ -2688,162 +3114,732 @@ mod tests {
         assert!(hub.state.lock().await.session_subscribers.is_empty());
     }
 
-    #[tokio::test]
-    async fn unobserved_close_cancels_on_return_and_rearms_after_disconnect() {
-        let mut options = (*test_hub().options).clone();
-        options.session_unobserved_timeout = 0;
-        let hub = BridgeHub::new(Arc::new(options));
-        let (input, mut commands) = mpsc::channel(4);
-        let mut runtime = crate::runtime_state::RuntimeState::new("test", Default::default());
-        runtime
-            .open_new_with_replay(
-                "test",
-                "session",
-                "/tmp",
-                json!({"sessionId":"session"}),
-                Vec::new(),
-            )
-            .unwrap();
+    async fn observation_hub(
+        capacity: usize,
+    ) -> (Arc<BridgeHub>, mpsc::Receiver<bridge::BridgeInput>) {
+        let hub = test_hub();
+        let (input, commands) = mpsc::channel(capacity);
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
             state.input = Some(input);
-            state.canonical.snapshot = Some(runtime.snapshot());
-            hub.update_auto_close(&mut state);
         }
-        let command = commands.recv().await.unwrap();
-        let bridge::BridgeInput::RetireUnobservedSession { permit: old, .. } = command else {
-            panic!("expected close");
-        };
-        let first = hub.subscribe_session("session".into()).await.unwrap();
-        let second = hub.subscribe_session("session".into()).await.unwrap();
-        assert!(!old.claim(), "return cancels even a queued close");
-        hub.unsubscribe(first.id, first.generation).await;
-        assert!(hub.state.lock().await.unobserved.is_empty());
-        hub.unsubscribe(second.id, second.generation).await;
-        let command = commands.recv().await.unwrap();
-        let bridge::BridgeInput::RetireUnobservedSession { permit, .. } = command else {
-            panic!("expected close");
-        };
-        assert!(
-            permit.claim(),
-            "last observer leaving starts a fresh interval"
-        );
-        hub.shutdown().await;
-    }
-
-    async fn timer_hub(timeout: i64) -> (Arc<BridgeHub>, mpsc::Receiver<bridge::BridgeInput>) {
-        let mut options = (*test_hub().options).clone();
-        options.session_unobserved_timeout = timeout;
-        let hub = BridgeHub::new(Arc::new(options));
-        let (input, commands) = mpsc::channel(32);
-        let mut runtime = crate::runtime_state::RuntimeState::new("test", Default::default());
-        runtime
-            .open_new_with_replay(
-                "test",
-                "session",
-                "/tmp",
-                json!({"sessionId":"session"}),
-                vec![],
-            )
-            .unwrap();
-        let mut state = hub.state.lock().await;
-        state.generation = 1;
-        state.input = Some(input);
-        state.canonical.snapshot = Some(runtime.snapshot());
-        hub.update_auto_close(&mut state);
-        drop(state);
-        tokio::task::yield_now().await;
         (hub, commands)
     }
 
+    fn observer_ready(id: u64, revision: u64) -> String {
+        json!({
+            "type": "bridge/internal_observer_ready", "observerId": id, "sessionId": "session",
+            "reset": {
+                "type": "bridge/session_reset", "bridgeEpoch": "epoch", "sessionId": "session",
+                "sessionIncarnation": 1, "viewRevision": revision,
+                "historyRevision": "history", "phase": "ready", "syncError": null,
+            },
+        })
+        .to_string()
+    }
+
+    fn observation_delta(revision: u64) -> String {
+        json!({
+            "type": "bridge/session_delta", "bridgeEpoch": "epoch", "sessionId": "session",
+            "sessionIncarnation": 1, "fromRevision": revision - 1, "viewRevision": revision,
+            "change": { "kind": "test" },
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn cancelled_session_sse_handshake_releases_pending_observer_immediately() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(session_events(
+            Path("session".to_string()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: None,
+                ..Default::default()
+            }),
+            HeaderMap::new(),
+        ));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id,
+            lease,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        assert_eq!(hub.state.lock().await.session_subscribers.len(), 1);
+        drop(handshake);
+        assert!(
+            lease.is_cancelled(),
+            "HTTP cancellation must not wait for the Hub lock"
+        );
+        assert!(reply.is_closed());
+        tokio::task::yield_now().await;
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+        let bridge::BridgeInput::UnobserveSession {
+            observer_id: removed,
+            lease: removed_lease,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected UnobserveSession")
+        };
+        assert_eq!(removed, observer_id);
+        assert!(lease.same_identity(&removed_lease));
+        hub.publish(1, observer_ready(observer_id, 10)).await;
+        assert!(
+            hub.state.lock().await.session_subscribers.is_empty(),
+            "late marker cannot revive cancelled HTTP"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_ready_marker_establishes_reset_before_the_live_suffix() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut global = hub.subscribe_global().await.unwrap();
+        let mut aggregate = hub.subscribe().await.unwrap();
+        let mut handshake = Box::pin(hub.observe_session("session".into(), None));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id, reply, ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        hub.publish(1, observation_delta(9)).await;
+        reply.send(Ok(())).unwrap();
+        assert!(
+            futures::poll!(handshake.as_mut()).is_pending(),
+            "a reply without the outbox cut cannot activate delivery"
+        );
+        hub.publish(1, observer_ready(observer_id, 10)).await;
+        hub.publish(1, observation_delta(11)).await;
+        let (mut subscription, guard) = handshake.await.unwrap();
+        let reset: serde_json::Value =
+            serde_json::from_str(&subscription.events.try_recv().unwrap().into_string()).unwrap();
+        let delta: serde_json::Value =
+            serde_json::from_str(&subscription.events.try_recv().unwrap().into_string()).unwrap();
+        assert_eq!(reset["type"], "bridge/session_reset");
+        assert_eq!(reset["viewRevision"], 10);
+        assert_eq!(delta["fromRevision"], 10);
+        assert_eq!(delta["viewRevision"], 11);
+        assert!(subscription.events.try_recv().is_err());
+        assert!(global.events.try_recv().is_err());
+        while let Ok(event) = aggregate.events.try_recv() {
+            assert!(!event.into_string().contains("internal_observer_ready"));
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn observation_recovery_requires_a_valid_owner_and_rejects_malformed_cursors() {
+        let query = SessionViewQuery {
+            expected_epoch: Some("epoch".into()),
+            expected_incarnation: Some(7),
+            ..Default::default()
+        };
+        let expected = SessionResourceOwner::new("epoch", "session", 7);
+        assert_eq!(
+            session_observation_owner("session", &query, &HeaderMap::new()).unwrap(),
+            Some(expected.clone())
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "epoch:7:42".parse().unwrap());
+        assert_eq!(
+            session_observation_owner("session", &SessionViewQuery::default(), &headers).unwrap(),
+            Some(expected)
+        );
+        for malformed in ["", "epoch", "epoch:7", "epoch:0:3", "epoch:7:bad", ":7:3"] {
+            headers.insert("last-event-id", malformed.parse().unwrap());
+            assert!(session_observation_owner("session", &query, &headers).is_err());
+            assert!(
+                session_observation_owner("session", &SessionViewQuery::default(), &headers)
+                    .is_err()
+            );
+        }
+        let partial = SessionViewQuery {
+            expected_epoch: Some("epoch".into()),
+            ..Default::default()
+        };
+        assert!(partial.expected_owner("session").is_err());
+    }
+
+    #[tokio::test]
+    async fn connection_replacement_reports_canonical_epoch_independently_of_generation() {
+        let (hub, _commands) = observation_hub(4).await;
+        assert!(hub.runtime_info().await["bridgeEpoch"].is_null());
+        let registry = crate::session_registry::SessionRegistry::new(
+            "new-connection",
+            crate::runtime_state::RuntimeLimits::default(),
+        );
+        hub.state.lock().await.canonical.snapshot = Some(registry.snapshot());
+        let runtime = hub.runtime_info().await;
+        assert_eq!(runtime["bridgeEpoch"], "new-connection");
+        assert_eq!(
+            runtime["generation"], 1,
+            "a host restart can reuse the numeric generation"
+        );
+        let response = session_view_error(bridge::SessionViewError::ConnectionReplaced {
+            owner: SessionResourceOwner::new("old-connection", "session", 1),
+            current_epoch: "new-connection".into(),
+        });
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "bridge_replaced");
+        assert_eq!(body["bridgeEpoch"], "old-connection");
+        assert_eq!(body["currentBridgeEpoch"], runtime["bridgeEpoch"]);
+        assert_eq!(body["sessionIncarnation"], 1);
+    }
+
+    #[tokio::test]
+    async fn view_refresh_and_sse_resume_return_the_retired_owner_without_fresh_open() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let owner = SessionResourceOwner::new("retired-epoch", "session", 9);
+        let mut view = Box::pin(get_session_view(
+            Path("session".into()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: Some("/workspace".into()),
+                expected_epoch: Some(owner.epoch.clone()),
+                expected_incarnation: Some(owner.incarnation),
+            }),
+        ));
+        assert!(futures::poll!(view.as_mut()).is_pending());
+        let bridge::BridgeInput::SessionViewRequest {
+            expected_owner,
+            response,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("refresh must carry its expected canonical owner");
+        };
+        assert_eq!(expected_owner, Some(owner.clone()));
+        response
+            .send(Err(bridge::SessionViewError::Retired(owner.clone())))
+            .unwrap();
+        let result = view.await;
+        assert_eq!(result.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(result.into_body(), 8192)
+            .await
+            .unwrap();
+        let expected: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(expected["code"], "session_retired");
+        assert_eq!(expected["sessionIncarnation"], 9);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "retired-epoch:9:12".parse().unwrap());
+        let mut observation = Box::pin(session_events(
+            Path("session".into()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery::default()),
+            headers,
+        ));
+        assert!(futures::poll!(observation.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            expected_owner,
+            lease,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("SSE recovery must carry its previous owner");
+        };
+        assert_eq!(expected_owner, Some(owner.clone()));
+        reply
+            .send(Err(bridge::SessionViewError::Retired(owner)))
+            .unwrap();
+        let result = observation.await;
+        assert_eq!(result.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(result.into_body(), 8192)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            expected
+        );
+        assert!(lease.is_cancelled());
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+    }
+
+    #[test]
+    fn only_catalog_changes_join_the_global_business_stream() {
+        let catalog =
+            json!({ "type": "bridge/catalog_changed", "bridgeEpoch": "epoch", "revision": 2 })
+                .to_string();
+        assert_eq!(global_business_event(&catalog), Some(catalog));
+        let retired = json!({ "type": "bridge/session_retired", "sessionId": "session", "bridgeEpoch": "epoch", "sessionIncarnation": 1, "reason": "deleted" }).to_string();
+        assert!(global_business_event(&retired).is_none());
+        assert!(business_session_event(&retired).is_some());
+        assert!(session_event_matches(&retired, "session"));
+        assert_eq!(
+            session_event_position(&retired),
+            None,
+            "terminal facts must not be discarded by revision deduplication"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_http_stream_uses_the_owner_cut_and_body_drop_unobserves() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(session_events(
+            Path("session".into()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: None,
+                ..Default::default()
+            }),
+            HeaderMap::new(),
+        ));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id,
+            lease,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("HTTP stream must use ObserveSession")
+        };
+        hub.publish(1, observer_ready(observer_id, 10)).await;
+        hub.publish(1, observation_delta(11)).await;
+        reply.send(Ok(())).unwrap();
+        let response = handshake.await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let first = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
+        let first = std::str::from_utf8(&first).unwrap();
+        assert!(first.contains("id: epoch:1:10"));
+        assert!(first.contains("bridge/session_reset"));
+        let next = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
+        assert!(
+            std::str::from_utf8(&next)
+                .unwrap()
+                .contains("bridge/session_delta")
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "HTTP must not issue a second snapshot query"
+        );
+        drop(body);
+        assert!(lease.is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            bridge::BridgeInput::UnobserveSession { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordered_observer_end_drains_the_committed_http_prefix_before_eof() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(session_events(
+            Path("session".into()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: None,
+                ..Default::default()
+            }),
+            HeaderMap::new(),
+        ));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id,
+            lease,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession");
+        };
+        hub.publish(1, observer_ready(observer_id, 10)).await;
+        reply.send(Ok(())).unwrap();
+        let mut body = handshake.await.into_body().into_data_stream();
+        hub.publish(1, observation_delta(11)).await;
+        hub.publish(1, json!({
+            "type": "bridge/session_turn_complete", "bridgeEpoch": "epoch", "sessionId": "session",
+            "sessionIncarnation": 1, "viewRevision": 12, "operationId": "last-turn",
+            "phase": "ready", "historyRevision": "final-history", "response": { "stopReason": "end_turn" },
+        }).to_string()).await;
+        hub.publish(
+            1,
+            json!({
+                "type": "bridge/session_retired", "bridgeEpoch": "epoch", "sessionId": "session",
+                "sessionIncarnation": 1, "reason": "closed",
+            })
+            .to_string(),
+        )
+        .await;
+        // The owner can finish before the publisher reaches its end marker.
+        lease.finish();
+        tokio::task::yield_now().await;
+        assert!(
+            hub.state
+                .lock()
+                .await
+                .session_subscribers
+                .contains_key(&observer_id)
+        );
+        let mut end = json!({
+            "type": "bridge/internal_observer_end", "observerId": observer_id, "sessionId": "session",
+            "bridgeEpoch": "epoch", "sessionIncarnation": 2,
+        });
+        hub.publish(1, end.to_string()).await;
+        assert!(
+            hub.state
+                .lock()
+                .await
+                .session_subscribers
+                .contains_key(&observer_id),
+            "old or wrong owner cannot end the stream"
+        );
+        end["sessionIncarnation"] = json!(1);
+        hub.publish(1, end.to_string()).await;
+        assert!(!lease.is_cancelled());
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+        let mut delivered = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+            delivered.push(String::from_utf8(chunk.unwrap().to_vec()).unwrap());
+        }
+        assert_eq!(delivered.len(), 4);
+        assert!(delivered[0].contains("bridge/session_reset"));
+        assert!(delivered[1].contains("bridge/session_delta"));
+        assert!(delivered[2].contains("last-turn"));
+        assert!(delivered[3].contains("bridge/session_retired"));
+        assert!(
+            !delivered
+                .iter()
+                .any(|event| event.contains("internal_observer_end"))
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            commands.try_recv().is_err(),
+            "normal finish must not send a late Unobserve"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_cancellation_finishes_an_idle_http_stream_without_another_event() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(session_events(
+            Path("session".into()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: None,
+                ..Default::default()
+            }),
+            HeaderMap::new(),
+        ));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id,
+            lease,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        hub.publish(1, observer_ready(observer_id, 10)).await;
+        reply.send(Ok(())).unwrap();
+        let mut body = handshake.await.into_body().into_data_stream();
+        futures::StreamExt::next(&mut body).await.unwrap().unwrap();
+        lease.cancel();
+        assert!(futures::StreamExt::next(&mut body).await.is_none());
+        tokio::task::yield_now().await;
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            bridge::BridgeInput::UnobserveSession { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn owner_cancellation_finishes_pending_http_without_waiting_for_its_reply() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(hub.observe_session("session".into(), None));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession { lease, reply, .. } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        lease.cancel();
+        assert!(handshake.await.is_err());
+        assert!(reply.is_closed());
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ready_marker_with_another_session_scope_revokes_pending_delivery() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(hub.observe_session("session".into(), None));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id,
+            lease,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        let mut marker: serde_json::Value =
+            serde_json::from_str(&observer_ready(observer_id, 10)).unwrap();
+        marker["reset"]["sessionId"] = json!("other");
+        hub.publish(1, marker.to_string()).await;
+        reply.send(Ok(())).unwrap();
+        assert!(handshake.await.is_err());
+        assert!(lease.is_cancelled());
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            bridge::BridgeInput::UnobserveSession { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn observe_marker_without_owner_reply_keeps_http_pending_and_failure_revokes_it() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(session_events(
+            Path("session".into()),
+            State(AppState {
+                bridge: hub.clone(),
+            }),
+            Query(SessionViewQuery {
+                cwd: Some("/tmp".into()),
+                ..Default::default()
+            }),
+            HeaderMap::new(),
+        ));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id,
+            cwd,
+            lease,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        assert_eq!(cwd.as_deref(), Some("/tmp"));
+        hub.publish(1, observer_ready(observer_id, 10)).await;
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        lease.cancel();
+        reply.send(Err(bridge::SessionViewError::NotFound)).unwrap();
+        assert_eq!(handshake.await.status(), StatusCode::NOT_FOUND);
+        assert!(lease.is_cancelled());
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            bridge::BridgeInput::UnobserveSession { .. }
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn unobserved_timeout_measures_absence_not_output_and_global_observers_do_not_count() {
-        let (hub, mut commands) = timer_hub(30).await;
-        let global = hub.subscribe().await.unwrap();
-        tokio::time::advance(Duration::from_secs(20)).await;
-        hub.publish(1, json!({"type":"acp/session_update","sessionId":"session", "update": {"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"output"}}}).to_string()).await;
-        tokio::time::advance(Duration::from_secs(9)).await;
-        tokio::task::yield_now().await;
-        assert!(commands.try_recv().is_err());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        let bridge::BridgeInput::RetireUnobservedSession { permit, .. } =
+    async fn observe_handshake_timeout_revokes_its_owner_lease() {
+        let (hub, mut commands) = observation_hub(4).await;
+        let mut handshake = Box::pin(hub.observe_session("session".into(), None));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession { lease, reply, .. } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        tokio::time::advance(BRIDGE_QUERY_TIMEOUT).await;
+        assert!(handshake.await.is_err());
+        assert!(lease.is_cancelled());
+        assert!(reply.is_closed());
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            bridge::BridgeInput::UnobserveSession { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn slow_session_delivery_unobserves_only_its_lease_and_preserves_other_observers() {
+        let (hub, mut commands) = observation_hub(8).await;
+        let mut observations = Vec::new();
+        let mut leases = Vec::new();
+        for _ in 0..2 {
+            let mut handshake = Box::pin(hub.observe_session("session".into(), None));
+            assert!(futures::poll!(handshake.as_mut()).is_pending());
+            let bridge::BridgeInput::ObserveSession {
+                observer_id,
+                lease,
+                reply,
+                ..
+            } = commands.try_recv().unwrap()
+            else {
+                panic!("expected ObserveSession")
+            };
+            hub.publish(1, observer_ready(observer_id, 1)).await;
+            reply.send(Ok(())).unwrap();
+            observations.push(handshake.await.unwrap());
+            leases.push(lease);
+        }
+        observations[1].0.events.try_recv().unwrap();
+        for revision in 2..=(SUBSCRIBER_QUEUE_CAPACITY as u64 + 1) {
+            hub.publish(1, observation_delta(revision)).await;
+            observations[1].0.events.try_recv().unwrap();
+        }
+        assert!(leases[0].is_cancelled());
+        assert!(!leases[1].is_cancelled());
+        assert_eq!(hub.state.lock().await.session_subscribers.len(), 1);
+        let bridge::BridgeInput::UnobserveSession { observer_id, .. } =
             commands.try_recv().unwrap()
         else {
-            panic!("expected timer close");
+            panic!("slow eviction must unobserve")
         };
-        assert!(permit.claim());
-        hub.unsubscribe(global.id, global.generation).await;
-        hub.shutdown().await;
+        assert_eq!(observer_id, observations[0].0.id);
+        hub.unsubscribe(observations[1].0.id, 1).await;
+        assert!(leases[1].is_cancelled());
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn observer_return_restarts_the_full_timeout_and_shutdown_cancels_it() {
-        let (hub, mut commands) = timer_hub(30).await;
-        tokio::time::advance(Duration::from_secs(20)).await;
-        let observer = hub.subscribe_session("session".into()).await.unwrap();
-        tokio::time::advance(Duration::from_secs(60)).await;
-        assert!(commands.try_recv().is_err());
-        hub.unsubscribe(observer.id, observer.generation).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(29)).await;
-        tokio::task::yield_now().await;
-        assert!(commands.try_recv().is_err());
-        hub.shutdown().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-        assert!(commands.try_recv().is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn negative_timeouts_disable_recycling_and_huge_values_do_not_overflow() {
-        for timeout in [i64::MIN, -2, -1, i64::MAX] {
-            let (hub, mut commands) = timer_hub(timeout).await;
-            tokio::time::advance(Duration::from_secs(1_000_000)).await;
-            tokio::task::yield_now().await;
-            assert!(commands.try_recv().is_err());
-            hub.shutdown().await;
+    #[tokio::test]
+    async fn observer_delivery_fences_generation_epoch_and_incarnation() {
+        for event_type in [
+            "bridge/session_delta",
+            "bridge/session_turn_complete",
+            "bridge/session_turn_failed",
+        ] {
+            for field in ["bridgeEpoch", "sessionIncarnation"] {
+                let (hub, mut commands) = observation_hub(4).await;
+                let mut handshake = Box::pin(hub.observe_session("session".into(), None));
+                assert!(futures::poll!(handshake.as_mut()).is_pending());
+                let bridge::BridgeInput::ObserveSession {
+                    observer_id,
+                    lease,
+                    reply,
+                    ..
+                } = commands.try_recv().unwrap()
+                else {
+                    panic!("expected ObserveSession")
+                };
+                reply.send(Ok(())).unwrap();
+                hub.publish(0, observer_ready(observer_id, 10)).await;
+                assert!(
+                    futures::poll!(handshake.as_mut()).is_pending(),
+                    "old generation cannot activate a current delivery"
+                );
+                hub.publish(1, observer_ready(observer_id, 10)).await;
+                let (mut subscription, _guard) = handshake.await.unwrap();
+                subscription.events.try_recv().unwrap();
+                let mut event: serde_json::Value =
+                    serde_json::from_str(&observation_delta(11)).unwrap();
+                event["type"] = json!(event_type);
+                event[field] = if field == "bridgeEpoch" {
+                    json!("other")
+                } else {
+                    json!(2)
+                };
+                hub.publish(1, event.to_string()).await;
+                assert!(lease.is_cancelled());
+                assert!(subscription.events.recv().await.is_none());
+                assert!(matches!(
+                    commands.try_recv().unwrap(),
+                    bridge::BridgeInput::UnobserveSession { .. }
+                ));
+            }
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn changed_incarnation_invalidates_a_queued_timer() {
-        let (hub, mut commands) = timer_hub(0).await;
-        let bridge::BridgeInput::RetireUnobservedSession {
-            permit: old,
-            incarnation,
-            ..
-        } = commands.try_recv().unwrap()
-        else {
-            panic!("expected close");
-        };
-        {
-            let mut state = hub.state.lock().await;
-            state
-                .canonical
-                .snapshot
-                .as_mut()
-                .unwrap()
-                .sessions
-                .get_mut("session")
-                .unwrap()
-                .incarnation += 1;
-            hub.update_auto_close(&mut state);
-        }
-        assert!(!old.claim());
+    #[tokio::test]
+    async fn cancellation_delivers_unobserve_even_when_bridge_input_is_full() {
+        let (hub, mut commands) = observation_hub(1).await;
+        hub.state
+            .lock()
+            .await
+            .input
+            .as_ref()
+            .unwrap()
+            .try_send(bridge::BridgeInput::RuntimeSnapshotRequest)
+            .unwrap();
+        let mut handshake = Box::pin(hub.observe_session("session".into(), None));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        let lease = hub
+            .state
+            .lock()
+            .await
+            .session_subscribers
+            .values()
+            .next()
+            .unwrap()
+            .lease
+            .clone()
+            .unwrap();
+        drop(handshake);
+        assert!(lease.is_cancelled());
         tokio::task::yield_now().await;
-        let bridge::BridgeInput::RetireUnobservedSession {
-            permit,
-            incarnation: next,
+        assert!(hub.state.lock().await.session_subscribers.is_empty());
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            bridge::BridgeInput::RuntimeSnapshotRequest
+        ));
+        let bridge::BridgeInput::UnobserveSession { lease: removed, .. } =
+            commands.recv().await.unwrap()
+        else {
+            panic!("cleanup cannot be dropped under command backpressure")
+        };
+        assert!(lease.same_identity(&removed));
+    }
+
+    #[tokio::test]
+    async fn ending_generation_revokes_pending_and_active_session_leases() {
+        let (hub, mut commands) = observation_hub(8).await;
+        let mut first = Box::pin(hub.observe_session("session".into(), None));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            observer_id,
+            lease: active,
+            reply,
             ..
         } = commands.try_recv().unwrap()
         else {
-            panic!("expected new timer");
+            panic!("expected ObserveSession")
         };
-        assert_eq!(next, incarnation + 1);
-        assert!(permit.claim());
-        hub.shutdown().await;
+        hub.publish(1, observer_ready(observer_id, 10)).await;
+        reply.send(Ok(())).unwrap();
+        let (_subscription, _guard) = first.await.unwrap();
+        let mut second = Box::pin(hub.observe_session("session".into(), None));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        let bridge::BridgeInput::ObserveSession {
+            lease: pending,
+            reply,
+            ..
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("expected ObserveSession")
+        };
+        hub.finish_generation(1).await;
+        assert!(active.is_cancelled());
+        assert!(pending.is_cancelled());
+        drop(reply);
+        assert!(second.await.is_err());
+        for _ in 0..2 {
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                bridge::BridgeInput::UnobserveSession { .. }
+            ));
+        }
     }
 
     #[test]
@@ -3137,6 +4133,300 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_session_deletion_uses_global_management_without_loading() {
+        let (hub, observer) = capability_fixture(&["--delete", "--close"]).await;
+        hub.business_request(json!({ "type": "session/list", "requestId": "list" }))
+            .await
+            .unwrap();
+        let deleted = hub
+            .business_request(json!({
+                "type": "session/delete", "requestId": "delete-cold", "sessionId": "saved",
+            }))
+            .await;
+        let listed = hub
+            .business_request(json!({ "type": "session/list", "requestId": "after-delete" }))
+            .await
+            .unwrap();
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+
+        assert!(deleted.is_ok(), "cold deletion failed: {deleted:?}");
+        assert_eq!(listed["sessions"], json!([]));
+        assert_eq!(listed["_meta"]["deletes"], 1);
+        for method in ["newSessions", "loads", "resumes", "closes"] {
+            assert_eq!(
+                listed["_meta"][method], 0,
+                "cold delete must not call {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_session_deletion_allows_global_requests_and_retry_after_failure() {
+        let (hub, observer) =
+            capability_fixture(&["--delete", "--close", "--hold-delete", "--fail-delete-once"])
+                .await;
+        for attempt in 1..=2 {
+            let deleting = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    hub.business_request(json!({
+                        "type": "session/delete", "requestId": format!("delete-{attempt}"),
+                        "sessionId": "saved",
+                    }))
+                    .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let listed = hub
+                        .business_request(json!({
+                            "type": "session/list", "requestId": format!("while-delete-{attempt}"),
+                        }))
+                        .await
+                        .unwrap();
+                    if listed["_meta"]["deletes"] == attempt {
+                        break;
+                    }
+                    assert!(
+                        !deleting.is_finished(),
+                        "delete failed before Agent dispatch"
+                    );
+                }
+            })
+            .await
+            .expect("global list must progress while cold deletion is waiting");
+            assert!(!deleting.is_finished());
+            assert!(
+                hub.session_view("saved".to_string()).await.is_err(),
+                "opening the same catalog entry must wait until deletion settles"
+            );
+            let competing = hub
+                .business_request(json!({
+                    "type": "session/delete", "requestId": format!("competing-{attempt}"),
+                    "sessionId": "saved",
+                }))
+                .await;
+            assert!(
+                competing.is_err(),
+                "a pending delete must exclude same-session mutations"
+            );
+            let released = hub.business_request(json!({
+                "type": "session/list", "requestId": format!("release-{attempt}"), "cursor": "release-delete",
+            })).await;
+            // Successful deletion can invalidate its releasing list response.
+            // A refused deletion leaves the page's catalog revision unchanged.
+            if let Err(error) = released {
+                assert_eq!(attempt, 2);
+                assert_eq!(error.data.unwrap()["kind"], "session_catalog_changed");
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), deleting)
+                .await
+                .unwrap()
+                .unwrap();
+            if attempt == 1 {
+                assert!(result.is_err());
+            } else {
+                assert!(result.is_ok(), "retry failed: {result:?}");
+            }
+            let listed = hub
+                .business_request(json!({
+                    "type": "session/list", "requestId": format!("settled-{attempt}"),
+                }))
+                .await
+                .unwrap();
+            for method in ["newSessions", "loads", "resumes", "closes"] {
+                assert_eq!(listed["_meta"][method], 0);
+            }
+            assert_eq!(listed["_meta"]["deletes"], attempt);
+            assert_eq!(
+                listed["sessions"].as_array().unwrap().len(),
+                if attempt == 1 { 1 } else { 0 }
+            );
+        }
+        let listed = hub
+            .business_request(json!({ "type": "session/list", "requestId": "final-list" }))
+            .await
+            .unwrap();
+        assert_eq!(listed["sessions"], json!([]));
+        assert_eq!(listed["_meta"]["deletes"], 2);
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    async fn pending_interaction_survives_reconnect(kind: &str) {
+        let (hub, mut browser) = capability_fixture(&[]).await;
+        let created = hub
+            .business_request(json!({ "type": "session/new", "requestId": "new" }))
+            .await
+            .unwrap();
+        let (mut session, _session_guard) = hub
+            .observe_session("created".to_string(), None)
+            .await
+            .unwrap();
+        let initial = &created["view"]["session"];
+        let accepted = hub
+            .start_turn(
+                "created".to_string(),
+                initial["historyRevision"].as_str().unwrap().to_string(),
+                "waiting-turn".to_string(),
+                vec![json!({ "type": "text", "text": format!("wait-{kind}") })],
+            )
+            .await
+            .unwrap();
+        let interaction_id = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = session.events.recv().await.unwrap().into_string();
+                let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+                if event["change"]["kind"] == "interaction_upsert" {
+                    assert_eq!(event["change"]["interaction"]["type"], kind);
+                    break event["change"]["interaction"]["interactionId"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                }
+            }
+        })
+        .await
+        .expect("Agent must publish the pending interaction");
+
+        hub.unsubscribe(session.id, session.generation).await;
+        hub.unsubscribe(browser.id, browser.generation).await;
+        browser = hub.subscribe().await.unwrap();
+        let view = hub.session_view("created".to_string()).await.unwrap();
+        let interactions = format!("{kind}s");
+        assert_eq!(view["session"]["phase"], "running");
+        assert_eq!(view["session"]["incarnation"], initial["incarnation"]);
+        assert_eq!(
+            view["session"]["historyRevision"],
+            initial["historyRevision"]
+        );
+        assert!(view["live"][&interactions].get(&interaction_id).is_some());
+
+        // Global discovery remains readable while the session awaits user input.
+        let listed = hub
+            .business_request(json!({ "type": "session/list", "requestId": "reconnect-list" }))
+            .await;
+        if listed.is_err() {
+            hub.shutdown().await;
+        }
+        let listed = listed.expect("pending user input must not block reconnect session/list");
+        assert_eq!(listed["_meta"]["loads"], 0);
+        assert_eq!(listed["_meta"]["prompts"], 1);
+
+        let other_view = hub.session_view("saved".to_string()).await.unwrap();
+        let (mut other, _other_guard) = hub
+            .observe_session("saved".to_string(), None)
+            .await
+            .unwrap();
+        let other_turn = hub
+            .start_turn(
+                "saved".to_string(),
+                other_view["session"]["historyRevision"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                "independent-turn".to_string(),
+                vec![json!({ "type": "text", "text": "continue independently" })],
+            )
+            .await
+            .expect("another session must accept a turn while user input is pending");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = other.events.recv().await.unwrap().into_string();
+                let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+                if event["type"] == "bridge/session_turn_complete" {
+                    assert_eq!(event["operationId"], other_turn["operationId"]);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the independent turn must complete before answering the pending interaction");
+        hub.business_request(json!({
+            "type": "session/set_mode", "requestId": "pending-mode",
+            "sessionId": "created", "modeId": "plan",
+        }))
+        .await
+        .expect("control admission may coexist with a pending prompt");
+        let still_pending = hub.session_view("created".to_string()).await.unwrap();
+        assert_eq!(still_pending["session"]["phase"], "running");
+        assert!(
+            still_pending["live"][&interactions]
+                .get(&interaction_id)
+                .is_some()
+        );
+        hub.unsubscribe(other.id, other.generation).await;
+
+        let (reconnected, _reconnected_guard) = hub
+            .observe_session("created".to_string(), None)
+            .await
+            .unwrap();
+        session = reconnected;
+        let response = if kind == "permission" {
+            json!({ "outcome": { "outcome": "selected", "optionId": "allow" } })
+        } else {
+            json!({ "action": "accept", "content": {} })
+        };
+        hub.business_request(json!({
+            "type": format!("{kind}/respond"),
+            "requestId": "reconnected-response",
+            "sessionId": "created",
+            format!("{kind}Id"): interaction_id,
+            "outcome": response.get("outcome"),
+            "response": response,
+        }))
+        .await
+        .expect("the reconnected observer can answer the original interaction");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = session.events.recv().await.unwrap().into_string();
+                let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+                if event["type"] == "bridge/session_turn_complete" {
+                    assert_eq!(event["operationId"], accepted["operationId"]);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the original turn completes after the reconnected response");
+        let completed = hub.session_view("created".to_string()).await.unwrap();
+        assert_eq!(completed["session"]["phase"], "ready");
+        assert!(
+            completed["live"][&interactions]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            completed["baseline"]["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|update| {
+                    update["content"]["text"]
+                        .as_str()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                        .as_ref()
+                        == Some(&response)
+                })
+        );
+        hub.unsubscribe(session.id, session.generation).await;
+        hub.unsubscribe(browser.id, browser.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_permission_survives_observer_reconnect_and_remains_actionable() {
+        pending_interaction_survives_reconnect("permission").await;
+    }
+
+    #[tokio::test]
+    async fn pending_elicitation_survives_observer_reconnect_and_remains_actionable() {
+        pending_interaction_survives_reconnect("elicitation").await;
+    }
+
+    #[tokio::test]
     async fn independent_session_capabilities_restore_without_listing() {
         let (hub, observer) = capability_fixture(&["--no-list"]).await;
         let response = get_session_view(
@@ -3146,6 +4436,7 @@ mod tests {
             }),
             Query(SessionViewQuery {
                 cwd: Some(env!("CARGO_MANIFEST_DIR").to_string()),
+                ..Default::default()
             }),
         )
         .await;
@@ -3187,7 +4478,9 @@ mod tests {
             }),
             Query(SessionViewQuery {
                 cwd: Some(env!("CARGO_MANIFEST_DIR").to_string()),
+                ..Default::default()
             }),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(stream.status(), StatusCode::OK);
@@ -3198,6 +4491,7 @@ mod tests {
             }),
             Query(SessionViewQuery {
                 cwd: Some("/ignored-route-workspace".to_string()),
+                ..Default::default()
             }),
         )
         .await;
@@ -3223,6 +4517,7 @@ mod tests {
                 }),
                 Query(SessionViewQuery {
                     cwd: Some(env!("CARGO_MANIFEST_DIR").to_string()),
+                    ..Default::default()
                 }),
             )
             .await;
@@ -3487,13 +4782,13 @@ mod tests {
             } else {
                 vec!["--close"]
             };
-            let (hub, observer) = capability_fixture_with_timeout(&flags, 0).await;
-            // Observe before creation so zero means exactly the subsequent disconnect.
-            let session_stream = hub.subscribe_session("created".into()).await.unwrap();
+            let (hub, observer) = capability_fixture_with_timeout(&flags, 1).await;
             let created = hub
                 .business_request(json!({"type":"session/new", "requestId":"new"}))
                 .await
                 .unwrap();
+            let (session_stream, _session_guard) =
+                hub.observe_session("created".into(), None).await.unwrap();
             hub.start_turn(
                 "created".into(),
                 created["view"]["session"]["historyRevision"]
@@ -3750,6 +5045,7 @@ mod tests {
             Path("stale-session".to_string()),
             State(state.clone()),
             Query(SessionViewQuery::default()),
+            HeaderMap::new(),
         )
         .await;
         assert_eq!(missing_events.status(), StatusCode::NOT_FOUND);
@@ -3968,8 +5264,8 @@ mod tests {
             .await
             .expect("saved session view");
         let initial_incarnation = initial["session"]["incarnation"].as_u64().unwrap();
-        let session_stream = hub
-            .subscribe_session("saved-session".to_string())
+        let (session_stream, _session_guard) = hub
+            .observe_session("saved-session".to_string(), None)
             .await
             .expect("session subscription");
         let revision = initial["session"]["historyRevision"]
@@ -4002,8 +5298,8 @@ mod tests {
         .await
         .expect("the completed unobserved session was not closed");
 
-        let reconnected = hub
-            .subscribe_session("saved-session".to_string())
+        let (reconnected, _reconnected_guard) = hub
+            .observe_session("saved-session".to_string(), None)
             .await
             .expect("reconnected session subscription");
         let reloaded = hub
@@ -4570,6 +5866,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_subscription_bootstrap_preserves_auth_without_session_or_request_replay() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(runtime.snapshot());
+        }
+        let auth_events = [
+            json!({ "type": "bridge/auth_terminal_started", "terminalId": "auth" }),
+            json!({ "type": "bridge/auth_terminal_output", "terminalId": "auth", "data": "Sign in" }),
+        ];
+        let request_events = [
+            json!({ "type": "acp/elicitation_request", "elicitationId": "form", "request": { "mode": "form" } }),
+            json!({ "type": "acp/elicitation_request", "elicitationId": "url", "request": { "mode": "url", "elicitationId": "flow" } }),
+            json!({ "type": "acp/elicitation_resolved", "elicitationId": "url", "response": { "action": "accept" } }),
+            json!({ "type": "acp/elicitation_complete", "notification": { "elicitationId": "flow" } }),
+            json!({ "type": "acp/mcp_connection", "connectionId": "mcp" }),
+            json!({ "type": "acp/mcp_message", "connectionId": "mcp", "message": {} }),
+        ];
+        for event in auth_events.iter().chain(request_events.iter()).chain([
+            &json!({ "type": "acp/session_created", "cwd": "/workspace", "response": { "sessionId": "session" } }),
+            &json!({ "type": "acp/prompt_started", "sessionId": "session", "requestId": "prompt", "prompt": [] }),
+            &json!({ "type": "acp/session_update", "notification": { "sessionId": "session", "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Private output" } } } }),
+            &json!({ "type": "bridge/error", "message": "Agent exited" }),
+            &json!({ "type": "bridge/phase", "phase": "error" }),
+        ]) {
+            hub.publish(1, event.to_string()).await;
+        }
+
+        let global = hub.subscribe_global().await.unwrap();
+        let initial = global
+            .initial_events
+            .iter()
+            .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(initial.len(), 4);
+        assert_eq!(&initial[..2], &auth_events);
+        assert_eq!(initial[2]["type"], "bridge/connection_error");
+        assert_eq!(initial[2]["message"], "Agent exited");
+        assert_eq!(
+            initial[3],
+            json!({ "type": "bridge/connection", "phase": "error" })
+        );
+
+        let aggregate = hub.subscribe().await.unwrap();
+        let aggregate_events = aggregate
+            .initial_events
+            .iter()
+            .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            aggregate_events
+                .iter()
+                .any(|event| event["type"] == "bridge/runtime_snapshot")
+        );
+        assert!(
+            aggregate_events
+                .iter()
+                .any(|event| event["type"] == "bridge/runtime_session")
+        );
+        for event in request_events {
+            assert!(
+                aggregate_events.contains(&event),
+                "aggregate replay lost {event}"
+            );
+        }
+        hub.unsubscribe(global.id, global.generation).await;
+        assert!(hub.state.lock().await.global_subscribers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrelated_session_events_do_not_consume_global_subscriber_capacity() {
+        let hub = test_hub();
+        let (input, _commands) = mpsc::channel(1);
+        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        {
+            let mut state = hub.state.lock().await;
+            state.generation = 1;
+            state.input = Some(input);
+            state.canonical.snapshot = Some(runtime.snapshot());
+        }
+        let mut global = hub.subscribe_global().await.unwrap();
+        for index in 0..=SUBSCRIBER_QUEUE_CAPACITY {
+            let session_id = format!("session-{index}");
+            runtime
+                .open_new(
+                    "epoch",
+                    &session_id,
+                    "/workspace",
+                    json!({ "sessionId": session_id }),
+                )
+                .unwrap();
+            let delta = runtime.deltas_after(index as u64).unwrap().remove(0);
+            for event in [
+                json!({ "type": "bridge/internal_runtime_delta", "value": delta }),
+                json!({ "type": "acp/session_update", "notification": { "sessionId": session_id, "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Private output" } } } }),
+                json!({ "type": "bridge/session_delta", "sessionId": session_id, "viewRevision": 2, "change": { "kind": "turn_update" } }),
+                json!({ "type": "bridge/error", "requestId": session_id, "message": "Session request failed" }),
+            ] {
+                hub.publish(1, event.to_string()).await;
+            }
+        }
+        assert!(global.events.try_recv().is_err());
+        {
+            let state = hub.state.lock().await;
+            let subscriber = state.global_subscribers.get(&global.id).unwrap();
+            assert_eq!(subscriber.queued_bytes.load(Ordering::Acquire), 0);
+        }
+        hub.publish(
+            1,
+            json!({ "type": "bridge/phase", "phase": "ready" }).to_string(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &global.events.try_recv().unwrap().into_string()
+            )
+            .unwrap(),
+            json!({ "type": "bridge/connection", "phase": "ready" }),
+        );
+        hub.finish_generation(0).await;
+        assert!(
+            hub.state
+                .lock()
+                .await
+                .global_subscribers
+                .contains_key(&global.id)
+        );
+        hub.finish_generation(1).await;
+        assert!(global.events.recv().await.is_none());
+    }
+
+    #[test]
+    fn global_authentication_replay_is_bounded_by_count_and_bytes() {
+        let mut bootstrap = BridgeBootstrap::default();
+        for index in 0..=MAX_AUTH_REPLAY_EVENTS {
+            bootstrap.update(
+                &json!({ "type": "bridge/auth_terminal_output", "data": index.to_string() })
+                    .to_string(),
+            );
+        }
+        let events = bootstrap.global_events().collect::<Vec<_>>();
+        assert_eq!(events.len(), MAX_AUTH_REPLAY_EVENTS);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[0]).unwrap()["data"],
+            "1"
+        );
+        bootstrap.update(&json!({ "type": "bridge/auth_terminal_output", "data": "x".repeat(MAX_AUTH_REPLAY_BYTES) }).to_string());
+        assert_eq!(bootstrap.global_events().count(), 0);
+        assert_eq!(bootstrap.auth_event_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn subscriber_count_has_a_hard_global_limit() {
         let hub = test_hub();
         let (input, _commands) = mpsc::channel(1);
@@ -4580,14 +6040,21 @@ mod tests {
         }
 
         let mut subscriptions = Vec::with_capacity(MAX_SUBSCRIBERS);
-        for _ in 0..MAX_SUBSCRIBERS {
-            subscriptions.push(hub.subscribe().await.expect("subscriber below hard limit"));
+        for index in 0..MAX_SUBSCRIBERS {
+            let subscription = match index % 3 {
+                0 => hub.subscribe().await,
+                1 => hub.subscribe_global().await,
+                _ => hub.subscribe_session("session".to_string()).await,
+            };
+            subscriptions.push(subscription.expect("subscriber below hard limit"));
         }
         assert!(hub.subscribe().await.is_none());
+        assert!(hub.subscribe_global().await.is_none());
+        assert!(hub.subscribe_session("session".to_string()).await.is_none());
 
         let released = subscriptions.pop().unwrap();
         hub.unsubscribe(released.id, released.generation).await;
-        assert!(hub.subscribe().await.is_some());
+        assert!(hub.subscribe_global().await.is_some());
     }
 
     #[tokio::test]
@@ -4787,7 +6254,7 @@ mod tests {
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
         runtime
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -4960,7 +6427,7 @@ mod tests {
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
         runtime
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,
@@ -4972,7 +6439,7 @@ mod tests {
             )
             .unwrap();
         runtime
-            .append_turn_update(
+            .append_runtime_update_for_test(
                 "epoch",
                 "session",
                 incarnation,

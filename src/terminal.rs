@@ -105,6 +105,7 @@ struct TerminalState {
     truncated: bool,
     exit_status: Option<TerminalExitStatus>,
     released: bool,
+    released_published: bool,
 }
 
 impl TerminalManager {
@@ -288,10 +289,6 @@ impl TerminalManager {
         }
     }
 
-    pub async fn assert_reference(&self, terminal_id: &str, session_id: &str) -> Result<(), Error> {
-        self.require(terminal_id, session_id).await.map(|_| ())
-    }
-
     #[cfg(test)]
     pub(crate) async fn pause_references_for_test(&self) -> impl Drop + '_ {
         self.terminals.lock().await
@@ -436,8 +433,25 @@ impl TerminalManager {
     }
 
     async fn emit_snapshot(&self, terminal: &Terminal) {
+        // Reserve delivery capacity before consuming a delta. Once the state is
+        // locked, composing and enqueueing both projections is one local cut;
+        // concurrent stdout/stderr publishers cannot reverse append order.
+        let permit = match &self.snapshots {
+            Some(snapshots) => match snapshots.reserve().await {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.events.cancel_generation();
+                    return;
+                }
+            },
+            None => None,
+        };
+        let mut state = terminal.state.lock().await;
+        if state.released_published {
+            return;
+        }
+        state.released_published = state.released;
         let (snapshot, internal_snapshot) = {
-            let mut state = terminal.state.lock().await;
             let (output, append) = if !state.pending_output.is_empty() {
                 (std::mem::take(&mut state.pending_output), true)
             } else if state.output.starts_with(&state.last_published_output) {
@@ -471,17 +485,11 @@ impl TerminalManager {
             })
             .to_string(),
         );
-        if let Some(snapshots) = &self.snapshots {
-            if snapshots
-                .send(TerminalSnapshot {
-                    incarnation: terminal.incarnation,
-                    value: internal_snapshot,
-                })
-                .await
-                .is_err()
-            {
-                self.events.cancel_generation();
-            }
+        if let Some(permit) = permit {
+            permit.send(TerminalSnapshot {
+                incarnation: terminal.incarnation,
+                value: internal_snapshot,
+            });
         }
     }
 }
@@ -702,6 +710,74 @@ mod tests {
             .await
             .unwrap();
         assert!(retained.value["output"].as_str().unwrap().len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_snapshot_delivery_does_not_consume_or_reorder_output() {
+        let root = tempfile::tempdir().unwrap();
+        let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (snapshots, mut snapshot_rx) = mpsc::channel(1);
+        snapshots
+            .send(TerminalSnapshot {
+                incarnation: 1,
+                value: json!({}),
+            })
+            .await
+            .unwrap();
+        let terminals = TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots));
+        let terminal = Terminal {
+            id: "ordered-terminal".to_string(),
+            session_id: "session".to_string(),
+            incarnation: 1,
+            output_limit: 1024,
+            state: Mutex::new(TerminalState {
+                output: b"first".to_vec(),
+                pending_output: b"first".to_vec(),
+                ..Default::default()
+            }),
+            changed: Notify::new(),
+            kill: Mutex::new(None),
+            readers_remaining: AtomicUsize::new(0),
+            reader_tasks: Mutex::new(Vec::new()),
+        };
+        let first = terminals.emit_snapshot(&terminal);
+        tokio::pin!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+        {
+            let mut state = terminal.state.lock().await;
+            assert_eq!(state.pending_output, b"first");
+            assert!(state.last_published_output.is_empty());
+            state.output.extend_from_slice(b"second");
+            state.pending_output.extend_from_slice(b"second");
+        }
+        assert!(event_rx.try_recv().is_err());
+        let second = terminals.emit_snapshot(&terminal);
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+        snapshot_rx.recv().await.unwrap();
+        first.await;
+        assert_eq!(
+            snapshot_rx.recv().await.unwrap().value["output"],
+            "firstsecond"
+        );
+        second.await;
+        assert_eq!(snapshot_rx.recv().await.unwrap().value["output"], "");
+        let first_public: Value = serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
+        let second_public: Value = serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(first_public["terminal"]["output"], "firstsecond");
+        assert_eq!(second_public["terminal"]["output"], "");
+        terminal.state.lock().await.released = true;
+        terminals.emit_snapshot(&terminal).await;
+        assert_eq!(snapshot_rx.recv().await.unwrap().value["released"], true);
+        event_rx.recv().await.unwrap();
+        terminal.state.lock().await.exit_status = Some(TerminalExitStatus::new().exit_code(0));
+        terminals.emit_snapshot(&terminal).await;
+        assert!(
+            snapshot_rx.try_recv().is_err(),
+            "a late process waiter cannot publish after release"
+        );
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

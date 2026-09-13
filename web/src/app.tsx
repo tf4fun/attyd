@@ -29,7 +29,7 @@ import { Conversation } from "./components/acp/conversation";
 import { ElicitationCard, ExternalFlowCard } from "./components/acp/elicitation";
 import { PermissionCard } from "./components/acp/permission";
 import { PlanCard } from "./components/acp/plan";
-import { CloseSessionDialog } from "./components/acp/close-session-dialog";
+import { SessionActionDialog } from "./components/acp/session-action-dialog";
 import { NewSessionDialog } from "./components/acp/new-session-dialog";
 import {
   PromptComposer,
@@ -59,7 +59,7 @@ const AuthTerminalCard = lazy(() => import("./components/acp/auth-terminal").the
 
 export default function App() {
   const { t } = useTranslation("app");
-  const [closingSessionId, setClosingSessionId] = useState<string>();
+  const [sessionAction, setSessionAction] = useState<{ kind: "close" | "delete"; sessionId: string }>();
   const {
     state,
     reconnect,
@@ -427,7 +427,7 @@ export default function App() {
   }, [measureThreadScroll, state.session?.sessionId]);
 
   useEffect(() => {
-    setClosingSessionId(undefined);
+    setSessionAction(undefined);
     setComposerDraft(undefined);
     setQueuedPrompts([]);
     setQueueError(undefined);
@@ -453,13 +453,13 @@ export default function App() {
   const changingControl = state.pendingSessionControl != null;
   const authBlocksCurrent = state.authStatus === "required" || state.pendingAuth != null;
   const authBlocksNewSession = authBlocksCurrent || state.authStatus === "logged_out";
-  const ready = state.phase === "ready" && state.sessionSyncPhase === "ready" && state.session != null && !transitioning && !changingControl && state.runtimeOperation == null && !authBlocksCurrent;
-  const composerAvailable = state.phase === "ready" && state.session != null &&
-    !transitioning && !changingControl && state.runtimeOperation == null && !authBlocksCurrent &&
-    (state.sessionSyncPhase === "ready" || state.running);
   const deletingCurrentSession = state.pendingSessionDeletions.some(
     ({ sessionId }) => sessionId === state.session?.sessionId,
   );
+  const ready = state.phase === "ready" && state.sessionSyncPhase === "ready" && state.session != null && !transitioning && !changingControl && !deletingCurrentSession && state.runtimeOperation == null && !authBlocksCurrent;
+  const composerAvailable = state.phase === "ready" && state.session != null &&
+    !transitioning && !changingControl && !deletingCurrentSession && state.runtimeOperation == null && !authBlocksCurrent &&
+    (state.sessionSyncPhase === "ready" || state.running);
   const terminalAuthOwnsInteraction = state.authTerminal?.status === "starting" ||
     state.authTerminal?.status === "running" ||
     state.authTerminal?.status === "succeeded";
@@ -555,10 +555,8 @@ export default function App() {
     t,
   ]);
   const requestSessionDeletion = useCallback((sessionId: string) => {
-    if (window.confirm(t("deleteConfirm"))) {
-      deleteSession(sessionId);
-    }
-  }, [deleteSession, t]);
+    setSessionAction({ kind: "delete", sessionId });
+  }, []);
 
   useEffect(() => {
     if (!ready || state.running || queuePaused || queuedPrompts.length === 0) return;
@@ -805,7 +803,7 @@ export default function App() {
                         <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> {t("forkThread")}</button>
                       ) : null}
                       {sessionCapabilities?.close != null ? (
-                        <button type="button" className="danger" disabled={transitioning || changingControl || state.runtimeOperation != null} onClick={() => setClosingSessionId(state.session?.sessionId)}><LogOut size={14} /> {t("closeThread")}</button>
+                        <button type="button" className="danger" disabled={transitioning || changingControl || state.runtimeOperation != null} onClick={() => state.session && setSessionAction({ kind: "close", sessionId: state.session.sessionId })}><LogOut size={14} /> {t("closeThread")}</button>
                       ) : null}
                       {sessionCapabilities?.delete != null ? (
                         <button
@@ -1077,14 +1075,23 @@ export default function App() {
         </div>
         </>}
       </main>
-      {closingSessionId && closingSessionId === state.session?.sessionId ? (
-        <CloseSessionDialog
-          disabled={transitioning || changingControl || state.runtimeOperation != null}
-          onCancel={() => setClosingSessionId(undefined)}
+      {sessionAction && (sessionAction.kind === "delete" || sessionAction.sessionId === state.session?.sessionId) ? (
+        <SessionActionDialog
+          action={sessionAction.kind}
+          sessionTitle={knownSessions.find(({ sessionId }) => sessionId === sessionAction.sessionId)?.title ?? undefined}
+          disabled={state.phase !== "ready" || transitioning || changingControl || (sessionAction.kind === "close"
+            ? state.runtimeOperation != null
+            : busySessionIds.includes(sessionAction.sessionId) || navigationDisabled ||
+              state.pendingSessionDeletions.some(({ sessionId }) => sessionId === sessionAction.sessionId))}
+          onCancel={() => setSessionAction(undefined)}
           onConfirm={() => {
-            setClosingSessionId(undefined);
-            setQueuePaused(true);
-            closeSession();
+            setSessionAction(undefined);
+            if (sessionAction.kind === "delete") {
+              deleteSession(sessionAction.sessionId);
+            } else {
+              setQueuePaused(true);
+              closeSession();
+            }
           }}
         />
       ) : null}

@@ -292,6 +292,134 @@ test("drives permission and form ACP interactions with real focus restoration", 
   expect(browserErrors).toEqual([]);
 });
 
+for (const kind of ["permission", "elicitation"] as const) {
+  test(`restores a pending ${kind} after page reload and answers the original request`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
+    await composer.press("Enter");
+    const interaction = kind === "permission"
+      ? page.getByRole("alertdialog", { name: "Agent permission request" })
+      : page.getByRole("dialog", { name: "Agent input request" });
+    await expect(interaction).toBeVisible();
+
+    await page.reload();
+    await expect(interaction).toBeVisible();
+    if (kind === "permission") {
+      await interaction.getByRole("button", { name: "Allow once" }).click();
+      await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
+    } else {
+      await interaction.getByLabel(/Name/).fill("Ada Lovelace");
+      await interaction.getByLabel(/Count/).fill("2");
+      await interaction.getByLabel(/Channel/).selectOption("stable");
+      await interaction.getByLabel("fast").check();
+      await interaction.getByLabel(/Starts at/).fill("2026-08-31T00:00:00Z");
+      await interaction.getByRole("button", { name: "Submit" }).click();
+      await expect(page.getByText("Form accept.", { exact: true })).toBeVisible();
+    }
+    await expect(interaction).toBeHidden();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+for (const { kind, listState } of [
+  { kind: "permission", listState: "stalled" },
+  { kind: "elicitation", listState: "failed" },
+] as const) {
+  test(`restores a pending ${kind} after reload while session listing is ${listState}`, async ({ page }) => {
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
+    await composer.press("Enter");
+    const interaction = kind === "permission"
+      ? page.getByRole("alertdialog", { name: "Agent permission request" })
+      : page.getByRole("dialog", { name: "Agent input request" });
+    await expect(interaction).toBeVisible();
+    const sessionUrl = page.url();
+    const browserErrors = collectBrowserErrors(page, listState === "failed" ? [500] : []);
+    let redispatchedTurns = 0;
+    page.on("request", (request) => {
+      if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/turns")) {
+        redispatchedTurns += 1;
+      }
+    });
+
+    let releaseList!: () => void;
+    const listGate = new Promise<void>((resolve) => { releaseList = resolve; });
+    let notifyListStarted!: () => void;
+    const listStarted = new Promise<void>((resolve) => { notifyListStarted = resolve; });
+    const listError = "Session listing failed during reload";
+    await page.route("**/api/v1/sessions", async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.continue();
+        return;
+      }
+      notifyListStarted();
+      await listGate;
+      if (listState === "failed") {
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: listError }) });
+      } else {
+        await route.continue();
+      }
+    });
+
+    try {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await listStarted;
+      await expect(interaction).toBeVisible();
+      await expect(page).toHaveURL(sessionUrl);
+      await expect(page.locator(".composer-reconnect")).toBeHidden();
+      if (listState === "failed") {
+        releaseList();
+        await expect(page.getByRole("alert").filter({ hasText: listError })).toBeVisible();
+        await expect(page.locator(".composer-reconnect")).toBeHidden();
+      }
+
+      if (kind === "permission") {
+        await interaction.getByRole("button", { name: "Allow once" }).click();
+        await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
+      } else {
+        await interaction.getByLabel(/Name/).fill("Ada Lovelace");
+        await interaction.getByLabel(/Count/).fill("2");
+        await interaction.getByLabel(/Channel/).selectOption("stable");
+        await interaction.getByLabel("fast").check();
+        await interaction.getByLabel(/Starts at/).fill("2026-08-31T00:00:00Z");
+        await interaction.getByRole("button", { name: "Submit" }).click();
+        await expect(page.getByText("Form accept.", { exact: true })).toBeVisible();
+      }
+      await expect(interaction).toBeHidden();
+      await expect(page.getByRole("button", { name: "Stop current turn" })).toBeHidden();
+      await expect(composer).toBeEnabled();
+      await expect(page.locator(".composer-reconnect")).toBeHidden();
+      expect(redispatchedTurns).toBe(0);
+      expect(browserErrors).toEqual([]);
+    } finally {
+      releaseList();
+      await page.unrouteAll({ behavior: "wait" });
+    }
+  });
+}
+
+test("keeps the connection usable when the Agent cancels pending interactions", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/sessions/saved-session");
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("agent-cancel-interactions-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("Connection survived Agent cancellations.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alertdialog", { name: "Agent permission request" })).toBeHidden();
+  await expect(page.getByRole("dialog", { name: "Agent input request" })).toBeHidden();
+  await page.reload();
+  await expect(page.getByText("Connection survived Agent cancellations.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(browserErrors).toEqual([]);
+});
+
 test("queues ACP follow-ups and uses session cancel for Send now", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");
@@ -674,6 +802,48 @@ test("runs different ACP sessions concurrently without treating running as a glo
   expect(browserErrors).toEqual([]);
 });
 
+test("deletes an unopened session from its project without creating or opening a session", async ({ page }) => {
+  const cwd = join(process.cwd(), "bin");
+  const server = await startRustTestServer({
+    cwd,
+    command: [process.execPath, "--import", "tsx", join(process.cwd(), "tests/fixtures/fake-agent.ts")],
+  });
+  const browserErrors = collectBrowserErrors(page);
+  const sessionRequests: string[] = [];
+  page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path.startsWith("/api/v1/sessions/") ||
+      (path === "/api/v1/sessions" && request.method() === "POST")) {
+      sessionRequests.push(`${request.method()} ${path}`);
+    }
+  });
+  try {
+    await page.goto(`http://127.0.0.1:${server.port}${projectPath(cwd)}`);
+    await expect(page.locator(".project-browser-path")).toHaveText(cwd);
+    await page.getByRole("button", { name: "Delete Saved ACP session", exact: true }).click();
+    const dialog = page.getByRole("alertdialog", { name: "Delete session?" });
+    await expect(dialog).toContainText("Saved ACP session");
+    const deleted = page.waitForResponse((response) =>
+      response.request().method() === "DELETE" &&
+      new URL(response.url()).pathname === "/api/v1/sessions/saved-session"
+    );
+    await dialog.getByRole("button", { name: "Delete session", exact: true }).click();
+    expect((await deleted).status()).toBe(204);
+    await expect(page.locator(".project-session-link").filter({ hasText: "Saved ACP session" })).toHaveCount(0);
+    await expect(page.locator(".project-session-link").filter({ hasText: "Earlier Agent thread" })).toBeVisible();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    await page.reload();
+    await expect(page.locator(".project-browser-path")).toHaveText(cwd);
+    await expect(page.locator(".project-session-link")).toHaveCount(1);
+    expect(sessionRequests).toEqual(["DELETE /api/v1/sessions/saved-session"]);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+    await page.screenshot({ path: test.info().outputPath("project-after-cold-delete.png") });
+  } finally {
+    await server.close();
+  }
+});
+
 test("closes then deletes both switched-away and current ACP sessions", async ({ page }) => {
   const server = await startRustTestServer({
     cwd: process.cwd(),
@@ -700,20 +870,211 @@ test("closes then deletes both switched-away and current ACP sessions", async ({
     await openSessionPicker(page);
     const oldDelete = picker.getByRole("button", { name: "Delete Saved ACP session" });
     await expect(oldDelete).toBeEnabled();
-    page.once("dialog", (dialog) => dialog.accept());
     await oldDelete.click();
+    const dialog = page.getByRole("alertdialog", { name: "Delete session?" });
+    await expect(dialog).toContainText("Saved ACP session");
+    await expect(dialog.getByRole("button", { name: "Keep session" })).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(oldDelete).toBeFocused();
+    await expect(picker.getByText("Saved ACP session", { exact: true })).toBeVisible();
+    await oldDelete.click();
+    await dialog.getByRole("button", { name: "Delete session", exact: true }).click();
     await expect(picker.getByText("Saved ACP session", { exact: true })).toBeHidden();
     await expect(page).toHaveURL(/\/sessions\/earlier-session$/u);
     await expect(page.getByRole("alert")).toHaveCount(0);
 
     await page.keyboard.press("Escape");
     await page.getByRole("button", { name: "Thread actions" }).click();
-    page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Delete thread" }).click();
-    await expect(page).toHaveURL(/\/$/u);
-    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
-    await expect(picker.getByText("Earlier Agent thread", { exact: true })).toBeHidden();
+    await expect(dialog).toContainText("Earlier Agent thread");
+    await dialog.getByRole("button", { name: "Delete session", exact: true }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
+    await expect(page.locator(".project-browser-path")).toHaveText(process.cwd());
+    await expect(page.locator(".project-session-link").filter({ hasText: "Earlier Agent thread" })).toHaveCount(0);
     await expect(page.getByRole("alert")).toHaveCount(0);
+    await page.screenshot({ path: test.info().outputPath("project-after-delete.png") });
+    expect(browserErrors).toEqual([]);
+  } finally {
+    await server.close();
+  }
+});
+
+for (const action of ["close", "delete"] as const) {
+  test(`retires the open session after an external ${action} without SSE reopening it`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    const sessionEvents: string[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/v1/sessions/saved-session/events") {
+        sessionEvents.push(request.url());
+      }
+    });
+    const observed = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === "/api/v1/sessions/saved-session/events" &&
+      response.status() === 200
+    );
+    await page.goto("/sessions/saved-session");
+    await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await observed;
+    const streamsBeforeRetirement = sessionEvents.length;
+    const origin = new URL(page.url()).origin;
+
+    // A separate API client mutates the same session. This page gets no local
+    // request callback: its owner-scoped SSE retirement must drive the exit.
+    const response = action === "close"
+      ? await page.request.post(`${origin}/api/v1/sessions/saved-session/close`)
+      : await page.request.delete(`${origin}/api/v1/sessions/saved-session`);
+    expect(response.status()).toBe(action === "close" ? 200 : 204);
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
+    await expect(page.locator(".project-browser-path")).toHaveText(process.cwd());
+    await expect(composer).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toHaveCount(0);
+
+    // Exercise recovery and directory reads after the retirement. Neither is
+    // permission to observe/load the closed session again. Do not GET its view:
+    // an explicit cold view request would itself materialize a saved session.
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event("online"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    const refreshed = page.waitForResponse((response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      response.status() === 200
+    );
+    await page.getByRole("button", { name: "Refresh projects and sessions", exact: true }).click();
+    const listed = await (await refreshed).json();
+    expect(listed.sessions.some((session: { sessionId: string }) => session.sessionId === "saved-session"))
+      .toBe(action === "close");
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
+    await expect(composer).toHaveCount(0);
+    expect(sessionEvents).toHaveLength(streamsBeforeRetirement);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+test("keeps a reopened session when its old close HTTP response arrives late", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  const cwd = process.cwd();
+  await page.goto(projectPath(cwd));
+  await page.locator(".project-session-link").filter({ hasText: "Saved ACP session" }).click();
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
+  await expect(composer).toBeEnabled();
+  const origin = new URL(page.url()).origin;
+  const viewUrl = `${origin}/api/v1/sessions/saved-session`;
+  const original = await (await page.request.get(viewUrl)).json();
+  let releaseResponse!: () => void;
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  let notifyClosed!: (status: number) => void;
+  let rejectClosed!: (error: unknown) => void;
+  const closedOnAgent = new Promise<number>((resolve, reject) => {
+    notifyClosed = resolve;
+    rejectClosed = reject;
+  });
+  await page.route("**/api/v1/sessions/saved-session/close", async (route) => {
+    try {
+      const response = await route.fetch();
+      notifyClosed(response.status());
+      await responseGate;
+      await route.fulfill({ response });
+    } catch (error) {
+      rejectClosed(error);
+      throw error;
+    }
+  });
+  try {
+    await page.getByRole("button", { name: "Thread actions", exact: true }).click();
+    await page.getByRole("button", { name: "Close thread", exact: true }).click();
+    await page.getByRole("alertdialog", { name: "Close session?" })
+      .getByRole("button", { name: "Close session", exact: true }).click();
+    expect(await closedOnAgent).toBe(200);
+
+    // Back remains a real navigation even if the retirement event has already
+    // replaced the current session URL with its project. Reopen explicitly while
+    // the first close request's browser callback is still waiting behind the gate.
+    const projectListed = page.waitForResponse((response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      response.status() === 200
+    );
+    await page.goBack();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
+    await projectListed;
+    await page.locator(".project-session-link").filter({ hasText: "Saved ACP session" }).click();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+    await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
+    await expect(composer).toBeEnabled();
+    const reopened = await (await page.request.get(viewUrl)).json();
+    expect(reopened.sessionIncarnation).toBeGreaterThan(original.sessionIncarnation);
+    await composer.fill("Keep the new incarnation's draft");
+
+    const oldResponse = page.waitForResponse((response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/v1/sessions/saved-session/close"
+    );
+    const refreshedAfterReply = page.waitForResponse((response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      response.status() === 200
+    );
+    releaseResponse();
+    expect((await oldResponse).status()).toBe(200);
+    // The directory refresh follows the old request's success callback, making
+    // the assertions below wait for that callback rather than an arbitrary delay.
+    await refreshedAfterReply;
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+    await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
+    await expect(composer).toBeEnabled();
+    await expect(composer).toHaveValue("Keep the new incarnation's draft");
+    expect((await (await page.request.get(viewUrl)).json()).sessionIncarnation)
+      .toBe(reopened.sessionIncarnation);
+    expect(browserErrors).toEqual([]);
+  } finally {
+    releaseResponse();
+    await page.unrouteAll({ behavior: "wait" });
+  }
+});
+
+test("keeps the session and composer when deletion fails during close", async ({ page }) => {
+  const cwd = process.cwd();
+  const server = await startRustTestServer({
+    cwd,
+    command: [process.execPath, "--import", "tsx", join(cwd, "tests/fixtures/fake-agent.ts"), "--fail-close-once"],
+  });
+  const origin = `http://127.0.0.1:${server.port}`;
+  const browserErrors = collectBrowserErrors(page, [409]);
+  try {
+    await page.goto(`${origin}/sessions/saved-session`);
+    const composer = page.locator('textarea[role="combobox"]');
+    const heading = page.getByRole("heading", { name: "Saved ACP session", exact: true });
+    await expect(heading).toBeVisible();
+    await expect(composer).toBeEnabled();
+    const original = await (await page.request.get(`${origin}/api/v1/sessions/saved-session`)).json();
+    await composer.fill("Keep my draft after failed deletion");
+    await page.getByRole("button", { name: "Thread actions", exact: true }).click();
+    await page.getByRole("button", { name: "Delete thread", exact: true }).click();
+    const deleted = page.waitForResponse((response) =>
+      response.request().method() === "DELETE" &&
+      new URL(response.url()).pathname === "/api/v1/sessions/saved-session"
+    );
+    await page.getByRole("alertdialog", { name: "Delete session?" })
+      .getByRole("button", { name: "Delete session", exact: true }).click();
+    expect((await deleted).status()).toBe(409);
+    await expect(page.getByText("Synthetic close failure", { exact: true })).toBeVisible();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
+    await expect(heading).toBeVisible();
+    await expect(composer).toBeEnabled();
+    await expect(composer).toHaveValue("Keep my draft after failed deletion");
+    await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
+    await expect(page.locator(".project-browser-path")).toHaveCount(0);
+    // Here the close itself failed, so the original owner remains materialized.
+    // Check its identity only after asserting that the UI never left it.
+    const retained = await (await page.request.get(`${origin}/api/v1/sessions/saved-session`)).json();
+    expect(retained.phase).toBe("ready");
+    expect(retained.sessionIncarnation).toBe(original.sessionIncarnation);
     expect(browserErrors).toEqual([]);
   } finally {
     await server.close();
@@ -2117,7 +2478,7 @@ for (const width of [1280, 390]) {
   });
 }
 
-test("puts created and forked sessions in the URL and returns home on close", async ({ page }) => {
+test("puts created and forked sessions in the URL and returns to their project on close", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/");
   await page.getByRole("button", { name: "New project", exact: true }).click();
@@ -2144,10 +2505,14 @@ test("puts created and forked sessions in the URL and returns home on close", as
   }
   await page.getByRole("button", { name: "Close thread" }).click();
   await page.getByRole("alertdialog", { name: "Close session?" }).getByRole("button", { name: "Close session", exact: true }).click();
-  await expect(page).toHaveURL(/\/$/u);
-  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
+  await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
+  await expect(page.locator(".project-browser-path")).toHaveText(process.cwd());
+  await expect(page.getByRole("button", { name: "New session in project", exact: true })).toBeEnabled();
   await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.reload();
+  await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
+  await expect(page.locator(".project-browser-path")).toHaveText(process.cwd());
+  await page.screenshot({ path: test.info().outputPath("project-after-close.png") });
   expect(browserErrors).toEqual([]);
 });
 
@@ -2187,7 +2552,8 @@ test("confirms closing a running session and permits live configuration changes"
     await expect(page.getByText("Waiting for close.", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Close thread" }).click();
     await dialog.getByRole("button", { name: "Close session", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
+    await expect(page.locator(".project-browser-path")).toHaveText(process.cwd());
     expect(closeRequests).toBe(1);
     expect(errors).toEqual([]);
   } finally {
@@ -2352,7 +2718,8 @@ test("browses cross-workspace projects and restores a shared session with its ow
     );
     await page.getByRole("button", { name: "Close thread" }).click();
     await page.getByRole("alertdialog", { name: "Close session?" }).getByRole("button", { name: "Close session", exact: true }).click();
-    await expect(page).toHaveURL(/\/$/u);
+    await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(otherCwd));
+    await expect(page.locator(".project-browser-path")).toHaveText(otherCwd);
     await refreshedList;
     const shared = await browser.newPage();
     const sharedErrors = collectBrowserErrors(shared);
@@ -2681,6 +3048,17 @@ function collectBrowserErrors(page: Page, expectedHttpStatuses: number[] = []): 
   page.on("console", (message) => {
     if (message.type() !== "error") return;
     const text = message.text();
+    const location = message.location().url;
+    const resource = URL.canParse(location) ? new URL(location) : undefined;
+    if (
+      text.startsWith("Failed to load resource: the server responded with a status of 404 (") &&
+      resource?.origin === new URL(page.url()).origin &&
+      /^\/api\/v1\/sessions\/[^/]+$/u.test(resource.pathname) && resource.search === ""
+    ) {
+      // An optimistic retained-view lookup may miss before directory discovery.
+      // Errors from the subsequent cwd lookup or any other resource remain visible.
+      return;
+    }
     if (
       text.startsWith("Failed to load resource: the server responded with a status of") &&
       expectedHttpStatuses.some((status) => text.includes(`status of ${status} (`))

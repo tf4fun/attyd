@@ -12,6 +12,9 @@ pub(crate) struct AutoClosePermit {
 }
 
 impl AutoClosePermit {
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
     pub fn pending(&self) -> bool {
         self.state.load(Ordering::Acquire) == 0
     }
