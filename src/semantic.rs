@@ -464,6 +464,29 @@ pub fn validate_and_track_session_update(
     Ok(())
 }
 
+/// A replay is one transaction containing historical entities, not one live
+/// turn's allocation of new messages/tools. Payload bounds and reference checks
+/// still apply; the caller discards the entire candidate on validation failure.
+pub(crate) fn validate_history_update(
+    state: &mut SessionUpdateSemanticState,
+    update: &Value,
+) -> ValidationResult {
+    let bytes = serialized_bytes(update)?;
+    if bytes > MAX_UPDATE_BYTES {
+        return Err(format!(
+            "Agent session update exceeds {MAX_UPDATE_BYTES} bytes"
+        ));
+    }
+    state.new_messages = 0;
+    state.new_tool_calls = 0;
+    state.new_plans = 0;
+    state.new_compactions = 0;
+    validate_session_update_payload(state, update)?;
+    state.update_count = state.update_count.saturating_add(1);
+    state.update_bytes = state.update_bytes.saturating_add(bytes);
+    Ok(())
+}
+
 pub fn validate_permission_request(
     state: &mut SessionUpdateSemanticState,
     request: &impl Serialize,

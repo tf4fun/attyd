@@ -3,14 +3,17 @@
 //! In particular, a response is not handed to its RPC task until the coordinator
 //! has inspected it and claimed any newly returned session ID.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex};
 
+use crate::history_replay::ReplayCandidate;
 use agent_client_protocol::schema::v1::RequestId;
 use agent_client_protocol::{
     Agent, ConnectionTo, Dispatch, Error, Handled, JsonRpcRequest, SentRequest,
 };
+use agent_client_protocol::{JsonRpcMessage, schema::v1::SessionNotification};
 use serde::Serialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -145,8 +148,9 @@ struct FaultReporter {
 impl FaultReporter {
     fn fail(&self, error: &Error) {
         if !self.reported.swap(true, Ordering::AcqRel) {
-            self.sink
-                .acp_error(error.clone(), None, Some("bridge/ingress"));
+            // This error stops the entire connection. Publish it in global
+            // scope so runtime recovery and business SSE retain the cause.
+            self.sink.acp_error(error.clone(), None, None);
         }
         self.cancellation.cancel();
     }
@@ -156,6 +160,7 @@ struct SenderInner {
     epoch: String,
     events: mpsc::Sender<IngressItem>,
     ordinary: IngressPool,
+    replays: SyncMutex<HashMap<String, (RequestId, ReplayCandidate)>>,
     required: IngressPool,
     ordered: OrderedIngress<IngressItem>,
     handoff: CompletionHandoff,
@@ -351,6 +356,7 @@ impl Scheduling {
                 epoch,
                 events,
                 ordinary: IngressPool::new(ORDINARY_ITEMS, ORDINARY_BYTES),
+                replays: SyncMutex::new(HashMap::new()),
                 required: IngressPool::new(REQUIRED_ITEMS, REQUIRED_BYTES),
                 ordered,
                 handoff,
@@ -553,6 +559,16 @@ impl Scheduling {
     pub(super) fn close(&mut self) {
         self.sender.inner.fault.cancellation.cancel();
         self.sender.inner.closed.cancel();
+        for (_, (_, replay)) in self
+            .sender
+            .inner
+            .replays
+            .lock()
+            .expect("replay registry lock poisoned")
+            .drain()
+        {
+            replay.discard();
+        }
         self.ingress_rx.close();
         while let Ok(item) = self.ingress_rx.try_recv() {
             reject_event(item.event, &Error::request_cancelled());
@@ -646,7 +662,65 @@ impl IngressSender {
     /// completion before routing the SDK waiter; all other dispatches use that
     /// exact same mpsc FIFO. Unregistered global responses remain with the SDK
     /// (initialize and the MCP manager); session-mutating RPCs must be registered.
-    pub(super) fn receive_dispatch(&self, dispatch: Dispatch) -> Result<Handled<Dispatch>, Error> {
+    pub(super) async fn receive_dispatch(
+        &self,
+        dispatch: Dispatch,
+    ) -> Result<Handled<Dispatch>, Error> {
+        // Capture a data writer without holding the connection registry during
+        // validation/folding. Only this transaction's candidate is locked below.
+        let replay = {
+            let mut replays = self
+                .inner
+                .replays
+                .lock()
+                .expect("replay registry lock poisoned");
+            match &dispatch {
+                Dispatch::Notification(message) if message.method == "session/update" => message
+                    .params
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| replays.get(id))
+                    .map(|(_, replay)| replay.clone()),
+                Dispatch::Response(_, router) => {
+                    if let Some(session_id) = replays
+                        .iter()
+                        .find(|(_, (id, _))| id == router.id())
+                        .map(|(id, _)| id.clone())
+                    {
+                        if let Some((_, replay)) = replays.remove(&session_id) {
+                            replay.seal();
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(replay) = replay {
+            let Dispatch::Notification(message) = dispatch else {
+                unreachable!("only notifications have a replay writer")
+            };
+            let result = (|| {
+                let notification =
+                    SessionNotification::parse_message(message.method(), message.params())
+                        .map_err(super::error_message)?;
+                super::ensure_relay_size(&notification, "session update")
+                    .map_err(super::error_message)?;
+                let update =
+                    serde_json::to_value(notification.update).map_err(|error| error.to_string())?;
+                let conversation = super::is_conversation_update(&update);
+                replay.ingest(update, conversation)
+            })();
+            if let Err(message) = result {
+                replay.reject(message.clone());
+                self.inner.fault.sink.acp_error(
+                    super::semantic_error(message),
+                    None,
+                    Some("session/update"),
+                );
+            }
+            return Ok(Handled::Yes);
+        }
         let handled = self.inner.ordered.intercept(dispatch).map_err(|error| {
             let error = scheduling_error(error);
             self.inner.fault.fail(&error);
@@ -774,6 +848,7 @@ impl IngressSender {
             reservation,
             registration,
             scope,
+            replay: None,
         })
     }
 
@@ -798,9 +873,15 @@ pub(super) struct PreparedRpc {
     reservation: RequestReservation<IngressItem>,
     registration: CompletionRegistration,
     scope: ExecutionScope,
+    replay: Option<ReplayCandidate>,
 }
 
 impl PreparedRpc {
+    pub(super) fn with_replay(mut self, replay: Option<ReplayCandidate>) -> Self {
+        self.replay = replay;
+        self
+    }
+
     /// Keep the caller's admission ticket through this call. On failure it can
     /// roll back under the original ticket; on success drop it before `wait`.
     pub(super) fn send<Req: JsonRpcRequest>(
@@ -808,12 +889,42 @@ impl PreparedRpc {
         connection: &ConnectionTo<Agent>,
         request: Req,
     ) -> Result<PendingRpc<Req::Response>, Error> {
+        // Same short gate as receive_dispatch: even an immediate response cannot
+        // pass before its load candidate has been bound to the assigned RPC ID.
+        let mut replays = self
+            .sender
+            .inner
+            .replays
+            .lock()
+            .expect("replay registry lock poisoned");
+        let session_id = match (&self.replay, &self.scope) {
+            (Some(_), ExecutionScope::Session(handle)) => Some(handle.session_id().to_string()),
+            (Some(_), _) => return Err(capacity_error("history replay requires a session owner")),
+            _ => None,
+        };
+        if session_id
+            .as_ref()
+            .is_some_and(|id| replays.contains_key(id))
+        {
+            return Err(capacity_error(
+                "session already has an active history replay",
+            ));
+        }
         let registered = self
             .sender
             .inner
             .ordered
             .send_registered(connection, request, self.reservation)
             .map_err(scheduling_error)?;
+        let replay_registration = session_id.zip(self.replay).map(|(session_id, replay)| {
+            replays.insert(session_id.clone(), (registered.request_id.clone(), replay));
+            ReplayRegistration {
+                sender: self.sender.clone(),
+                session_id,
+                request_id: registered.request_id.clone(),
+            }
+        });
+        drop(replays);
         if let Err(error) = self.registration.bind(registered.request_id.clone()) {
             let error = scheduling_error(error);
             self.sender.inner.fault.fail(&error);
@@ -825,7 +936,33 @@ impl PreparedRpc {
             scope: self.scope,
             request_id: registered.request_id,
             sent: registered.sent,
+            replay_registration,
         })
+    }
+}
+
+struct ReplayRegistration {
+    sender: IngressSender,
+    session_id: String,
+    request_id: RequestId,
+}
+
+impl Drop for ReplayRegistration {
+    fn drop(&mut self) {
+        let mut replays = self
+            .sender
+            .inner
+            .replays
+            .lock()
+            .expect("replay registry lock poisoned");
+        if replays
+            .get(&self.session_id)
+            .is_some_and(|(id, _)| id == &self.request_id)
+        {
+            if let Some((_, replay)) = replays.remove(&self.session_id) {
+                replay.seal();
+            }
+        }
     }
 }
 
@@ -835,6 +972,7 @@ pub(super) struct PendingRpc<Response> {
     scope: ExecutionScope,
     pub request_id: agent_client_protocol::schema::v1::RequestId,
     sent: SentRequest<Response>,
+    replay_registration: Option<ReplayRegistration>,
 }
 
 impl<Response> PendingRpc<Response> {
@@ -843,6 +981,7 @@ impl<Response> PendingRpc<Response> {
             result = self.sent.block_task() => result,
             _ = self.sender.inner.closed.cancelled() => return Err(Error::request_cancelled()),
         };
+        drop(self.replay_registration);
         if let Err(error) = &result {
             self.sender
                 .inner
@@ -1101,8 +1240,8 @@ mod tests {
         assert!(!scheduling.has_local_work());
     }
 
-    #[test]
-    fn ordinary_ingress_capacity_preserves_reserved_commands_and_faults_required_overflow() {
+    #[tokio::test]
+    async fn ordinary_ingress_capacity_preserves_reserved_commands_and_faults_required_overflow() {
         let (_scheduling, sender, cancellation, mut errors) = setup();
         for _ in 0..ORDINARY_ITEMS {
             browser(&sender);
@@ -1125,12 +1264,20 @@ mod tests {
         assert!(
             sender
                 .receive_dispatch(Dispatch::Notification(update))
+                .await
                 .is_err()
         );
         assert!(cancellation.is_cancelled());
+        let error: Value = serde_json::from_str(&errors.try_recv().unwrap()).unwrap();
+        assert_eq!(error["type"], "bridge/error");
+        assert_eq!(error["data"], "ingress item budget exhausted");
         assert!(
-            errors.try_recv().is_ok(),
-            "required ingress overflow is reported visibly"
+            error.get("operation").is_none(),
+            "connection failure must reach global SSE"
+        );
+        assert!(
+            error.get("requestId").is_none(),
+            "connection failure must survive runtime recovery"
         );
         assert!(
             errors.try_recv().is_err(),
@@ -1305,6 +1452,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_data_does_not_consume_live_ingress_capacity() {
+        let (mut scheduling, sender, cancellation, mut errors) = setup();
+        for _ in 0..ORDINARY_ITEMS {
+            browser(&sender);
+        }
+        let replay = ReplayCandidate::default();
+        sender
+            .inner
+            .replays
+            .lock()
+            .unwrap()
+            .insert("a".into(), (RequestId::Number(7), replay.clone()));
+        for index in 0..1_000 {
+            let message = UntypedMessage::new(
+                "session/update",
+                json!({
+                    "sessionId":"a", "update":{"sessionUpdate":"agent_message_chunk",
+                    "messageId":format!("m-{index}"), "content":{"type":"text","text":"history"}}
+                }),
+            )
+            .unwrap();
+            assert!(matches!(
+                sender
+                    .receive_dispatch(Dispatch::Notification(message))
+                    .await
+                    .unwrap(),
+                Handled::Yes
+            ));
+        }
+        assert_eq!(scheduling.ingress_rx.len(), ORDINARY_ITEMS);
+        assert_eq!(replay.lock().updates().unwrap().len(), 1_000);
+        assert!(!cancellation.is_cancelled());
+        assert!(errors.try_recv().is_err());
+        sender
+            .try_browser(BridgeInput::RuntimeSnapshotRequest, TrafficClass::Reserved)
+            .unwrap();
+        scheduling.close();
+        assert_eq!(
+            replay.bytes(),
+            0,
+            "shutdown must release even a retained replay writer"
+        );
+        assert!(sender.inner.replays.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_response_seals_history_before_following_live_data() {
+        let (mut scheduling, sender, _cancellation, mut errors) = setup();
+        let a = scheduling.register_session("a", 1).unwrap();
+        let b = scheduling.register_session("b", 1).unwrap();
+        let (outgoing, mut requests) = futures::channel::mpsc::channel::<String>(4);
+        let (mut responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(4);
+        let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
+        let (done, finished) = oneshot::channel();
+        let connection = Client
+            .builder()
+            .on_receive_dispatch(
+                {
+                    let sender = sender.clone();
+                    async move |dispatch: Dispatch, _connection| {
+                        sender.receive_dispatch(dispatch).await
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_with(transport, async move |connection| {
+                let replay = ReplayCandidate::default();
+                let pending = sender
+                    .prepare_rpc(
+                        RequestClass::Control,
+                        owner(Some("a"), "load"),
+                        Some(a.clone()),
+                    )
+                    .unwrap()
+                    .with_replay(Some(replay.clone()))
+                    .send(
+                        &connection,
+                        UntypedMessage::new("session/load", json!({"sessionId":"a"})).unwrap(),
+                    )
+                    .unwrap();
+                let mut waiting = Box::pin(pending.wait());
+                // Historical records never enter this FIFO. The first item must be
+                // the response, followed by a normal live update for the same owner.
+                for _ in 0..2 {
+                    let item = tokio::select! {
+                        item = scheduling.ingress_rx.recv() => item.unwrap(),
+                        _ = &mut waiting => panic!("response escaped its completion transition"),
+                    };
+                    scheduling
+                        .route_session(&a, item)
+                        .unwrap_or_else(|_| panic!("route failed"));
+                }
+                assert_eq!(
+                    replay.lock().updates().unwrap()[0]["content"]["text"],
+                    "history"
+                );
+                assert_eq!(replay.lock().updates().unwrap().len(), 1);
+                assert!(
+                    replay.append(json!({})).is_err(),
+                    "response must seal the candidate"
+                );
+                let ScheduledInput { event, turn, .. } = scheduling.pump().unwrap().unwrap();
+                let BridgeIngress::RpcCompleted(completion) = event else {
+                    panic!("replay consumed a task slot")
+                };
+                scheduling.handoff_completion(completion, turn).unwrap();
+                let (result, turn) = waiting.await.unwrap();
+                result.unwrap();
+                assert!(
+                    scheduling.pump().unwrap().is_none(),
+                    "live update passed uncommitted replay"
+                );
+                browser(&sender);
+                let item = scheduling.ingress_rx.try_recv().unwrap();
+                scheduling
+                    .route_session(&b, item)
+                    .unwrap_or_else(|_| panic!("other session route failed"));
+                drop(scheduling.pump().unwrap().unwrap());
+                drop(turn);
+                let ScheduledInput { event, .. } = scheduling.pump().unwrap().unwrap();
+                let BridgeIngress::Acp(Dispatch::Notification(message)) = event else {
+                    panic!("live update lost")
+                };
+                assert_eq!(message.params["update"]["content"]["text"], "live");
+                assert!(sender.inner.replays.lock().unwrap().is_empty());
+                assert!(errors.try_recv().is_err());
+                done.send(()).unwrap();
+                Ok(())
+            });
+        let peer = async move {
+            let request: Value = serde_json::from_str(&requests.next().await.unwrap()).unwrap();
+            responses.send(Ok(json!([
+                {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"a","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"history"}}}},
+                {"jsonrpc":"2.0","id":request["id"],"result":{}},
+                {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"a","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live"}}}}
+            ]).to_string())).await.unwrap();
+            finished.await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(
+            Duration::from_secs(3),
+            futures::future::join(connection, peer),
+        )
+        .await
+        .unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn real_sdk_updates_and_response_share_fifo_and_result_ticket_blocks_only_its_session() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
         let a = scheduling.register_session("a", 1).unwrap();
@@ -1319,7 +1614,9 @@ mod tests {
             .on_receive_dispatch(
                 {
                     let sender = sender.clone();
-                    async move |dispatch: Dispatch, _connection| sender.receive_dispatch(dispatch)
+                    async move |dispatch: Dispatch, _connection| {
+                        sender.receive_dispatch(dispatch).await
+                    }
                 },
                 agent_client_protocol::on_receive_dispatch!(),
             )
@@ -1422,7 +1719,9 @@ mod tests {
             .on_receive_dispatch(
                 {
                     let sender = sender.clone();
-                    async move |dispatch: Dispatch, _connection| sender.receive_dispatch(dispatch)
+                    async move |dispatch: Dispatch, _connection| {
+                        sender.receive_dispatch(dispatch).await
+                    }
                 },
                 agent_client_protocol::on_receive_dispatch!(),
             )
@@ -1494,7 +1793,9 @@ mod tests {
         let connection = Client
             .builder()
             .on_receive_dispatch(
-                async move |dispatch: Dispatch, _connection| sender.receive_dispatch(dispatch),
+                async move |dispatch: Dispatch, _connection| {
+                    sender.receive_dispatch(dispatch).await
+                },
                 agent_client_protocol::on_receive_dispatch!(),
             )
             .connect_with(transport, async move |connection| {
@@ -1547,7 +1848,7 @@ mod tests {
                     {
                         let sender = sender.clone();
                         async move |dispatch: Dispatch, _connection| {
-                            sender.receive_dispatch(dispatch)
+                            sender.receive_dispatch(dispatch).await
                         }
                     },
                     agent_client_protocol::on_receive_dispatch!(),

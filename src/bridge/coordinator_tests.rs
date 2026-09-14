@@ -246,7 +246,7 @@ async fn run_wire_batch(permission: bool, creation_pending: bool) {
     let connection = Client
         .builder()
         .on_receive_dispatch(
-            async move |dispatch: Dispatch, _connection| ingress.receive_dispatch(dispatch),
+            async move |dispatch: Dispatch, _connection| ingress.receive_dispatch(dispatch).await,
             agent_client_protocol::on_receive_dispatch!(),
         )
         .connect_with(transport, async move |connection| {

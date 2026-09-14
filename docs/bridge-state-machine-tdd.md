@@ -172,6 +172,22 @@ history, invents missing Agent data or silently treats a partial replay as autho
 - Protocol-valid baseline, candidate and overlay growth has no bridge-defined cumulative cap.
 - Wire values, live resources and subscriber delivery retain their independent safety and
   backpressure limits.
+- Load/resume registers one replay candidate before sending its RPC. Historical notifications
+  validate and fold directly into that separate allocation; they consume no live ingress items,
+  session execution tickets or per-turn new-entity quota. Each record retains the wire/payload
+  size limits. Candidate bytes are accounted independently of transport buffers.
+- The matching response seals the candidate at the ordered wire boundary. The session completion
+  ticket checks epoch/incarnation/attempt and publishes the baseline atomically; following updates
+  use the live FIFO and cannot pass that commit. Failure/retirement discards the candidate, and a
+  retained writer cannot mutate a replacement attempt. Requests for permission/elicitation remain
+  live requests; replayed tool records never allocate responders.
+- Replay folding updates only the relevant history slot and byte count, without cloning or
+  serializing all previous turns per record. Control patches fold into bounded final control state.
+  The unknown-ID pre-creation staging quota does not apply to known-owner historical data.
+- Catalog requests and other sessions can progress while a load response is outstanding. The
+  transport hook does not wait for a session execution ticket or a human interaction response.
+- Ingress faults that terminate a connection are published in global scope so runtime recovery
+  and global SSE retain the original failure instead of exposing only interrupted HTTP requests.
 - Continuous unobserved intervals recycle sessions through negotiated close, including running work.
 - Observed sessions remain materialized; attachment/control admission defers an expired close.
 - Close/delete/generation shutdown drops baselines, candidates and retry tasks.
@@ -184,7 +200,7 @@ history, invents missing Agent data or silently treats a partial replay as autho
 | S0 specification | authority/state/API/memory contract and adversarial test plan | this ledger and the linked runtime documents |
 | S1 state tests | baseline, CAS, terminal retention, commit/failure | `session_mirror.rs` and `history_cache.rs` native tests |
 | S2 state implementation | separate shared HistoryCache and session phases | `session_mirror.rs`, `history_cache.rs` |
-| S3 ACP orchestration | cold load, retry, validation, cross-session concurrency | `bridge.rs` and `server.rs` native tests |
+| S3 ACP orchestration | cold load, burst replay, retry, validation, cross-session concurrency | `bridge.rs` and `server.rs` native tests; `burst-load-agent.mjs` replays 10,050 updates exceeding 1 MB; catalog calls complete before the fixture releases the load response. `scheduling.rs` checks response cuts and live-queue isolation; `history_replay.rs` checks incremental folding, poisoning and retirement |
 | S4 observer delivery | atomic baseline+overlay snapshot, suffix/reset, shared payload | `server.rs` subscriber, revision-gap and byte-accounting tests |
 | S5 command API | CAS/idempotency and browser-local deferred queue dispatch | native append tests, `use-acp.test.ts`, Chromium queue cases |
 | S6 browser projection | business snapshot/SSE rendering; no ACP lifecycle ownership | `use-acp.test.ts`, `state.test.ts`, Chromium reconnect cases |

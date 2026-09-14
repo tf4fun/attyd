@@ -29,8 +29,6 @@ pub(crate) struct SessionResources {
 #[derive(Default)]
 pub(crate) struct AttachmentDelivery {
     pub(crate) subscriber: Option<u64>,
-    pub(crate) update_count: usize,
-    pub(crate) update_bytes: usize,
     pub(crate) control_candidate: SyncControlCandidate,
 }
 

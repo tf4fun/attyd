@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::history_replay::ReplayCandidate;
 use crate::runtime_state::fold_active_turn_update;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -75,9 +76,7 @@ struct HistoryEntry {
 
 struct LoadCandidate {
     attempt_id: String,
-    updates: Vec<Value>,
-    bytes: usize,
-    invalid: Option<HistoryCacheError>,
+    replay: ReplayCandidate,
 }
 
 pub(crate) struct HistoryCache {
@@ -87,7 +86,6 @@ pub(crate) struct HistoryCache {
     entries: HashMap<SessionKey, HistoryEntry>,
     candidates: HashMap<SessionKey, LoadCandidate>,
     snapshot_bytes: usize,
-    candidate_bytes: usize,
 }
 
 impl HistoryCache {
@@ -99,7 +97,6 @@ impl HistoryCache {
             entries: HashMap::new(),
             candidates: HashMap::new(),
             snapshot_bytes: 0,
-            candidate_bytes: 0,
         }
     }
 
@@ -118,11 +115,11 @@ impl HistoryCache {
         self.entries.get(key).map(|entry| &entry.snapshot)
     }
 
-    pub(crate) fn candidate_updates(
+    pub(crate) fn candidate(
         &self,
         key: &SessionKey,
         attempt_id: &str,
-    ) -> Result<&[Value], HistoryCacheError> {
+    ) -> Result<ReplayCandidate, HistoryCacheError> {
         let candidate = self
             .candidates
             .get(key)
@@ -130,10 +127,7 @@ impl HistoryCache {
         if candidate.attempt_id != attempt_id {
             return Err(HistoryCacheError::AttemptMismatch);
         }
-        if let Some(error) = &candidate.invalid {
-            return Err(error.clone());
-        }
-        Ok(&candidate.updates)
+        Ok(candidate.replay.clone())
     }
 
     pub(crate) fn begin_candidate(
@@ -148,9 +142,7 @@ impl HistoryCache {
             key,
             LoadCandidate {
                 attempt_id: attempt_id.into(),
-                updates: Vec::new(),
-                bytes: 0,
-                invalid: None,
+                replay: ReplayCandidate::default(),
             },
         );
         Ok(())
@@ -162,37 +154,7 @@ impl HistoryCache {
         attempt_id: &str,
         update: Value,
     ) -> Result<(), HistoryCacheError> {
-        let candidate = self
-            .candidates
-            .get(key)
-            .ok_or(HistoryCacheError::CandidateMissing)?;
-        if candidate.attempt_id != attempt_id {
-            return Err(HistoryCacheError::AttemptMismatch);
-        }
-        if let Some(error) = &candidate.invalid {
-            return Err(error.clone());
-        }
-        let updates = match fold_history_update(&candidate.updates, &update) {
-            Ok(updates) => updates,
-            Err(_) => {
-                self.poison_candidate(key, attempt_id, HistoryCacheError::InvalidReplay)?;
-                return Err(HistoryCacheError::InvalidReplay);
-            }
-        };
-        let bytes = serde_json::to_vec(&updates)
-            .map(|value| value.len())
-            .unwrap_or(usize::MAX);
-        let candidate = self
-            .candidates
-            .get_mut(key)
-            .expect("candidate was validated above");
-        self.candidate_bytes = self
-            .candidate_bytes
-            .saturating_sub(candidate.bytes)
-            .saturating_add(bytes);
-        candidate.bytes = bytes;
-        candidate.updates = updates;
-        Ok(())
+        self.candidate(key, attempt_id)?.append(update)
     }
 
     pub(crate) fn poison_candidate(
@@ -201,16 +163,7 @@ impl HistoryCache {
         attempt_id: &str,
         error: HistoryCacheError,
     ) -> Result<(), HistoryCacheError> {
-        let candidate = self
-            .candidates
-            .get_mut(key)
-            .ok_or(HistoryCacheError::CandidateMissing)?;
-        if candidate.attempt_id != attempt_id {
-            return Err(HistoryCacheError::AttemptMismatch);
-        }
-        if candidate.invalid.is_none() {
-            candidate.invalid = Some(error);
-        }
+        self.candidate(key, attempt_id)?.poison(error);
         Ok(())
     }
 
@@ -219,22 +172,10 @@ impl HistoryCache {
         key: &SessionKey,
         attempt_id: &str,
     ) -> Result<Arc<HistorySnapshot>, HistoryCacheError> {
-        let candidate = self
-            .candidates
-            .get(key)
-            .ok_or(HistoryCacheError::CandidateMissing)?;
-        if candidate.attempt_id != attempt_id {
-            return Err(HistoryCacheError::AttemptMismatch);
-        }
-        if let Some(error) = &candidate.invalid {
-            return Err(error.clone());
-        }
-        let candidate = self
-            .candidates
-            .remove(key)
-            .expect("candidate was validated above");
-        self.candidate_bytes = self.candidate_bytes.saturating_sub(candidate.bytes);
-        Ok(self.install_snapshot(key.clone(), candidate.updates, candidate.bytes))
+        let replay = self.candidate(key, attempt_id)?;
+        let (updates, bytes) = replay.take_history()?;
+        self.candidates.remove(key);
+        Ok(self.install_snapshot(key.clone(), updates, bytes))
     }
 
     pub(crate) fn append_committed_updates(
@@ -264,18 +205,9 @@ impl HistoryCache {
         key: &SessionKey,
         attempt_id: &str,
     ) -> Result<(), HistoryCacheError> {
-        let candidate = self
-            .candidates
-            .get(key)
-            .ok_or(HistoryCacheError::CandidateMissing)?;
-        if candidate.attempt_id != attempt_id {
-            return Err(HistoryCacheError::AttemptMismatch);
-        }
-        let candidate = self
-            .candidates
-            .remove(key)
-            .expect("candidate was validated above");
-        self.candidate_bytes = self.candidate_bytes.saturating_sub(candidate.bytes);
+        let replay = self.candidate(key, attempt_id)?;
+        replay.discard();
+        self.candidates.remove(key);
         Ok(())
     }
 
@@ -314,7 +246,7 @@ impl HistoryCache {
             self.snapshot_bytes = self.snapshot_bytes.saturating_sub(entry.snapshot.bytes);
         }
         if let Some(candidate) = self.candidates.remove(key) {
-            self.candidate_bytes = self.candidate_bytes.saturating_sub(candidate.bytes);
+            candidate.replay.discard();
         }
     }
 
@@ -324,7 +256,11 @@ impl HistoryCache {
             snapshots: self.entries.len(),
             candidates: self.candidates.len(),
             snapshot_bytes: self.snapshot_bytes,
-            candidate_bytes: self.candidate_bytes,
+            candidate_bytes: self
+                .candidates
+                .values()
+                .map(|candidate| candidate.replay.bytes())
+                .sum(),
         }
     }
 

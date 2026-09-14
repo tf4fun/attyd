@@ -2272,7 +2272,7 @@ where
         {
             let ingress = ingress.clone();
             async move |dispatch: agent_client_protocol::Dispatch, _connection| {
-                ingress.receive_dispatch(dispatch)
+                ingress.receive_dispatch(dispatch).await
             }
         },
         agent_client_protocol::on_receive_dispatch!(),
@@ -3034,46 +3034,33 @@ async fn handle_session_update(
                     .get_or_insert_with(|| error_message(error.clone()));
             }
             Err(error)
-        } else if let Err(message) = validate_and_track_session_update(validation, &update) {
+        } else if let Err(message) = if attachment || mirror_replay_attempt.is_some() {
+            crate::semantic::validate_history_update(validation, &update)
+        } else {
+            validate_and_track_session_update(validation, &update)
+        } {
             if !active || attachment || mirror_replay_attempt.is_some() {
                 validation.invalid_reason.get_or_insert(message.clone());
             }
             Err(semantic_error(message))
         } else if attachment {
-            let delivery = &session_ingest(&state, &session_id)
-                .expect("attachment has an owner")
-                .attachment;
-            let replay_bytes = delivery.update_bytes;
-            let replay_len = delivery.update_count;
-            let update_bytes = serialized_value_len(&update);
-            if replay_len >= MAX_EARLY_UPDATES
-                || replay_bytes.saturating_add(update_bytes) > MAX_EARLY_UPDATE_BYTES
-            {
-                Err(semantic_error(format!(
-                    "Agent session attachment replay exceeds {MAX_EARLY_UPDATE_BYTES} bytes or {MAX_EARLY_UPDATES} updates"
-                )))
-            } else {
-                let incarnation = state
-                    .sessions
-                    .state(&session_id)
-                    .map(|session| session.incarnation)
-                    .ok_or_else(|| runtime_state_error("missing canonical attachment transaction"));
-                let runtime_result = incarnation.and_then(|incarnation| {
-                    if is_conversation_update(&update) {
-                        let attempt = session_mirror(&mut state)
-                            .load_attempt(&session_id, incarnation)
-                            .map(str::to_string);
-                        if let Some(attempt) = attempt {
-                            session_mirror(&mut state)
-                                .append_load_update(
-                                    &session_id,
-                                    incarnation,
-                                    &attempt,
-                                    update.clone(),
-                                )
-                                .map_err(mirror_error)?;
-                        }
-                    }
+            let incarnation = state
+                .sessions
+                .state(&session_id)
+                .map(|session| session.incarnation)
+                .ok_or_else(|| runtime_state_error("missing canonical attachment transaction"));
+            let runtime_result = incarnation.and_then(|incarnation| {
+                if is_conversation_update(&update) {
+                    let attempt = state
+                        .sessions
+                        .load_attempt(&session_id, incarnation)
+                        .map(str::to_string)
+                        .ok_or_else(|| runtime_state_error("attachment has no load attempt"))?;
+                    state
+                        .sessions
+                        .append_load_update(&session_id, incarnation, &attempt, update.clone())
+                        .map_err(mirror_error)
+                } else {
                     let epoch = state.sessions.epoch().to_string();
                     state
                         .sessions
@@ -3084,21 +3071,13 @@ async fn handle_session_update(
                             update.clone(),
                         )
                         .map_err(runtime_state_error)
-                });
-                match runtime_result {
-                    Ok(()) => {
-                        let delivery = &mut session_ingest_mut(&mut state, &session_id)
-                            .expect("attachment has an owner")
-                            .attachment;
-                        delivery.update_count = replay_len.saturating_add(1);
-                        delivery.update_bytes = replay_bytes.saturating_add(update_bytes);
-                        Ok(delivery
-                            .subscriber
-                            .map_or(Delivery::Broadcast, Delivery::Direct))
-                    }
-                    Err(error) => Err(error),
                 }
-            }
+            });
+            runtime_result.map(|()| {
+                session_ingest(&state, &session_id)
+                    .and_then(|resources| resources.attachment.subscriber)
+                    .map_or(Delivery::Broadcast, Delivery::Direct)
+            })
         } else if active
             && !attachment
             && matches!(
@@ -3447,6 +3426,22 @@ async fn send_ordered_then<Req: JsonRpcRequest>(
     request: Req,
     sent: impl FnOnce(),
 ) -> Result<Result<Req::Response, Error>, Error> {
+    send_ordered_with_replay(
+        connection, ingress, execution, owner, class, request, sent, None,
+    )
+    .await
+}
+
+async fn send_ordered_with_replay<Req: JsonRpcRequest>(
+    connection: &ConnectionTo<Agent>,
+    ingress: Option<&IngressSender>,
+    execution: &mut Option<ExecutionTurn>,
+    owner: RequestOwner,
+    class: RequestClass,
+    request: Req,
+    sent: impl FnOnce(),
+    replay: Option<crate::history_replay::ReplayCandidate>,
+) -> Result<Result<Req::Response, Error>, Error> {
     let Some(ingress) = ingress else {
         let pending = connection.send_request(request);
         sent();
@@ -3461,7 +3456,7 @@ async fn send_ordered_then<Req: JsonRpcRequest>(
     let handle = execution.as_ref().and_then(ExecutionTurn::handle).cloned();
     let pending = match ingress
         .prepare_rpc(class, owner, handle)
-        .and_then(|prepared| prepared.send(connection, request))
+        .and_then(|prepared| prepared.with_replay(replay).send(connection, request))
     {
         Ok(pending) => pending,
         Err(error) => return Ok(Err(error)),
@@ -3470,6 +3465,77 @@ async fn send_ordered_then<Req: JsonRpcRequest>(
     drop(execution.take());
     let (result, turn) = pending.wait().await?;
     *execution = Some(turn);
+    Ok(result)
+}
+
+/// The RPC owns lifecycle/ordering; the candidate owns replay data. The receive
+/// hook seals that candidate at the response cut before any following live update.
+async fn send_history<Req: JsonRpcRequest>(
+    connection: &ConnectionTo<Agent>,
+    ingress: Option<&IngressSender>,
+    execution: &mut Option<ExecutionTurn>,
+    state: &Arc<Mutex<BridgeState>>,
+    owner: RequestOwner,
+    request: Req,
+) -> Result<Result<Req::Response, Error>, Error> {
+    let session_id = owner
+        .session_id
+        .as_deref()
+        .ok_or_else(|| runtime_state_error("load has no session"))?;
+    let incarnation = owner
+        .incarnation
+        .ok_or_else(|| runtime_state_error("load has no incarnation"))?;
+    let attempt_id = owner
+        .attempt_id
+        .as_deref()
+        .ok_or_else(|| runtime_state_error("load has no attempt"))?;
+    let replay = state
+        .lock()
+        .await
+        .sessions
+        .load_candidate(session_id, incarnation, attempt_id)
+        .map_err(mirror_error)?;
+    let result = send_ordered_with_replay(
+        connection,
+        ingress,
+        execution,
+        owner.clone(),
+        RequestClass::Control,
+        request,
+        || {},
+        Some(replay.clone()),
+    )
+    .await?;
+    if ingress.is_some() && result.is_ok() {
+        // Still holds the completion ticket. Following same-session events cannot
+        // observe an intermediate mix of replay controls and the old baseline.
+        let mut state = state.lock().await;
+        state
+            .sessions
+            .load_candidate(session_id, incarnation, attempt_id)
+            .map_err(mirror_error)?;
+        let (mut validation, controls) = replay.take_controls();
+        let current = session_validation_mut(&mut state, session_id)
+            .ok_or_else(|| runtime_state_error("load lost its validation allocation"))?;
+        validation.allocation = current.allocation.clone();
+        *current = validation;
+        if session_operation_pending(&state, session_id, SessionAdmission::Attachment) {
+            let epoch = state.sessions.epoch().to_owned();
+            for update in controls {
+                state
+                    .sessions
+                    .append_attachment_candidate(&epoch, session_id, incarnation, update)
+                    .map_err(runtime_state_error)?;
+            }
+        } else {
+            let candidate = &mut session_ingest_mut(&mut state, session_id)
+                .ok_or_else(|| runtime_state_error("load lost its resources"))?
+                .attachment
+                .control_candidate;
+            candidate.bytes = controls.iter().map(serialized_value_len).sum();
+            candidate.updates = controls;
+        }
+    }
     Ok(result)
 }
 
@@ -4025,12 +4091,12 @@ async fn handle_command_inner(
                 Some(&request_id),
             );
             let result = if operation == "session/load" {
-                send_ordered(
+                send_history(
                     &connection,
                     ingress.as_ref(),
                     execution,
+                    &state,
                     owner.clone(),
-                    RequestClass::Control,
                     LoadSessionRequest::new(session_id.clone(), &cwd)
                         .additional_directories(local_additional_directories(&options))
                         .mcp_servers(options.mcp_servers.clone()),
@@ -4038,12 +4104,12 @@ async fn handle_command_inner(
                 .await?
                 .map(|response| serde_json::to_value(response).expect("ACP response serializes"))
             } else {
-                send_ordered(
+                send_history(
                     &connection,
                     ingress.as_ref(),
                     execution,
+                    &state,
                     owner.clone(),
-                    RequestClass::Control,
                     ResumeSessionRequest::new(session_id.clone(), &cwd)
                         .additional_directories(local_additional_directories(&options))
                         .mcp_servers(options.mcp_servers.clone()),
@@ -6068,12 +6134,12 @@ async fn synchronize_authoritative_history(
             operation_id,
             Some(&attempt_id),
         );
-        let result = send_ordered(
+        let result = send_history(
             connection,
             ingress,
             execution,
+            state,
             owner.clone(),
-            RequestClass::Control,
             LoadSessionRequest::new(session_id.to_string(), &cwd)
                 .additional_directories(local_additional_directories(options))
                 .mcp_servers(options.mcp_servers.clone()),
@@ -7958,6 +8024,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_load_burst_preserves_all_history_and_keeps_catalog_available() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = format!("{cwd}/tests/fixtures/burst-load-agent.mjs");
+        let options = options(&["attyd", "--cwd", cwd, "--", "node", &fixture]);
+        let (commands, command_rx) = mpsc::channel(16);
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let bridge = tokio::spawn(run_with_cancellation(
+            Arc::new(options),
+            command_rx,
+            event_tx.into(),
+            cancellation.clone(),
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let raw = events
+                    .recv()
+                    .await
+                    .expect("bridge stopped before initialization");
+                let event: Value = serde_json::from_str(&raw).unwrap();
+                assert_ne!(event["type"], "bridge/error", "{event}");
+                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                    break;
+                }
+            }
+            let (response, mut view_result) = oneshot::channel();
+            commands
+                .send(BridgeInput::SessionViewRequest {
+                    session_id: "burst-history".to_string(),
+                    cwd: Some(cwd.to_string()),
+                    expected_owner: None,
+                    response,
+                })
+                .await
+                .unwrap();
+            // The fixture withholds the load response until catalog operations
+            // have completed. Listing cannot depend on the history transaction.
+            loop {
+                let listed = request(
+                    &commands,
+                    json!({"type": "session/list", "requestId": "during-replay"}),
+                )
+                .await
+                .unwrap();
+                if listed["sessions"]
+                    .as_array()
+                    .is_some_and(|sessions| !sessions.is_empty())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(matches!(
+                view_result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            request(
+                &commands,
+                json!({"type": "session/list", "requestId": "finish-replay"}),
+            )
+            .await
+            .unwrap();
+            let view = loop {
+                tokio::select! {
+                    biased;
+                    event = events.recv() => {
+                        let raw = event.expect("bridge stopped during history replay");
+                        let event: Value = serde_json::from_str(&raw).unwrap();
+                        assert_ne!(event["type"], "bridge/error", "history replay failed: {event}");
+                    }
+                    result = &mut view_result => break result.unwrap().unwrap(),
+                }
+            };
+            let updates = view["baseline"]["updates"].as_array().unwrap();
+            assert_eq!(updates.len(), 10_050, "history replay was truncated");
+            assert!(serialized_value_len(&view["baseline"]["updates"]) > MAX_EARLY_UPDATE_BYTES);
+            for (index, update) in updates.iter().enumerate() {
+                assert_eq!(update["messageId"], format!("history-{index}"));
+            }
+            request(
+                &commands,
+                json!({"type": "session/list", "requestId": "after-burst"}),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !cancellation.is_cancelled(),
+                "history replay stopped the connection"
+            );
+        })
+        .await;
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .unwrap()
+            .unwrap();
+        result.expect("history replay did not complete");
+    }
+
+    #[tokio::test]
     async fn fork_response_batch_keeps_following_target_update_without_load() {
         async fn next_event(events: &mut mpsc::UnboundedReceiver<String>) -> Value {
             let raw = tokio::time::timeout(Duration::from_secs(10), events.recv())
@@ -9690,10 +9856,12 @@ mod tests {
         assert_eq!(
             state
                 .sessions
-                .resources("session", incarnation)
+                .load_candidate("session", incarnation, "load")
                 .unwrap()
-                .attachment
-                .update_count,
+                .lock()
+                .updates()
+                .unwrap()
+                .len(),
             1
         );
         let validation = state
@@ -9743,6 +9911,10 @@ mod tests {
         assert_eq!(operation.operation_id, "load");
         assert_eq!(operation.kind, RuntimeSessionOperationKind::Load);
         assert_eq!(operation.stage, "attaching");
+        bridge_state
+            .sessions
+            .begin_load("session", incarnation, "load")
+            .unwrap();
         clear_attachment_delivery(&mut bridge_state, "session", incarnation);
         let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -9780,6 +9952,11 @@ mod tests {
                 .unwrap()
                 .contains("candidate")
         );
+        let baseline = state
+            .sessions
+            .commit_load("session", incarnation, "load")
+            .unwrap();
+        assert_eq!(baseline.updates()[0]["content"]["text"], "candidate");
         state
             .sessions
             .complete_attachment(
@@ -9795,7 +9972,7 @@ mod tests {
             !serde_json::to_string(&state.sessions.snapshot())
                 .unwrap()
                 .contains("candidate"),
-            "successful load replay is transient browser delivery, not bridge history",
+            "history payload belongs to the shared cache, not runtime snapshots",
         );
         assert!(
             state
@@ -12661,7 +12838,9 @@ mod ordered_command_tests {
             .on_receive_dispatch(
                 {
                     let ingress = ingress.clone();
-                    async move |dispatch: Dispatch, _connection| ingress.receive_dispatch(dispatch)
+                    async move |dispatch: Dispatch, _connection| {
+                        ingress.receive_dispatch(dispatch).await
+                    }
                 },
                 agent_client_protocol::on_receive_dispatch!(),
             )
@@ -12792,7 +12971,9 @@ mod ordered_command_tests {
             .on_receive_dispatch(
                 {
                     let ingress = ingress.clone();
-                    async move |dispatch: Dispatch, _connection| ingress.receive_dispatch(dispatch)
+                    async move |dispatch: Dispatch, _connection| {
+                        ingress.receive_dispatch(dispatch).await
+                    }
                 },
                 agent_client_protocol::on_receive_dispatch!(),
             )

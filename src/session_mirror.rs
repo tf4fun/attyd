@@ -147,6 +147,21 @@ impl SessionRegistry {
         Ok(())
     }
 
+    pub(crate) fn load_candidate(
+        &self,
+        session_id: &str,
+        incarnation: u64,
+        attempt_id: &str,
+    ) -> Result<crate::history_replay::ReplayCandidate, MirrorError> {
+        let session = self.require_state(session_id, incarnation)?;
+        if session.load_attempt.as_deref() != Some(attempt_id) {
+            return Err(MirrorError::OperationMismatch);
+        }
+        Ok(self
+            .history
+            .candidate(&SessionKey::new(session_id, incarnation), attempt_id)?)
+    }
+
     pub(crate) fn append_load_update(
         &mut self,
         session_id: &str,
@@ -216,7 +231,9 @@ impl SessionRegistry {
                 .history
                 .peek(&key)
                 .ok_or(MirrorError::InconsistentHistory)?;
-            let candidate = self.history.candidate_updates(&key, attempt_id)?;
+            let replay = self.history.candidate(&key, attempt_id)?;
+            let data = replay.lock();
+            let candidate = data.updates()?;
             let Some(prefix_end) = history_prefix_end(candidate, prior.updates()) else {
                 return Err(MirrorError::InconsistentHistory);
             };

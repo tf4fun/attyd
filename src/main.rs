@@ -8,6 +8,7 @@ mod elicitation_validation;
 mod event_queue;
 mod filesystem;
 mod history_cache;
+mod history_replay;
 mod mcp;
 mod mcp_config;
 mod options;

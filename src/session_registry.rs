@@ -565,8 +565,6 @@ mod tests {
             previous: Some(SessionUpdateSemanticState::default()),
         });
         resources.attachment.subscriber = Some(7);
-        resources.attachment.update_count = 2;
-        resources.attachment.update_bytes = 42;
         resources
             .attachment
             .control_candidate
@@ -658,8 +656,6 @@ mod tests {
             &waiting.validation
         ));
         assert_eq!(resources.attachment.subscriber, Some(7));
-        assert_eq!(resources.attachment.update_count, 2);
-        assert_eq!(resources.attachment.update_bytes, 42);
         assert_eq!(resources.attachment.control_candidate.updates.len(), 1);
         assert_eq!(resources.attachment.control_candidate.bytes, 12);
         assert_eq!(

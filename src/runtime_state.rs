@@ -2518,7 +2518,7 @@ fn extract_control_state(entries: Vec<Value>) -> BTreeMap<String, Value> {
     controls
 }
 
-fn fold_control_update(previous: Option<&Value>, update: Value) -> Value {
+pub(crate) fn fold_control_update(previous: Option<&Value>, update: Value) -> Value {
     let kind = update.get("sessionUpdate").and_then(Value::as_str);
     if !matches!(kind, Some("session_info_update" | "usage_update")) {
         return update;
