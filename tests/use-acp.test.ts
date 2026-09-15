@@ -782,6 +782,33 @@ describe("project navigation", () => {
     expect(acp.state.phase).toBe("stopped");
   });
 
+  it("drops pending session refreshes when the connection stops", async () => {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const global = TestEventSource.instances.find(({ url }) => url === "/api/v1/events")!;
+    const source = TestEventSource.instances.find(({ url }) => url.includes("alpha-one/events"))!;
+    let finishView!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) =>
+      String(input).split("?")[0] === "/api/v1/sessions/alpha-one"
+        ? new Promise<Response>((resolve) => { finishView = resolve; })
+        : defaultFetch(input, init));
+    const reset = (viewRevision: number) => source.onmessage?.({ data: JSON.stringify({
+      type: "bridge/session_reset", bridgeEpoch: "epoch", sessionId: "alpha-one",
+      sessionIncarnation: 1, viewRevision,
+    }) });
+    await act(async () => reset(2));
+    await act(async () => reset(3));
+    const before = fetchMock.mock.calls.length;
+    await act(async () => {
+      global.onmessage?.({ data: JSON.stringify({ type: "bridge/connection", phase: "stopped" }) });
+      reset(4);
+      finishView(response(sessionView("alpha-one", "/work/stale")));
+    });
+    expect(fetchMock.mock.calls).toHaveLength(before);
+    expect(acp.state.phase).toBe("stopped");
+    expect(acp.state.cwd).toBe("/work/alpha");
+    expect(window.location.pathname).toBe(sessionPath("alpha-one", "/work/alpha"));
+  });
+
   it.each(["runtime", "session-refresh"] as const)("restores history after connection replacement discovered by %s", async (discovery) => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
     let runtimeReads = 0;

@@ -40,6 +40,7 @@ export function useAcp() {
   const sessionEventsRef = useRef<EventSource | undefined>(undefined);
   const activeSessionIdRef = useRef<string | undefined>(undefined);
   const sessionViewRef = useRef<BridgeSessionView | undefined>(undefined);
+  const connectionReadyRef = useRef(false);
   const promptAdmissionsRef = useRef(new Map<string, {
     requestId: string;
     baseRevision: string;
@@ -166,7 +167,7 @@ export function useAcp() {
   }, [navigateSession]);
 
   const refreshSession = useCallback((sessionId: string) => {
-    if (activeSessionIdRef.current !== sessionId) return;
+    if (!connectionReadyRef.current || activeSessionIdRef.current !== sessionId) return;
     if (refreshInFlightRef.current?.sessionId === sessionId) {
       refreshInFlightRef.current.pending = true;
       return;
@@ -322,6 +323,8 @@ export function useAcp() {
         if (sessionEventsRef.current !== source || navigationRef.current !== navigation ||
           !sameSessionOwner(sessionViewRef.current, owner)) return;
         if (!runtime.connected || runtime.phase?.phase !== "ready") {
+          connectionReadyRef.current = false;
+          refreshInFlightRef.current = undefined;
           refreshRuntimeRef.current();
         } else if (runtime.bridgeEpoch != null && runtime.bridgeEpoch !== owner.bridgeEpoch) {
           prepareConnectionRestore();
@@ -469,6 +472,8 @@ export function useAcp() {
     try {
       const runtime = await requestJson<RuntimeView>("/api/v1/runtime");
       if (!stillCurrent()) return;
+      connectionReadyRef.current = runtime.connected && runtime.phase?.phase === "ready";
+      if (!connectionReadyRef.current) refreshInFlightRef.current = undefined;
       if (runtime.bridgeEpoch != null && sessionViewRef.current != null &&
         runtime.bridgeEpoch !== sessionViewRef.current.bridgeEpoch) {
         prepareConnectionRestore();
@@ -581,6 +586,11 @@ export function useAcp() {
   const handleGlobalEvent = useCallback((event: GlobalBusinessEvent) => {
     switch (event.type) {
       case "bridge/connection":
+        connectionReadyRef.current = event.phase === "ready";
+        // A stopped connection can still have queued session reset events and
+        // an outstanding GET. Neither may start another query or install a
+        // stale view after the Agent has exited.
+        if (!connectionReadyRef.current) refreshInFlightRef.current = undefined;
         if (event.phase === "stopped" || event.phase === "error") {
           promptAdmissionsRef.current.clear();
         }

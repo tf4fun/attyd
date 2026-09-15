@@ -237,6 +237,15 @@ also cover large ingress/publication backlogs, FIFO completion delivery behind n
 round-robin progress while another session is busy, early creation replay and active replay
 beyond the former queue limits.
 
+The bridge explicitly observes the SDK's clean incoming EOF signal, drains accepted deliveries
+without a deadline unless explicitly cancelled, and publishes `stopped`.
+Shutdown skips Agent cancellation notifications after EOF so a broken pipe
+cannot interrupt the remaining results. The `bridge::tests::stdio_clean_eof_*` regressions cover
+idle exit, exit with a pending prompt, and exit immediately after either the full fragment burst
+or a 9 MB message and its terminal response, with the event consumer left unread until shutdown.
+The browser stops queued session refreshes as soon as the global connection becomes unavailable;
+late query results cannot install an old view or start another GET on the stopped bridge.
+
 Queues use available process memory. If producers permanently outpace consumers, retained memory
 will grow until consumption, disconnection or lifecycle cleanup releases it; attyd does not impose
 an arbitrary truncation threshold.

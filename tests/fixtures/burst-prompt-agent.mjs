@@ -1,14 +1,18 @@
 import { createInterface } from "node:readline";
 
-const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+const exitMode = process.argv[2];
+const exit = () => process.exit(0);
+const write = (message, callback) => process.stdout.write(`${JSON.stringify(message)}\n`, callback);
 for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
   const response = (result) => ({ jsonrpc: "2.0", id: request.id, result });
   if (request.method === "initialize") {
-    write(response({ protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods: [] }));
+    write(response({ protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods: [] }),
+      exitMode === "exit-idle" ? exit : undefined);
   } else if (request.method === "session/load") {
     write(response({}));
   } else if (request.method === "session/prompt") {
+    if (exitMode === "exit-pending") exit();
     const large = request.params.prompt?.[0]?.text === "answer-large";
     const messages = Array.from({ length: large ? 1 : 2_048 }, (_, index) => ({
       jsonrpc: "2.0",
@@ -25,7 +29,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     // One transport burst, with the terminal response immediately after its last
     // fragment. No sleeps or per-fragment acknowledgement from the client.
     process.stdout.write([...messages, response({ stopReason: "end_turn" })]
-      .map((message) => `${JSON.stringify(message)}\n`).join(""));
+      .map((message) => `${JSON.stringify(message)}\n`).join(""),
+      exitMode === "exit-completed" ? exit : undefined);
   } else if (request.id !== undefined) {
     write({ jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } });
   }

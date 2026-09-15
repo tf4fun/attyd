@@ -2256,6 +2256,10 @@ where
                             let Some(item) = item else { break None };
                             coordinator.route(item, &scheduling, &ingress, &state, &sink).await?;
                         }
+                        // Clean EOF fails pending RPCs but does not cancel the
+                        // SDK foreground future. Stop admission and let the
+                        // cleanup below drain already accepted deliveries.
+                        _ = connection.incoming_closed() => break None,
                         input = observer_rx.recv() => {
                             if let Some(input) = input {
                                 let _ = ingress.try_browser(input, crate::session_dispatch::TrafficClass::Reserved);
@@ -2602,8 +2606,18 @@ where
                 }
                 Ok::<(), Error>(())
             };
-            tokio::time::timeout(SHUTDOWN_CANCEL_GRACE_PERIOD, drain).await
-                .map_err(|_| Error::internal_error().data("session transitions did not drain during shutdown"))??;
+            let drain_deadline = async {
+                // Natural EOF seals a finite input stream, not a processing
+                // deadline. Only explicit cancellation may bound its cleanup.
+                if connection.is_incoming_closed() {
+                    cancellation.cancelled().await;
+                }
+                tokio::time::sleep(SHUTDOWN_CANCEL_GRACE_PERIOD).await;
+            };
+            tokio::select! {
+                result = drain => result?,
+                _ = drain_deadline => return Err(Error::internal_error().data("session transitions did not drain during shutdown")),
+            }
             coordinator.close(&ingress, &sink)?;
             scheduling.close();
             {
@@ -3213,7 +3227,11 @@ async fn cancel_prompts_on_shutdown(
     }
 
     for (session_id, incarnation) in &session_ids {
-        let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
+        // Incoming EOF already failed pending RPCs. Writing a cancellation to
+        // an exited Agent can break the transport before their results drain.
+        if !connection.is_incoming_closed() {
+            let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
+        }
         cancel_interactions(session_id, *incarnation, "session_cancelled", state, sink).await;
     }
 
@@ -7719,6 +7737,122 @@ mod tests {
             "title": format!("Session {session_id}"),
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stdio_clean_eof_stops_an_idle_bridge() {
+        verify_stdio_clean_eof("exit-idle", false).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_clean_eof_fails_a_pending_prompt_and_stops() {
+        verify_stdio_clean_eof("exit-pending", false).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_clean_eof_drains_a_completed_burst_before_stopping() {
+        verify_stdio_clean_eof("exit-completed", false).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_clean_eof_drains_a_large_message_before_stopping() {
+        verify_stdio_clean_eof("exit-completed", true).await;
+    }
+
+    async fn verify_stdio_clean_eof(exit_mode: &str, large: bool) {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = format!("{cwd}/tests/fixtures/burst-prompt-agent.mjs");
+        let options = options(&["attyd", "--cwd", cwd, "--", "node", &fixture, exit_mode]);
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let mut bridge = tokio::spawn(run_with_cancellation(
+            Arc::new(options),
+            command_rx,
+            event_tx.into(),
+            cancellation.clone(),
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let raw = events.recv().await.expect("bridge stopped before initialization");
+                let event: Value = serde_json::from_str(&raw).unwrap();
+                assert_ne!(event["type"], "bridge/error", "{event}");
+                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                    break;
+                }
+            }
+            if exit_mode != "exit-idle" {
+                let (response, result) = oneshot::channel();
+                commands.send(BridgeInput::SessionViewRequest {
+                    session_id: "burst".into(),
+                    cwd: Some(cwd.into()),
+                    expected_owner: None,
+                    response,
+                }).unwrap();
+                let view = result.await.unwrap().unwrap();
+                request(&commands, json!({
+                    "type": "session/prompt", "requestId": "eof-prompt", "sessionId": "burst",
+                    "historyRevision": view["session"]["historyRevision"],
+                    "prompt": [{"type": "text", "text": if large { "answer-large" } else { "answer" }}],
+                })).await.unwrap();
+            }
+
+            // Keep the consumer idle until the process and bridge both finish.
+            // A clean EOF must terminate without closing the browser command
+            // channel, and every accepted output must remain available afterward.
+            (&mut bridge).await.unwrap();
+            let mut stopped = false;
+            let mut text = String::new();
+            let mut outcomes = Vec::new();
+            let mut errors = Vec::new();
+            while let Some(raw) = events.recv().await {
+                let event: Value = serde_json::from_str(&raw).unwrap();
+                assert!(!stopped, "event published after bridge stopped: {}", event["type"]);
+                if matches!(event["type"].as_str(), Some("acp/error" | "bridge/error")) {
+                    errors.push(event.clone());
+                }
+                if event["type"] == "acp/session_update"
+                    && event["notification"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                {
+                    text.push_str(event["notification"]["update"]["content"]["text"].as_str().unwrap());
+                }
+                if matches!(event["type"].as_str(), Some("bridge/session_turn_complete" | "bridge/session_turn_failed")) {
+                    outcomes.push(event.clone());
+                }
+                if event["type"] == "bridge/phase" {
+                    assert_eq!(event["phase"], "stopped", "{event}; errors: {errors:?}");
+                    stopped = true;
+                }
+            }
+            assert!(stopped, "clean EOF did not publish a stopped phase");
+            match exit_mode {
+                "exit-idle" => assert!(outcomes.is_empty()),
+                "exit-pending" => {
+                    assert_eq!(outcomes.len(), 1);
+                    assert_eq!(outcomes[0]["type"], "bridge/session_turn_failed");
+                }
+                "exit-completed" => {
+                    assert_eq!(outcomes.len(), 1);
+                    assert_eq!(outcomes[0]["type"], "bridge/session_turn_complete");
+                    assert_eq!(outcomes[0]["response"]["stopReason"], "end_turn");
+                    let expected = if large {
+                        "完整🙂".repeat(900_000)
+                    } else {
+                        (0..2_048).map(|index| format!("片段{index}🙂\n")).collect::<String>()
+                    };
+                    assert_eq!(text, expected, "output preceding EOF was truncated");
+                }
+                _ => unreachable!(),
+            }
+        }).await;
+        cancellation.cancel();
+        if !bridge.is_finished() {
+            tokio::time::timeout(Duration::from_secs(5), bridge)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        result.expect("clean EOF left the bridge running");
     }
 
     #[tokio::test]
