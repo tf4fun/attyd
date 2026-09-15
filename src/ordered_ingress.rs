@@ -15,7 +15,7 @@ use agent_client_protocol::{
     Agent, ConnectionTo, Dispatch, Error, Handled, JsonRpcRequest, SentRequest,
 };
 use serde_json::Value;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RequestOwner {
@@ -32,19 +32,6 @@ pub(crate) enum RequestClass {
     Control,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RequestBudget {
-    pub requests: usize,
-    pub completion_bytes: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct IngressLimits {
-    pub max_response_bytes: usize,
-    pub long_running: RequestBudget,
-    pub control: RequestBudget,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompletionSource {
     Response,
@@ -59,9 +46,6 @@ pub(crate) struct OrderedCompletion {
     pub result: Result<Value, Error>,
     pub source: CompletionSource,
     pub response_bytes: usize,
-    // Retain both budgets through delivery, so queued long-running completions
-    // cannot repeatedly release and reacquire admission ahead of control traffic.
-    _budget: CompletionBudget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,22 +57,10 @@ pub(crate) enum CompletionDisposition {
 
 #[derive(Debug)]
 pub(crate) enum IngressErrorKind {
-    InvalidLimits(&'static str),
-    InvalidResponseLimit {
-        requested: usize,
-        maximum: usize,
-    },
-    RequestSlotsExhausted(RequestClass),
-    CompletionBytesExhausted(RequestClass),
-    CompletionQueueFull,
     CompletionQueueClosed,
     ForeignReservation,
     DuplicateRequestId,
     RegistryPoisoned,
-    ResponseTooLarge {
-        bytes: usize,
-        limit: usize,
-    },
     Serialization(String),
     RouteFailed(Error),
     DeliveryAndRouteFailed {
@@ -133,30 +105,12 @@ impl std::error::Error for IngressError {}
 impl fmt::Display for IngressErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidLimits(message) => write!(formatter, "invalid limits: {message}"),
-            Self::InvalidResponseLimit { requested, maximum } => {
-                write!(
-                    formatter,
-                    "response reservation {requested} must be within 1..={maximum} bytes"
-                )
-            }
-            Self::RequestSlotsExhausted(class) => {
-                write!(formatter, "{class:?} request slots exhausted")
-            }
-            Self::CompletionBytesExhausted(class) => {
-                write!(formatter, "{class:?} completion bytes exhausted")
-            }
-            Self::CompletionQueueFull => write!(formatter, "completion queue is full"),
             Self::CompletionQueueClosed => write!(formatter, "completion queue is closed"),
             Self::ForeignReservation => {
                 write!(formatter, "reservation belongs to another connection")
             }
             Self::DuplicateRequestId => write!(formatter, "SDK request ID is already registered"),
             Self::RegistryPoisoned => write!(formatter, "request registry is poisoned"),
-            Self::ResponseTooLarge { bytes, limit } => write!(
-                formatter,
-                "response has {bytes} bytes; reservation allows {limit}"
-            ),
             Self::Serialization(error) => {
                 write!(formatter, "response serialization failed: {error}")
             }
@@ -171,43 +125,18 @@ impl fmt::Display for IngressErrorKind {
     }
 }
 
-struct ClassBudget {
-    requests: Arc<Semaphore>,
-    bytes: Arc<Semaphore>,
-}
-
-impl ClassBudget {
-    fn new(budget: RequestBudget) -> Self {
-        Self {
-            requests: Arc::new(Semaphore::new(budget.requests)),
-            bytes: Arc::new(Semaphore::new(budget.completion_bytes)),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct CompletionBudget {
-    _request: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
-}
-
 pub(crate) struct RequestReservation<Event> {
     identity: Arc<()>,
     owner: RequestOwner,
     method: String,
-    response_limit: usize,
-    delivery: mpsc::OwnedPermit<Event>,
-    budget: CompletionBudget,
+    delivery: mpsc::UnboundedSender<Event>,
 }
 
 struct Inner<Event> {
     identity: Arc<()>,
     pending: Mutex<HashMap<RequestId, RequestReservation<Event>>>,
-    events: mpsc::Sender<Event>,
+    events: mpsc::UnboundedSender<Event>,
     to_event: fn(OrderedCompletion) -> Event,
-    max_response_bytes: usize,
-    long_running: ClassBudget,
-    control: ClassBudget,
 }
 
 pub(crate) struct OrderedIngress<Event> {
@@ -229,96 +158,34 @@ pub(crate) struct RegisteredRequest<Response> {
 
 impl<Event: Send + 'static> OrderedIngress<Event> {
     pub(crate) fn new(
-        limits: IngressLimits,
-        events: mpsc::Sender<Event>,
+        events: mpsc::UnboundedSender<Event>,
         to_event: fn(OrderedCompletion) -> Event,
     ) -> Result<Self, IngressError> {
-        let request_slots = limits
-            .long_running
-            .requests
-            .checked_add(limits.control.requests);
-        if request_slots.is_none_or(|slots| slots == 0 || slots > events.max_capacity()) {
-            return Err(IngressError::new(IngressErrorKind::InvalidLimits(
-                "event queue must hold the configured request slots for both classes",
-            )));
-        }
-        if limits.max_response_bytes == 0 || limits.max_response_bytes > u32::MAX as usize {
-            return Err(IngressError::new(IngressErrorKind::InvalidLimits(
-                "response limit must be positive and fit the byte-permit counter",
-            )));
-        }
-        for budget in [limits.long_running, limits.control] {
-            if budget.requests > Semaphore::MAX_PERMITS
-                || budget.completion_bytes > Semaphore::MAX_PERMITS
-            {
-                return Err(IngressError::new(IngressErrorKind::InvalidLimits(
-                    "request or byte budget exceeds the semaphore capacity",
-                )));
-            }
-        }
         Ok(Self {
             inner: Arc::new(Inner {
                 identity: Arc::new(()),
                 pending: Mutex::new(HashMap::new()),
                 events,
                 to_event,
-                max_response_bytes: limits.max_response_bytes,
-                long_running: ClassBudget::new(limits.long_running),
-                control: ClassBudget::new(limits.control),
             }),
         })
     }
 
-    /// Reserve every resource before dispatch. Dropping an unused reservation releases
-    /// its request slot, byte budget, and queue slot together. Bytes are a reservation
-    /// for one serialized response, not a cumulative history limit.
+    /// Capture the request owner before dispatch. Completion uses the shared FIFO.
     pub(crate) fn try_reserve(
         &self,
-        class: RequestClass,
+        _class: RequestClass,
         owner: RequestOwner,
-        response_byte_limit: usize,
     ) -> Result<RequestReservation<Event>, IngressError> {
-        if response_byte_limit == 0 || response_byte_limit > self.inner.max_response_bytes {
-            return Err(IngressError::new(IngressErrorKind::InvalidResponseLimit {
-                requested: response_byte_limit,
-                maximum: self.inner.max_response_bytes,
-            }));
+        if self.inner.events.is_closed() {
+            return Err(IngressError::new(IngressErrorKind::CompletionQueueClosed));
         }
-        let class_budget = match class {
-            RequestClass::LongRunning => &self.inner.long_running,
-            RequestClass::Control => &self.inner.control,
-        };
-        let request = class_budget
-            .requests
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| IngressError::new(IngressErrorKind::RequestSlotsExhausted(class)))?;
-        let bytes = class_budget
-            .bytes
-            .clone()
-            .try_acquire_many_owned(response_byte_limit as u32)
-            .map_err(|_| IngressError::new(IngressErrorKind::CompletionBytesExhausted(class)))?;
-        let delivery = self
-            .inner
-            .events
-            .clone()
-            .try_reserve_owned()
-            .map_err(|error| {
-                IngressError::new(match error {
-                    mpsc::error::TrySendError::Full(_) => IngressErrorKind::CompletionQueueFull,
-                    mpsc::error::TrySendError::Closed(_) => IngressErrorKind::CompletionQueueClosed,
-                })
-            })?;
+        let delivery = self.inner.events.clone();
         Ok(RequestReservation {
             identity: self.inner.identity.clone(),
             owner,
             method: String::new(),
-            response_limit: response_byte_limit,
             delivery,
-            budget: CompletionBudget {
-                _request: request,
-                _bytes: bytes,
-            },
         })
     }
 
@@ -403,7 +270,7 @@ impl<Event: Send + 'static> OrderedIngress<Event> {
 
     /// Only for a request that ended without a received response (e.g. EOF or local
     /// dispatch failure). The caller keeps the SDK response consumer in its existing
-    /// bounded task; this module does not spawn a task per request.
+    /// owned task; this module does not spawn a task per request.
     pub(crate) fn complete_without_response(
         &self,
         request_id: &RequestId,
@@ -427,9 +294,7 @@ impl<Event: Send + 'static> OrderedIngress<Event> {
         let Some(RequestReservation {
             owner,
             method,
-            response_limit,
             delivery,
-            budget,
             ..
         }) = pending
         else {
@@ -438,12 +303,6 @@ impl<Event: Send + 'static> OrderedIngress<Event> {
         let fail = |kind| IngressError::for_request(kind, owner.clone(), request_id.clone());
         let bytes = response_bytes(result)
             .map_err(|error| fail(IngressErrorKind::Serialization(error.to_string())))?;
-        if bytes > response_limit {
-            return Err(fail(IngressErrorKind::ResponseTooLarge {
-                bytes,
-                limit: response_limit,
-            }));
-        }
         if self.inner.events.is_closed() {
             return Err(fail(IngressErrorKind::CompletionQueueClosed));
         }
@@ -454,14 +313,10 @@ impl<Event: Send + 'static> OrderedIngress<Event> {
             result: result.clone(),
             source,
             response_bytes: bytes,
-            _budget: budget,
         });
-        let sender = delivery.send(event);
-        // OwnedPermit::send is infallible even if the receiver has closed. Report a
-        // closure observed around publication; success means enqueued, not consumed.
-        if sender.is_closed() {
-            return Err(fail(IngressErrorKind::CompletionQueueClosed));
-        }
+        delivery
+            .send(event)
+            .map_err(|_| fail(IngressErrorKind::CompletionQueueClosed))?;
         Ok(CompletionDisposition::Delivered)
     }
 }
@@ -506,27 +361,13 @@ mod tests {
         }
     }
 
-    fn limits(long_running: usize, control: usize) -> IngressLimits {
-        IngressLimits {
-            max_response_bytes: 1024,
-            long_running: RequestBudget {
-                requests: long_running,
-                completion_bytes: long_running * 1024,
-            },
-            control: RequestBudget {
-                requests: control,
-                completion_bytes: control * 1024,
-            },
-        }
-    }
-
     fn setup() -> (
         OrderedIngress<OrderedCompletion>,
-        mpsc::Receiver<OrderedCompletion>,
+        mpsc::UnboundedReceiver<OrderedCompletion>,
     ) {
-        let (sender, receiver) = mpsc::channel(4);
+        let (sender, receiver) = mpsc::unbounded_channel();
         (
-            OrderedIngress::new(limits(2, 1), sender, |event| event).unwrap(),
+            OrderedIngress::new(sender, |event| event).unwrap(),
             receiver,
         )
     }
@@ -535,11 +376,8 @@ mod tests {
         ingress: &OrderedIngress<OrderedCompletion>,
         id: &str,
         class: RequestClass,
-        response_limit: usize,
     ) -> RequestId {
-        let reservation = ingress
-            .try_reserve(class, owner(id), response_limit)
-            .unwrap();
+        let reservation = ingress.try_reserve(class, owner(id)).unwrap();
         let id = RequestId::from(id.to_string());
         ingress
             .register_with(reservation, || (id.clone(), ()))
@@ -548,83 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn unsent_reservation_releases_request_bytes_and_delivery_slots() {
-        let (ingress, _receiver) = setup();
-        let available = ingress.inner.events.capacity();
-        let reservation = ingress
-            .try_reserve(RequestClass::LongRunning, owner("unused"), 1024)
-            .unwrap();
-        assert_eq!(ingress.inner.events.capacity(), available - 1);
-        assert_eq!(ingress.inner.long_running.requests.available_permits(), 1);
-        assert_eq!(ingress.inner.long_running.bytes.available_permits(), 1024);
-        drop(reservation);
-        assert_eq!(ingress.inner.events.capacity(), available);
-        assert_eq!(ingress.inner.long_running.requests.available_permits(), 2);
-        assert_eq!(ingress.inner.long_running.bytes.available_permits(), 2048);
-    }
-
-    #[test]
-    fn long_running_requests_and_queued_completions_leave_control_budget_available() {
-        let (sender, mut receiver) = mpsc::channel(2);
-        let ingress = OrderedIngress::new(limits(1, 1), sender, |event| event).unwrap();
-        let id = register(&ingress, "long", RequestClass::LongRunning, 1024);
-        assert!(matches!(
-            ingress.complete(&id, &Ok(json!({ "ok": true })), CompletionSource::Response),
-            Ok(CompletionDisposition::Delivered),
-        ));
-        assert!(matches!(
-            ingress.try_reserve(RequestClass::LongRunning, owner("next-long"), 1024),
-            Err(IngressError {
-                kind: IngressErrorKind::RequestSlotsExhausted(RequestClass::LongRunning),
-                ..
-            }),
-        ));
-        let control = ingress
-            .try_reserve(RequestClass::Control, owner("list"), 1024)
-            .unwrap();
-        assert_eq!(ingress.inner.events.capacity(), 0);
-        drop(receiver.try_recv().unwrap());
-        let next = ingress
-            .try_reserve(RequestClass::LongRunning, owner("next-long"), 1024)
-            .unwrap();
-        drop((control, next));
-    }
-
-    #[test]
-    fn byte_admission_failure_rolls_back_the_request_slot() {
-        let (sender, _receiver) = mpsc::channel(3);
-        let mut configured = limits(2, 1);
-        configured.long_running.completion_bytes = 1024;
-        let ingress = OrderedIngress::new(configured, sender, |event| event).unwrap();
-        let first = ingress
-            .try_reserve(RequestClass::LongRunning, owner("first"), 768)
-            .unwrap();
-        assert!(matches!(
-            ingress.try_reserve(RequestClass::LongRunning, owner("second"), 512),
-            Err(IngressError {
-                kind: IngressErrorKind::CompletionBytesExhausted(RequestClass::LongRunning),
-                ..
-            }),
-        ));
-        assert_eq!(ingress.inner.long_running.requests.available_permits(), 1);
-        assert_eq!(ingress.inner.long_running.bytes.available_permits(), 256);
-        let control = ingress
-            .try_reserve(RequestClass::Control, owner("cancel"), 1024)
-            .unwrap();
-        drop(first);
-        assert!(
-            ingress
-                .try_reserve(RequestClass::LongRunning, owner("second"), 1024)
-                .is_ok()
-        );
-        drop(control);
-    }
-
-    #[test]
     fn response_and_local_failure_share_one_completion_owner() {
         for response_first in [true, false] {
             let (ingress, mut receiver) = setup();
-            let id = register(&ingress, "request", RequestClass::LongRunning, 1024);
+            let id = register(&ingress, "request", RequestClass::LongRunning);
             let response =
                 || ingress.complete(&id, &Ok(json!({ "ok": true })), CompletionSource::Response);
             let local =
@@ -653,7 +418,6 @@ mod tests {
             );
             assert!(receiver.try_recv().is_err());
             drop(completion);
-            assert_eq!(ingress.inner.long_running.requests.available_permits(), 2);
         }
     }
 
@@ -661,7 +425,7 @@ mod tests {
     fn response_cannot_pass_between_send_and_owner_registration() {
         let (ingress, mut receiver) = setup();
         let reservation = ingress
-            .try_reserve(RequestClass::LongRunning, owner("fast"), 1024)
+            .try_reserve(RequestClass::LongRunning, owner("fast"))
             .unwrap();
         let (sending, sent) = thread_channel::sync_channel(1);
         let (release, released) = thread_channel::sync_channel(1);
@@ -703,21 +467,17 @@ mod tests {
     }
 
     #[test]
-    fn response_limits_and_closed_delivery_report_the_affected_owner() {
+    fn large_response_is_delivered_and_closed_delivery_reports_the_affected_owner() {
         let (ingress, mut receiver) = setup();
-        let id = register(&ingress, "large", RequestClass::LongRunning, 16);
-        let error = ingress
-            .complete(&id, &Ok(json!("x".repeat(64))), CompletionSource::Response)
-            .unwrap_err();
-        assert!(matches!(
-            error.kind,
-            IngressErrorKind::ResponseTooLarge { limit: 16, .. }
-        ));
-        assert_eq!(error.owner, Some(owner("large")));
-        assert_eq!(error.request_id, Some(id));
-        assert!(receiver.try_recv().is_err());
-        assert_eq!(ingress.inner.long_running.requests.available_permits(), 2);
-        let id = register(&ingress, "closed", RequestClass::Control, 1024);
+        let id = register(&ingress, "large", RequestClass::LongRunning);
+        let payload = json!("x".repeat(8_000_001));
+        ingress
+            .complete(&id, &Ok(payload.clone()), CompletionSource::Response)
+            .unwrap();
+        let completion = receiver.try_recv().unwrap();
+        assert_eq!(completion.result, Ok(payload));
+        assert_eq!(completion.request_id, id);
+        let id = register(&ingress, "closed", RequestClass::Control);
         drop(receiver);
         let error = ingress
             .complete_without_response(&id, Error::internal_error().data("EOF"))
@@ -728,7 +488,6 @@ mod tests {
         ));
         assert_eq!(error.owner, Some(owner("closed")));
         assert_eq!(error.request_id, Some(id));
-        assert_eq!(ingress.inner.control.requests.available_permits(), 1);
     }
 
     #[test]
@@ -736,7 +495,7 @@ mod tests {
         let (first, _first_receiver) = setup();
         let (second, _second_receiver) = setup();
         let reservation = first
-            .try_reserve(RequestClass::LongRunning, owner("foreign"), 1024)
+            .try_reserve(RequestClass::LongRunning, owner("foreign"))
             .unwrap();
         let error = second
             .register_with(reservation, || -> (RequestId, ()) {
@@ -744,8 +503,6 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error.kind, IngressErrorKind::ForeignReservation));
-        assert_eq!(first.inner.long_running.requests.available_permits(), 2);
-        assert_eq!(first.inner.events.capacity(), 4);
     }
 
     enum TestEvent {
@@ -754,48 +511,46 @@ mod tests {
     }
 
     #[test]
-    fn queue_admission_reports_full_or_closed_and_releases_partial_reservations() {
-        let (events, mut receiver) = mpsc::channel(3);
-        let ingress =
-            OrderedIngress::new(limits(2, 1), events.clone(), TestEvent::Completion).unwrap();
-        for _ in 0..3 {
-            assert!(
-                events
-                    .try_send(TestEvent::Notification(Value::Null))
-                    .is_ok()
-            );
+    fn completion_delivery_survives_an_unread_notification_backlog() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let ingress = OrderedIngress::new(events.clone(), TestEvent::Completion).unwrap();
+        for index in 0..4_096 {
+            events.send(TestEvent::Notification(json!(index))).unwrap();
+        }
+        let reservation = ingress
+            .try_reserve(RequestClass::Control, owner("complete"))
+            .unwrap();
+        let id = RequestId::from("complete".to_string());
+        ingress
+            .register_with(reservation, || (id.clone(), ()))
+            .unwrap();
+        ingress
+            .complete(&id, &Ok(json!({"ok":true})), CompletionSource::Response)
+            .unwrap();
+        for index in 0..4_096 {
+            let TestEvent::Notification(value) = receiver.try_recv().unwrap() else {
+                panic!("completion overtook content")
+            };
+            assert_eq!(value, index);
         }
         assert!(matches!(
-            ingress.try_reserve(RequestClass::Control, owner("full"), 1024),
-            Err(IngressError {
-                kind: IngressErrorKind::CompletionQueueFull,
-                ..
-            }),
+            receiver.try_recv().unwrap(),
+            TestEvent::Completion(_)
         ));
-        assert_eq!(ingress.inner.control.requests.available_permits(), 1);
-        assert_eq!(ingress.inner.control.bytes.available_permits(), 1024);
-        drop(receiver.try_recv().unwrap());
-        assert!(
-            ingress
-                .try_reserve(RequestClass::Control, owner("available"), 1024)
-                .is_ok()
-        );
         drop(receiver);
         assert!(matches!(
-            ingress.try_reserve(RequestClass::Control, owner("closed"), 1024),
+            ingress.try_reserve(RequestClass::Control, owner("closed")),
             Err(IngressError {
                 kind: IngressErrorKind::CompletionQueueClosed,
                 ..
-            }),
+            })
         ));
-        assert_eq!(ingress.inner.control.requests.available_permits(), 1);
-        assert_eq!(ingress.inner.control.bytes.available_permits(), 1024);
     }
 
     #[tokio::test]
     async fn incoming_eof_publishes_one_local_failure_for_the_registered_owner() {
-        let (events, mut receiver) = mpsc::channel(2);
-        let ingress = OrderedIngress::new(limits(1, 1), events, |event| event).unwrap();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let ingress = OrderedIngress::new(events, |event| event).unwrap();
         let (outgoing, mut peer_requests) = futures::channel::mpsc::channel::<String>(4);
         let (peer_responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(4);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -814,7 +569,7 @@ mod tests {
             )
             .connect_with(transport, async move |connection| {
                 let reservation = ingress
-                    .try_reserve(RequestClass::LongRunning, owner("lost"), 1024)
+                    .try_reserve(RequestClass::LongRunning, owner("lost"))
                     .unwrap();
                 let request = ingress
                     .send_registered(
@@ -855,9 +610,8 @@ mod tests {
 
     #[tokio::test]
     async fn shared_queue_preserves_updates_on_both_sides_of_creation_response() {
-        let (events, mut received) = mpsc::channel(6);
-        let ingress =
-            OrderedIngress::new(limits(2, 1), events.clone(), TestEvent::Completion).unwrap();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let ingress = OrderedIngress::new(events.clone(), TestEvent::Completion).unwrap();
         let (outgoing, mut peer_requests) = futures::channel::mpsc::channel::<String>(4);
         let (mut peer_responses, incoming) =
             futures::channel::mpsc::channel::<io::Result<String>>(4);
@@ -871,7 +625,7 @@ mod tests {
                     async move |dispatch: Dispatch, _connection| {
                         if let Dispatch::Notification(notification) = dispatch {
                             events
-                                .try_send(TestEvent::Notification(notification.params))
+                                .send(TestEvent::Notification(notification.params))
                                 .map_err(|error| Error::internal_error().data(error.to_string()))?;
                             Ok(Handled::Yes)
                         } else {
@@ -888,7 +642,7 @@ mod tests {
                 creation_owner.session_id = None;
                 creation_owner.incarnation = None;
                 let reservation = ingress
-                    .try_reserve(RequestClass::Control, creation_owner, 1024)
+                    .try_reserve(RequestClass::Control, creation_owner)
                     .unwrap();
                 let request = ingress
                     .send_registered(
@@ -938,8 +692,8 @@ mod tests {
 
     #[tokio::test]
     async fn closed_completion_receiver_does_not_leave_the_rpc_waiter_parked() {
-        let (events, receiver) = mpsc::channel(2);
-        let ingress = OrderedIngress::new(limits(1, 1), events, |event| event).unwrap();
+        let (events, receiver) = mpsc::unbounded_channel();
+        let ingress = OrderedIngress::new(events, |event| event).unwrap();
         let delivery_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (outgoing, mut peer_requests) = futures::channel::mpsc::channel::<String>(4);
         let (mut peer_responses, incoming) =
@@ -972,7 +726,7 @@ mod tests {
             )
             .connect_with(transport, async move |connection| {
                 let reservation = ingress
-                    .try_reserve(RequestClass::Control, owner("query"), 1024)
+                    .try_reserve(RequestClass::Control, owner("query"))
                     .unwrap();
                 let request = ingress
                     .send_registered(

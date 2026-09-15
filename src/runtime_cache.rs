@@ -4,19 +4,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Map, Value, json};
 
-const MAX_RUNTIME_EVENTS_PER_SESSION: usize = 100_000;
-const MAX_RUNTIME_BYTES_PER_SESSION: usize = 32 * 1024 * 1024;
-const MAX_RUNTIME_BYTES_TOTAL: usize = 64 * 1024 * 1024;
-const MAX_PENDING_SESSION_EVENTS: usize = 10_000;
-const MAX_GLOBAL_RUNTIME_EVENTS: usize = 1_024;
-const MAX_GLOBAL_RUNTIME_BYTES: usize = 8 * 1024 * 1024;
-const MAX_LIVE_TERMINAL_BYTES: usize = 1_000_000;
-
 #[derive(Default)]
 pub(crate) struct ActiveRuntimeProjection {
     sessions: HashMap<String, RuntimeSession>,
     pending_session_events: HashMap<String, VecDeque<String>>,
-    pending_session_truncated: HashSet<String>,
     prompt_sessions: HashMap<String, String>,
     operation_sessions: HashMap<String, String>,
     permission_sessions: HashMap<String, String>,
@@ -411,7 +402,6 @@ impl ActiveRuntimeProjection {
             terminal
                 .get("outputBytes")
                 .and_then(Value::as_str)
-                .filter(|encoded| encoded.len() <= MAX_LIVE_TERMINAL_BYTES * 2)
                 .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
                 .unwrap_or(fallback_output)
         } else {
@@ -432,8 +422,7 @@ impl ActiveRuntimeProjection {
                 } else {
                     output.len()
                 }
-            })
-            .min(MAX_LIVE_TERMINAL_BYTES);
+            });
         let key = (session_id, terminal_id);
         let buffer = self.terminal_output_bytes.entry(key).or_default();
         if append {
@@ -575,7 +564,7 @@ impl ActiveRuntimeProjection {
             session: Value::Object(session),
             events: VecDeque::new(),
             event_bytes: 0,
-            truncated: self.pending_session_truncated.remove(session_id),
+            truncated: false,
             updated_at: self.clock,
             active_prompt: None,
             pending_permissions: HashMap::new(),
@@ -590,7 +579,6 @@ impl ActiveRuntimeProjection {
             }
         }
         self.sessions.insert(session_id.to_string(), runtime);
-        self.enforce_total_budget();
     }
 
     fn open_forked_session(
@@ -613,7 +601,6 @@ impl ActiveRuntimeProjection {
             session.updated_at = self.clock;
             if session.active_prompt.is_some() {
                 session.push(event.to_string());
-                self.enforce_total_budget();
             }
             return;
         }
@@ -625,17 +612,6 @@ impl ActiveRuntimeProjection {
             .entry(session_id.to_string())
             .or_default();
         pending.push_back(event.to_string());
-        let mut pending_bytes = pending.iter().map(String::len).sum::<usize>();
-        while pending.len() > MAX_PENDING_SESSION_EVENTS
-            || pending_bytes > MAX_RUNTIME_BYTES_PER_SESSION
-        {
-            let Some(removed) = pending.pop_front() else {
-                break;
-            };
-            pending_bytes = pending_bytes.saturating_sub(removed.len());
-            self.pending_session_truncated
-                .insert(session_id.to_string());
-        }
     }
 
     fn record_optional_session_event(&mut self, session_id: Option<&str>, event: &str) {
@@ -649,14 +625,6 @@ impl ActiveRuntimeProjection {
     fn record_global_event(&mut self, event: &str) {
         self.global_event_bytes = self.global_event_bytes.saturating_add(event.len());
         self.global_events.push_back(event.to_string());
-        while self.global_events.len() > MAX_GLOBAL_RUNTIME_EVENTS
-            || self.global_event_bytes > MAX_GLOBAL_RUNTIME_BYTES
-        {
-            let Some(removed) = self.global_events.pop_front() else {
-                break;
-            };
-            self.global_event_bytes = self.global_event_bytes.saturating_sub(removed.len());
-        }
     }
 
     fn remove_pending_terminal(&mut self, session_id: &str, release: &Value) {
@@ -693,7 +661,6 @@ impl ActiveRuntimeProjection {
     fn remove_session(&mut self, session_id: &str) {
         self.sessions.remove(session_id);
         self.pending_session_events.remove(session_id);
-        self.pending_session_truncated.remove(session_id);
         self.prompt_sessions.retain(|_, value| value != session_id);
         self.operation_sessions
             .retain(|_, value| value != session_id);
@@ -721,34 +688,6 @@ impl ActiveRuntimeProjection {
             })
         {
             session.active_operation = None;
-        }
-    }
-
-    fn enforce_total_budget(&mut self) {
-        let mut total = self
-            .sessions
-            .values()
-            .map(|session| session.event_bytes)
-            .sum::<usize>();
-        while total > MAX_RUNTIME_BYTES_TOTAL {
-            let Some(session_id) = self
-                .sessions
-                .iter()
-                .filter(|(_, session)| !session.events.is_empty())
-                .min_by_key(|(_, session)| session.updated_at)
-                .map(|(session_id, _)| session_id.clone())
-            else {
-                break;
-            };
-            let Some(session) = self.sessions.get_mut(&session_id) else {
-                break;
-            };
-            let Some(removed) = session.events.pop_front() else {
-                break;
-            };
-            session.event_bytes = session.event_bytes.saturating_sub(removed.len());
-            session.truncated = true;
-            total = total.saturating_sub(removed.len());
         }
     }
 }
@@ -872,15 +811,6 @@ impl RuntimeSession {
     fn push(&mut self, event: String) {
         self.event_bytes = self.event_bytes.saturating_add(event.len());
         self.events.push_back(event);
-        while self.events.len() > MAX_RUNTIME_EVENTS_PER_SESSION
-            || self.event_bytes > MAX_RUNTIME_BYTES_PER_SESSION
-        {
-            let Some(removed) = self.events.pop_front() else {
-                break;
-            };
-            self.event_bytes = self.event_bytes.saturating_sub(removed.len());
-            self.truncated = true;
-        }
     }
 }
 
@@ -953,6 +883,35 @@ mod tests {
                     == Some(kind)
             })
             .count()
+    }
+
+    #[test]
+    fn live_replay_keeps_every_event_in_a_large_burst() {
+        let mut projection = ActiveRuntimeProjection::default();
+        projection.update(
+            r#"{"type":"acp/session_created","cwd":"/workspace","response":{"sessionId":"burst"}}"#,
+        );
+        projection.update(
+            r#"{"type":"acp/prompt_started","sessionId":"burst","requestId":"prompt","prompt":[]}"#,
+        );
+        assert!(projection.sessions["burst"].active_prompt.is_some());
+        for index in 0..100_050 {
+            projection.record_session_value("burst", json!({
+                "type":"acp/session_update", "notification":{"sessionId":"burst","update":{
+                    "sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":format!("片段{index}🙂")}
+                }}
+            }));
+        }
+        let session = &projection.sessions["burst"];
+        assert_eq!(session.events.len(), 100_051);
+        for (index, raw) in session.events.iter().skip(1).enumerate() {
+            let event: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                event["notification"]["update"]["content"]["text"],
+                format!("片段{index}🙂")
+            );
+        }
+        assert!(!session.truncated);
     }
 
     #[test]

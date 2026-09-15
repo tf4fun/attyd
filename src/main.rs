@@ -25,6 +25,7 @@ mod session_registry;
 mod session_resources;
 mod session_state;
 mod terminal;
+mod websocket_agent;
 
 use anyhow::Result;
 use clap::Parser;

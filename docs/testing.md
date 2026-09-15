@@ -14,7 +14,7 @@ drivers; there is no second backend implementation.
 | Layer | Command | Purpose |
 | --- | --- | --- |
 | Frontend and browser contract | `npm test` | Reducer, event-envelope, content, prompt-history, search, interaction, accessibility, load-replacement, and adversarial-state cases |
-| Rust backend | `npm run test:rust` | Native cases for active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, bounded event queues, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
+| Rust backend | `npm run test:rust` | Native cases for active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, lossless event queues and burst/slow-subscriber delivery, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
 | Remote ACP transports | `npm run test:remote` | Connects the Rust binary to SDK HTTP/SSE and WebSocket ACP servers; verifies remote capability boundaries and Agent-owned absolute cwd |
 | Rust-hosted black box | `npm run test:ui` | Exercises the production binary's embedded bundle and REST/session-SSE API with a real stdio ACP fixture, revision-guarded prompt completion, history reload, and deletion |
 | MCP-over-ACP protocol | `node --import tsx scripts/acp-protocol-smoke.ts` | Verifies bidirectional requests and notifications, error preservation, cancellation, cleanup, and reconnect using SDK fixtures |
@@ -84,8 +84,8 @@ Chrome; CI installs Chromium. The coverage command uses the same browser setup.
 
 The Rust suite covers CLI and MCP configuration boundaries,
 filesystem roots/read/write/context behavior, terminal and terminal-auth lifecycle, optional
-capability gates, Agent-owned cwd selection, early/late update isolation, bounded relay values,
-structured errors, cyclic pagination, session races, complete ContentBlock validation,
+capability gates, Agent-owned cwd selection, early/late update isolation, large lossless relay values,
+complete structured errors, large HTTP/stdio/WebSocket payloads, delayed admission, cyclic pagination, session races, complete ContentBlock validation,
 prompt/usage coherence, configuration and mode references, transactional session updates,
 permission and elicitation semantics, and MCP process/request races.
 

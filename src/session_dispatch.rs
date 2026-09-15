@@ -1,22 +1,14 @@
-//! Bounded queues for short session transitions at the ordered ingress boundary.
+//! FIFO queues for short session transitions at the ordered ingress boundary.
 //!
-//! The caller puts commands, ACP updates, and ordered RPC completions through this
-//! one dispatcher. Reserved capacity never changes a session's FIFO order. Taking
-//! a delivery makes that allocation busy until its guard is dropped; other sessions
-//! remain eligible for round-robin draining. A guard covers local state reduction,
-//! not an Agent request, a user interaction, or external resource cleanup.
-//!
-//! No task or waiting sender is created here. Capacity errors preserve the rejected
-//! event and distinguish commands from required ingress so the connection owner can
-//! apply its rejection or connection-failure policy. Shared global budgets remain
-//! finite: this component does not promise unlimited isolation between sessions.
+//! Taking a delivery makes its allocation busy until the guard is dropped. Other
+//! sessions remain eligible for round-robin draining. A guard covers local state
+//! reduction, not an Agent request, user interaction, or external cleanup.
+//! Queued items and bytes are accounted, but bursts never reject accepted content.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrafficClass {
@@ -31,71 +23,16 @@ pub(crate) enum EventOrigin {
     RequiredInbound,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Budget {
-    pub items: usize,
-    pub bytes: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ClassLimits {
-    pub ordinary: Budget,
-    pub reserved: Budget,
-}
-
-impl ClassLimits {
-    fn get(self, class: TrafficClass) -> Budget {
-        match class {
-            TrafficClass::Ordinary => self.ordinary,
-            TrafficClass::Reserved => self.reserved,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DispatchLimits {
-    pub max_sessions: usize,
-    pub max_event_bytes: usize,
-    pub per_session: ClassLimits,
-    pub global: ClassLimits,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BudgetScope {
-    Session,
-    Global,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BudgetDimension {
-    Items,
-    Bytes,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DispatchError {
-    InvalidLimits(&'static str),
     Closed,
     RegistryPoisoned,
     EpochMismatch,
     ForeignHandle,
     SessionRemoved,
     StaleHandle,
-    StaleIncarnation {
-        current: u64,
-        requested: u64,
-    },
-    SessionLimit,
+    StaleIncarnation { current: u64, requested: u64 },
     AllocationExhausted,
-    EventTooLarge {
-        bytes: usize,
-        limit: usize,
-    },
-    BudgetExhausted {
-        scope: BudgetScope,
-        class: TrafficClass,
-        dimension: BudgetDimension,
-    },
 }
 
 impl fmt::Display for DispatchError {
@@ -143,87 +80,51 @@ impl Eq for SessionHandle {}
 
 #[derive(Debug)]
 pub(crate) struct Rejected<E> {
-    pub handle: SessionHandle,
-    pub class: TrafficClass,
     pub origin: EventOrigin,
     pub error: DispatchError,
     pub event: E,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BudgetUsage {
+pub(crate) struct QueueUsage {
     // Includes queued deliveries and deliveries currently being reduced.
     pub items: usize,
     pub bytes: usize,
 }
 
-struct BudgetPool {
-    limits: Budget,
-    items: Arc<Semaphore>,
-    bytes: Arc<Semaphore>,
+#[derive(Debug, Default)]
+struct QueueAccounting {
+    items: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
 }
 
-impl BudgetPool {
-    fn new(limits: Budget) -> Self {
-        Self {
-            limits,
-            items: Arc::new(Semaphore::new(limits.items)),
-            bytes: Arc::new(Semaphore::new(limits.bytes)),
+impl QueueAccounting {
+    fn record(&self, bytes: usize) -> QueueLease {
+        self.items.fetch_add(1, Ordering::AcqRel);
+        self.bytes.fetch_add(bytes, Ordering::AcqRel);
+        QueueLease {
+            items: self.items.clone(),
+            bytes: self.bytes.clone(),
+            size: bytes,
         }
     }
 
-    fn acquire(
-        &self,
-        bytes: usize,
-        scope: BudgetScope,
-        class: TrafficClass,
-    ) -> Result<BudgetLease, DispatchError> {
-        let items =
-            self.items
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| DispatchError::BudgetExhausted {
-                    scope,
-                    class,
-                    dimension: BudgetDimension::Items,
-                })?;
-        let bytes = self
-            .bytes
-            .clone()
-            .try_acquire_many_owned(bytes as u32)
-            .map_err(|_| DispatchError::BudgetExhausted {
-                scope,
-                class,
-                dimension: BudgetDimension::Bytes,
-            })?;
-        Ok(BudgetLease {
-            _items: items,
-            _bytes: bytes,
-        })
-    }
-
-    fn usage(&self) -> BudgetUsage {
-        BudgetUsage {
-            items: self.limits.items - self.items.available_permits(),
-            bytes: self.limits.bytes - self.bytes.available_permits(),
+    fn usage(&self) -> QueueUsage {
+        QueueUsage {
+            items: self.items.load(Ordering::Acquire),
+            bytes: self.bytes.load(Ordering::Acquire),
         }
     }
 }
 
+#[derive(Default)]
 struct ClassPools {
-    ordinary: BudgetPool,
-    reserved: BudgetPool,
+    ordinary: QueueAccounting,
+    reserved: QueueAccounting,
 }
 
 impl ClassPools {
-    fn new(limits: ClassLimits) -> Self {
-        Self {
-            ordinary: BudgetPool::new(limits.ordinary),
-            reserved: BudgetPool::new(limits.reserved),
-        }
-    }
-
-    fn get(&self, class: TrafficClass) -> &BudgetPool {
+    fn get(&self, class: TrafficClass) -> &QueueAccounting {
         match class {
             TrafficClass::Ordinary => &self.ordinary,
             TrafficClass::Reserved => &self.reserved,
@@ -232,17 +133,25 @@ impl ClassPools {
 }
 
 #[derive(Debug)]
-struct BudgetLease {
-    _items: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
+struct QueueLease {
+    items: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+    size: usize,
+}
+
+impl Drop for QueueLease {
+    fn drop(&mut self) {
+        self.items.fetch_sub(1, Ordering::AcqRel);
+        self.bytes.fetch_sub(self.size, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct DeliveryGuard {
     // Dropping an old allocation's guard never changes its replacement's flag.
     busy: Option<Arc<AtomicBool>>,
-    session: Option<BudgetLease>,
-    global: Option<BudgetLease>,
+    session: Option<QueueLease>,
+    global: Option<QueueLease>,
 }
 
 impl Drop for DeliveryGuard {
@@ -283,7 +192,7 @@ impl<E> Delivery<E> {
 
 struct SessionQueue<E> {
     handle: SessionHandle,
-    budgets: ClassPools,
+    accounting: ClassPools,
     queue: VecDeque<Delivery<E>>,
     scheduled: bool,
     busy: Arc<AtomicBool>,
@@ -299,7 +208,6 @@ struct Registry<E> {
 struct Inner<E> {
     epoch: Arc<str>,
     identity: Arc<()>,
-    limits: DispatchLimits,
     global: ClassPools,
     registry: Mutex<Registry<E>>,
 }
@@ -317,38 +225,12 @@ impl<E> Clone for SessionDispatch<E> {
 }
 
 impl<E> SessionDispatch<E> {
-    pub(crate) fn new(
-        epoch: impl Into<String>,
-        limits: DispatchLimits,
-    ) -> Result<Self, DispatchError> {
-        if limits.max_sessions == 0
-            || limits.max_event_bytes == 0
-            || limits.max_event_bytes > u32::MAX as usize
-        {
-            return Err(DispatchError::InvalidLimits(
-                "session and event limits must be positive; event bytes must fit u32",
-            ));
-        }
-        for class in [TrafficClass::Ordinary, TrafficClass::Reserved] {
-            for budget in [limits.per_session.get(class), limits.global.get(class)] {
-                if budget.items == 0
-                    || budget.items > Semaphore::MAX_PERMITS
-                    || budget.bytes == 0
-                    || budget.bytes > u32::MAX as usize
-                    || budget.bytes > Semaphore::MAX_PERMITS
-                {
-                    return Err(DispatchError::InvalidLimits(
-                        "item and byte budgets must fit their positive semaphore bounds",
-                    ));
-                }
-            }
-        }
+    pub(crate) fn new(epoch: impl Into<String>) -> Result<Self, DispatchError> {
         Ok(Self {
             inner: Arc::new(Inner {
                 epoch: Arc::from(epoch.into()),
                 identity: Arc::new(()),
-                limits,
-                global: ClassPools::new(limits.global),
+                global: ClassPools::default(),
                 registry: Mutex::new(Registry {
                     closed: false,
                     next_allocation: 0,
@@ -386,8 +268,6 @@ impl<E> SessionDispatch<E> {
                     requested: incarnation,
                 });
             }
-        } else if registry.sessions.len() >= self.inner.limits.max_sessions {
-            return Err(DispatchError::SessionLimit);
         }
         let allocation = registry
             .next_allocation
@@ -405,7 +285,7 @@ impl<E> SessionDispatch<E> {
             session_id.clone(),
             SessionQueue {
                 handle: handle.clone(),
-                budgets: ClassPools::new(self.inner.limits.per_session),
+                accounting: ClassPools::default(),
                 queue: VecDeque::new(),
                 scheduled: false,
                 busy: Arc::new(AtomicBool::new(false)),
@@ -444,9 +324,8 @@ impl<E> SessionDispatch<E> {
         Ok(())
     }
 
-    /// `bytes` is measured by the trusted ingress serializer. Zero-byte events
-    /// still consume one byte and one item; the wrapper's fixed overhead is bounded
-    /// by the item limits. This function never waits for queue capacity.
+    /// `bytes` is measured by the ingress serializer for accounting only.
+    /// Enqueueing never rejects an event because earlier work is still pending.
     pub(crate) fn try_route(
         &self,
         handle: &SessionHandle,
@@ -463,25 +342,12 @@ impl<E> SessionDispatch<E> {
                 .map_err(|_| DispatchError::RegistryPoisoned)?;
             self.validate_handle(&registry, handle)?;
             let bytes = bytes.max(1);
-            if bytes > self.inner.limits.max_event_bytes {
-                return Err(DispatchError::EventTooLarge {
-                    bytes,
-                    limit: self.inner.limits.max_event_bytes,
-                });
-            }
             let queue = registry
                 .sessions
                 .get_mut(handle.session_id())
                 .expect("validated queue");
-            let session = queue
-                .budgets
-                .get(class)
-                .acquire(bytes, BudgetScope::Session, class)?;
-            let global = self
-                .inner
-                .global
-                .get(class)
-                .acquire(bytes, BudgetScope::Global, class)?;
+            let session = queue.accounting.get(class).record(bytes);
+            let global = self.inner.global.get(class).record(bytes);
             Ok((
                 registry,
                 bytes,
@@ -513,8 +379,6 @@ impl<E> SessionDispatch<E> {
                 Ok(())
             }
             Err(error) => Err(Rejected {
-                handle: handle.clone(),
-                class,
                 origin,
                 error,
                 event,
@@ -587,7 +451,7 @@ impl<E> SessionDispatch<E> {
         Ok(())
     }
 
-    pub(crate) fn global_usage(&self, class: TrafficClass) -> BudgetUsage {
+    pub(crate) fn global_usage(&self, class: TrafficClass) -> QueueUsage {
         self.inner.global.get(class).usage()
     }
 
@@ -595,7 +459,7 @@ impl<E> SessionDispatch<E> {
         &self,
         handle: &SessionHandle,
         class: TrafficClass,
-    ) -> Result<BudgetUsage, DispatchError> {
+    ) -> Result<QueueUsage, DispatchError> {
         let registry = self
             .inner
             .registry
@@ -603,7 +467,7 @@ impl<E> SessionDispatch<E> {
             .map_err(|_| DispatchError::RegistryPoisoned)?;
         self.validate_handle(&registry, handle)?;
         Ok(registry.sessions[handle.session_id()]
-            .budgets
+            .accounting
             .get(class)
             .usage())
     }
@@ -615,35 +479,8 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
 
-    fn limits() -> DispatchLimits {
-        DispatchLimits {
-            max_sessions: 4,
-            max_event_bytes: 16,
-            per_session: ClassLimits {
-                ordinary: Budget {
-                    items: 2,
-                    bytes: 16,
-                },
-                reserved: Budget {
-                    items: 1,
-                    bytes: 16,
-                },
-            },
-            global: ClassLimits {
-                ordinary: Budget {
-                    items: 4,
-                    bytes: 32,
-                },
-                reserved: Budget {
-                    items: 2,
-                    bytes: 32,
-                },
-            },
-        }
-    }
-
     fn dispatch() -> SessionDispatch<&'static str> {
-        SessionDispatch::new("epoch", limits()).unwrap()
+        SessionDispatch::new("epoch").unwrap()
     }
 
     fn ordinary(
@@ -679,33 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_limits_are_rejected_before_allocating_queues() {
-        for invalid in [
-            DispatchLimits {
-                max_sessions: 0,
-                ..limits()
-            },
-            DispatchLimits {
-                max_event_bytes: 0,
-                ..limits()
-            },
-            DispatchLimits {
-                global: ClassLimits {
-                    ordinary: Budget { items: 0, bytes: 1 },
-                    ..limits().global
-                },
-                ..limits()
-            },
-        ] {
-            assert!(matches!(
-                SessionDispatch::<()>::new("epoch", invalid),
-                Err(DispatchError::InvalidLimits(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn reserved_response_stays_between_the_updates_in_one_fifo() {
+    fn empty_epoch_is_rejected_before_allocating_queues() {
         let dispatch = dispatch();
         let session = dispatch.register("a", 1).unwrap();
         ordinary(&dispatch, &session, "update-before");
@@ -724,16 +535,16 @@ mod tests {
         assert!(dispatch.try_next().unwrap().is_none());
         assert_eq!(
             dispatch.global_usage(TrafficClass::Ordinary),
-            BudgetUsage { items: 0, bytes: 0 }
+            QueueUsage { items: 0, bytes: 0 }
         );
         assert_eq!(
             dispatch.global_usage(TrafficClass::Reserved),
-            BudgetUsage { items: 0, bytes: 0 }
+            QueueUsage { items: 0, bytes: 0 }
         );
     }
 
     #[test]
-    fn zero_byte_events_and_extracted_payloads_retain_budgets_until_guard_drop() {
+    fn zero_byte_events_and_extracted_payloads_retain_accounting_until_guard_drop() {
         let dispatch = dispatch();
         let session = dispatch.register("a", 1).unwrap();
         dispatch
@@ -754,15 +565,15 @@ mod tests {
         assert_eq!(event, "reduced");
         assert_eq!(
             dispatch.global_usage(TrafficClass::Reserved),
-            BudgetUsage { items: 1, bytes: 1 }
+            QueueUsage { items: 1, bytes: 1 }
         );
         assert_eq!(
             dispatch
                 .session_usage(&session, TrafficClass::Reserved)
                 .unwrap(),
-            BudgetUsage { items: 1, bytes: 1 }
+            QueueUsage { items: 1, bytes: 1 }
         );
-        let rejected = dispatch
+        dispatch
             .try_route(
                 &session,
                 TrafficClass::Reserved,
@@ -770,143 +581,76 @@ mod tests {
                 0,
                 "next",
             )
-            .unwrap_err();
-        assert_eq!(rejected.origin, EventOrigin::RequiredInbound);
-        drop(guard);
-        required(&dispatch, &session, "next");
-    }
-
-    #[test]
-    fn one_full_ordinary_queue_leaves_other_sessions_and_reserved_capacity_available() {
-        let dispatch = dispatch();
-        let a = dispatch.register("a", 1).unwrap();
-        let b = dispatch.register("b", 2).unwrap();
-        ordinary(&dispatch, &a, "a1");
-        ordinary(&dispatch, &a, "a2");
-        let rejected = dispatch
-            .try_route(&a, TrafficClass::Ordinary, EventOrigin::Command, 1, "a3")
-            .unwrap_err();
-        assert_eq!(rejected.handle, a);
-        assert_eq!(rejected.class, TrafficClass::Ordinary);
-        assert_eq!(rejected.origin, EventOrigin::Command);
-        assert_eq!(rejected.event, "a3");
-        assert_eq!(
-            rejected.error,
-            DispatchError::BudgetExhausted {
-                scope: BudgetScope::Session,
-                class: TrafficClass::Ordinary,
-                dimension: BudgetDimension::Items
-            }
-        );
-        ordinary(&dispatch, &b, "b1");
-        ordinary(&dispatch, &b, "b2");
-        required(&dispatch, &a, "a-control");
-        required(&dispatch, &b, "b-complete");
-        assert_eq!(dispatch.global_usage(TrafficClass::Ordinary).items, 4);
-        assert_eq!(dispatch.global_usage(TrafficClass::Reserved).items, 2);
-        let a1 = dispatch.try_next().unwrap().unwrap();
-        let b1 = dispatch.try_next().unwrap().unwrap();
-        assert_eq!(*a1.event(), "a1");
-        assert_eq!(*b1.event(), "b1");
-    }
-
-    #[test]
-    fn required_global_overflow_is_explicit_and_rolls_back_local_reservations() {
-        let dispatch = dispatch();
-        let a = dispatch.register("a", 1).unwrap();
-        let b = dispatch.register("b", 1).unwrap();
-        let c = dispatch.register("c", 1).unwrap();
-        ordinary(&dispatch, &a, "a1");
-        ordinary(&dispatch, &a, "a2");
-        ordinary(&dispatch, &b, "b1");
-        ordinary(&dispatch, &b, "b2");
-        let rejected = dispatch
-            .try_route(
-                &c,
-                TrafficClass::Ordinary,
-                EventOrigin::RequiredInbound,
-                2,
-                "canonical-update",
-            )
-            .unwrap_err();
-        assert_eq!(rejected.origin, EventOrigin::RequiredInbound);
-        assert_eq!(rejected.event, "canonical-update");
-        assert_eq!(
-            rejected.error,
-            DispatchError::BudgetExhausted {
-                scope: BudgetScope::Global,
-                class: TrafficClass::Ordinary,
-                dimension: BudgetDimension::Items
-            }
-        );
-        assert_eq!(
-            dispatch.session_usage(&c, TrafficClass::Ordinary).unwrap(),
-            BudgetUsage { items: 0, bytes: 0 }
-        );
-        assert_eq!(
-            dispatch.global_usage(TrafficClass::Ordinary),
-            BudgetUsage { items: 4, bytes: 4 }
-        );
-        required(&dispatch, &c, "required-response");
-    }
-
-    #[test]
-    fn byte_limits_and_single_event_limits_release_every_partial_permit() {
-        let mut limits = limits();
-        limits.per_session.ordinary.bytes = 3;
-        limits.global.ordinary.bytes = 3;
-        let dispatch = SessionDispatch::new("epoch", limits).unwrap();
-        let a = dispatch.register("a", 1).unwrap();
-        let b = dispatch.register("b", 1).unwrap();
-        dispatch
-            .try_route(&a, TrafficClass::Ordinary, EventOrigin::Command, 2, "a")
             .unwrap();
-        for (handle, scope) in [(&a, BudgetScope::Session), (&b, BudgetScope::Global)] {
-            let rejected = dispatch
+        assert!(dispatch.try_next().unwrap().is_none());
+        assert_eq!(
+            dispatch.global_usage(TrafficClass::Reserved),
+            QueueUsage { items: 2, bytes: 2 }
+        );
+        drop(guard);
+        let next = dispatch.try_next().unwrap().unwrap();
+        assert_eq!(*next.event(), "next");
+        drop(next);
+        assert_eq!(
+            dispatch.global_usage(TrafficClass::Reserved),
+            QueueUsage { items: 0, bytes: 0 }
+        );
+    }
+
+    #[test]
+    fn large_backlogs_preserve_fifo_and_other_sessions_can_progress() {
+        let dispatch = SessionDispatch::new("epoch").unwrap();
+        let a = dispatch.register("a", 1).unwrap();
+        let b = dispatch.register("b", 1).unwrap();
+        for index in 0..4_096 {
+            dispatch
                 .try_route(
-                    handle,
+                    &a,
                     TrafficClass::Ordinary,
-                    EventOrigin::Command,
-                    2,
-                    "overflow",
+                    EventOrigin::RequiredInbound,
+                    64 * 1024,
+                    index,
                 )
-                .unwrap_err();
-            assert_eq!(
-                rejected.error,
-                DispatchError::BudgetExhausted {
-                    scope,
-                    class: TrafficClass::Ordinary,
-                    dimension: BudgetDimension::Bytes
-                }
-            );
+                .unwrap();
         }
-        assert_eq!(
-            dispatch.session_usage(&b, TrafficClass::Ordinary).unwrap(),
-            BudgetUsage { items: 0, bytes: 0 }
-        );
-        assert_eq!(
-            dispatch.global_usage(TrafficClass::Ordinary),
-            BudgetUsage { items: 1, bytes: 2 }
-        );
-        let rejected = dispatch
+        dispatch
             .try_route(
-                &b,
+                &a,
                 TrafficClass::Reserved,
                 EventOrigin::RequiredInbound,
-                17,
-                "oversized",
+                1,
+                4_096,
             )
-            .unwrap_err();
+            .unwrap();
+        dispatch
+            .try_route(
+                &b,
+                TrafficClass::Ordinary,
+                EventOrigin::RequiredInbound,
+                1,
+                99,
+            )
+            .unwrap();
+        let first = dispatch.try_next().unwrap().unwrap();
+        assert_eq!(*first.event(), 0);
+        let other = dispatch.try_next().unwrap().unwrap();
+        assert_eq!(other.handle, b);
+        assert_eq!(*other.event(), 99);
+        assert!(dispatch.try_next().unwrap().is_none());
+        drop((first, other));
+        for index in 1..=4_096 {
+            let next = dispatch.try_next().unwrap().unwrap();
+            assert_eq!(next.handle, a);
+            assert_eq!(*next.event(), index);
+        }
+        assert!(dispatch.try_next().unwrap().is_none());
         assert_eq!(
-            rejected.error,
-            DispatchError::EventTooLarge {
-                bytes: 17,
-                limit: 16
-            }
+            dispatch.global_usage(TrafficClass::Ordinary),
+            QueueUsage { items: 0, bytes: 0 }
         );
         assert_eq!(
             dispatch.global_usage(TrafficClass::Reserved),
-            BudgetUsage { items: 0, bytes: 0 }
+            QueueUsage { items: 0, bytes: 0 }
         );
     }
 
@@ -933,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_releases_queued_budget_but_old_delivery_cannot_unblock_reopened_session() {
+    fn replacement_releases_queued_accounting_but_old_delivery_cannot_unblock_reopened_session() {
         for remove_first in [false, true] {
             let dispatch = dispatch();
             let old = dispatch.register("a", 1).unwrap();
@@ -949,7 +693,7 @@ mod tests {
             };
             assert_eq!(
                 dispatch.global_usage(TrafficClass::Ordinary),
-                BudgetUsage { items: 1, bytes: 1 }
+                QueueUsage { items: 1, bytes: 1 }
             );
             assert_ne!(old, new);
             ordinary(&dispatch, &new, "new-running");
@@ -1011,11 +755,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_identity_and_session_count_are_bounded_independently_of_queue_items() {
+    fn registry_identity_is_checked_without_limiting_session_count() {
         let dispatch = dispatch();
-        let another = SessionDispatch::<()>::new("epoch", limits()).unwrap();
+        let another = SessionDispatch::<()>::new("epoch").unwrap();
         let foreign = another.register("a", 1).unwrap();
-        let next_epoch = SessionDispatch::<()>::new("other-epoch", limits()).unwrap();
+        let next_epoch = SessionDispatch::<()>::new("other-epoch").unwrap();
         let epoch_handle = next_epoch.register("a", 1).unwrap();
         let own = dispatch.register("a", 1).unwrap();
         assert_eq!(
@@ -1047,7 +791,9 @@ mod tests {
         for id in ["b", "c", "d"] {
             dispatch.register(id, 1).unwrap();
         }
-        assert_eq!(dispatch.register("e", 1), Err(DispatchError::SessionLimit));
+        for index in 0..1_024 {
+            dispatch.register(format!("extra-{index}"), 1).unwrap();
+        }
         dispatch.register("a", 2).unwrap();
         assert_eq!(dispatch.remove(&own), Err(DispatchError::StaleHandle));
     }
@@ -1065,11 +811,11 @@ mod tests {
         dispatch.close().unwrap();
         assert_eq!(
             dispatch.global_usage(TrafficClass::Ordinary),
-            BudgetUsage { items: 1, bytes: 1 }
+            QueueUsage { items: 1, bytes: 1 }
         );
         assert_eq!(
             dispatch.global_usage(TrafficClass::Reserved),
-            BudgetUsage { items: 0, bytes: 0 }
+            QueueUsage { items: 0, bytes: 0 }
         );
         assert!(matches!(dispatch.try_next(), Err(DispatchError::Closed)));
         assert_eq!(dispatch.register("new", 1), Err(DispatchError::Closed));
@@ -1087,7 +833,7 @@ mod tests {
         drop(delivery);
         assert_eq!(
             dispatch.global_usage(TrafficClass::Ordinary),
-            BudgetUsage { items: 0, bytes: 0 }
+            QueueUsage { items: 0, bytes: 0 }
         );
     }
 
@@ -1120,7 +866,7 @@ mod tests {
                 self.0.take().unwrap()();
             }
         }
-        let dispatch = SessionDispatch::new("epoch", limits()).unwrap();
+        let dispatch = SessionDispatch::new("epoch").unwrap();
         let session = dispatch.register("a", 1).unwrap();
         let dropped = Arc::new(AtomicUsize::new(0));
         let reentrant = dispatch.clone();

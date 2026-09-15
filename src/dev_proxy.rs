@@ -1,5 +1,4 @@
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::body::Body;
@@ -19,8 +18,7 @@ pub(crate) struct DevProxy {
 impl DevProxy {
     pub(crate) fn new(origin: &str) -> Self {
         let uri: Uri = origin.parse().expect("validated development server origin");
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(Duration::from_secs(5)));
+        let connector = HttpConnector::new();
         // The direct connector deliberately ignores HTTP_PROXY and never follows
         // redirects. Browsers receive the development server's original response.
         Self {
@@ -50,16 +48,11 @@ impl DevProxy {
             .headers_mut()
             .insert(header::HOST, self.authority.clone());
 
-        let response =
-            tokio::time::timeout(Duration::from_secs(30), self.client.request(request)).await;
+        let response = self.client.request(request).await;
         let mut response = match response {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+            Ok(response) => response,
+            Err(error) => {
                 tracing::warn!(%error, server = %self.origin, "frontend development proxy failed");
-                return unavailable();
-            }
-            Err(_) => {
-                tracing::warn!(server = %self.origin, "frontend development server response timed out");
                 return unavailable();
             }
         };
@@ -73,12 +66,9 @@ impl DevProxy {
             }
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             tokio::spawn(async move {
-                let upgrades = tokio::time::timeout(Duration::from_secs(10), async {
-                    tokio::try_join!(downstream_upgrade, upstream_upgrade)
-                })
-                .await;
+                let upgrades = tokio::try_join!(downstream_upgrade, upstream_upgrade);
                 match upgrades {
-                    Ok(Ok((downstream, upstream))) => {
+                    Ok((downstream, upstream)) => {
                         if let Err(error) = tokio::io::copy_bidirectional(
                             &mut TokioIo::new(downstream),
                             &mut TokioIo::new(upstream),
@@ -221,6 +211,7 @@ mod tests {
     use super::*;
     use axum::Router;
     use futures::{SinkExt, StreamExt};
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 

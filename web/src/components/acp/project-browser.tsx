@@ -103,7 +103,6 @@ export function ProjectBrowser({
         <input
           type="search"
           value={query}
-          maxLength={256}
           autoComplete="off"
           spellCheck="false"
           placeholder={isProject ? t("projects.searchSessions") : t("projects.searchProjectsOrSessions")}

@@ -95,7 +95,7 @@ try {
   assert.equal(await statusWithHost(origin, { Host: "agent.example", Origin: "https://agent.example" }), 200);
   assert.equal(await statusWithHost(origin, { Host: "agent.example", Origin: "http://agent.example", "X-Forwarded-Proto": "https" }), 403);
 
-  await verifyBodyLimits(origin);
+  await verifyLargeRequestBody(origin);
 
   const events = await fetch(`${origin}/api/v1/events`, { signal: observer.signal });
   assert.equal(events.status, 200);
@@ -154,7 +154,7 @@ function statusWithHost(origin: string, headers: Record<string, string>): Promis
   });
 }
 
-async function verifyBodyLimits(origin: string): Promise<void> {
+async function verifyLargeRequestBody(origin: string): Promise<void> {
   const createdResponse = await fetch(`${origin}/api/v1/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -173,29 +173,21 @@ async function verifyBodyLimits(origin: string): Promise<void> {
   const headers = {
     "Content-Type": "application/json",
     "If-Match": `"${before.historyRevision}"`,
-    "Idempotency-Key": "body-limit-regression",
+    "Idempotency-Key": "large-body-regression",
   };
-  const rejected = await postJson(
-    `${sessionUrl}/turns`, headers,
-    JSON.stringify({ prompt: [{ type: "text", text: "x".repeat(5 * 1024 * 1024) }] }),
-  );
-  assert.equal(rejected.status, 413, "requests over 5 MiB must be rejected before a turn starts");
-  assert.equal((await view()).historyRevision, before.historyRevision);
-
-  // Valid PCM WAV at the supported 3 MiB decoded attachment limit. Its base64
-  // JSON body exceeds Axum's 2 MiB default and must still reach the ACP Agent.
-  const wav = Buffer.alloc(3 * 1024 * 1024);
+  // Valid PCM WAV beyond the former 3 MiB attachment and 5 MiB HTTP limits.
+  // Verify the Agent receives every decoded byte and all prompt blocks.
+  const wav = Buffer.alloc(4 * 1024 * 1024);
   wav.write("RIFF", 0); wav.writeUInt32LE(wav.length - 8, 4); wav.write("WAVEfmt ", 8);
   wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
   wav.writeUInt32LE(8_000, 24); wav.writeUInt32LE(16_000, 28);
   wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
   wav.write("data", 36); wav.writeUInt32LE(wav.length - 44, 40);
   const body = JSON.stringify({ prompt: [
-    { type: "text", text: "large-attachment-input-flow" },
+    ...Array.from({ length: 65 }, () => ({ type: "text", text: "large-attachment-input-flow" })),
     { type: "audio", mimeType: "audio/wav", data: wav.toString("base64") },
   ] });
-  assert.ok(Buffer.byteLength(body) > 2 * 1024 * 1024);
-  assert.ok(Buffer.byteLength(body) < 5 * 1024 * 1024);
+  assert.ok(Buffer.byteLength(body) > 5 * 1024 * 1024);
   const controller = new AbortController();
   const events = await fetch(`${sessionUrl}/events`, { signal: controller.signal });
   assert.equal(events.status, 200);
@@ -234,8 +226,7 @@ function postJson(url: string, headers: Record<string, string>, body: string): P
       });
       response.once("error", reject);
     });
-    // Let the server reject an oversized Content-Length before sending bytes;
-    // otherwise an early 413 can race the upload and appear as a client EPIPE.
+    // Exercise the HTTP 100-continue handshake with the complete large body.
     req.once("continue", () => req.end(body));
     req.once("error", reject);
     req.setTimeout(10_000, () => req.destroy(new Error("JSON upload timed out")));

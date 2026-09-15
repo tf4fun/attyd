@@ -2,7 +2,6 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  MAX_ATTACHMENT_BYTES,
   createPromptAttachments,
 } from "../web/src/lib/prompt-attachments";
 
@@ -70,11 +69,19 @@ describe("ACP prompt attachment conversion", () => {
     ], {})).rejects.toThrow("agent cannot accept pixel.png");
   });
 
-  it("bounds each conversion batch before reading file content", async () => {
-    await expect(createPromptAttachments([
-      new File([new Uint8Array(MAX_ATTACHMENT_BYTES + 1)], "large.bin", {
+  it("converts attachments beyond the former batch limit without truncation", async () => {
+    const attachments = await createPromptAttachments([
+      new File([new Uint8Array(3 * 1024 * 1024 + 1)], "large.bin", {
         type: "application/octet-stream",
       }),
-    ], { embeddedContext: true })).rejects.toThrow("limited to 3 MB");
+    ], { embeddedContext: true });
+    expect(attachments).toHaveLength(1);
+    const block = attachments[0].block;
+    expect(block.type).toBe("resource");
+    if (block.type === "resource" && "blob" in block.resource) {
+      expect(atob(block.resource.blob)).toHaveLength(3 * 1024 * 1024 + 1);
+    } else {
+      throw new Error("Expected a binary resource");
+    }
   });
 });

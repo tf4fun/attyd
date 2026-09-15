@@ -24,13 +24,12 @@ use serde_json::json;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
-use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::bridge;
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
-use crate::event_queue::{self, EventQueueLimits, EventReceiver, EventSender};
+use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
 use crate::runtime_cache::ActiveRuntimeProjection;
 use crate::runtime_state::{RuntimeChange, RuntimeDelta, RuntimeSnapshot, fold_active_turn_update};
@@ -39,14 +38,6 @@ use crate::session_resources::SessionResourceOwner;
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const HTTP_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(6);
-const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
-const SUBSCRIBER_QUEUE_BYTE_CAPACITY: usize = 8 * 1024 * 1024;
-const MAX_AUTH_REPLAY_EVENTS: usize = 1_024;
-const MAX_AUTH_REPLAY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SUBSCRIBERS: usize = 64;
-const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
-const BRIDGE_EVENT_QUEUE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
-const BRIDGE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(not(feature = "dev"))]
 #[derive(RustEmbed)]
@@ -154,10 +145,7 @@ impl SessionViewQuery {
         match (&self.expected_epoch, self.expected_incarnation) {
             (None, None) => Ok(None),
             (Some(epoch), Some(incarnation))
-                if !epoch.is_empty()
-                    && epoch.len() <= 1024
-                    && !epoch.contains('\0')
-                    && incarnation != 0 =>
+                if !epoch.is_empty() && !epoch.contains('\0') && incarnation != 0 =>
             {
                 Ok(Some(SessionResourceOwner::new(
                     epoch.clone(),
@@ -271,14 +259,6 @@ impl BridgeBootstrap {
             ) => {
                 self.auth_event_bytes = self.auth_event_bytes.saturating_add(event.len());
                 self.auth_events.push_back(event.to_string());
-                while self.auth_events.len() > MAX_AUTH_REPLAY_EVENTS
-                    || self.auth_event_bytes > MAX_AUTH_REPLAY_BYTES
-                {
-                    let Some(removed) = self.auth_events.pop_front() else {
-                        break;
-                    };
-                    self.auth_event_bytes = self.auth_event_bytes.saturating_sub(removed.len());
-                }
             }
             _ => {}
         }
@@ -563,7 +543,7 @@ fn retire_released_terminals(snapshot: &mut RuntimeSnapshot) {
 #[derive(Default)]
 struct BridgeHubState {
     generation: u64,
-    input: Option<mpsc::Sender<bridge::BridgeInput>>,
+    input: Option<mpsc::UnboundedSender<bridge::BridgeInput>>,
     cancellation: Option<CancellationToken>,
     subscribers: HashMap<u64, SubscriberSender>,
     global_subscribers: HashMap<u64, SubscriberSender>,
@@ -582,17 +562,13 @@ struct BridgeHub {
     stopped: Notify,
 }
 
-impl BridgeHubState {
-    fn subscriber_count(&self) -> usize {
-        self.subscribers.len() + self.global_subscribers.len() + self.session_subscribers.len()
-    }
-}
+impl BridgeHubState {}
 
 struct BridgeSubscription {
     id: u64,
     generation: u64,
     initial_events: Vec<String>,
-    events: mpsc::Receiver<QueuedSubscriberEvent>,
+    events: mpsc::UnboundedReceiver<QueuedSubscriberEvent>,
 }
 
 struct SubscriptionGuard {
@@ -623,7 +599,7 @@ struct SessionSubscriber {
     session_id: String,
     sender: SubscriberSender,
     lease: Option<ObservationLease>,
-    input: Option<mpsc::Sender<bridge::BridgeInput>>,
+    input: Option<mpsc::UnboundedSender<bridge::BridgeInput>>,
     ready: Option<oneshot::Sender<()>>,
     owner: Option<(String, u64)>,
 }
@@ -642,21 +618,13 @@ impl Drop for SessionSubscriber {
             observer_id: self.id,
             lease,
         };
-        if let Err(mpsc::error::TrySendError::Full(command)) = input.try_send(command)
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            // Keep the original generation's sender. A full command queue must
-            // delay cleanup, never silently discard it or target a new runtime.
-            runtime.spawn(async move {
-                let _ = input.send(command).await;
-            });
-        }
+        let _ = input.send(command);
     }
 }
 
 #[derive(Clone)]
 struct SubscriberSender {
-    tx: mpsc::Sender<QueuedSubscriberEvent>,
+    tx: mpsc::UnboundedSender<QueuedSubscriberEvent>,
     queued_bytes: Arc<AtomicUsize>,
 }
 
@@ -684,8 +652,8 @@ impl Drop for QueuedSubscriberEvent {
 }
 
 impl SubscriberSender {
-    fn channel(capacity: usize) -> (Self, mpsc::Receiver<QueuedSubscriberEvent>) {
-        let (tx, rx) = mpsc::channel(capacity);
+    fn channel() -> (Self, mpsc::UnboundedReceiver<QueuedSubscriberEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
                 tx,
@@ -698,15 +666,9 @@ impl SubscriberSender {
     fn try_send(&self, event: impl Into<Arc<str>>) -> Result<(), ()> {
         let event = event.into();
         let bytes = event.len();
-        self.queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current
-                    .checked_add(bytes)
-                    .filter(|next| *next <= SUBSCRIBER_QUEUE_BYTE_CAPACITY)
-            })
-            .map_err(|_| ())?;
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.tx
-            .try_send(QueuedSubscriberEvent {
+            .send(QueuedSubscriberEvent {
                 event,
                 queued_bytes: self.queued_bytes.clone(),
                 bytes,
@@ -814,7 +776,7 @@ fn session_reset_value(session_id: &str, view: &serde_json::Value) -> Option<ser
 
 struct BridgeRuntime {
     generation: u64,
-    input: mpsc::Receiver<bridge::BridgeInput>,
+    input: mpsc::UnboundedReceiver<bridge::BridgeInput>,
     events: EventReceiver,
     event_tx: EventSender,
     cancellation: CancellationToken,
@@ -841,15 +803,9 @@ impl BridgeHub {
                 state.runtime = ActiveRuntimeProjection::default();
                 state.canonical = CanonicalProjection::default();
                 state.canonical_resync_pending = false;
-                let (input_tx, input) = mpsc::channel(256);
+                let (input_tx, input) = mpsc::unbounded_channel();
                 let cancellation = CancellationToken::new();
-                let (event_tx, events) = event_queue::channel(
-                    EventQueueLimits {
-                        max_items: BRIDGE_EVENT_QUEUE_CAPACITY,
-                        max_bytes: BRIDGE_EVENT_QUEUE_BYTE_CAPACITY,
-                    },
-                    cancellation.clone(),
-                );
+                let (event_tx, events) = event_queue::channel(cancellation.clone());
                 state.input = Some(input_tx);
                 state.cancellation = Some(cancellation.clone());
                 Some(BridgeRuntime {
@@ -872,13 +828,10 @@ impl BridgeHub {
     async fn subscribe(self: &Arc<Self>) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
-        let (event_tx, event_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = SubscriberSender::channel();
         let (generation, initial_events) = {
             let mut state = self.state.lock().await;
             if state.shutting_down || state.input.is_none() {
-                return None;
-            }
-            if state.subscriber_count() >= MAX_SUBSCRIBERS {
                 return None;
             }
             let mut initial_events = Vec::new();
@@ -910,17 +863,14 @@ impl BridgeHub {
     async fn subscribe_global(self: &Arc<Self>) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
-        let (event_tx, event_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = SubscriberSender::channel();
         let (generation, initial_events) = {
             let mut state = self.state.lock().await;
-            if state.shutting_down
-                || state.input.is_none()
-                || state.subscriber_count() >= MAX_SUBSCRIBERS
-            {
+            if state.shutting_down || state.input.is_none() {
                 return None;
             }
             // Global recovery never captures session state or constructs its replay.
-            // Registration and the bounded authentication/connection bootstrap share
+            // Registration and the authentication/connection bootstrap share
             // this lock, so later global events form a continuous suffix.
             let initial_events = state.bootstrap.global_events().collect();
             state.global_subscribers.insert(id, event_tx);
@@ -952,7 +902,7 @@ impl BridgeHub {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
         let lease = ObservationLease::new();
-        let (sender, events) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (sender, events) = SubscriberSender::channel();
         let (ready, activated) = oneshot::channel();
         let (input, generation) = {
             let mut state = self.state.lock().await;
@@ -961,11 +911,6 @@ impl BridgeHub {
                 .clone()
                 .filter(|_| !state.shutting_down)
                 .ok_or_else(|| bridge::SessionViewError::unavailable("bridge is not ready"))?;
-            if state.subscriber_count() >= MAX_SUBSCRIBERS {
-                return Err(bridge::SessionViewError::unavailable(
-                    "too many event subscribers",
-                ));
-            }
             state.session_subscribers.insert(
                 id,
                 SessionSubscriber {
@@ -1011,7 +956,6 @@ impl BridgeHub {
                     lease: lease.clone(),
                     reply,
                 })
-                .await
                 .map_err(|_| {
                     bridge::SessionViewError::unavailable(
                         "bridge stopped before accepting the observer",
@@ -1045,14 +989,7 @@ impl BridgeHub {
                 )),
             }
         };
-        if let Err(error) = tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, handshake)
-            .await
-            .unwrap_or_else(|_| {
-                Err(bridge::SessionViewError::unavailable(
-                    "bridge session observation timed out",
-                ))
-            })
-        {
+        if let Err(error) = handshake.await {
             self.unsubscribe(id, generation).await;
             return Err(error);
         }
@@ -1071,13 +1008,10 @@ impl BridgeHub {
     async fn subscribe_session(self: &Arc<Self>, session_id: String) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
-        let (event_tx, event_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = SubscriberSender::channel();
         let generation = {
             let mut state = self.state.lock().await;
             if state.shutting_down || state.input.is_none() {
-                return None;
-            }
-            if state.subscriber_count() >= MAX_SUBSCRIBERS {
                 return None;
             }
             let generation = state.generation;
@@ -1256,9 +1190,7 @@ impl BridgeHub {
                 }
             };
             if let Some(input) = snapshot_request {
-                let _ = input
-                    .send(bridge::BridgeInput::RuntimeSnapshotRequest)
-                    .await;
+                let _ = input.send(bridge::BridgeInput::RuntimeSnapshotRequest);
             }
             return;
         }
@@ -1374,16 +1306,12 @@ impl BridgeHub {
                 expected_owner,
                 response,
             })
-            .await
             .map_err(|_| {
                 bridge::SessionViewError::unavailable("bridge stopped before accepting the query")
             })?;
-        tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
-            .await
-            .map_err(|_| bridge::SessionViewError::unavailable("bridge session query timed out"))?
-            .map_err(|_| {
-                bridge::SessionViewError::unavailable("bridge stopped before answering the query")
-            })?
+        result.await.map_err(|_| {
+            bridge::SessionViewError::unavailable("bridge stopped before answering the query")
+        })?
     }
 
     async fn start_turn(
@@ -1409,11 +1337,9 @@ impl BridgeHub {
                 prompt,
                 response,
             })
-            .await
             .map_err(|_| "bridge stopped before accepting the turn".to_string())?;
-        tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
+        result
             .await
-            .map_err(|_| "bridge turn admission timed out".to_string())?
             .map_err(|_| "bridge stopped before admitting the turn".to_string())?
     }
 
@@ -1431,16 +1357,12 @@ impl BridgeHub {
         let (response, result) = oneshot::channel();
         input
             .send(bridge::BridgeInput::BusinessRequest { command, response })
-            .await
             .map_err(|_| {
                 bridge::BridgeRequestError::internal("bridge stopped before accepting the request")
             })?;
-        tokio::time::timeout(BRIDGE_QUERY_TIMEOUT, result)
-            .await
-            .map_err(|_| bridge::BridgeRequestError::internal("bridge request timed out"))?
-            .map_err(|_| {
-                bridge::BridgeRequestError::internal("bridge stopped before answering the request")
-            })?
+        result.await.map_err(|_| {
+            bridge::BridgeRequestError::internal("bridge stopped before answering the request")
+        })?
     }
 
     async fn runtime_info(&self) -> serde_json::Value {
@@ -1669,7 +1591,6 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(bridge::MAX_BRIDGE_MESSAGE_BYTES))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -1916,7 +1837,7 @@ async fn search_context(
     State(state): State<AppState>,
     Query(query): Query<ContextSearchQuery>,
 ) -> Response {
-    if query.query.encode_utf16().count() > 256 || !valid_api_identifier(&query.session_id) {
+    if !valid_api_identifier(&query.session_id) {
         return api_bad_request("invalid context session or query");
     }
     business_response(
@@ -1937,7 +1858,7 @@ async fn read_context(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<ContextReadBody>,
 ) -> Response {
-    if !valid_api_identifier(&session_id) || body.path.is_empty() || body.path.len() > 16_384 {
+    if !valid_api_identifier(&session_id) || body.path.is_empty() {
         return api_bad_request("invalid session ID or context path");
     }
     business_response(
@@ -2158,7 +2079,7 @@ async fn respond_to_interaction(
 }
 
 fn valid_api_identifier(value: &str) -> bool {
-    !value.is_empty() && value.encode_utf16().count() <= 1_024
+    !value.is_empty()
 }
 
 fn api_bad_request(message: &str) -> Response {
@@ -2242,16 +2163,18 @@ async fn get_session_view(
     State(state): State<AppState>,
     Query(query): Query<SessionViewQuery>,
 ) -> Response {
-    if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
+    if session_id.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({ "error": "invalid session ID" })),
         )
             .into_response();
     }
-    if query.cwd.as_ref().is_some_and(|cwd| {
-        cwd.is_empty() || cwd.encode_utf16().count() > 16_384 || cwd.contains('\0')
-    }) {
+    if query
+        .cwd
+        .as_ref()
+        .is_some_and(|cwd| cwd.is_empty() || cwd.contains('\0'))
+    {
         return api_bad_request("invalid session cwd");
     }
     let expected_owner = match query.expected_owner(&session_id) {
@@ -2351,7 +2274,7 @@ async fn start_session_turn(
     headers: HeaderMap,
     axum::Json(body): axum::Json<StartTurnBody>,
 ) -> Response {
-    if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
+    if session_id.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({ "error": "invalid session ID" })),
@@ -2374,19 +2297,19 @@ async fn start_session_turn(
     let Some(client_intent_id) = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty() && value.encode_utf16().count() <= 1_024)
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
     else {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(json!({ "error": "a bounded Idempotency-Key is required" })),
+            axum::Json(json!({ "error": "an Idempotency-Key is required" })),
         )
             .into_response();
     };
-    if body.prompt.is_empty() || body.prompt.len() > 64 {
+    if body.prompt.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(json!({ "error": "prompt must contain between 1 and 64 content blocks" })),
+            axum::Json(json!({ "error": "prompt must contain at least one content block" })),
         )
             .into_response();
     }
@@ -2411,7 +2334,7 @@ fn parse_strong_etag(value: &str) -> Option<String> {
     value
         .strip_prefix('"')?
         .strip_suffix('"')
-        .filter(|value| !value.is_empty() && value.len() <= 4_096)
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
@@ -2425,15 +2348,12 @@ fn session_observation_owner(
         .get("last-event-id")
         .map(|value| {
             let value = value.to_str().map_err(|_| "invalid Last-Event-ID")?;
-            if value.len() > 2048 {
-                return Err("invalid Last-Event-ID");
-            }
             let mut parts = value.rsplitn(3, ':');
             let revision = parts.next().and_then(|value| value.parse::<u64>().ok());
             let incarnation = parts.next().and_then(|value| value.parse::<u64>().ok());
             let epoch = parts
                 .next()
-                .filter(|value| !value.is_empty() && value.len() <= 1024 && !value.contains('\0'));
+                .filter(|value| !value.is_empty() && !value.contains('\0'));
             match (epoch, incarnation, revision) {
                 (Some(epoch), Some(incarnation), Some(revision))
                     if incarnation != 0 && revision != 0 =>
@@ -2455,12 +2375,14 @@ async fn session_events(
     Query(query): Query<SessionViewQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
+    if session_id.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if query.cwd.as_ref().is_some_and(|cwd| {
-        cwd.is_empty() || cwd.encode_utf16().count() > 16_384 || cwd.contains('\0')
-    }) {
+    if query
+        .cwd
+        .as_ref()
+        .is_some_and(|cwd| cwd.is_empty() || cwd.contains('\0'))
+    {
         return api_bad_request("invalid session cwd");
     }
     let expected_owner = match session_observation_owner(&session_id, &query, &headers) {
@@ -2657,7 +2579,7 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_state::{RuntimeLimits, RuntimeState};
+    use crate::runtime_state::RuntimeState;
     use clap::Parser;
     use tower::ServiceExt;
 
@@ -2846,9 +2768,9 @@ mod tests {
     #[tokio::test]
     async fn shutdown_closes_event_streams_without_an_active_agent() {
         let hub = test_hub();
-        let (aggregate_tx, mut aggregate_rx) = SubscriberSender::channel(4);
-        let (global_tx, mut global_rx) = SubscriberSender::channel(4);
-        let (session_tx, mut session_rx) = SubscriberSender::channel(4);
+        let (aggregate_tx, mut aggregate_rx) = SubscriberSender::channel();
+        let (global_tx, mut global_rx) = SubscriberSender::channel();
+        let (session_tx, mut session_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.subscribers.insert(1, aggregate_tx);
@@ -3015,7 +2937,7 @@ mod tests {
 
     #[test]
     fn canonical_terminal_deltas_reconstruct_live_output_without_session_copies() {
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut runtime = RuntimeState::new("epoch");
         let incarnation = runtime
             .open_new(
                 "epoch",
@@ -3055,10 +2977,43 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn large_http_prompt_with_many_blocks_waits_for_slow_admission() {
+        let (hub, mut commands) = observation_hub(1).await;
+        let app = app_router(&hub.options, hub.clone());
+        let mut blocks = vec![json!({"type":"text", "text":"small"}); 65];
+        blocks[0]["text"] = json!("x".repeat(6 * 1024 * 1024));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sessions/session/turns")
+            .header(header::HOST, "localhost:7331")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::IF_MATCH, "\"history-1\"")
+            .header("Idempotency-Key", "large-prompt")
+            .body(Body::from(json!({"prompt": blocks}).to_string()))
+            .unwrap();
+        let mut pending = Box::pin(app.oneshot(request));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        let bridge::BridgeInput::TurnRequest {
+            prompt, response, ..
+        } = commands.recv().await.unwrap()
+        else {
+            panic!("expected complete turn request")
+        };
+        assert_eq!(prompt.len(), 65);
+        assert_eq!(prompt[0]["text"].as_str().unwrap().len(), 6 * 1024 * 1024);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        response
+            .send(Ok(json!({"disposition":"accepted"})))
+            .unwrap();
+        assert!(pending.await.unwrap().status().is_success());
+    }
+
     #[tokio::test]
     async fn session_subscription_does_not_queue_unrelated_session_traffic() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
+        let (input, _commands) = mpsc::unbounded_channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -3069,7 +3024,7 @@ mod tests {
             .await
             .expect("session subscription");
 
-        for index in 0..SUBSCRIBER_QUEUE_CAPACITY * 2 {
+        for index in 0..64 * 2 {
             hub.publish(
                 1,
                 json!({
@@ -3115,10 +3070,10 @@ mod tests {
     }
 
     async fn observation_hub(
-        capacity: usize,
-    ) -> (Arc<BridgeHub>, mpsc::Receiver<bridge::BridgeInput>) {
+        _capacity: usize,
+    ) -> (Arc<BridgeHub>, mpsc::UnboundedReceiver<bridge::BridgeInput>) {
         let hub = test_hub();
-        let (input, commands) = mpsc::channel(capacity);
+        let (input, commands) = mpsc::unbounded_channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -3273,10 +3228,7 @@ mod tests {
     async fn connection_replacement_reports_canonical_epoch_independently_of_generation() {
         let (hub, _commands) = observation_hub(4).await;
         assert!(hub.runtime_info().await["bridgeEpoch"].is_null());
-        let registry = crate::session_registry::SessionRegistry::new(
-            "new-connection",
-            crate::runtime_state::RuntimeLimits::default(),
-        );
+        let registry = crate::session_registry::SessionRegistry::new("new-connection");
         hub.state.lock().await.canonical.snapshot = Some(registry.snapshot());
         let runtime = hub.runtime_info().await;
         assert_eq!(runtime["bridgeEpoch"], "new-connection");
@@ -3654,7 +3606,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn observe_handshake_timeout_revokes_its_owner_lease() {
+    async fn observe_handshake_waits_until_explicit_cancellation() {
         let (hub, mut commands) = observation_hub(4).await;
         let mut handshake = Box::pin(hub.observe_session("session".into(), None));
         assert!(futures::poll!(handshake.as_mut()).is_pending());
@@ -3662,8 +3614,11 @@ mod tests {
         else {
             panic!("expected ObserveSession")
         };
-        tokio::time::advance(BRIDGE_QUERY_TIMEOUT).await;
-        assert!(handshake.await.is_err());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        assert!(!lease.is_cancelled());
+        drop(handshake);
+        tokio::task::yield_now().await;
         assert!(lease.is_cancelled());
         assert!(reply.is_closed());
         assert!(hub.state.lock().await.session_subscribers.is_empty());
@@ -3674,7 +3629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_session_delivery_unobserves_only_its_lease_and_preserves_other_observers() {
+    async fn slow_session_delivery_keeps_its_lease_and_preserves_other_observers() {
         let (hub, mut commands) = observation_hub(8).await;
         let mut observations = Vec::new();
         let mut leases = Vec::new();
@@ -3696,19 +3651,18 @@ mod tests {
             leases.push(lease);
         }
         observations[1].0.events.try_recv().unwrap();
-        for revision in 2..=(SUBSCRIBER_QUEUE_CAPACITY as u64 + 1) {
+        for revision in 2..=(64 as u64 + 1) {
             hub.publish(1, observation_delta(revision)).await;
             observations[1].0.events.try_recv().unwrap();
         }
-        assert!(leases[0].is_cancelled());
+        assert!(!leases[0].is_cancelled());
         assert!(!leases[1].is_cancelled());
-        assert_eq!(hub.state.lock().await.session_subscribers.len(), 1);
-        let bridge::BridgeInput::UnobserveSession { observer_id, .. } =
-            commands.try_recv().unwrap()
-        else {
-            panic!("slow eviction must unobserve")
-        };
-        assert_eq!(observer_id, observations[0].0.id);
+        assert_eq!(hub.state.lock().await.session_subscribers.len(), 2);
+        assert!(commands.try_recv().is_err());
+        // The paused observer receives the reset and every following revision.
+        assert_eq!(observations[0].0.events.len(), 65);
+        hub.unsubscribe(observations[0].0.id, 1).await;
+        assert!(leases[0].is_cancelled());
         hub.unsubscribe(observations[1].0.id, 1).await;
         assert!(leases[1].is_cancelled());
         assert!(hub.state.lock().await.session_subscribers.is_empty());
@@ -3763,7 +3717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_delivers_unobserve_even_when_bridge_input_is_full() {
+    async fn cancellation_delivers_unobserve_after_queued_commands() {
         let (hub, mut commands) = observation_hub(1).await;
         hub.state
             .lock()
@@ -3771,7 +3725,7 @@ mod tests {
             .input
             .as_ref()
             .unwrap()
-            .try_send(bridge::BridgeInput::RuntimeSnapshotRequest)
+            .send(bridge::BridgeInput::RuntimeSnapshotRequest)
             .unwrap();
         let mut handshake = Box::pin(hub.observe_session("session".into(), None));
         assert!(futures::poll!(handshake.as_mut()).is_pending());
@@ -3793,6 +3747,10 @@ mod tests {
         assert!(matches!(
             commands.try_recv().unwrap(),
             bridge::BridgeInput::RuntimeSnapshotRequest
+        ));
+        assert!(matches!(
+            commands.recv().await.unwrap(),
+            bridge::BridgeInput::ObserveSession { .. }
         ));
         let bridge::BridgeInput::UnobserveSession { lease: removed, .. } =
             commands.recv().await.unwrap()
@@ -3862,8 +3820,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_legacy_and_debug_state_does_not_change_canonical_projection() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, _commands) = mpsc::unbounded_channel();
+        let mut runtime = RuntimeState::new("epoch");
         runtime
             .open_new(
                 "epoch",
@@ -3938,8 +3896,8 @@ mod tests {
     #[tokio::test]
     async fn live_session_open_is_not_followed_by_a_redundant_runtime_snapshot() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let (subscriber_tx, mut subscriber_rx) = SubscriberSender::channel(4);
+        let (input, _commands) = mpsc::unbounded_channel();
+        let (subscriber_tx, mut subscriber_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -3999,9 +3957,9 @@ mod tests {
     #[tokio::test]
     async fn directed_event_reaches_only_the_requesting_subscriber() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let (target_tx, mut target_rx) = SubscriberSender::channel(4);
-        let (other_tx, mut other_rx) = SubscriberSender::channel(4);
+        let (input, _commands) = mpsc::unbounded_channel();
+        let (target_tx, mut target_rx) = SubscriberSender::channel();
+        let (other_tx, mut other_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -4038,9 +3996,9 @@ mod tests {
     #[tokio::test]
     async fn load_replacement_is_private_and_never_becomes_completed_replay() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let (target_tx, mut target_rx) = SubscriberSender::channel(8);
-        let (other_tx, mut other_rx) = SubscriberSender::channel(8);
+        let (input, _commands) = mpsc::unbounded_channel();
+        let (target_tx, mut target_rx) = SubscriberSender::channel();
+        let (other_tx, mut other_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -5216,6 +5174,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_burst_preserves_all_updates_for_a_slow_subscriber() {
+        verify_live_delivery(false).await;
+    }
+
+    #[tokio::test]
+    async fn large_stdio_message_reaches_slow_subscriber_and_history_intact() {
+        verify_live_delivery(true).await;
+    }
+
+    async fn verify_live_delivery(large: bool) {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let fixture = format!("{cwd}/tests/fixtures/burst-prompt-agent.mjs");
+        let options = Options::try_parse_from(["attyd", "--cwd", cwd, "--", "node", &fixture])
+            .unwrap()
+            .normalized()
+            .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let mut observer = hub.subscribe().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let event = observer
+                    .events
+                    .recv()
+                    .await
+                    .expect("initialization stopped");
+                let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                    break;
+                }
+            }
+            let initial = hub
+                .session_view_with_cwd("burst".into(), Some(cwd.into()))
+                .await
+                .unwrap();
+            let (mut subscriber, _guard) = hub
+                .observe_session("burst".into(), Some(cwd.into()))
+                .await
+                .unwrap();
+            hub.start_turn(
+                "burst".into(),
+                initial["session"]["historyRevision"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                "burst-intent".into(),
+                vec![json!({"type":"text","text":if large { "answer-large" } else { "answer" }})],
+            )
+            .await
+            .unwrap();
+
+            // Leave the subscriber unread while the Agent completes. Delivery
+            // backlog must neither cancel the turn nor evict this observer.
+            loop {
+                let event = observer
+                    .events
+                    .recv()
+                    .await
+                    .expect("burst stopped the bridge");
+                let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+                assert_ne!(event["type"], "bridge/error", "{event}");
+                if event["type"] == "bridge/session_turn_complete" {
+                    break;
+                }
+            }
+            let final_view = hub.session_view("burst".into()).await.unwrap();
+            assert_eq!(final_view["session"]["phase"], "ready");
+            assert!(final_view["session"]["activeTurn"].is_null());
+            let expected = if large {
+                "完整🙂".repeat(900_000)
+            } else {
+                (0..2_048)
+                    .map(|index| format!("片段{index}🙂\n"))
+                    .collect::<String>()
+            };
+            let updates = final_view["baseline"]["updates"].as_array().unwrap();
+            let text = updates
+                .iter()
+                .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+                .map(|update| update["content"]["text"].as_str().unwrap())
+                .collect::<String>();
+            assert_eq!(text, expected);
+            let mut streamed = String::new();
+            loop {
+                let event = subscriber
+                    .events
+                    .recv()
+                    .await
+                    .expect("slow subscriber was evicted");
+                let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+                if event["type"] == "bridge/session_delta"
+                    && event["change"]["kind"] == "turn_update"
+                {
+                    streamed.push_str(
+                        event["change"]["update"]["content"]["text"]
+                            .as_str()
+                            .unwrap(),
+                    );
+                }
+                if event["type"] == "bridge/session_turn_complete" {
+                    assert_eq!(event["response"]["stopReason"], "end_turn");
+                    break;
+                }
+            }
+            assert_eq!(streamed, expected);
+            assert_eq!(hub.state.lock().await.generation, 1);
+        })
+        .await;
+        hub.shutdown().await;
+        result.expect("burst did not complete");
+    }
+
+    #[tokio::test]
     async fn session_subscriber_disconnect_keeps_running_turn_then_reloads_after_idle_close() {
         async fn next_event(subscription: &mut BridgeSubscription) -> serde_json::Value {
             let queued = tokio::time::timeout(Duration::from_secs(10), subscription.events.recv())
@@ -5784,7 +5854,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_completion_finishes_generation_with_a_leaked_event_sender() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
+        let (input, _commands) = mpsc::unbounded_channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -5833,8 +5903,8 @@ mod tests {
     #[tokio::test]
     async fn old_generation_direct_events_are_rejected() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let (subscriber, mut events) = SubscriberSender::channel(1);
+        let (input, _commands) = mpsc::unbounded_channel();
+        let (subscriber, mut events) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 2;
@@ -5847,29 +5917,11 @@ mod tests {
         assert!(hub.state.lock().await.subscribers.contains_key(&42));
     }
 
-    #[test]
-    fn saturated_bridge_event_queue_cancels_the_generation() {
-        let cancellation = CancellationToken::new();
-        let (events, _receiver) = event_queue::channel(
-            EventQueueLimits {
-                max_items: 1,
-                max_bytes: 64,
-            },
-            cancellation.clone(),
-        );
-        events.send("first".to_string()).unwrap();
-        assert_eq!(
-            events.send("second".to_string()),
-            Err(crate::event_queue::EventSendError::Full)
-        );
-        assert!(cancellation.is_cancelled());
-    }
-
     #[tokio::test]
     async fn global_subscription_bootstrap_preserves_auth_without_session_or_request_replay() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, _commands) = mpsc::unbounded_channel();
+        let mut runtime = RuntimeState::new("epoch");
         runtime
             .open_new(
                 "epoch",
@@ -5950,8 +6002,8 @@ mod tests {
     #[tokio::test]
     async fn unrelated_session_events_do_not_consume_global_subscriber_capacity() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, _commands) = mpsc::unbounded_channel();
+        let mut runtime = RuntimeState::new("epoch");
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -5959,7 +6011,7 @@ mod tests {
             state.canonical.snapshot = Some(runtime.snapshot());
         }
         let mut global = hub.subscribe_global().await.unwrap();
-        for index in 0..=SUBSCRIBER_QUEUE_CAPACITY {
+        for index in 0..=64 {
             let session_id = format!("session-{index}");
             runtime
                 .open_new(
@@ -6010,47 +6062,50 @@ mod tests {
     }
 
     #[test]
-    fn global_authentication_replay_is_bounded_by_count_and_bytes() {
+    fn global_authentication_replay_preserves_count_and_bytes() {
         let mut bootstrap = BridgeBootstrap::default();
-        for index in 0..=MAX_AUTH_REPLAY_EVENTS {
+        for index in 0..=1_024 {
             bootstrap.update(
                 &json!({ "type": "bridge/auth_terminal_output", "data": index.to_string() })
                     .to_string(),
             );
         }
         let events = bootstrap.global_events().collect::<Vec<_>>();
-        assert_eq!(events.len(), MAX_AUTH_REPLAY_EVENTS);
+        assert_eq!(events.len(), 1_025);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&events[0]).unwrap()["data"],
-            "1"
+            "0"
         );
-        bootstrap.update(&json!({ "type": "bridge/auth_terminal_output", "data": "x".repeat(MAX_AUTH_REPLAY_BYTES) }).to_string());
-        assert_eq!(bootstrap.global_events().count(), 0);
-        assert_eq!(bootstrap.auth_event_bytes, 0);
+        bootstrap.update(
+            &json!({ "type": "bridge/auth_terminal_output", "data": "x".repeat(8 * 1024 * 1024) })
+                .to_string(),
+        );
+        assert_eq!(bootstrap.global_events().count(), 1_026);
+        assert!(bootstrap.auth_event_bytes > 8 * 1024 * 1024);
     }
 
     #[tokio::test]
-    async fn subscriber_count_has_a_hard_global_limit() {
+    async fn subscriber_count_does_not_reject_additional_observers() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
+        let (input, _commands) = mpsc::unbounded_channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
             state.input = Some(input);
         }
 
-        let mut subscriptions = Vec::with_capacity(MAX_SUBSCRIBERS);
-        for index in 0..MAX_SUBSCRIBERS {
+        let mut subscriptions = Vec::with_capacity(65);
+        for index in 0..65 {
             let subscription = match index % 3 {
                 0 => hub.subscribe().await,
                 1 => hub.subscribe_global().await,
                 _ => hub.subscribe_session("session".to_string()).await,
             };
-            subscriptions.push(subscription.expect("subscriber below hard limit"));
+            subscriptions.push(subscription.expect("subscriber beyond former limit"));
         }
-        assert!(hub.subscribe().await.is_none());
-        assert!(hub.subscribe_global().await.is_none());
-        assert!(hub.subscribe_session("session".to_string()).await.is_none());
+        assert!(hub.subscribe().await.is_some());
+        assert!(hub.subscribe_global().await.is_some());
+        assert!(hub.subscribe_session("session".to_string()).await.is_some());
 
         let released = subscriptions.pop().unwrap();
         hub.unsubscribe(released.id, released.generation).await;
@@ -6058,11 +6113,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_subscriber_is_evicted_without_blocking_a_healthy_subscriber() {
+    async fn slow_subscriber_preserves_its_backlog_without_blocking_a_healthy_subscriber() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let (slow_tx, _slow_rx) = SubscriberSender::channel(1);
-        let (healthy_tx, mut healthy_rx) = SubscriberSender::channel(4);
+        let (input, _commands) = mpsc::unbounded_channel();
+        let (slow_tx, mut slow_rx) = SubscriberSender::channel();
+        let (healthy_tx, mut healthy_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -6080,9 +6135,17 @@ mod tests {
             .await;
 
         let state = hub.state.lock().await;
-        assert!(!state.subscribers.contains_key(&1));
+        assert!(state.subscribers.contains_key(&1));
         assert!(state.subscribers.contains_key(&2));
         drop(state);
+        assert_eq!(
+            slow_rx.try_recv().unwrap().into_string(),
+            r#"{"type":"bridge/phase","phase":"starting"}"#
+        );
+        assert_eq!(
+            slow_rx.try_recv().unwrap().into_string(),
+            r#"{"type":"bridge/phase","phase":"ready"}"#
+        );
         assert_eq!(
             healthy_rx.try_recv().unwrap().into_string(),
             r#"{"type":"bridge/phase","phase":"starting"}"#
@@ -6096,7 +6159,7 @@ mod tests {
     #[tokio::test]
     async fn released_terminal_is_not_replayed_to_a_new_subscriber() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
+        let (input, _commands) = mpsc::unbounded_channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -6163,7 +6226,7 @@ mod tests {
         const COMPLETED_MARKER: &str = "completed-history-must-not-bootstrap";
 
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
+        let (input, _commands) = mpsc::unbounded_channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -6240,8 +6303,8 @@ mod tests {
         const COMPLETED_MARKER: &str = "slow-subscriber-completed-turn";
 
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, _commands) = mpsc::unbounded_channel();
+        let mut runtime = RuntimeState::new("epoch");
         let incarnation = runtime
             .open_new(
                 "epoch",
@@ -6266,7 +6329,7 @@ mod tests {
             )
             .unwrap();
         let active = runtime.snapshot();
-        let (slow_tx, _slow_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (slow_tx, _slow_rx) = SubscriberSender::channel();
         let slow_queued_bytes = slow_tx.queued_bytes.clone();
         {
             let mut state = hub.state.lock().await;
@@ -6310,10 +6373,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscriber_backlog_is_bounded_by_bytes_not_only_event_count() {
+    async fn subscriber_backlog_preserves_large_events() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let (subscriber_tx, _subscriber_rx) = SubscriberSender::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (input, _commands) = mpsc::unbounded_channel();
+        let (subscriber_tx, mut subscriber_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -6322,38 +6385,32 @@ mod tests {
         }
         let large_event = json!({
             "type": "bridge/stderr",
-            "chunk": "x".repeat(SUBSCRIBER_QUEUE_BYTE_CAPACITY / 2 + 1),
+            "chunk": "x".repeat(4 * 1024 * 1024 + 1),
         })
         .to_string();
 
         hub.publish(1, large_event.clone()).await;
         assert!(hub.state.lock().await.subscribers.contains_key(&1));
-        hub.publish(1, large_event).await;
-        assert!(
-            !hub.state.lock().await.subscribers.contains_key(&1),
-            "a few large events must not bypass subscriber memory bounds"
-        );
+        hub.publish(1, large_event.clone()).await;
+        assert!(hub.state.lock().await.subscribers.contains_key(&1));
+        for _ in 0..2 {
+            assert_eq!(subscriber_rx.try_recv().unwrap().into_string(), large_event);
+        }
     }
 
     #[tokio::test]
     async fn subscriber_byte_accounting_releases_on_receive_and_failed_send() {
-        let (sender, mut receiver) = SubscriberSender::channel(1);
+        let (sender, mut receiver) = SubscriberSender::channel();
         sender.try_send("first".to_string()).unwrap();
         assert_eq!(sender.queued_bytes.load(Ordering::Acquire), 5);
-        assert!(sender.try_send("overflow".to_string()).is_err());
-        assert_eq!(
-            sender.queued_bytes.load(Ordering::Acquire),
-            5,
-            "event-count rejection must roll back its byte reservation"
-        );
+        sender.try_send("second".to_string()).unwrap();
+        assert_eq!(sender.queued_bytes.load(Ordering::Acquire), 11);
 
         let event = receiver.recv().await.unwrap().into_arc();
         assert_eq!(event.as_ref(), "first");
-        assert_eq!(
-            sender.queued_bytes.load(Ordering::Acquire),
-            0,
-            "dequeueing an SSE event must release its queue reservation"
-        );
+        assert_eq!(sender.queued_bytes.load(Ordering::Acquire), 6);
+        assert_eq!(receiver.recv().await.unwrap().into_string(), "second");
+        assert_eq!(sender.queued_bytes.load(Ordering::Acquire), 0);
         drop(receiver);
         assert!(sender.try_send("closed".to_string()).is_err());
         assert_eq!(
@@ -6365,8 +6422,8 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_payload_is_shared_across_subscriber_backlogs() {
-        let (first, mut first_rx) = SubscriberSender::channel(1);
-        let (second, mut second_rx) = SubscriberSender::channel(1);
+        let (first, mut first_rx) = SubscriberSender::channel();
+        let (second, mut second_rx) = SubscriberSender::channel();
         let payload: Arc<str> = Arc::from("authoritative baseline");
 
         first.try_send(payload.clone()).unwrap();
@@ -6380,8 +6437,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscriber_byte_ledgers_are_independent_and_release_on_receiver_drop() {
-        let (first, first_rx) = SubscriberSender::channel(2);
-        let (second, mut second_rx) = SubscriberSender::channel(2);
+        let (first, first_rx) = SubscriberSender::channel();
+        let (second, mut second_rx) = SubscriberSender::channel();
         first.try_send("first".to_string()).unwrap();
         second.try_send("second".to_string()).unwrap();
         assert_eq!(first.queued_bytes.load(Ordering::Acquire), 5);
@@ -6404,7 +6461,7 @@ mod tests {
 
     #[test]
     fn canonical_projection_folds_typed_snapshot_and_contiguous_deltas() {
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut runtime = RuntimeState::new("epoch");
         let mut projection = CanonicalProjection::default();
         assert!(
             projection.update(
@@ -6503,7 +6560,7 @@ mod tests {
 
     #[test]
     fn replaying_the_same_canonical_snapshot_is_idempotent() {
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut runtime = RuntimeState::new("epoch");
         let incarnation = runtime
             .open_new(
                 "epoch",
@@ -6538,7 +6595,7 @@ mod tests {
 
     #[test]
     fn stale_turn_update_operation_forces_resnapshot_without_partial_mutation() {
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut runtime = RuntimeState::new("epoch");
         let incarnation = runtime
             .open_new(
                 "epoch",
@@ -6595,7 +6652,7 @@ mod tests {
 
     #[test]
     fn canonical_projection_discards_a_gapped_delta_stream() {
-        let runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let runtime = RuntimeState::new("epoch");
         let mut projection = CanonicalProjection::default();
         projection.update(
             &json!({
@@ -6628,7 +6685,7 @@ mod tests {
 
     #[test]
     fn canonical_projection_rejects_a_session_revision_jump() {
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut runtime = RuntimeState::new("epoch");
         runtime
             .open_new(
                 "epoch",
@@ -6670,7 +6727,7 @@ mod tests {
 
     #[test]
     fn canonical_projection_tracks_sequential_terminal_retirement() {
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut runtime = RuntimeState::new("epoch");
         let initial = runtime.snapshot();
         let mut projection = CanonicalProjection::default();
         projection.update(
@@ -6739,8 +6796,8 @@ mod tests {
     #[tokio::test]
     async fn subscriber_bootstrap_contains_atomic_canonical_snapshot_and_suffix() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, _commands) = mpsc::unbounded_channel();
+        let mut runtime = RuntimeState::new("epoch");
         let initial = runtime.snapshot();
         {
             let mut state = hub.state.lock().await;
@@ -6797,8 +6854,8 @@ mod tests {
     #[tokio::test]
     async fn canonical_gap_requests_a_fresh_bridge_snapshot() {
         let hub = test_hub();
-        let (input, mut commands) = mpsc::channel(1);
-        let runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, mut commands) = mpsc::unbounded_channel();
+        let runtime = RuntimeState::new("epoch");
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -6838,8 +6895,8 @@ mod tests {
     #[tokio::test]
     async fn gap_resnapshot_is_single_flight_and_reestablishes_contiguous_suffix() {
         let hub = test_hub();
-        let (input, mut commands) = mpsc::channel(8);
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, mut commands) = mpsc::unbounded_channel();
+        let mut runtime = RuntimeState::new("epoch");
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -6921,8 +6978,8 @@ mod tests {
     #[tokio::test]
     async fn two_subscribers_receive_the_same_canonical_revision_and_state() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
-        let mut runtime = RuntimeState::new("epoch", RuntimeLimits::default());
+        let (input, _commands) = mpsc::unbounded_channel();
+        let mut runtime = RuntimeState::new("epoch");
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
@@ -6970,12 +7027,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_signal_bypasses_a_saturated_command_queue() {
+    async fn shutdown_signal_bypasses_a_command_backlog() {
         let hub = test_hub();
-        let (input, _commands) = mpsc::channel(1);
+        let (input, _commands) = mpsc::unbounded_channel();
         input
             .send(bridge::BridgeInput::RuntimeSnapshotRequest)
-            .await
             .unwrap();
         let input_probe = input.clone();
         let cancellation = CancellationToken::new();
@@ -6995,8 +7051,8 @@ mod tests {
             .expect("shutdown was blocked behind the command queue");
         assert!(
             input_probe
-                .try_send(bridge::BridgeInput::RuntimeSnapshotRequest)
-                .is_err()
+                .send(bridge::BridgeInput::RuntimeSnapshotRequest)
+                .is_ok()
         );
         hub.finish_generation(1).await;
         shutdown.await.unwrap();

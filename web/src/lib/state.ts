@@ -665,7 +665,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
               sessionId: action.sessionId,
               stage: action.stage,
             },
-          ].slice(-100),
+          ],
         };
       }
     case "session/delete_continue":
@@ -845,7 +845,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
           )
         : { ...state, phase: event.phase };
     case "bridge/stderr":
-      return { ...state, stderr: tail(state.stderr + event.chunk, 80_000) };
+      return { ...state, stderr: state.stderr + event.chunk };
     case "bridge/context_search_result":
     case "bridge/context_attached":
       // Request-scoped context responses are consumed by useAcp before dispatch.
@@ -1479,7 +1479,7 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
     case "acp/mcp_message":
       return {
         ...state,
-        mcpActivity: [...state.mcpActivity, event].slice(-100),
+        mcpActivity: [...state.mcpActivity, event],
       };
   }
 
@@ -2192,14 +2192,13 @@ function terminateBridgeState(
 
 function appendAuthTerminalOutput(state: AppState, data: string): AppState {
   if (!state.authTerminal) return state;
-  const maxCharacters = 2_000_000;
   const output = state.authTerminal.output + data;
-  const truncated = state.authTerminal.truncated || output.length > maxCharacters;
+  const truncated = state.authTerminal.truncated;
   return {
     ...state,
     authTerminal: {
       ...state.authTerminal,
-      output: output.length > maxCharacters ? output.slice(-maxCharacters) : output,
+      output,
       truncated,
     },
   };
@@ -2845,7 +2844,7 @@ function markSessionAttention(state: AppState, sessionId: string): AppState {
     ? state
     : {
         ...state,
-        attentionSessionIds: [...state.attentionSessionIds, sessionId].slice(-32),
+        attentionSessionIds: [...state.attentionSessionIds, sessionId],
       };
 }
 
@@ -2887,14 +2886,14 @@ function errorTimelineItem(
 function appendBackgroundEvent(state: AppState, event: unknown): AppState {
   return {
     ...state,
-    backgroundEvents: [...state.backgroundEvents, event].slice(-100),
+    backgroundEvents: [...state.backgroundEvents, event],
   };
 }
 
 function upsertTerminalSnapshot(
   snapshots: TerminalSnapshot[],
   incoming: TerminalSnapshot,
-  retainHistory = false,
+  _retainHistory = false,
 ): TerminalSnapshot[] {
   const previous = snapshots.find(
     ({ terminalId }) => terminalId === incoming.terminalId,
@@ -2902,9 +2901,7 @@ function upsertTerminalSnapshot(
   const output = incoming.outputAppend && previous != null
     ? previous.output + incoming.output
     : incoming.output;
-  const retainedOutput = incoming.retainedBytes != null && output.length > incoming.retainedBytes
-    ? output.slice(-incoming.retainedBytes)
-    : output;
+  const retainedOutput = retainTerminalBytes(output, incoming.retainedBytes);
   const merged = { ...incoming, output: retainedOutput };
   const next = [
     ...snapshots.filter(({ terminalId }) => terminalId !== incoming.terminalId),
@@ -2912,7 +2909,7 @@ function upsertTerminalSnapshot(
   ];
   // A materialized business view owns its history retention. Live updates must
   // not evict terminal results that are still referenced by that history.
-  return retainHistory ? next : next.slice(-64);
+  return next;
 }
 
 function resolveElicitation(
@@ -3003,7 +3000,7 @@ function upsertExternalFlow(
   const index = flows.findIndex(
     ({ elicitationId }) => elicitationId === next.elicitationId,
   );
-  if (index < 0) return [...flows, next].slice(-100);
+  if (index < 0) return [...flows, next];
   const result = [...flows];
   result[index] = next;
   return result;
@@ -3015,6 +3012,11 @@ function mergeSessions(current: SessionInfo[], incoming: SessionInfo[]): Session
   return [...sessions.values()];
 }
 
-function tail(value: string, max: number): string {
-  return value.length > max ? value.slice(value.length - max) : value;
+function retainTerminalBytes(output: string, retainedBytes?: number): string {
+  if (retainedBytes == null) return output;
+  const bytes = new TextEncoder().encode(output);
+  if (bytes.length <= retainedBytes) return output;
+  let start = bytes.length - retainedBytes;
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+  return new TextDecoder().decode(bytes.subarray(start));
 }

@@ -1,7 +1,6 @@
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import {
-  MAX_CONTENT_BINARY_BYTES,
   safeMediaDataUrl,
   validateContentBlockSemantics,
 } from "../shared/content-validation";
@@ -89,8 +88,8 @@ describe("ACP content block semantic validation", () => {
     }
   });
 
-  it("bounds decoded binary payloads independently of JSON envelope size", () => {
-    const oversized = "AAAA".repeat(Math.floor(MAX_CONTENT_BINARY_BYTES / 3) + 1);
+  it("accepts binary payloads beyond the former size limit", () => {
+    const oversized = "AAAA".repeat(Math.floor(3 * 1024 * 1024 / 3) + 1);
     expect(() => validateContentBlockSemantics({
       type: "resource",
       resource: {
@@ -98,7 +97,7 @@ describe("ACP content block semantic validation", () => {
         mimeType: "application/octet-stream",
         blob: oversized,
       },
-    })).toThrow(`${MAX_CONTENT_BINARY_BYTES} decoded bytes`);
+    })).not.toThrow();
   });
 
   it("accepts ACP annotations while bounding unsafe semantic values", () => {
@@ -124,6 +123,6 @@ describe("ACP content block semantic validation", () => {
         uri: "urn:fixture:annotated",
         text: "note",
       },
-    })).toThrow("annotations last-modified timestamp exceeds");
+    })).not.toThrow();
   });
 });

@@ -1,8 +1,4 @@
-import i18n from "../i18n";
 
-export const MAX_THREAD_SEARCH_QUERY_CHARS = 256;
-export const MAX_THREAD_SEARCH_MATCHES = 10_000;
-export const MAX_THREAD_SEARCH_CHARS = 2_000_000;
 
 export interface ThreadSearchOptions {
   caseSensitive: boolean;
@@ -22,7 +18,7 @@ export interface TextSearchResult {
 
 export interface CompiledThreadSearch {
   error?: string;
-  find(text: string, limit?: number): TextSearchResult;
+  find(text: string): TextSearchResult;
 }
 
 const WORD_CHARACTER = /[\p{L}\p{N}_]/u;
@@ -32,9 +28,6 @@ export function compileThreadSearch(
   options: ThreadSearchOptions,
 ): CompiledThreadSearch {
   if (query.length === 0) return emptySearch();
-  if (query.length > MAX_THREAD_SEARCH_QUERY_CHARS) {
-    return invalidSearch(i18n.t("search.queryLimit", { ns: "conversation", count: MAX_THREAD_SEARCH_QUERY_CHARS }));
-  }
 
   let expression: RegExp;
   try {
@@ -47,13 +40,7 @@ export function compileThreadSearch(
   }
 
   return {
-    find(text, requestedLimit = MAX_THREAD_SEARCH_MATCHES) {
-      const limit = Math.min(
-        MAX_THREAD_SEARCH_MATCHES,
-        Math.max(0, Math.trunc(requestedLimit)),
-      );
-      if (limit === 0 || text.length === 0) return { matches: [], limited: false };
-
+    find(text) {
       const matches: TextSearchMatch[] = [];
       expression.lastIndex = 0;
       let match: RegExpExecArray | null;
@@ -64,7 +51,6 @@ export function compileThreadSearch(
           end > start &&
           (!options.wholeWord || isWholeWord(text, start, end))
         ) {
-          if (matches.length >= limit) return { matches, limited: true };
           matches.push({ start, end });
         }
 

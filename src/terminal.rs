@@ -25,15 +25,6 @@ pub(crate) struct TerminalSnapshot {
     pub value: serde_json::Value,
 }
 
-pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 1_000_000;
-const DEFAULT_TERMINAL_OUTPUT_BYTES: usize = 200_000;
-const MAX_TERMINALS: usize = 32;
-const MAX_TERMINAL_COMMAND_LENGTH: usize = 16_384;
-const MAX_TERMINAL_ARGS: usize = 4_096;
-const MAX_TERMINAL_ARG_LENGTH: usize = 65_536;
-const MAX_TERMINAL_ENV: usize = 256;
-const MAX_TERMINAL_ENV_NAME_LENGTH: usize = 256;
-const MAX_TERMINAL_ENV_VALUE_LENGTH: usize = 65_536;
 const TERMINAL_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
@@ -41,14 +32,14 @@ pub struct TerminalManager {
     filesystem: Arc<WorkspaceFileSystem>,
     terminals: Arc<Mutex<HashMap<String, Arc<Terminal>>>>,
     events: EventSender,
-    snapshots: Option<mpsc::Sender<TerminalSnapshot>>,
+    snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
 }
 
 struct Terminal {
     id: String,
     session_id: String,
     incarnation: u64,
-    output_limit: usize,
+    output_limit: Option<usize>,
     state: Mutex<TerminalState>,
     changed: Notify,
     kill: Mutex<Option<oneshot::Sender<()>>>,
@@ -112,7 +103,7 @@ impl TerminalManager {
     pub fn new_with_snapshots<E>(
         filesystem: Arc<WorkspaceFileSystem>,
         events: E,
-        snapshots: Option<mpsc::Sender<TerminalSnapshot>>,
+        snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
     ) -> Self
     where
         E: Into<EventSender>,
@@ -144,18 +135,11 @@ impl TerminalManager {
             .await?;
         let output_limit = request
             .output_byte_limit
-            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
-            .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTES)
-            .min(MAX_TERMINAL_OUTPUT_BYTES);
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
 
         // Admission, process creation, and registration share one critical
         // section, including managers scoped to different workspaces.
         let mut terminals = self.terminals.lock().await;
-        if terminals.len() >= MAX_TERMINALS {
-            return Err(
-                Error::invalid_request().data(format!("terminal limit reached ({MAX_TERMINALS})"))
-            );
-        }
         let mut process = spawn_command(&request, &cwd).map_err(terminal_spawn_error)?;
         let stdout = process.child.stdout.take();
         let stderr = process.child.stderr.take();
@@ -351,8 +335,10 @@ impl TerminalManager {
                     }
                     state.output.extend_from_slice(&buffer[..count]);
                     state.pending_output.extend_from_slice(&buffer[..count]);
-                    if state.output.len() > terminal.output_limit {
-                        let overflow = state.output.len() - terminal.output_limit;
+                    if let Some(limit) = terminal.output_limit
+                        && state.output.len() > limit
+                    {
+                        let overflow = state.output.len() - limit;
                         state.output.drain(..overflow);
                         while state.output.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
                             state.output.remove(0);
@@ -433,19 +419,8 @@ impl TerminalManager {
     }
 
     async fn emit_snapshot(&self, terminal: &Terminal) {
-        // Reserve delivery capacity before consuming a delta. Once the state is
-        // locked, composing and enqueueing both projections is one local cut;
-        // concurrent stdout/stderr publishers cannot reverse append order.
-        let permit = match &self.snapshots {
-            Some(snapshots) => match snapshots.reserve().await {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    self.events.cancel_generation();
-                    return;
-                }
-            },
-            None => None,
-        };
+        // Compose and enqueue both projections while holding the state lock so
+        // concurrent stdout/stderr publishers preserve append order.
         let mut state = terminal.state.lock().await;
         if state.released_published {
             return;
@@ -485,16 +460,20 @@ impl TerminalManager {
             })
             .to_string(),
         );
-        if let Some(permit) = permit {
-            permit.send(TerminalSnapshot {
-                incarnation: terminal.incarnation,
-                value: internal_snapshot,
-            });
+        if let Some(snapshots) = &self.snapshots
+            && snapshots
+                .send(TerminalSnapshot {
+                    incarnation: terminal.incarnation,
+                    value: internal_snapshot,
+                })
+                .is_err()
+        {
+            self.events.cancel_generation();
         }
     }
 }
 
-fn output_text(state: &TerminalState, limit: usize) -> (String, bool) {
+fn output_text(state: &TerminalState, limit: Option<usize>) -> (String, bool) {
     let mut bytes = state.output.as_slice();
     if state.exit_status.is_none() && !state.released {
         // A reader may stop between bytes of a character. Hold that suffix until
@@ -512,7 +491,7 @@ fn output_text(state: &TerminalState, limit: usize) -> (String, bool) {
         }
     }
     let output = String::from_utf8_lossy(bytes);
-    let mut start = output.len().saturating_sub(limit);
+    let mut start = limit.map_or(0, |limit| output.len().saturating_sub(limit));
     while !output.is_char_boundary(start) {
         start += 1;
     }
@@ -563,33 +542,18 @@ fn spawn_command(request: &CreateTerminalRequest, cwd: &Path) -> std::io::Result
 }
 
 fn validate_create_request(request: &CreateTerminalRequest) -> Result<(), Error> {
-    if request.command.is_empty()
-        || request.command.len() > MAX_TERMINAL_COMMAND_LENGTH
-        || request.command.contains('\0')
-    {
+    if request.command.is_empty() || request.command.contains('\0') {
         return Err(Error::invalid_params().data(format!(
-            "terminal command must contain 1..={MAX_TERMINAL_COMMAND_LENGTH} characters without NUL bytes"
+            "terminal command must be non-empty and contain no NUL bytes"
         )));
     }
-    if request.args.len() > MAX_TERMINAL_ARGS
-        || request
-            .args
-            .iter()
-            .any(|arg| arg.len() > MAX_TERMINAL_ARG_LENGTH || arg.contains('\0'))
-    {
-        return Err(Error::invalid_params().data("terminal arguments exceed the supported limits"));
-    }
-    if request.env.len() > MAX_TERMINAL_ENV {
-        return Err(Error::invalid_params().data(format!(
-            "terminal environment exceeds {MAX_TERMINAL_ENV} variables"
-        )));
+    if request.args.iter().any(|arg| arg.contains('\0')) {
+        return Err(Error::invalid_params().data("terminal arguments must contain no NUL bytes"));
     }
     let mut names = HashSet::new();
     for variable in &request.env {
         if variable.name.is_empty()
-            || variable.name.len() > MAX_TERMINAL_ENV_NAME_LENGTH
             || variable.name.contains(['=', '\0'])
-            || variable.value.len() > MAX_TERMINAL_ENV_VALUE_LENGTH
             || variable.value.contains('\0')
             || !names.insert(variable.name.as_str())
         {
@@ -620,6 +584,9 @@ fn normalize_exit_status(status: std::process::ExitStatus) -> TerminalExitStatus
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FORMER_TERMINALS: usize = 32;
+    const FORMER_TERMINAL_COMMAND_LENGTH: usize = 16_384;
+
     use serde_json::Value;
     use std::time::Duration;
 
@@ -672,7 +639,7 @@ mod tests {
             id: "partial".to_string(),
             session_id: "session".to_string(),
             incarnation: 1,
-            output_limit: 1,
+            output_limit: Some(1),
             state: Mutex::new(TerminalState {
                 output: vec![0xe4],
                 ..Default::default()
@@ -713,24 +680,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_snapshot_delivery_does_not_consume_or_reorder_output() {
+    async fn snapshot_backlog_does_not_consume_or_reorder_output() {
         let root = tempfile::tempdir().unwrap();
         let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
         let (events, mut event_rx) = mpsc::unbounded_channel();
-        let (snapshots, mut snapshot_rx) = mpsc::channel(1);
+        let (snapshots, mut snapshot_rx) = mpsc::unbounded_channel();
         snapshots
             .send(TerminalSnapshot {
                 incarnation: 1,
                 value: json!({}),
             })
-            .await
             .unwrap();
         let terminals = TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots));
         let terminal = Terminal {
             id: "ordered-terminal".to_string(),
             session_id: "session".to_string(),
             incarnation: 1,
-            output_limit: 1024,
+            output_limit: Some(1024),
             state: Mutex::new(TerminalState {
                 output: b"first".to_vec(),
                 pending_output: b"first".to_vec(),
@@ -741,32 +707,21 @@ mod tests {
             readers_remaining: AtomicUsize::new(0),
             reader_tasks: Mutex::new(Vec::new()),
         };
-        let first = terminals.emit_snapshot(&terminal);
-        tokio::pin!(first);
-        assert!(futures::poll!(&mut first).is_pending());
+        terminals.emit_snapshot(&terminal).await;
         {
             let mut state = terminal.state.lock().await;
-            assert_eq!(state.pending_output, b"first");
-            assert!(state.last_published_output.is_empty());
+            assert!(state.pending_output.is_empty());
             state.output.extend_from_slice(b"second");
             state.pending_output.extend_from_slice(b"second");
         }
-        assert!(event_rx.try_recv().is_err());
-        let second = terminals.emit_snapshot(&terminal);
-        tokio::pin!(second);
-        assert!(futures::poll!(&mut second).is_pending());
+        terminals.emit_snapshot(&terminal).await;
         snapshot_rx.recv().await.unwrap();
-        first.await;
-        assert_eq!(
-            snapshot_rx.recv().await.unwrap().value["output"],
-            "firstsecond"
-        );
-        second.await;
-        assert_eq!(snapshot_rx.recv().await.unwrap().value["output"], "");
+        assert_eq!(snapshot_rx.recv().await.unwrap().value["output"], "first");
+        assert_eq!(snapshot_rx.recv().await.unwrap().value["output"], "second");
         let first_public: Value = serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
         let second_public: Value = serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
-        assert_eq!(first_public["terminal"]["output"], "firstsecond");
-        assert_eq!(second_public["terminal"]["output"], "");
+        assert_eq!(first_public["terminal"]["output"], "first");
+        assert_eq!(second_public["terminal"]["output"], "second");
         terminal.state.lock().await.released = true;
         terminals.emit_snapshot(&terminal).await;
         assert_eq!(snapshot_rx.recv().await.unwrap().value["released"], true);
@@ -788,13 +743,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
         let (events, mut event_rx) = mpsc::unbounded_channel();
-        let (snapshots, mut snapshot_rx) = mpsc::channel(CHUNK_COUNT + 1);
+        let (snapshots, mut snapshot_rx) = mpsc::unbounded_channel();
         let terminals = TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots));
         let terminal = Arc::new(Terminal {
             id: "linear-terminal".to_string(),
             session_id: "session".to_string(),
             incarnation: 1,
-            output_limit: CHUNK_COUNT * CHUNK_BYTES,
+            output_limit: Some(CHUNK_COUNT * CHUNK_BYTES),
             state: Mutex::new(TerminalState::default()),
             changed: Notify::new(),
             kill: Mutex::new(None),
@@ -890,6 +845,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn unspecified_output_limit_preserves_more_than_the_former_hard_maximum() {
+        let root = tempfile::tempdir().unwrap();
+        let (terminals, _events) = manager(root.path());
+        let created = create_terminal(
+            &terminals,
+            CreateTerminalRequest::new("session", "printf '%1100000s' '' | tr ' ' x"),
+        )
+        .await
+        .unwrap();
+        let output = wait_until_exited(&terminals, "session", &created.terminal_id).await;
+        assert_eq!(output.output.len(), 1_100_000);
+        assert!(output.output.bytes().all(|byte| byte == b'x'));
+        assert!(!output.truncated);
+        terminals.close_all().await;
+    }
+
     #[tokio::test]
     async fn truncates_output_only_at_utf8_boundaries() {
         let root = tempfile::tempdir().unwrap();
@@ -1391,12 +1363,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (terminals, mut events) = manager(root.path());
         assert!(
-            create_terminal(
-                &terminals,
-                CreateTerminalRequest::new("session", "x".repeat(MAX_TERMINAL_COMMAND_LENGTH + 1),)
-            )
-            .await
-            .is_err()
+            validate_create_request(&CreateTerminalRequest::new(
+                "session",
+                "x".repeat(FORMER_TERMINAL_COMMAND_LENGTH + 1)
+            ))
+            .is_ok()
         );
         assert!(
             create_terminal(
@@ -1439,7 +1410,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn concurrent_terminal_creation_respects_capacity_and_release_restores_it() {
+    fn concurrent_terminal_creation_has_no_application_count_limit() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -1454,7 +1425,7 @@ mod tests {
             // admission race is exercised independently of disk/scheduler speed.
             let (resume, paused) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || paused.recv().unwrap());
-            let mut requests = (0..MAX_TERMINALS + 1)
+            let mut requests = (0..FORMER_TERMINALS + 1)
                 .map(|index| {
                     let manager = if index % 2 == 0 { &terminals } else { &other };
                     Box::pin(create_terminal(
@@ -1472,7 +1443,7 @@ mod tests {
             let accepted = results.iter().filter(|result| result.is_ok()).count();
             let rejected = results.iter().filter_map(|result| result.as_ref().err());
             terminals.close_all().await;
-            assert_eq!(accepted, MAX_TERMINALS);
+            assert_eq!(accepted, FORMER_TERMINALS + 1);
             for error in rejected {
                 assert!(
                     error

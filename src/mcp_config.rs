@@ -6,8 +6,6 @@ use agent_client_protocol::schema::v1::{
 };
 use serde_json::Value;
 
-const MAX_MCP_SERVERS: usize = 32;
-
 #[derive(Clone, Debug)]
 pub struct AcpMcpProvider {
     pub name: String,
@@ -41,11 +39,6 @@ pub fn load_mcp_configs(
             let (server, provider) = parse_server(entry, &label)?;
             servers.push(server);
             providers.extend(provider);
-            if servers.len() > MAX_MCP_SERVERS {
-                return Err(format!(
-                    "MCP configs contain more than {MAX_MCP_SERVERS} servers"
-                ));
-            }
         }
     }
 
@@ -299,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn enforces_the_combined_server_limit_across_config_files() {
+    fn loads_all_servers_across_config_files() {
         let directory = tempfile::tempdir().unwrap();
         let command = std::env::current_exe().unwrap();
         let first = write_config(
@@ -324,11 +317,7 @@ mod tests {
                     .collect(),
             ),
         );
-        assert!(
-            load_mcp_configs(&[first, overflow])
-                .unwrap_err()
-                .contains("more than 32")
-        );
+        assert_eq!(load_mcp_configs(&[first, overflow]).unwrap().0.len(), 33);
     }
 
     #[test]

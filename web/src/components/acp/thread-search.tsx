@@ -16,9 +16,6 @@ import {
 } from "react";
 import { useTranslation } from "../../i18n";
 import {
-  MAX_THREAD_SEARCH_CHARS,
-  MAX_THREAD_SEARCH_MATCHES,
-  MAX_THREAD_SEARCH_QUERY_CHARS,
   compileThreadSearch,
   type ThreadSearchOptions,
 } from "../../lib/thread-search";
@@ -214,7 +211,6 @@ export function ThreadSearchBar({
           aria-describedby={error || limited ? "thread-search-status" : undefined}
           placeholder={t("search.placeholder")}
           value={query}
-          maxLength={MAX_THREAD_SEARCH_QUERY_CHARS + 1}
           onChange={(event) => setQuery(event.target.value)}
         />
         <SearchOptionButton
@@ -256,9 +252,9 @@ export function ThreadSearchBar({
           onClick={onClose}
         ><X size={15} /></button>
       </div>
-      {error || limited ? (
+      {error ? (
         <div id="thread-search-status" className={error ? "thread-search-error" : "thread-search-limit"} role="status">
-          {error ?? t("search.limit", { count: MAX_THREAD_SEARCH_MATCHES, value: MAX_THREAD_SEARCH_MATCHES.toLocaleString(i18n.language) })}
+          {error}
         </div>
       ) : null}
     </div>
@@ -298,23 +294,8 @@ export function scanThreadSearchDom(
 
   const documents = collectSearchDocuments(root);
   const matches: DomSearchMatch[] = [];
-  let searchedCharacters = 0;
-  let limited = false;
   for (const document of documents) {
-    if (matches.length >= MAX_THREAD_SEARCH_MATCHES) {
-      limited = true;
-      break;
-    }
-    const remainingCharacters = MAX_THREAD_SEARCH_CHARS - searchedCharacters;
-    if (remainingCharacters <= 0) {
-      limited = true;
-      break;
-    }
-    const text = document.text.slice(0, remainingCharacters);
-    searchedCharacters += text.length;
-    if (text.length < document.text.length) limited = true;
-    const result = compiled.find(text, MAX_THREAD_SEARCH_MATCHES - matches.length);
-    limited ||= result.limited;
+    const result = compiled.find(document.text);
     for (const match of result.matches) {
       matches.push({
         key: `${document.key}:${match.start}:${match.end}`,
@@ -323,7 +304,7 @@ export function scanThreadSearchDom(
       });
     }
   }
-  return { matches, limited };
+  return { matches, limited: false };
 }
 
 function collectSearchDocuments(root: HTMLElement): SearchDocument[] {

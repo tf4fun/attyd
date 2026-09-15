@@ -125,7 +125,7 @@ describe("interface languages", () => {
 
   it("translates stored attachment diagnostics without rewriting external errors", async () => {
     await setLanguagePreference("en");
-    const error = new PromptAttachmentError("sizeLimit");
+    const error = new PromptAttachmentError("preparing");
     const english = promptAttachmentErrorMessage(error);
     await setLanguagePreference("zh-CN");
     expect(promptAttachmentErrorMessage(error)).not.toBe(english);

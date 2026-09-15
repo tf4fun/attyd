@@ -41,7 +41,7 @@ describe("ACP change review aggregation", () => {
     });
   });
 
-  it("bounds large diff rendering and labels its line matching approximate", () => {
+  it("preserves large diff rendering and labels its line matching approximate", () => {
     const oldText = Array.from({ length: 1_200 }, (_, index) => `old ${index}`).join("\n");
     const newText = Array.from({ length: 1_200 }, (_, index) => `new ${index}`).join("\n");
     const summary = collectReviewChanges([tool("large", "/workspace/large.ts", oldText, newText)]);
@@ -50,8 +50,8 @@ describe("ACP change review aggregation", () => {
     expect(summary.approximate).toBe(true);
     expect(diff.addedLines).toBe(1_200);
     expect(diff.removedLines).toBe(1_200);
-    expect(diff.lines.length).toBeLessThanOrEqual(800);
-    expect(diff.truncated).toBe(true);
+    expect(diff.lines).toHaveLength(2_400);
+    expect(diff.truncated).toBe(false);
   });
 });
 

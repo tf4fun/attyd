@@ -93,7 +93,6 @@ export function SessionHistory({
           <input
             type="search"
             value={query}
-            maxLength={256}
             autoComplete="off"
             spellCheck="false"
             placeholder={t("history.filter")}

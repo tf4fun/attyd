@@ -44,7 +44,7 @@ export function AuthTerminalCard({
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: 12,
       lineHeight: 1.25,
-      scrollback: 5_000,
+      scrollback: 0,
       theme: {
         background: "#1c1c1e",
         foreground: "#e5e5ea",
@@ -80,8 +80,8 @@ export function AuthTerminalCard({
       } catch {
         return;
       }
-      const cols = Math.min(500, Math.max(2, instance.cols));
-      const rows = Math.min(300, Math.max(2, instance.rows));
+      const cols = Math.max(1, instance.cols);
+      const rows = Math.max(1, instance.rows);
       if (callbacks.current.active) {
         callbacks.current.onResize(terminalState.requestId, cols, rows);
       }
@@ -114,6 +114,7 @@ export function AuthTerminalCard({
   useEffect(() => {
     const instance = xterm.current;
     if (!instance) return;
+    instance.options.scrollback = terminalState.output.length;
     if (terminalState.output.startsWith(writtenOutput.current)) {
       const addition = terminalState.output.slice(writtenOutput.current.length);
       if (addition) instance.write(addition);

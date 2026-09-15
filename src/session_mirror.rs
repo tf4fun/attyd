@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     fn mirror() -> SessionMirror {
-        SessionMirror::new("epoch", crate::runtime_state::RuntimeLimits::default())
+        SessionMirror::new("epoch")
     }
 
     fn load_initial(mirror: &mut SessionMirror, session_id: &str, incarnation: u64) {
@@ -2136,7 +2136,7 @@ mod tests {
     }
 
     #[test]
-    fn consumed_intent_remains_non_dispatchable_after_exact_metadata_is_evicted() {
+    fn consumed_intent_returns_its_original_operation_after_reconcile() {
         let mut mirror = mirror();
         mirror.register_new("session", 1);
         let revision = mirror
@@ -2167,15 +2167,11 @@ mod tests {
             .unwrap();
         let successor = mirror.commit_load("session", 1, "load").unwrap();
 
-        mirror
-            .sessions
-            .get_mut("session")
-            .unwrap()
-            .state
-            .forget_recent_consumptions();
         assert_eq!(
             mirror.start_turn("session", 1, successor.revision(), "old-intent", prompt,),
-            Err(MirrorError::IdempotencyConflict)
+            Ok(TurnAdmission::Duplicate {
+                operation_id: operation
+            })
         );
     }
 

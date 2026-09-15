@@ -13,20 +13,19 @@ use futures::{Stream, stream};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
-pub const MAX_AGENT_NDJSON_LINE_BYTES: usize = 8_000_000;
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const STDERR_CHUNK_BYTES: usize = 8 * 1024;
 
 type StderrCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
 type FatalCallback = Arc<dyn Fn(Error) + Send + Sync + 'static>;
 
-pub struct BoundedAcpAgent {
+pub struct StdioAcpAgent {
     config: AcpAgentConfig,
     stderr_callback: Option<StderrCallback>,
     fatal_callback: Option<FatalCallback>,
 }
 
-impl BoundedAcpAgent {
+impl StdioAcpAgent {
     pub fn new(config: AcpAgentConfig) -> Self {
         Self {
             config,
@@ -46,7 +45,7 @@ impl BoundedAcpAgent {
     }
 }
 
-impl ConnectTo<Client> for BoundedAcpAgent {
+impl ConnectTo<Client> for StdioAcpAgent {
     async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<(), Error> {
         let (channel, transport) = self.into_channel_and_future();
         futures::try_join!(transport, ConnectTo::<Client>::connect_to(channel, client))?;
@@ -65,7 +64,7 @@ impl ConnectTo<Client> for BoundedAcpAgent {
     }
 }
 
-impl BoundedAcpAgent {
+impl StdioAcpAgent {
     fn spawn_channel(self) -> Result<(Channel, BoxFuture<'static, Result<(), Error>>), Error> {
         let mut command = Command::new(self.config.command());
         command
@@ -110,7 +109,7 @@ impl BoundedAcpAgent {
 
         let (incoming_tx, incoming) = mpsc::unbounded::<std::io::Result<String>>();
         let stdout_future = async move {
-            let lines = bounded_lines(BufReader::new(child_stdout), MAX_AGENT_NDJSON_LINE_BYTES);
+            let lines = ndjson_lines(BufReader::new(child_stdout));
             let mut lines = pin!(lines);
             while let Some(line) = lines.next().await {
                 match line {
@@ -137,10 +136,8 @@ impl BoundedAcpAgent {
                 Either::Left((result, _)) => result,
                 Either::Right((stdout_result, protocol)) => {
                     stdout_result?;
-                    match tokio::time::timeout(SHUTDOWN_GRACE_PERIOD, protocol).await {
-                        Ok(result) => result,
-                        Err(_) => Ok(()),
-                    }
+                    // EOF seals the input; let every accepted frame drain.
+                    protocol.await
                 }
             }
         };
@@ -162,10 +159,8 @@ impl BoundedAcpAgent {
                     }
                     Either::Right((status, protocol)) => {
                         validate_exit(status.map_err(Error::into_internal_error)?)?;
-                        match tokio::time::timeout(SHUTDOWN_GRACE_PERIOD, protocol).await {
-                            Ok(result) => result,
-                            Err(_) => Ok(()),
-                        }
+                        // Natural process exit must not time out accepted output.
+                        protocol.await
                     }
                 }
             };
@@ -214,7 +209,7 @@ fn validate_exit(status: std::process::ExitStatus) -> Result<(), Error> {
     }
 }
 
-fn bounded_lines<R>(reader: R, maximum: usize) -> impl Stream<Item = std::io::Result<String>> + Send
+fn ndjson_lines<R>(reader: R) -> impl Stream<Item = std::io::Result<String>> + Send
 where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
@@ -239,16 +234,6 @@ where
                 let newline = available.iter().position(|byte| *byte == b'\n');
                 let consumed = newline.map_or(available.len(), |index| index + 1);
                 let content = newline.map_or(available, |index| &available[..index]);
-                if line.len().saturating_add(content.len()) > maximum {
-                    reader.consume(consumed);
-                    return Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Agent NDJSON line exceeds {maximum} bytes"),
-                        )),
-                        (reader, Vec::new(), true),
-                    ));
-                }
                 line.extend_from_slice(content);
                 reader.consume(consumed);
                 if newline.is_some() {
@@ -270,126 +255,20 @@ fn decode_line(mut line: Vec<u8>) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{ProtocolVersion, v1::InitializeRequest};
+
     use futures::StreamExt;
-    use std::io::Write;
 
     #[tokio::test]
-    async fn bounds_agent_lines_by_encoded_bytes_and_resets_at_newlines() {
-        let input = "12345\n你好\nnext".as_bytes();
-        let lines = bounded_lines(BufReader::new(input), 6)
+    async fn preserves_large_utf8_lines_and_resets_at_newlines() {
+        let large = "你好".repeat(1_400_000);
+        let input = format!("{large}\r\nnext\nlast");
+        let lines = ndjson_lines(BufReader::new(std::io::Cursor::new(input.into_bytes())))
             .collect::<Vec<_>>()
             .await;
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].as_ref().unwrap(), "12345");
-        assert_eq!(lines[1].as_ref().unwrap(), "你好");
-        assert_eq!(lines[2].as_ref().unwrap(), "next");
-
-        let oversized = "你好\n".as_bytes();
-        let lines = bounded_lines(BufReader::new(oversized), 5)
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0]
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds 5 bytes")
-        );
-    }
-
-    #[test]
-    fn oversized_agent_child_fixture() {
-        if std::env::var_os("ATTYD_OVERSIZED_AGENT_CHILD").is_none() {
-            return;
-        }
-        let mut stdout = std::io::stdout().lock();
-        stdout
-            .write_all(&vec![b'x'; MAX_AGENT_NDJSON_LINE_BYTES + 1])
-            .unwrap();
-        stdout.write_all(b"\n").unwrap();
-        stdout.flush().unwrap();
-        loop {
-            std::thread::park();
-        }
-    }
-
-    #[tokio::test]
-    async fn surfaces_a_real_childs_oversized_line_without_waiting_for_exit() {
-        let executable = std::env::current_exe().unwrap();
-        let config = AcpAgentConfig::new(executable)
-            .args([
-                "--exact",
-                "agent_process::tests::oversized_agent_child_fixture",
-                "--nocapture",
-            ])
-            .env("ATTYD_OVERSIZED_AGENT_CHILD", "1");
-        let agent = BoundedAcpAgent::new(config);
-        let (_channel, connection) = ConnectTo::<Client>::into_channel_and_future(agent);
-        let error = tokio::time::timeout(Duration::from_secs(10), connection)
-            .await
-            .expect("oversized child stdout must not leave the connection pending")
-            .expect_err("oversized child stdout must fail the connection");
-        assert!(
-            format!("{error:?}").contains("Agent NDJSON line exceeds 8000000 bytes"),
-            "unexpected connection error: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn surfaces_an_oversized_line_through_the_client_builder() {
-        let executable = std::env::current_exe().unwrap();
-        let config = AcpAgentConfig::new(executable)
-            .args([
-                "--exact",
-                "agent_process::tests::oversized_agent_child_fixture",
-                "--nocapture",
-            ])
-            .env("ATTYD_OVERSIZED_AGENT_CHILD", "1");
-        let agent = BoundedAcpAgent::new(config);
-        let connection = Client.builder().connect_with(agent, async |connection| {
-            connection
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
-            Ok(())
-        });
-        let error = tokio::time::timeout(Duration::from_secs(10), connection)
-            .await
-            .expect("transport failure must wake the client foreground")
-            .expect_err("oversized child stdout must fail the client connection");
-        assert!(
-            format!("{error:?}").contains("Agent NDJSON line exceeds 8000000 bytes"),
-            "unexpected connection error: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn surfaces_the_typescript_fixture_oversized_line() {
-        let fixture =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-agent.ts");
-        let config = AcpAgentConfig::new("node").args([
-            "--import".to_string(),
-            "tsx".to_string(),
-            fixture.to_string_lossy().into_owned(),
-            "--oversized-stdout-line".to_string(),
-        ]);
-        let agent = BoundedAcpAgent::new(config);
-        let connection = Client.builder().connect_with(agent, async |connection| {
-            connection
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
-            Ok(())
-        });
-        let error = tokio::time::timeout(Duration::from_secs(10), connection)
-            .await
-            .expect("TypeScript fixture stdout must not leave the connection pending")
-            .expect_err("oversized TypeScript fixture stdout must fail the connection");
-        assert!(
-            format!("{error:?}").contains("Agent NDJSON line exceeds 8000000 bytes"),
-            "unexpected connection error: {error:?}"
-        );
+        assert_eq!(lines[0].as_ref().unwrap().len(), large.len());
+        assert_eq!(lines[0].as_ref().unwrap(), &large);
+        assert_eq!(lines[1].as_ref().unwrap(), "next");
+        assert_eq!(lines[2].as_ref().unwrap(), "last");
     }
 }

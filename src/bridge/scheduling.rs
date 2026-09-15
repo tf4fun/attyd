@@ -15,34 +15,23 @@ use agent_client_protocol::{
 };
 use agent_client_protocol::{JsonRpcMessage, schema::v1::SessionNotification};
 use serde::Serialize;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::inbound_requests::{CapturedInboundRequest, InboundRequestLease};
-use super::{
-    BridgeInput, EventSink, MAX_AGENT_RELAY_BYTES, MAX_BRIDGE_MESSAGE_BYTES, MAX_TRACKED_SESSIONS,
-};
+use super::{BridgeInput, EventSink};
 use crate::completion_handoff::{
     CompletionHandoff, CompletionRegistration, CompletionTurn, HandoffDisposition,
 };
 use crate::ordered_ingress::{
-    IngressLimits, OrderedCompletion, OrderedIngress, RequestBudget, RequestClass, RequestOwner,
-    RequestReservation,
+    OrderedCompletion, OrderedIngress, RequestClass, RequestOwner, RequestReservation,
 };
 use crate::session_dispatch::{
-    Budget, ClassLimits, Delivery, DeliveryGuard, DispatchLimits, EventOrigin, SessionDispatch,
-    SessionHandle, TrafficClass,
+    Delivery, DeliveryGuard, EventOrigin, SessionDispatch, SessionHandle, TrafficClass,
 };
 use crate::session_resources::{SessionResourceOwner, UrlRegistration};
 use crate::terminal::TerminalSnapshot;
 
-const ORDINARY_ITEMS: usize = 256;
-const REQUIRED_ITEMS: usize = 128;
-const ORDINARY_BYTES: usize = 16 * 1024 * 1024;
-const REQUIRED_BYTES: usize = 32 * 1024 * 1024;
-const LONG_REQUESTS: usize = 32;
-const CONTROL_REQUESTS: usize = 32;
-const COMPLETION_ITEMS: usize = LONG_REQUESTS + CONTROL_REQUESTS;
 const COORDINATOR_ID: &str = "attyd:connection-coordinator";
 
 pub(super) enum BridgeIngress {
@@ -75,8 +64,7 @@ pub(super) struct CapturedRoute {
     pub url_registration: Option<UrlRegistration>,
 }
 
-/// The payload's ingress budget travels into the local execution turn, so draining
-/// the shared channel cannot turn its byte limit into an unbounded staging buffer.
+/// One accepted event retains its wire order until its local transition finishes.
 pub(super) struct IngressItem {
     pub request_lease: Option<InboundRequestLease>,
     pub event: BridgeIngress,
@@ -84,7 +72,6 @@ pub(super) struct IngressItem {
     bytes: usize,
     class: TrafficClass,
     origin: EventOrigin,
-    budget: Option<IngressBudget>,
 }
 
 impl IngressItem {
@@ -96,45 +83,7 @@ impl IngressItem {
             request_lease: None,
             class: TrafficClass::Reserved,
             origin: EventOrigin::RequiredInbound,
-            // OrderedIngress already reserved this response's slot and bytes.
-            budget: None,
         }
-    }
-}
-
-struct IngressBudget {
-    _items: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
-}
-
-struct IngressPool {
-    items: Arc<Semaphore>,
-    bytes: Arc<Semaphore>,
-}
-
-impl IngressPool {
-    fn new(items: usize, bytes: usize) -> Self {
-        Self {
-            items: Arc::new(Semaphore::new(items)),
-            bytes: Arc::new(Semaphore::new(bytes)),
-        }
-    }
-
-    fn reserve(&self, bytes: usize) -> Result<IngressBudget, Error> {
-        let items = self
-            .items
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity_error("ingress item budget exhausted"))?;
-        let bytes = self
-            .bytes
-            .clone()
-            .try_acquire_many_owned(bytes as u32)
-            .map_err(|_| capacity_error("ingress byte budget exhausted"))?;
-        Ok(IngressBudget {
-            _items: items,
-            _bytes: bytes,
-        })
     }
 }
 
@@ -158,10 +107,8 @@ impl FaultReporter {
 
 struct SenderInner {
     epoch: String,
-    events: mpsc::Sender<IngressItem>,
-    ordinary: IngressPool,
+    events: mpsc::UnboundedSender<IngressItem>,
     replays: SyncMutex<HashMap<String, (RequestId, ReplayCandidate)>>,
-    required: IngressPool,
     ordered: OrderedIngress<IngressItem>,
     handoff: CompletionHandoff,
     wake: Arc<Notify>,
@@ -176,10 +123,10 @@ pub(super) struct IngressSender {
     inner: Arc<SenderInner>,
 }
 
-/// One global lane is independent of every session queue and has its own budgets.
+/// One global lane is independent of every session queue.
 /// Its internal handle is never used as a canonical ACP session handle.
 pub(super) struct Scheduling {
-    pub ingress_rx: mpsc::Receiver<IngressItem>,
+    pub ingress_rx: mpsc::UnboundedReceiver<IngressItem>,
     pub wake: Arc<Notify>,
     sessions: SessionDispatch<IngressItem>,
     global: SessionDispatch<IngressItem>,
@@ -222,10 +169,7 @@ impl ExecutionScope {
 }
 
 enum ExecutionLease {
-    Local {
-        guard: DeliveryGuard,
-        _ingress: Option<IngressBudget>,
-    },
+    Local { guard: DeliveryGuard },
     Completion(CompletionTurn),
 }
 
@@ -262,8 +206,7 @@ impl ExecutionTurn {
 impl Drop for ExecutionTurn {
     fn drop(&mut self) {
         match self.lease.take() {
-            Some(ExecutionLease::Local { guard, _ingress }) => {
-                drop(_ingress);
+            Some(ExecutionLease::Local { guard }) => {
                 drop(guard);
                 self.wake.notify_one();
             }
@@ -279,75 +222,13 @@ impl Scheduling {
         sink: EventSink,
         cancellation: CancellationToken,
     ) -> Result<(Self, IngressSender), Error> {
-        let (events, ingress_rx) =
-            mpsc::channel(ORDINARY_ITEMS + REQUIRED_ITEMS + COMPLETION_ITEMS);
+        let (events, ingress_rx) = mpsc::unbounded_channel();
         let wake = Arc::new(Notify::new());
-        let handoff =
-            CompletionHandoff::new(COMPLETION_ITEMS, wake.clone()).map_err(scheduling_error)?;
-        let ordered = OrderedIngress::new(
-            IngressLimits {
-                max_response_bytes: MAX_AGENT_RELAY_BYTES,
-                long_running: RequestBudget {
-                    requests: LONG_REQUESTS,
-                    completion_bytes: LONG_REQUESTS * MAX_AGENT_RELAY_BYTES,
-                },
-                control: RequestBudget {
-                    requests: CONTROL_REQUESTS,
-                    completion_bytes: CONTROL_REQUESTS * MAX_AGENT_RELAY_BYTES,
-                },
-            },
-            events.clone(),
-            IngressItem::completion,
-        )
-        .map_err(scheduling_error)?;
-        let sessions = SessionDispatch::new(
-            epoch.clone(),
-            DispatchLimits {
-                max_sessions: MAX_TRACKED_SESSIONS,
-                max_event_bytes: MAX_BRIDGE_MESSAGE_BYTES,
-                per_session: ClassLimits {
-                    ordinary: Budget {
-                        items: 64,
-                        bytes: 8 * 1024 * 1024,
-                    },
-                    reserved: Budget {
-                        items: 64,
-                        bytes: 16 * 1024 * 1024,
-                    },
-                },
-                global: ClassLimits {
-                    ordinary: Budget {
-                        items: ORDINARY_ITEMS,
-                        bytes: ORDINARY_BYTES,
-                    },
-                    reserved: Budget {
-                        items: REQUIRED_ITEMS + COMPLETION_ITEMS,
-                        bytes: REQUIRED_BYTES + COMPLETION_ITEMS * MAX_AGENT_RELAY_BYTES,
-                    },
-                },
-            },
-        )
-        .map_err(scheduling_error)?;
-        let global_limits = ClassLimits {
-            ordinary: Budget {
-                items: 64,
-                bytes: ORDINARY_BYTES,
-            },
-            reserved: Budget {
-                items: REQUIRED_ITEMS + COMPLETION_ITEMS,
-                bytes: REQUIRED_BYTES + COMPLETION_ITEMS * MAX_AGENT_RELAY_BYTES,
-            },
-        };
-        let global = SessionDispatch::new(
-            epoch.clone(),
-            DispatchLimits {
-                max_sessions: 1,
-                max_event_bytes: MAX_BRIDGE_MESSAGE_BYTES,
-                per_session: global_limits,
-                global: global_limits,
-            },
-        )
-        .map_err(scheduling_error)?;
+        let handoff = CompletionHandoff::new(wake.clone()).map_err(scheduling_error)?;
+        let ordered = OrderedIngress::new(events.clone(), IngressItem::completion)
+            .map_err(scheduling_error)?;
+        let sessions = SessionDispatch::new(epoch.clone()).map_err(scheduling_error)?;
+        let global = SessionDispatch::new(epoch.clone()).map_err(scheduling_error)?;
         let global_handle = global
             .register(COORDINATOR_ID, 1)
             .map_err(scheduling_error)?;
@@ -355,9 +236,7 @@ impl Scheduling {
             inner: Arc::new(SenderInner {
                 epoch,
                 events,
-                ordinary: IngressPool::new(ORDINARY_ITEMS, ORDINARY_BYTES),
                 replays: SyncMutex::new(HashMap::new()),
-                required: IngressPool::new(REQUIRED_ITEMS, REQUIRED_BYTES),
                 ordered,
                 handoff,
                 wake: wake.clone(),
@@ -390,7 +269,7 @@ impl Scheduling {
         incarnation: u64,
     ) -> Result<SessionHandle, Error> {
         if incarnation == 0 {
-            return Err(capacity_error(
+            return Err(ownership_error(
                 "a cold placeholder cannot own an execution queue",
             ));
         }
@@ -451,7 +330,7 @@ impl Scheduling {
         if owner.is_some_and(|owner| !ExecutionScope::Session(handle.clone()).matches(owner)) {
             return Err(self.reject(
                 item,
-                capacity_error("event owner does not match the canonical session route"),
+                ownership_error("event owner does not match the canonical session route"),
             ));
         }
         self.sessions
@@ -520,10 +399,7 @@ impl Scheduling {
             request_lease: item.request_lease,
             turn: ExecutionTurn {
                 scope,
-                lease: Some(ExecutionLease::Local {
-                    guard,
-                    _ingress: item.budget,
-                }),
+                lease: Some(ExecutionLease::Local { guard }),
                 wake: self.wake.clone(),
             },
         }
@@ -535,16 +411,15 @@ impl Scheduling {
         mut turn: ExecutionTurn,
     ) -> Result<HandoffDisposition, Error> {
         if !turn.matches_owner(&completion.owner) {
-            let error = capacity_error("completion ticket does not belong to its RPC owner");
+            let error = ownership_error("completion ticket does not belong to its RPC owner");
             self.sender.inner.fault.fail(&error);
             return Err(error);
         }
-        let Some(ExecutionLease::Local { guard, _ingress }) = turn.lease.take() else {
-            let error = capacity_error("completion was handed off more than once");
+        let Some(ExecutionLease::Local { guard }) = turn.lease.take() else {
+            let error = ownership_error("completion was handed off more than once");
             self.sender.inner.fault.fail(&error);
             return Err(error);
         };
-        drop(_ingress);
         self.sender
             .inner
             .handoff
@@ -649,7 +524,7 @@ impl IngressSender {
         let owner = completion.owner.clone();
         let request_id = completion.request_id.clone();
         // Canceling the handoff sender may wake a task immediately. Release the
-        // completion allocation first so that wake observes reclaimed capacity.
+        // completion allocation first so that wake observes the retired completion.
         drop(completion);
         self.inner
             .handoff
@@ -704,8 +579,7 @@ impl IngressSender {
                 let notification =
                     SessionNotification::parse_message(message.method(), message.params())
                         .map_err(super::error_message)?;
-                super::ensure_relay_size(&notification, "session update")
-                    .map_err(super::error_message)?;
+                super::relay_bytes(&notification).map_err(super::error_message)?;
                 let update =
                     serde_json::to_value(notification.update).map_err(|error| error.to_string())?;
                 let conversation = super::is_conversation_update(&update);
@@ -762,47 +636,28 @@ impl IngressSender {
                 return Err(Error::request_cancelled());
             }
             let bytes = measure_event(&event)?.max(1);
-            let maximum = if origin == EventOrigin::Command {
-                MAX_BRIDGE_MESSAGE_BYTES
-            } else {
-                MAX_AGENT_RELAY_BYTES
-            };
-            if bytes > maximum {
-                return Err(capacity_error("ingress event exceeds its byte limit"));
-            }
-            let pool = match class {
-                TrafficClass::Ordinary => &self.inner.ordinary,
-                TrafficClass::Reserved => &self.inner.required,
-            };
-            let budget = pool.reserve(bytes)?;
-            let permit = self
-                .inner
-                .events
-                .clone()
-                .try_reserve_owned()
-                .map_err(|error| scheduling_error(error.to_string()))?;
-            Ok((bytes, budget, permit))
+            Ok(bytes)
         })();
         match admitted {
-            Ok((bytes, budget, permit)) => {
-                let sender = permit.send(IngressItem {
+            Ok(bytes) => {
+                match self.inner.events.send(IngressItem {
                     event,
                     route: None,
                     request_lease: None,
                     bytes,
                     class,
                     origin,
-                    budget: Some(budget),
-                });
-                if sender.is_closed() {
-                    let error =
-                        Error::request_cancelled().data("bridge ingress closed during delivery");
-                    if origin == EventOrigin::RequiredInbound {
-                        self.inner.fault.fail(&error);
+                }) {
+                    Ok(()) => Ok(()),
+                    Err(rejected) => {
+                        let error = Error::request_cancelled()
+                            .data("bridge ingress closed during delivery");
+                        reject_event(rejected.0.event, &error);
+                        if origin == EventOrigin::RequiredInbound {
+                            self.inner.fault.fail(&error);
+                        }
+                        Err(error)
                     }
-                    Err(error)
-                } else {
-                    Ok(())
                 }
             }
             Err(error) => {
@@ -828,7 +683,7 @@ impl IngressSender {
             ExecutionScope::Session,
         );
         if !scope.matches(&owner) {
-            return Err(capacity_error("RPC owner and execution route disagree"));
+            return Err(ownership_error("RPC owner and execution route disagree"));
         }
         if self.inner.fault.cancellation.is_cancelled() {
             return Err(Error::request_cancelled());
@@ -836,7 +691,7 @@ impl IngressSender {
         let reservation = self
             .inner
             .ordered
-            .try_reserve(class, owner.clone(), MAX_AGENT_RELAY_BYTES)
+            .try_reserve(class, owner.clone())
             .map_err(scheduling_error)?;
         let registration = self
             .inner
@@ -899,14 +754,14 @@ impl PreparedRpc {
             .expect("replay registry lock poisoned");
         let session_id = match (&self.replay, &self.scope) {
             (Some(_), ExecutionScope::Session(handle)) => Some(handle.session_id().to_string()),
-            (Some(_), _) => return Err(capacity_error("history replay requires a session owner")),
+            (Some(_), _) => return Err(ownership_error("history replay requires a session owner")),
             _ => None,
         };
         if session_id
             .as_ref()
             .is_some_and(|id| replays.contains_key(id))
         {
-            return Err(capacity_error(
+            return Err(ownership_error(
                 "session already has an active history replay",
             ));
         }
@@ -1039,7 +894,7 @@ fn reject_event(event: BridgeIngress, error: &Error) {
     }
 }
 
-fn capacity_error(message: &str) -> Error {
+fn ownership_error(message: &str) -> Error {
     Error::invalid_request().data(message)
 }
 fn scheduling_error(error: impl std::fmt::Display) -> Error {
@@ -1159,54 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn rpc_class_reservations_leave_control_capacity_and_release_unused_contexts() {
-        let (scheduling, sender, cancellation, _errors) = setup();
-        let handle = scheduling.register_session("a", 1).unwrap();
-        assert!(scheduling.register_session("placeholder", 0).is_err());
-        let mut pending = Vec::new();
-        for index in 0..LONG_REQUESTS {
-            pending.push(
-                sender
-                    .prepare_rpc(
-                        RequestClass::LongRunning,
-                        owner(Some("a"), &format!("prompt-{index}")),
-                        Some(handle.clone()),
-                    )
-                    .unwrap(),
-            );
-        }
-        assert!(
-            sender
-                .prepare_rpc(
-                    RequestClass::LongRunning,
-                    owner(Some("a"), "excess"),
-                    Some(handle.clone())
-                )
-                .is_err()
-        );
-        let control = sender
-            .prepare_rpc(RequestClass::Control, owner(None, "list"), None)
-            .unwrap();
-        assert!(!cancellation.is_cancelled());
-        drop(control);
-        drop(pending.pop());
-        assert!(
-            sender
-                .prepare_rpc(
-                    RequestClass::LongRunning,
-                    owner(Some("a"), "replacement"),
-                    Some(handle)
-                )
-                .is_ok()
-        );
-        assert!(
-            sender
-                .prepare_rpc(RequestClass::Control, owner(None, "list"), None)
-                .is_ok()
-        );
-    }
-
-    #[test]
     fn local_drain_counts_delivery_guards_but_not_remote_response_reservations() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
         let handle = scheduling.register_session("a", 1).unwrap();
@@ -1241,69 +1048,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_ingress_capacity_preserves_reserved_commands_and_faults_required_overflow() {
-        let (_scheduling, sender, cancellation, mut errors) = setup();
-        for _ in 0..ORDINARY_ITEMS {
-            browser(&sender);
+    async fn live_ingress_bursts_preserve_all_notifications_before_control_work() {
+        let (mut scheduling, sender, cancellation, mut errors) = setup();
+        for index in 0..4_096 {
+            let message =
+                UntypedMessage::new("session/update", json!({"sessionId":"a","index":index}))
+                    .unwrap();
+            assert!(matches!(
+                sender
+                    .receive_dispatch(Dispatch::Notification(message))
+                    .await
+                    .unwrap(),
+                Handled::Yes
+            ));
         }
-        assert!(
-            sender
-                .try_browser(browser_input(), TrafficClass::Ordinary)
-                .is_err()
-        );
-        assert!(
-            !cancellation.is_cancelled(),
-            "a rejected command must not stop the connection"
-        );
         sender
-            .try_browser(browser_input(), TrafficClass::Reserved)
+            .try_browser(BridgeInput::RuntimeSnapshotRequest, TrafficClass::Reserved)
             .unwrap();
-        let update =
-            UntypedMessage::new("session/update", json!({ "sessionId": "a", "update": {} }))
-                .unwrap();
-        assert!(
-            sender
-                .receive_dispatch(Dispatch::Notification(update))
-                .await
-                .is_err()
-        );
-        assert!(cancellation.is_cancelled());
-        let error: Value = serde_json::from_str(&errors.try_recv().unwrap()).unwrap();
-        assert_eq!(error["type"], "bridge/error");
-        assert_eq!(error["data"], "ingress item budget exhausted");
-        assert!(
-            error.get("operation").is_none(),
-            "connection failure must reach global SSE"
-        );
-        assert!(
-            error.get("requestId").is_none(),
-            "connection failure must survive runtime recovery"
-        );
-        assert!(
-            errors.try_recv().is_err(),
-            "fault publication is emitted once"
-        );
-    }
-
-    #[test]
-    fn mandatory_browser_bookkeeping_overflow_is_a_connection_fault() {
-        let (_scheduling, sender, cancellation, mut errors) = setup();
-        for _ in 0..REQUIRED_ITEMS {
-            sender
-                .try_browser(browser_input(), TrafficClass::Reserved)
-                .unwrap();
+        for index in 0..4_096 {
+            let item = scheduling.ingress_rx.try_recv().unwrap();
+            let BridgeIngress::Acp(Dispatch::Notification(message)) = item.event else {
+                panic!("notification lost")
+            };
+            assert_eq!(message.params["index"], index);
         }
-        assert!(
-            sender
-                .try_browser(BridgeInput::RuntimeSnapshotRequest, TrafficClass::Reserved)
-                .is_err()
-        );
-        assert!(cancellation.is_cancelled());
-        assert!(errors.try_recv().is_ok());
+        assert!(matches!(
+            scheduling.ingress_rx.try_recv().unwrap().event,
+            BridgeIngress::Browser(BridgeInput::RuntimeSnapshotRequest)
+        ));
+        assert!(!cancellation.is_cancelled());
+        assert!(errors.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn busy_session_does_not_hide_global_or_other_session_work_and_keeps_ingress_budget() {
+    async fn busy_session_does_not_hide_global_or_other_session_work_and_preserves_fifo() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
         let a = scheduling.register_session("a", 1).unwrap();
         let b = scheduling.register_session("b", 1).unwrap();
@@ -1316,10 +1094,6 @@ mod tests {
         }
         let a1 = scheduling.pump().unwrap().unwrap();
         assert_eq!(a1.turn.handle(), Some(&a));
-        assert_eq!(
-            sender.inner.ordinary.items.available_permits(),
-            ORDINARY_ITEMS - 3
-        );
         browser(&sender);
         let item = scheduling.ingress_rx.try_recv().unwrap();
         scheduling
@@ -1340,10 +1114,6 @@ mod tests {
         let a2 = scheduling.pump().unwrap().unwrap();
         assert_eq!(a2.turn.handle(), Some(&a));
         drop(a2);
-        assert_eq!(
-            sender.inner.ordinary.items.available_permits(),
-            ORDINARY_ITEMS
-        );
     }
 
     #[test]
@@ -1400,15 +1170,7 @@ mod tests {
         assert!(reply.send(Ok(turn)).is_ok());
         let turn = continuation.await.unwrap();
         assert_eq!(turn.handle(), Some(&handle));
-        assert_eq!(
-            sender.inner.required.items.available_permits(),
-            REQUIRED_ITEMS - 1
-        );
         drop(turn);
-        assert_eq!(
-            sender.inner.required.items.available_permits(),
-            REQUIRED_ITEMS
-        );
     }
 
     #[tokio::test]
@@ -1454,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn replay_data_does_not_consume_live_ingress_capacity() {
         let (mut scheduling, sender, cancellation, mut errors) = setup();
-        for _ in 0..ORDINARY_ITEMS {
+        for _ in 0..4_096 {
             browser(&sender);
         }
         let replay = ReplayCandidate::default();
@@ -1481,7 +1243,7 @@ mod tests {
                 Handled::Yes
             ));
         }
-        assert_eq!(scheduling.ingress_rx.len(), ORDINARY_ITEMS);
+        assert_eq!(scheduling.ingress_rx.len(), 4_096);
         assert_eq!(replay.lock().updates().unwrap().len(), 1_000);
         assert!(!cancellation.is_cancelled());
         assert!(errors.try_recv().is_err());
@@ -1991,14 +1753,6 @@ mod tests {
             route.url_registration.unwrap().registration_id,
             "registration-1"
         );
-        assert_eq!(
-            sender.inner.required.items.available_permits(),
-            REQUIRED_ITEMS - 1
-        );
         drop(turn);
-        assert_eq!(
-            sender.inner.required.items.available_permits(),
-            REQUIRED_ITEMS
-        );
     }
 }

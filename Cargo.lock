@@ -317,6 +317,7 @@ dependencies = [
  "agent-client-protocol-http",
  "anyhow",
  "assert_cmd",
+ "async-tungstenite",
  "axum",
  "base64",
  "clap",

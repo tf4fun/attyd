@@ -1,7 +1,6 @@
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { TimelineItem } from "./state";
 
-export const MAX_PROMPT_HISTORY = 100;
 
 /**
  * Builds input history from the active ACP thread itself, including history
@@ -10,12 +9,7 @@ export const MAX_PROMPT_HISTORY = 100;
  */
 export function collectPromptHistory(
   timeline: TimelineItem[],
-  limit = MAX_PROMPT_HISTORY,
 ): ContentBlock[][] {
-  const boundedLimit = Number.isFinite(limit)
-    ? Math.min(MAX_PROMPT_HISTORY, Math.max(0, Math.trunc(limit)))
-    : MAX_PROMPT_HISTORY;
-  if (boundedLimit === 0) return [];
   const prompts: Array<{ blocks: ContentBlock[]; role: "user" | "protocol-user" }> = [];
 
   for (let index = 0; index < timeline.length; index += 1) {
@@ -40,7 +34,7 @@ export function collectPromptHistory(
     }
   }
 
-  return prompts.slice(-boundedLimit).map(({ blocks }) => blocks);
+  return prompts.map(({ blocks }) => blocks);
 }
 
 function contentBlocksEqual(left: ContentBlock[], right: ContentBlock[]): boolean {

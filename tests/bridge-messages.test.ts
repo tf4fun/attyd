@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  MAX_BRIDGE_ERROR_DATA_BYTES,
   parseClientCommand,
   parseServerEvent,
 } from "../shared/bridge";
@@ -107,11 +106,11 @@ describe("browser bridge messages", () => {
     }))).toThrow("completed browser history");
     expect(() => parseClientCommand(JSON.stringify({
       type: "x".repeat(129),
-    }))).toThrow("command type is too long");
+    }))).toThrow("Unknown");
     expect(() => parseClientCommand(JSON.stringify({
       type: "session/new",
       requestId: "x".repeat(1_025),
-    }))).toThrow("requestId exceeds 1024 characters");
+    }))).not.toThrow();
     expect(() => parseClientCommand(JSON.stringify({
       type: "session/new",
       requestId: "new-relative",
@@ -121,34 +120,34 @@ describe("browser bridge messages", () => {
       type: "auth/authenticate",
       requestId: "auth",
       methodId: "x".repeat(1_025),
-    }))).toThrow("methodId exceeds 1024 characters");
+    }))).not.toThrow();
     expect(() => parseClientCommand(JSON.stringify({
       type: "auth/terminal_start",
       requestId: "auth",
       methodId: "terminal",
-      cols: 1,
+      cols: 0,
       rows: 24,
-    }))).toThrow("cols must be an integer between 2 and 500");
+    }))).toThrow("cols must be an integer between 1 and 65535");
     expect(() => parseClientCommand(JSON.stringify({
       type: "auth/terminal_input",
       requestId: "auth",
       data: "x".repeat(65_537),
-    }))).toThrow("data exceeds 65536 characters");
+    }))).not.toThrow();
     expect(() => parseClientCommand(JSON.stringify({
       type: "session/cancel",
       sessionId: "x".repeat(1_025),
-    }))).toThrow("sessionId exceeds 1024 characters");
+    }))).not.toThrow();
     expect(() => parseClientCommand(JSON.stringify({
       type: "session/list",
       requestId: "x",
       cursor: "x".repeat(4_097),
-    }))).toThrow("cursor exceeds 4096 characters");
+    }))).not.toThrow();
     expect(() => parseClientCommand(JSON.stringify({
       type: "context/search",
       requestId: "x",
       sessionId: "s",
       query: "x".repeat(257),
-    }))).toThrow("query exceeds 256 characters");
+    }))).not.toThrow();
     expect(() => parseClientCommand(JSON.stringify({
       type: "context/search",
       requestId: "x",
@@ -164,7 +163,7 @@ describe("browser bridge messages", () => {
       requestId: "x",
       sessionId: "s",
       path: "x".repeat(16_385),
-    }))).toThrow("path exceeds 16384 characters");
+    }))).not.toThrow();
     expect(() => parseClientCommand('{"type":"session/prompt","requestId":"x"}')).toThrow("sessionId");
     expect(() => parseClientCommand('{"type":"permission/respond","requestId":"response","permissionId":"x","outcome":{"outcome":"selected"}}')).toThrow("optionId");
     expect(() => parseClientCommand(JSON.stringify({
@@ -429,7 +428,7 @@ describe("browser bridge messages", () => {
       type: "acp/terminal_state",
       terminal: { terminalId: "terminal", released: true },
     });
-    for (const outputBytes of ["%%%", "a===", "abcd\n", 5, "A".repeat(1_333_336)]) {
+    for (const outputBytes of ["%%%", "a===", "abcd\n", 5]) {
       expect(() => parseServerEvent(JSON.stringify({
         type: "acp/terminal_state",
         terminal: {
@@ -491,8 +490,8 @@ describe("browser bridge messages", () => {
     expect(() => parseServerEvent(JSON.stringify({
       type: "bridge/error",
       message: "oversized error data",
-      data: { padding: "x".repeat(MAX_BRIDGE_ERROR_DATA_BYTES) },
-    }))).toThrow("relay limit");
+      data: { padding: "x".repeat(256 * 1024) },
+    }))).not.toThrow();
     expect(() => parseServerEvent(JSON.stringify({
       type: "bridge/auth_terminal_exited",
       requestId: "terminal-auth",

@@ -70,14 +70,10 @@
     "nextHint": "Next match · Enter",
     "close": "Close thread search",
     "closeHint": "Close search · Escape",
-    "counter": "{{current}}/{{total}}",
-    "limit_one": "Showing the first {{value}} matches",
-    "limit_other": "Showing the first {{value}} matches",
-    "queryLimit": "Search is limited to {{count, number}} characters"
+    "counter": "{{current}}/{{total}}"
   },
   "attachments": {
     "errors": {
-      "sizeLimit": "Attachments are limited to 3 MB per prompt",
       "unsupportedFile": "The agent cannot accept {{name}}",
       "preparing": "Wait for attachments to finish preparing before sending",
       "inactiveSession": "Wait for an active ACP session before attaching files",

@@ -151,7 +151,7 @@ impl ReplayCandidate {
         if data.sealed || data.invalid.is_some() {
             return Ok(());
         }
-        let result = (|| {
+        let result: Result<(), String> = (|| {
             validate_history_update(&mut data.validation, &update)?;
             if conversation {
                 data.history
@@ -169,9 +169,6 @@ impl ReplayCandidate {
                     .control_bytes
                     .saturating_sub(previous_bytes)
                     .saturating_add(value_bytes(&update));
-                if bytes > 1_000_000 {
-                    return Err("Agent control replay exceeds its buffer limit".to_owned());
-                }
                 data.control_bytes = bytes;
                 if let Some(position) = position {
                     data.controls[position] = update;

@@ -31,7 +31,7 @@ ConnectionRuntime
 |- negotiated capabilities and connection phase
 |- listed session metadata
 |- sessions: Map<SessionId, SessionRuntime>
-`- bounded connection-scoped live resources and diagnostics
+`- connection-scoped live resources and diagnostics
 
 SessionRuntime                         HistoryCache (separate allocation)
 |- incarnation and view revision       `- SessionKey -> Arc<HistorySnapshot>
@@ -42,7 +42,7 @@ SessionRuntime                         HistoryCache (separate allocation)
 |- one ActiveOverlay
 |- one LoadAttempt metadata             LoadTransaction (separate allocation)
 |- live resources                       `- one byte-accounted replay candidate
-`- bounded intent tombstone
+`- exact intent result map
 ```
 
 Complete history payload must not be placed inside `SessionRuntime`, runtime deltas or raw debug
@@ -67,8 +67,7 @@ and revision metadata; observers access the shared snapshot through the history 
 
 Mode/config controls and close may coexist with a prompt. Competing controls, attachment, fork,
 close and delete remain mutually exclusive; fork/delete still require no running prompt.
-Different sessions may progress concurrently under request, transport and delivery backpressure
-bounds.
+Different sessions may progress concurrently under request admission and per-session ordering.
 
 ## Append contract
 
@@ -107,7 +106,7 @@ Agent request and is identical whether or not the Agent advertises load. The pro
 browser replacement but not bridge replacement; Cold history remains unavailable without load.
 
 Session-specific observer absence starts the CLI-configured close interval. Return cancels queued
-admission; output/completion do not reset it. The default is 1800 seconds; negatives disable, zero
+admission; output/completion do not reset it. The default is -1 (disabled); negatives disable, zero
 attempts immediate close. Expiry may close running work. Unsupported/refused close keeps state,
 and uncertain outcomes remain explicit. Never-observed materialized sessions count; list rows do
 not. Queued timers and late prompt responses must respect incarnation identity.
@@ -133,13 +132,14 @@ epoch; a numeric generation counter alone does not identify a host restart. View
 subscriptions carry `expectedEpoch` / `expectedIncarnation`; native SSE retries also carry their
 `Last-Event-ID`. A confirmed close/delete publishes `bridge/session_retired` before ending the
 observation stream. A successful close preceding a failed delete still retires the observation.
-Slow subscribers are evicted without affecting Agent work. Baseline payload is shared/chunked
-rather than cloned into every subscriber queue.
+Slow subscribers retain their ordered backlog until they consume it or disconnect. Baseline
+payload is shared/chunked rather than cloned into every subscriber queue. Queue growth never
+cancels Agent work or evicts an otherwise connected observer.
 
-Directory management is global. Cold deletion reserves only a bounded catalog ID, with no session
+Directory management is global. Cold deletion reserves only its catalog ID, with no session
 runtime allocation. Deleting an existing runtime coordinates its lifecycle and resource cleanup.
-List operations hold an independent bounded permit while waiting for Agent list serialization;
-they release the execution turn so other global operations can proceed. New/fork/delete advance
+List operations serialize Agent list requests without an admission count limit;
+waiting callers release the execution turn so other global operations can proceed. New/fork/delete advance
 the catalog revision and publish a lightweight invalidation. List responses return `catalogRevision`;
 business pagination sends it as `expectedCatalogRevision`. A changed revision rejects the old
 page before cache installation or response publication, and the browser restarts from page one.
@@ -170,20 +170,23 @@ history, invents missing Agent data or silently treats a partial replay as autho
 - Old baseline + overlay bytes are accounted throughout normal turn commit; a candidate exists only
   for load/attachment transactions.
 - Protocol-valid baseline, candidate and overlay growth has no bridge-defined cumulative cap.
-- Wire values, live resources and subscriber delivery retain their independent safety and
-  backpressure limits.
+- ACP ingress, session dispatch, bridge publication, subscriber delivery and temporary replay
+  queues have no item-count or cumulative byte cap. Content is processed in order, without
+  rejecting bursts, cancelling the connection or dropping earlier records. Byte ledgers measure
+  retained data and release it on consumption/teardown; they are not admission limits.
+- Wire values and live resources retain their independent validation and lifecycle rules.
 - Load/resume registers one replay candidate before sending its RPC. Historical notifications
   validate and fold directly into that separate allocation; they consume no live ingress items,
-  session execution tickets or per-turn new-entity quota. Each record retains the wire/payload
-  size limits. Candidate bytes are accounted independently of transport buffers.
+  session execution tickets. Format, ownership and lifecycle validation still apply, with no
+  record-size or entity-count cap. Candidate bytes are accounted independently of transport buffers.
 - The matching response seals the candidate at the ordered wire boundary. The session completion
   ticket checks epoch/incarnation/attempt and publishes the baseline atomically; following updates
   use the live FIFO and cannot pass that commit. Failure/retirement discards the candidate, and a
   retained writer cannot mutate a replacement attempt. Requests for permission/elicitation remain
   live requests; replayed tool records never allocate responders.
 - Replay folding updates only the relevant history slot and byte count, without cloning or
-  serializing all previous turns per record. Control patches fold into bounded final control state.
-  The unknown-ID pre-creation staging quota does not apply to known-owner historical data.
+  serializing all previous turns per record. Control patches fold into final control state.
+  Unknown pre-creation IDs must still correspond to outstanding creation attempts.
 - Catalog requests and other sessions can progress while a load response is outstanding. The
   transport hook does not wait for a session execution ticket or a human interaction response.
 - Ingress faults that terminate a connection are published in global scope so runtime recovery
@@ -221,4 +224,42 @@ Keep these retired behaviors out of the production path:
 - Bridge-owned unversioned queued prompt admission.
 
 Epoch/incarnation isolation, semantic folding, live-resource registries, per-session operation
-exclusion, bounded channels and canonical suffix-gap handling are retained and adapted.
+exclusion and canonical suffix-gap handling are retained and adapted. Delivery queues are
+unbounded so valid bursts cannot be converted into connection failures.
+
+## Lossless burst delivery regression
+
+`tests/fixtures/burst-prompt-agent.mjs` sends 2,048 ordered Chinese/emoji fragments and the
+prompt response in one write. `server::tests::live_burst_preserves_all_updates_for_a_slow_subscriber`
+leaves session SSE unread until the turn is committed, then verifies both the canonical text and
+every streamed fragment, the final `end_turn`, and the unchanged bridge generation. Unit tests
+also cover large ingress/publication backlogs, FIFO completion delivery behind notifications,
+round-robin progress while another session is busy, early creation replay and active replay
+beyond the former queue limits.
+
+Queues use available process memory. If producers permanently outpace consumers, retained memory
+will grow until consumption, disconnection or lifecycle cleanup releases it; attyd does not impose
+an arbitrary truncation threshold.
+
+
+## No application-imposed resource quotas
+
+attyd does not reject, truncate or evict valid content based on fixed message sizes, queue counts,
+concurrency counts, replay/cache sizes, attachment sizes, file sizes, search result counts or prompt
+history lengths. This applies through stdio NDJSON, WebSocket frames, HTTP bodies, ACP/MCP
+registration, canonical state, subscriber delivery and browser projections. Error details are
+forwarded completely. Queries and observation handshakes wait for completion, cancellation or
+connection closure; retryable loads have no fixed retry count. Exact idempotency results remain
+available for the session incarnation rather than falling back to a probabilistic filter.
+
+Protocol field types, valid encoding, reference consistency, filesystem confinement, negotiated
+capabilities, per-session operation ordering and explicit cancellation remain enforced. Agent-owned
+`outputByteLimit`, file line ranges, elicitation schema constraints and terminal stop reasons retain
+their meaning. Without an explicit `outputByteLimit`, terminal output is retained in full.
+Lifecycle cleanup still releases retired resources, and shutdown/process cleanup has a grace period.
+Search debouncing and the large-diff approximation select processing strategies without discarding
+source content or search matches.
+
+Regression coverage includes a 9 MB stdio update through a slow observer and committed history,
+a 65 MiB WebSocket frame, a 6 MiB HTTP prompt with 65 blocks and delayed admission, more than
+1 MB of terminal output without an explicit limit, and more than eight queued browser prompts.

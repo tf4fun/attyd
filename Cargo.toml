@@ -14,6 +14,7 @@ dev = []
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "754d5aa1ce2cfa54ba2c2a6d3edc7e7b6bce28eb", features = ["unstable"] }
 agent-client-protocol-http = { git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "754d5aa1ce2cfa54ba2c2a6d3edc7e7b6bce28eb", features = ["client"] }
 anyhow = "1.0"
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["tokio-rustls-webpki-roots"] }
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }

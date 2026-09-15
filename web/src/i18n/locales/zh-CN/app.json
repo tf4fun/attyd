@@ -9,8 +9,7 @@
   "agentThread": "Agent 会话",
   "queue": {
     "sessionChanged": "ACP 会话已改变，一条排队消息已被丢弃。",
-    "sendFailed": "未能向 Agent 发送排队消息。",
-    "limit": "每个 ACP 轮次最多可排队 {{count}} 条消息。"
+    "sendFailed": "未能向 Agent 发送排队消息。"
   },
   "backProject": "返回项目",
   "backProjects": "返回项目列表",

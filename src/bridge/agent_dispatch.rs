@@ -366,7 +366,7 @@ async fn permission(
     context: AgentContext,
     turn: Option<ExecutionTurn>,
 ) -> Result<(), Error> {
-    ensure_relay_size(&request, "permission request")?;
+    relay_bytes(&request)?;
     let session_id = request.session_id.0.to_string();
     let owner = context.require_owner(&*context.state.lock().await, &session_id)?;
     let permission_id = interaction_allocation(&context)?;
@@ -385,9 +385,7 @@ async fn permission(
             &request,
         )
         .map_err(semantic_error)?;
-        if state.sessions.permission_owners.len() >= MAX_PENDING_INTERACTIONS {
-            false
-        } else {
+        {
             if state
                 .sessions
                 .resources(&session_id, owner.incarnation)
@@ -510,7 +508,7 @@ async fn elicitation(
     context: AgentContext,
     turn: Option<ExecutionTurn>,
 ) -> Result<(), Error> {
-    ensure_relay_size(&request, "elicitation request")?;
+    relay_bytes(&request)?;
     let request_value = validate_elicitation_request(&request)
         .map_err(|error| Error::invalid_params().data(error))?;
     let elicitation_id = interaction_allocation(&context)?;
@@ -530,11 +528,9 @@ async fn elicitation(
             .as_deref()
             .map(|id| context.require_owner(&state, id))
             .transpose()?;
-        if pending_elicitation_count(&state) >= MAX_PENDING_INTERACTIONS {
-            (false, owner)
-        } else {
+        {
             if let Some(url_elicitation_id) = &url_elicitation_id {
-                if url_elicitation_id.is_empty() || url_elicitation_id.len() > 1_024 {
+                if url_elicitation_id.is_empty() {
                     return Err(Error::invalid_params()
                         .data("Agent returned an invalid URL elicitation ID"));
                 }
@@ -543,13 +539,6 @@ async fn elicitation(
                 {
                     return Err(Error::invalid_params().data(format!(
                         "URL elicitation ID is already outstanding: {url_elicitation_id}"
-                    )));
-                }
-                if state.sessions.url_owners.len() + pending_elicitation_count(&state)
-                    >= MAX_URL_ELICITATION_IDS
-                {
-                    return Err(Error::invalid_request().data(format!(
-                        "Agent exceeded {MAX_URL_ELICITATION_IDS} outstanding URL elicitations"
                     )));
                 }
             }
@@ -622,7 +611,7 @@ async fn complete_elicitation(
     context: &AgentContext,
     _turn: Option<ExecutionTurn>,
 ) -> Result<(), Error> {
-    ensure_relay_size(&notification, "elicitation completion")?;
+    relay_bytes(&notification)?;
     let elicitation_id = notification.elicitation_id.0.to_string();
     let mut state = context.state.lock().await;
     let registration = context.url_registration.as_ref().ok_or_else(|| {
@@ -965,10 +954,10 @@ mod tests {
             } else {
                 "elicitation/create"
             };
-            let mut inbound = InboundRequests::new(1);
+            let mut inbound = InboundRequests::new();
             let id = agent_client_protocol::schema::v1::RequestId::from("reused-id".to_owned());
             let lease = inbound
-                .register(id.clone(), method, &route, context.ingress.clone(), 0)
+                .register(id.clone(), method, &route, context.ingress.clone())
                 .unwrap();
             let old_cancel = inbound.capture_cancel(&id).unwrap();
 
@@ -1066,7 +1055,7 @@ mod tests {
             assert!(inbound.finish(&id, "old"));
             route.dispatch_owner.attempt_id = Some("new".to_owned());
             let _new_lease = inbound
-                .register(id.clone(), method, &route, context.ingress.clone(), 0)
+                .register(id.clone(), method, &route, context.ingress.clone())
                 .unwrap();
             let (mut permission, mut elicitation) =
                 pending(&context, kind, owner.as_ref(), "new").await;
@@ -1191,7 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn responder_transfer_starts_work_only_after_acceptance_and_reports_failed_delivery() {
         let (context, mut scheduling, _events) = context();
-        let mut inbound = InboundRequests::new(3);
+        let mut inbound = InboundRequests::new();
         let (incoming_tx, mut received) = mpsc::channel(3);
         let (outgoing, mut peer_responses) = futures::channel::mpsc::channel::<String>(8);
         let (mut peer_requests, incoming) =
@@ -1232,7 +1221,6 @@ mod tests {
                         request.method(),
                         &route,
                         context.ingress.clone(),
-                        serialized_value_len(request.params()),
                     )
                     .unwrap();
                 typed_request::<RequestPermissionRequest>(

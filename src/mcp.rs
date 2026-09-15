@@ -6,21 +6,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{Agent, ConnectionTo, Error, RequestCancellation};
 use serde_json::{Map, Value, json, value::to_raw_value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::event_queue::EventSender;
 use crate::mcp_config::AcpMcpProvider;
-
-const MAX_CONNECTIONS: usize = 16;
-const MAX_PENDING_REQUESTS: usize = 128;
-const MAX_MESSAGE_BYTES: usize = 3_000_000;
-const MAX_INPUT_BYTES: usize = 5_000_000;
 
 type PendingResult = Result<Value, Error>;
 
@@ -47,7 +42,6 @@ struct McpConnection {
     closed: AtomicBool,
     announced: AtomicBool,
     kill: Mutex<Option<oneshot::Sender<()>>>,
-    callbacks: Arc<Semaphore>,
     cancelled: CancellationToken,
 }
 
@@ -82,12 +76,6 @@ impl McpManager {
         let _connect_guard = self.connect_lock.lock().await;
         if cancellation.is_cancelled() {
             return Err(Error::request_cancelled());
-        }
-        if self.connections.lock().await.len() >= MAX_CONNECTIONS {
-            return Err(Error::new(
-                -32000,
-                format!("at most {MAX_CONNECTIONS} MCP connections are allowed"),
-            ));
         }
         let server_id = request.server_id.0.to_string();
         let provider = self.providers.get(&server_id).cloned().ok_or_else(|| {
@@ -154,7 +142,6 @@ impl McpManager {
             closed: AtomicBool::new(false),
             announced: AtomicBool::new(false),
             kill: Mutex::new(Some(kill_tx)),
-            callbacks: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
             cancelled: CancellationToken::new(),
         });
         self.connections
@@ -211,14 +198,6 @@ impl McpManager {
             let mut pending = connection.pending.lock().await;
             if connection.closed.load(Ordering::Acquire) {
                 return Err(unknown_connection(&connection.id));
-            }
-            if pending.len() >= MAX_PENDING_REQUESTS {
-                return Err(Error::new(
-                    -32000,
-                    format!(
-                        "at most {MAX_PENDING_REQUESTS} MCP requests may be pending on one connection"
-                    ),
-                ));
             }
             pending.insert(
                 id.clone(),
@@ -349,9 +328,9 @@ impl McpManager {
             let mut line = Vec::new();
             loop {
                 line.clear();
-                let count = match read_bounded_line(&mut reader, &mut line, MAX_INPUT_BYTES).await {
+                match reader.read_until(b'\n', &mut line).await {
                     Ok(0) => break,
-                    Ok(count) => count,
+                    Ok(_) => {}
                     Err(error) => {
                         manager
                             .terminate(
@@ -362,16 +341,6 @@ impl McpManager {
                         break;
                     }
                 };
-                if count > MAX_MESSAGE_BYTES {
-                    manager
-                        .terminate(
-                            &connection,
-                            Error::invalid_request()
-                                .data("MCP server emitted an oversized message"),
-                        )
-                        .await;
-                    break;
-                }
                 if line.ends_with(b"\n") {
                     line.pop();
                     if line.ends_with(b"\r") {
@@ -388,18 +357,10 @@ impl McpManager {
                 if value.get("method").and_then(Value::as_str).is_some()
                     && value.get("id").is_some()
                 {
-                    let Ok(permit) = connection.callbacks.clone().try_acquire_owned() else {
-                        let _ = write_json(&connection, &json!({
-                            "jsonrpc": "2.0", "id": value["id"],
-                            "error": {"code": -32000, "message": "Too many pending MCP server requests"},
-                        })).await;
-                        continue;
-                    };
                     let manager = manager.clone();
                     let connection = connection.clone();
                     let acp = acp.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
                         // A callback may issue another request on this same MCP connection.
                         // Keep the reader free to deliver that request's response.
                         tokio::select! {
@@ -722,44 +683,9 @@ fn exit_status_label(status: std::process::ExitStatus) -> String {
     "unknown".to_string()
 }
 
-async fn read_bounded_line<R>(
-    reader: &mut R,
-    line: &mut Vec<u8>,
-    maximum: usize,
-) -> std::io::Result<usize>
-where
-    R: AsyncBufRead + Unpin,
-{
-    line.clear();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(line.len());
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let consumed = newline.map_or(available.len(), |index| index + 1);
-        let content_bytes = newline.unwrap_or(available.len());
-        if line.len().saturating_add(content_bytes) > maximum {
-            reader.consume(consumed);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("MCP server output exceeds {maximum} buffered bytes"),
-            ));
-        }
-        line.extend_from_slice(&available[..consumed]);
-        reader.consume(consumed);
-        if newline.is_some() {
-            return Ok(line.len());
-        }
-    }
-}
-
 async fn write_json(connection: &McpConnection, value: &Value) -> Result<(), Error> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    if bytes.len() > MAX_MESSAGE_BYTES {
-        return Err(Error::invalid_params().data("MCP message exceeds the size limit"));
-    }
     let mut stdin = connection.stdin.lock().await;
     stdin
         .write_all(&bytes)
@@ -768,14 +694,9 @@ async fn write_json(connection: &McpConnection, value: &Value) -> Result<(), Err
     stdin.flush().await.map_err(Error::into_internal_error)
 }
 
-fn validate_message(method: &str, params: Option<&Map<String, Value>>) -> Result<(), Error> {
-    if method.is_empty() || method.len() > 1_024 {
-        return Err(
-            Error::invalid_params().data("MCP method must contain between 1 and 1024 characters")
-        );
-    }
-    if serde_json::to_vec(&params).map_err(Error::from)?.len() > MAX_MESSAGE_BYTES {
-        return Err(Error::invalid_params().data("MCP params exceed the size limit"));
+fn validate_message(method: &str, _params: Option<&Map<String, Value>>) -> Result<(), Error> {
+    if method.is_empty() {
+        return Err(Error::invalid_params().data("MCP method must not be empty"));
     }
     Ok(())
 }
@@ -791,16 +712,20 @@ fn parse_params(value: Option<&Value>) -> Result<Option<Map<String, Value>>, Err
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FORMER_MESSAGE_BYTES: usize = 3_000_000;
 
     #[test]
-    fn validates_method_params_and_message_size() {
+    fn validates_method_params_without_message_size_limits() {
         assert!(validate_message("tools/list", None).is_ok());
         assert!(validate_message("", None).is_err());
-        assert!(validate_message(&"x".repeat(1_025), None).is_err());
+        assert!(validate_message(&"x".repeat(1_025), None).is_ok());
 
         let mut oversized = Map::new();
-        oversized.insert("padding".to_string(), json!("x".repeat(MAX_MESSAGE_BYTES)));
-        assert!(validate_message("tools/call", Some(&oversized)).is_err());
+        oversized.insert(
+            "padding".to_string(),
+            json!("x".repeat(FORMER_MESSAGE_BYTES)),
+        );
+        assert!(validate_message("tools/call", Some(&oversized)).is_ok());
 
         let object = json!({ "name": "fixture" });
         assert_eq!(
@@ -829,30 +754,5 @@ mod tests {
         );
         manager.close_all().await;
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn bounds_incomplete_mcp_output_before_allocating_an_unbounded_line() {
-        let mut reader = BufReader::new(&b"12345\nnext\n"[..]);
-        let mut line = Vec::new();
-        assert_eq!(
-            read_bounded_line(&mut reader, &mut line, 5).await.unwrap(),
-            6
-        );
-        assert_eq!(line, b"12345\n");
-        assert_eq!(
-            read_bounded_line(&mut reader, &mut line, 5).await.unwrap(),
-            5
-        );
-        assert_eq!(line, b"next\n");
-
-        let mut oversized = BufReader::new(&b"123456"[..]);
-        assert!(
-            read_bounded_line(&mut oversized, &mut line, 5)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds 5 buffered bytes")
-        );
     }
 }

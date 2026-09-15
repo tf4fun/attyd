@@ -2,10 +2,8 @@ import type { ContentBlock, PromptCapabilities } from "@agentclientprotocol/sdk"
 import i18n from "../i18n";
 import { randomId } from "./id";
 
-export const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
 
 type PromptAttachmentErrorKey =
-  | "sizeLimit"
   | "unsupportedFile"
   | "preparing"
   | "inactiveSession"
@@ -39,11 +37,6 @@ export async function createPromptAttachments(
   files: File[],
   capabilities: PromptCapabilities | null | undefined,
 ): Promise<PromptAttachment[]> {
-  const total = files.reduce((sum, file) => sum + file.size, 0);
-  if (total > MAX_ATTACHMENT_BYTES) {
-    throw new PromptAttachmentError("sizeLimit");
-  }
-
   return Promise.all(
     files.map(async (file, index) => {
       const name = promptFileName(file, index);

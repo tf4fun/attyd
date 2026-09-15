@@ -4,7 +4,6 @@ import { timelineTurnStarts } from "./timeline-turns";
 
 const MAX_EXACT_DIFF_CELLS = 500_000;
 const CONTEXT_LINES = 3;
-const MAX_RENDERED_LINES = 800;
 
 export type ReviewLineKind = "context" | "added" | "removed" | "hunk";
 
@@ -130,29 +129,14 @@ export function buildReviewLines(
   } else if (oldLines.length * newLines.length <= MAX_EXACT_DIFF_CELLS) {
     lines = exactLineDiff(oldLines, newLines);
   } else {
-    lines = boundedLineDiff(oldLines, newLines);
+    lines = approximateLineDiff(oldLines, newLines);
     approximate = true;
   }
 
   const addedLines = lines.reduce((count, line) => count + (line.kind === "added" ? 1 : 0), 0);
   const removedLines = lines.reduce((count, line) => count + (line.kind === "removed" ? 1 : 0), 0);
   const compacted = compactContext(lines);
-  if (compacted.length <= MAX_RENDERED_LINES) {
-    return { lines: compacted, addedLines, removedLines, approximate, truncated: false };
-  }
-  const firstCount = Math.floor((MAX_RENDERED_LINES - 1) / 2);
-  const lastCount = MAX_RENDERED_LINES - firstCount - 1;
-  return {
-    lines: [
-      ...compacted.slice(0, firstCount),
-      { kind: "hunk", text: `… ${compacted.length - firstCount - lastCount} review rows omitted …` },
-      ...compacted.slice(-lastCount),
-    ],
-    addedLines,
-    removedLines,
-    approximate,
-    truncated: true,
-  };
+  return { lines: compacted, addedLines, removedLines, approximate, truncated: false };
 }
 
 function exactLineDiff(oldLines: string[], newLines: string[]): ReviewLine[] {
@@ -199,7 +183,7 @@ function exactLineDiff(oldLines: string[], newLines: string[]): ReviewLine[] {
   return lines;
 }
 
-function boundedLineDiff(oldLines: string[], newLines: string[]): ReviewLine[] {
+function approximateLineDiff(oldLines: string[], newLines: string[]): ReviewLine[] {
   let prefix = 0;
   while (
     prefix < oldLines.length &&

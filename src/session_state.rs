@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -10,9 +10,6 @@ use crate::runtime_state::{
     SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
     fold_active_turn_update,
 };
-
-const RECENT_CONSUMPTION_LIMIT: usize = 64;
-const CONSUMED_INTENT_FILTER_WORDS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -71,9 +68,7 @@ pub(crate) struct SessionState {
     #[serde(skip)]
     active_payload_digest: Option<[u8; 32]>,
     #[serde(skip)]
-    recent_consumptions: VecDeque<LastConsumption>,
-    #[serde(skip)]
-    consumed_intents: ConsumedIntentFilter,
+    consumed_intents: HashMap<String, LastConsumption>,
     #[serde(skip)]
     pub(crate) load_attempt: Option<String>,
     #[serde(skip)]
@@ -85,50 +80,9 @@ pub(crate) struct SessionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LastConsumption {
     operation_id: String,
-    client_intent_id: String,
     payload_digest: [u8; 32],
     consumed_revision: String,
     successor_revision: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConsumedIntentFilter {
-    words: Vec<u64>,
-}
-
-impl Default for ConsumedIntentFilter {
-    fn default() -> Self {
-        Self {
-            words: vec![0; CONSUMED_INTENT_FILTER_WORDS],
-        }
-    }
-}
-
-impl ConsumedIntentFilter {
-    fn indexes(client_intent_id: &str) -> [usize; 4] {
-        let digest = Sha256::digest(client_intent_id.as_bytes());
-        std::array::from_fn(|index| {
-            let offset = index * 4;
-            let value = u32::from_le_bytes(
-                digest[offset..offset + 4]
-                    .try_into()
-                    .expect("SHA-256 contains four 32-bit indexes"),
-            );
-            value as usize % (CONSUMED_INTENT_FILTER_WORDS * u64::BITS as usize)
-        })
-    }
-
-    fn contains(&self, client_intent_id: &str) -> bool {
-        Self::indexes(client_intent_id).into_iter().all(|index| {
-            self.words[index / u64::BITS as usize] & (1_u64 << (index % u64::BITS as usize)) != 0
-        })
-    }
-
-    fn insert(&mut self, client_intent_id: &str) {
-        for index in Self::indexes(client_intent_id) {
-            self.words[index / u64::BITS as usize] |= 1_u64 << (index % u64::BITS as usize);
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,8 +159,7 @@ impl SessionState {
             history_notice: None,
             operation: None,
             active_payload_digest: None,
-            recent_consumptions: VecDeque::new(),
-            consumed_intents: ConsumedIntentFilter::default(),
+            consumed_intents: HashMap::new(),
             load_attempt: None,
             load_origin: None,
             active_overlay_bytes: 0,
@@ -323,11 +276,7 @@ impl SessionState {
                 Err(MirrorError::IdempotencyConflict)
             };
         }
-        if let Some(last) = self
-            .recent_consumptions
-            .iter()
-            .find(|last| last.client_intent_id == client_intent_id)
-        {
+        if let Some(last) = self.consumed_intents.get(client_intent_id) {
             return if last.payload_digest == digest
                 && (last.consumed_revision == expected_history_revision
                     || last.successor_revision == expected_history_revision)
@@ -338,11 +287,6 @@ impl SessionState {
             } else {
                 Err(MirrorError::IdempotencyConflict)
             };
-        }
-        if self.consumed_intents.contains(client_intent_id) {
-            // Exact response metadata is bounded, but this filter has no false negatives.
-            // An old intent must never dispatch again after its exact metadata is evicted.
-            return Err(MirrorError::IdempotencyConflict);
         }
         self.can_begin(SessionAdmission::Prompt)?;
         if self.history_revision.as_deref() != Some(expected_history_revision) {
@@ -527,19 +471,17 @@ impl SessionState {
         if let Some(turn) = self.active_turn.take()
             && let Some(consumed_revision) = self.history_revision.as_ref()
         {
-            self.consumed_intents.insert(&turn.client_intent_id);
-            self.recent_consumptions.push_back(LastConsumption {
-                operation_id: turn.operation_id,
-                client_intent_id: turn.client_intent_id,
-                payload_digest: self
-                    .active_payload_digest
-                    .expect("history commit was validated"),
-                consumed_revision: consumed_revision.clone(),
-                successor_revision: revision.clone(),
-            });
-            while self.recent_consumptions.len() > RECENT_CONSUMPTION_LIMIT {
-                self.recent_consumptions.pop_front();
-            }
+            self.consumed_intents.insert(
+                turn.client_intent_id,
+                LastConsumption {
+                    operation_id: turn.operation_id,
+                    payload_digest: self
+                        .active_payload_digest
+                        .expect("history commit was validated"),
+                    consumed_revision: consumed_revision.clone(),
+                    successor_revision: revision.clone(),
+                },
+            );
         }
         self.history_revision = Some(revision);
         self.active_overlay_bytes = 0;
@@ -554,11 +496,6 @@ impl SessionState {
 
     fn advance_revision(&mut self) {
         self.view_revision = self.view_revision.wrapping_add(1).max(1);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn forget_recent_consumptions(&mut self) {
-        self.recent_consumptions.clear();
     }
 }
 
@@ -893,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_intent_cannot_dispatch_after_exact_metadata_is_forgotten() {
+    fn completed_intents_remain_exactly_idempotent_after_many_turns() {
         let mut session = ready();
         start(&mut session);
         session
@@ -901,7 +838,23 @@ mod tests {
             .unwrap();
         session.validate_history_commit().unwrap();
         session.history_committed("history-2".into(), 1, false);
-        session.forget_recent_consumptions();
+        for index in 2..200 {
+            let operation = format!("turn-{index}");
+            let current = format!("history-{index}");
+            session
+                .admit_turn(
+                    operation.clone(),
+                    &current,
+                    &format!("intent-{index}"),
+                    prompt("hello"),
+                )
+                .unwrap();
+            session
+                .complete_turn(&operation, json!({ "stopReason": "end_turn" }))
+                .unwrap();
+            session.validate_history_commit().unwrap();
+            session.history_committed(format!("history-{}", index + 1), 1, false);
+        }
         assert_eq!(
             session.admit_turn(
                 "another-operation".into(),
@@ -909,7 +862,9 @@ mod tests {
                 "intent-1",
                 prompt("hello")
             ),
-            Err(MirrorError::IdempotencyConflict),
+            Ok(TurnAdmission::Duplicate {
+                operation_id: "turn-1".into()
+            }),
         );
         assert_eq!(session.phase, MirrorPhase::Ready);
         assert!(session.active_turn.is_none());

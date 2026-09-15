@@ -9,15 +9,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use walkdir::WalkDir;
 
-const MAX_FILE_CONTENT_BYTES: usize = 4_000_000;
-const MAX_FILE_SCAN_BYTES: usize = 128_000_000;
-const MAX_FILE_PATH_LENGTH: usize = 16_384;
-const MAX_CONTEXT_BYTES: u64 = 3 * 1024 * 1024;
-const MAX_CONTEXT_QUERY_LENGTH: usize = 256;
-const MAX_CONTEXT_RESULTS: usize = 24;
-const MAX_CONTEXT_SCAN_ENTRIES: usize = 50_000;
-const MAX_CONTEXT_DEPTH: usize = 32;
-
 #[derive(Clone)]
 pub struct WorkspaceFileSystem {
     roots: Arc<Vec<WorkspaceRoot>>,
@@ -103,22 +94,9 @@ impl WorkspaceFileSystem {
             .map(ReadTextFileResponse::new);
         }
 
-        if metadata.len() > MAX_FILE_CONTENT_BYTES as u64 {
-            return Err(Error::invalid_request().data(format!(
-                "ACP file read exceeds {MAX_FILE_CONTENT_BYTES} bytes"
-            )));
-        }
-        let file = tokio::fs::File::open(&path).await.map_err(fs_error)?;
+        let mut file = tokio::fs::File::open(&path).await.map_err(fs_error)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_FILE_CONTENT_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(fs_error)?;
-        if bytes.len() > MAX_FILE_CONTENT_BYTES {
-            return Err(Error::invalid_request().data(format!(
-                "ACP file read exceeds {MAX_FILE_CONTENT_BYTES} bytes"
-            )));
-        }
+        file.read_to_end(&mut bytes).await.map_err(fs_error)?;
         let content = String::from_utf8(bytes)
             .map_err(|_| Error::invalid_request().data("ACP file is not valid UTF-8 text"))?;
         Ok(ReadTextFileResponse::new(content))
@@ -148,11 +126,6 @@ impl WorkspaceFileSystem {
     ) -> Result<WriteTextFileResponse, Error> {
         if self.read_only {
             return Err(Error::invalid_request().data("attyd is running in read-only mode"));
-        }
-        if request.content.len() > MAX_FILE_CONTENT_BYTES {
-            return Err(Error::invalid_request().data(format!(
-                "ACP file write exceeds {MAX_FILE_CONTENT_BYTES} bytes"
-            )));
         }
         ensure_not_cancelled(cancellation)?;
         let lexical = self.checked_lexical_path(&request.path)?;
@@ -226,10 +199,9 @@ impl WorkspaceFileSystem {
     }
 
     pub async fn search_context(&self, query: &str) -> Result<Vec<Value>, Error> {
-        if query.len() > MAX_CONTEXT_QUERY_LENGTH || query.contains('\0') {
-            return Err(Error::invalid_params().data(format!(
-                "context search query must be at most {MAX_CONTEXT_QUERY_LENGTH} characters without NUL bytes"
-            )));
+        if query.contains('\0') {
+            return Err(Error::invalid_params()
+                .data(format!("context search query must contain no NUL bytes")));
         }
         let roots = self.roots.clone();
         let query = query.trim().to_lowercase();
@@ -242,7 +214,6 @@ impl WorkspaceFileSystem {
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>();
             let mut candidates = Vec::new();
-            let mut scanned = 0_usize;
             for root in roots.iter() {
                 let root_name = root
                     .canonical
@@ -251,7 +222,6 @@ impl WorkspaceFileSystem {
                     .unwrap_or_else(|| root.canonical.to_str().unwrap_or("workspace"))
                     .to_string();
                 let walker = WalkDir::new(&root.canonical)
-                    .max_depth(MAX_CONTEXT_DEPTH)
                     .follow_links(false)
                     .into_iter()
                     .filter_entry(|entry| {
@@ -262,10 +232,6 @@ impl WorkspaceFileSystem {
                             )
                     });
                 for entry in walker.filter_map(Result::ok) {
-                    scanned += 1;
-                    if scanned > MAX_CONTEXT_SCAN_ENTRIES {
-                        break;
-                    }
                     if !entry.file_type().is_file() || !is_context_text_path(entry.path()) {
                         continue;
                     }
@@ -281,9 +247,6 @@ impl WorkspaceFileSystem {
                     let Ok(metadata) = entry.metadata() else {
                         continue;
                     };
-                    if metadata.len() > MAX_CONTEXT_BYTES {
-                        continue;
-                    }
                     candidates.push((
                         score,
                         relative,
@@ -291,9 +254,6 @@ impl WorkspaceFileSystem {
                         entry.path().to_path_buf(),
                         metadata.len(),
                     ));
-                }
-                if scanned > MAX_CONTEXT_SCAN_ENTRIES {
-                    break;
                 }
             }
             candidates.sort_by(|left, right| {
@@ -304,7 +264,6 @@ impl WorkspaceFileSystem {
             });
             Ok(candidates
                 .into_iter()
-                .take(MAX_CONTEXT_RESULTS)
                 .map(|(_, relative_path, root_name, path, size)| {
                     json!({
                         "path": path,
@@ -328,18 +287,15 @@ impl WorkspaceFileSystem {
             );
         }
         let metadata = tokio::fs::metadata(&target).await.map_err(fs_error)?;
-        if !metadata.is_file() || metadata.len() > MAX_CONTEXT_BYTES {
-            return Err(Error::invalid_request().data(format!(
-                "workspace context exceeds {MAX_CONTEXT_BYTES} bytes"
-            )));
+        if !metadata.is_file() {
+            return Err(
+                Error::invalid_request().data(format!("workspace context must be a regular file"))
+            );
         }
-        let file = tokio::fs::File::open(&target).await.map_err(fs_error)?;
+        let mut file = tokio::fs::File::open(&target).await.map_err(fs_error)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_CONTEXT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(fs_error)?;
-        if bytes.len() as u64 > MAX_CONTEXT_BYTES || bytes.contains(&0) {
+        file.read_to_end(&mut bytes).await.map_err(fs_error)?;
+        if bytes.contains(&0) {
             return Err(Error::invalid_request().data("workspace context is not a text file"));
         }
         let text = String::from_utf8(bytes)
@@ -378,13 +334,9 @@ impl WorkspaceFileSystem {
 
     fn checked_lexical_path(&self, path: &Path) -> Result<PathBuf, Error> {
         let path_text = path.to_string_lossy();
-        if path_text.is_empty()
-            || path_text.len() > MAX_FILE_PATH_LENGTH
-            || path_text.contains('\0')
-            || !path.is_absolute()
-        {
+        if path_text.is_empty() || path_text.contains('\0') || !path.is_absolute() {
             return Err(Error::invalid_params().data(format!(
-                "ACP filesystem path must be absolute, non-empty, and at most {MAX_FILE_PATH_LENGTH} bytes"
+                "ACP filesystem path must be absolute, non-empty, and contain no NUL bytes"
             )));
         }
         let lexical = normalize(path);
@@ -427,7 +379,6 @@ async fn read_text_range(
     let mut output = Vec::new();
     let mut current_line = 1_u32;
     let mut selected = 0_u32;
-    let mut scanned = 0_usize;
 
     loop {
         // Consume bounded chunks, including when a skipped line has no newline.
@@ -437,18 +388,7 @@ async fn read_text_range(
         }
         let end = chunk.iter().position(|byte| *byte == b'\n');
         let count = end.map_or(chunk.len(), |index| index + 1);
-        scanned = scanned.saturating_add(count);
-        if scanned > MAX_FILE_SCAN_BYTES {
-            return Err(Error::invalid_request().data(format!(
-                "ACP file range scan exceeds {MAX_FILE_SCAN_BYTES} bytes"
-            )));
-        }
         if current_line >= start_line {
-            if count > MAX_FILE_CONTENT_BYTES - output.len() {
-                return Err(Error::invalid_request().data(format!(
-                    "ACP file read exceeds {MAX_FILE_CONTENT_BYTES} bytes"
-                )));
-            }
             output.extend_from_slice(&chunk[..count]);
             if end.is_some() {
                 selected += 1;
@@ -669,6 +609,9 @@ fn context_mime_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FORMER_FILE_CONTENT_BYTES: usize = 4_000_000;
+    const FORMER_CONTEXT_BYTES: u64 = 3 * 1024 * 1024;
+    const FORMER_CONTEXT_QUERY_LENGTH: usize = 256;
 
     fn request_error_data(error: Error) -> String {
         error
@@ -726,34 +669,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_reads_bound_both_returned_content_and_skipped_unterminated_lines() {
-        // An unending line must hit a budget without buffering the whole line.
-        for (start, expected) in [(1, "file read exceeds"), (2, "range scan exceeds")] {
-            let reader = BufReader::new(tokio::io::repeat(b'x'));
-            let error = read_text_range(reader, start, Some(1)).await.unwrap_err();
-            assert!(request_error_data(error).contains(expected));
-        }
-
+    async fn range_reads_preserve_large_lines_and_obey_the_requested_line_range() {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("long-line.txt");
-        let content = "x".repeat(MAX_FILE_CONTENT_BYTES);
-        std::fs::write(&file, &content).unwrap();
+        let content = "x".repeat(FORMER_FILE_CONTENT_BYTES + 1);
+        std::fs::write(&file, format!("{content}\nlast")).unwrap();
         let fs = WorkspaceFileSystem::new(directory.path(), false, &[]).unwrap();
         assert_eq!(
             fs.read(ReadTextFileRequest::new("session", &file).line(1).limit(1))
                 .await
                 .unwrap()
                 .content,
-            content
+            format!("{content}\n")
         );
-        std::fs::write(&file, format!("{content}x")).unwrap();
-        assert!(
-            request_error_data(
-                fs.read(ReadTextFileRequest::new("session", &file).line(1).limit(1))
-                    .await
-                    .unwrap_err()
-            )
-            .contains("file read exceeds")
+        assert_eq!(
+            fs.read(ReadTextFileRequest::new("session", &file).line(2).limit(1))
+                .await
+                .unwrap()
+                .content,
+            "last"
         );
     }
 
@@ -827,7 +761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_inside_the_workspace_and_bounds_content_before_mutation() {
+    async fn reads_and_writes_complete_large_files_inside_the_workspace() {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("bounded.txt");
         std::fs::write(&file, "stable").unwrap();
@@ -838,26 +772,25 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "updated");
 
-        let oversized = "x".repeat(MAX_FILE_CONTENT_BYTES + 1);
-        assert!(
-            request_error_data(
-                fs.write(WriteTextFileRequest::new("session", &file, oversized))
-                    .await
-                    .unwrap_err()
-            )
-            .contains("write exceeds")
-        );
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "updated");
+        let oversized = "x".repeat(FORMER_FILE_CONTENT_BYTES + 1);
+        fs.write(WriteTextFileRequest::new(
+            "session",
+            &file,
+            oversized.clone(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), oversized);
 
         std::fs::write(
             &file,
-            format!("head\n{}", "x".repeat(MAX_FILE_CONTENT_BYTES + 1)),
+            format!("head\n{}", "x".repeat(FORMER_FILE_CONTENT_BYTES + 1)),
         )
         .unwrap();
         assert!(
             fs.read(ReadTextFileRequest::new("session", &file))
                 .await
-                .is_err()
+                .is_ok()
         );
         let response = fs
             .read(ReadTextFileRequest::new("session", &file).line(1).limit(1))
@@ -1015,25 +948,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unsafe_binary_and_oversized_context() {
+    async fn rejects_unsafe_context_and_preserves_large_valid_context() {
         let directory = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let binary = directory.path().join("binary.png");
         let large = directory.path().join("large.txt");
         let secret = outside.path().join("secret.txt");
         std::fs::write(&binary, [0, 1, 2]).unwrap();
-        std::fs::write(&large, "x".repeat(MAX_CONTEXT_BYTES as usize + 1)).unwrap();
+        std::fs::write(&large, "x".repeat(FORMER_CONTEXT_BYTES as usize + 1)).unwrap();
         std::fs::write(&secret, "secret").unwrap();
         let fs = WorkspaceFileSystem::new(directory.path(), false, &[]).unwrap();
 
         assert!(fs.read_context(&binary).await.is_err());
-        assert!(fs.read_context(&large).await.is_err());
+        assert!(fs.read_context(&large).await.is_ok());
         assert!(fs.read_context(&secret).await.is_err());
-        assert!(fs.search_context("large").await.unwrap().is_empty());
+        assert!(fs.search_context("large").await.unwrap().len() == 1);
         assert!(
-            fs.search_context(&"x".repeat(MAX_CONTEXT_QUERY_LENGTH + 1))
+            fs.search_context(&"x".repeat(FORMER_CONTEXT_QUERY_LENGTH + 1))
                 .await
-                .is_err()
+                .is_ok()
         );
     }
 

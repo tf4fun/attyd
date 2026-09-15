@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  MAX_THREAD_SEARCH_MATCHES,
-  MAX_THREAD_SEARCH_QUERY_CHARS,
   compileThreadSearch,
 } from "../web/src/lib/thread-search";
 
@@ -32,14 +30,15 @@ describe("Agent thread search", () => {
       .toEqual([]);
   });
 
-  it("bounds queries and retained match counts", () => {
-    const tooLong = compileThreadSearch("x".repeat(MAX_THREAD_SEARCH_QUERY_CHARS + 1), defaults);
-    expect(tooLong.error).toContain(String(MAX_THREAD_SEARCH_QUERY_CHARS));
+  it("searches long queries and preserves all matches", () => {
+    const tooLong = compileThreadSearch("x".repeat(256 + 1), defaults);
+    expect(tooLong.error).toBeUndefined();
+    expect(tooLong.find("x".repeat(257)).matches).toEqual([{ start: 0, end: 257 }]);
 
     const bounded = compileThreadSearch("x", defaults).find(
-      "x".repeat(MAX_THREAD_SEARCH_MATCHES + 2),
+      "x".repeat(10_000 + 2),
     );
-    expect(bounded.matches).toHaveLength(MAX_THREAD_SEARCH_MATCHES);
-    expect(bounded.limited).toBe(true);
+    expect(bounded.matches).toHaveLength(10_002);
+    expect(bounded.limited).toBe(false);
   });
 });

@@ -816,7 +816,7 @@ describe("ACP UI state", () => {
     });
   });
 
-  it("tracks ephemeral MCP connections and bounds raw transport activity", () => {
+  it("tracks ephemeral MCP connections and preserves raw transport activity", () => {
     let state = appReducer(initialState, event({
       type: "acp/mcp_connection",
       action: "connected",
@@ -839,8 +839,8 @@ describe("ACP UI state", () => {
       connectionId: "connection-1",
       name: "Tools",
     }]);
-    expect(state.mcpActivity).toHaveLength(100);
-    expect(state.mcpActivity[0].method).toBe("fixture/40");
+    expect(state.mcpActivity).toHaveLength(140);
+    expect(state.mcpActivity[0].method).toBe("fixture/0");
 
     state = appReducer(state, event({
       type: "acp/mcp_connection",
@@ -852,7 +852,7 @@ describe("ACP UI state", () => {
     expect(state.mcpConnections).toEqual([]);
   });
 
-  it("isolates, replaces, bounds, and releases terminal snapshots", () => {
+  it("isolates, replaces, preserves, and releases terminal snapshots", () => {
     let state = {
       ...initialState,
       session: { sessionId: "current" },
@@ -923,8 +923,8 @@ describe("ACP UI state", () => {
         },
       }));
     }
-    expect(state.terminalSnapshots).toHaveLength(64);
-    expect(state.terminalSnapshots[0].terminalId).toBe("terminal-7");
+    expect(state.terminalSnapshots).toHaveLength(71);
+    expect(state.terminalSnapshots[0].terminalId).toBe("terminal-0");
 
     state = appReducer(state, { type: "socket/closed" });
     expect(state.terminalSnapshots.every(({ released }) => released)).toBe(true);

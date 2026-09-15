@@ -5,8 +5,7 @@ use uuid::Uuid;
 
 use crate::history_cache::{HistoryCache, SessionKey};
 use crate::runtime_state::{
-    PendingInteraction, RuntimeEffect, RuntimeJournal, RuntimeLimits, SessionLifecycle,
-    SessionLiveState, UrlFlow,
+    PendingInteraction, RuntimeEffect, RuntimeJournal, SessionLifecycle, SessionLiveState, UrlFlow,
 };
 use crate::session_resources::{
     ElicitationResponder, PermissionResponder, SessionResourceOwner, SessionResources,
@@ -354,7 +353,7 @@ impl SessionRegistry {
         self.sessions.remove(session_id);
     }
 
-    pub(crate) fn new(epoch: impl Into<String>, limits: RuntimeLimits) -> Self {
+    pub(crate) fn new(epoch: impl Into<String>) -> Self {
         let epoch = epoch.into();
         Self {
             history: HistoryCache::new(epoch.clone()),
@@ -374,14 +373,14 @@ impl SessionRegistry {
             resolved_request_elicitations: VecDeque::new(),
             resolved_request_url_flows: VecDeque::new(),
             effects: VecDeque::new(),
-            journal: RuntimeJournal::new(limits),
+            journal: RuntimeJournal::new(),
         }
     }
 }
 
 impl Default for SessionRegistry {
     fn default() -> Self {
-        Self::new(Uuid::new_v4().to_string(), RuntimeLimits::default())
+        Self::new(Uuid::new_v4().to_string())
     }
 }
 
@@ -634,7 +633,7 @@ mod tests {
 
     #[test]
     fn same_incarnation_history_reset_keeps_all_non_cloneable_resources() {
-        let mut registry = SessionRegistry::new("epoch", RuntimeLimits::default());
+        let mut registry = SessionRegistry::new("epoch");
         registry.register_new("session", 1);
         let mut waiting = populate(&mut registry, "session", 1);
         registry.register_cold("session", 1);
@@ -666,7 +665,7 @@ mod tests {
 
     #[test]
     fn physical_removal_answers_waiters_and_responders_and_cancels_leases() {
-        let mut registry = SessionRegistry::new("epoch", RuntimeLimits::default());
+        let mut registry = SessionRegistry::new("epoch");
         registry.register_new("session", 1);
         let mut waiting = populate(&mut registry, "session", 1);
         registry.remove("session", 2);
@@ -688,7 +687,7 @@ mod tests {
 
     #[test]
     fn replacement_retires_old_resources_and_stale_cleanup_preserves_new_resources() {
-        let mut registry = SessionRegistry::new("epoch", RuntimeLimits::default());
+        let mut registry = SessionRegistry::new("epoch");
         registry.register_new("session", 1);
         let mut old = populate(&mut registry, "session", 1);
         let incarnation = registry
@@ -720,7 +719,7 @@ mod tests {
 
     #[test]
     fn failed_live_attachment_preserves_waiters_until_explicit_owner_removal() {
-        let mut registry = SessionRegistry::new("epoch", RuntimeLimits::default());
+        let mut registry = SessionRegistry::new("epoch");
         let incarnation = registry
             .start_attachment(
                 "epoch",
@@ -753,7 +752,7 @@ mod tests {
 
     #[test]
     fn registry_drop_answers_outstanding_work_instead_of_dropping_senders() {
-        let mut registry = SessionRegistry::new("epoch", RuntimeLimits::default());
+        let mut registry = SessionRegistry::new("epoch");
         registry.register_new("session", 1);
         let mut waiting = populate(&mut registry, "session", 1);
         drop(registry);

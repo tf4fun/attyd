@@ -70,14 +70,10 @@
     "nextHint": "下一个结果 · Enter",
     "close": "关闭对话搜索",
     "closeHint": "关闭搜索 · Escape",
-    "counter": "{{current}}/{{total}}",
-    "limit_one": "显示前 {{value}} 个结果",
-    "limit_other": "显示前 {{value}} 个结果",
-    "queryLimit": "搜索内容最多为 {{count, number}} 个字符"
+    "counter": "{{current}}/{{total}}"
   },
   "attachments": {
     "errors": {
-      "sizeLimit": "每条提示词的附件总大小不能超过 3 MB",
       "unsupportedFile": "Agent 无法接收 {{name}}",
       "preparing": "请等待附件准备完成后再发送",
       "inactiveSession": "请在 ACP 会话激活后再添加附件",

@@ -34,7 +34,7 @@ import type {
 } from "../../../../shared/bridge";
 import i18n, { useTranslation } from "../../i18n";
 import { randomId } from "../../lib/id";
-import { MAX_ATTACHMENT_BYTES, createPromptAttachments, PromptAttachmentError, promptAttachmentErrorMessage, type PromptAttachment } from "../../lib/prompt-attachments";
+import { createPromptAttachments, PromptAttachmentError, promptAttachmentErrorMessage, type PromptAttachment } from "../../lib/prompt-attachments";
 import { ContextUsage, type ContextUsageValue } from "./context-usage";
 
 export interface ComposerDraft {
@@ -130,7 +130,7 @@ export function PromptComposer({
   const commandMatches = useMemo(() => {
     if (commandMenuDismissed || !value.startsWith("/") || value.includes(" ")) return [];
     const query = value.slice(1).toLowerCase();
-    return commands.filter(({ name }) => name.toLowerCase().includes(query)).slice(0, 8);
+    return commands.filter(({ name }) => name.toLowerCase().includes(query));
   }, [commandMenuDismissed, commands, value]);
   const contextMention = useMemo(() => {
     if (
@@ -324,16 +324,6 @@ export function PromptComposer({
     const incomingBytes = files.reduce((sum, file) => sum + file.size, 0);
     let reserved = false;
     try {
-      const attachedBytes = attachmentsRef.current.reduce(
-        (sum, item) => sum + item.size,
-        0,
-      );
-      if (
-        attachedBytes + pendingAttachmentBytes.current + incomingBytes >
-        MAX_ATTACHMENT_BYTES
-      ) {
-        throw new PromptAttachmentError("sizeLimit");
-      }
       pendingAttachmentBytes.current += incomingBytes;
       pendingFileCount.current += files.length;
       reserved = true;
@@ -364,33 +354,12 @@ export function PromptComposer({
     let reservedBytes = 0;
     let reserved = false;
     try {
-      const attachedBytes = attachmentsRef.current.reduce(
-        (sum, item) => sum + item.size,
-        0,
-      );
-      if (
-        attachedBytes + pendingAttachmentBytes.current + incomingBytes >
-        MAX_ATTACHMENT_BYTES
-      ) {
-        throw new PromptAttachmentError("sizeLimit");
-      }
       pendingAttachmentBytes.current += incomingBytes;
       pendingFileCount.current += 1;
       reservedBytes = incomingBytes;
       reserved = true;
       setPendingFiles(pendingFileCount.current);
       const attachment = await onReadWorkspaceContext(match.path);
-      const otherPendingBytes = Math.max(
-        0,
-        pendingAttachmentBytes.current - reservedBytes,
-      );
-      const currentBytes = attachmentsRef.current.reduce(
-        (sum, item) => sum + item.size,
-        0,
-      );
-      if (currentBytes + otherPendingBytes + attachment.size > MAX_ATTACHMENT_BYTES) {
-        throw new PromptAttachmentError("sizeLimit");
-      }
       pendingAttachmentBytes.current += attachment.size - reservedBytes;
       reservedBytes = attachment.size;
       const next: PromptAttachment = {

@@ -43,13 +43,12 @@ describe("session routes", () => {
     expect(sessionPath("\uD800")).toBe("/");
   });
 
-  it("bounds decoded IDs to the backend limit of 1024 UTF-16 units", () => {
+  it("round-trips IDs beyond the former length limit", () => {
     for (const sessionId of ["a".repeat(1_024), "🪿".repeat(512)]) {
       expect(readSessionIdFromPath(sessionPath(sessionId))).toBe(sessionId);
     }
     for (const sessionId of ["a".repeat(1_025), "🪿".repeat(513)]) {
-      expect(sessionPath(sessionId)).toBe("/");
-      expect(readSessionIdFromPath(`/sessions/${encodeURIComponent(sessionId)}`)).toBeUndefined();
+      expect(readSessionIdFromPath(sessionPath(sessionId))).toBe(sessionId);
     }
   });
 
@@ -83,8 +82,8 @@ describe("project routes", () => {
     for (const cwd of paths) expect(readProjectCwdFromPath(projectPath(cwd))).toBe(cwd);
   });
 
-  it("rejects relative, oversized, null-containing, and unencodable paths", () => {
-    for (const cwd of ["", ".", "..", "work/project", "~/project", "C:project", "\\work", "/work\0project", "/\uD800", `/${"a".repeat(16_384)}`]) {
+  it("rejects relative, null-containing, and unencodable paths", () => {
+    for (const cwd of ["", ".", "..", "work/project", "~/project", "C:project", "\\work", "/work\0project", "/\uD800"]) {
       expect(projectPath(cwd)).toBe("/");
       expect(sessionPath("saved", cwd)).toBe("/");
       try {
@@ -93,7 +92,7 @@ describe("project routes", () => {
         expect(error).toBeInstanceOf(URIError);
       }
     }
-    const longest = `/${"a".repeat(16_383)}`;
+    const longest = `/${"a".repeat(16_385)}`;
     expect(readProjectCwdFromPath(projectPath(longest))).toBe(longest);
   });
 
@@ -104,7 +103,6 @@ describe("project routes", () => {
       "/projects/%2Fwork/sessions", "/projects/%2Fwork/sessions/", "/projects/%2Fwork/sessions/%",
       "/projects/%2Fwork/sessions/%2E%2E", "/projects/%2Fwork/sessions/id/extra",
       "/projects/relative/sessions/id", "/projects/%FF/sessions/id",
-      `/projects/%2Fwork/sessions/${"a".repeat(1_025)}`,
     ]) {
       expect(readProjectCwdFromPath(route)).toBeUndefined();
       expect(readSessionIdFromPath(route)).toBeUndefined();

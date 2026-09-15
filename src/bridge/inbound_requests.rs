@@ -1,4 +1,4 @@
-//! Bounded routing for Agent request cancellation at the wire ingress cut.
+//! Owner-scoped routing for Agent request cancellation at the wire ingress cut.
 //!
 //! The coordinator owns the map. It retains values, never leases: only the
 //! queued request and its responder keep an allocation alive. A captured cancel
@@ -9,13 +9,9 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::RequestId;
 use agent_client_protocol::{Error, JsonRpcMessage};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::scheduling::{CapturedRoute, IngressSender};
 use super::{CreateElicitationRequest, RequestPermissionRequest};
-
-const MAX_INBOUND_REQUESTS: usize = 512;
-const MAX_INBOUND_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InboundRequestKind {
@@ -33,25 +29,19 @@ pub(super) struct CapturedInboundRequest {
 }
 
 pub(super) struct InboundRequests {
-    limit: usize,
     requests: HashMap<RequestId, CapturedInboundRequest>,
-    count: Arc<Semaphore>,
-    bytes: Arc<Semaphore>,
 }
 
 impl Default for InboundRequests {
     fn default() -> Self {
-        Self::new(MAX_INBOUND_REQUESTS)
+        Self::new()
     }
 }
 
 impl InboundRequests {
-    pub(super) fn new(limit: usize) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            limit,
             requests: HashMap::new(),
-            count: Arc::new(Semaphore::new(limit)),
-            bytes: Arc::new(Semaphore::new(MAX_INBOUND_REQUEST_BYTES)),
         }
     }
 
@@ -61,13 +51,9 @@ impl InboundRequests {
         method: &str,
         route: &CapturedRoute,
         ingress: IngressSender,
-        payload_bytes: usize,
     ) -> Result<InboundRequestLease, Error> {
         if self.requests.contains_key(&request_id) {
             return Err(Error::invalid_request().data("Agent request ID is already outstanding"));
-        }
-        if self.requests.len() >= self.limit {
-            return Err(Error::invalid_request().data("Agent inbound request limit reached"));
         }
         let allocation = route
             .dispatch_owner
@@ -83,22 +69,6 @@ impl InboundRequests {
         } else {
             InboundRequestKind::Other
         };
-        // Cover the retained external-work payload independently of ingress
-        // delivery slots, which must remain available for cancellation/finish.
-        let payload_bytes = payload_bytes
-            .checked_add(256)
-            .and_then(|bytes| u32::try_from(bytes).ok())
-            .filter(|bytes| *bytes as usize <= MAX_INBOUND_REQUEST_BYTES)
-            .ok_or_else(|| Error::invalid_request().data("Agent inbound payload limit reached"))?;
-        let count =
-            self.count.clone().try_acquire_owned().map_err(|_| {
-                Error::invalid_request().data("Agent inbound request limit reached")
-            })?;
-        let bytes = self
-            .bytes
-            .clone()
-            .try_acquire_many_owned(payload_bytes)
-            .map_err(|_| Error::invalid_request().data("Agent inbound payload limit reached"))?;
         self.requests.insert(
             request_id.clone(),
             CapturedInboundRequest {
@@ -112,8 +82,6 @@ impl InboundRequests {
             request_id,
             allocation,
             ingress,
-            count: Some(count),
-            bytes: Some(bytes),
         })))
     }
 
@@ -187,16 +155,11 @@ struct RequestLifetime {
     request_id: RequestId,
     allocation: String,
     ingress: IngressSender,
-    count: Option<OwnedSemaphorePermit>,
-    bytes: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for RequestLifetime {
     fn drop(&mut self) {
-        drop(self.count.take());
-        drop(self.bytes.take());
-        // Synchronous enqueue, no detached cleanup task. Required-ingress
-        // exhaustion already fails the connection through IngressSender.
+        // Synchronous enqueue keeps cleanup ordered with subsequent requests.
         let _ = self
             .ingress
             .inbound_request_finished(self.request_id.clone(), self.allocation.clone());
@@ -244,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_capture_does_not_keep_lease_alive_and_finish_is_allocation_exact() {
         let (mut scheduling, ingress) = scheduling();
-        let mut requests = InboundRequests::new(2);
+        let mut requests = InboundRequests::new();
         let id = RequestId::from(1);
         let lease = requests
             .register(
@@ -252,7 +215,6 @@ mod tests {
                 "session/request_permission",
                 &route("old", Some(1)),
                 ingress.clone(),
-                0,
             )
             .unwrap();
         let duplicate = lease.clone();
@@ -283,7 +245,6 @@ mod tests {
                 "elicitation/create",
                 &route("new", Some(2)),
                 ingress,
-                0,
             )
             .unwrap();
         assert!(!requests.finish(&cancelled.request_id, &cancelled.allocation));
@@ -295,9 +256,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_bounds_distinguish_numeric_and_string_ids() {
+    async fn routing_distinguishes_numeric_and_string_ids_without_count_limits() {
         let (_scheduling, ingress) = scheduling();
-        let mut requests = InboundRequests::new(2);
+        let mut requests = InboundRequests::new();
         let number = RequestId::from(1);
         let string = RequestId::from("1".to_owned());
         let _first = requests
@@ -306,7 +267,6 @@ mod tests {
                 "fs/read_text_file",
                 &route("number", Some(1)),
                 ingress.clone(),
-                0,
             )
             .unwrap();
         assert!(
@@ -315,8 +275,7 @@ mod tests {
                     number.clone(),
                     "test",
                     &route("duplicate", Some(1)),
-                    ingress.clone(),
-                    0
+                    ingress.clone()
                 )
                 .is_err()
         );
@@ -326,7 +285,6 @@ mod tests {
                 "fs/write_text_file",
                 &route("string", Some(1)),
                 ingress.clone(),
-                0,
             )
             .unwrap();
         assert_eq!(
@@ -347,74 +305,17 @@ mod tests {
                     RequestId::from(2),
                     "test",
                     &route("overflow", Some(1)),
-                    ingress,
-                    0
+                    ingress
                 )
-                .is_err()
+                .is_ok()
         );
-        assert_eq!(requests.requests.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn external_payload_budget_is_released_before_finish_delivery() {
-        let (mut scheduling, ingress) = scheduling();
-        let mut requests = InboundRequests::new(4);
-        let first = requests
-            .register(
-                RequestId::from(1),
-                "fs/write_text_file",
-                &route("large", Some(1)),
-                ingress.clone(),
-                MAX_INBOUND_REQUEST_BYTES - 256,
-            )
-            .unwrap();
-        assert_eq!(requests.bytes.available_permits(), 0);
-        assert!(
-            requests
-                .register(
-                    RequestId::from(2),
-                    "test",
-                    &route("blocked", Some(1)),
-                    ingress.clone(),
-                    0
-                )
-                .is_err()
-        );
-        assert_eq!(requests.requests.len(), 1);
-        drop(first);
-        // The coordinator has not consumed Finished yet. The lease, rather than
-        // its routing row, owns the retained-work budget.
-        let _next = requests
-            .register(
-                RequestId::from(2),
-                "fs/write_text_file",
-                &route("next", Some(1)),
-                ingress.clone(),
-                MAX_INBOUND_REQUEST_BYTES - 256,
-            )
-            .unwrap();
-        assert!(matches!(
-            scheduling.ingress_rx.try_recv().unwrap().event,
-            BridgeIngress::InboundRequestFinished { .. }
-        ));
-        assert!(
-            requests
-                .register(
-                    RequestId::from(3),
-                    "test",
-                    &route("oversized", Some(1)),
-                    ingress,
-                    usize::MAX
-                )
-                .is_err()
-        );
-        assert_eq!(requests.requests.len(), 2);
+        assert_eq!(requests.requests.len(), 3);
     }
 
     #[tokio::test]
     async fn creation_binding_is_once_and_cannot_recapture_a_replacement_owner() {
         let (_scheduling, ingress) = scheduling();
-        let mut requests = InboundRequests::new(1);
+        let mut requests = InboundRequests::new();
         let id = RequestId::from(1);
         let _lease = requests
             .register(
@@ -422,7 +323,6 @@ mod tests {
                 "elicitation/create",
                 &route("allocation", None),
                 ingress,
-                0,
             )
             .unwrap();
         let early_cancel = requests.capture_cancel(&id).unwrap();

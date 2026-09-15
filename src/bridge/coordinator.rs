@@ -26,7 +26,7 @@ impl Default for Coordinator {
         Self {
             handles: HashMap::new(),
             creations: HashMap::new(),
-            inbound: InboundRequests::new(512),
+            inbound: InboundRequests::new(),
         }
     }
 }
@@ -38,7 +38,7 @@ struct CreationClaim {
     following: VecDeque<IngressItem>,
 }
 
-/// Begin a queued local transition. RPC/user waits are transferred to bounded
+/// Begin a queued local transition. RPC/user waits are transferred to owned
 /// owners by the handler; the coordinator never waits for their completion.
 pub(super) async fn dispatch_ready(
     delivery: ScheduledInput,
@@ -405,11 +405,6 @@ impl Coordinator {
                         message.method(),
                         &route,
                         ingress.clone(),
-                        serialized_value_len(message.params())
-                            .saturating_add(serialized_value_len(responder.id()).saturating_mul(4))
-                            .saturating_add(
-                                route.dispatch_owner.operation_id.len().saturating_mul(2),
-                            ),
                     ) {
                         Ok(lease) => item.request_lease = Some(lease),
                         Err(error) => {
@@ -804,10 +799,7 @@ pub(super) fn prepare_cold_input(
     };
 
     let reserved = (|| {
-        if serialized_value_len(&command) > MAX_BRIDGE_MESSAGE_BYTES {
-            return Err(Error::invalid_params().data("attachment command exceeds the relay limit"));
-        }
-        let operation = bounded_string_field(&command, "type", MAX_BRIDGE_TYPE_LENGTH)?;
+        let operation = nonempty_string_field(&command, "type")?;
         let operation_id = string_field(&command, "requestId")?.to_string();
         let session_id = string_field(&command, "sessionId")?;
         let kind = if operation == "session/load" {
@@ -1050,7 +1042,7 @@ mod blocked_queue_retirement_tests {
         )
         .unwrap();
         let mut coordinator = Coordinator::default();
-        for index in 0..MAX_TRACKED_SESSIONS + 2 {
+        for index in 0..34 {
             let session_id = format!("failed-cold-{index}");
             let (input, mut waiter) = if index % 2 == 0 {
                 let (response, received) = oneshot::channel();

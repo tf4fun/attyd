@@ -457,6 +457,27 @@ test("queues ACP follow-ups and uses session cancel for Send now", async ({ page
   expect(browserErrors).toEqual([]);
 });
 
+test("preserves queued prompts beyond the former eight-message limit", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/sessions/saved-session");
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  await composer.fill("browser permission flow");
+  await composer.press("Enter");
+  await expect(page.getByRole("alertdialog", { name: "Agent permission request" })).toBeVisible();
+  for (let index = 1; index <= 12; index += 1) {
+    await composer.fill(`queued follow-up ${index}`);
+    await composer.press("Enter");
+  }
+  const queue = page.getByRole("region", { name: "Queued messages" });
+  await expect(queue).toContainText("12 queued");
+  for (let index = 1; index <= 12; index += 1) {
+    await expect(queue.getByRole("article", { name: `Queued message ${index}`, exact: true }))
+      .toContainText(`queued follow-up ${index}`);
+  }
+  expect(browserErrors).toEqual([]);
+});
+
 test("keeps queued ACP work paused after Stop and resumes it after a new message", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");

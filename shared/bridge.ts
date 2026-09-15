@@ -20,14 +20,6 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { validateContentBlockSemantics } from "./content-validation.js";
 
-export const MAX_BRIDGE_MESSAGE_BYTES = 5 * 1024 * 1024;
-export const MAX_BRIDGE_ERROR_DATA_BYTES = 256 * 1024;
-const MAX_BRIDGE_TYPE_LENGTH = 128;
-const MAX_BRIDGE_IDENTIFIER_LENGTH = 1_024;
-const MAX_BRIDGE_CURSOR_LENGTH = 4_096;
-const MAX_BRIDGE_PATH_LENGTH = 16_384;
-const MAX_RUNTIME_SESSIONS = 10_000;
-const MAX_RUNTIME_INTENT_RESULTS = 4_096;
 
 export interface TerminalSnapshot {
   sessionId: string;
@@ -414,9 +406,6 @@ export function parseServerEvent(raw: string): ServerEvent {
   if (!isRecord(value) || typeof value.type !== "string") {
     throw new Error("Server bridge event must be an object with a type");
   }
-  if (value.type.length > MAX_BRIDGE_TYPE_LENGTH) {
-    throw new Error("Server bridge event type is too long");
-  }
   if (!Object.hasOwn(SERVER_EVENT_TYPES, value.type)) {
     throw new Error(`Unknown server bridge event: ${value.type}`);
   }
@@ -440,15 +429,14 @@ function validateServerEventEnvelope(
     case "bridge/runtime_replay_started":
       if (
         !Number.isSafeInteger(value.sessionCount) ||
-        Number(value.sessionCount) < 0 ||
-        Number(value.sessionCount) > MAX_RUNTIME_SESSIONS
+        Number(value.sessionCount) < 0
       ) {
         throw new Error("bridge/runtime_replay_started sessionCount is invalid");
       }
       return;
     case "bridge/runtime_session": {
       requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "cwd", MAX_BRIDGE_PATH_LENGTH);
+      requireNonemptyString(value, "cwd");
       if (value.cwd !== "") {
         validateOptionalWorkspacePath(value.cwd, "bridge/runtime_session cwd");
       }
@@ -467,9 +455,6 @@ function validateServerEventEnvelope(
     }
     case "bridge/runtime_replay_complete":
       requireStringArray(value.sessionIds, "bridge/runtime_replay_complete sessionIds");
-      if (value.sessionIds.length > MAX_RUNTIME_SESSIONS) {
-        throw new Error("bridge/runtime_replay_complete has too many sessions");
-      }
       return;
     case "bridge/runtime_snapshot": {
       const snapshot = requireRecordValue(
@@ -485,21 +470,9 @@ function validateServerEventEnvelope(
         snapshot.connectionRevision,
         "bridge/runtime_snapshot connectionRevision",
       );
-      requireBoundedRecord(
-        snapshot.sessions,
-        MAX_RUNTIME_SESSIONS,
-        "bridge/runtime_snapshot sessions",
-      );
-      requireBoundedRecord(
-        snapshot.requestElicitations,
-        MAX_RUNTIME_INTENT_RESULTS,
-        "bridge/runtime_snapshot requestElicitations",
-      );
-      requireBoundedRecord(
-        snapshot.requestUrlFlows,
-        MAX_RUNTIME_INTENT_RESULTS,
-        "bridge/runtime_snapshot requestUrlFlows",
-      );
+      requireObject(snapshot.sessions, "bridge/runtime_snapshot sessions");
+      requireObject(snapshot.requestElicitations, "bridge/runtime_snapshot requestElicitations");
+      requireObject(snapshot.requestUrlFlows, "bridge/runtime_snapshot requestUrlFlows");
       return;
     }
     case "bridge/runtime_delta": {
@@ -543,20 +516,17 @@ function validateServerEventEnvelope(
       return;
     case "bridge/context_search_result": {
       requireBridgeIdentifier(value, "requestId");
-      requireBoundedStringAllowEmpty(value, "query", 256);
+      requireStringField(value, "query");
       requireArray(value.matches, "bridge/context_search_result matches");
-      if (value.matches.length > 24) {
-        throw new Error("bridge/context_search_result exceeds 24 matches");
-      }
       for (const [index, candidate] of value.matches.entries()) {
         const match = requireRecordValue(
           candidate,
           `bridge/context_search_result match ${index}`,
         );
-        requireBoundedString(match, "path", MAX_BRIDGE_PATH_LENGTH);
-        requireBoundedString(match, "name", 1_024);
-        requireBoundedString(match, "relativePath", MAX_BRIDGE_PATH_LENGTH);
-        requireBoundedString(match, "rootName", 1_024);
+        requireNonemptyString(match, "path");
+        requireNonemptyString(match, "name");
+        requireNonemptyString(match, "relativePath");
+        requireNonemptyString(match, "rootName");
         if (!Number.isSafeInteger(match.size) || Number(match.size) < 0) {
           throw new Error("bridge/context_search_result match size must be non-negative");
         }
@@ -570,7 +540,7 @@ function validateServerEventEnvelope(
         value.attachment,
         "bridge/context_attached attachment",
       );
-      requireBoundedString(attachment, "name", MAX_BRIDGE_PATH_LENGTH);
+      requireNonemptyString(attachment, "name");
       if (!Number.isSafeInteger(attachment.size) || Number(attachment.size) < 0) {
         throw new Error("bridge/context_attached attachment size must be non-negative");
       }
@@ -591,9 +561,6 @@ function validateServerEventEnvelope(
     case "bridge/auth_terminal_output":
       requireBridgeIdentifier(value, "requestId");
       requireStringValue(value.data, "bridge/auth_terminal_output data");
-      if (value.data.length > 65_536) {
-        throw new Error("bridge/auth_terminal_output data exceeds 65536 characters");
-      }
       return;
     case "bridge/auth_terminal_exited":
       requireBridgeIdentifier(value, "requestId");
@@ -637,9 +604,6 @@ function validateServerEventEnvelope(
       if (value.data !== undefined) {
         const serialized = JSON.stringify(value.data);
         if (serialized === undefined) throw new Error("bridge/error data must be JSON serializable");
-        if (new TextEncoder().encode(serialized).byteLength > MAX_BRIDGE_ERROR_DATA_BYTES) {
-          throw new Error("bridge/error data exceeds the relay limit");
-        }
       }
       return;
     case "acp/initialized":
@@ -702,19 +666,14 @@ function validateServerEventEnvelope(
       requireString(terminal, "sessionId");
       requireString(terminal, "terminalId");
       requireStringValue(terminal.output, "acp/terminal_state output");
-      if (terminal.output.length > 1_000_000) {
-        throw new Error("acp/terminal_state output exceeds 1000000 characters");
-      }
       if (terminal.outputBytes != null) {
         requireStringValue(terminal.outputBytes, "acp/terminal_state outputBytes");
         const encoded = terminal.outputBytes;
-        const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
         if (
-          encoded.length > 1_333_336 || encoded.length % 4 !== 0 ||
-          !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded) ||
-          encoded.length / 4 * 3 - padding > 1_000_000
+          encoded.length % 4 !== 0 ||
+          !/^[A-Za-z0-9+/]*={0,2}$/u.test(encoded)
         ) {
-          throw new Error("acp/terminal_state outputBytes must be base64 within 1000000 bytes");
+          throw new Error("acp/terminal_state outputBytes must be base64");
         }
       }
       if (typeof terminal.truncated !== "boolean") {
@@ -840,7 +799,7 @@ export function isAbsoluteWorkspacePath(value: string): boolean {
 
 function validateOptionalWorkspacePath(value: unknown, label: string): void {
   if (value == null) return;
-  requireBoundedStringValue(value, label, MAX_BRIDGE_PATH_LENGTH);
+  requireNonemptyStringValue(value, label);
   if (value.includes("\0") || !isAbsoluteWorkspacePath(value)) {
     throw new Error(`${label} must be an absolute path`);
   }
@@ -853,9 +812,6 @@ function validateEarlySessionUpdates(
 ): void {
   if (value == null) return;
   requireArray(value, `${label} earlyUpdates`);
-  if (value.length > 10_000) {
-    throw new Error(`${label} earlyUpdates exceeds 10000 notifications`);
-  }
   for (const item of value) {
     const notification = requireRecordValue(item, `${label} early update`);
     if (notification.sessionId !== sessionId) {
@@ -913,7 +869,7 @@ function validateCanonicalRuntimeIdentity(
   value: Record<string, unknown>,
   label: string,
 ): void {
-  requireBoundedString(value, "epoch", MAX_BRIDGE_IDENTIFIER_LENGTH);
+  requireNonemptyString(value, "epoch");
   if (value.epoch === "") throw new Error(`${label} epoch must not be empty`);
 }
 
@@ -923,11 +879,8 @@ function requireNonNegativeSafeInteger(value: unknown, label: string): void {
   }
 }
 
-function requireBoundedRecord(value: unknown, limit: number, label: string): void {
+function requireObject(value: unknown, label: string): void {
   if (!isRecord(value)) throw new Error(`${label} must be an object`);
-  if (Object.keys(value).length > limit) {
-    throw new Error(`${label} exceeds ${limit} entries`);
-  }
 }
 
 function requireEnum(
@@ -948,9 +901,6 @@ export function parseClientCommand(raw: string): ClientCommand {
   if (Object.hasOwn(value, "history")) {
     throw new Error("Bridge commands must not contain completed browser history");
   }
-  if (value.type.length > MAX_BRIDGE_TYPE_LENGTH) {
-    throw new Error("Bridge command type is too long");
-  }
   switch (value.type) {
     case "auth/authenticate":
       requireBridgeIdentifier(value, "requestId");
@@ -964,9 +914,6 @@ export function parseClientCommand(raw: string): ClientCommand {
     case "auth/terminal_input":
       requireBridgeIdentifier(value, "requestId");
       requireStringValue(value.data, "auth/terminal_input data");
-      if (value.data.length > 65_536) {
-        throw new Error("auth/terminal_input data exceeds 65536 characters");
-      }
       break;
     case "auth/terminal_resize":
       requireBridgeIdentifier(value, "requestId");
@@ -981,12 +928,12 @@ export function parseClientCommand(raw: string): ClientCommand {
     case "context/search":
       requireBridgeIdentifier(value, "requestId");
       requireBridgeIdentifier(value, "sessionId");
-      requireBoundedStringAllowEmpty(value, "query", 256);
+      requireStringField(value, "query");
       break;
     case "context/read":
       requireBridgeIdentifier(value, "requestId");
       requireBridgeIdentifier(value, "sessionId");
-      requireBoundedString(value, "path", MAX_BRIDGE_PATH_LENGTH);
+      requireNonemptyString(value, "path");
       break;
     case "session/new":
       requireBridgeIdentifier(value, "requestId");
@@ -996,9 +943,6 @@ export function parseClientCommand(raw: string): ClientCommand {
       requireBridgeIdentifier(value, "requestId");
       if (value.cursor != null && typeof value.cursor !== "string") {
         throw new Error("session/list has an invalid cursor");
-      }
-      if (typeof value.cursor === "string" && value.cursor.length > MAX_BRIDGE_CURSOR_LENGTH) {
-        throw new Error(`session/list cursor exceeds ${MAX_BRIDGE_CURSOR_LENGTH} characters`);
       }
       break;
     case "session/load":
@@ -1030,9 +974,6 @@ export function parseClientCommand(raw: string): ClientCommand {
       if (!["string", "boolean"].includes(typeof value.value)) {
         throw new Error("session/set_config_option has an invalid value");
       }
-      if (typeof value.value === "string" && value.value.length > MAX_BRIDGE_IDENTIFIER_LENGTH) {
-        throw new Error(`session/set_config_option value exceeds ${MAX_BRIDGE_IDENTIFIER_LENGTH} characters`);
-      }
       break;
     case "permission/respond":
       requireBridgeIdentifier(value, "requestId");
@@ -1046,9 +987,6 @@ export function parseClientCommand(raw: string): ClientCommand {
       requireBridgeIdentifier(value, "elicitationId");
       if (!isRecord(value.response) || typeof value.response.action !== "string") {
         throw new Error("elicitation/respond requires a response action");
-      }
-      if (value.response.action.length > MAX_BRIDGE_TYPE_LENGTH) {
-        throw new Error("elicitation/respond action is too long");
       }
       if (!["accept", "decline", "cancel"].includes(value.response.action)) {
         throw new Error(`Unsupported elicitation response action: ${value.response.action}`);
@@ -1074,24 +1012,21 @@ export function parseClientCommand(raw: string): ClientCommand {
 }
 
 function requireTerminalSize(cols: unknown, rows: unknown, label: string): void {
-  if (!Number.isSafeInteger(cols) || Number(cols) < 2 || Number(cols) > 500) {
-    throw new Error(`${label} cols must be an integer between 2 and 500`);
+  if (!Number.isSafeInteger(cols) || Number(cols) < 1 || Number(cols) > 65_535) {
+    throw new Error(`${label} cols must be an integer between 1 and 65535`);
   }
-  if (!Number.isSafeInteger(rows) || Number(rows) < 2 || Number(rows) > 300) {
-    throw new Error(`${label} rows must be an integer between 2 and 300`);
+  if (!Number.isSafeInteger(rows) || Number(rows) < 1 || Number(rows) > 65_535) {
+    throw new Error(`${label} rows must be an integer between 1 and 65535`);
   }
 }
 
 function validatePrompt(prompt: unknown[]): void {
-  if (prompt.length === 0 || prompt.length > 64) {
-    throw new Error("session/prompt requires between 1 and 64 content blocks");
+  if (prompt.length === 0) {
+    throw new Error("session/prompt requires at least one content block");
   }
   for (const block of prompt) {
     if (!isRecord(block) || typeof block.type !== "string") {
       throw new Error("session/prompt contains an invalid content block");
-    }
-    if (block.type.length > MAX_BRIDGE_TYPE_LENGTH) {
-      throw new Error("session/prompt content block type is too long");
     }
     switch (block.type) {
       case "text":
@@ -1162,44 +1097,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function requireBridgeIdentifier(value: Record<string, unknown>, key: string): void {
-  requireBoundedString(value, key, MAX_BRIDGE_IDENTIFIER_LENGTH);
+  requireNonemptyString(value, key);
 }
 
-function requireBoundedString(
-  value: Record<string, unknown>,
-  key: string,
-  maximum: number,
-): void {
-  requireBoundedStringValue(
-    value[key],
-    `${String(value.type ?? "message")} ${key}`,
-    maximum,
-  );
+function requireNonemptyString(value: Record<string, unknown>, key: string): void {
+  requireNonemptyStringValue(value[key], `${String(value.type ?? "message")} ${key}`);
 }
 
-function requireBoundedStringAllowEmpty(
-  value: Record<string, unknown>,
-  key: string,
-  maximum: number,
-): void {
+function requireStringField(value: Record<string, unknown>, key: string): void {
   const candidate = value[key];
   const label = `${String(value.type ?? "message")} ${key}`;
   requireStringValue(candidate, label);
-  if (candidate.length > maximum) {
-    throw new Error(`${label} exceeds ${maximum} characters`);
-  }
 }
 
-function requireBoundedStringValue(
-  value: unknown,
-  label: string,
-  maximum: number,
-): asserts value is string {
+function requireNonemptyStringValue(value: unknown, label: string): asserts value is string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`${label} is required`);
-  }
-  if (value.length > maximum) {
-    throw new Error(`${label} exceeds ${maximum} characters`);
   }
 }
 

@@ -1,7 +1,5 @@
 import { isAbsoluteWorkspacePath } from "../../../shared/bridge";
 
-const MAX_SESSION_ID_LENGTH = 1_024;
-const MAX_PROJECT_PATH_LENGTH = 16_384;
 
 export function readProjectCwdFromPath(pathname: string): string | undefined {
   const match = /^\/projects\/([^/?#]+)(?:\/sessions\/([^/?#]+))?$/.exec(pathname);
@@ -43,7 +41,7 @@ export function sessionPath(sessionId?: string, cwd?: string): string {
 }
 
 function encodeProjectCwd(cwd: string): string | undefined {
-  if (cwd.length > MAX_PROJECT_PATH_LENGTH || cwd.includes("\0") || !isAbsoluteWorkspacePath(cwd)) {
+  if (cwd.includes("\0") || !isAbsoluteWorkspacePath(cwd)) {
     return undefined;
   }
   // Keep the Agent's exact path, including separators, case, and trailing slash.
@@ -55,7 +53,7 @@ function encodeProjectCwd(cwd: string): string | undefined {
 }
 
 function encodeSessionId(sessionId: string): string | undefined {
-  if (sessionId.length === 0 || sessionId.length > MAX_SESSION_ID_LENGTH) return undefined;
+  if (sessionId.length === 0) return undefined;
   // Browsers normalize literal and percent-encoded dot path segments away.
   if (sessionId === "." || sessionId === "..") return undefined;
   try {

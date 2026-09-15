@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::Error;
@@ -11,14 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::event_queue::EventSender;
 
-const MAX_AUTH_ARGUMENTS: usize = 256;
-const MAX_AUTH_ARGUMENT_LENGTH: usize = 16_384;
-const MAX_AUTH_ENVIRONMENT_ENTRIES: usize = 256;
-const MAX_AUTH_ENVIRONMENT_NAME_LENGTH: usize = 256;
-const MAX_AUTH_ENVIRONMENT_VALUE_LENGTH: usize = 65_536;
-const MAX_AUTH_ENVIRONMENT_BYTES: usize = 1_000_000;
-const MAX_AUTH_TERMINAL_OUTPUT_BYTES: usize = 4_000_000;
-const MAX_AUTH_TERMINAL_EVENT_BYTES: usize = 32_768;
+const AUTH_TERMINAL_READ_CHUNK_BYTES: usize = 32_768;
 
 #[derive(Clone)]
 pub struct AuthTerminalManager {
@@ -40,7 +33,6 @@ struct ActiveAuthTerminal {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    output_bytes: AtomicUsize,
     cancelled: AtomicBool,
     settled: AtomicBool,
     failure: Mutex<Option<String>>,
@@ -100,7 +92,6 @@ impl AuthTerminalManager {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(child.clone_killer()),
-            output_bytes: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
             settled: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -119,9 +110,6 @@ impl AuthTerminalManager {
     }
 
     pub fn write(&self, request_id: &str, data: &str) -> Result<(), Error> {
-        if data.len() > MAX_AUTH_TERMINAL_EVENT_BYTES {
-            return Err(Error::invalid_params().data("terminal authentication input is too large"));
-        }
         let active = self.require_active(request_id)?;
         let mut writer = active.writer.lock().map_err(lock_error)?;
         writer
@@ -193,24 +181,12 @@ impl AuthTerminalManager {
     fn spawn_reader(&self, active: Arc<ActiveAuthTerminal>, mut reader: Box<dyn Read + Send>) {
         let manager = self.clone();
         tokio::task::spawn_blocking(move || {
-            let mut buffer = [0_u8; MAX_AUTH_TERMINAL_EVENT_BYTES];
+            let mut buffer = [0_u8; AUTH_TERMINAL_READ_CHUNK_BYTES];
             loop {
                 let count = match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => count,
                 };
-                let total = active.output_bytes.fetch_add(count, Ordering::AcqRel) + count;
-                if total > MAX_AUTH_TERMINAL_OUTPUT_BYTES {
-                    if let Ok(mut failure) = active.failure.lock() {
-                        *failure = Some(format!(
-                            "terminal authentication output exceeded {MAX_AUTH_TERMINAL_OUTPUT_BYTES} bytes"
-                        ));
-                    }
-                    if let Ok(mut killer) = active.killer.lock() {
-                        let _ = killer.kill();
-                    }
-                    break;
-                }
                 manager.send(json!({
                     "type": "bridge/auth_terminal_output",
                     "requestId": active.request_id,
@@ -298,40 +274,21 @@ impl AuthTerminalManager {
 }
 
 pub(crate) fn validate_method(method: &AuthMethodTerminal) -> Result<(), Error> {
-    if method.args.len() > MAX_AUTH_ARGUMENTS
-        || method.args.iter().any(|argument| {
-            argument.encode_utf16().count() > MAX_AUTH_ARGUMENT_LENGTH || argument.contains('\0')
-        })
-    {
+    if method.args.iter().any(|argument| argument.contains('\0')) {
         return Err(Error::invalid_params().data("terminal authentication arguments are invalid"));
     }
-    if method.env.len() > MAX_AUTH_ENVIRONMENT_ENTRIES {
-        return Err(Error::invalid_params()
-            .data("terminal authentication environment has too many entries"));
-    }
-    let mut bytes = 0_usize;
     for (name, value) in &method.env {
         let valid_name = !name.is_empty()
-            && name.len() <= MAX_AUTH_ENVIRONMENT_NAME_LENGTH
             && name.chars().enumerate().all(|(index, character)| {
                 character == '_'
                     || character.is_ascii_alphabetic()
                     || (index > 0 && character.is_ascii_digit())
             });
-        if !valid_name
-            || value.encode_utf16().count() > MAX_AUTH_ENVIRONMENT_VALUE_LENGTH
-            || value.contains('\0')
-        {
+        if !valid_name || value.contains('\0') {
             return Err(
                 Error::invalid_params().data("terminal authentication environment is invalid")
             );
         }
-        bytes = bytes.saturating_add(name.len()).saturating_add(value.len());
-    }
-    if bytes > MAX_AUTH_ENVIRONMENT_BYTES {
-        return Err(
-            Error::invalid_params().data("terminal authentication environment is too large")
-        );
     }
     Ok(())
 }
@@ -354,6 +311,8 @@ fn internal_error(error: anyhow::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FORMER_AUTH_ARGUMENT_LENGTH: usize = 16_384;
+
     use serde_json::{Value, json};
     use std::path::Path;
     use std::time::Duration;
@@ -596,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_agent_arguments_environment_and_terminal_size() {
+    fn validates_agent_environment_and_terminal_size() {
         let invalid_name = method(json!({
             "id": "terminal-login",
             "name": "Terminal login",
@@ -609,9 +568,9 @@ mod tests {
             "id": "terminal-login",
             "name": "Terminal login",
             "type": "terminal",
-            "args": ["x".repeat(MAX_AUTH_ARGUMENT_LENGTH + 1)]
+            "args": ["x".repeat(FORMER_AUTH_ARGUMENT_LENGTH + 1)]
         }));
-        assert!(validate_method(&invalid_argument).is_err());
+        assert!(validate_method(&invalid_argument).is_ok());
 
         let duplicate_free_valid = method(json!({
             "id": "terminal-login",

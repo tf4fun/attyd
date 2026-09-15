@@ -13,7 +13,6 @@ import {
 import { assertNever } from "../../../../shared/exhaustive";
 import { useTranslation } from "../../i18n";
 
-export const MAX_QUEUED_PROMPTS = 8;
 
 export interface QueuedPrompt {
   id: string;

@@ -12,12 +12,12 @@ use agent_client_protocol::{
 use agent_client_protocol_http::HttpClient;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use self::scheduling::{ExecutionTurn, IngressSender};
-use crate::agent_process::BoundedAcpAgent;
+use crate::agent_process::StdioAcpAgent;
 use crate::auth_terminal::{AuthTerminalManager, validate_method as validate_terminal_auth_method};
 use crate::elicitation_validation::{
     validate_elicitation_request, validate_elicitation_response_value,
@@ -56,30 +56,9 @@ mod coordinator_tests;
 mod inbound_requests;
 mod scheduling;
 
-pub const MAX_BRIDGE_MESSAGE_BYTES: usize = 5 * 1024 * 1024;
-const MAX_BRIDGE_TYPE_LENGTH: usize = 128;
-const MAX_BRIDGE_IDENTIFIER_LENGTH: usize = 1_024;
-const MAX_BRIDGE_PATH_LENGTH: usize = 16_384;
-const MAX_AGENT_RELAY_BYTES: usize = 4_000_000;
-const MAX_PENDING_INTERACTIONS: usize = 128;
-const MAX_URL_ELICITATION_IDS: usize = 10_000;
-const MAX_AUTH_METHODS: usize = 100;
-const MAX_AUTH_METHOD_NAME_LENGTH: usize = 4_096;
-const MAX_AUTH_METHOD_DESCRIPTION_LENGTH: usize = 16_384;
-const MAX_EARLY_UPDATES: usize = 10_000;
-const MAX_EARLY_UPDATE_BYTES: usize = 1_000_000;
-const MAX_TRACKED_SESSIONS: usize = 32;
-const MAX_BRIDGE_ERROR_DATA_BYTES: usize = 256 * 1024;
-const MAX_BRIDGE_ERROR_MESSAGE_CHARS: usize = 16_384;
-const MAX_SESSION_LIST_TOTAL_BYTES: usize = 16_000_000;
-const MAX_LISTED_SESSIONS: usize = 10_000;
-const MAX_PENDING_LIST_REQUESTS: usize = 32;
 const SHUTDOWN_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(2);
-const TERMINAL_SNAPSHOT_QUEUE_CAPACITY: usize = 64;
 const RECONCILE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const RECONCILE_MAX_BACKOFF: Duration = Duration::from_secs(8);
-const RECONCILE_MAX_ATTEMPTS: usize = 8;
-const MAX_SESSION_VIEW_WAITERS_PER_SESSION: usize = 64;
 
 #[derive(Clone)]
 struct EventSink {
@@ -89,19 +68,7 @@ struct EventSink {
 impl EventSink {
     fn send(&self, event: Value) {
         let serialized = event.to_string();
-        if serialized.len() <= MAX_BRIDGE_MESSAGE_BYTES {
-            let _ = self.tx.send(serialized);
-        } else {
-            let _ = self.tx.send(
-                json!({
-                    "type": "bridge/error",
-                    "message": format!(
-                        "browser event exceeds {MAX_BRIDGE_MESSAGE_BYTES} bytes"
-                    ),
-                })
-                .to_string(),
-            );
-        }
+        let _ = self.tx.send(serialized);
     }
 
     fn typed(&self, kind: &str, value: impl Serialize) {
@@ -192,24 +159,15 @@ fn relay_interaction_resolution(
 }
 
 fn acp_error_event(error: Error, request_id: Option<&str>, operation: Option<&str>) -> Value {
-    let message = truncate_chars(error.message, MAX_BRIDGE_ERROR_MESSAGE_CHARS);
+    let message = error.message;
     let mut event = json!({
         "type": "bridge/error",
         "message": message,
         "code": i32::from(error.code),
     });
     if let Some(data) = error.data {
-        match serde_json::to_vec(&data) {
-            Ok(serialized) if serialized.len() <= MAX_BRIDGE_ERROR_DATA_BYTES => {
-                event["data"] = data;
-                event["dataBytes"] = json!(serialized.len());
-            }
-            Ok(serialized) => {
-                event["dataTruncated"] = json!(true);
-                event["dataBytes"] = json!(serialized.len());
-            }
-            Err(_) => event["dataTruncated"] = json!(true),
-        }
+        event["dataBytes"] = json!(serde_json::to_vec(&data).map_or(0, |encoded| encoded.len()));
+        event["data"] = data;
     }
     if let Some(request_id) = request_id {
         event["requestId"] = json!(request_id);
@@ -220,22 +178,8 @@ fn acp_error_event(error: Error, request_id: Option<&str>, operation: Option<&st
     event
 }
 
-fn truncate_chars(value: String, maximum: usize) -> String {
-    if value.chars().count() <= maximum {
-        return value;
-    }
-    let mut result = value.chars().take(maximum).collect::<String>();
-    result.push('…');
-    result
-}
-
-fn ensure_relay_size(value: &impl Serialize, label: &str) -> Result<usize, Error> {
+fn relay_bytes(value: &impl Serialize) -> Result<usize, Error> {
     let bytes = serde_json::to_vec(value)?.len();
-    if bytes > MAX_AGENT_RELAY_BYTES {
-        return Err(Error::invalid_request().data(format!(
-            "Agent {label} exceeds {MAX_AGENT_RELAY_BYTES} bytes"
-        )));
-    }
     Ok(bytes)
 }
 
@@ -244,8 +188,8 @@ fn semantic_error(message: impl Into<String>) -> Error {
 }
 
 fn validate_agent_session_id(session_id: &str) -> Result<(), String> {
-    if session_id.is_empty() || session_id.encode_utf16().count() > 1_024 {
-        return Err("Agent session ID must contain between 1 and 1024 characters".to_string());
+    if session_id.is_empty() {
+        return Err("Agent session ID must not be empty".to_string());
     }
     Ok(())
 }
@@ -313,14 +257,6 @@ impl SessionUpdateOwner {
     }
 }
 
-struct SessionListLimit(Arc<Semaphore>);
-
-impl Default for SessionListLimit {
-    fn default() -> Self {
-        Self(Arc::new(Semaphore::new(MAX_PENDING_LIST_REQUESTS)))
-    }
-}
-
 #[derive(Default)]
 struct BridgeState {
     agent_capabilities: Option<AgentCapabilities>,
@@ -330,7 +266,6 @@ struct BridgeState {
     catalog_deletions: HashMap<String, CatalogDeletion>,
     catalog_revision: u64,
     session_list_gate: Arc<Mutex<()>>,
-    session_list_limit: SessionListLimit,
     pending_creations: usize,
     creation_staging: HashMap<String, CreationStaging>,
     early_update_count: usize,
@@ -339,7 +274,7 @@ struct BridgeState {
     in_flight_request_ids: HashSet<String>,
     sessions: SessionRegistry,
     published_runtime_seq: u64,
-    observer_events: Option<mpsc::Sender<BridgeInput>>,
+    observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
     observer_timeout: Option<i64>,
     observers_stopped: bool,
 }
@@ -710,14 +645,6 @@ fn prepare_session_response(
     {
         return Err(semantic_error(format!(
             "Agent returned a duplicate active session ID: {session_id}"
-        )));
-    }
-    if !attaching
-        && state.sessions.live(session_id).is_none()
-        && state.sessions.allocated_session_count() >= MAX_TRACKED_SESSIONS
-    {
-        return Err(semantic_error(format!(
-            "Active session limit reached ({MAX_TRACKED_SESSIONS})"
         )));
     }
     let (modes, _) = response_controls(response)?;
@@ -1196,11 +1123,17 @@ fn refresh_observer_timers(state: &mut BridgeState) {
                 return;
             }
             while timer.permit.pending() {
-                tokio::select! {
-                    _ = timer.permit.cancelled.cancelled() => return,
-                    result = events.send(BridgeInput::RetireUnobservedSession {
-                        session_id: session_id.clone(), incarnation, absence_id: timer.id, permit: timer.permit.clone(),
-                    }) => { if result.is_err() { return; } }
+                if timer.permit.cancelled.is_cancelled()
+                    || events
+                        .send(BridgeInput::RetireUnobservedSession {
+                            session_id: session_id.clone(),
+                            incarnation,
+                            absence_id: timer.id,
+                            permit: timer.permit.clone(),
+                        })
+                        .is_err()
+                {
+                    return;
                 }
                 // A control/load may still own admission. Preserve the original
                 // absence interval while retrying its close intent.
@@ -1315,13 +1248,11 @@ fn finish_session_view_waiter(
                         _ = lease.finished() => return,
                         _ = lease.cancelled() => {}
                     }
-                    let _ = events
-                        .send(BridgeInput::UnobserveSession {
-                            session_id,
-                            observer_id,
-                            lease,
-                        })
-                        .await;
+                    let _ = events.send(BridgeInput::UnobserveSession {
+                        session_id,
+                        observer_id,
+                        lease,
+                    });
                 });
             }
         }
@@ -1422,21 +1353,7 @@ fn prepare_session_view_request_for_owner(
     }
     if let Some(materialization) = session_materialization_mut(state, &session_id) {
         materialization.waiters.retain(|waiter| !waiter.is_closed());
-        if materialization.waiters.len() >= MAX_SESSION_VIEW_WAITERS_PER_SESSION {
-            waiter.cancel("too many observers are waiting for this session");
-        } else {
-            materialization.waiters.push(waiter);
-        }
-        return None;
-    }
-    if state
-        .sessions
-        .iter_states()
-        .filter(|session| session_materialization(state, &session.session_id).is_some())
-        .count()
-        >= MAX_TRACKED_SESSIONS
-    {
-        waiter.cancel("too many sessions are waiting for materialization");
+        materialization.waiters.push(waiter);
         return None;
     }
     let incarnation = if let Some(session) = state.sessions.state(&session_id) {
@@ -2090,7 +2007,7 @@ impl TurnResponder {
 
 pub async fn run_with_cancellation(
     options: Arc<Options>,
-    commands: mpsc::Receiver<BridgeInput>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
     events: EventSender,
     cancellation: CancellationToken,
 ) {
@@ -2116,8 +2033,8 @@ pub async fn run_with_cancellation(
             let config = AcpAgentConfig::new(&options.command[0])
                 .args(options.command.iter().skip(1).cloned());
             let debug_sink = sink.clone();
-            let (fatal_tx, mut fatal_rx) = mpsc::channel(1);
-            let agent = BoundedAcpAgent::new(config)
+            let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+            let agent = StdioAcpAgent::new(config)
                 .on_stderr(move |chunk| {
                     debug_sink.send(json!({
                         "type": "bridge/stderr",
@@ -2125,7 +2042,7 @@ pub async fn run_with_cancellation(
                     }));
                 })
                 .on_fatal(move |error| {
-                    let _ = fatal_tx.try_send(error);
+                    let _ = fatal_tx.send(error);
                 });
             let connection = run_connection(
                 agent,
@@ -2156,7 +2073,17 @@ pub async fn run_with_cancellation(
                 result = &mut connection => result,
             }
         }
-        Transport::Http | Transport::Ws => match HttpClient::with_endpoint(&options.command[0]) {
+        Transport::Ws => {
+            run_connection(
+                crate::websocket_agent::WebSocketAgent::new(options.command[0].clone()),
+                options.clone(),
+                commands,
+                sink.clone(),
+                cancellation.clone(),
+            )
+            .await
+        }
+        Transport::Http => match HttpClient::with_endpoint(&options.command[0]) {
             Ok(client) => {
                 run_connection(
                     client,
@@ -2184,7 +2111,7 @@ pub async fn run_with_cancellation(
 async fn run_connection<T>(
     transport: T,
     options: Arc<Options>,
-    mut commands: mpsc::Receiver<BridgeInput>,
+    mut commands: mpsc::UnboundedReceiver<BridgeInput>,
     sink: EventSink,
     cancellation: CancellationToken,
 ) -> Result<(), Error>
@@ -2196,7 +2123,7 @@ where
     let (mut scheduling, ingress) =
         scheduling::Scheduling::new(epoch.clone(), sink.clone(), cancellation.clone())?;
     let mut coordinator = coordinator::Coordinator::default();
-    let (observer_events, mut observer_rx) = mpsc::channel(256);
+    let (observer_events, mut observer_rx) = mpsc::unbounded_channel();
     {
         let mut state = state.lock().await;
         state.observer_events = Some(observer_events);
@@ -2216,12 +2143,12 @@ where
         })
         .transpose()?
         .map(Arc::new);
-    let (terminal_snapshot_tx, mut terminal_snapshot_rx) =
-        mpsc::channel(TERMINAL_SNAPSHOT_QUEUE_CAPACITY);
+    let (terminal_snapshot_tx, mut terminal_snapshot_rx) = mpsc::unbounded_channel();
     let terminals = filesystem.clone().map(|filesystem| {
         TerminalManager::new_with_snapshots(filesystem, sink.tx.clone(), Some(terminal_snapshot_tx))
     });
-    let (terminal_barrier, mut terminal_barrier_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
+    let (terminal_barrier, mut terminal_barrier_rx) =
+        mpsc::unbounded_channel::<oneshot::Sender<()>>();
     {
         let ingress = ingress.clone();
         tokio::spawn(async move {
@@ -2288,7 +2215,7 @@ where
                     Implementation::new("attyd", crate::VERSION).title("attyd web client"),
                 );
             let response = connection.send_request(initialize).block_task().await?;
-            ensure_relay_size(&response, "initialize response")?;
+            relay_bytes(&response)?;
             if response.protocol_version != ProtocolVersion::V1 {
                 return Err(Error::invalid_request().data(format!(
                     "unsupported ACP protocol version: {}",
@@ -2546,7 +2473,6 @@ where
                     let result = if bridge_managed_materialization {
                         let mut command = command;
                         let mut backoff = RECONCILE_INITIAL_BACKOFF;
-                        let mut attempt = 0_usize;
                         let materialization_cancel = {
                             let state = context.state.lock().await;
                             intent_session_id.as_deref()
@@ -2557,9 +2483,8 @@ where
                         };
                         loop {
                             if materialization_cancel.is_cancelled() { break Err(Error::request_cancelled()); }
-                            attempt += 1;
                             command["bridgeMaterializationFinalAttempt"] =
-                                json!(attempt >= RECONCILE_MAX_ATTEMPTS);
+                                json!(false);
                             command["bridgeMaterializationRetryAfterMs"] = json!(backoff.as_millis());
                             let result = tokio::select! {
                                 _ = materialization_cancel.cancelled() => break Err(Error::request_cancelled()),
@@ -2570,7 +2495,6 @@ where
                             match result {
                                 Err(error)
                                     if retryable_reconcile_error(&error)
-                                        && attempt < RECONCILE_MAX_ATTEMPTS
                                         && !context.cancellation.is_cancelled() =>
                                 {
                                     tokio::select! {
@@ -2657,7 +2581,7 @@ where
             }
             mcp.close_all().await;
             let (barrier, forwarded) = oneshot::channel();
-            if terminal_barrier.send(barrier).await.is_ok() { let _ = forwarded.await; }
+            if terminal_barrier.send(barrier).is_ok() { let _ = forwarded.await; }
             let drain = async {
                 loop {
                     while let Ok(item) = scheduling.ingress_rx.try_recv() {
@@ -2921,7 +2845,7 @@ async fn handle_session_update(
         Broadcast,
         Direct(u64),
     }
-    if let Err(error) = ensure_relay_size(&notification, "session update") {
+    if let Err(error) = relay_bytes(&notification) {
         sink.acp_error(error, None, Some("session/update"));
         return;
     }
@@ -3104,52 +3028,24 @@ async fn handle_session_update(
                     .expect("replay has an owner")
                     .attachment
                     .control_candidate;
-                if candidate.updates.len() >= MAX_EARLY_UPDATES
-                    || candidate.bytes.saturating_add(bytes) > MAX_EARLY_UPDATE_BYTES
-                {
-                    Err(semantic_error(format!(
-                        "Agent control replay exceeds {MAX_EARLY_UPDATE_BYTES} bytes or {MAX_EARLY_UPDATES} updates"
-                    )))
-                } else {
-                    candidate.bytes = candidate.bytes.saturating_add(bytes);
-                    candidate.updates.push(update.clone());
-                    Ok(())
-                }
+                candidate.bytes = candidate.bytes.saturating_add(bytes);
+                candidate.updates.push(update.clone());
+                Ok(())
             };
             mirrored.map(|()| Delivery::None)
         } else if early_creation {
             let notification_bytes = serde_json::to_vec(&notification)
-                .map(|bytes| bytes.len())
-                .unwrap_or(MAX_EARLY_UPDATE_BYTES + 1);
-            let replay_error = if state.early_update_count >= MAX_EARLY_UPDATES {
-                Some(format!(
-                    "Agent exceeded {MAX_EARLY_UPDATES} updates before completing session creation"
-                ))
-            } else if state.early_update_bytes.saturating_add(notification_bytes)
-                > MAX_EARLY_UPDATE_BYTES
-            {
-                Some(format!(
-                    "Agent session creation replay exceeds {MAX_EARLY_UPDATE_BYTES} bytes"
-                ))
-            } else {
-                None
-            };
-            if let Some(message) = replay_error {
-                if let Some(validation) = owner_validation_mut(&mut state, &session_id, &owner) {
-                    validation.invalid_reason.get_or_insert(message.clone());
-                }
-                Err(semantic_error(message))
-            } else {
-                let staging = state
-                    .creation_staging
-                    .get_mut(&session_id)
-                    .expect("creation allocation was checked");
-                staging.early_notifications.push(notification.clone());
-                staging.bytes += notification_bytes;
-                state.early_update_count += 1;
-                state.early_update_bytes += notification_bytes;
-                Ok(Delivery::None)
-            }
+                .expect("ACP notification serializes")
+                .len();
+            let staging = state
+                .creation_staging
+                .get_mut(&session_id)
+                .expect("creation allocation was checked");
+            staging.early_notifications.push(notification.clone());
+            staging.bytes += notification_bytes;
+            state.early_update_count += 1;
+            state.early_update_bytes += notification_bytes;
+            Ok(Delivery::None)
         } else {
             let incarnation = attached_session_incarnation(&state, &session_id).unwrap_or(0);
             if incarnation != 0 {
@@ -3686,11 +3582,6 @@ async fn handle_command_inner(
     if context.ingress.is_some() && execution.is_none() {
         return Err(Error::internal_error().data("ordered command has no execution ticket"));
     }
-    if serialized_value_len(&command) > MAX_BRIDGE_MESSAGE_BYTES {
-        return Err(Error::invalid_params().data(format!(
-            "Bridge command exceeds {MAX_BRIDGE_MESSAGE_BYTES} bytes"
-        )));
-    }
     let CommandContext {
         auto_close,
         options,
@@ -3705,7 +3596,7 @@ async fn handle_command_inner(
         cancellation,
     } = context;
     let bridge_state = state.clone();
-    let operation = bounded_string_field(&command, "type", MAX_BRIDGE_TYPE_LENGTH)?;
+    let operation = nonempty_string_field(&command, "type")?;
     let epoch = state.lock().await.sessions.epoch().to_string();
     match operation {
         "auth/authenticate" => {
@@ -3735,7 +3626,7 @@ async fn handle_command_inner(
                 AuthenticateRequest::new(method_id.to_string()),
             )
             .await??;
-            ensure_relay_size(&response, "authentication response")?;
+            relay_bytes(&response)?;
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -3758,7 +3649,7 @@ async fn handle_command_inner(
                 LogoutRequest::new(),
             )
             .await??;
-            ensure_relay_size(&response, "logout response")?;
+            relay_bytes(&response)?;
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -3773,13 +3664,6 @@ async fn handle_command_inner(
             let cwd = new_session_cwd(&command, &options)?;
             {
                 let mut state = state.lock().await;
-                if state.sessions.allocated_session_count() + state.pending_creations
-                    >= MAX_TRACKED_SESSIONS
-                {
-                    return Err(semantic_error(format!(
-                        "Active session limit reached ({MAX_TRACKED_SESSIONS})"
-                    )));
-                }
                 state.pending_creations += 1;
             }
             let request = NewSessionRequest::new(&cwd)
@@ -3802,16 +3686,15 @@ async fn handle_command_inner(
                 Ok(response) => {
                     let session_id = response.session_id.0.to_string();
                     let response_value = serde_json::to_value(&response)?;
-                    let tracked =
-                        ensure_relay_size(&response, "session/new response").and_then(|_| {
-                            prepare_session_response(
-                                &mut state,
-                                &session_id,
-                                cwd.clone(),
-                                &response_value,
-                                None,
-                            )
-                        });
+                    let tracked = relay_bytes(&response).and_then(|_| {
+                        prepare_session_response(
+                            &mut state,
+                            &session_id,
+                            cwd.clone(),
+                            &response_value,
+                            None,
+                        )
+                    });
                     let early_updates = match tracked {
                         Ok(updates) => updates,
                         Err(error) => {
@@ -3905,42 +3788,21 @@ async fn handle_command_inner(
             require_agent_method("session/list", &state).await?;
             let cursor = match command.get("cursor") {
                 None | Some(Value::Null) => None,
-                Some(Value::String(cursor))
-                    if !cursor.is_empty() && cursor.encode_utf16().count() <= 4_096 =>
-                {
-                    Some(cursor.clone())
-                }
+                Some(Value::String(cursor)) if !cursor.is_empty() => Some(cursor.clone()),
                 Some(_) => {
                     return Err(Error::invalid_params()
-                        .data("session/list cursor must be a non-empty bounded string"));
+                        .data("session/list cursor must be a non-empty string"));
                 }
             };
             let expected_revision = match command.get("expectedCatalogRevision") {
                 None | Some(Value::Null) => None,
-                Some(Value::String(revision)) if !revision.is_empty() && revision.len() <= 128 => {
-                    Some(revision.as_str())
-                }
+                Some(Value::String(revision)) if !revision.is_empty() => Some(revision.as_str()),
                 Some(_) => {
                     return Err(Error::invalid_params()
-                        .data("expectedCatalogRevision must be a non-empty bounded string"));
+                        .data("expectedCatalogRevision must be a non-empty string"));
                 }
             };
-            // Waiting for another browser's page releases the execution ticket,
-            // but must keep an independent operation budget. RPC reservations do
-            // not exist yet and cannot bound these mutex waiters.
-            let (list_gate, _list_admission) = {
-                let state = state.lock().await;
-                let admission = state
-                    .session_list_limit
-                    .0
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| {
-                        Error::new(-32000, "Too many pending session list requests")
-                            .data(json!({ "kind": "session_list_capacity" }))
-                    })?;
-                (state.session_list_gate.clone(), admission)
-            };
+            let list_gate = state.lock().await.session_list_gate.clone();
             let list_owner = rpc_owner(&epoch, None, &request_id, None);
             drop(execution.take());
             let _list_request = list_gate.lock().await;
@@ -4156,7 +4018,7 @@ async fn handle_command_inner(
                     return Err(error);
                 }
             };
-            if let Err(error) = ensure_relay_size(&response, "session attachment response") {
+            if let Err(error) = relay_bytes(&response) {
                 fail_runtime_attachment(
                     &mut state,
                     &session_id,
@@ -4350,20 +4212,6 @@ async fn handle_command_inner(
                     RuntimeSessionOperationKind::Fork,
                     &request_id,
                 )?;
-                if state.sessions.allocated_session_count() + state.pending_creations
-                    >= MAX_TRACKED_SESSIONS
-                {
-                    release_session_operation(
-                        &mut state,
-                        &source_id,
-                        source_incarnation,
-                        SessionAdmission::Fork,
-                        &request_id,
-                    );
-                    return Err(semantic_error(format!(
-                        "Active session limit reached ({MAX_TRACKED_SESSIONS})"
-                    )));
-                }
                 let epoch = state.sessions.epoch().to_string();
                 if let Err(error) = state.sessions.start_operation(
                     &epoch,
@@ -4438,7 +4286,7 @@ async fn handle_command_inner(
             };
             let session_id = response.session_id.0.to_string();
             let response_value = serde_json::to_value(&response)?;
-            let tracked = ensure_relay_size(&response, "session/fork response").and_then(|_| {
+            let tracked = relay_bytes(&response).and_then(|_| {
                 if session_id == source_id {
                     Err(Error::invalid_request()
                         .data("Agent returned the source session ID for session/fork"))
@@ -5223,7 +5071,7 @@ async fn handle_command_inner(
                     return Err(error);
                 }
             };
-            if let Err(error) = ensure_relay_size(&response, "session mode response") {
+            if let Err(error) = relay_bytes(&response) {
                 let mut state = state.lock().await;
 
                 let epoch = state.sessions.epoch().to_string();
@@ -5390,7 +5238,7 @@ async fn handle_command_inner(
                     return Err(error);
                 }
             };
-            if let Err(error) = ensure_relay_size(&response, "session config response") {
+            if let Err(error) = relay_bytes(&response) {
                 let mut state = state.lock().await;
 
                 let epoch = state.sessions.epoch().to_string();
@@ -5651,7 +5499,7 @@ async fn handle_command_inner(
         "context/search" => {
             let request_id = string_field(&command, "requestId")?;
             let session_id = string_field(&command, "sessionId")?;
-            let query = string_field_allow_empty(&command, "query", 256)?;
+            let query = string_field_allow_empty(&command, "query")?;
             let filesystem = filesystem.ok_or_else(|| {
                 Error::method_not_found()
                     .data("workspace context is unavailable for remote transports")
@@ -5680,7 +5528,7 @@ async fn handle_command_inner(
         "context/read" => {
             let request_id = string_field(&command, "requestId")?;
             let session_id = string_field(&command, "sessionId")?;
-            let path = bounded_string_field(&command, "path", MAX_BRIDGE_PATH_LENGTH)?;
+            let path = nonempty_string_field(&command, "path")?;
             let filesystem = filesystem.ok_or_else(|| {
                 Error::method_not_found()
                     .data("workspace context is unavailable for remote transports")
@@ -5742,7 +5590,7 @@ async fn handle_command_inner(
         }
         "auth/terminal_input" => {
             let request_id = string_field(&command, "requestId")?;
-            let data = string_field_allow_empty(&command, "data", MAX_BRIDGE_MESSAGE_BYTES)?;
+            let data = string_field_allow_empty(&command, "data")?;
             auth_terminal.write(request_id, data)?;
         }
         "auth/terminal_resize" => {
@@ -6095,9 +5943,7 @@ async fn synchronize_authoritative_history(
     };
     let epoch = state.lock().await.sessions.epoch().to_string();
     let mut backoff = RECONCILE_INITIAL_BACKOFF;
-    let mut attempt = 0_usize;
     loop {
-        attempt += 1;
         let attempt_id = Uuid::new_v4().to_string();
         let validation_owner = {
             let mut state = state.lock().await;
@@ -6156,7 +6002,7 @@ async fn synchronize_authoritative_history(
             let failure = match result {
                 Ok(response) => {
                     let response_value = serde_json::to_value(&response)?;
-                    let validation_error = ensure_relay_size(&response, "session/load response")
+                    let validation_error = relay_bytes(&response)
                         .err()
                         .or_else(|| response_controls(&response_value).err())
                         .or_else(|| {
@@ -6263,8 +6109,7 @@ async fn synchronize_authoritative_history(
                 Err(error) => {
                     rollback_replay_validation(&mut state, session_id, &validation_owner);
                     take_sync_control_candidate(&mut state, session_id);
-                    let retryable =
-                        retryable_reconcile_error(&error) && attempt < RECONCILE_MAX_ATTEMPTS;
+                    let retryable = retryable_reconcile_error(&error);
                     session_mirror(&mut state)
                         .fail_load(
                             session_id,
@@ -6316,34 +6161,21 @@ async fn synchronize_authoritative_history(
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
-    bounded_string_field(value, field, MAX_BRIDGE_IDENTIFIER_LENGTH)
+    nonempty_string_field(value, field)
 }
 
-fn bounded_string_field<'a>(
-    value: &'a Value,
-    field: &str,
-    maximum: usize,
-) -> Result<&'a str, Error> {
+fn nonempty_string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
     value
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.encode_utf16().count() <= maximum)
-        .ok_or_else(|| {
-            Error::invalid_params().data(format!(
-                "{field} must contain between 1 and {maximum} characters"
-            ))
-        })
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::invalid_params().data(format!("{field} must contain non-empty")))
 }
 
-fn string_field_allow_empty<'a>(
-    value: &'a Value,
-    field: &str,
-    maximum: usize,
-) -> Result<&'a str, Error> {
+fn string_field_allow_empty<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
     value
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| value.encode_utf16().count() <= maximum)
         .ok_or_else(|| Error::invalid_params().data(format!("{field} must be a string")))
 }
 
@@ -6391,24 +6223,10 @@ fn advance_catalog_revision(state: &mut BridgeState, sink: &EventSink) -> u64 {
 fn validate_session_list_page(
     response: &ListSessionsResponse,
     cursor: Option<&str>,
-    state: &BridgeState,
+    _state: &BridgeState,
 ) -> Result<(), Error> {
-    ensure_relay_size(response, "session/list response")?;
-    if response.sessions.len() > MAX_LISTED_SESSIONS {
-        return Err(Error::invalid_request().data(format!(
-            "Agent returned more than {MAX_LISTED_SESSIONS} sessions in one page"
-        )));
-    }
+    relay_bytes(response)?;
 
-    let mut retained_sessions: HashMap<&str, &SessionInfo> = if cursor.is_none() {
-        HashMap::new()
-    } else {
-        state
-            .listed_sessions
-            .iter()
-            .map(|(id, session)| (id.as_str(), session))
-            .collect()
-    };
     for session in &response.sessions {
         let session_id = session.session_id.0.as_ref();
         if validate_agent_session_id(session_id).is_err() {
@@ -6420,11 +6238,6 @@ fn validate_session_list_page(
         if !valid_session_path(&cwd) {
             return Err(Error::invalid_request().data(format!(
                 "Agent returned an invalid absolute session cwd: {session_id}"
-            )));
-        }
-        if session.additional_directories.len() > 256 {
-            return Err(Error::invalid_request().data(format!(
-                "Agent listed session {session_id} with more than 256 additional directories"
             )));
         }
         for directory in &session.additional_directories {
@@ -6445,28 +6258,9 @@ fn validate_session_list_page(
             &format!("Agent listed session {session_id}"),
         )
         .map_err(semantic_error)?;
-        retained_sessions.insert(session_id, session);
     }
-    if retained_sessions.len() > MAX_LISTED_SESSIONS {
-        return Err(Error::invalid_request().data(format!(
-            "session/list returned more than {MAX_LISTED_SESSIONS} unique sessions"
-        )));
-    }
-    // Repeated pages from independent observers replace the same metadata.
-    // Bound the actual retained rows, not previously relayed response bytes.
-    let retained_bytes = retained_sessions
-        .values()
-        .try_fold(0_usize, |total, session| {
-            serde_json::to_vec(session).map(|bytes| total.saturating_add(bytes.len()))
-        })?;
-    if retained_bytes > MAX_SESSION_LIST_TOTAL_BYTES {
-        return Err(Error::invalid_request().data(format!(
-            "retained session/list metadata exceeds {MAX_SESSION_LIST_TOTAL_BYTES} bytes"
-        )));
-    }
-
     if let Some(next_cursor) = &response.next_cursor {
-        if next_cursor.is_empty() || next_cursor.encode_utf16().count() > 4_096 {
+        if next_cursor.is_empty() {
             return Err(
                 Error::invalid_request().data("Agent returned an invalid session/list cursor")
             );
@@ -6480,10 +6274,7 @@ fn validate_session_list_page(
 }
 
 fn valid_session_path(value: &str) -> bool {
-    !value.is_empty()
-        && value.encode_utf16().count() <= 16_384
-        && !value.contains('\0')
-        && is_portable_absolute_path(value)
+    !value.is_empty() && !value.contains('\0') && is_portable_absolute_path(value)
 }
 
 fn validate_prompt_capabilities(blocks: &[Value], state: &BridgeState) -> Result<(), Error> {
@@ -6662,14 +6453,6 @@ fn reserve_attachment_locked(
                     ))
                 })?),
             };
-            if state.sessions.live(session_id).is_none()
-                && state.sessions.allocated_session_count() + state.pending_creations
-                    >= MAX_TRACKED_SESSIONS
-            {
-                return Err(semantic_error(format!(
-                    "Active session limit reached ({MAX_TRACKED_SESSIONS})"
-                )));
-            }
             // A retry installs a fresh live incarnation. Move the same loading
             // transaction explicitly so retirement cancels every other old handle.
             let previous_incarnation = state
@@ -6721,24 +6504,6 @@ fn reserve_attachment_locked(
     begin_replay_validation(state, session_id);
     clear_attachment_delivery(state, session_id, reservation.incarnation());
     Ok(reservation)
-}
-
-fn session_operation_count(state: &BridgeState, kind: SessionAdmission) -> usize {
-    state
-        .sessions
-        .iter_states()
-        .filter(|session| {
-            session
-                .operation
-                .as_ref()
-                .is_some_and(|operation| operation.kind.admission() == kind)
-        })
-        .count()
-        + if kind == SessionAdmission::Delete {
-            state.catalog_deletions.len()
-        } else {
-            0
-        }
 }
 
 fn settle_attachment(state: &mut BridgeState, session_id: &str) {
@@ -6890,11 +6655,6 @@ fn reserve_deletion(
         return Err(
             Error::invalid_request().data("another prompt or session mutation is already running")
         );
-    }
-    if session_operation_count(state, SessionAdmission::Delete) >= MAX_TRACKED_SESSIONS {
-        return Err(semantic_error(format!(
-            "Pending session deletion limit reached ({MAX_TRACKED_SESSIONS})"
-        )));
     }
     if let Some(session) = state.sessions.state(session_id) {
         let incarnation = session.incarnation;
@@ -7205,11 +6965,6 @@ fn validate_configured_capabilities(
 }
 
 fn validate_auth_methods(methods: &[AuthMethod], terminal_supported: bool) -> Result<(), Error> {
-    if methods.len() > MAX_AUTH_METHODS {
-        return Err(semantic_error(format!(
-            "Agent advertised more than {MAX_AUTH_METHODS} authentication methods"
-        )));
-    }
     let mut ids = HashSet::new();
     for method in methods {
         let id = method.id().0.as_ref();
@@ -7220,16 +6975,9 @@ fn validate_auth_methods(methods: &[AuthMethod], terminal_supported: bool) -> Re
             )));
         }
         let name = method.name();
-        if name.is_empty() || name.encode_utf16().count() > MAX_AUTH_METHOD_NAME_LENGTH {
+        if name.is_empty() {
             return Err(semantic_error(format!(
-                "Agent authentication method name must contain between 1 and {MAX_AUTH_METHOD_NAME_LENGTH} characters"
-            )));
-        }
-        if method.description().is_some_and(|description| {
-            description.encode_utf16().count() > MAX_AUTH_METHOD_DESCRIPTION_LENGTH
-        }) {
-            return Err(semantic_error(format!(
-                "Agent authentication method description exceeds {MAX_AUTH_METHOD_DESCRIPTION_LENGTH} characters"
+                "Agent authentication method name must not be empty"
             )));
         }
         if let AuthMethod::Terminal(method) = method {
@@ -7275,6 +7023,13 @@ async fn require_agent_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FORMER_BRIDGE_MESSAGE_BYTES: usize = 5 * 1024 * 1024;
+    const FORMER_BRIDGE_IDENTIFIER_LENGTH: usize = 1_024;
+    const FORMER_BRIDGE_PATH_LENGTH: usize = 16_384;
+    const FORMER_AGENT_RELAY_BYTES: usize = 4_000_000;
+    const FORMER_TRACKED_SESSIONS: usize = 32;
+    const FORMER_BRIDGE_ERROR_DATA_BYTES: usize = 256 * 1024;
+
     use clap::Parser;
 
     fn register_test_session(state: &mut BridgeState, session_id: &str, cwd: &str) -> u64 {
@@ -7912,7 +7667,7 @@ mod tests {
     }
 
     async fn request(
-        commands: &mpsc::Sender<BridgeInput>,
+        commands: &mpsc::UnboundedSender<BridgeInput>,
         command: Value,
     ) -> Result<Value, String> {
         if command["type"] == "session/prompt" {
@@ -7928,7 +7683,6 @@ mod tests {
                         cwd: None,
                         response,
                     })
-                    .await
                     .unwrap();
                 let view = result.await.unwrap().unwrap();
                 view["session"]["historyRevision"]
@@ -7945,14 +7699,12 @@ mod tests {
                     prompt: command["prompt"].as_array().unwrap().clone(),
                     response,
                 })
-                .await
                 .unwrap();
             result.await.unwrap()
         } else {
             let (response, result) = oneshot::channel();
             commands
                 .send(BridgeInput::BusinessRequest { command, response })
-                .await
                 .unwrap();
             result.await.unwrap().map_err(|error| {
                 error.message + &error.data.map_or(String::new(), |data| data.to_string())
@@ -7970,65 +7722,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relays_a_fatal_oversized_stdio_line_before_initialization() {
-        let cwd = env!("CARGO_MANIFEST_DIR");
-        let fixture = std::path::Path::new(cwd).join("tests/fixtures/fake-agent.ts");
-        let fixture = fixture.to_string_lossy().into_owned();
-        let options = Options::try_parse_from([
-            "attyd",
-            "--cwd",
-            cwd,
-            "--",
-            "node",
-            "--import",
-            "tsx",
-            &fixture,
-            "--oversized-stdout-line",
-        ])
-        .unwrap()
-        .normalized()
-        .unwrap();
-        let (_commands, command_rx) = mpsc::channel(1);
-        let (event_tx, mut events) = mpsc::unbounded_channel();
-        tokio::spawn(run_with_cancellation(
-            Arc::new(options),
-            command_rx,
-            event_tx.into(),
-            CancellationToken::new(),
-        ));
-
-        let mut received = Vec::new();
-        let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let event = events.recv().await.expect("bridge event channel closed");
-                let value: Value = serde_json::from_str(&event).unwrap();
-                received.push(value.clone());
-                if value["type"] == "bridge/error" {
-                    return value;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("bridge did not relay fatal transport error: {received:?}"));
-        assert!(
-            error
-                .to_string()
-                .contains("Agent NDJSON line exceeds 8000000 bytes"),
-            "unexpected bridge error: {error}"
-        );
-        assert!(
-            !received
-                .iter()
-                .any(|event| event["type"] == "acp/initialized")
-        );
-    }
-
-    #[tokio::test]
     async fn cold_load_burst_preserves_all_history_and_keeps_catalog_available() {
         let cwd = env!("CARGO_MANIFEST_DIR");
         let fixture = format!("{cwd}/tests/fixtures/burst-load-agent.mjs");
         let options = options(&["attyd", "--cwd", cwd, "--", "node", &fixture]);
-        let (commands, command_rx) = mpsc::channel(16);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let bridge = tokio::spawn(run_with_cancellation(
@@ -8057,7 +7755,6 @@ mod tests {
                     expected_owner: None,
                     response,
                 })
-                .await
                 .unwrap();
             // The fixture withholds the load response until catalog operations
             // have completed. Listing cannot depend on the history transaction.
@@ -8099,7 +7796,7 @@ mod tests {
             };
             let updates = view["baseline"]["updates"].as_array().unwrap();
             assert_eq!(updates.len(), 10_050, "history replay was truncated");
-            assert!(serialized_value_len(&view["baseline"]["updates"]) > MAX_EARLY_UPDATE_BYTES);
+            assert!(serialized_value_len(&view["baseline"]["updates"]) > 1_000_000);
             for (index, update) in updates.iter().enumerate() {
                 assert_eq!(update["messageId"], format!("history-{index}"));
             }
@@ -8140,7 +7837,7 @@ mod tests {
         let cwd = env!("CARGO_MANIFEST_DIR");
         let fixture = format!("{cwd}/tests/fixtures/fork-response-batch-agent.mjs");
         let options = options(&["attyd", "--cwd", cwd, "--", "node", &fixture]);
-        let (commands, command_rx) = mpsc::channel(16);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let bridge = tokio::spawn(run_with_cancellation(
@@ -8209,7 +7906,6 @@ mod tests {
                 cwd: None,
                 response,
             })
-            .await
             .unwrap();
         let recovered = received.await.unwrap().unwrap();
         assert_eq!(recovered["baseline"], fork["view"]["baseline"]);
@@ -8248,7 +7944,7 @@ mod tests {
             &fixture,
             "--fork-source-update-before-response",
         ]);
-        let (commands, command_rx) = mpsc::channel(16);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let bridge = tokio::spawn(run_with_cancellation(
@@ -8331,7 +8027,6 @@ mod tests {
                 }),
                 response: release_reply,
             })
-            .await
             .unwrap();
         // Releasing Fork can change the catalog before this list response is
         // reduced. That obsolete page is correctly rejected, but no other error is.
@@ -8394,7 +8089,7 @@ mod tests {
         .unwrap()
         .normalized()
         .unwrap();
-        let (commands, command_rx) = mpsc::channel(16);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let bridge = tokio::spawn(run_with_cancellation(
@@ -8591,7 +8286,6 @@ mod tests {
                     }),
                     response,
                 })
-                .await
                 .unwrap();
             replies.push(result);
         }
@@ -8640,7 +8334,7 @@ mod tests {
         .unwrap()
         .normalized()
         .unwrap();
-        let (commands, command_rx) = mpsc::channel(16);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let bridge = tokio::spawn(run_with_cancellation(
@@ -8770,7 +8464,7 @@ mod tests {
         .unwrap()
         .normalized()
         .unwrap();
-        let (commands, command_rx) = mpsc::channel(16);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let bridge = tokio::spawn(run_with_cancellation(
@@ -8869,7 +8563,6 @@ mod tests {
                 cwd: None,
                 response: response_tx,
             })
-            .await
             .unwrap();
         let rebuilt = response_rx.await.unwrap().unwrap();
         assert_eq!(rebuilt["baseline"], completed["baseline"]);
@@ -8956,7 +8649,7 @@ mod tests {
         .unwrap()
         .normalized()
         .unwrap();
-        let (commands, command_rx) = mpsc::channel(16);
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let bridge = tokio::spawn(run_with_cancellation(
@@ -10111,65 +9804,59 @@ mod tests {
     }
 
     #[test]
-    fn bounds_structured_acp_errors_before_browser_relay() {
+    fn relays_complete_structured_acp_errors() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         sink.acp_error(
             Error::internal_error()
-                .data(json!({ "payload": "x".repeat(MAX_BRIDGE_ERROR_DATA_BYTES + 1) })),
+                .data(json!({ "payload": "x".repeat(FORMER_BRIDGE_ERROR_DATA_BYTES + 1) })),
             Some("request"),
             Some("session/prompt"),
         );
         let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(event["type"], "bridge/error");
-        assert_eq!(event["dataTruncated"], true);
-        assert!(event.get("data").is_none());
+        assert!(event.get("dataTruncated").is_none());
+        assert_eq!(
+            event["data"]["payload"].as_str().unwrap().len(),
+            FORMER_BRIDGE_ERROR_DATA_BYTES + 1
+        );
         assert_eq!(event["requestId"], "request");
     }
 
     #[test]
-    fn bounds_agent_relay_values_and_browser_event_fallbacks() {
-        assert!(ensure_relay_size(&json!({ "ok": true }), "fixture").is_ok());
-        assert!(
-            ensure_relay_size(
-                &json!({ "padding": "x".repeat(MAX_AGENT_RELAY_BYTES) }),
-                "fixture",
-            )
-            .is_err()
-        );
+    fn relays_large_values_and_browser_events_without_replacement() {
+        assert!(relay_bytes(&json!({ "ok": true })).is_ok());
+        assert!(relay_bytes(&json!({ "padding": "x".repeat(FORMER_AGENT_RELAY_BYTES) })).is_ok());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
-        sink.send(json!({ "padding": "x".repeat(MAX_BRIDGE_MESSAGE_BYTES) }));
+        sink.send(json!({ "padding": "x".repeat(FORMER_BRIDGE_MESSAGE_BYTES) }));
         let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(event["type"], "bridge/error");
-        assert!(
-            event["message"]
-                .as_str()
-                .unwrap()
-                .contains("browser event exceeds")
+        assert_eq!(
+            event["padding"].as_str().unwrap().len(),
+            FORMER_BRIDGE_MESSAGE_BYTES
         );
     }
 
     #[test]
-    fn validates_bounded_browser_fields_and_terminal_dimensions() {
+    fn validates_browser_field_types_and_terminal_dimensions() {
         let command = json!({
             "requestId": "request",
             "empty": "",
-            "tooLong": "x".repeat(MAX_BRIDGE_IDENTIFIER_LENGTH + 1),
-            "wideIdentifier": "😀".repeat(MAX_BRIDGE_IDENTIFIER_LENGTH / 2),
-            "tooWideIdentifier": "😀".repeat(MAX_BRIDGE_IDENTIFIER_LENGTH / 2 + 1),
-            "path": "x".repeat(MAX_BRIDGE_PATH_LENGTH),
+            "tooLong": "x".repeat(FORMER_BRIDGE_IDENTIFIER_LENGTH + 1),
+            "wideIdentifier": "😀".repeat(FORMER_BRIDGE_IDENTIFIER_LENGTH / 2),
+            "tooWideIdentifier": "😀".repeat(FORMER_BRIDGE_IDENTIFIER_LENGTH / 2 + 1),
+            "path": "x".repeat(FORMER_BRIDGE_PATH_LENGTH),
             "cols": 80,
             "zero": 0,
         });
         assert_eq!(string_field(&command, "requestId").unwrap(), "request");
         assert!(string_field(&command, "empty").is_err());
-        assert!(string_field(&command, "tooLong").is_err());
+        assert!(string_field(&command, "tooLong").is_ok());
         assert!(string_field(&command, "wideIdentifier").is_ok());
-        assert!(string_field(&command, "tooWideIdentifier").is_err());
-        assert!(bounded_string_field(&command, "path", MAX_BRIDGE_PATH_LENGTH).is_ok());
-        assert_eq!(string_field_allow_empty(&command, "empty", 4).unwrap(), "");
+        assert!(string_field(&command, "tooWideIdentifier").is_ok());
+        assert!(nonempty_string_field(&command, "path").is_ok());
+        assert_eq!(string_field_allow_empty(&command, "empty").unwrap(), "");
         assert_eq!(u16_field(&command, "cols").unwrap(), 80);
         assert!(u16_field(&command, "zero").is_err());
         assert!(u16_field(&json!({ "cols": 65_536 }), "cols").is_err());
@@ -10270,7 +9957,7 @@ mod tests {
     #[test]
     fn reload_does_not_consume_an_extra_creation_slot() {
         let mut state = BridgeState::default();
-        for index in 0..MAX_TRACKED_SESSIONS - 1 {
+        for index in 0..FORMER_TRACKED_SESSIONS - 1 {
             register_test_session(&mut state, &format!("session-{index}"), "/workspace");
         }
         reserve_attachment_locked(
@@ -10284,7 +9971,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             state.sessions.allocated_session_count(),
-            MAX_TRACKED_SESSIONS - 1
+            FORMER_TRACKED_SESSIONS - 1
         );
         reserve_attachment_locked(
             &mut state,
@@ -10297,7 +9984,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             state.sessions.allocated_session_count(),
-            MAX_TRACKED_SESSIONS
+            FORMER_TRACKED_SESSIONS
         );
         assert!(
             reserve_attachment_locked(
@@ -10308,7 +9995,7 @@ mod tests {
                 "overflow-load",
                 None
             )
-            .is_err()
+            .is_ok()
         );
         // A confirmed close followed by failed deletion leaves a Closed live
         // owner. Reattaching replaces that allocation instead of requiring a new slot.
@@ -10345,7 +10032,7 @@ mod tests {
         assert_ne!(replacement.incarnation(), incarnation);
         assert_eq!(
             state.sessions.allocated_session_count(),
-            MAX_TRACKED_SESSIONS
+            FORMER_TRACKED_SESSIONS + 1
         );
     }
 
@@ -10568,7 +10255,7 @@ mod tests {
     async fn owner_cancelled_observe_restarts_absence_and_fences_an_old_timer() {
         let mut state = BridgeState::default();
         let incarnation = register_test_session(&mut state, "session", "/workspace");
-        let (input, mut commands) = mpsc::channel(8);
+        let (input, mut commands) = mpsc::unbounded_channel();
         state.observer_events = Some(input);
         state.observer_timeout = Some(30);
         refresh_observer_timers(&mut state);
@@ -11021,15 +10708,15 @@ mod tests {
     }
 
     #[test]
-    fn catalog_deletion_reservations_enforce_global_capacity() {
+    fn catalog_deletion_reservations_have_no_global_count_limit() {
         let mut state = BridgeState::default();
         let first = reserve_deletion(&mut state, "first", "first").unwrap();
-        for index in 1..MAX_TRACKED_SESSIONS {
+        for index in 1..FORMER_TRACKED_SESSIONS {
             let id = format!("remote-{index}");
             reserve_deletion(&mut state, &id, &id).unwrap();
         }
-        assert!(reserve_deletion(&mut state, "excess", "excess").is_err());
-        assert_eq!(state.catalog_deletions.len(), MAX_TRACKED_SESSIONS);
+        assert!(reserve_deletion(&mut state, "excess", "excess").is_ok());
+        assert_eq!(state.catalog_deletions.len(), FORMER_TRACKED_SESSIONS + 1);
         assert_eq!(state.sessions.iter_states().count(), 0);
         release_deletion(&mut state, "first", first, "first");
         assert!(reserve_deletion(&mut state, "replacement", "replacement").is_ok());
@@ -11071,7 +10758,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cyclic_session_list_cursors_and_unbounded_rows() {
+    fn rejects_cyclic_cursors_and_accepts_large_session_metadata() {
         let mut state = BridgeState::default();
         state.listed_sessions.insert(
             "saved".to_string(),
@@ -11119,7 +10806,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert!(validate_session_list_page(&too_many_roots, None, &state).is_err());
+        assert!(validate_session_list_page(&too_many_roots, None, &state).is_ok());
 
         let invalid_metadata: ListSessionsResponse = serde_json::from_value(json!({
             "sessions": [{
@@ -11129,13 +10816,13 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert!(validate_session_list_page(&invalid_metadata, None, &state).is_err());
+        assert!(validate_session_list_page(&invalid_metadata, None, &state).is_ok());
 
         let invalid_cursor: ListSessionsResponse = serde_json::from_value(json!({
             "sessions": [], "nextCursor": "x".repeat(4_097)
         }))
         .unwrap();
-        assert!(validate_session_list_page(&invalid_cursor, None, &state).is_err());
+        assert!(validate_session_list_page(&invalid_cursor, None, &state).is_ok());
     }
 
     #[tokio::test]
@@ -12357,20 +12044,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caps_early_update_retention_and_marks_invalid_replays() {
+    async fn preserves_early_update_bursts_until_creation_completes() {
         let state = Arc::new(Mutex::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
-        for index in 0..(MAX_EARLY_UPDATES + 16) {
+        for index in 0..10_016 {
             let notification: SessionNotification = serde_json::from_value(json!({
                 "sessionId": "new-session",
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "messageId": format!("message-{index}"),
-                    "content": { "type": "text", "text": "early" }
+                    "messageId": "early-answer",
+                    "content": { "type": "text", "text": format!("{index}:{}", "x".repeat(128)) }
                 }
             }))
             .unwrap();
@@ -12384,19 +12071,16 @@ mod tests {
             .map(|staging| staging.early_notifications.len())
             .sum::<usize>();
         let state = state.lock().await;
-        assert!(retained <= MAX_EARLY_UPDATES);
-        assert!(state.early_update_bytes <= MAX_EARLY_UPDATE_BYTES);
+        assert_eq!(retained, 10_016);
+        assert!(state.early_update_bytes > 1_000_000);
         assert!(
             state.creation_staging["new-session"]
                 .validation
                 .invalid_reason
-                .is_some()
+                .is_none()
         );
         drop(state);
-        while let Ok(event) = rx.try_recv() {
-            let event: Value = serde_json::from_str(&event).unwrap();
-            assert_eq!(event["type"], "bridge/error");
-        }
+        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -12410,7 +12094,7 @@ mod catalog_command_tests {
     use std::io;
 
     struct CatalogWire {
-        commands: mpsc::Sender<BridgeInput>,
+        commands: mpsc::UnboundedSender<BridgeInput>,
         requests: futures::channel::mpsc::Receiver<String>,
         responses: futures::channel::mpsc::Sender<io::Result<String>>,
         buffered: VecDeque<Value>,
@@ -12434,7 +12118,7 @@ mod catalog_command_tests {
             .unwrap()
             .normalized()
             .unwrap();
-            let (commands, command_rx) = mpsc::channel(64);
+            let (commands, command_rx) = mpsc::unbounded_channel();
             let (events, event_rx) = mpsc::unbounded_channel();
             let cancellation = CancellationToken::new();
             let task = tokio::spawn(run_connection(
@@ -12476,7 +12160,6 @@ mod catalog_command_tests {
             let (response, result) = oneshot::channel();
             self.commands
                 .send(BridgeInput::BusinessRequest { command, response })
-                .await
                 .unwrap();
             result
         }
@@ -12538,7 +12221,7 @@ mod catalog_command_tests {
     }
 
     #[tokio::test]
-    async fn session_list_waiters_are_bounded_without_blocking_catalog_deletion() {
+    async fn session_list_waiters_survive_backlog_without_blocking_catalog_deletion() {
         let mut wire = CatalogWire::start().await;
         let first = wire
             .submit(json!({
@@ -12548,15 +12231,15 @@ mod catalog_command_tests {
         let held = wire.next_request().await;
         assert_eq!(held["method"], "session/list");
         let mut waiting = Vec::new();
-        for index in 1..MAX_PENDING_LIST_REQUESTS {
+        for index in 1..64 {
             let result = wire
                 .submit(json!({
                     "type": "session/list", "requestId": format!("waiting-{index}"),
                 }))
                 .await;
             if index == 1 {
-                // An HTTP timeout drops only its receiver. Accepted work still
-                // occupies the bounded operation slot until it settles.
+                // A disconnected HTTP caller drops only its receiver; accepted
+                // work still settles in order.
                 drop(result);
                 waiting.push(None);
             } else {
@@ -12568,8 +12251,7 @@ mod catalog_command_tests {
                 "type": "session/list", "requestId": "excess",
             }))
             .await;
-        let error = CatalogWire::result(excess).await.unwrap_err();
-        assert_eq!(error.data.unwrap()["kind"], "session_list_capacity");
+        waiting.push(Some(excess));
 
         // List mutex waiters must neither borrow every Control RPC slot nor
         // retain the global execution ticket while the Agent is parked.
@@ -12793,7 +12475,7 @@ mod ordered_command_tests {
     use crate::session_dispatch::TrafficClass;
 
     #[tokio::test]
-    async fn ordered_send_preserves_rollback_ticket_and_yields_only_during_rpc_wait() {
+    async fn ordered_send_survives_many_registrations_and_yields_only_during_rpc_wait() {
         let (events, _events) = mpsc::unbounded_channel();
         let (mut scheduling, ingress) = Scheduling::new(
             "epoch".into(),
@@ -12813,7 +12495,7 @@ mod ordered_command_tests {
         }
         let mut execution = Some(scheduling.pump().unwrap().unwrap().turn);
         let mut reservations = Vec::new();
-        for index in 0..32 {
+        for index in 0..128 {
             reservations.push(
                 ingress
                     .prepare_rpc(
@@ -12846,29 +12528,6 @@ mod ordered_command_tests {
             )
             .connect_with(transport, async move |connection| {
                 let owner = rpc_owner("epoch", Some(("session", 1)), "prompt", None);
-                let result = send_ordered(
-                    &connection,
-                    Some(&ingress),
-                    &mut execution,
-                    owner.clone(),
-                    RequestClass::LongRunning,
-                    UntypedMessage::new("test/prompt", json!({})).unwrap(),
-                )
-                .await;
-                assert!(
-                    result.unwrap().is_err(),
-                    "budget exhaustion is a local rollback error"
-                );
-                assert!(
-                    execution
-                        .as_ref()
-                        .is_some_and(|turn| turn.matches_owner(&owner))
-                );
-                assert!(
-                    scheduling.pump().unwrap().is_none(),
-                    "rollback still excludes the next local turn"
-                );
-                drop(reservations);
                 let mut waiting = Box::pin(send_ordered(
                     &connection,
                     Some(&ingress),
@@ -12921,6 +12580,7 @@ mod ordered_command_tests {
                 );
                 drop(execution.take());
                 assert!(scheduling.pump().unwrap().is_some());
+                drop(reservations);
                 finished.send(()).unwrap();
                 Ok(())
             });

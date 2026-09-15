@@ -23,9 +23,7 @@ use crate::session_dispatch::DeliveryGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HandoffError {
-    InvalidLimit,
     Closed,
-    RegistrationLimit,
     DuplicateOwner,
     RegistryPoisoned,
     Withdrawn,
@@ -71,8 +69,8 @@ pub(crate) enum DiscardDisposition {
     StaleRequestId,
 }
 
-/// Owns both ingress completion budgets and the session's current FIFO delivery.
-/// Dropping it releases all budgets and the busy flag before waking the pump.
+/// Owns the ingress completion and the session's current FIFO delivery.
+/// Dropping it releases the payload and the busy flag before waking the pump.
 #[must_use = "reduce the local result transition or drop the turn to release the session"]
 #[derive(Debug)]
 pub(crate) struct CompletionTurn {
@@ -96,7 +94,7 @@ impl CompletionTurn {
 
     /// Run a synchronous local result transition, retaining the guard through
     /// success, early error, and panic. The completion itself cannot be moved out
-    /// of this API; callers may take its result while keeping its budget here.
+    /// of this API; callers may take its result while keeping its delivery guard here.
     /// Return external cleanup work for execution only after this method returns.
     pub(crate) fn reduce<R>(mut self, reduce: impl FnOnce(&mut OrderedCompletion) -> R) -> R {
         let result = reduce(self.completion.as_mut().expect("live completion turn"));
@@ -127,7 +125,6 @@ struct State {
 }
 
 struct Inner {
-    limit: usize,
     wake: Arc<Notify>,
     state: Mutex<State>,
 }
@@ -138,13 +135,9 @@ pub(crate) struct CompletionHandoff {
 }
 
 impl CompletionHandoff {
-    pub(crate) fn new(limit: usize, wake: Arc<Notify>) -> Result<Self, HandoffError> {
-        if limit == 0 {
-            return Err(HandoffError::InvalidLimit);
-        }
+    pub(crate) fn new(wake: Arc<Notify>) -> Result<Self, HandoffError> {
         Ok(Self {
             inner: Arc::new(Inner {
-                limit,
                 wake,
                 state: Mutex::new(State {
                     closed: false,
@@ -173,9 +166,6 @@ impl CompletionHandoff {
             }
             if state.entries.contains_key(&owner) {
                 return Err(HandoffError::DuplicateOwner);
-            }
-            if state.entries.len() == self.inner.limit {
-                return Err(HandoffError::RegistrationLimit);
             }
             state.entries.insert(
                 owner.clone(),
@@ -474,11 +464,9 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
+    use crate::ordered_ingress::RequestClass;
     use crate::ordered_ingress::{CompletionSource, OrderedIngress};
-    use crate::ordered_ingress::{IngressLimits, RequestBudget, RequestClass};
-    use crate::session_dispatch::{
-        Budget, ClassLimits, DispatchLimits, EventOrigin, SessionDispatch, TrafficClass,
-    };
+    use crate::session_dispatch::{EventOrigin, SessionDispatch, TrafficClass};
 
     const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -495,27 +483,14 @@ mod tests {
     struct Fixture {
         completion: OrderedCompletion,
         ingress: OrderedIngress<OrderedCompletion>,
-        _receiver: mpsc::Receiver<OrderedCompletion>,
+        _receiver: mpsc::UnboundedReceiver<OrderedCompletion>,
     }
 
-    // Use the real ingress budget and in-memory ACP response route. No private
+    // Use the real ingress registration and in-memory ACP response route. No private
     // completion constructor, socket, sleeps, or test-only production hooks.
     async fn response(owner: RequestOwner) -> Fixture {
-        let budget = RequestBudget {
-            requests: 1,
-            completion_bytes: 1024,
-        };
-        let (events, mut receiver) = mpsc::channel(2);
-        let ingress = OrderedIngress::new(
-            IngressLimits {
-                max_response_bytes: 1024,
-                long_running: budget,
-                control: budget,
-            },
-            events,
-            |event| event,
-        )
-        .unwrap();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let ingress = OrderedIngress::new(events, |event| event).unwrap();
         let (outgoing, mut peer_requests) = futures::channel::mpsc::channel::<String>(4);
         let (mut peer_responses, incoming) =
             futures::channel::mpsc::channel::<io::Result<String>>(4);
@@ -537,7 +512,7 @@ mod tests {
             )
             .connect_with(transport, async move |connection| {
                 let reservation = ingress
-                    .try_reserve(RequestClass::LongRunning, owner, 1024)
+                    .try_reserve(RequestClass::LongRunning, owner)
                     .unwrap();
                 let request = ingress
                     .send_registered(
@@ -584,26 +559,7 @@ mod tests {
     // A2 is already queued before the completion guard is transferred. The test
     // pump receives no fresh ingress; only the turn's drop may wake it to take A2.
     fn queued_delivery() -> (SessionDispatch<&'static str>, DeliveryGuard) {
-        let classes = ClassLimits {
-            ordinary: Budget {
-                items: 4,
-                bytes: 64,
-            },
-            reserved: Budget {
-                items: 4,
-                bytes: 64,
-            },
-        };
-        let dispatch = SessionDispatch::new(
-            "epoch",
-            DispatchLimits {
-                max_sessions: 2,
-                max_event_bytes: 16,
-                per_session: classes,
-                global: classes,
-            },
-        )
-        .unwrap();
+        let dispatch = SessionDispatch::new("epoch").unwrap();
         let session = dispatch.register("a", 1).unwrap();
         for event in ["completion", "A2"] {
             dispatch
@@ -634,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn discard_is_exact_and_terminates_only_the_matching_bound_waiter() {
-        let handoff = CompletionHandoff::new(1, Arc::new(Notify::new())).unwrap();
+        let handoff = CompletionHandoff::new(Arc::new(Notify::new())).unwrap();
         let mut registration = handoff.register(owner()).unwrap();
         let current = RequestId::from("current".to_owned());
         let old = RequestId::from("old".to_owned());
@@ -658,7 +614,7 @@ mod tests {
 
     #[tokio::test]
     async fn discard_before_bind_checks_the_later_request_id() {
-        let handoff = CompletionHandoff::new(1, Arc::new(Notify::new())).unwrap();
+        let handoff = CompletionHandoff::new(Arc::new(Notify::new())).unwrap();
         let old = RequestId::from("old".to_owned());
         let current = RequestId::from("current".to_owned());
         let mut matching = handoff.register(owner()).unwrap();
@@ -697,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn retiring_one_incarnation_preserves_other_sessions_and_epochs() {
-        let handoff = CompletionHandoff::new(4, Arc::new(Notify::new())).unwrap();
+        let handoff = CompletionHandoff::new(Arc::new(Notify::new())).unwrap();
         let mut registrations = Vec::new();
         for index in 0..4 {
             let mut identity = owner();
@@ -727,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn discard_releases_a_matching_early_delivery_before_the_next_turn() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let mut registration = handoff.register(owner()).unwrap();
         let fixture = response(owner()).await;
         let request_id = fixture.completion.request_id.clone();
@@ -741,7 +697,7 @@ mod tests {
         assert!(
             fixture
                 .ingress
-                .try_reserve(RequestClass::LongRunning, owner(), 1024)
+                .try_reserve(RequestClass::LongRunning, owner())
                 .is_ok()
         );
         assert_eq!(
@@ -757,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn early_response_waits_for_binding_and_local_reduction_before_a2() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let mut registration = handoff.register(owner()).unwrap();
         // The response can arrive as soon as send_registered runs: context is
         // already present, but its returned request ID has not yet been bound.
@@ -781,8 +737,8 @@ mod tests {
         let turn = registration.wait().await.unwrap();
         assert!(
             ingress
-                .try_reserve(RequestClass::LongRunning, owner(), 1024)
-                .is_err()
+                .try_reserve(RequestClass::LongRunning, owner())
+                .is_ok()
         );
         let answer = turn.reduce(|completion| {
             assert!(dispatch.try_next().unwrap().is_none());
@@ -794,7 +750,7 @@ mod tests {
         assert_woken(&wake, &dispatch).await;
         assert!(
             ingress
-                .try_reserve(RequestClass::LongRunning, owner(), 1024)
+                .try_reserve(RequestClass::LongRunning, owner())
                 .is_ok()
         );
     }
@@ -802,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn withdrawn_task_late_response_cannot_satisfy_reused_owner() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         handoff.register(owner()).unwrap().withdraw();
         let mut replacement = handoff.register(owner()).unwrap();
         let mut old = response(owner()).await;
@@ -839,7 +795,7 @@ mod tests {
     #[tokio::test]
     async fn delivered_old_registration_drop_does_not_withdraw_new_allocation() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let mut old = handoff.register(owner()).unwrap();
         let fixture = response(owner()).await;
         old.bind(fixture.completion.request_id.clone()).unwrap();
@@ -862,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn every_owner_component_and_bound_request_id_are_fenced() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let mut registration = handoff.register(owner()).unwrap();
         registration
             .bind(RequestId::from("expected".to_owned()))
@@ -901,7 +857,7 @@ mod tests {
     async fn failed_synchronous_send_releases_turn_on_both_handoff_paths() {
         for early in [false, true] {
             let wake = Arc::new(Notify::new());
-            let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+            let handoff = CompletionHandoff::new(wake.clone()).unwrap();
             let mut registration = handoff.register(owner()).unwrap();
             let fixture = response(owner()).await;
             let request_id = fixture.completion.request_id.clone();
@@ -935,7 +891,7 @@ mod tests {
     async fn cancelled_wait_future_releases_buffered_turn_and_registration() {
         for delivered in [false, true] {
             let wake = Arc::new(Notify::new());
-            let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+            let handoff = CompletionHandoff::new(wake.clone()).unwrap();
             let mut registration = handoff.register(owner()).unwrap();
             let fixture = response(owner()).await;
             registration
@@ -963,10 +919,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_error_and_panic_release_both_budgets_before_waking_pump() {
+    async fn local_error_and_panic_release_payload_and_guard_before_waking_pump() {
         for panics in [false, true] {
             let wake = Arc::new(Notify::new());
-            let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+            let handoff = CompletionHandoff::new(wake.clone()).unwrap();
             let mut registration = handoff.register(owner()).unwrap();
             let fixture = response(owner()).await;
             registration
@@ -991,7 +947,7 @@ mod tests {
             assert!(
                 fixture
                     .ingress
-                    .try_reserve(RequestClass::LongRunning, owner(), 1024)
+                    .try_reserve(RequestClass::LongRunning, owner())
                     .is_ok()
             );
         }
@@ -1001,7 +957,7 @@ mod tests {
     async fn close_and_withdraw_release_parked_turns_and_close_rejects_delivery() {
         for close in [false, true] {
             let wake = Arc::new(Notify::new());
-            let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+            let handoff = CompletionHandoff::new(wake.clone()).unwrap();
             let registration = handoff.register(owner()).unwrap();
             let fixture = response(owner()).await;
             let (dispatch, guard) = queued_delivery();
@@ -1019,7 +975,7 @@ mod tests {
             assert_woken(&wake, &dispatch).await;
         }
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let mut registration = handoff.register(owner()).unwrap();
         registration
             .bind(RequestId::from("pending".to_owned()))
@@ -1041,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn additional_early_completion_is_explicitly_rejected_without_overwrite() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let mut registration = handoff.register(owner()).unwrap();
         let first = response(owner()).await;
         let request_id = first.completion.request_id.clone();
@@ -1064,12 +1020,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_limits_and_unbound_wait_do_not_leave_contexts() {
-        assert!(matches!(
-            CompletionHandoff::new(0, Arc::new(Notify::new())),
-            Err(HandoffError::InvalidLimit)
-        ));
-        let handoff = CompletionHandoff::new(1, Arc::new(Notify::new())).unwrap();
+    async fn duplicate_owners_and_unbound_wait_do_not_leave_contexts() {
+        let handoff = CompletionHandoff::new(Arc::new(Notify::new())).unwrap();
         let registration = handoff.register(owner()).unwrap();
         assert!(matches!(
             handoff.register(owner()),
@@ -1077,10 +1029,8 @@ mod tests {
         ));
         let mut other = owner();
         other.operation_id = "other".to_owned();
-        assert!(matches!(
-            handoff.register(other.clone()),
-            Err(HandoffError::RegistrationLimit)
-        ));
+        let other_registration = handoff.register(other.clone()).unwrap();
+        drop(other_registration);
         assert!(matches!(
             registration.wait().await,
             Err(HandoffError::Unbound)
@@ -1091,7 +1041,7 @@ mod tests {
     #[tokio::test]
     async fn poisoned_registry_still_releases_rejected_and_parked_guards() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let registration = handoff.register(owner()).unwrap();
         let parked = response(owner()).await;
         let (parked_dispatch, parked_guard) = queued_delivery();
@@ -1116,7 +1066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_parked_turn_wakes_pump_only_after_unlock_and_budgets_release() {
+    async fn closing_parked_turn_wakes_pump_only_after_unlock_and_guards_release() {
         struct PumpWake {
             handoff: CompletionHandoff,
             dispatch: SessionDispatch<&'static str>,
@@ -1136,7 +1086,7 @@ mod tests {
                 );
                 pump.ingress_released.store(
                     pump.ingress
-                        .try_reserve(RequestClass::LongRunning, owner(), 1024)
+                        .try_reserve(RequestClass::LongRunning, owner())
                         .is_ok(),
                     Ordering::SeqCst,
                 );
@@ -1150,7 +1100,7 @@ mod tests {
         }
 
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(1, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let _registration = handoff.register(owner()).unwrap();
         let fixture = response(owner()).await;
         let (dispatch, guard) = queued_delivery();
@@ -1176,7 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn last_dispatcher_handle_drop_closes_waiters_and_releases_early_turns() {
         let wake = Arc::new(Notify::new());
-        let handoff = CompletionHandoff::new(2, wake.clone()).unwrap();
+        let handoff = CompletionHandoff::new(wake.clone()).unwrap();
         let clone = handoff.clone();
         let mut bound_owner = owner();
         bound_owner.operation_id = "waiting".to_owned();

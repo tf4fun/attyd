@@ -7,36 +7,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-const MAX_CONTENT_BINARY_BYTES: usize = 3 * 1024 * 1024;
-const MAX_URI_LENGTH: usize = 16_384;
-const MAX_MIME_TYPE_LENGTH: usize = 255;
-const MAX_RESOURCE_LABEL_LENGTH: usize = 16_384;
-const MAX_ANNOTATION_TIMESTAMP_LENGTH: usize = 16_384;
 
-const MAX_PROMPT_RESPONSE_BYTES: usize = 1_000_000;
-const MAX_SESSION_CONTROLS: usize = 256;
-const MAX_SELECT_VALUES: usize = 512;
-const MAX_CONTROL_BYTES: usize = 1_000_000;
-const MAX_CONTROL_IDENTIFIER_LENGTH: usize = 256;
-const MAX_CONTROL_LABEL_LENGTH: usize = 4_096;
-
-const MAX_UPDATE_BYTES: usize = 4_000_000;
-const MAX_IDENTIFIER_LENGTH: usize = 1_024;
-const MAX_AVAILABLE_COMMANDS: usize = 1_000;
-const MAX_PLAN_ENTRIES: usize = 1_000;
-const MAX_TOOL_COLLECTION_ITEMS: usize = 10_000;
-const MAX_COMPACTIONS: usize = 1_000;
-const MAX_TOOL_CALLS: usize = 10_000;
-const MAX_MESSAGES: usize = 10_000;
-const MAX_PLANS: usize = 1_000;
-const MAX_COMPACTION_SUMMARY_BYTES: usize = 3_000_000;
-const MAX_SESSION_TITLE_LENGTH: usize = 16_384;
-const MAX_TOOL_PATH_LENGTH: usize = 16_384;
-const MAX_TOOL_LABEL_LENGTH: usize = 16_384;
 const MAX_TOOL_LOCATION_LINE: u64 = u32::MAX as u64;
-const MAX_PERMISSION_OPTIONS: usize = 100;
-const MAX_PERMISSION_REQUEST_BYTES: usize = 1_000_000;
-const MAX_PERMISSION_OPTION_NAME_LENGTH: usize = 4_096;
 
 pub type ValidationResult<T = ()> = Result<T, String>;
 
@@ -47,10 +19,6 @@ pub struct SessionUpdateSemanticState {
     tool_calls: HashMap<String, Option<String>>,
     messages: HashMap<String, String>,
     plans: HashMap<String, String>,
-    new_messages: usize,
-    new_tool_calls: usize,
-    new_plans: usize,
-    new_compactions: usize,
     pub update_count: usize,
     pub update_bytes: usize,
     pub current_mode_id: Option<String>,
@@ -61,10 +29,6 @@ impl SessionUpdateSemanticState {
     /// Reset turn accounting while retaining session-scoped entities. ACP v1
     /// notifications and compactions can continue outside a prompt's lifetime.
     pub fn retire_turn(&mut self) {
-        self.new_messages = 0;
-        self.new_tool_calls = 0;
-        self.new_plans = 0;
-        self.new_compactions = 0;
         self.update_count = 0;
         self.update_bytes = 0;
         self.invalid_reason = None;
@@ -121,17 +85,9 @@ pub fn validate_content_block(block: &Value, subject: &str) -> ValidationResult 
                 required_string(block, "uri", subject)?,
                 &format!("{subject} resource URI"),
             )?;
-            validate_label(
-                required_string(block, "name", subject)?,
-                &format!("{subject} resource name"),
-            )?;
-            for (field, label) in [
-                ("title", "resource title"),
-                ("description", "resource description"),
-            ] {
-                if let Some(value) = optional_string(block, field, subject)? {
-                    validate_label(value, &format!("{subject} {label}"))?;
-                }
+            required_string(block, "name", subject)?;
+            for field in ["title", "description"] {
+                optional_string(block, field, subject)?;
             }
             if let Some(mime_type) = optional_string(block, "mimeType", subject)? {
                 validate_mime_type(mime_type, &format!("{subject} resource MIME type"), None)?;
@@ -177,11 +133,6 @@ pub fn validate_content_block(block: &Value, subject: &str) -> ValidationResult 
 pub fn validate_prompt_response(response: &impl Serialize) -> ValidationResult {
     let value = serde_json::to_value(response)
         .map_err(|error| format!("failed to serialize Agent prompt response: {error}"))?;
-    if serialized_bytes(&value)? > MAX_PROMPT_RESPONSE_BYTES {
-        return Err(format!(
-            "Agent prompt response exceeds {MAX_PROMPT_RESPONSE_BYTES} bytes"
-        ));
-    }
     if let Some(usage) = value.get("usage").filter(|value| !value.is_null()) {
         validate_prompt_usage(usage)?;
     }
@@ -224,15 +175,6 @@ pub fn validate_session_controls(
     if let Some(options) = config_options.filter(|value| !value.is_null()) {
         validate_session_config_options(options)?;
     }
-    let combined = serde_json::json!({
-        "modes": modes.cloned().unwrap_or(Value::Null),
-        "configOptions": config_options.cloned().unwrap_or_else(|| Value::Array(Vec::new())),
-    });
-    if serialized_bytes(&combined)? > MAX_CONTROL_BYTES {
-        return Err(format!(
-            "Agent session controls exceed the {MAX_CONTROL_BYTES} byte limit"
-        ));
-    }
     Ok(())
 }
 
@@ -244,17 +186,12 @@ pub fn validate_session_modes(modes: &Value) -> ValidationResult {
     if available.is_empty() {
         return Err("Agent session modes must contain at least one available mode".to_string());
     }
-    if available.len() > MAX_SESSION_CONTROLS {
-        return Err(format!(
-            "Agent returned more than {MAX_SESSION_CONTROLS} session modes"
-        ));
-    }
     let mut ids = HashSet::new();
     for mode in available {
         let id = required_string(mode, "id", "session mode")?;
         let name = required_string(mode, "name", "session mode")?;
-        validate_identifier(id, MAX_CONTROL_IDENTIFIER_LENGTH, "session mode ID")?;
-        validate_non_empty_label(name, MAX_CONTROL_LABEL_LENGTH, "session mode name")?;
+        validate_identifier(id, "session mode ID")?;
+        validate_non_empty_label(name, "session mode name")?;
         if !ids.insert(id) {
             return Err(format!("Agent returned duplicate session mode ID: {id}"));
         }
@@ -287,17 +224,12 @@ pub fn validate_session_config_options(options: &Value) -> ValidationResult {
     let options = options
         .as_array()
         .ok_or_else(|| "Agent config options must be an array".to_string())?;
-    if options.len() > MAX_SESSION_CONTROLS {
-        return Err(format!(
-            "Agent returned more than {MAX_SESSION_CONTROLS} config options"
-        ));
-    }
     let mut ids = HashSet::new();
     for option in options {
         let id = required_string(option, "id", "config option")?;
         let name = required_string(option, "name", "config option")?;
-        validate_identifier(id, MAX_CONTROL_IDENTIFIER_LENGTH, "config option ID")?;
-        validate_non_empty_label(name, MAX_CONTROL_LABEL_LENGTH, "config option name")?;
+        validate_identifier(id, "config option ID")?;
+        validate_non_empty_label(name, "config option name")?;
         if !ids.insert(id) {
             return Err(format!("Agent returned duplicate config option ID: {id}"));
         }
@@ -380,16 +312,8 @@ fn validate_select_option(option: &Value, config_id: &str) -> ValidationResult {
         if let Some(nested) = item.get("options").and_then(Value::as_array) {
             let group = required_string(item, "group", "config option group")?;
             let name = required_string(item, "name", "config option group")?;
-            validate_identifier(
-                group,
-                MAX_CONTROL_IDENTIFIER_LENGTH,
-                &format!("config option {config_id} group ID"),
-            )?;
-            validate_non_empty_label(
-                name,
-                MAX_CONTROL_LABEL_LENGTH,
-                &format!("config option {config_id} group name"),
-            )?;
+            validate_identifier(group, &format!("config option {config_id} group ID"))?;
+            validate_non_empty_label(name, &format!("config option {config_id} group name"))?;
             if !groups.insert(group) {
                 return Err(format!(
                     "Agent config option {config_id} has duplicate group ID: {group}"
@@ -405,11 +329,6 @@ fn validate_select_option(option: &Value, config_id: &str) -> ValidationResult {
             }
         } else {
             add_select_value(config_id, &mut values, item)?;
-        }
-        if values.len() > MAX_SELECT_VALUES {
-            return Err(format!(
-                "Agent config option {config_id} has more than {MAX_SELECT_VALUES} selectable values"
-            ));
         }
     }
     let current = required_string(option, "currentValue", "select config option")?;
@@ -428,16 +347,8 @@ fn add_select_value<'a>(
 ) -> ValidationResult {
     let value = required_string(option, "value", "config option value")?;
     let name = required_string(option, "name", "config option value")?;
-    validate_identifier(
-        value,
-        MAX_CONTROL_IDENTIFIER_LENGTH,
-        &format!("config option {config_id} value"),
-    )?;
-    validate_non_empty_label(
-        name,
-        MAX_CONTROL_LABEL_LENGTH,
-        &format!("config option {config_id} value name"),
-    )?;
+    validate_identifier(value, &format!("config option {config_id} value"))?;
+    validate_non_empty_label(name, &format!("config option {config_id} value name"))?;
     if !values.insert(value) {
         return Err(format!(
             "Agent config option {config_id} has duplicate value: {value}"
@@ -451,11 +362,6 @@ pub fn validate_and_track_session_update(
     update: &Value,
 ) -> ValidationResult {
     let update_bytes = serialized_bytes(update)?;
-    if update_bytes > MAX_UPDATE_BYTES {
-        return Err(format!(
-            "Agent session update exceeds {MAX_UPDATE_BYTES} bytes"
-        ));
-    }
     let mut next = state.clone();
     validate_session_update_payload(&mut next, update)?;
     next.update_count = next.update_count.saturating_add(1);
@@ -472,15 +378,6 @@ pub(crate) fn validate_history_update(
     update: &Value,
 ) -> ValidationResult {
     let bytes = serialized_bytes(update)?;
-    if bytes > MAX_UPDATE_BYTES {
-        return Err(format!(
-            "Agent session update exceeds {MAX_UPDATE_BYTES} bytes"
-        ));
-    }
-    state.new_messages = 0;
-    state.new_tool_calls = 0;
-    state.new_plans = 0;
-    state.new_compactions = 0;
     validate_session_update_payload(state, update)?;
     state.update_count = state.update_count.saturating_add(1);
     state.update_bytes = state.update_bytes.saturating_add(bytes);
@@ -493,11 +390,6 @@ pub fn validate_permission_request(
 ) -> ValidationResult<HashSet<String>> {
     let request = serde_json::to_value(request)
         .map_err(|error| format!("failed to serialize permission request: {error}"))?;
-    if serialized_bytes(&request)? > MAX_PERMISSION_REQUEST_BYTES {
-        return Err(format!(
-            "Agent permission request exceeds {MAX_PERMISSION_REQUEST_BYTES} bytes"
-        ));
-    }
     let tool_call = request
         .get("toolCall")
         .ok_or_else(|| "Agent permission request is missing its tool call".to_string())?;
@@ -506,15 +398,15 @@ pub fn validate_permission_request(
         .get("options")
         .and_then(Value::as_array)
         .ok_or_else(|| "Agent permission options must be an array".to_string())?;
-    if options.is_empty() || options.len() > MAX_PERMISSION_OPTIONS {
+    if options.is_empty() {
         return Err(format!(
-            "Agent permission request must contain between 1 and {MAX_PERMISSION_OPTIONS} options"
+            "Agent permission request must contain at least one option"
         ));
     }
     let mut ids = HashSet::new();
     for option in options {
         let id = required_string(option, "optionId", "permission option")?;
-        if id.is_empty() || js_len(id) > MAX_IDENTIFIER_LENGTH {
+        if id.is_empty() {
             return Err("Agent returned an invalid permission option ID".to_string());
         }
         if !ids.insert(id.to_string()) {
@@ -523,7 +415,7 @@ pub fn validate_permission_request(
             ));
         }
         let name = required_string(option, "name", "permission option")?;
-        if name.is_empty() || js_len(name) > MAX_PERMISSION_OPTION_NAME_LENGTH {
+        if name.is_empty() {
             return Err(format!(
                 "Agent returned an invalid permission option name: {id}"
             ));
@@ -558,13 +450,8 @@ fn validate_session_update_payload(
                 "Agent message content",
             )?;
             if let Some(message_id) = optional_string(update, "messageId", "session update")? {
-                validate_identifier(message_id, MAX_IDENTIFIER_LENGTH, "Agent message ID")?;
-                charge_new_entity(
-                    !state.messages.contains_key(message_id),
-                    &mut state.new_messages,
-                    MAX_MESSAGES,
-                    "message IDs",
-                )?;
+                validate_identifier(message_id, "Agent message ID")?;
+
                 state
                     .messages
                     .insert(message_id.to_string(), kind.to_string());
@@ -577,35 +464,21 @@ fn validate_session_update_payload(
                 .get("plan")
                 .ok_or_else(|| "Agent plan update is missing plan".to_string())?;
             let plan_id = required_string(plan, "planId", "plan update")?;
-            validate_identifier(plan_id, MAX_IDENTIFIER_LENGTH, "Agent plan ID")?;
+            validate_identifier(plan_id, "Agent plan ID")?;
             if plan.get("type").and_then(Value::as_str) == Some("items") {
                 validate_plan_entries(plan.get("entries"))?;
             }
-            track_named_state(
-                &mut state.plans,
-                &mut state.new_plans,
-                plan_id,
-                "active",
-                MAX_PLANS,
-                "plans",
-            )?;
+            track_named_state(&mut state.plans, plan_id, "active")?;
         }
         "plan_removed" => {
             let plan_id = required_string(update, "planId", "plan removal")?;
-            validate_identifier(plan_id, MAX_IDENTIFIER_LENGTH, "Agent plan ID")?;
-            track_named_state(
-                &mut state.plans,
-                &mut state.new_plans,
-                plan_id,
-                "removed",
-                MAX_PLANS,
-                "plans",
-            )?;
+            validate_identifier(plan_id, "Agent plan ID")?;
+            track_named_state(&mut state.plans, plan_id, "removed")?;
         }
         "available_commands_update" => validate_available_commands(update)?,
         "current_mode_update" => {
             let mode_id = required_string(update, "currentModeId", "mode update")?;
-            validate_identifier(mode_id, MAX_IDENTIFIER_LENGTH, "Agent mode ID")?;
+            validate_identifier(mode_id, "Agent mode ID")?;
             state.current_mode_id = Some(mode_id.to_string());
         }
         "config_option_update" => validate_session_controls(None, update.get("configOptions"))?,
@@ -627,25 +500,14 @@ fn validate_tool_update(
     update: &Value,
 ) -> ValidationResult {
     let tool_id = required_string(update, "toolCallId", "tool update")?;
-    validate_identifier(tool_id, MAX_IDENTIFIER_LENGTH, "Agent tool call ID")?;
-    for (field, label) in [("title", "title"), ("name", "name")] {
-        if let Some(value) = optional_string(update, field, "tool update")?
-            && js_len(value) > MAX_TOOL_LABEL_LENGTH
-        {
-            return Err(format!(
-                "Agent tool {label} exceeds {MAX_TOOL_LABEL_LENGTH} characters"
-            ));
-        }
+    validate_identifier(tool_id, "Agent tool call ID")?;
+    for field in ["title", "name"] {
+        optional_string(update, field, "tool update")?;
     }
     if let Some(content) = update.get("content").filter(|value| !value.is_null()) {
         let content = content
             .as_array()
             .ok_or_else(|| "Agent tool content must be an array".to_string())?;
-        if content.len() > MAX_TOOL_COLLECTION_ITEMS {
-            return Err(format!(
-                "Agent tool content exceeds {MAX_TOOL_COLLECTION_ITEMS} items"
-            ));
-        }
         for item in content {
             match item.get("type").and_then(Value::as_str) {
                 Some("content") => validate_content_block(
@@ -659,7 +521,6 @@ fn validate_tool_update(
                 )?,
                 Some("terminal") => validate_identifier(
                     required_string(item, "terminalId", "tool terminal")?,
-                    MAX_IDENTIFIER_LENGTH,
                     "Agent terminal reference ID",
                 )?,
                 Some(other) => return Err(format!("unsupported Agent tool content: {other}")),
@@ -671,11 +532,6 @@ fn validate_tool_update(
         let locations = locations
             .as_array()
             .ok_or_else(|| "Agent tool locations must be an array".to_string())?;
-        if locations.len() > MAX_TOOL_COLLECTION_ITEMS {
-            return Err(format!(
-                "Agent tool locations exceed {MAX_TOOL_COLLECTION_ITEMS} items"
-            ));
-        }
         for location in locations {
             validate_absolute_path(
                 required_string(location, "path", "tool location")?,
@@ -692,12 +548,7 @@ fn validate_tool_update(
             }
         }
     }
-    charge_new_entity(
-        !state.tool_calls.contains_key(tool_id),
-        &mut state.new_tool_calls,
-        MAX_TOOL_CALLS,
-        "tool calls",
-    )?;
+
     let previous = state.tool_calls.get(tool_id).cloned().flatten();
     let status = optional_string(update, "status", "tool update")?
         .map(str::to_string)
@@ -711,47 +562,24 @@ fn validate_available_commands(update: &Value) -> ValidationResult {
         .get("availableCommands")
         .and_then(Value::as_array)
         .ok_or_else(|| "Agent available commands must be an array".to_string())?;
-    if commands.len() > MAX_AVAILABLE_COMMANDS {
-        return Err(format!(
-            "Agent returned more than {MAX_AVAILABLE_COMMANDS} available commands"
-        ));
-    }
     let mut names = HashSet::new();
     for command in commands {
         let name = required_string(command, "name", "available command")?;
-        validate_identifier(name, MAX_IDENTIFIER_LENGTH, "Agent available command name")?;
+        validate_identifier(name, "Agent available command name")?;
         if !names.insert(name) {
             return Err(format!(
                 "Agent returned duplicate available command: {name}"
             ));
         }
-        if js_len(required_string(
-            command,
-            "description",
-            "available command",
-        )?) > 16_384
-        {
-            return Err(format!("Available command description is too long: {name}"));
-        }
-        if let Some(hint) = command
-            .get("input")
-            .and_then(|input| input.get("hint"))
-            .and_then(Value::as_str)
-            && js_len(hint) > 4_096
-        {
-            return Err(format!("Available command input hint is too long: {name}"));
-        }
+        required_string(command, "description", "available command")?;
     }
     Ok(())
 }
 
 fn validate_plan_entries(entries: Option<&Value>) -> ValidationResult {
-    let entries = entries
+    entries
         .and_then(Value::as_array)
         .ok_or_else(|| "Agent plan entries must be an array".to_string())?;
-    if entries.len() > MAX_PLAN_ENTRIES {
-        return Err(format!("Agent plan exceeds {MAX_PLAN_ENTRIES} entries"));
-    }
     Ok(())
 }
 
@@ -787,22 +615,14 @@ pub fn validate_session_metadata(
     subject: &str,
 ) -> ValidationResult {
     if let Some(title) = title.filter(|value| !value.is_null()) {
-        let title = title
+        title
             .as_str()
             .ok_or_else(|| format!("{subject} title must be a string or null"))?;
-        if js_len(title) > MAX_SESSION_TITLE_LENGTH {
-            return Err(format!(
-                "{subject} title exceeds {MAX_SESSION_TITLE_LENGTH} characters"
-            ));
-        }
     }
     if let Some(updated_at) = updated_at.filter(|value| !value.is_null()) {
-        let updated_at = updated_at
+        updated_at
             .as_str()
             .ok_or_else(|| format!("{subject} updatedAt must be a string or null"))?;
-        if js_len(updated_at) > 256 {
-            return Err(format!("{subject} updatedAt exceeds 256 characters"));
-        }
     }
     Ok(())
 }
@@ -812,7 +632,7 @@ fn validate_compaction_update(
     update: &Value,
 ) -> ValidationResult {
     let id = required_string(update, "compactionId", "compaction update")?;
-    validate_identifier(id, MAX_IDENTIFIER_LENGTH, "Agent compaction ID")?;
+    validate_identifier(id, "Agent compaction ID")?;
     let status = required_string(update, "status", "compaction update")?;
     let summary = update.get("summary").filter(|value| !value.is_null());
     if summary
@@ -832,11 +652,6 @@ fn validate_compaction_update(
             .as_array()
             .ok_or_else(|| "Agent compaction summary must be an array".to_string())?;
         let bytes = serialized_bytes(summary)?;
-        if bytes > MAX_COMPACTION_SUMMARY_BYTES {
-            return Err(format!(
-                "Agent compaction summary exceeds {MAX_COMPACTION_SUMMARY_BYTES} bytes"
-            ));
-        }
         for block in blocks {
             validate_content_block(block, "Agent compaction summary content")?;
         }
@@ -855,12 +670,7 @@ fn validate_compaction_update(
     {
         return Err(format!("Compaction is already terminal: {id}"));
     }
-    charge_new_entity(
-        !state.compactions.contains_key(id),
-        &mut state.new_compactions,
-        MAX_COMPACTIONS,
-        "compactions",
-    )?;
+
     state.compactions.insert(
         id.to_string(),
         TrackedCompaction {
@@ -876,7 +686,7 @@ fn validate_compaction_chunk(
     update: &Value,
 ) -> ValidationResult {
     let id = required_string(update, "compactionId", "compaction chunk")?;
-    validate_identifier(id, MAX_IDENTIFIER_LENGTH, "Agent compaction ID")?;
+    validate_identifier(id, "Agent compaction ID")?;
     let content = update
         .get("content")
         .ok_or_else(|| "Agent compaction chunk content is missing".to_string())?;
@@ -892,11 +702,6 @@ fn validate_compaction_chunk(
     let bytes = tracked
         .summary_bytes
         .saturating_add(serialized_bytes(content)?);
-    if bytes > MAX_COMPACTION_SUMMARY_BYTES {
-        return Err(format!(
-            "Compaction summary exceeds {MAX_COMPACTION_SUMMARY_BYTES} bytes"
-        ));
-    }
     tracked.summary_bytes = bytes;
     Ok(())
 }
@@ -912,41 +717,29 @@ fn validate_annotations(annotations: Option<&Value>, subject: &str) -> Validatio
     let annotations = annotations
         .as_object()
         .ok_or_else(|| format!("{subject} must be an object"))?;
-    if annotations
-        .get("lastModified")
-        .and_then(Value::as_str)
-        .is_some_and(|value| js_len(value) > MAX_ANNOTATION_TIMESTAMP_LENGTH)
-    {
-        return Err(format!(
-            "{subject} last-modified timestamp exceeds {MAX_ANNOTATION_TIMESTAMP_LENGTH} characters"
-        ));
-    }
     if let Some(priority) = annotations.get("priority").filter(|value| !value.is_null())
         && !priority.as_f64().is_some_and(f64::is_finite)
     {
         return Err(format!("{subject} priority must be finite"));
     }
+    if let Some(timestamp) = annotations
+        .get("lastModified")
+        .filter(|value| !value.is_null())
+    {
+        timestamp
+            .as_str()
+            .ok_or_else(|| format!("{subject} last-modified timestamp must be a string"))?;
+    }
     Ok(())
 }
 
 fn validate_base64(value: &str, subject: &str) -> ValidationResult {
-    let maximum_characters = MAX_CONTENT_BINARY_BYTES.div_ceil(3) * 4;
-    if value.len() > maximum_characters {
-        return Err(format!(
-            "{subject} exceeds {MAX_CONTENT_BINARY_BYTES} decoded bytes"
-        ));
-    }
     if !value.len().is_multiple_of(4) {
         return Err(format!("{subject} must be canonical base64"));
     }
     let decoded = BASE64_STANDARD
         .decode(value)
         .map_err(|_| format!("{subject} must be canonical base64"))?;
-    if decoded.len() > MAX_CONTENT_BINARY_BYTES {
-        return Err(format!(
-            "{subject} exceeds {MAX_CONTENT_BINARY_BYTES} decoded bytes"
-        ));
-    }
     if BASE64_STANDARD.encode(&decoded) != value {
         return Err(format!("{subject} must be canonical base64"));
     }
@@ -964,7 +757,6 @@ fn validate_mime_type(
         return Err(format!("{subject} is invalid"));
     };
     if value.is_empty()
-        || js_len(value) > MAX_MIME_TYPE_LENGTH
         || !mime_token(family)
         || !mime_token(subtype)
         || parts.any(|parameter| {
@@ -1009,46 +801,29 @@ fn mime_token(value: &str) -> bool {
 }
 
 fn validate_uri(value: &str, subject: &str) -> ValidationResult {
-    if value.is_empty() || js_len(value) > MAX_URI_LENGTH {
-        return Err(format!(
-            "{subject} must contain between 1 and {MAX_URI_LENGTH} characters"
-        ));
+    if value.is_empty() {
+        return Err(format!("{subject} must not be empty"));
     }
     url::Url::parse(value)
         .map(|_| ())
         .map_err(|_| format!("{subject} is invalid"))
 }
 
-fn validate_label(value: &str, subject: &str) -> ValidationResult {
-    if js_len(value) > MAX_RESOURCE_LABEL_LENGTH {
-        return Err(format!(
-            "{subject} exceeds {MAX_RESOURCE_LABEL_LENGTH} characters"
-        ));
+fn validate_identifier(value: &str, label: &str) -> ValidationResult {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
     }
     Ok(())
 }
 
-fn validate_identifier(value: &str, maximum: usize, label: &str) -> ValidationResult {
-    if value.is_empty() || js_len(value) > maximum {
-        return Err(format!(
-            "{label} must contain between 1 and {maximum} characters"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_non_empty_label(value: &str, maximum: usize, label: &str) -> ValidationResult {
-    validate_identifier(value, maximum, label)
+fn validate_non_empty_label(value: &str, label: &str) -> ValidationResult {
+    validate_identifier(value, label)
 }
 
 fn validate_absolute_path(path: &str, subject: &str) -> ValidationResult {
-    if path.is_empty()
-        || js_len(path) > MAX_TOOL_PATH_LENGTH
-        || path.contains('\0')
-        || !is_portable_absolute_path(path)
-    {
+    if path.is_empty() || path.contains('\0') || !is_portable_absolute_path(path) {
         return Err(format!(
-            "{subject} must be an absolute path of at most {MAX_TOOL_PATH_LENGTH} characters"
+            "{subject} must be an absolute path without NUL bytes"
         ));
     }
     Ok(())
@@ -1069,33 +844,8 @@ fn js_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
-fn track_named_state(
-    ids: &mut HashMap<String, String>,
-    new_ids: &mut usize,
-    id: &str,
-    value: &str,
-    maximum: usize,
-    label: &str,
-) -> ValidationResult {
-    charge_new_entity(!ids.contains_key(id), new_ids, maximum, label)?;
+fn track_named_state(ids: &mut HashMap<String, String>, id: &str, value: &str) -> ValidationResult {
     ids.insert(id.to_string(), value.to_string());
-    Ok(())
-}
-
-fn charge_new_entity(
-    is_new: bool,
-    count: &mut usize,
-    maximum: usize,
-    label: &str,
-) -> ValidationResult {
-    if is_new {
-        if *count >= maximum {
-            return Err(format!(
-                "Agent exceeded {maximum} new {label} in one turn or replay"
-            ));
-        }
-        *count += 1;
-    }
     Ok(())
 }
 
@@ -1133,21 +883,29 @@ fn optional_string<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FORMER_CONTENT_BINARY_BYTES: usize = 3 * 1024 * 1024;
+    const FORMER_PROMPT_RESPONSE_BYTES: usize = 1_000_000;
+    const FORMER_CONTROL_IDENTIFIER_LENGTH: usize = 256;
+    const FORMER_COMPACTIONS: usize = 1_000;
+    const FORMER_TOOL_CALLS: usize = 10_000;
+    const FORMER_MESSAGES: usize = 10_000;
+    const FORMER_PLANS: usize = 1_000;
+
     use serde_json::json;
 
     #[test]
-    fn session_indexes_do_not_turn_per_turn_limits_into_lifetime_limits() {
+    fn session_indexes_accept_entities_beyond_former_turn_and_lifetime_limits() {
         let mut state = SessionUpdateSemanticState::default();
         state.messages.extend(
-            (0..MAX_MESSAGES).map(|i| (format!("m-{i}"), "agent_message_chunk".to_string())),
+            (0..FORMER_MESSAGES).map(|i| (format!("m-{i}"), "agent_message_chunk".to_string())),
+        );
+        state.tool_calls.extend(
+            (0..FORMER_TOOL_CALLS).map(|i| (format!("t-{i}"), Some("completed".to_string()))),
         );
         state
-            .tool_calls
-            .extend((0..MAX_TOOL_CALLS).map(|i| (format!("t-{i}"), Some("completed".to_string()))));
-        state
             .plans
-            .extend((0..MAX_PLANS).map(|i| (format!("p-{i}"), "removed".to_string())));
-        state.compactions.extend((0..MAX_COMPACTIONS).map(|i| {
+            .extend((0..FORMER_PLANS).map(|i| (format!("p-{i}"), "removed".to_string())));
+        state.compactions.extend((0..FORMER_COMPACTIONS).map(|i| {
             (
                 format!("c-{i}"),
                 TrackedCompaction {
@@ -1156,10 +914,6 @@ mod tests {
                 },
             )
         }));
-        state.new_messages = MAX_MESSAGES;
-        state.new_tool_calls = MAX_TOOL_CALLS;
-        state.new_plans = MAX_PLANS;
-        state.new_compactions = MAX_COMPACTIONS;
         assert!(
             validate_and_track_session_update(
                 &mut state,
@@ -1168,7 +922,7 @@ mod tests {
                     "content": { "type": "text", "text": "over the current turn limit" }
                 })
             )
-            .is_err()
+            .is_ok()
         );
         state.retire_turn();
         for update in [
@@ -1179,10 +933,10 @@ mod tests {
         ] {
             validate_and_track_session_update(&mut state, &update).unwrap();
         }
-        assert_eq!(state.messages.len(), MAX_MESSAGES + 1);
-        assert_eq!(state.tool_calls.len(), MAX_TOOL_CALLS + 1);
-        assert_eq!(state.plans.len(), MAX_PLANS + 1);
-        assert_eq!(state.compactions.len(), MAX_COMPACTIONS + 1);
+        assert_eq!(state.messages.len(), FORMER_MESSAGES + 1);
+        assert_eq!(state.tool_calls.len(), FORMER_TOOL_CALLS + 1);
+        assert_eq!(state.plans.len(), FORMER_PLANS + 1);
+        assert_eq!(state.compactions.len(), FORMER_COMPACTIONS + 1);
     }
 
     #[test]
@@ -1262,7 +1016,7 @@ mod tests {
                 &json!({
                     "type": "text",
                     "text": "bad annotation",
-                    "annotations": { "lastModified": "x".repeat(16_385) }
+                    "annotations": { "lastModified": 42 }
                 }),
                 "ACP content block",
             )
@@ -1271,8 +1025,8 @@ mod tests {
     }
 
     #[test]
-    fn bounds_decoded_content_independently_from_the_envelope() {
-        let oversized = "AAAA".repeat(MAX_CONTENT_BINARY_BYTES / 3 + 1);
+    fn accepts_decoded_content_beyond_the_former_size_limit() {
+        let oversized = "AAAA".repeat(FORMER_CONTENT_BINARY_BYTES / 3 + 1);
         assert!(
             validate_content_block(
                 &json!({
@@ -1281,13 +1035,12 @@ mod tests {
                 }),
                 "ACP content block",
             )
-            .unwrap_err()
-            .contains("decoded bytes")
+            .is_ok()
         );
     }
 
     #[test]
-    fn validates_prompt_usage_consistency_and_response_size() {
+    fn validates_prompt_usage_and_accepts_large_response_metadata() {
         validate_prompt_response(&json!({
             "stopReason": "end_turn",
             "usage": { "totalTokens": 10, "inputTokens": 4, "outputTokens": 6 }
@@ -1306,9 +1059,9 @@ mod tests {
         assert!(
             validate_prompt_response(&json!({
                 "stopReason": "end_turn",
-                "_meta": { "padding": "x".repeat(MAX_PROMPT_RESPONSE_BYTES) }
+                "_meta": { "padding": "x".repeat(FORMER_PROMPT_RESPONSE_BYTES) }
             }))
-            .is_err()
+            .is_ok()
         );
     }
 
@@ -1339,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_contradictory_duplicate_and_unbounded_controls() {
+    fn rejects_contradictory_controls_and_accepts_large_valid_collections() {
         assert!(
             validate_session_modes(&json!({
                 "currentModeId": "missing",
@@ -1382,7 +1135,7 @@ mod tests {
                     "name": format!("Mode {index}")
                 })).collect::<Vec<_>>()
             }))
-            .is_err()
+            .is_ok()
         );
     }
 
@@ -1497,7 +1250,7 @@ mod tests {
             json!({ "sessionUpdate": "usage_update", "used": -1, "size": 10 }),
             json!({
                 "sessionUpdate": "session_info_update",
-                "title": "x".repeat(MAX_SESSION_TITLE_LENGTH + 1)
+                "title": 42
             }),
         ] {
             assert!(validate_and_track_session_update(&mut state, &update).is_err());
@@ -1733,14 +1486,14 @@ mod tests {
     }
 
     #[test]
-    fn uses_javascript_utf16_lengths_for_protocol_character_limits() {
-        let astral = "😀".repeat(MAX_CONTROL_IDENTIFIER_LENGTH);
+    fn accepts_long_unicode_control_identifiers() {
+        let astral = "😀".repeat(FORMER_CONTROL_IDENTIFIER_LENGTH);
         validate_session_modes(&json!({
             "currentModeId": astral,
             "availableModes": [{ "id": astral, "name": "Mode" }]
         }))
-        .unwrap_err();
-        let bmp = "界".repeat(MAX_CONTROL_IDENTIFIER_LENGTH);
+        .unwrap();
+        let bmp = "界".repeat(FORMER_CONTROL_IDENTIFIER_LENGTH);
         validate_session_modes(&json!({
             "currentModeId": bmp,
             "availableModes": [{ "id": bmp, "name": "模式" }]

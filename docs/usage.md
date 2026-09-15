@@ -209,7 +209,7 @@ Place attyd options before `--` and the Agent command or endpoint after it.
 | `-t, --transport <transport>` | `stdio` (default), `http` (Streamable HTTP/SSE), or `ws`. |
 | `--add-dir <path>` | Additional stdio workspace root; repeatable and unavailable with remote transports. |
 | `--mcp-config <file>` | Static MCP configuration file; repeatable. |
-| `--session-unobserved-timeout <seconds>` | Close an unobserved session after this interval; defaults to `1800` (30 minutes). Any negative value disables recycling; `0` closes immediately. Requires Agent close support. |
+| `--session-unobserved-timeout <seconds>` | Close an unobserved session after this interval; defaults to `-1` (disabled). Any negative value disables recycling; `0` closes immediately. Requires Agent close support. |
 | `--read-only` | Disable attyd's ACP `fs/write_text_file` capability and handler. |
 | `--allowed-origin <origin>` | Allow a browser origin and its hostname for a reverse proxy or custom domain; repeatable. |
 | `--help`, `--version` | Show CLI help or the executable version. |

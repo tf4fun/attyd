@@ -14,21 +14,6 @@ use crate::session_state::{MirrorError, SessionAdmission, SessionState, TurnAdmi
 #[cfg(test)]
 pub(crate) use crate::session_registry::SessionRegistry as RuntimeState;
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RuntimeLimits {
-    pub max_delta_events: usize,
-    pub max_delta_bytes: usize,
-}
-
-impl Default for RuntimeLimits {
-    fn default() -> Self {
-        Self {
-            max_delta_events: 4_096,
-            max_delta_bytes: 16 * 1024 * 1024,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeSnapshot {
@@ -322,7 +307,6 @@ pub(crate) enum RuntimeStateError {
     SessionNotActive,
     OperationCollision,
     InteractionCollision,
-    ResourceLimit,
 }
 
 /// Retains the published delta suffix without owning session business state.
@@ -331,16 +315,14 @@ pub(crate) struct RuntimeJournal {
     seq: u64,
     deltas: VecDeque<RuntimeDelta>,
     bytes: usize,
-    limits: RuntimeLimits,
 }
 
 impl RuntimeJournal {
-    pub(crate) fn new(limits: RuntimeLimits) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             seq: 0,
             deltas: VecDeque::new(),
             bytes: 0,
-            limits,
         }
     }
 
@@ -375,14 +357,6 @@ impl RuntimeJournal {
         };
         self.bytes = self.bytes.saturating_add(serialized_len(&delta));
         self.deltas.push_back(delta);
-        while self.deltas.len() > self.limits.max_delta_events
-            || self.bytes > self.limits.max_delta_bytes
-        {
-            let Some(removed) = self.deltas.pop_front() else {
-                break;
-            };
-            self.bytes = self.bytes.saturating_sub(serialized_len(&removed));
-        }
     }
 
     fn retire_turn_payload(&mut self, session_id: &str, incarnation: u64, operation_id: &str) {
@@ -667,11 +641,6 @@ impl SessionRegistry {
             return Ok(());
         };
         let bytes = serialized_len(&update);
-        if session.attachment_candidate.len() >= 10_000
-            || session.attachment_candidate_bytes.saturating_add(bytes) > 1_000_000
-        {
-            return Err(RuntimeStateError::ResourceLimit);
-        }
         session.attachment_candidate.push(update);
         session.attachment_candidate_bytes =
             session.attachment_candidate_bytes.saturating_add(bytes);
@@ -2475,8 +2444,7 @@ pub(crate) fn fold_terminal_snapshot(previous: Option<&Value>, incoming: &Value)
         .get("retainedBytes")
         .and_then(Value::as_u64)
         .and_then(|bytes| usize::try_from(bytes).ok())
-        .unwrap_or(output.len())
-        .min(crate::terminal::MAX_TERMINAL_OUTPUT_BYTES);
+        .unwrap_or(output.len());
     if output.len() > limit {
         output.drain(..output.len() - limit);
     }
@@ -2588,9 +2556,6 @@ fn remember_resolved_permission(session: &mut SessionLiveState, interaction_id: 
 
 fn remember_resolved_interaction(resolved: &mut VecDeque<String>, interaction_id: &str) {
     resolved.push_back(interaction_id.to_string());
-    while resolved.len() > 1_024 {
-        resolved.pop_front();
-    }
 }
 
 fn drain_session_liveness(
@@ -2860,13 +2825,7 @@ mod tests {
     use serde_json::json;
 
     fn state() -> RuntimeState {
-        RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_delta_events: 128,
-                max_delta_bytes: 1_000_000,
-            },
-        )
+        RuntimeState::new("epoch")
     }
 
     fn open(state: &mut RuntimeState, session_id: &str) -> u64 {
@@ -4389,13 +4348,7 @@ mod tests {
 
     #[test]
     fn active_turn_accounting_does_not_reject_a_large_valid_update() {
-        let mut state = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_delta_events: 128,
-                max_delta_bytes: 1_000_000,
-            },
-        );
+        let mut state = RuntimeState::new("epoch");
         let incarnation = open(&mut state, "session");
         state
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
@@ -4435,7 +4388,7 @@ mod tests {
 
     #[test]
     fn streaming_turn_deltas_do_not_republish_the_full_active_tail() {
-        let mut state = RuntimeState::new("epoch", RuntimeLimits::default());
+        let mut state = RuntimeState::new("epoch");
         let incarnation = open(&mut state, "session");
         state
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
@@ -4789,20 +4742,14 @@ mod tests {
     }
 
     #[test]
-    fn delta_resume_requires_snapshot_for_future_or_evicted_sequence() {
-        let mut state = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_delta_events: 2,
-                max_delta_bytes: 1_000_000,
-            },
-        );
+    fn delta_resume_rejects_future_sequence_and_preserves_all_deltas() {
+        let mut state = RuntimeState::new("epoch");
         open(&mut state, "a");
         open(&mut state, "b");
         open(&mut state, "c");
 
         assert!(state.deltas_after(state.seq() + 1).is_none());
-        assert!(state.deltas_after(0).is_none());
+        assert_eq!(state.deltas_after(0).unwrap().len(), 3);
         assert_eq!(state.deltas_after(1).unwrap().len(), 2);
     }
 
@@ -5494,13 +5441,7 @@ mod tests {
 
     #[test]
     fn terminal_result_is_not_retained_after_turn_retirement() {
-        let mut state = RuntimeState::new(
-            "epoch",
-            RuntimeLimits {
-                max_delta_events: 128,
-                max_delta_bytes: 1_000_000,
-            },
-        );
+        let mut state = RuntimeState::new("epoch");
         let incarnation = open(&mut state, "session");
         let operation_id = "prompt".to_string();
         state

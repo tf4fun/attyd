@@ -5,15 +5,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::semantic::{ValidationResult, serialized_bytes};
+use crate::semantic::ValidationResult;
 
-const MAX_ELICITATION_FIELDS: usize = 64;
-const MAX_ELICITATION_CHOICES: usize = 256;
-const MAX_PATTERN_LENGTH: usize = 512;
-const MAX_ELICITATION_BYTES: usize = 2_000_000;
-const MAX_ELICITATION_MESSAGE_LENGTH: usize = 16_384;
-const MAX_ELICITATION_FIELD_NAME_LENGTH: usize = 256;
-const MAX_ELICITATION_RESPONSE_BYTES: usize = 2_000_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 pub fn validate_elicitation_request(request: &impl Serialize) -> ValidationResult<Value> {
@@ -24,14 +17,9 @@ pub fn validate_elicitation_request(request: &impl Serialize) -> ValidationResul
 }
 
 pub fn validate_elicitation_request_value(request: &Value) -> ValidationResult {
-    if serialized_bytes(request)? > MAX_ELICITATION_BYTES {
-        return Err(format!(
-            "Elicitation request exceeds {MAX_ELICITATION_BYTES} bytes"
-        ));
-    }
     let message = required_string(request, "message", "Elicitation")?;
-    if message.is_empty() || js_len(message) > MAX_ELICITATION_MESSAGE_LENGTH {
-        return Err("Elicitation message is empty or too long".to_string());
+    if message.is_empty() {
+        return Err("Elicitation message is empty".to_string());
     }
     validate_scope(request)?;
     match request.get("mode").and_then(Value::as_str) {
@@ -60,11 +48,6 @@ pub fn validate_elicitation_request_value(request: &Value) -> ValidationResult {
 }
 
 pub fn validate_elicitation_response_value(request: &Value, response: &Value) -> ValidationResult {
-    if serialized_bytes(response)? > MAX_ELICITATION_RESPONSE_BYTES {
-        return Err(format!(
-            "Elicitation response exceeds {MAX_ELICITATION_RESPONSE_BYTES} bytes"
-        ));
-    }
     let action = required_string(response, "action", "Elicitation response")?;
     if !matches!(action, "accept" | "decline" | "cancel") {
         return Err(format!("Unsupported elicitation response action: {action}"));
@@ -156,11 +139,6 @@ fn validate_schema(schema: &Value) -> ValidationResult {
             .as_object()
             .ok_or_else(|| "Form elicitation schema properties must be an object".to_string())?,
     };
-    if properties.len() > MAX_ELICITATION_FIELDS {
-        return Err(format!(
-            "Elicitation schema has more than {MAX_ELICITATION_FIELDS} fields"
-        ));
-    }
     let required = string_array(schema.get("required"), "Elicitation schema required")?;
     let mut unique = HashSet::new();
     for name in required {
@@ -174,7 +152,7 @@ fn validate_schema(schema: &Value) -> ValidationResult {
         }
     }
     for (name, field_schema) in properties {
-        if name.is_empty() || js_len(name) > MAX_ELICITATION_FIELD_NAME_LENGTH {
+        if name.is_empty() {
             return Err("Elicitation schema contains an invalid field name".to_string());
         }
         validate_property_schema(name, field_schema)?;
@@ -379,9 +357,6 @@ fn validate_choices(name: &str, choices: Option<&Vec<String>>) -> ValidationResu
     let Some(choices) = choices else {
         return Ok(());
     };
-    if choices.len() > MAX_ELICITATION_CHOICES {
-        return Err(format!("Elicitation field {name} has too many choices"));
-    }
     if choices.iter().collect::<HashSet<_>>().len() != choices.len() {
         return Err(format!("Elicitation field {name} has duplicate choices"));
     }
@@ -389,9 +364,6 @@ fn validate_choices(name: &str, choices: Option<&Vec<String>>) -> ValidationResu
 }
 
 fn validate_safe_pattern(name: &str, source: &str) -> ValidationResult {
-    if js_len(source) > MAX_PATTERN_LENGTH {
-        return Err(format!("Elicitation field {name} pattern is too long"));
-    }
     Regex::new(source)
         .map_err(|_| format!("Elicitation field {name} has an invalid schema pattern"))?;
     if has_back_reference(source) || has_unsafe_quantified_group(source) {

@@ -9,8 +9,7 @@
   "agentThread": "Agent thread",
   "queue": {
     "sessionChanged": "A queued message was discarded because its ACP session changed.",
-    "sendFailed": "The queued message could not be sent to the Agent.",
-    "limit": "Only {{count}} messages can be queued for one ACP turn."
+    "sendFailed": "The queued message could not be sent to the Agent."
   },
   "backProject": "Back to project",
   "backProjects": "Back to projects",

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
-import { collectPromptHistory, MAX_PROMPT_HISTORY } from "../web/src/lib/prompt-history";
+import { collectPromptHistory } from "../web/src/lib/prompt-history";
 import type { TimelineItem } from "../web/src/lib/state";
 
 describe("ACP prompt history", () => {
@@ -29,16 +29,14 @@ describe("ACP prompt history", () => {
     ])).toEqual([repeated, repeated]);
   });
 
-  it("bounds history without modifying complete ContentBlock arrays", () => {
-    const timeline = Array.from({ length: MAX_PROMPT_HISTORY + 3 }, (_, index) =>
+  it("preserves complete prompt history and ContentBlock arrays", () => {
+    const timeline = Array.from({ length: 100 + 3 }, (_, index) =>
       message(String(index), "user", [{ type: "text", text: String(index) }])
     );
     const history = collectPromptHistory(timeline);
-    expect(history).toHaveLength(MAX_PROMPT_HISTORY);
-    expect(history[0]).toEqual([{ type: "text", text: "3" }]);
+    expect(history).toHaveLength(103);
+    expect(history[0]).toEqual([{ type: "text", text: "0" }]);
     expect(history.at(-1)).toEqual([{ type: "text", text: "102" }]);
-    expect(collectPromptHistory(timeline, 0)).toEqual([]);
-    expect(collectPromptHistory(timeline, MAX_PROMPT_HISTORY + 1)).toHaveLength(MAX_PROMPT_HISTORY);
   });
 });
 

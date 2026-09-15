@@ -37,7 +37,6 @@ import {
   type ThreadNavigationTarget,
 } from "./components/acp/prompt-composer";
 import {
-  MAX_QUEUED_PROMPTS,
   QueuedPrompts,
   type QueuedPrompt,
 } from "./components/acp/queued-prompts";
@@ -91,7 +90,7 @@ export default function App() {
   const [newThreadOpen, setNewThreadOpen] = useState(false);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>();
   const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
-  const [queueError, setQueueError] = useState<"queue.sessionChanged" | "queue.sendFailed" | "queue.limit">();
+  const [queueError, setQueueError] = useState<"queue.sessionChanged" | "queue.sendFailed">();
   const [queuePaused, setQueuePaused] = useState(false);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchFocusRequest, setThreadSearchFocusRequest] = useState(0);
@@ -599,10 +598,6 @@ export default function App() {
     }
     const sessionId = state.session?.sessionId;
     if (!sessionId) return false;
-    if (queuedPrompts.length >= MAX_QUEUED_PROMPTS) {
-      setQueueError("queue.limit");
-      return false;
-    }
     setQueuedPrompts((current) => [
       ...current,
       { id: randomId(), sessionId, blocks },
@@ -1001,7 +996,7 @@ export default function App() {
             ) : null}
             <QueuedPrompts
               prompts={queuedPrompts}
-              error={queueError ? t(queueError, { count: MAX_QUEUED_PROMPTS }) : undefined}
+              error={queueError ? t(queueError) : undefined}
               paused={queuePaused}
               canSendNow={composerAvailable && state.running}
               onEdit={(queued) => {

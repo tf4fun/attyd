@@ -16,7 +16,7 @@ For every materialized session the bridge owns:
 - process-local `PromptResponse` boundaries for turns completed while that baseline is retained;
 - at most one active or completed-but-not-yet-committed turn overlay;
 - live permission, elicitation, URL, terminal, MCP and control state;
-- bounded idempotency and revision metadata that contains no conversation payload;
+- exact idempotency and revision metadata that contains no conversation payload;
 - at most one staged load candidate.
 
 Closing the bridge discards all of this state. Restarting reconstructs an idle session only through
@@ -42,7 +42,7 @@ cold-materialize old history or recover it after bridge restart. The bridge does
 database, browser-backed history, temporary persistence or a private protocol extension to hide
 that ACP limitation.
 
-Unobserved materialized sessions use `--session-unobserved-timeout`: default 1800 seconds,
+Unobserved materialized sessions use `--session-unobserved-timeout`: default -1 (disabled),
 any negative value disables recycling, zero attempts immediate close. Only session-specific
 observers count. Return cancels the queued timer; renewed absence starts a full interval.
 Agent output and turn completion never reset it. Expiry can close a running task when negotiated.
@@ -69,8 +69,8 @@ Bridge process
 |- ActiveOverlay: zero or one per session
 |- LoadCandidate: zero or one per session
 |- LiveResourceStore
-|- bounded intent/revision metadata
-`- bounded shared subscriber delivery
+|- exact intent/revision metadata
+`- shared subscriber delivery
 
 Browser
 |- rendered projection
@@ -177,7 +177,7 @@ immutable baseline + current overlay + independent live resources
 ```
 
 Snapshot capture and suffix registration are one actor operation. Each snapshot/delta carries
-bridge epoch, session incarnation and view revision. A continuous cursor receives the bounded
+bridge epoch, session incarnation and view revision. A continuous cursor receives the retained
 suffix; an old epoch, gap, reordering or expired suffix receives a reset snapshot. Crossing a
 turn commit yields either old baseline plus overlay or the new baseline, never a mixture.
 
@@ -231,8 +231,8 @@ LoadTransaction { candidate, byte accounting, attempt }
 Baseline, overlay and cold-load candidate bytes are accounted for diagnostics and regression tests,
 but their cumulative size is not an admission rule. A protocol-valid Agent history or turn is never
 rejected because it crossed a bridge-defined conversation budget. Normal turn commit needs the old
-baseline and one overlay, not a second full replay candidate. Single-value wire safety, bounded
-delivery queues and live-resource concurrency limits remain separate from conversation retention.
+baseline and one overlay, not a second full replay candidate. Protocol validity and lifecycle rules remain enforced; wire sizes, delivery queues and
+live-resource counts have no application-imposed quota.
 
 In practice the Agent/model context window and available process memory bound useful history, but
 the bridge does not infer that context window or reinterpret it as an ACP admission rule. Resource
