@@ -404,6 +404,67 @@ for (const { kind, listState } of [
   });
 }
 
+for (const action of ["complete", "cancel"] as const) {
+  test(`archives the unfinished plan when a turn ${action}s and keeps it out of the dock after reload`, async ({ page }, testInfo) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill("browser permission flow");
+    await composer.press("Enter");
+    const dockPlan = page.locator(".input-dock .plan-card");
+    await expect(dockPlan).toContainText("Answer the test");
+    const permission = page.getByRole("alertdialog", { name: "Agent permission request" });
+    await expect(permission).toBeVisible();
+    if (action === "complete") {
+      await permission.getByRole("button", { name: "Allow once" }).click();
+    } else {
+      await page.getByRole("button", { name: "Stop current turn", exact: true }).click();
+    }
+    await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+    await expect(dockPlan).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
+    await expect(dockPlan).toHaveCount(0);
+    const turn = page.locator(".conversation-turn").last();
+    await turn.getByRole("button", { name: "Expand execution process", exact: true }).click();
+    await expect(turn.locator(".plan-card")).toContainText("Answer the test");
+    await page.screenshot({ path: testInfo.outputPath(`plan-${action}-archived.png`) });
+    await composer.fill("usage-flow");
+    await composer.press("Enter");
+    await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
+    await expect(dockPlan).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+for (const flow of ["plan-completed-flow", "plan-empty-flow"]) {
+  test(`removes ${flow} from the dock before the turn ends`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
+    await composer.fill(flow);
+    await composer.press("Enter");
+    const dockPlan = page.locator(".input-dock .plan-card");
+    await expect(dockPlan).toContainText("Inspect plan lifecycle");
+    const permission = page.getByRole("alertdialog", { name: "Agent permission request" });
+    await expect(permission).toContainText("Complete plan");
+    await permission.getByRole("button", { name: "Continue", exact: true }).click();
+    await expect(permission).toContainText("Finish turn");
+    await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeVisible();
+    await expect(dockPlan).toHaveCount(0);
+    await permission.getByRole("button", { name: "Continue", exact: true }).click();
+    await expect(page.getByText("Plan lifecycle finished.", { exact: true })).toBeVisible();
+    await expect(dockPlan).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByText("Plan lifecycle finished.", { exact: true })).toBeVisible();
+    await expect(dockPlan).toHaveCount(0);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
 test("keeps the connection usable when the Agent cancels pending interactions", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");

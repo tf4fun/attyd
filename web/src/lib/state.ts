@@ -1501,12 +1501,12 @@ function startPrompt(
     state.pendingSessionControl != null ||
     state.runtimeOperation != null
   ) return state;
+  state = archiveActivePlan(state);
   return {
     ...state,
     running: true,
     agentActivity: { kind: "waiting" },
     pendingPrompt: { requestId, sessionId, blocks },
-    activePlan: planWithoutCompletedEntries(state.activePlan),
     timeline: [
       ...state.timeline,
       {
@@ -1529,19 +1529,14 @@ function completePrompt(
     state.pendingPrompt?.requestId !== event.requestId ||
     state.pendingPrompt.sessionId !== event.sessionId
   ) return appendBackgroundEvent(state, event);
-  const completedPlan = event.response.stopReason !== "cancelled" &&
-    isCompletedLegacyPlan(state.activePlan)
-    ? state.activePlan
-    : undefined;
+  state = archiveActivePlan(state);
   return {
     ...state,
     running: false,
     agentActivity: undefined,
     pendingPrompt: undefined,
-    activePlan: completedPlan ? undefined : state.activePlan,
     timeline: [
       ...finishTurnTools(state.timeline, event.response),
-      ...(completedPlan ? [completedPlan] : []),
       { id: randomId(), type: "stop", response: event.response },
     ],
   };
@@ -1554,6 +1549,7 @@ function failPrompt(
   const pendingPrompt = state.pendingPrompt;
   if (pendingPrompt == null || pendingPrompt.requestId !== event.requestId) return state;
   const retryBlocks = pendingPrompt.blocks;
+  state = archiveActivePlan(state);
   return {
     ...state,
     running: false,
@@ -1647,15 +1643,35 @@ function reduceSessionUpdate(
   }
 
   if (update.sessionUpdate === "plan") {
+    // Legacy plans have no ID: keep one latest snapshot per turn. Historical
+    // replay never creates a live composer card, even for unfinished entries.
+    const turnStart = timelineTurnStarts(state.timeline).at(-1) ?? 0;
+    const index = state.timeline.findIndex((item, index) => index >= turnStart &&
+      item.type === "plan" && item.update.sessionUpdate === "plan");
+    const previous = state.activePlan ?? state.timeline[index];
+    const item: Extract<TimelineItem, { type: "plan" }> = {
+      id: previous?.id ?? randomId(),
+      type: "plan",
+      update,
+      raw: [...(previous?.type === "plan" ? previous.raw : []), notification],
+    };
+    const active = state.running && state.sessionSyncPhase !== "reconciling" &&
+      update.entries.some(({ status }) => status !== "completed");
+    const timeline = [...state.timeline];
+    if (active || update.entries.length === 0) {
+      if (index >= 0) timeline.splice(index, 1);
+    } else if (index >= 0) {
+      timeline[index] = item;
+    } else {
+      timeline.push(item);
+    }
     return {
       ...state,
-      activePlan: {
-        id: state.activePlan?.id ?? randomId(),
-        type: "plan",
-        update,
-        raw: [...(state.activePlan?.raw ?? []), notification],
-      },
-      agentActivity: state.running ? { kind: "planning" } : state.agentActivity,
+      activePlan: active ? item : undefined,
+      timeline,
+      agentActivity: active
+        ? { kind: "planning" }
+        : state.agentActivity?.kind === "planning" ? { kind: "waiting" } : state.agentActivity,
     };
   }
 
@@ -2087,22 +2103,13 @@ function lastAssistantChunk(
   return chunk?.role === role ? chunk : undefined;
 }
 
-function planWithoutCompletedEntries(
-  plan: AppState["activePlan"],
-): AppState["activePlan"] {
-  if (!plan || plan.update.sessionUpdate !== "plan") return plan;
-  const entries = plan.update.entries.filter(({ status }) => status !== "completed");
-  if (entries.length === plan.update.entries.length) return plan;
-  if (entries.length === 0) return undefined;
-  return { ...plan, update: { ...plan.update, entries } };
-}
-
-function isCompletedLegacyPlan(
-  plan: AppState["activePlan"],
-): plan is Extract<TimelineItem, { type: "plan" }> {
-  return plan?.update.sessionUpdate === "plan" &&
-    plan.update.entries.length > 0 &&
-    plan.update.entries.every(({ status }) => status === "completed");
+function archiveActivePlan(state: AppState): AppState {
+  if (state.activePlan == null) return state;
+  return {
+    ...state,
+    activePlan: undefined,
+    timeline: [...state.timeline, state.activePlan],
+  };
 }
 
 function contentBlockEqual(left: ContentBlock, right: ContentBlock): boolean {
@@ -2154,7 +2161,7 @@ function terminateBridgeState(
   phase: Extract<ConnectionPhase, "error" | "stopped">,
   socketOpen: boolean,
 ): AppState {
-  const current = rollbackSessionTransition(state);
+  const current = archiveActivePlan(rollbackSessionTransition(state));
   return {
     ...current,
     phase,
@@ -2220,6 +2227,7 @@ function settleAuthenticationRequired(
     next = rollbackSessionTransition(next);
   }
   if (requestId != null && requestId === next.pendingPrompt?.requestId) {
+    next = archiveActivePlan(next);
     next = {
       ...next,
       running: false,
@@ -2234,7 +2242,7 @@ function settleAuthenticationRequired(
         next,
         sessionId,
         (cached) => ({
-          ...cached,
+          ...archiveActivePlan(cached),
           running: false,
           agentActivity: undefined,
           pendingPrompt: undefined,
@@ -2386,6 +2394,7 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
       next = { ...next, timeline: finishTurnTools(next.timeline, { stopReason: "cancelled" }) };
     }
     if (view.phase !== "running") {
+      next = archiveActivePlan(next);
       next = {
         ...next,
         running: view.phase === "reconciling",
@@ -2441,6 +2450,7 @@ function applyBridgeTurnComplete(
       ],
     };
   }
+  state = archiveActivePlan(state);
   return {
     ...state,
     running: false,
@@ -2476,6 +2486,7 @@ function applyBridgeTurnFailure(
   const ownsActivePrompt = state.pendingPrompt == null ||
     state.pendingPrompt.requestId === event.clientIntentId ||
     state.pendingPrompt.requestId === event.operationId;
+  if (ownsActivePrompt) state = archiveActivePlan(state);
   const next = !ownsActivePrompt
     ? { ...state, timeline: [...state.timeline, error] }
     : {

@@ -621,6 +621,41 @@ const agent = acp
       });
     }
     sessionHistory.set(params.sessionId, history);
+    if (promptText === "plan-completed-flow" || promptText === "plan-empty-flow") {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [{ content: "Inspect plan lifecycle", priority: "high", status: "in_progress" }],
+        },
+      });
+      for (const stage of ["Complete plan", "Finish turn"]) {
+        await client.request(acp.methods.client.session.requestPermission, {
+          sessionId: params.sessionId,
+          toolCall: { toolCallId: `plan-${requestId}-${stage}`, title: stage },
+          options: [{ optionId: "continue", name: "Continue", kind: "allow_once" }],
+        });
+        if (stage === "Complete plan") {
+          await client.notify(acp.methods.client.session.update, {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "plan",
+              entries: promptText === "plan-empty-flow" ? [] : [
+                { content: "Inspect plan lifecycle", priority: "high", status: "completed" },
+              ],
+            },
+          });
+        }
+      }
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Plan lifecycle finished." },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (promptText === "command-menu-flow") {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
