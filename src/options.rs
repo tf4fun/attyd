@@ -45,8 +45,9 @@ pub struct Options {
     #[arg(long, value_parser = normalize_dev_server)]
     pub dev_server: Option<String>,
 
-    /// Explicit browser origin for a custom domain or HTTPS reverse proxy. May be repeated.
-    #[arg(long = "allowed-origin", value_parser = normalize_origin)]
+    /// Browser origin for a custom domain or HTTPS reverse proxy. May be repeated.
+    /// Use '*' to allow any HTTP(S) origin and hostname (disables DNS-rebinding protection).
+    #[arg(long = "allowed-origin", value_parser = normalize_allowed_origin)]
     pub allowed_origins: Vec<String>,
 
     /// Stdio workspace default and local filesystem boundary.
@@ -136,7 +137,7 @@ impl Options {
         self.allowed_origins = self
             .allowed_origins
             .iter()
-            .map(|origin| normalize_origin(origin))
+            .map(|origin| normalize_allowed_origin(origin))
             .collect::<Result<_, _>>()?;
         self.allowed_origins.sort();
         self.allowed_origins.dedup();
@@ -163,6 +164,14 @@ fn normalize_dev_server(value: &str) -> Result<String, String> {
         return Err(invalid());
     }
     Ok(origin)
+}
+
+fn normalize_allowed_origin(value: &str) -> Result<String, String> {
+    if value == "*" {
+        return Ok(value.to_string());
+    }
+    normalize_origin(value)
+        .map_err(|error| format!("{error}; use '*' to allow any HTTP(S) origin and hostname"))
 }
 
 pub(crate) fn normalize_origin(value: &str) -> Result<String, String> {
@@ -215,6 +224,7 @@ mod tests {
             assert_eq!(options.dev_server.as_deref(), Some(expected));
         }
         for input in [
+            "*",
             "https://localhost:5173",
             "ws://localhost:5173",
             "localhost:5173",
@@ -396,6 +406,41 @@ mod tests {
             .normalized()
             .unwrap_err();
         assert!(error.contains("-- <agent-command> [args...]"));
+    }
+
+    #[test]
+    fn accepts_wildcard_allowed_origins_alone_and_with_explicit_origins() {
+        for origins in [vec!["*"], vec!["https://agent.example:443", "*", "*"]] {
+            let mut arguments = vec!["attyd"];
+            for origin in &origins {
+                arguments.extend(["--allowed-origin", origin]);
+            }
+            arguments.extend(["--", "agent"]);
+            let options = Options::try_parse_from(arguments)
+                .unwrap()
+                .normalized()
+                .unwrap();
+            let expected = if origins.len() == 1 {
+                vec!["*"]
+            } else {
+                vec!["*", "https://agent.example"]
+            };
+            assert_eq!(options.allowed_origins, expected);
+        }
+        for origin in [
+            "https://*.example.com",
+            "http://*",
+            "**",
+            " *",
+            "* ",
+            "null",
+        ] {
+            assert!(
+                Options::try_parse_from(["attyd", "--allowed-origin", origin, "--", "agent"])
+                    .is_err(),
+                "accepted {origin}"
+            );
+        }
     }
 
     #[test]

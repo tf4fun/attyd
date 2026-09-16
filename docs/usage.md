@@ -211,7 +211,7 @@ Place attyd options before `--` and the Agent command or endpoint after it.
 | `--mcp-config <file>` | Static MCP configuration file; repeatable. |
 | `--session-unobserved-timeout <seconds>` | Close an unobserved session after this interval; defaults to `-1` (disabled). Any negative value disables recycling; `0` closes immediately. Requires Agent close support. |
 | `--read-only` | Disable attyd's ACP `fs/write_text_file` capability and handler. |
-| `--allowed-origin <origin>` | Allow a browser origin and its hostname for a reverse proxy or custom domain; repeatable. |
+| `--allowed-origin <origin>` | Allow a browser origin and its hostname for a reverse proxy or custom domain; repeatable. Use `'*'` to allow any HTTP(S) origin and hostname. |
 | `--help`, `--version` | Show CLI help or the executable version. |
 
 Relative CLI paths resolve against the directory where attyd was launched.
@@ -414,6 +414,19 @@ origin to reach an internal HTTP listener; forwarded headers are not trusted.
 These checks reduce cross-origin and DNS-rebinding exposure, not network access
 by unauthenticated clients. Keep authentication and access restrictions at the
 proxy or network boundary.
+
+To allow any HTTP(S) origin and hostname, pass a quoted wildcard so the shell
+does not expand it into filenames:
+
+```bash
+./target/release/attyd --allowed-origin '*' -- your-agent acp
+```
+
+This disables the origin and hostname allowlists, including DNS-rebinding
+protection. Use it only when access is controlled by a trusted proxy or network.
+Request headers must still be valid: duplicate Host or Origin headers, malformed
+origins, and `Origin: null` are rejected. Only the standalone `*` is supported;
+patterns such as `https://*.example.com` are not supported.
 
 Configured workspace roots apply to attyd-provided local filesystem and context
 operations. They do not sandbox the Agent's own tools or terminal commands.

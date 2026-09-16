@@ -73,18 +73,20 @@ impl OriginPolicy {
         let parsed = url::Url::parse(&http_origin).expect("validated HTTP origin");
         let direct_host = matches!(parsed.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)))
             || parsed.host_str() == Some("localhost");
-        let configured_host = self.allowed_origins.iter().any(|origin| {
-            let scheme = origin.split_once("://").expect("validated origin").0;
-            normalize_origin(&format!("{scheme}://{host}")).as_ref() == Ok(origin)
-        });
+        let allow_any = self.allowed_origins.iter().any(|origin| origin == "*");
+        let configured_host = allow_any
+            || self.allowed_origins.iter().any(|origin| {
+                let scheme = origin.split_once("://").expect("validated origin").0;
+                normalize_origin(&format!("{scheme}://{host}")).as_ref() == Ok(origin)
+            });
         if !direct_host && !configured_host {
             return false;
         }
 
         let mut origins = request.headers().get_all(header::ORIGIN).iter();
         let Some(origin) = origins.next() else {
-            // Command-line clients do not send Origin. Host is still checked
-            // so an unconfigured DNS name cannot rebind to this server.
+            // Command-line clients do not send Origin. Unless '*' is configured,
+            // Host must still be allowlisted to prevent DNS rebinding.
             return true;
         };
         if origins.next().is_some() {
@@ -97,7 +99,9 @@ impl OriginPolicy {
         else {
             return false;
         };
-        (direct_host && origin == http_origin) || self.allowed_origins.contains(&origin)
+        allow_any
+            || (direct_host && origin == http_origin)
+            || self.allowed_origins.contains(&origin)
     }
 }
 
@@ -2722,6 +2726,76 @@ mod tests {
                 policy.allows(&request.body(Body::empty()).unwrap()),
                 allowed,
                 "Host={host}, Origin={origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_origin_boundary_allows_any_http_origin_and_host() {
+        for allowed_origins in [
+            vec!["*".to_string()],
+            vec!["https://agent.example".to_string(), "*".to_string()],
+        ] {
+            let policy = OriginPolicy { allowed_origins };
+            for (host, origin, allowed) in [
+                ("proxy.example:8443", None, true),
+                (
+                    "proxy.example:8443",
+                    Some("https://proxy.example:8443"),
+                    true,
+                ),
+                ("proxy.example:8443", Some("https://other.example"), true),
+                ("127.0.0.1:7331", Some("https://other.example"), true),
+                ("localhost:7331", Some("http://localhost:8000"), true),
+                ("[::1]:7331", Some("http://[::1]:8000"), true),
+                ("proxy.example", Some("null"), false),
+                ("proxy.example", Some("*"), false),
+                ("proxy.example", Some("https://*.example"), false),
+                ("proxy.example", Some("file://other.example"), false),
+                ("proxy.example", Some("https://other.example/path"), false),
+                (
+                    "proxy.example",
+                    Some("https://one.example https://two.example"),
+                    false,
+                ),
+                ("user@proxy.example", None, false),
+                ("proxy.example/path", None, false),
+                ("*", None, false),
+            ] {
+                let mut request = Request::builder()
+                    .uri("/api/v1/runtime")
+                    .header(header::HOST, host);
+                if let Some(origin) = origin {
+                    request = request.header(header::ORIGIN, origin);
+                }
+                assert_eq!(
+                    policy.allows(&request.body(Body::empty()).unwrap()),
+                    allowed,
+                    "Host={host}, Origin={origin:?}"
+                );
+            }
+            for headers in [
+                vec![],
+                vec![("host", "one.example"), ("host", "two.example")],
+                vec![
+                    ("host", "proxy.example"),
+                    ("origin", "https://one.example"),
+                    ("origin", "https://two.example"),
+                ],
+            ] {
+                let mut request = Request::builder().uri("/api/v1/runtime");
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                assert!(!policy.allows(&request.body(Body::empty()).unwrap()));
+            }
+            assert!(
+                policy.allows(
+                    &Request::builder()
+                        .uri("http://proxy.example:7331/api/v1/runtime")
+                        .body(Body::empty())
+                        .unwrap()
+                )
             );
         }
     }

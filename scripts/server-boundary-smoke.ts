@@ -5,6 +5,7 @@ import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { startRustTestServer } from "./rust-test-server.js";
 import type { BridgeSessionView, CreatedSessionResult } from "../web/src/lib/business-api.js";
 
 // Real HTTP and process-lifecycle checks; no model, account, or user workspace.
@@ -124,6 +125,7 @@ try {
   assert.notEqual(noCommandExit, 0);
   assert.match(noCommandOutput, /-- <agent-command> \[args\.\.\.\]/u);
   assert.doesNotMatch(noCommandOutput, /attyd listening/u);
+  await verifyWildcardOrigin();
   console.log("server boundary smoke passed");
 } catch (error) {
   console.error({ stdout, stderr });
@@ -143,7 +145,30 @@ try {
   await rm(temporary, { recursive: true, force: true });
 }
 
-function statusWithHost(origin: string, headers: Record<string, string>): Promise<number> {
+async function verifyWildcardOrigin(): Promise<void> {
+  const server = await startRustTestServer({
+    command: [process.execPath, "--import", "tsx", "tests/fixtures/fake-agent.ts"],
+    args: ["--allowed-origin", "*"],
+  });
+  try {
+    const origin = `http://127.0.0.1:${server.port}`;
+    for (const headers of [
+      { Host: "custom.example:8443" },
+      { Host: "custom.example:8443", Origin: "https://custom.example:8443" },
+      { Host: "custom.example:8443", Origin: "https://other.example" },
+      { Host: `127.0.0.1:${server.port}`, Origin: "http://other.example:8000" },
+    ]) {
+      assert.equal(await statusWithHost(origin, headers), 200, JSON.stringify(headers));
+    }
+    for (const invalidOrigin of ["null", "*", "https://custom.example/path"]) {
+      assert.equal(await statusWithHost(origin, { Host: "custom.example", Origin: invalidOrigin }), 403);
+    }
+  } finally {
+    await server.close();
+  }
+}
+
+function statusWithHost(origin: string, headers: Record<string, string | undefined>): Promise<number> {
   return new Promise((resolve, reject) => {
     const req = request(`${origin}/api/v1/runtime`, { headers }, (response) => {
       response.resume();
