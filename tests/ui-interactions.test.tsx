@@ -519,6 +519,76 @@ describe("ACP interactive UI contract", () => {
     expect(onCancel).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    { name: "during composition", isComposing: true, keyCode: 13 },
+    { name: "at the IME commit boundary", isComposing: false, keyCode: 229 },
+  ])("keeps Enter $name from submitting a prompt", async ({ isComposing, keyCode }) => {
+    const onSubmit = vi.fn();
+    await render(root, (
+      <PromptComposer
+        disabled={false}
+        running={false}
+        commands={[]}
+        onSubmit={onSubmit}
+        onCancel={() => undefined}
+      />
+    ));
+    const composer = requireElement<HTMLTextAreaElement>(container.querySelector("textarea"));
+    await replaceText(composer, "keep this English text");
+    const event = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      key: "Enter",
+      isComposing,
+      keyCode,
+    });
+    await act(async () => { composer.dispatchEvent(event); });
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(composer.value).toBe("keep this English text");
+    expect(event.defaultPrevented).toBe(false);
+
+    await press(composer, "Enter");
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith("keep this English text", []);
+    expect(composer.value).toBe("");
+  });
+
+  it("leaves IME keys to the input method while an Agent turn is running", async () => {
+    const onSubmit = vi.fn();
+    const onCancel = vi.fn();
+    const onNavigateThread = vi.fn();
+    await render(root, (
+      <PromptComposer
+        disabled={false}
+        running
+        commands={[]}
+        onSubmit={onSubmit}
+        onCancel={onCancel}
+        onNavigateThread={onNavigateThread}
+      />
+    ));
+    const composer = requireElement<HTMLTextAreaElement>(container.querySelector("textarea"));
+    await replaceText(composer, "queued follow-up");
+    for (const key of ["ArrowDown", "ArrowUp", "Enter", "Escape", "Home"]) {
+      const event = new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key,
+        isComposing: true,
+        ctrlKey: key === "Home",
+      });
+      await act(async () => { composer.dispatchEvent(event); });
+      expect(event.defaultPrevented).toBe(false);
+      expect(composer.value).toBe("queued follow-up");
+    }
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(onNavigateThread).not.toHaveBeenCalled();
+
+    await press(composer, "Enter");
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith("queued follow-up", []);
+    expect(composer.value).toBe("");
+  });
+
   it("navigates Zed-style prompt history and resends exact ACP blocks", async () => {
     const onSubmit = vi.fn();
     const older = [

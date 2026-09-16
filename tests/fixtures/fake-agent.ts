@@ -621,6 +621,19 @@ const agent = acp
       });
     }
     sessionHistory.set(params.sessionId, history);
+    if (promptText === "command-menu-flow") {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: Array.from({ length: 24 }, (_, index) => ({
+            name: `command-${String(index + 1).padStart(2, "0")}`,
+            description: `Run command ${index + 1}`,
+          })),
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (turnDesign) {
       const turn = history.filter((update) => update.sessionUpdate === "user_message_chunk").length;
       const answers = [

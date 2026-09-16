@@ -575,6 +575,97 @@ test("pastes and drops negotiated ACP context into the Zed-style composer", asyn
   expect(browserErrors).toEqual([]);
 });
 
+test("preserves IME-confirmed English until a separate Enter submits it", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/sessions/saved-session");
+  const editor = page.locator('textarea[role="combobox"]');
+  await expect(editor).toBeEnabled();
+  await editor.fill("usage-flow");
+  const prompts = page.locator(".message-user").filter({ hasText: "usage-flow" });
+
+  await editor.dispatchEvent("compositionstart", { data: "" });
+  await editor.dispatchEvent("keydown", { key: "Enter", keyCode: 13, isComposing: true });
+  await expect(editor).toHaveValue("usage-flow");
+  await expect(prompts).toHaveCount(0);
+  await editor.dispatchEvent("compositionend", { data: "usage-flow" });
+
+  // IME commit can end composition before its confirming keydown arrives.
+  await editor.dispatchEvent("keydown", { key: "Enter", keyCode: 229, isComposing: false });
+  await expect(editor).toHaveValue("usage-flow");
+  await expect(editor).toBeFocused();
+  await expect(prompts).toHaveCount(0);
+
+  await editor.press("Enter");
+  await expect(prompts).toHaveCount(1);
+  await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
+  await expect(editor).toHaveValue("");
+  expect(browserErrors).toEqual([]);
+});
+
+for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
+  test(`keeps keyboard-selected commands visible at ${viewport.width}px`, async ({ page }, testInfo) => {
+    const browserErrors = collectBrowserErrors(page);
+    await page.setViewportSize(viewport);
+    await page.goto("/sessions/saved-session");
+    const editor = page.locator('textarea[role="combobox"]');
+    await expect(editor).toBeEnabled();
+    await editor.fill("command-menu-flow");
+    await editor.press("Enter");
+    await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+    await editor.fill("/");
+
+    const menu = page.locator("#agent-command-menu");
+    const options = menu.getByRole("option");
+    await expect(options).toHaveCount(24);
+    expect(await menu.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+
+    const expectSelectedVisible = async (index: number) => {
+      await expect(options.nth(index)).toHaveAttribute("aria-selected", "true");
+      await expect(options.nth(index)).toBeInViewport({ ratio: 1 });
+      await expect(editor).toHaveAttribute("aria-activedescendant", `agent-command-${index}`);
+      await expect(editor).toBeFocused();
+    };
+
+    await expectSelectedVisible(0);
+    await editor.press("ArrowUp");
+    await expectSelectedVisible(23);
+    await editor.press("ArrowDown");
+    await expectSelectedVisible(0);
+    for (let index = 1; index <= 16; index += 1) {
+      await editor.press("ArrowDown");
+      await expectSelectedVisible(index);
+    }
+    for (let index = 15; index >= 0; index -= 1) {
+      await editor.press("ArrowUp");
+      await expectSelectedVisible(index);
+    }
+
+    await editor.press("ArrowUp");
+    await editor.fill("/command-1");
+    await expect(options).toHaveCount(10);
+    await expectSelectedVisible(0);
+    await editor.press("ArrowUp");
+    await expectSelectedVisible(9);
+    await editor.press("Escape");
+    await expect(menu).toBeHidden();
+    await editor.fill("/");
+    await expectSelectedVisible(0);
+
+    await editor.press("Alt+Shift+Escape");
+    await expect(page.locator(".composer")).toHaveAttribute("data-expanded", "true");
+    await editor.press("ArrowUp");
+    await expectSelectedVisible(23);
+    await testInfo.attach("selected-command", {
+      body: await page.screenshot(),
+      contentType: "image/png",
+    });
+    await editor.press("Enter");
+    await expect(editor).toHaveValue("/command-24");
+    await expect(menu).toBeHidden();
+    expect(browserErrors).toEqual([]);
+  });
+}
+
 test("adds a workspace file through a Zed-style @ mention", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.setViewportSize({ width: 390, height: 844 });

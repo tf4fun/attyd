@@ -112,6 +112,7 @@ export function PromptComposer({
   const [expanded, setExpanded] = useState(false);
   const [historyIndex, setHistoryIndex] = useState<number>();
   const area = useRef<HTMLTextAreaElement>(null);
+  const activeCommand = useRef<HTMLButtonElement>(null);
   const picker = useRef<HTMLInputElement>(null);
   const attachmentsRef = useRef<PromptAttachment[]>([]);
   const pendingAttachmentBytes = useRef(0);
@@ -235,6 +236,9 @@ export function PromptComposer({
   };
 
   useEffect(() => setActiveCommandIndex(0), [commandMatches.length, value]);
+  useEffect(() => {
+    activeCommand.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeCommandIndex, commandMatches]);
   useEffect(() => setActiveContextIndex(0), [contextMention?.query, contextMatches.length]);
   useEffect(() => {
     if (interactionPending) setExpanded(false);
@@ -485,6 +489,8 @@ export function PromptComposer({
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // IME commit keys can arrive after compositionend with keyCode 229.
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
     if (
       event.key === "Escape" &&
       event.altKey &&
@@ -632,6 +638,7 @@ export function PromptComposer({
           {commandMatches.map((command, index) => (
             <button
               key={command.name}
+              ref={index === activeCommandIndex ? activeCommand : undefined}
               id={`agent-command-${index}`}
               type="button"
               role="option"
