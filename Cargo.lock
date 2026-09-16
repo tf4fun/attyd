@@ -327,6 +327,7 @@ dependencies = [
  "mime_guess",
  "portable-pty",
  "regex",
+ "reqwest",
  "rust-embed",
  "rustix",
  "serde",

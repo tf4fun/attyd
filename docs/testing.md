@@ -34,6 +34,45 @@ separate steps so failures identify their layer directly. See the workflow for C
 Conformance follows the [ACP compatibility contract](acp-coverage.md#compatibility-contract);
 backend-specific smoke tests remain optional.
 
+The remote-transport smoke uses a local SDK mock Agent. Its first prompt deliberately
+waits for cancellation; the second session's prompt returns immediately. On failure,
+the harness prints the mock HTTP/Agent timeline, runtime/session snapshots, and Rust
+process logs before teardown. It inherits the normal logging configuration; set
+`RUST_LOG=attyd=info,agent_client_protocol=debug,agent_client_protocol_http=trace`
+when extra SDK diagnostics are needed. The 10-second prompt deadline detects
+stalled delivery, not model inference latency.
+
+The smoke starts the normal Rust executable and uses the official TypeScript SDK's
+HTTP/SSE server over real local TCP connections. Only Agent business responses are
+mocked. Like the browser, it continuously consumes global and active-session SSE,
+switches the session subscription when opening another thread, and re-subscribes
+when returning to the running thread. Holding one prompt while another session
+progresses represents a running Agent turn; the smoke does not inject scheduler
+yields or modify Hyper. Failure timelines include connection IDs and peer ports
+to distinguish requests on different sockets. Loopback
+latency, the mock's immediate replies, and debug builds differ from typical remote
+deployments, so failures demonstrate a supported flow rather than a production
+failure rate.
+
+ACP HTTP currently disables idle connection pooling to avoid observed stalls before
+prompt delivery. RPCs use fresh connections, while SSE streams stay open. This
+workaround adds a TCP handshake per RPC, plus TLS for HTTPS. With browser subscriptions
+aligned as above, a Linux run using unmodified dependencies and default pooling
+completed 92 passes and one prompt-delivery timeout; the workaround completed 100
+passes without a timeout. These are bounded checks, not production failure rates.
+
+A separate diagnostic run with Hyper 1.11.1 and hyper-util 0.1.20 captured an HTTP/1
+dispatch handoff race under the default Tokio executor: after the sender consumed
+the readiness signal, an overlapping empty-queue poll reasserted it, and receiving
+the request did not clear it. Connection and socket IDs showed the active SSE
+connection being stored idle and reused by a later POST, which remained queued
+until the smoke timed out. The triggering poll had cooperative budget remaining;
+budget exhaustion is not the explanation for this trace. Instrumentation affects
+timing, and neither this trace nor the passing workaround establishes the exact
+internal sequence of the original CI failure. Retain the normal concurrent-session
+smoke as the regression gate; revisit pooling when a narrower mitigation or an
+upstream fix has been validated against that flow.
+
 The binary matrix uses native Linux x86_64/ARM64, macOS Intel/Apple silicon, and
 Windows x86_64 runners. Every target checks `--version`, runs the standalone
 HTTP/assets smoke, and packages license materials before release. The complete

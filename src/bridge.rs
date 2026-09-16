@@ -2083,7 +2083,7 @@ pub async fn run_with_cancellation(
             )
             .await
         }
-        Transport::Http => match HttpClient::with_endpoint(&options.command[0]) {
+        Transport::Http => match remote_http_client(&options.command[0]) {
             Ok(client) => {
                 run_connection(
                     client,
@@ -2106,6 +2106,20 @@ pub async fn run_with_cancellation(
             sink.send(json!({ "type": "bridge/phase", "phase": "error" }));
         }
     }
+}
+
+fn remote_http_client(
+    endpoint: &str,
+) -> Result<HttpClient, agent_client_protocol_http::HttpClientError> {
+    // Keep long-lived SSE streams out of the pool used by later ACP requests.
+    // Diagnostics captured stale dispatch readiness returning an active SSE
+    // connection to the pool, where a later RPC reused it and stalled. Disabling
+    // reuse avoids this path, at the cost of a fresh connection per RPC; see
+    // docs/testing.md for the evidence and scope of this workaround.
+    let http = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()?;
+    HttpClient::with_endpoint_and_client(endpoint, http)
 }
 
 async fn run_connection<T>(
