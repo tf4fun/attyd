@@ -80,7 +80,6 @@ impl Eq for SessionHandle {}
 
 #[derive(Debug)]
 pub(crate) struct Rejected<E> {
-    pub origin: EventOrigin,
     pub error: DispatchError,
     pub event: E,
 }
@@ -167,18 +166,17 @@ impl Drop for DeliveryGuard {
 #[derive(Debug)]
 pub(crate) struct Delivery<E> {
     pub handle: SessionHandle,
-    pub class: TrafficClass,
-    pub origin: EventOrigin,
-    pub bytes: usize,
     event: E,
     guard: DeliveryGuard,
 }
 
 impl<E> Delivery<E> {
+    #[cfg(test)]
     pub(crate) fn event(&self) -> &E {
         &self.event
     }
 
+    #[cfg(test)]
     pub(crate) fn event_mut(&mut self) -> &mut E {
         &mut self.event
     }
@@ -330,7 +328,6 @@ impl<E> SessionDispatch<E> {
         &self,
         handle: &SessionHandle,
         class: TrafficClass,
-        origin: EventOrigin,
         bytes: usize,
         event: E,
     ) -> Result<(), Rejected<E>> {
@@ -350,7 +347,6 @@ impl<E> SessionDispatch<E> {
             let global = self.inner.global.get(class).record(bytes);
             Ok((
                 registry,
-                bytes,
                 DeliveryGuard {
                     busy: None,
                     session: Some(session),
@@ -359,16 +355,13 @@ impl<E> SessionDispatch<E> {
             ))
         })();
         match result {
-            Ok((mut registry, bytes, guard)) => {
+            Ok((mut registry, guard)) => {
                 let queue = registry
                     .sessions
                     .get_mut(handle.session_id())
                     .expect("validated queue remains locked");
                 queue.queue.push_back(Delivery {
                     handle: handle.clone(),
-                    class,
-                    origin,
-                    bytes,
                     event,
                     guard,
                 });
@@ -378,11 +371,7 @@ impl<E> SessionDispatch<E> {
                 }
                 Ok(())
             }
-            Err(error) => Err(Rejected {
-                origin,
-                error,
-                event,
-            }),
+            Err(error) => Err(Rejected { error, event }),
         }
     }
 
@@ -489,13 +478,7 @@ mod tests {
         event: &'static str,
     ) {
         dispatch
-            .try_route(
-                handle,
-                TrafficClass::Ordinary,
-                EventOrigin::Command,
-                1,
-                event,
-            )
+            .try_route(handle, TrafficClass::Ordinary, 1, event)
             .unwrap();
     }
 
@@ -505,13 +488,7 @@ mod tests {
         event: &'static str,
     ) {
         dispatch
-            .try_route(
-                handle,
-                TrafficClass::Reserved,
-                EventOrigin::RequiredInbound,
-                1,
-                event,
-            )
+            .try_route(handle, TrafficClass::Reserved, 1, event)
             .unwrap();
     }
 
@@ -548,18 +525,9 @@ mod tests {
         let dispatch = dispatch();
         let session = dispatch.register("a", 1).unwrap();
         dispatch
-            .try_route(
-                &session,
-                TrafficClass::Reserved,
-                EventOrigin::RequiredInbound,
-                0,
-                "complete",
-            )
+            .try_route(&session, TrafficClass::Reserved, 0, "complete")
             .unwrap();
         let mut delivery = dispatch.try_next().unwrap().unwrap();
-        assert_eq!(delivery.bytes, 1);
-        assert_eq!(delivery.class, TrafficClass::Reserved);
-        assert_eq!(delivery.origin, EventOrigin::RequiredInbound);
         *delivery.event_mut() = "reduced";
         let (event, guard) = delivery.into_parts();
         assert_eq!(event, "reduced");
@@ -574,13 +542,7 @@ mod tests {
             QueueUsage { items: 1, bytes: 1 }
         );
         dispatch
-            .try_route(
-                &session,
-                TrafficClass::Reserved,
-                EventOrigin::RequiredInbound,
-                0,
-                "next",
-            )
+            .try_route(&session, TrafficClass::Reserved, 0, "next")
             .unwrap();
         assert!(dispatch.try_next().unwrap().is_none());
         assert_eq!(
@@ -604,32 +566,14 @@ mod tests {
         let b = dispatch.register("b", 1).unwrap();
         for index in 0..4_096 {
             dispatch
-                .try_route(
-                    &a,
-                    TrafficClass::Ordinary,
-                    EventOrigin::RequiredInbound,
-                    64 * 1024,
-                    index,
-                )
+                .try_route(&a, TrafficClass::Ordinary, 64 * 1024, index)
                 .unwrap();
         }
         dispatch
-            .try_route(
-                &a,
-                TrafficClass::Reserved,
-                EventOrigin::RequiredInbound,
-                1,
-                4_096,
-            )
+            .try_route(&a, TrafficClass::Reserved, 1, 4_096)
             .unwrap();
         dispatch
-            .try_route(
-                &b,
-                TrafficClass::Ordinary,
-                EventOrigin::RequiredInbound,
-                1,
-                99,
-            )
+            .try_route(&b, TrafficClass::Ordinary, 1, 99)
             .unwrap();
         let first = dispatch.try_next().unwrap().unwrap();
         assert_eq!(*first.event(), 0);
@@ -714,13 +658,7 @@ mod tests {
             );
             assert_eq!(dispatch.remove(&old), Err(DispatchError::StaleHandle));
             let rejected = dispatch
-                .try_route(
-                    &old,
-                    TrafficClass::Reserved,
-                    EventOrigin::RequiredInbound,
-                    1,
-                    "late",
-                )
+                .try_route(&old, TrafficClass::Reserved, 1, "late")
                 .unwrap_err();
             assert_eq!(rejected.error, DispatchError::StaleHandle);
             drop(new_delivery);
@@ -764,26 +702,14 @@ mod tests {
         let own = dispatch.register("a", 1).unwrap();
         assert_eq!(
             dispatch
-                .try_route(
-                    &foreign,
-                    TrafficClass::Ordinary,
-                    EventOrigin::Command,
-                    1,
-                    "foreign"
-                )
+                .try_route(&foreign, TrafficClass::Ordinary, 1, "foreign")
                 .unwrap_err()
                 .error,
             DispatchError::ForeignHandle
         );
         assert_eq!(
             dispatch
-                .try_route(
-                    &epoch_handle,
-                    TrafficClass::Ordinary,
-                    EventOrigin::Command,
-                    1,
-                    "foreign"
-                )
+                .try_route(&epoch_handle, TrafficClass::Ordinary, 1, "foreign")
                 .unwrap_err()
                 .error,
             DispatchError::EpochMismatch
@@ -820,13 +746,7 @@ mod tests {
         assert!(matches!(dispatch.try_next(), Err(DispatchError::Closed)));
         assert_eq!(dispatch.register("new", 1), Err(DispatchError::Closed));
         let rejected = dispatch
-            .try_route(
-                &a,
-                TrafficClass::Reserved,
-                EventOrigin::RequiredInbound,
-                1,
-                "late-response",
-            )
+            .try_route(&a, TrafficClass::Reserved, 1, "late-response")
             .unwrap_err();
         assert_eq!(rejected.error, DispatchError::Closed);
         assert_eq!(rejected.event, "late-response");
@@ -877,13 +797,7 @@ mod tests {
         })));
         assert!(
             dispatch
-                .try_route(
-                    &session,
-                    TrafficClass::Ordinary,
-                    EventOrigin::Command,
-                    1,
-                    event
-                )
+                .try_route(&session, TrafficClass::Ordinary, 1, event)
                 .is_ok()
         );
         dispatch.remove(&session).unwrap();

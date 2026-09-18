@@ -121,7 +121,7 @@ export type GlobalBusinessEvent =
     };
 
 export type SessionBusinessEvent =
-  | (SessionOwner & { type: "bridge/session_retired"; reason: "closed" | "deleted" })
+  | (SessionOwner & { type: "bridge/session_retired"; reason: "closed" | "deleted" | "unobserved" })
   | {
       type: "bridge/session_reset";
       bridgeEpoch: string;

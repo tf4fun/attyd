@@ -4,6 +4,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Map, Value, json};
 
+/// Sessions the Agent may keep writing to after local retirement (no
+/// session/close support). Their late events are dead letters, not pre-open
+/// liveness signals, so they must not enter the pending buffers.
+const RETIRED_SESSION_CAP: usize = 512;
+
 #[derive(Default)]
 pub(crate) struct ActiveRuntimeProjection {
     sessions: HashMap<String, RuntimeSession>,
@@ -13,9 +18,9 @@ pub(crate) struct ActiveRuntimeProjection {
     permission_sessions: HashMap<String, String>,
     elicitation_sessions: HashMap<String, Option<String>>,
     url_elicitation_sessions: HashMap<String, Option<String>>,
-    global_events: VecDeque<String>,
-    global_event_bytes: usize,
     terminal_output_bytes: HashMap<(String, String), Vec<u8>>,
+    retired_sessions: HashSet<String>,
+    retired_session_order: VecDeque<String>,
     clock: u64,
 }
 
@@ -123,7 +128,7 @@ impl ActiveRuntimeProjection {
                     self.complete_operation(request_id);
                 }
             }
-            "acp/session_closed" | "acp/session_deleted" => {
+            "acp/session_closed" | "acp/session_deleted" | "bridge/session_retired" => {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
                     self.remove_session(session_id);
                 }
@@ -132,7 +137,9 @@ impl ActiveRuntimeProjection {
                 let Some(session_id) = value.get("sessionId").and_then(Value::as_str) else {
                     return;
                 };
-                if let Some(request_id) = value.get("requestId").and_then(Value::as_str) {
+                if !self.retired_sessions.contains(session_id)
+                    && let Some(request_id) = value.get("requestId").and_then(Value::as_str)
+                {
                     self.prompt_sessions
                         .insert(request_id.to_string(), session_id.to_string());
                 }
@@ -149,8 +156,10 @@ impl ActiveRuntimeProjection {
                 let Some(session_id) = value.get("sessionId").and_then(Value::as_str) else {
                     return;
                 };
-                self.operation_sessions
-                    .insert(request_id.to_string(), session_id.to_string());
+                if !self.retired_sessions.contains(session_id) {
+                    self.operation_sessions
+                        .insert(request_id.to_string(), session_id.to_string());
+                }
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session.active_operation = Some(event.to_string());
                 }
@@ -230,8 +239,10 @@ impl ActiveRuntimeProjection {
                 else {
                     return;
                 };
-                self.permission_sessions
-                    .insert(permission_id.to_string(), session_id.to_string());
+                if !self.retired_sessions.contains(session_id) {
+                    self.permission_sessions
+                        .insert(permission_id.to_string(), session_id.to_string());
+                }
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session
                         .pending_permissions
@@ -264,12 +275,20 @@ impl ActiveRuntimeProjection {
                     .filter(|request| request.get("mode").and_then(Value::as_str) == Some("url"))
                     .and_then(|request| request.get("elicitationId"))
                     .and_then(Value::as_str)
+                    && session_id
+                        .as_deref()
+                        .is_none_or(|id| !self.retired_sessions.contains(id))
                 {
                     self.url_elicitation_sessions
                         .insert(url_id.to_string(), session_id.clone());
                 }
-                self.elicitation_sessions
-                    .insert(elicitation_id.to_string(), session_id.clone());
+                if session_id
+                    .as_deref()
+                    .is_none_or(|id| !self.retired_sessions.contains(id))
+                {
+                    self.elicitation_sessions
+                        .insert(elicitation_id.to_string(), session_id.clone());
+                }
                 if let Some(session_id) = session_id.as_deref()
                     && let Some(session) = self.sessions.get_mut(session_id)
                 {
@@ -358,7 +377,7 @@ impl ActiveRuntimeProjection {
             | "acp/authenticated"
             | "acp/logged_out"
             | "acp/mcp_connection"
-            | "acp/mcp_message" => self.record_global_event(event),
+            | "acp/mcp_message" => Self::record_global_event(event),
             _ => {}
         }
     }
@@ -381,6 +400,9 @@ impl ActiveRuntimeProjection {
         else {
             return (event.to_string(), event.to_string());
         };
+        if self.retired_sessions.contains(&session_id) {
+            return (event.to_string(), event.to_string());
+        }
         let Some(terminal_id) = terminal
             .get("terminalId")
             .and_then(Value::as_str)
@@ -450,6 +472,7 @@ impl ActiveRuntimeProjection {
         (public.to_string(), value.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_events(&self) -> Vec<String> {
         let mut sessions = self
             .sessions
@@ -470,7 +493,6 @@ impl ActiveRuntimeProjection {
             session_ids.push(session_id.clone());
             replay.extend(Self::session_events(session_id, session));
         }
-        replay.extend(self.global_events.iter().cloned());
         replay.push(
             json!({
                 "type": "bridge/runtime_replay_complete",
@@ -578,6 +600,7 @@ impl ActiveRuntimeProjection {
                 runtime.observe_liveness(&event);
             }
         }
+        self.retired_sessions.remove(session_id);
         self.sessions.insert(session_id.to_string(), runtime);
     }
 
@@ -597,6 +620,9 @@ impl ActiveRuntimeProjection {
 
     fn record_session_event(&mut self, session_id: &str, event: &str) {
         self.clock = self.clock.wrapping_add(1);
+        if self.retired_sessions.contains(session_id) {
+            return;
+        }
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.updated_at = self.clock;
             if session.active_prompt.is_some() {
@@ -618,13 +644,14 @@ impl ActiveRuntimeProjection {
         if let Some(session_id) = session_id {
             self.record_session_event(session_id, event);
         } else {
-            self.record_global_event(event);
+            Self::record_global_event(event);
         }
     }
 
-    fn record_global_event(&mut self, event: &str) {
-        self.global_event_bytes = self.global_event_bytes.saturating_add(event.len());
-        self.global_events.push_back(event.to_string());
+    /// Global events have no retained consumer: log them as diagnostic evidence
+    /// instead of buffering them forever.
+    fn record_global_event(event: &str) {
+        tracing::info!(event = %event, "global runtime event");
     }
 
     fn remove_pending_terminal(&mut self, session_id: &str, release: &Value) {
@@ -661,6 +688,15 @@ impl ActiveRuntimeProjection {
     fn remove_session(&mut self, session_id: &str) {
         self.sessions.remove(session_id);
         self.pending_session_events.remove(session_id);
+        if self.retired_sessions.insert(session_id.to_string()) {
+            self.retired_session_order.push_back(session_id.to_string());
+            while self.retired_session_order.len() > RETIRED_SESSION_CAP {
+                let Some(oldest) = self.retired_session_order.pop_front() else {
+                    break;
+                };
+                self.retired_sessions.remove(&oldest);
+            }
+        }
         self.prompt_sessions.retain(|_, value| value != session_id);
         self.operation_sessions
             .retain(|_, value| value != session_id);
@@ -693,6 +729,7 @@ impl ActiveRuntimeProjection {
 }
 
 impl RuntimeSession {
+    #[cfg(test)]
     fn has_replayable_state(&self) -> bool {
         self.active_prompt.is_some()
             || self.active_operation.is_some()
@@ -1007,7 +1044,58 @@ mod tests {
     }
 
     #[test]
-    fn replays_connection_scoped_auth_and_mcp_runtime_events() {
+    fn retired_session_late_events_are_dead_letters_not_pending_liveness() {
+        let mut cache = ActiveRuntimeProjection::default();
+        cache.update(
+            r#"{"type":"acp/session_created","cwd":"/w","response":{"sessionId":"ghost"}}"#,
+        );
+        cache.update(
+            r#"{"type":"bridge/session_retired","sessionId":"ghost","bridgeEpoch":"e","sessionIncarnation":1,"reason":"unobserved"}"#,
+        );
+
+        // An Agent that still owns the session may keep streaming liveness
+        // events; none of them may enter the pending buffers or correlation maps.
+        cache.update(
+            r#"{"type":"acp/terminal_state","terminal":{"sessionId":"ghost","terminalId":"t","output":"still-running"}}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/permission_request","permissionId":"p","request":{"sessionId":"ghost"}}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/elicitation_request","elicitationId":"el","request":{"sessionId":"ghost"}}"#,
+        );
+
+        assert!(cache.pending_session_events.is_empty());
+        assert!(cache.terminal_output_bytes.is_empty());
+        assert!(cache.permission_sessions.is_empty());
+        assert!(cache.elicitation_sessions.is_empty());
+        assert!(cache.retired_sessions.contains("ghost"));
+    }
+
+    #[test]
+    fn reopened_session_leaves_the_retired_tombstone() {
+        let mut cache = ActiveRuntimeProjection::default();
+        cache
+            .update(r#"{"type":"acp/session_created","cwd":"/w","response":{"sessionId":"back"}}"#);
+        cache.update(
+            r#"{"type":"bridge/session_retired","sessionId":"back","bridgeEpoch":"e","sessionIncarnation":1,"reason":"unobserved"}"#,
+        );
+        cache.update(
+            r#"{"type":"acp/session_attached","sessionId":"back","cwd":"/w","response":{"sessionId":"back"}}"#,
+        );
+
+        assert!(!cache.retired_sessions.contains("back"));
+        cache.update(
+            r#"{"type":"acp/permission_request","permissionId":"p","request":{"sessionId":"back"}}"#,
+        );
+        assert_eq!(
+            cache.permission_sessions.get("p").map(String::as_str),
+            Some("back")
+        );
+    }
+
+    #[test]
+    fn connection_scoped_auth_and_mcp_events_are_logged_not_retained() {
         let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"bridge/auth_terminal_started","requestId":"auth","methodId":"login"}"#,
@@ -1019,9 +1107,9 @@ mod tests {
         );
 
         let replay = cache.replay_events().join("\n");
-        assert!(replay.contains("auth_terminal_started"));
-        assert!(replay.contains("Code: "));
-        assert!(replay.contains("mcp_connection"));
+        assert!(!replay.contains("auth_terminal_started"));
+        assert!(!replay.contains("Code: "));
+        assert!(!replay.contains("mcp_connection"));
     }
 
     #[test]
@@ -1044,7 +1132,6 @@ mod tests {
         assert!(!replay.contains("acp/elicitation_request"));
         assert!(!replay.contains("acp/elicitation_resolved"));
         assert!(!replay.contains("acp/elicitation_complete"));
-        assert!(cache.global_events.is_empty());
     }
 
     #[test]
@@ -1067,7 +1154,6 @@ mod tests {
         assert!(!replay.contains("acp/elicitation_request"));
         assert!(!replay.contains("acp/elicitation_resolved"));
         assert!(!replay.contains("acp/elicitation_aborted"));
-        assert!(cache.global_events.is_empty());
     }
 
     #[test]

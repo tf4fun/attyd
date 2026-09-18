@@ -334,19 +334,13 @@ impl Scheduling {
             ));
         }
         self.sessions
-            .try_route(handle, item.class, item.origin, item.bytes, item)
+            .try_route(handle, item.class, item.bytes, item)
             .map_err(|rejected| self.reject(rejected.event, scheduling_error(rejected.error)))
     }
 
     pub(super) fn route_global(&self, item: IngressItem) -> Result<(), RouteRejected> {
         self.global
-            .try_route(
-                &self.global_handle,
-                item.class,
-                item.origin,
-                item.bytes,
-                item,
-            )
+            .try_route(&self.global_handle, item.class, item.bytes, item)
             .map_err(|rejected| self.reject(rejected.event, scheduling_error(rejected.error)))
     }
 

@@ -268,6 +268,7 @@ impl BridgeBootstrap {
         }
     }
 
+    #[cfg(test)]
     fn hello_event(&self) -> Option<&String> {
         self.hello.as_ref()
     }
@@ -826,9 +827,9 @@ impl BridgeHub {
         }
     }
 
-    // Retain the aggregate stream for compatibility checks while business SSE
-    // uses subscriptions that only receive their own scope.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Aggregate stream retained for test observation; business SSE uses
+    // subscriptions that only receive their own scope.
+    #[cfg(test)]
     async fn subscribe(self: &Arc<Self>) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
         let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
@@ -1008,6 +1009,7 @@ impl BridgeHub {
         ))
     }
 
+    #[cfg(test)]
     #[cfg(test)]
     async fn subscribe_session(self: &Arc<Self>, session_id: String) -> Option<BridgeSubscription> {
         self.ensure_runtime().await;
@@ -4807,7 +4809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_unobserved_timer_closes_running_work_and_does_not_retry_refusal() {
+    async fn expired_unobserved_timer_waits_for_running_work_then_closes_once() {
         for refused in [false, true] {
             let flags = if refused {
                 vec!["--close", "--fail-close"]
@@ -4834,6 +4836,23 @@ mod tests {
             .unwrap();
             hub.unsubscribe(session_stream.id, session_stream.generation)
                 .await;
+            // The interval expires while the turn is still running: expiry must
+            // wait for end_turn instead of cutting the work off.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let counts = hub
+                .business_request(json!({"type":"session/list", "requestId":"count"}))
+                .await
+                .unwrap();
+            assert_eq!(
+                counts["_meta"]["closes"], 0,
+                "expiry must not interrupt a running turn"
+            );
+            hub.business_request(json!({
+                "type": "session/cancel", "requestId": "cancel",
+                "sessionId": "created",
+            }))
+            .await
+            .unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let counts = hub
@@ -4847,7 +4866,7 @@ mod tests {
                 }
             })
             .await
-            .expect("expiry must not wait for the running prompt to finish");
+            .expect("the settled turn lets the deferred retire proceed");
             tokio::time::sleep(Duration::from_millis(250)).await;
             let counts = hub
                 .business_request(json!({"type":"session/list", "requestId":"later-count"}))
@@ -4880,6 +4899,132 @@ mod tests {
             hub.unsubscribe(observer.id, observer.generation).await;
             hub.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn expired_unobserved_timer_retires_session_without_agent_close() {
+        // No "--close" flag: the Agent cannot close sessions, so expiry must
+        // still release the local copy without sending any RPC.
+        let (hub, mut observer) = capability_fixture_with_timeout(&[], 1).await;
+        hub.business_request(json!({"type":"session/new", "requestId":"new"}))
+            .await
+            .unwrap();
+        let (session_stream, _session_guard) =
+            hub.observe_session("created".into(), None).await.unwrap();
+        hub.unsubscribe(session_stream.id, session_stream.generation)
+            .await;
+        let mut retired_reason = None;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event: serde_json::Value =
+                    serde_json::from_str(&observer.events.recv().await.unwrap().into_string())
+                        .unwrap();
+                if event["type"] == "bridge/session_retired" && event["sessionId"] == "created" {
+                    retired_reason = event["reason"].as_str().map(str::to_string);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("expiry must retire the session without Agent close support");
+        assert_eq!(retired_reason.as_deref(), Some("unobserved"));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let counts = hub
+            .business_request(json!({"type":"session/list", "requestId":"count"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            counts["_meta"]["closes"], 0,
+            "local retirement must not send session/close"
+        );
+        let snapshot = hub.state.lock().await.canonical.snapshot.clone().unwrap();
+        assert!(
+            !snapshot.sessions.contains_key("created"),
+            "locally retired session must leave the runtime snapshot"
+        );
+        let replay = hub.state.lock().await.runtime.replay_events().join("\n");
+        assert!(
+            !replay.contains("\"created\""),
+            "local retirement must release the runtime projection: {replay}"
+        );
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn expired_unobserved_timer_waits_for_a_pending_permission() {
+        let (hub, observer) = capability_fixture_with_timeout(&["--close"], 1).await;
+        let created = hub
+            .business_request(json!({"type":"session/new", "requestId":"new"}))
+            .await
+            .unwrap();
+        let (session_stream, _session_guard) =
+            hub.observe_session("created".into(), None).await.unwrap();
+        hub.start_turn(
+            "created".into(),
+            created["view"]["session"]["historyRevision"]
+                .as_str()
+                .unwrap()
+                .into(),
+            "turn".into(),
+            vec![json!({"type":"text","text":"wait-permission"})],
+        )
+        .await
+        .unwrap();
+        let permission_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = hub.state.lock().await;
+                if let Some(permission_id) = state
+                    .canonical
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.sessions.get("created"))
+                    .and_then(|session| session.permissions.keys().next().cloned())
+                {
+                    break permission_id;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the permission request must become pending");
+        hub.unsubscribe(session_stream.id, session_stream.generation)
+            .await;
+        // The interval expires while the Agent waits on the interaction:
+        // retirement must defer rather than cancel the actionable request.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let counts = hub
+            .business_request(json!({"type":"session/list", "requestId":"count"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            counts["_meta"]["closes"], 0,
+            "a pending interaction must defer unobserved retirement"
+        );
+        hub.business_request(json!({
+            "type": "permission/respond", "requestId": "respond",
+            "permissionId": permission_id,
+            "outcome": {"outcome": "selected", "optionId": "allow"},
+        }))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let counts = hub
+                    .business_request(json!({"type":"session/list", "requestId":"count"}))
+                    .await
+                    .unwrap();
+                if counts["_meta"]["closes"] == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the resolved interaction lets the deferred retire proceed");
+        hub.unsubscribe(observer.id, observer.generation).await;
+        hub.shutdown().await;
     }
 
     #[tokio::test]
@@ -6065,8 +6210,8 @@ mod tests {
         );
         for event in request_events {
             assert!(
-                aggregate_events.contains(&event),
-                "aggregate replay lost {event}"
+                !aggregate_events.contains(&event),
+                "global events are logged, not retained for replay: {event}"
             );
         }
         hub.unsubscribe(global.id, global.generation).await;

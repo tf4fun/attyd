@@ -80,7 +80,7 @@ pub struct Options {
 
     /// Close sessions after this many unobserved seconds: negative disables, zero closes immediately.
     /// Closing may stop Agent tasks and managed terminals; history recovery depends on the Agent.
-    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    #[arg(long, default_value_t = 300, allow_negative_numbers = true)]
     pub session_unobserved_timeout: i64,
 
     /// Agent command for stdio, or one endpoint URL for a remote transport.

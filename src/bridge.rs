@@ -40,6 +40,7 @@ use crate::semantic::{
 };
 use crate::session_mirror::{MirrorError, MirrorPhase, TurnAdmission};
 use crate::session_observation::ObservationLease;
+use crate::session_observers::SessionWork;
 use crate::session_registry::SessionRegistry;
 use crate::session_resources::{
     AttachmentDelivery, ElicitationResponder, PermissionResponder, ReplayValidationBackup,
@@ -400,6 +401,7 @@ fn take_pending_elicitation(
     }
 }
 
+#[cfg(test)]
 fn pending_elicitation_count(state: &BridgeState) -> usize {
     state.request_elicitations.len() + state.sessions.elicitation_owners.len()
 }
@@ -1099,10 +1101,11 @@ fn refresh_observer_timers(state: &mut BridgeState) {
                 session.session_id.clone(),
                 session.incarnation,
                 session.live.as_ref().map(|live| live.lifecycle.clone()),
+                SessionWork::of(session),
             )
         })
         .collect::<Vec<_>>();
-    for (session_id, incarnation, lifecycle) in owners {
+    for (session_id, incarnation, lifecycle, work) in owners {
         let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) else {
             continue;
         };
@@ -1110,11 +1113,12 @@ fn refresh_observer_timers(state: &mut BridgeState) {
             resources.observers.stop_absence();
             continue;
         }
-        let Some(timer) =
-            resources
-                .observers
-                .refresh(lifecycle.as_ref(), timeout, tokio::time::Instant::now())
-        else {
+        let Some(timer) = resources.observers.refresh(
+            lifecycle.as_ref(),
+            work,
+            timeout,
+            tokio::time::Instant::now(),
+        ) else {
             continue;
         };
         let events = events.clone();
@@ -1163,6 +1167,16 @@ fn finish_session_observers(
         }));
         lease.finish();
     }
+}
+
+/// An unobserved session outside the Idle work state must not be retired:
+/// in-flight work would be cut off and a pending interaction would be
+/// cancelled Agent-side.
+fn session_blocks_unobserved_retire(state: &BridgeState, session_id: &str) -> bool {
+    state
+        .sessions
+        .state(session_id)
+        .is_some_and(|session| SessionWork::of(session) != SessionWork::Idle)
 }
 
 fn retire_session_observation(
@@ -2320,26 +2334,50 @@ where
                                 .sessions
                                 .active_session(&session_id)
                                 .is_none_or(|session| session.state.incarnation != incarnation)
-                            || !state
-                                .agent_capabilities
-                                .as_ref()
-                                .is_some_and(|caps| caps.session_capabilities.close.is_some())
                         {
                             permit.cancel();
                             continue;
                         }
+                        // A running turn, an in-flight operation, or a pending
+                        // interaction owns the session's next step: leave the
+                        // permit pending so the timer retries after it settles.
+                        if session_blocks_unobserved_retire(&state, &session_id) {
+                            continue;
+                        }
+                        // The Agent owns the session: close it when supported,
+                        // otherwise drop our local copy and let the Agent keep
+                        // whatever it retains (the Zed model).
+                        let supports_close = state
+                            .agent_capabilities
+                            .as_ref()
+                            .is_some_and(|caps| caps.session_capabilities.close.is_some());
                         drop(state);
                         auto_close = Some(permit);
-                        (
-                            json!({
-                                "type": "session/close",
-                                "requestId": format!("bridge-unobserved-close-{}", Uuid::new_v4()),
-                                "sessionId": session_id,
-                                "expectedIncarnation": incarnation,
-                            }),
-                            None,
-                            None,
-                        )
+                        let request_id =
+                            format!("bridge-unobserved-retire-{}", Uuid::new_v4());
+                        if supports_close {
+                            (
+                                json!({
+                                    "type": "session/close",
+                                    "requestId": request_id,
+                                    "sessionId": session_id,
+                                    "expectedIncarnation": incarnation,
+                                }),
+                                None,
+                                None,
+                            )
+                        } else {
+                            (
+                                json!({
+                                    "type": "bridge/retire_session",
+                                    "requestId": request_id,
+                                    "sessionId": session_id,
+                                    "expectedIncarnation": incarnation,
+                                }),
+                                None,
+                                None,
+                            )
+                        }
                     }
                     Some(BridgeInput::SessionViewRequest {
                         session_id,
@@ -2650,6 +2688,7 @@ fn error_message(error: Error) -> String {
     error.data.map_or(error.message, |data| data.to_string())
 }
 
+#[cfg(test)]
 async fn resolve_session_view_waiters(
     state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
@@ -2820,6 +2859,7 @@ fn drain_runtime_effects(state: &mut BridgeState, sink: &EventSink) -> Vec<(Stri
     terminal_releases
 }
 
+#[cfg(test)]
 async fn apply_runtime_effects(
     state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
@@ -4512,6 +4552,9 @@ async fn handle_command_inner(
             require_agent_method("session/close", &state).await?;
             let incarnation = {
                 let mut state = state.lock().await;
+                if auto_close.is_some() && session_blocks_unobserved_retire(&state, &session_id) {
+                    return Ok(());
+                }
                 if command
                     .get("expectedIncarnation")
                     .and_then(Value::as_u64)
@@ -4648,6 +4691,7 @@ async fn handle_command_inner(
                     incarnation,
                     SessionAdmission::Close,
                     &request_id,
+                    "closed",
                 );
             }
             sink.send(json!({
@@ -4655,6 +4699,122 @@ async fn handle_command_inner(
                 "requestId": request_id,
                 "sessionId": session_id,
             }));
+        }
+        // Local retirement for Agents without session/close: the Agent keeps
+        // whatever it retains; we drop our copy and the session may still be
+        // listed or re-materialized on the next open.
+        "bridge/retire_session" => {
+            let request_id = string_field(&command, "requestId")?.to_string();
+            let session_id = string_field(&command, "sessionId")?.to_string();
+            let incarnation = {
+                let mut state = state.lock().await;
+                if auto_close.is_some() && session_blocks_unobserved_retire(&state, &session_id) {
+                    return Ok(());
+                }
+                if command
+                    .get("expectedIncarnation")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|expected| {
+                        state
+                            .sessions
+                            .active_session(&session_id)
+                            .is_none_or(|session| session.state.incarnation != expected)
+                    })
+                {
+                    if let Some(permit) = &auto_close {
+                        permit.cancel();
+                    }
+                    return Ok(());
+                }
+                let incarnation = reserve_session_operation(
+                    &mut state,
+                    &session_id,
+                    RuntimeSessionOperationKind::Close,
+                    &request_id,
+                )?;
+
+                let epoch = state.sessions.epoch().to_string();
+                if let Err(error) = state.sessions.start_operation(
+                    &epoch,
+                    &session_id,
+                    incarnation,
+                    request_id.clone(),
+                    RuntimeSessionOperationKind::Close,
+                    "closing",
+                ) {
+                    release_session_operation(
+                        &mut state,
+                        &session_id,
+                        incarnation,
+                        SessionAdmission::Close,
+                        &request_id,
+                    );
+                    return Err(runtime_state_error(error));
+                }
+                if let Some(permit) = &auto_close {
+                    if !permit.claim() {
+                        state
+                            .sessions
+                            .fail_operation(
+                                &epoch,
+                                &session_id,
+                                incarnation,
+                                &request_id,
+                                RuntimeSessionOperationKind::Close,
+                                json!({"message":"observer returned"}),
+                            )
+                            .map_err(runtime_state_error)?;
+                        release_session_operation(
+                            &mut state,
+                            &session_id,
+                            incarnation,
+                            SessionAdmission::Close,
+                            &request_id,
+                        );
+                        return Ok(());
+                    }
+                }
+                flush_runtime(&mut state, &sink);
+                incarnation
+            };
+            let terminal_releases = {
+                let mut state = state.lock().await;
+
+                let epoch = state.sessions.epoch().to_string();
+                state
+                    .sessions
+                    .close_session(&epoch, &session_id, incarnation, &request_id)
+                    .map_err(runtime_state_error)?;
+                clear_ingest_resources(&mut state, &session_id, incarnation);
+                cancel_interactions_locked(
+                    &session_id,
+                    incarnation,
+                    "session_retired",
+                    &mut state,
+                    &sink,
+                );
+                flush_runtime(&mut state, &sink);
+                drain_runtime_effects(&mut state, &sink)
+            };
+            drop(execution.take());
+            release_runtime_terminals(terminals.as_ref(), terminal_releases).await;
+            if let Some(terminals) = &terminals {
+                terminals.release_session(&session_id).await;
+            }
+            let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
+            continue_execution(ingress.as_ref(), execution, &owner).await?;
+            {
+                let mut state = state.lock().await;
+                complete_session_retirement(
+                    &mut state,
+                    &sink,
+                    &session_id,
+                    incarnation,
+                    SessionAdmission::Close,
+                    &request_id,
+                    "unobserved",
+                );
+            }
         }
         "session/delete" => {
             let request_id = string_field(&command, "requestId")?.to_string();
@@ -4862,6 +5022,7 @@ async fn handle_command_inner(
                     incarnation,
                     SessionAdmission::Delete,
                     &request_id,
+                    "deleted",
                 );
                 state.listed_sessions.remove(&session_id);
                 advance_catalog_revision(&mut state, &sink);
@@ -6605,22 +6766,13 @@ fn complete_session_retirement(
     incarnation: u64,
     operation: SessionAdmission,
     operation_id: &str,
+    reason: &str,
 ) {
     if session_mirror(state)
         .finish_session_cleanup(session_id, incarnation, operation, operation_id)
         .is_ok()
     {
-        retire_session_observation(
-            state,
-            sink,
-            session_id,
-            incarnation,
-            if operation == SessionAdmission::Delete {
-                "deleted"
-            } else {
-                "closed"
-            },
-        );
+        retire_session_observation(state, sink, session_id, incarnation, reason);
         state
             .sessions
             .cancel_resources(session_id, incarnation, "session retired");
@@ -7125,6 +7277,11 @@ mod tests {
                 incarnation,
                 admission,
                 "retire",
+                if admission == SessionAdmission::Delete {
+                    "deleted"
+                } else {
+                    "closed"
+                },
             );
             let retired: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
             let ended: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
@@ -7147,6 +7304,11 @@ mod tests {
                 incarnation,
                 admission,
                 "retire",
+                if admission == SessionAdmission::Delete {
+                    "deleted"
+                } else {
+                    "closed"
+                },
             );
             assert!(
                 events.try_recv().is_err(),
@@ -9328,6 +9490,7 @@ mod tests {
             old,
             SessionAdmission::Close,
             "close",
+            "closed",
         );
         let new = register_test_session(&mut state, "session", "/workspace");
         assert_ne!(new, old);
@@ -9477,6 +9640,7 @@ mod tests {
             first,
             SessionAdmission::Close,
             "close",
+            "closed",
         );
         let second = state
             .sessions
@@ -10391,6 +10555,7 @@ mod tests {
                 .observers
                 .refresh(
                     Some(&SessionLifecycle::Active),
+                    SessionWork::Idle,
                     0,
                     tokio::time::Instant::now()
                 )
@@ -11736,6 +11901,7 @@ mod tests {
                 incarnation,
                 SessionAdmission::Close,
                 "not-owner",
+                "closed",
             );
             assert!(session_operation_pending(
                 &state,
@@ -11749,6 +11915,7 @@ mod tests {
                 incarnation,
                 SessionAdmission::Close,
                 "close",
+                "closed",
             );
         }
         assert!(
@@ -11893,6 +12060,7 @@ mod tests {
             first,
             SessionAdmission::Close,
             "close",
+            "closed",
         );
         assert!(state.sessions.state("session").is_none());
         let second = state

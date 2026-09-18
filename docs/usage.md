@@ -209,7 +209,7 @@ Place attyd options before `--` and the Agent command or endpoint after it.
 | `-t, --transport <transport>` | `stdio` (default), `http` (Streamable HTTP/SSE), or `ws`. |
 | `--add-dir <path>` | Additional stdio workspace root; repeatable and unavailable with remote transports. |
 | `--mcp-config <file>` | Static MCP configuration file; repeatable. |
-| `--session-unobserved-timeout <seconds>` | Close an unobserved session after this interval; defaults to `-1` (disabled). Any negative value disables recycling; `0` closes immediately. Requires Agent close support. |
+| `--session-unobserved-timeout <seconds>` | Retire an unobserved session after this interval; defaults to `300` (five minutes). Any negative value disables recycling; `0` retires immediately. The Agent is asked to `session/close` when it supports it; either way the local copy is released. |
 | `--read-only` | Disable attyd's ACP `fs/write_text_file` capability and handler. |
 | `--allowed-origin <origin>` | Allow a browser origin and its hostname for a reverse proxy or custom domain; repeatable. Use `'*'` to allow any HTTP(S) origin and hostname. |
 | `--help`, `--version` | Show CLI help or the executable version. |
@@ -254,15 +254,26 @@ Only a successful Agent close clears local messages and terminal output. Detache
 services can outlive the session. Settings may be sent while a prompt runs; the
 Agent decides when a changed mode or configuration takes effect.
 
-Leaving a conversation starts the unobserved-session timer. Only that session's
-SSE observers count; project/home pages do not keep it open. Returning cancels the
-timer, and leaving again starts the full interval. Output does not reset it, and
-expiry may close a running task. Newly materialized sessions with no observer also
-count; mere list entries do not. Failed or unsupported close retains the projection.
+Leaving a conversation moves the session into the unobserved attention machine.
+Only that session's SSE observers count; project/home pages do not keep it open.
+The machine classifies each unobserved session by its work state: a running turn,
+an in-flight operation or materialization, a live managed terminal, or a pending
+permission/elicitation/URL interaction keeps the closing countdown disarmed —
+retirement must not cut work off or cancel an interaction Agent-side. Once
+nothing is in-flight the countdown arms for the full interval, and any arriving
+observer, turn, or interaction cancels it. Returning to the session always
+cancels the countdown. Newly materialized sessions with no observer also count;
+mere list entries do not. The Agent owns the session: when it supports
+`session/close` expiry sends that request first; without close support the local
+copy is still released and the Agent keeps whatever it retains. A session retired
+without Agent close may remain listed and may be re-materialized on the next open
+when the Agent supports `session/load`. A failed explicit close retains the
+projection.
 
 ```bash
 attyd --session-unobserved-timeout 600 -- your-agent acp # ten minutes
 attyd --session-unobserved-timeout -1 -- your-agent acp # manual close only
+# omitted: sessions retire after five unobserved minutes by default
 ```
 
 Browser reconnection uses the host's in-memory session state. Restarting attyd

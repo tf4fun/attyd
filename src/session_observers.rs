@@ -6,6 +6,80 @@ use tokio::time::Instant;
 use crate::auto_close::AutoClosePermit;
 use crate::runtime_state::SessionLifecycle;
 use crate::session_observation::ObservationLease;
+use crate::session_state::SessionState;
+
+/// Attention state machine input: what an unobserved session is doing.
+/// Only `Idle` arms the closing countdown; every other state is live work.
+///
+/// The full machine, driven by Agent/observer events through `refresh`:
+///
+/// ```text
+///   OBSERVED ── ≥1 observation lease; never retires
+///      │ last observer leaves (classified by work)
+///      ▼
+///   WORKING ── active_turn / operation / load_attempt / live terminal
+///      │         in-flight: real work, no countdown
+///      │ interaction request arrives (permission, elicitation, url flow)
+///      ▼
+///   AWAITING ── interaction pending: the Agent is parked on a user decision
+///      │         Retirement would cancel it Agent-side, so no countdown.
+///      │ interaction resolves → WORKING (turn continues) or CLOSING
+///      │ turn ends with nothing pending
+///      ▼
+///   CLOSING ── nothing in-flight: countdown armed (idle since T,
+///      │       deadline T + interval). Expiry retires; arriving work or an
+///      │       observer cancels it.
+///      ▼
+///   RETIRED ── permit claimed → session/close or local retirement
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionWork {
+    /// Nothing in-flight: the unobserved countdown may arm.
+    Idle,
+    /// A turn, exclusive operation, materialization attempt, or live managed
+    /// terminal is in-flight: real work that must not be cut off.
+    Running,
+    /// The Agent is parked on a user decision (permission, elicitation, or URL
+    /// flow). Cancelling it changes Agent state, so it must block retirement.
+    AwaitingInteraction,
+}
+
+impl SessionWork {
+    /// Derive the work state from the session owner.
+    pub(crate) fn of(session: &SessionState) -> Self {
+        if session.live.as_ref().is_some_and(|live| {
+            !live.permissions.is_empty()
+                || !live.elicitations.is_empty()
+                || !live.url_flows.is_empty()
+        }) {
+            return Self::AwaitingInteraction;
+        }
+        if session.active_turn.is_some()
+            || session.operation.is_some()
+            || session.load_attempt.is_some()
+            || session
+                .live
+                .as_ref()
+                .is_some_and(|live| live.terminals.values().any(terminal_is_running))
+        {
+            return Self::Running;
+        }
+        Self::Idle
+    }
+}
+
+/// A retained terminal counts as running work only while its process is alive:
+/// released entries are removed upstream, and an exited terminal has its
+/// `exitStatus` recorded even before release.
+fn terminal_is_running(terminal: &serde_json::Value) -> bool {
+    !terminal
+        .get("released")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && terminal
+            .get("exitStatus")
+            .is_none_or(serde_json::Value::is_null)
+}
 
 /// Observation belongs to the session allocation. Delivery only owns cancellable
 /// leases; it never decides whether a session is eligible to close.
@@ -70,11 +144,13 @@ impl SessionObservers {
         true
     }
 
-    /// Called after an owner transition. Output, turn completion and temporary
-    /// control/loading work preserve an existing absence interval.
+    /// Called after an owner transition. The absence interval measures
+    /// *continuously idle* time: an observer or any non-Idle work state clears
+    /// the deadline, and settling back into idle starts a fresh interval.
     pub(crate) fn refresh(
         &mut self,
         lifecycle: Option<&SessionLifecycle>,
+        work: SessionWork,
         timeout_seconds: i64,
         now: Instant,
     ) -> Option<AbsenceTimer> {
@@ -84,6 +160,7 @@ impl SessionObservers {
                 matches!(phase, SessionLifecycle::Closed | SessionLifecycle::Deleting)
             })
             || !self.observers.is_empty()
+            || work != SessionWork::Idle
         {
             self.cancel_absence();
             return None;
@@ -145,7 +222,12 @@ mod tests {
     use super::*;
 
     fn arm(owner: &mut SessionObservers, timeout: i64) -> Option<AbsenceTimer> {
-        owner.refresh(Some(&SessionLifecycle::Active), timeout, Instant::now())
+        owner.refresh(
+            Some(&SessionLifecycle::Active),
+            SessionWork::Idle,
+            timeout,
+            Instant::now(),
+        )
     }
 
     #[tokio::test(start_paused = true)]
@@ -174,20 +256,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn output_and_busy_transitions_do_not_reset_absence() {
-        let mut owner = SessionObservers::default();
-        let timer = arm(&mut owner, 30).unwrap();
-        tokio::time::advance(Duration::from_secs(20)).await;
-        assert!(arm(&mut owner, 30).is_none());
-        assert!(
-            owner
-                .refresh(Some(&SessionLifecycle::Closing), 30, Instant::now())
-                .is_none()
-        );
-        tokio::time::advance(Duration::from_secs(10)).await;
-        assert!(timer.wait().await);
-        assert!(arm(&mut owner, 30).is_none());
-        assert!(owner.matches_absence(timer.id, &timer.permit));
+    async fn non_idle_work_cancels_absence_and_idle_rearms_a_fresh_interval() {
+        for work in [SessionWork::Running, SessionWork::AwaitingInteraction] {
+            let mut owner = SessionObservers::default();
+            let timer = arm(&mut owner, 30).unwrap();
+            tokio::time::advance(Duration::from_secs(20)).await;
+            // In-flight work or a pending interaction cancels the deadline.
+            assert!(
+                owner
+                    .refresh(Some(&SessionLifecycle::Active), work, 30, Instant::now())
+                    .is_none()
+            );
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(!timer.wait().await);
+            assert!(!timer.permit.pending());
+            // Settling back to idle starts a fresh interval, not a residual one.
+            let next = arm(&mut owner, 30).unwrap();
+            tokio::time::advance(Duration::from_secs(29)).await;
+            let waiting = next.wait();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(waiting.await);
+            assert!(!owner.matches_absence(timer.id, &timer.permit));
+            assert!(owner.matches_absence(next.id, &next.permit));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -236,7 +329,12 @@ mod tests {
         drop(old_owner);
         assert!(!old.wait().await);
         assert!(new.wait().await);
-        new_owner.refresh(Some(&SessionLifecycle::Closed), 0, Instant::now());
+        new_owner.refresh(
+            Some(&SessionLifecycle::Closed),
+            SessionWork::Idle,
+            0,
+            Instant::now(),
+        );
         assert!(!new.permit.claim());
     }
 

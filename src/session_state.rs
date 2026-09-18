@@ -399,6 +399,7 @@ impl SessionState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn abort_turn(&mut self, operation_id: &str) -> Result<(), MirrorError> {
         if self.phase != MirrorPhase::Running
             || self

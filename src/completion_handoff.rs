@@ -96,6 +96,7 @@ impl CompletionTurn {
     /// success, early error, and panic. The completion itself cannot be moved out
     /// of this API; callers may take its result while keeping its delivery guard here.
     /// Return external cleanup work for execution only after this method returns.
+    #[cfg(test)]
     pub(crate) fn reduce<R>(mut self, reduce: impl FnOnce(&mut OrderedCompletion) -> R) -> R {
         let result = reduce(self.completion.as_mut().expect("live completion turn"));
         drop(self);
@@ -420,6 +421,7 @@ impl CompletionRegistration {
             .map_err(|_| HandoffError::CompletionUnavailable)
     }
 
+    #[cfg(test)]
     pub(crate) fn withdraw(self) {
         drop(self);
     }
@@ -466,7 +468,7 @@ mod tests {
 
     use crate::ordered_ingress::RequestClass;
     use crate::ordered_ingress::{CompletionSource, OrderedIngress};
-    use crate::session_dispatch::{EventOrigin, SessionDispatch, TrafficClass};
+    use crate::session_dispatch::{SessionDispatch, TrafficClass};
 
     const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -563,13 +565,7 @@ mod tests {
         let session = dispatch.register("a", 1).unwrap();
         for event in ["completion", "A2"] {
             dispatch
-                .try_route(
-                    &session,
-                    TrafficClass::Reserved,
-                    EventOrigin::RequiredInbound,
-                    1,
-                    event,
-                )
+                .try_route(&session, TrafficClass::Reserved, 1, event)
                 .unwrap();
         }
         let (event, guard) = dispatch.try_next().unwrap().unwrap().into_parts();

@@ -83,6 +83,7 @@ impl SessionRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn allocated_session_count(&self) -> usize {
         self.sessions
             .values()

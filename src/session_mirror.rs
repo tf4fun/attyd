@@ -637,6 +637,7 @@ impl SessionRegistry {
         Ok(session.view_revision)
     }
 
+    #[cfg(test)]
     pub(crate) fn abort_turn(
         &mut self,
         session_id: &str,

@@ -44,6 +44,8 @@ pub(crate) struct OrderedCompletion {
     pub method: String,
     pub request_id: RequestId,
     pub result: Result<Value, Error>,
+    /// Completion provenance, asserted by tests; production routes uniformly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub source: CompletionSource,
     pub response_bytes: usize,
 }
@@ -72,7 +74,10 @@ pub(crate) enum IngressErrorKind {
 #[derive(Debug)]
 pub(crate) struct IngressError {
     pub kind: IngressErrorKind,
+    /// Failure context asserted by tests; production only reports the kind.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub owner: Option<RequestOwner>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub request_id: Option<RequestId>,
 }
 

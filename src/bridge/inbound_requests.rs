@@ -141,11 +141,13 @@ impl InboundRequests {
 }
 
 /// Clones are only for moving a request's lifetime through queued/task contexts.
-/// Captured routing entries must never retain this lease.
+/// Captured routing entries must never retain this lease. The field itself is
+/// never read: dropping the last lease sends the lifetime cleanup.
 #[derive(Clone)]
-pub(super) struct InboundRequestLease(Arc<RequestLifetime>);
+pub(super) struct InboundRequestLease(#[allow(dead_code)] Arc<RequestLifetime>);
 
 impl InboundRequestLease {
+    #[cfg(test)]
     pub(super) fn allocation(&self) -> &str {
         &self.0.allocation
     }

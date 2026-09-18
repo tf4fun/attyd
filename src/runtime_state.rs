@@ -68,6 +68,7 @@ impl SessionLiveState {
         self.session.get("modes").filter(|value| !value.is_null())
     }
 
+    #[cfg(test)]
     pub(crate) fn current_mode_id(&self) -> Option<&str> {
         self.control_state
             .get("current_mode_update")
