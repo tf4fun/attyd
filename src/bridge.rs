@@ -56,6 +56,8 @@ mod coordinator;
 mod coordinator_tests;
 mod inbound_requests;
 mod scheduling;
+#[cfg(test)]
+mod unobserved_tests;
 
 const SHUTDOWN_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const RECONCILE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);

@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tools.json --noEmit && tsc -p tsconfig.browser.json --noEmit",
     "test": "vitest run",
     "test:rust": "ATTYD_SKIP_WEB_BUILD=1 cargo test",
+    "test:idle-retirement": "ATTYD_SKIP_WEB_BUILD=1 cargo test bridge::unobserved_tests",
     "test:remote": "ATTYD_SKIP_WEB_BUILD=1 cargo build && node --import tsx scripts/rust-remote-smoke.ts",
     "test:browser": "npm run build:client && ATTYD_SKIP_WEB_BUILD=1 cargo build && playwright test",
     "test:goose": "ATTYD_SKIP_WEB_BUILD=1 cargo build && node --import tsx scripts/goose-smoke.ts",

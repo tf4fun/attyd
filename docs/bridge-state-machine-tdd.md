@@ -62,7 +62,8 @@ and revision metadata; observers access the shared snapshot through the history 
 | Running | observer churn | Running | none |
 | Running | PromptResponse | Reconciling | none |
 | Reconciling | atomic local promotion | Ready | none |
-| Active, including Running | configured absence deadline expires | closing/closed | capability-gated `session/close` |
+| Unobserved Active + Idle | continuous idle deadline expires | closing/closed | `session/close` when supported, otherwise local retirement |
+| Unobserved, non-Idle | turn / operation / load / interaction / running terminal | working/awaiting | no retirement; start a fresh interval after work settles |
 | any live | close/delete/shutdown | closing/closed | capability-gated lifecycle I/O |
 
 Mode/config controls and close may coexist with a prompt. Competing controls, attachment, fork,
@@ -105,11 +106,15 @@ Failure before step 4 cannot alter the installed baseline or completed overlay. 
 Agent request and is identical whether or not the Agent advertises load. The projection survives
 browser replacement but not bridge replacement; Cold history remains unavailable without load.
 
-Session-specific observer absence starts the CLI-configured close interval. Return cancels queued
-admission; output/completion do not reset it. The default is -1 (disabled); negatives disable, zero
-attempts immediate close. Expiry may close running work. Unsupported/refused close keeps state,
-and uncertain outcomes remain explicit. Never-observed materialized sessions count; list rows do
-not. Queued timers and late prompt responses must respect incarnation identity.
+Session-specific observer absence starts the CLI-configured retirement interval only while the
+session is idle. Returning observers or live work cancel the countdown; settling back to idle
+starts a full new interval. The default is 300 seconds; negatives disable, zero attempts immediate
+retirement. Running turns, operations, history loads, live terminals and pending interactions
+prevent retirement. Without Agent close support, expiry releases the local allocation only.
+A refused automatic close preserves the session and must not rearm itself through its own
+Running-to-Idle transition; a fresh observation/absence cycle permits another attempt. Uncertain
+outcomes remain explicit. Never-observed materialized sessions count; list rows do not. Queued
+timers and late responses must respect incarnation identity.
 
 Successful resume/fork is retained even if optional load fails. Use Agent replay (including empty),
 then available memory context, then a missing-history notice. Cached source context is never sent
@@ -191,8 +196,8 @@ history, invents missing Agent data or silently treats a partial replay as autho
   transport hook does not wait for a session execution ticket or a human interaction response.
 - Ingress faults that terminate a connection are published in global scope so runtime recovery
   and global SSE retain the original failure instead of exposing only interrupted HTTP requests.
-- Continuous unobserved intervals recycle sessions through negotiated close, including running work.
-- Observed sessions remain materialized; attachment/control admission defers an expired close.
+- Continuous unobserved idle intervals recycle sessions through negotiated close or local retirement.
+- Observed sessions remain materialized; work cancels the countdown and completion starts a full interval.
 - Close/delete/generation shutdown drops baselines, candidates and retry tasks.
 - No history payload is persisted.
 
@@ -209,6 +214,38 @@ history, invents missing Agent data or silently treats a partial replay as autho
 | S6 browser projection | business snapshot/SSE rendering; no ACP lifecycle ownership | `use-acp.test.ts`, `state.test.ts`, Chromium reconnect cases |
 | S7 removal | no browser raw-ACP transport or competing prompt admission registry | REST/SSE routes, protocol types and cleanup regressions |
 | S8 release | Rust/TS/browser/transport/protocol/memory gates all green | run the suites in [testing.md](testing.md) against the release commit; CI enforces the gates |
+
+## Idle-retirement regression gate
+
+Run `npm run test:idle-retirement` before implementing the fixes reviewed against
+`a5b07ff11ccdc8e338d222a578854ab2cb2158d6`. These native tests live under
+`src/bridge/unobserved_tests/` and exercise the real bridge coordinator and ACP protocol over an
+in-memory transport. Tokio's paused clock advances the deadlines; the tests do not launch Node,
+open network sockets, use external fixtures or wait for wall-clock sleeps.
+
+| Case | Trigger | Required behavior |
+| --- | --- | --- |
+| `idle_retirement_refused_immediate_close_does_not_spin` | timeout 0; Agent rejects close | one attempt; no immediate retry loop |
+| `idle_retirement_refused_close_does_not_restart_the_timeout` | timeout 30s; Agent rejects close; wait another 90s | no self-rearming close request |
+| `idle_retirement_resume_history_completion_starts_a_full_interval` | resume followed by a 15s empty history load; timeout 10s | no close during load; a complete 10s idle interval after completion; eventual close |
+| `idle_retirement_fork_history_completion_starts_a_full_interval` | same delayed load for a fork target; source remains observed | target gets its own full idle interval and eventually closes |
+| Late retired-session update during creation | locally retire old ID; batch old update, new updates and new response | preserve the new session's exact early replay and canonical controls |
+| Successful close | Agent acknowledges automatic close | one retirement and no repeated close |
+| Refusal followed by reobservation | observe refused session, submit a turn, then leave | session remains usable; observation blocks retirement; fresh absence rearms |
+| Creation without stale updates | same creation replay without the old ID notification | normal early replay and canonical controls remain intact |
+| Explicit rematerialization | reopen the retired ID and complete authoritative load | new incarnation with the loaded history; retirement filtering must not ban the ID |
+
+The recorded Red baseline on `a5b07ff` is **5 failures and 4 passes**: both refusal cases,
+both optional-load cases and the late-update case fail at their behavior assertions; the four
+control cases pass. The existing 474 Rust tests pass when this new module is excluded, and
+`npm run check` passes. No production fix is included in this baseline.
+
+Keep the defect cases as ordinary failing tests during the Red phase: do not ignore them, mark
+them `should_panic`, weaken their assertions or make the gate accept a nonzero exit status.
+The Green phase requires every case above to pass with the same assertions. A fix must preserve
+both the negative checks (no duplicate close or lost replay) and the positive checks (eventual
+retirement, usable sessions and explicit rematerialization). Then run `npm run test:rust` and
+`npm run check`, followed by the relevant transport/API suites before browser projection checks.
 
 ## Removal ledger
 
