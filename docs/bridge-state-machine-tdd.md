@@ -229,6 +229,8 @@ open network sockets, use external fixtures or wait for wall-clock sleeps.
 | `idle_retirement_refused_close_does_not_restart_the_timeout` | timeout 30s; Agent rejects close; wait another 90s | no self-rearming close request |
 | `idle_retirement_resume_history_completion_starts_a_full_interval` | resume followed by a 15s empty history load; timeout 10s | no close during load; a complete 10s idle interval after completion; eventual close |
 | `idle_retirement_fork_history_completion_starts_a_full_interval` | same delayed load for a fork target; source remains observed | target gets its own full idle interval and eventually closes |
+| `idle_retirement_short_resume_history_completion_starts_a_full_interval` | resume followed by a 4s empty history load; timeout 10s | cancel the old deadline before it expires; wait a complete 10s after loading, then close |
+| `idle_retirement_short_fork_history_completion_starts_a_full_interval` | same short load for a fork target; source remains observed | target gets a complete 10s idle interval even when loading ends before the old deadline |
 | Late retired-session update during creation | locally retire old ID; batch old update, new updates and new response | preserve the new session's exact early replay and canonical controls |
 | Successful close | Agent acknowledges automatic close | one retirement and no repeated close |
 | Refusal followed by reobservation | observe refused session, submit a turn, then leave | session remains usable; observation blocks retirement; fresh absence rearms |
@@ -239,6 +241,13 @@ The recorded Red baseline on `a5b07ff` is **5 failures and 4 passes**: both refu
 both optional-load cases and the late-update case fail at their behavior assertions; the four
 control cases pass. The existing 474 Rust tests pass when this new module is excluded, and
 `npm run check` passes. No production fix is included in this baseline.
+
+On `9485496`, the original nine cases pass, but the two added short-load cases fail:
+both resume and fork close after only **6s of idle**, rather than the required **10s**.
+The expanded gate therefore records **2 failures and 9 passes**. These cases preserve the
+original assertions and vary only the load duration; they catch a fix that cancels the old
+countdown only when its deadline happens to expire during loading. This follow-up adds tests
+and documentation only; the incomplete implementation remains unchanged.
 
 Keep the defect cases as ordinary failing tests during the Red phase: do not ignore them, mark
 them `should_panic`, weaken their assertions or make the gate accept a nonzero exit status.

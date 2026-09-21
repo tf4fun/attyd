@@ -6,19 +6,17 @@ async fn assert_optional_history_gets_a_fresh_idle_interval(
     mut agent: TestAgent,
     mut completion: oneshot::Receiver<Result<Value, BridgeRequestError>>,
     session_id: &str,
+    load_duration: Duration,
 ) {
     let load = agent.next_request().await;
     assert_eq!(load["method"], "session/load");
     assert_eq!(load["params"]["sessionId"], session_id);
 
-    // Keep the authoritative replay genuinely in flight beyond the idle limit.
+    // Keep the authoritative replay genuinely in flight for the chosen interval.
     // A catalog request or replay notification here would refresh every session's
     // timers and hide a missing refresh at the optional-load transition itself.
     assert!(
-        agent
-            .request_within(Duration::from_secs(15))
-            .await
-            .is_none(),
+        agent.request_within(load_duration).await.is_none(),
         "optional history loading must prevent retirement"
     );
     assert!(matches!(
@@ -52,8 +50,7 @@ async fn assert_optional_history_gets_a_fresh_idle_interval(
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn idle_retirement_resume_history_completion_starts_a_full_interval() {
+async fn resume_history_completion_starts_a_full_interval(load_duration: Duration) {
     let mut agent = TestAgent::start(
         IDLE_SECONDS,
         json!({
@@ -72,11 +69,11 @@ async fn idle_retirement_resume_history_completion_starts_a_full_interval() {
     assert_eq!(resume["method"], "session/resume");
     agent.reply(&resume, json!({})).await;
 
-    assert_optional_history_gets_a_fresh_idle_interval(agent, completion, "saved").await;
+    assert_optional_history_gets_a_fresh_idle_interval(agent, completion, "saved", load_duration)
+        .await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn idle_retirement_fork_history_completion_starts_a_full_interval() {
+async fn fork_history_completion_starts_a_full_interval(load_duration: Duration) {
     let mut agent = TestAgent::start(
         IDLE_SECONDS,
         json!({
@@ -120,5 +117,26 @@ async fn idle_retirement_fork_history_completion_starts_a_full_interval() {
     assert_eq!(fork["method"], "session/fork");
     agent.reply(&fork, json!({ "sessionId": "target" })).await;
 
-    assert_optional_history_gets_a_fresh_idle_interval(agent, completion, "target").await;
+    assert_optional_history_gets_a_fresh_idle_interval(agent, completion, "target", load_duration)
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_retirement_resume_history_completion_starts_a_full_interval() {
+    resume_history_completion_starts_a_full_interval(Duration::from_secs(15)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_retirement_fork_history_completion_starts_a_full_interval() {
+    fork_history_completion_starts_a_full_interval(Duration::from_secs(15)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_retirement_short_resume_history_completion_starts_a_full_interval() {
+    resume_history_completion_starts_a_full_interval(Duration::from_secs(4)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_retirement_short_fork_history_completion_starts_a_full_interval() {
+    fork_history_completion_starts_a_full_interval(Duration::from_secs(4)).await;
 }
