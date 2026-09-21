@@ -88,6 +88,10 @@ pub(crate) struct SessionObservers {
     observers: HashMap<u64, ObservationLease>,
     next_absence: u64,
     absence: Option<AbsenceTimer>,
+    /// An automatic close was already dispatched for this observation-absence
+    /// cycle. A refused or failed attempt must not rearm itself through its own
+    /// Running-to-Idle transition; only a fresh observation permits another.
+    close_attempted: bool,
 }
 
 #[derive(Clone)]
@@ -127,6 +131,7 @@ impl SessionObservers {
         }
         self.observers.insert(id, lease);
         self.cancel_absence();
+        self.close_attempted = false;
         true
     }
 
@@ -165,7 +170,10 @@ impl SessionObservers {
             self.cancel_absence();
             return None;
         }
-        if self.absence.is_some() || lifecycle != Some(&SessionLifecycle::Active) {
+        if self.absence.is_some()
+            || self.close_attempted
+            || lifecycle != Some(&SessionLifecycle::Active)
+        {
             return None;
         }
         self.next_absence = self.next_absence.wrapping_add(1).max(1);
@@ -177,6 +185,13 @@ impl SessionObservers {
         };
         self.absence = Some(timer.clone());
         Some(timer)
+    }
+
+    /// The bridge committed this absence interval to an automatic close. The
+    /// outcome is settled by that attempt: idle transitions must not rearm a
+    /// replacement timer until a fresh observation cycle begins.
+    pub(crate) fn mark_close_attempted(&mut self) {
+        self.close_attempted = true;
     }
 
     pub(crate) fn matches_absence(&self, id: u64, permit: &AutoClosePermit) -> bool {

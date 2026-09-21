@@ -2325,7 +2325,7 @@ where
                         if !permit.pending() {
                             continue;
                         }
-                        let state = state.lock().await;
+                        let mut state = state.lock().await;
                         if !state
                             .sessions
                             .resources(&session_id, incarnation)
@@ -2341,9 +2341,15 @@ where
                             continue;
                         }
                         // A running turn, an in-flight operation, or a pending
-                        // interaction owns the session's next step: leave the
-                        // permit pending so the timer retries after it settles.
+                        // interaction owns the session's next step: cancel this
+                        // countdown. Settling back to idle starts a fresh full
+                        // interval rather than resuming a stale deadline.
                         if session_blocks_unobserved_retire(&state, &session_id) {
+                            if let Ok(resources) =
+                                state.sessions.resources_mut(&session_id, incarnation)
+                            {
+                                resources.observers.stop_absence();
+                            }
                             continue;
                         }
                         // The Agent owns the session: close it when supported,
@@ -2942,6 +2948,11 @@ async fn handle_session_update(
                 allocation,
             }
         } else if state.pending_creations > 0 {
+            // The Agent still owns locally retired sessions: their late updates
+            // are not early replay for an unrelated pending creation.
+            if state.sessions.is_retired(&session_id) {
+                return;
+            }
             if let Err(message) = validate_agent_session_id(&session_id) {
                 sink.acp_error(semantic_error(message), None, Some("session/update"));
                 return;
@@ -2984,7 +2995,10 @@ async fn handle_session_update(
         let active = attached_session_incarnation(&state, &session_id).is_some();
         let attachment =
             session_operation_pending(&state, &session_id, SessionAdmission::Attachment);
-        let early_creation = !active && !attachment && state.pending_creations > 0;
+        let early_creation = !active
+            && !attachment
+            && state.pending_creations > 0
+            && !state.sessions.is_retired(&session_id);
         if !active && !attachment && !early_creation {
             return;
         }
@@ -4554,7 +4568,12 @@ async fn handle_command_inner(
             require_agent_method("session/close", &state).await?;
             let incarnation = {
                 let mut state = state.lock().await;
-                if auto_close.is_some() && session_blocks_unobserved_retire(&state, &session_id) {
+                if session_blocks_unobserved_retire(&state, &session_id)
+                    && let Some(permit) = &auto_close
+                {
+                    // Live work superseded this attempt; a fresh interval
+                    // starts when the session settles back to idle.
+                    permit.cancel();
                     return Ok(());
                 }
                 if command
@@ -4618,6 +4637,11 @@ async fn handle_command_inner(
                             &request_id,
                         );
                         return Ok(());
+                    }
+                    // A refused or failed automatic close stays settled: its own
+                    // Running-to-Idle transition must not rearm the countdown.
+                    if let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) {
+                        resources.observers.mark_close_attempted();
                     }
                 }
                 flush_runtime(&mut state, &sink);
@@ -4710,7 +4734,10 @@ async fn handle_command_inner(
             let session_id = string_field(&command, "sessionId")?.to_string();
             let incarnation = {
                 let mut state = state.lock().await;
-                if auto_close.is_some() && session_blocks_unobserved_retire(&state, &session_id) {
+                if session_blocks_unobserved_retire(&state, &session_id)
+                    && let Some(permit) = &auto_close
+                {
+                    permit.cancel();
                     return Ok(());
                 }
                 if command
@@ -4774,6 +4801,9 @@ async fn handle_command_inner(
                             &request_id,
                         );
                         return Ok(());
+                    }
+                    if let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) {
+                        resources.observers.mark_close_attempted();
                     }
                 }
                 flush_runtime(&mut state, &sink);

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -41,6 +41,10 @@ pub(crate) struct SessionRegistry {
     pub(crate) next_incarnation: u64,
     pub(crate) next_operation: u64,
     pub(crate) sessions: BTreeMap<String, SessionEntry>,
+    /// Fully removed session IDs. The Agent may still own them (local
+    /// retirement) or may report them again later, so late updates must not be
+    /// mistaken for a pending creation's early replay.
+    retired_ids: HashSet<String>,
     pub(crate) permission_owners: HashMap<String, SessionResourceOwner>,
     pub(crate) elicitation_owners: HashMap<String, SessionResourceOwner>,
     pub(crate) url_owners: HashMap<String, UrlRegistration>,
@@ -342,6 +346,13 @@ impl SessionRegistry {
             .cancel(reason);
     }
 
+    /// A session ID the bridge once owned and fully released. Retirement
+    /// filtering uses it to keep late Agent updates out of other sessions'
+    /// creation replay; it never bans the ID from rematerializing.
+    pub(crate) fn is_retired(&self, session_id: &str) -> bool {
+        self.retired_ids.contains(session_id)
+    }
+
     pub(crate) fn retire_entry(&mut self, session_id: &str, incarnation: u64, reason: &str) {
         if self
             .sessions
@@ -352,6 +363,7 @@ impl SessionRegistry {
         }
         self.cancel_resources(session_id, incarnation, reason);
         self.sessions.remove(session_id);
+        self.retired_ids.insert(session_id.to_string());
     }
 
     pub(crate) fn new(epoch: impl Into<String>) -> Self {
@@ -362,6 +374,7 @@ impl SessionRegistry {
             next_incarnation: 0,
             next_operation: 0,
             sessions: BTreeMap::new(),
+            retired_ids: HashSet::new(),
             permission_owners: HashMap::new(),
             elicitation_owners: HashMap::new(),
             url_owners: HashMap::new(),
