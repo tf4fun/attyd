@@ -23,6 +23,37 @@ enum EventSenderInner {
     },
     #[cfg(test)]
     Unbounded(mpsc::UnboundedSender<String>),
+    #[cfg(test)]
+    FaultInjected {
+        tx: mpsc::UnboundedSender<String>,
+        fault: TestEventFault,
+    },
+}
+
+/// Inject failures at the actual publication boundary without changing the
+/// production queue, serialization, or journal behavior.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestEventFault {
+    attempts: Arc<AtomicUsize>,
+    delta_attempts: Arc<AtomicUsize>,
+    fail_after: usize,
+}
+
+#[cfg(test)]
+impl TestEventFault {
+    pub(crate) fn delta_attempts(&self) -> usize {
+        self.delta_attempts.load(Ordering::Acquire)
+    }
+
+    fn rejects(&self, event: &str) -> bool {
+        if serde_json::from_str::<serde_json::Value>(event).is_ok_and(|value| {
+            value["type"] == "bridge/internal_runtime_delta"
+        }) {
+            self.delta_attempts.fetch_add(1, Ordering::AcqRel);
+        }
+        self.attempts.fetch_add(1, Ordering::AcqRel) >= self.fail_after
+    }
 }
 
 pub(crate) struct EventReceiver {
@@ -82,6 +113,14 @@ impl EventSender {
             }
             #[cfg(test)]
             EventSenderInner::Unbounded(tx) => tx.send(event).map_err(|_| EventSendError::Closed),
+            #[cfg(test)]
+            EventSenderInner::FaultInjected { tx, fault } => {
+                if fault.rejects(&event) {
+                    Err(EventSendError::Closed)
+                } else {
+                    tx.send(event).map_err(|_| EventSendError::Closed)
+                }
+            }
         }
     }
 
@@ -90,6 +129,8 @@ impl EventSender {
             EventSenderInner::Accounted { cancellation, .. } => cancellation.cancel(),
             #[cfg(test)]
             EventSenderInner::Unbounded(_) => {}
+            #[cfg(test)]
+            EventSenderInner::FaultInjected { .. } => {}
         }
     }
 
@@ -100,7 +141,30 @@ impl EventSender {
                 queued_bytes.load(Ordering::Acquire)
             }
             EventSenderInner::Unbounded(_) => 0,
+            EventSenderInner::FaultInjected { .. } => 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_failing_after(successes: usize) -> (Self, EventReceiver, TestEventFault) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let fault = TestEventFault {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            delta_attempts: Arc::new(AtomicUsize::new(0)),
+            fail_after: successes,
+        };
+        (
+            Self {
+                inner: EventSenderInner::FaultInjected {
+                    tx,
+                    fault: fault.clone(),
+                },
+            },
+            EventReceiver {
+                inner: EventReceiverInner::Unbounded(rx),
+            },
+            fault,
+        )
     }
 }
 

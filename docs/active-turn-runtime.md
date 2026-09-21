@@ -241,8 +241,16 @@ LoadTransaction { candidate, byte accounting, attempt }
 Baseline, overlay and cold-load candidate bytes are accounted for diagnostics and regression tests,
 but their cumulative size is not an admission rule. A protocol-valid Agent history or turn is never
 rejected because it crossed a bridge-defined conversation budget. Normal turn commit needs the old
-baseline and one overlay, not a second full replay candidate. Protocol validity and lifecycle rules remain enforced; wire sizes, delivery queues and
-live-resource counts have no application-imposed quota.
+baseline and one overlay, not a second full replay candidate. Protocol validity and lifecycle rules
+remain enforced; wire sizes and live-resource counts have no application-imposed quota.
+
+The [memory-retention acceptance target](runtime-memory-retention-tests.md) separates valid input
+from disposable presentation delivery. Agent input must be applied completely and in order.
+Successful internal publication must release the journal's old payloads. A slow session observer's
+reconstructible backlog may be coalesced into a latest reset without clipping conversation data,
+cancelling work or releasing its observation lease. Errors and other semantic outcomes absent from
+the current snapshot remain reliable events. These targets are being tested in Red before the
+production memory optimization is implemented; see the [diagnosis and plan](runtime-memory-retention.md).
 
 In practice the Agent/model context window and available process memory bound useful history, but
 the bridge does not infer that context window or reinterpret it as an ACP admission rule. Resource

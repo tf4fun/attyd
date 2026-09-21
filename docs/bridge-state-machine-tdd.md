@@ -141,9 +141,14 @@ epoch; a numeric generation counter alone does not identify a host restart. View
 subscriptions carry `expectedEpoch` / `expectedIncarnation`; native SSE retries also carry their
 `Last-Event-ID`. A confirmed close/delete publishes `bridge/session_retired` before ending the
 observation stream. A successful close preceding a failed delete still retires the observation.
-Slow subscribers retain their ordered backlog until they consume it or disconnect. Baseline
-payload is shared/chunked rather than cloned into every subscriber queue. Queue growth never
-cancels Agent work or evicts an otherwise connected observer.
+Healthy subscribers receive ordered deltas. The memory-retention acceptance target permits a slow
+session subscriber's reconstructible presentation backlog to be replaced by a coalesced latest
+reset, followed by an owner-fenced view refresh. Final state must equal uninterrupted observation.
+Retirement and failures that the current snapshot cannot reconstruct remain reliable semantic
+events; a reset cannot discard their outcome or retry prompt. Baseline payload is shared/chunked
+rather than cloned into every subscriber queue. Coalescing never cancels Agent work or evicts an
+otherwise connected observer. This target is in the Red phase; see
+[memory acceptance](runtime-memory-retention-tests.md) for implemented tests and current failures.
 
 Directory management is global. Cold deletion reserves only its catalog ID, with no session
 runtime allocation. Deleting an existing runtime coordinates its lifecycle and resource cleanup.
@@ -179,10 +184,15 @@ history, invents missing Agent data or silently treats a partial replay as autho
 - Old baseline + overlay bytes are accounted throughout normal turn commit; a candidate exists only
   for load/attachment transactions.
 - Protocol-valid baseline, candidate and overlay growth has no bridge-defined cumulative cap.
-- ACP ingress, session dispatch, bridge publication, subscriber delivery and temporary replay
-  queues have no item-count or cumulative byte cap. Content is processed in order, without
-  rejecting bursts, cancelling the connection or dropping earlier records. Byte ledgers measure
-  retained data and release it on consumption/teardown; they are not admission limits.
+- ACP ingress, session dispatch and replay apply valid input in order without arbitrary
+  conversation quotas, burst rejection or dropping unapplied records.
+- The internal publication journal is temporary: successful ordered handoff releases its
+  contiguous published prefix; a failed handoff never advances the successful watermark.
+  Old overlay versions and a second raw conversation journal must not survive delivery.
+- Session subscriber presentation data may be coalesced into a latest reset when complete state
+  can be recovered. Non-reconstructible semantic events remain reliable. Byte ledgers measure
+  retained payload and release it on consumption, replacement or teardown; they are not a reason
+  to truncate valid conversation content. These memory targets have explicit Red regression gates.
 - Wire values and live resources retain their independent validation and lifecycle rules.
 - Load/resume registers one replay candidate before sending its RPC. Historical notifications
   validate and fold directly into that separate allocation; they consume no live ingress items,

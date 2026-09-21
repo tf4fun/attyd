@@ -57,6 +57,8 @@ mod coordinator_tests;
 mod inbound_requests;
 mod scheduling;
 #[cfg(test)]
+mod memory_retention_tests;
+#[cfg(test)]
 mod unobserved_tests;
 
 const SHUTDOWN_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -2196,6 +2198,8 @@ where
     T: ConnectTo<Client>,
 {
     let state = Arc::new(Mutex::new(BridgeState::default()));
+    #[cfg(test)]
+    memory_retention_tests::capture_coordinator_state(&state);
     let epoch = state.lock().await.sessions.epoch().to_string();
     let (mut scheduling, ingress) =
         scheduling::Scheduling::new(epoch.clone(), sink.clone(), cancellation.clone())?;

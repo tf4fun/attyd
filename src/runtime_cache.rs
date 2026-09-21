@@ -901,6 +901,9 @@ fn url_elicitation_id(event: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod memory_retention_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -923,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn live_replay_keeps_every_event_in_a_large_burst() {
+    fn memory_retention_large_burst_preserves_delivery_without_raw_replay_copies() {
         let mut projection = ActiveRuntimeProjection::default();
         projection.update(
             r#"{"type":"acp/session_created","cwd":"/workspace","response":{"sessionId":"burst"}}"#,
@@ -933,26 +936,28 @@ mod tests {
         );
         assert!(projection.sessions["burst"].active_prompt.is_some());
         for index in 0..100_050 {
-            projection.record_session_value("burst", json!({
+            let input = json!({
                 "type":"acp/session_update", "notification":{"sessionId":"burst","update":{
                     "sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":format!("片段{index}🙂")}
                 }}
-            }));
+            });
+            let delivered = projection.update_and_normalize(&input.to_string());
+            assert_eq!(serde_json::from_str::<Value>(&delivered).unwrap(), input);
         }
         let session = &projection.sessions["burst"];
-        assert_eq!(session.events.len(), 100_051);
-        for (index, raw) in session.events.iter().skip(1).enumerate() {
-            let event: Value = serde_json::from_str(raw).unwrap();
-            assert_eq!(
-                event["notification"]["update"]["content"]["text"],
-                format!("片段{index}🙂")
-            );
-        }
+        let replay = projection.replay_session_events("burst");
+        assert_eq!(replay_type_count(&replay, "acp/prompt_started"), 1);
+        assert_eq!(
+            replay_type_count(&replay, "acp/session_update"),
+            0,
+            "delivered conversation belongs to canonical history, not another raw replay archive"
+        );
+        assert_eq!(memory_retention_tests::raw_conversation_bytes(&projection), 0);
         assert!(!session.truncated);
     }
 
     #[test]
-    fn replays_independent_concurrent_session_runtime_state() {
+    fn memory_retention_replays_independent_current_resources_without_duplicate_conversation() {
         let mut cache = ActiveRuntimeProjection::default();
         cache.update(
             r#"{"type":"acp/session_created","requestId":"new-a","cwd":"/a","response":{"sessionId":"a"}}"#,
@@ -966,16 +971,27 @@ mod tests {
         cache.update(
             r#"{"type":"acp/prompt_started","requestId":"prompt-b","sessionId":"b","prompt":[{"type":"text","text":"B"}]}"#,
         );
-        cache.update(
+        let delivered = cache.update_and_normalize(
             r#"{"type":"acp/session_update","notification":{"sessionId":"b","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"B result"}}}}"#,
         );
+        let delivered: Value = serde_json::from_str(&delivered).unwrap();
+        assert_eq!(delivered["notification"]["sessionId"], "b");
+        let folded = crate::runtime_state::fold_active_turn_update(
+            &[],
+            &delivered["notification"]["update"],
+        )
+        .unwrap();
+        assert_eq!(folded[0]["content"]["text"], "B result");
 
         let replay = cache.replay_events().join("\n");
         assert!(replay.contains(r#""sessionId":"a""#));
         assert!(replay.contains(r#""sessionId":"b""#));
         assert!(replay.contains(r#""requestId":"prompt-a""#));
         assert!(replay.contains(r#""requestId":"prompt-b""#));
-        assert!(replay.contains("B result"));
+        assert!(
+            !replay.contains("B result"),
+            "canonical conversation is delivered intact without a duplicate legacy archive"
+        );
     }
 
     #[test]

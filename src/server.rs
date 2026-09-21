@@ -2583,6 +2583,9 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
 }
 
 #[cfg(test)]
+mod memory_retention_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime_state::RuntimeState;
@@ -3145,7 +3148,7 @@ mod tests {
         assert!(hub.state.lock().await.session_subscribers.is_empty());
     }
 
-    async fn observation_hub(
+    pub(super) async fn observation_hub(
         _capacity: usize,
     ) -> (Arc<BridgeHub>, mpsc::UnboundedReceiver<bridge::BridgeInput>) {
         let hub = test_hub();
@@ -3158,7 +3161,7 @@ mod tests {
         (hub, commands)
     }
 
-    fn observer_ready(id: u64, revision: u64) -> String {
+    pub(super) fn observer_ready(id: u64, revision: u64) -> String {
         json!({
             "type": "bridge/internal_observer_ready", "observerId": id, "sessionId": "session",
             "reset": {
@@ -3705,7 +3708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_session_delivery_keeps_its_lease_and_preserves_other_observers() {
+    async fn memory_retention_slow_session_delivery_keeps_its_lease_and_preserves_other_observers() {
         let (hub, mut commands) = observation_hub(8).await;
         let mut observations = Vec::new();
         let mut leases = Vec::new();
@@ -3735,8 +3738,25 @@ mod tests {
         assert!(!leases[1].is_cancelled());
         assert_eq!(hub.state.lock().await.session_subscribers.len(), 2);
         assert!(commands.try_recv().is_err());
-        // The paused observer receives the reset and every following revision.
-        assert_eq!(observations[0].0.events.len(), 65);
+        // Pending reconstructible state may be replaced by a newer reset. The
+        // resulting cursor must still reach the same state as the healthy peer.
+        let mut delivered_revision = 0;
+        while let Ok(event) = observations[0].0.events.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+            match event["type"].as_str().unwrap() {
+                "bridge/session_reset" => {
+                    let next = event["viewRevision"].as_u64().unwrap();
+                    assert!(next >= delivered_revision);
+                    delivered_revision = next;
+                }
+                "bridge/session_delta" => {
+                    assert_eq!(event["fromRevision"].as_u64().unwrap(), delivered_revision);
+                    delivered_revision = event["viewRevision"].as_u64().unwrap();
+                }
+                other => panic!("unexpected session state event: {other}"),
+            }
+        }
+        assert_eq!(delivered_revision, 65);
         hub.unsubscribe(observations[0].0.id, 1).await;
         assert!(leases[0].is_cancelled());
         hub.unsubscribe(observations[1].0.id, 1).await;
@@ -5393,7 +5413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_burst_preserves_all_updates_for_a_slow_subscriber() {
+    async fn live_burst_reconstructs_complete_content_for_a_slow_subscriber() {
         verify_live_delivery(false).await;
     }
 
@@ -5431,6 +5451,11 @@ mod tests {
                 .observe_session("burst".into(), Some(cwd.into()))
                 .await
                 .unwrap();
+            let owner = SessionResourceOwner::new(
+                initial["bridgeEpoch"].as_str().unwrap(),
+                "burst",
+                initial["session"]["incarnation"].as_u64().unwrap(),
+            );
             hub.start_turn(
                 "burst".into(),
                 initial["session"]["historyRevision"]
@@ -5475,6 +5500,7 @@ mod tests {
                 .collect::<String>();
             assert_eq!(text, expected);
             let mut streamed = String::new();
+            let mut streamed_revision = 0;
             loop {
                 let event = subscriber
                     .events
@@ -5482,14 +5508,60 @@ mod tests {
                     .await
                     .expect("slow subscriber was evicted");
                 let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
-                if event["type"] == "bridge/session_delta"
-                    && event["change"]["kind"] == "turn_update"
-                {
-                    streamed.push_str(
-                        event["change"]["update"]["content"]["text"]
-                            .as_str()
-                            .unwrap(),
-                    );
+                if event["type"] == "bridge/session_reset" {
+                    assert_eq!(event["bridgeEpoch"], initial["bridgeEpoch"]);
+                    assert_eq!(event["sessionIncarnation"], initial["session"]["incarnation"]);
+                    // A compacted reset carries no transcript. Recover through
+                    // the same fenced GET as a browser, then ignore older
+                    // queued deltas already represented by that snapshot.
+                    let recovered = hub
+                        .session_view_for_owner("burst".into(), None, Some(owner.clone()))
+                        .await
+                        .unwrap();
+                    streamed_revision = recovered["session"]["viewRevision"].as_u64().unwrap();
+                    assert!(streamed_revision >= event["viewRevision"].as_u64().unwrap());
+                    streamed = recovered["baseline"]["updates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+                        .map(|update| update["content"]["text"].as_str().unwrap())
+                        .collect::<String>();
+                    if let Some(updates) = recovered["session"]["activeTurn"]["updates"].as_array() {
+                        for update in updates
+                            .iter()
+                            .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+                        {
+                            streamed.push_str(update["content"]["text"].as_str().unwrap());
+                        }
+                    }
+                    if recovered["session"]["phase"] == "ready"
+                        && recovered["session"]["turnOutcomes"]
+                            .as_array()
+                            .is_some_and(|outcomes| {
+                                outcomes.iter().any(|outcome| {
+                                    outcome["response"]["stopReason"] == "end_turn"
+                                })
+                            })
+                    {
+                        // Completion may already be represented by the full
+                        // current view; no intermediate completion event is
+                        // required when that outcome is reconstructible.
+                        break;
+                    }
+                } else if event["type"] == "bridge/session_delta" {
+                    let revision = event["viewRevision"].as_u64().unwrap();
+                    if revision > streamed_revision {
+                        assert_eq!(event["fromRevision"].as_u64().unwrap(), streamed_revision);
+                        if event["change"]["kind"] == "turn_update" {
+                            streamed.push_str(
+                                event["change"]["update"]["content"]["text"]
+                                    .as_str()
+                                    .unwrap(),
+                            );
+                        }
+                        streamed_revision = revision;
+                    }
                 }
                 if event["type"] == "bridge/session_turn_complete" {
                     assert_eq!(event["response"]["stopReason"], "end_turn");
@@ -5497,6 +5569,17 @@ mod tests {
                 }
             }
             assert_eq!(streamed, expected);
+            assert_eq!(
+                streamed_revision,
+                final_view["session"]["viewRevision"].as_u64().unwrap()
+            );
+            assert!(
+                hub.state
+                    .lock()
+                    .await
+                    .session_subscribers
+                    .contains_key(&subscriber.id)
+            );
             assert_eq!(hub.state.lock().await.generation, 1);
         })
         .await;
