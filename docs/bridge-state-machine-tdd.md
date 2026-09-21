@@ -35,9 +35,9 @@ ConnectionRuntime
 
 SessionRuntime                         HistoryCache (separate allocation)
 |- incarnation and view revision       `- SessionKey -> Arc<HistorySnapshot>
-|- phase: Cold | Loading | Ready
-|         | Running | Reconciling
-|         | Blocked | Closing | Closed
+|- history phase: Cold | Loading | Ready | Running | Reconciling | Blocked
+|- live lifecycle: Attaching | Active | Closing | ClosingForDelete
+|                  | Deleting | Closed | Uncertain
 |- opaque historyRevision
 |- one ActiveOverlay
 |- one LoadAttempt metadata             LoadTransaction (separate allocation)
@@ -69,6 +69,10 @@ and revision metadata; observers access the shared snapshot through the history 
 Mode/config controls and close may coexist with a prompt. Competing controls, attachment, fork,
 close and delete remain mutually exclusive; fork/delete still require no running prompt.
 Different sessions may progress concurrently under request admission and per-session ordering.
+
+The [history workflow lifecycle proposal](history-sync-lifecycle.md) extends work accounting to
+cold materialization and optional-history retry waits. A workflow owner is distinct from both a
+single load attempt and exclusive business admission; this extension is pending implementation.
 
 ## Append contract
 
@@ -249,12 +253,46 @@ original assertions and vary only the load duration; they catch a fix that cance
 countdown only when its deadline happens to expire during loading. This follow-up adds tests
 and documentation only; the incomplete implementation remains unchanged.
 
+On `a65d5d1`, all 11 existing cases pass after `begin_load` cancels the previous idle countdown.
+That result covers the listed scenarios, not the entire retry workflow. A later review confirmed
+that an unobserved fork target can still retire during a 2s load backoff with a 1s idle timeout
+and a concurrent catalog refresh. The required next Red/Green gates are W1–W8 in
+[history-sync-lifecycle.md](history-sync-lifecycle.md#8-tdd-合并准入). The 31 follow-up behavior
+tests now live in `src/bridge/unobserved_tests/workflow*.rs`; they extend the gate to 42 cases
+and are separate from that historical 11-case green result. Production code is unchanged.
+
 Keep the defect cases as ordinary failing tests during the Red phase: do not ignore them, mark
 them `should_panic`, weaken their assertions or make the gate accept a nonzero exit status.
 The Green phase requires every case above to pass with the same assertions. A fix must preserve
 both the negative checks (no duplicate close or lost replay) and the positive checks (eventual
 retirement, usable sessions and explicit rematerialization). Then run `npm run test:rust` and
 `npm run check`, followed by the relevant transport/API suites before browser projection checks.
+
+## History-workflow Red baseline
+
+Against unchanged production code at `a65d5d1`, the 31 workflow tests record **25 passes and
+6 failures**. Together with the original 11 tests, `npm run test:idle-retirement` records
+**36 passes and 6 failures**. The failures are behavior assertions, not build failures or
+unanswered fixture requests:
+
+| Failing test | Observed behavior |
+| --- | --- |
+| `history_workflow_retry_backoff_blocks_agent_close` | `session/close` arrives during the target's 2s retry wait with a 1s idle timeout |
+| `history_workflow_retry_backoff_blocks_local_retirement` | without close support, `bridge/session_retired` reports `unobserved` during the same retry wait |
+| `history_workflow_completed_prompt_supersedes_backoff_without_losing_turn_boundary` | the old flow loads after the new prompt completed; faithful message replay still clears the retained turn outcome |
+| `history_workflow_completed_control_supersedes_backoff_without_reloading` | the old flow loads after the new control completed and replaces the history revision |
+| `idle_retirement_workflow_explicit_reload_supersedes_same_incarnation_retry` | the old flow loads again after a successful explicit reload |
+| `idle_retirement_workflow_old_fork_cannot_finish_replacement_fork_scope` | a second fork using the retired ID receives close instead of its next retry; successor workflow protection is missing |
+
+The full Rust run records **510 passes and these same 6 failures**: all **485 pre-existing
+tests pass**. `npm run check` passes type checking, all **318 frontend/shared tests**, and the
+client build. Formatting and diff checks pass. Integration transport/API/browser validation
+remains a Green-phase requirement after the production fix; this Red test change does not claim
+those release gates were rerun.
+
+See the [W1–W8 coverage mapping](history-sync-lifecycle.md#可执行覆盖映射) for the exact modules
+and the remaining implementation-layer flow-ID cleanup checks. Keep all six failures executable
+and preserve the 25 control cases; both groups are required to establish Green.
 
 ## Removal ledger
 

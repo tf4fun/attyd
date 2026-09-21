@@ -12,6 +12,11 @@ use std::io;
 mod close;
 mod history;
 mod retirement;
+mod workflow;
+mod workflow_admission;
+mod workflow_cancellation;
+mod workflow_handoff;
+mod workflow_retry;
 
 struct TestAgent {
     commands: mpsc::UnboundedSender<BridgeInput>,
@@ -19,6 +24,7 @@ struct TestAgent {
     responses: futures::channel::mpsc::Sender<io::Result<String>>,
     buffered: VecDeque<Value>,
     events: mpsc::UnboundedReceiver<String>,
+    event_log: Vec<Value>,
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
 }
@@ -50,6 +56,7 @@ impl TestAgent {
             responses,
             buffered: VecDeque::new(),
             events: event_rx,
+            event_log: Vec::new(),
             cancellation,
             task: Some(task),
         };
@@ -136,6 +143,7 @@ impl TestAgent {
             loop {
                 let raw = self.events.recv().await.expect("bridge event stream ended");
                 let event: Value = serde_json::from_str(&raw).unwrap();
+                self.event_log.push(event.clone());
                 if event["type"] == kind
                     && (event["sessionId"] == session_id
                         || event["response"]["sessionId"] == session_id)
@@ -146,6 +154,15 @@ impl TestAgent {
         })
         .await
         .unwrap_or_else(|_| panic!("missing {kind} event for {session_id}"))
+    }
+
+    /// Keep lifecycle evidence even when a test awaits a different event. In
+    /// particular, absence of an ACP close does not prove no local retirement.
+    fn recorded_events(&mut self) -> &[Value] {
+        while let Ok(raw) = self.events.try_recv() {
+            self.event_log.push(serde_json::from_str(&raw).unwrap());
+        }
+        &self.event_log
     }
 
     async fn stop(mut self) {

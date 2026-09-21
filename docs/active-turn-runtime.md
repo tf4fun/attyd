@@ -42,12 +42,18 @@ cold-materialize old history or recover it after bridge restart. The bridge does
 database, browser-backed history, temporary persistence or a private protocol extension to hide
 that ACP limitation.
 
-Unobserved materialized sessions use `--session-unobserved-timeout`: default -1 (disabled),
-any negative value disables recycling, zero attempts immediate close. Only session-specific
-observers count. Return cancels the queued timer; renewed absence starts a full interval.
-Agent output and turn completion never reset it. Expiry can close a running task when negotiated.
-Unsupported or failed close keeps the projection; successful close releases it. Timers check the
+Unobserved materialized sessions use `--session-unobserved-timeout`: default 300 seconds,
+any negative value disables recycling, zero attempts immediate retirement once idle. Only
+session-specific observers count. A returning observer or live work cancels the countdown;
+settling back to unobserved idle starts a full new interval. Running turns, operations, history
+loads, live terminals and pending interactions prevent automatic retirement. Expiry uses negotiated
+close, or local retirement when close is unsupported. A refused automatic close keeps the session
+and does not rearm itself; a new observation/absence cycle permits another attempt. Timers check
 incarnation and cancellable admission so a returning observer or reopened ID defeats a stale task.
+
+Work must cover a history workflow's retry waits as well as individual RPCs. The remaining
+optional-fork retry gap and proposed resource-owner extension are specified in
+[history-sync-lifecycle.md](history-sync-lifecycle.md); that extension is not yet implemented.
 
 While a session is materialized by a bridge, that bridge is assumed to be its only writer. ACP v1
 provides no revision or lease that can prevent a different ACP client from concurrently appending to
@@ -80,8 +86,9 @@ Browser
 
 The baseline is a process-local projection, not a second persistent authority. It begins with an
 Agent load, a labelled attachment fallback, or an empty new session, then extends with accepted
-prompts and observed ACP updates. It is never persisted. Releasing a projection requires
-a successful upstream close when available; cold recovery then returns to the Agent's replay.
+prompts and observed ACP updates. It is never persisted. Automatic release uses a successful
+upstream close when available, or local retirement when close is unsupported; cold recovery
+returns to the Agent's replay.
 
 ## Session state machine
 
@@ -102,10 +109,12 @@ Reconciling(Bn + completed overlay) --------+
   | atomic local overlay promotion
   v
 Ready(Bn+1, Hn+1)
-  | configured observer-absence deadline (also applies while Running)
-  v
-Closing -- successful session/close --> Cold / released
 ```
+
+History phase and live lifecycle are separate. An Active, unobserved, idle session becomes
+eligible for automatic retirement only after the full configured idle interval. Negotiated close
+or local retirement releases the allocation; explicit reopening establishes a new incarnation.
+Running work does not transition to automatic close merely because observers are absent.
 
 `Bn` is an immutable in-memory history snapshot. `Hn` is an opaque bridge history revision
 containing bridge epoch, session incarnation and a monotonic generation. It is not a message count,
@@ -120,7 +129,8 @@ The first observer of a Cold session starts one single-flight load. Replay updat
 staged privately. Only a successful response and valid complete candidate atomically install a
 baseline. Concurrent observers join the same load and never see a partial candidate.
 
-A transient load failure retries with bounded exponential backoff and jitter. A retry begins only
+A transient load failure retries with exponential backoff from 250ms to a maximum interval of
+8s; this does not impose a total retry count. A retry begins only
 after the prior request has definitively terminated; if its outcome is uncertain the connection
 must be drained or replaced first. Unsupported, authorization and invalid replay failures become
 visible `Blocked` states rather than hot retry loops. If the Agent returns `ResourceNotFound`
@@ -275,14 +285,16 @@ surface never owns ACP lifecycle semantics, history folding or reconnect decisio
 - **H05 Commit retention:** terminal output remains in the overlay until baseline commit.
 - **H06 CAS:** one history revision admits at most one distinct turn append.
 - **H07 Idempotency:** one intent key/digest dispatches at most once per bridge epoch.
-- **H08 Per-session exclusion:** load, prompt and session mutations never overlap for one session.
+- **H08 Per-session exclusion:** load excludes prompt and competing session mutations;
+  one exclusive operation is admitted at a time. Control and manual close may coexist with a prompt.
 - **H09 Observer independence:** subscriber lifecycle cannot affect Agent work.
 - **H10 Generation isolation:** old epoch/incarnation/attempt events cannot mutate current state.
 - **H11 Live-resource independence:** baseline replacement cannot retire unrelated live resources.
 - **H12 Faithful retention:** baseline, overlay and candidate are byte-accounted but have no
   bridge-defined cumulative admission cap.
-- **H13 Unobserved release:** only continuous session-specific absence schedules automatic close;
-  return cancels admission, incarnation changes invalidate it, and expiry can close running work.
+- **H13 Unobserved release:** only continuous unobserved idle time schedules automatic retirement;
+  observers or work cancel admission, incarnation changes invalidate it, and work completion starts
+  a full new interval. Retry waits belong to unfinished work; see the proposed workflow fix above.
 - **H14 Honest uncertainty:** lost non-idempotent outcomes are never blindly redispatched.
 - **H15 No persistence:** bridge history state disappears with the bridge process.
 

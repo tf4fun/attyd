@@ -96,11 +96,18 @@ before the user responds, preserve the original interaction ID, and perform zero
 - `candidate_growth_is_accounted_without_admission_rejection`
 - `large_protocol_valid_history_is_not_rejected_by_cache_accounting`
 - `large_protocol_valid_active_overlay_is_not_rejected`
-- `unobserved_timeout_measures_absence_not_output_and_global_observers_do_not_count`
+- `unobserved_timeout_measures_continuous_idle_and_global_observers_do_not_count`
 - `observed_running_reconciling_and_live_resource_sessions_are_pinned`
 - `released_session_next_observer_starts_one_load`
 - `close_delete_and_shutdown_release_cache_candidate_and_retry_task`
 - `ten_thousand_turns_keep_one_baseline_and_zero_retired_overlays`
+
+The pending production workflow-lifetime extension is specified by gates W1–W8 in
+[history-sync-lifecycle.md](history-sync-lifecycle.md#8-tdd-合并准入): retry waits remain work,
+completion starts a full idle interval, accepted business mutations supersede optional history
+sync, and old-owner cleanup cannot affect a successor. The 31 added behavior tests in
+`src/bridge/unobserved_tests/workflow*.rs` extend the original 11 idle-retirement regressions.
+They establish the Red gate; production workflow ownership is not yet implemented.
 
 ### API and SSE
 
@@ -198,7 +205,7 @@ zero-history assertion, and queued-prompt automatic dispatch must be replaced by
   successful empty replay, stable fork ID and no duplicate fork/load on refresh.
 - `active_prompt_controls_and_close_preserve_a_reopened_incarnation`: live settings, manual close,
   a reopened ID and late old prompt completion without changing the new turn.
-- Timer tests use paused Tokio time for disabled/zero/positive/extreme values, continuous absence,
+- Timer tests use paused Tokio time for disabled/zero/positive/extreme values, continuous unobserved idle,
   observer return, global observer exclusion, generation changes and shutdown cancellation.
 - `tests/acp-presentation.test.tsx`: close consent/focus, empty configOptions precedence,
   embedded media reuse, decoded attachment export, preview failure and invalid-data fallback.
