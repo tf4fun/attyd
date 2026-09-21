@@ -7,9 +7,10 @@ use crate::history_cache::{HistoryCache, SessionKey};
 use crate::runtime_state::{
     PendingInteraction, RuntimeEffect, RuntimeJournal, SessionLifecycle, SessionLiveState, UrlFlow,
 };
+use crate::session_observers::SessionWork;
 use crate::session_resources::{
-    ElicitationResponder, PermissionResponder, SessionResourceOwner, SessionResources,
-    UrlRegistration,
+    ElicitationResponder, HistorySyncOwner, HistorySyncResources, PermissionResponder,
+    SessionResourceOwner, SessionResources, UrlRegistration,
 };
 use crate::session_state::{MirrorError, SessionState};
 
@@ -296,6 +297,79 @@ impl SessionRegistry {
         Ok(&mut entry.resources)
     }
 
+    /// One history workflow owns the session's optional sync slot for its whole
+    /// lifetime. Registration cancels any armed idle countdown: work is live
+    /// from this transaction onward, including future retry waits.
+    pub(crate) fn begin_history_sync(
+        &mut self,
+        owner: &HistorySyncOwner,
+    ) -> Result<(), MirrorError> {
+        if owner.session.epoch != self.epoch {
+            return Err(MirrorError::OperationMismatch);
+        }
+        let resources = self.resources_mut(&owner.session.session_id, owner.session.incarnation)?;
+        if resources.history_sync.is_some() {
+            return Err(MirrorError::OperationMismatch);
+        }
+        resources.observers.stop_absence();
+        resources.history_sync = Some(HistorySyncResources {
+            flow_id: owner.flow_id.clone(),
+            cancellation: owner.cancellation.clone(),
+        });
+        Ok(())
+    }
+
+    /// An admitted business operation takes over the session's projection. The
+    /// slot is released atomically with that admission — the successor owns the
+    /// idle interval from its own settle — but the parked continuation's token
+    /// is not fired: it still wakes at its own deadline, sees `Superseded`, and
+    /// reports the projection exactly as the successor left it.
+    pub(crate) fn supersede_history_sync(&mut self, session_id: &str, incarnation: u64) {
+        if let Ok(resources) = self.resources_mut(session_id, incarnation) {
+            resources.history_sync = None;
+        }
+    }
+
+    /// Only the exact flow identity may release the slot: a stale owner's late
+    /// finish must not strip a replacement workflow's protection.
+    pub(crate) fn finish_history_sync(&mut self, owner: &HistorySyncOwner) {
+        if let Ok(resources) =
+            self.resources_mut(&owner.session.session_id, owner.session.incarnation)
+            && resources
+                .history_sync
+                .as_ref()
+                .is_some_and(|sync| sync.flow_id == owner.flow_id)
+        {
+            resources.history_sync = None;
+        }
+    }
+
+    /// How a waking continuation's flow identity compares to the live slot.
+    pub(crate) fn history_sync_status(&self, owner: &HistorySyncOwner) -> HistorySyncStatus {
+        match self.sessions.get(&owner.session.session_id) {
+            Some(entry)
+                if owner.session.epoch == self.epoch
+                    && entry.state.incarnation == owner.session.incarnation =>
+            {
+                match &entry.resources.history_sync {
+                    Some(sync) if sync.flow_id == owner.flow_id => HistorySyncStatus::Owned,
+                    _ => HistorySyncStatus::Superseded,
+                }
+            }
+            _ => HistorySyncStatus::Gone,
+        }
+    }
+
+    /// The single retirement-side work query: one allocation's admission state
+    /// plus its outstanding resource flows.
+    pub(crate) fn work(&self, session_id: &str) -> Option<SessionWork> {
+        self.sessions.get(session_id).map(SessionWork::of)
+    }
+
+    pub(crate) fn iter_entries(&self) -> impl Iterator<Item = &SessionEntry> {
+        self.sessions.values()
+    }
+
     /// Final physical removal is centralized so pending senders are answered and
     /// observer/materialization cancellation tokens are never silently discarded.
     pub(crate) fn cancel_resources(&mut self, session_id: &str, incarnation: u64, reason: &str) {
@@ -396,6 +470,17 @@ impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new(Uuid::new_v4().to_string())
     }
+}
+
+/// A waking history continuation's relationship to the live sync slot.
+pub(crate) enum HistorySyncStatus {
+    /// The slot still belongs to this flow: the next attempt may proceed.
+    Owned,
+    /// The same incarnation lost the slot to an admitted business operation or
+    /// a successor flow: yield without another attempt or fallback write.
+    Superseded,
+    /// The session, incarnation, or epoch is gone: finish as cancelled.
+    Gone,
 }
 
 #[cfg(test)]

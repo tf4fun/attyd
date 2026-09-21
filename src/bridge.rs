@@ -41,11 +41,11 @@ use crate::semantic::{
 use crate::session_mirror::{MirrorError, MirrorPhase, TurnAdmission};
 use crate::session_observation::ObservationLease;
 use crate::session_observers::SessionWork;
-use crate::session_registry::SessionRegistry;
+use crate::session_registry::{HistorySyncStatus, SessionRegistry};
 use crate::session_resources::{
-    AttachmentDelivery, ElicitationResponder, PermissionResponder, ReplayValidationBackup,
-    SessionResourceOwner, SessionResources, SessionUpdateOwner, SyncControlCandidate,
-    UrlRegistration,
+    AttachmentDelivery, ElicitationResponder, HistorySyncOwner, PermissionResponder,
+    ReplayValidationBackup, SessionResourceOwner, SessionResources, SessionUpdateOwner,
+    SyncControlCandidate, UrlRegistration,
 };
 use crate::session_state::SessionAdmission;
 use crate::terminal::{TerminalManager, TerminalSnapshot};
@@ -1097,13 +1097,13 @@ fn refresh_observer_timers(state: &mut BridgeState) {
     };
     let owners = state
         .sessions
-        .iter_states()
-        .map(|session| {
+        .iter_entries()
+        .map(|entry| {
             (
-                session.session_id.clone(),
-                session.incarnation,
-                session.live.as_ref().map(|live| live.lifecycle.clone()),
-                SessionWork::of(session),
+                entry.state.session_id.clone(),
+                entry.state.incarnation,
+                entry.state.live.as_ref().map(|live| live.lifecycle.clone()),
+                SessionWork::of(entry),
             )
         })
         .collect::<Vec<_>>();
@@ -1177,8 +1177,8 @@ fn finish_session_observers(
 fn session_blocks_unobserved_retire(state: &BridgeState, session_id: &str) -> bool {
     state
         .sessions
-        .state(session_id)
-        .is_some_and(|session| SessionWork::of(session) != SessionWork::Idle)
+        .work(session_id)
+        .is_some_and(|work| work != SessionWork::Idle)
 }
 
 fn retire_session_observation(
@@ -1694,6 +1694,38 @@ struct CommandContext {
     auth_terminal: AuthTerminalManager,
     prompt_lifecycle: Arc<PromptLifecycle>,
     cancellation: CancellationToken,
+    history_flow: Arc<HistoryFlowGuard>,
+}
+
+/// The command-level owner of one registered history workflow. The command's
+/// finalizer takes the owner back out; an unexpectedly dropped task instead
+/// posts an identified cleanup so the session never leaks a busy slot.
+struct HistoryFlowGuard {
+    owner: std::sync::Mutex<Option<HistorySyncOwner>>,
+    events: mpsc::UnboundedSender<BridgeInput>,
+}
+
+impl HistoryFlowGuard {
+    fn register(&self, owner: HistorySyncOwner) {
+        *self.owner.lock().expect("history flow guard poisoned") = Some(owner);
+    }
+
+    fn take(&self) -> Option<HistorySyncOwner> {
+        self.owner
+            .lock()
+            .expect("history flow guard poisoned")
+            .take()
+    }
+}
+
+impl Drop for HistoryFlowGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.owner.lock()
+            && let Some(owner) = slot.take()
+        {
+            let _ = self.events.send(BridgeInput::FinishHistorySync { owner });
+        }
+    }
 }
 
 pub(crate) enum BridgeInput {
@@ -1722,6 +1754,11 @@ pub(crate) enum BridgeInput {
         incarnation: u64,
         absence_id: u64,
         permit: crate::auto_close::AutoClosePermit,
+    },
+    /// A dropped command task releases its history workflow through the
+    /// coordinator instead of mutating canonical state inside `Drop`.
+    FinishHistorySync {
+        owner: HistorySyncOwner,
     },
     TurnRequest {
         session_id: String,
@@ -1752,6 +1789,7 @@ impl BridgeInput {
             | Self::UnobserveSession { session_id, .. }
             | Self::RetireUnobservedSession { session_id, .. }
             | Self::TurnRequest { session_id, .. } => Some(session_id),
+            Self::FinishHistorySync { owner } => Some(&owner.session.session_id),
             Self::BusinessRequest { command, .. } | Self::PreparedAttachment { command, .. } => {
                 match command.get("type").and_then(Value::as_str)? {
                     "permission/respond" => state
@@ -1802,6 +1840,12 @@ impl BridgeInput {
             ),
             Self::UnobserveSession { session_id, .. }
             | Self::RetireUnobservedSession { session_id, .. } => serialized_value_len(session_id),
+            Self::FinishHistorySync { owner } => serialized_value_len(&(
+                &owner.session.epoch,
+                &owner.session.session_id,
+                owner.session.incarnation,
+                &owner.flow_id,
+            )),
             Self::TurnRequest {
                 session_id,
                 history_revision,
@@ -1831,6 +1875,9 @@ impl BridgeInput {
             Self::UnobserveSession { lease, .. } => lease.cancel(),
             Self::RetireUnobservedSession { permit, .. } => {
                 permit.cancel();
+            }
+            Self::FinishHistorySync { owner } => {
+                owner.cancellation.cancel();
             }
             Self::TurnRequest { response, .. } => {
                 let _ = response.send(Err(error_message(error)));
@@ -2156,7 +2203,7 @@ where
     let (observer_events, mut observer_rx) = mpsc::unbounded_channel();
     {
         let mut state = state.lock().await;
-        state.observer_events = Some(observer_events);
+        state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
     }
     sink.internal_typed(
@@ -2314,6 +2361,14 @@ where
                         let snapshot = state.sessions.snapshot();
                         state.published_runtime_seq = snapshot.through_seq;
                         sink.internal_typed("bridge/internal_runtime_snapshot", snapshot);
+                        continue;
+                    }
+                    Some(BridgeInput::FinishHistorySync { owner }) => {
+                        // A dropped task may not release its flow through the
+                        // command finalizer; only the exact identity may do so.
+                        let mut state = state.lock().await;
+                        state.sessions.finish_history_sync(&owner);
+                        refresh_observer_timers(&mut state);
                         continue;
                     }
                     Some(BridgeInput::RetireUnobservedSession {
@@ -2502,6 +2557,10 @@ where
                     auth_terminal: auth_terminal.clone(),
                     prompt_lifecycle: prompt_lifecycle.clone(),
                     cancellation: cancellation.clone(),
+                    history_flow: Arc::new(HistoryFlowGuard {
+                        owner: std::sync::Mutex::new(None),
+                        events: observer_events.clone(),
+                    }),
                 };
                 connection.spawn(async move {
                     let request_id = command
@@ -3586,10 +3645,25 @@ async fn handle_command(
         context.clone(),
         prompt_start,
         turn_responder,
-        business_responder,
+        business_responder.clone(),
         &mut execution,
     )
     .await;
+    // A registered history flow ends inside the same boundary as its business
+    // outcome: the response publishes first, then the flow releases and the
+    // idle interval restarts — even when the ordered epilogue was skipped.
+    if let Some(flow) = context.history_flow.take() {
+        if let Some(responder) = &business_responder {
+            match &result {
+                Ok(()) => responder.success(json!({ "status": "ok" })),
+                Err(error) => responder.error(error),
+            }
+        }
+        let mut state = context.state.lock().await;
+        state.sessions.finish_history_sync(&flow);
+        flush_runtime(&mut state, &context.sink);
+        drop(state);
+    }
     // Result publication, interaction retirement and the Observe materialization
     // cut are part of this local turn, including every early error path above.
     let terminal_releases = if context.ingress.is_none() || execution.is_some() {
@@ -3682,6 +3756,7 @@ async fn handle_command_inner(
         auth_terminal,
         prompt_lifecycle,
         cancellation,
+        history_flow,
     } = context;
     let bridge_state = state.clone();
     let operation = nonempty_string_field(&command, "type")?;
@@ -4227,6 +4302,27 @@ async fn handle_command_inner(
                 return Err(runtime_state_error(error));
             }
             commit_replay_validation(&mut state, &session_id, &validation_owner);
+            // The optional sync is registered before the attachment operation
+            // releases: retirement must see continuous work across the handoff.
+            let history_owner = if operation == "session/resume" {
+                let owner = HistorySyncOwner {
+                    session: SessionResourceOwner::new(
+                        epoch.clone(),
+                        session_id.clone(),
+                        attachment_incarnation,
+                    ),
+                    flow_id: Uuid::new_v4().to_string(),
+                    cancellation: CancellationToken::new(),
+                };
+                state
+                    .sessions
+                    .begin_history_sync(&owner)
+                    .map_err(mirror_error)?;
+                history_flow.register(owner.clone());
+                Some(owner)
+            } else {
+                None
+            };
             release_session_operation(
                 &mut state,
                 &session_id,
@@ -4262,6 +4358,7 @@ async fn handle_command_inner(
                         updates: resume_cache.as_ref().map(|snapshot| snapshot.updates()).unwrap_or(&[]),
                         notice: "Only context received while resuming is available; earlier history may be missing.",
                     },
+                    history_owner.as_ref().expect("resume registers its history flow"),
                     ingress.as_ref(), execution, &request_id,
                 )
                 .await?;
@@ -4318,6 +4415,12 @@ async fn handle_command_inner(
                     );
                     return Err(runtime_state_error(error));
                 }
+                // The accepted fork owns the source's projection for its read;
+                // a parked optional history flow yields instead of replaying
+                // over the branched session later.
+                state
+                    .sessions
+                    .supersede_history_sync(&source_id, source_incarnation);
                 flush_runtime(&mut state, &sink);
                 state.pending_creations += 1;
                 (cwd, source_incarnation, source_baseline)
@@ -4517,6 +4620,19 @@ async fn handle_command_inner(
                 SessionAdmission::Fork,
                 &request_id,
             );
+            // The optional-history workflow is live from the handoff onward:
+            // registering before publication and the runtime flush keeps the
+            // unobserved target working through every retry wait.
+            let history_owner = HistorySyncOwner {
+                session: SessionResourceOwner::new(epoch.clone(), session_id.clone(), incarnation),
+                flow_id: Uuid::new_v4().to_string(),
+                cancellation: CancellationToken::new(),
+            };
+            state
+                .sessions
+                .begin_history_sync(&history_owner)
+                .map_err(mirror_error)?;
+            history_flow.register(history_owner.clone());
             advance_catalog_revision(&mut state, &sink);
             flush_runtime(&mut state, &sink);
             creation_finish.committed(incarnation)?;
@@ -4533,6 +4649,7 @@ async fn handle_command_inner(
                 &session_id,
                 incarnation,
                 AttachmentHistoryFallback::Installed,
+                &history_owner,
                 ingress.as_ref(),
                 execution,
                 &request_id,
@@ -5125,6 +5242,12 @@ async fn handle_command_inner(
                         return Ok(());
                     }
                 };
+                // The accepted turn owns the projection now: an optional
+                // history workflow still parked in backoff yields instead of
+                // retrying over this turn's outcome.
+                state
+                    .sessions
+                    .supersede_history_sync(&session_id, incarnation);
                 flush_runtime(&mut state, &sink);
                 let view = session_view_value(&mut state, &session_id, incarnation)?;
                 sink.send(json!({
@@ -5255,6 +5378,12 @@ async fn handle_command_inner(
                     );
                     return Err(runtime_state_error(error));
                 }
+                // The admitted control owns the projection now; an optional
+                // history flow parked in backoff yields instead of replaying
+                // over this control's outcome.
+                state
+                    .sessions
+                    .supersede_history_sync(&session_id, incarnation);
                 flush_runtime(&mut state, &sink);
                 incarnation
             };
@@ -5422,6 +5551,9 @@ async fn handle_command_inner(
                     );
                     return Err(runtime_state_error(error));
                 }
+                state
+                    .sessions
+                    .supersede_history_sync(&session_id, incarnation);
                 flush_runtime(&mut state, &sink);
                 incarnation
             };
@@ -6030,6 +6162,16 @@ fn attachment_cache_notice<'a>(updates: &[Value], notice: &'a str) -> &'a str {
     }
 }
 
+/// The terminal state of one optional history workflow. Only `Failed` may
+/// enter the cached fallback: a superseded flow must not overwrite the
+/// successor's projection, and a retired owner must not publish at all.
+enum HistorySyncOutcome {
+    Loaded,
+    Failed(Error),
+    Superseded,
+    Stopped(Error),
+}
+
 // Attachment success is independent of the Agent's ability to replay history.
 async fn synchronize_attached_history(
     connection: &ConnectionTo<Agent>,
@@ -6040,6 +6182,7 @@ async fn synchronize_attached_history(
     session_id: &str,
     incarnation: u64,
     fallback: AttachmentHistoryFallback<'_>,
+    flow: &HistorySyncOwner,
     ingress: Option<&IngressSender>,
     execution: &mut Option<ExecutionTurn>,
     operation_id: &str,
@@ -6066,7 +6209,7 @@ async fn synchronize_attached_history(
             return Ok(());
         }
     }
-    let result = synchronize_authoritative_history(
+    let outcome = synchronize_authoritative_history(
         connection,
         options,
         state,
@@ -6074,16 +6217,35 @@ async fn synchronize_attached_history(
         cancellation,
         session_id,
         incarnation,
+        flow,
         ingress,
         execution,
         operation_id,
     )
     .await;
-    if result.is_ok() {
-        return Ok(());
-    }
-    if ingress.is_some() && execution.is_none() {
-        return result;
+    match outcome {
+        HistorySyncOutcome::Loaded => return Ok(()),
+        HistorySyncOutcome::Stopped(error) => return Err(error),
+        HistorySyncOutcome::Superseded => {
+            // An admitted business operation owns the projection now. If the
+            // original target is still its live owner the command completes
+            // with the current view; a lifecycle handoff settles as a conflict.
+            let state = state.lock().await;
+            let alive = state
+                .sessions
+                .active_session(session_id)
+                .is_some_and(|session| session.state.incarnation == incarnation);
+            return if alive {
+                Ok(())
+            } else {
+                Err(Error::invalid_request().data("session closed while retrieving history"))
+            };
+        }
+        HistorySyncOutcome::Failed(error) => {
+            if ingress.is_some() && execution.is_none() {
+                return Err(error);
+            }
+        }
     }
     let mut state = state.lock().await;
     // A concurrent close or runtime shutdown must never resurrect an attachment.
@@ -6150,21 +6312,29 @@ async fn synchronize_authoritative_history(
     cancellation: &CancellationToken,
     session_id: &str,
     incarnation: u64,
+    flow: &HistorySyncOwner,
     ingress: Option<&IngressSender>,
     execution: &mut Option<ExecutionTurn>,
     operation_id: &str,
-) -> Result<(), Error> {
-    require_agent_method("session/load", state).await?;
+) -> HistorySyncOutcome {
+    if let Err(error) = require_agent_method("session/load", state).await {
+        return HistorySyncOutcome::Failed(error);
+    }
     let cwd = {
         let state = state.lock().await;
-        state
+        match state
             .sessions
             .active_session(session_id)
             .filter(|session| session.state.incarnation == incarnation)
             .map(|session| session.live.cwd.clone())
-            .ok_or_else(|| {
-                Error::invalid_params().data("session disappeared before reconciliation")
-            })?
+        {
+            Some(cwd) => cwd,
+            None => {
+                return HistorySyncOutcome::Stopped(
+                    Error::invalid_params().data("session disappeared before reconciliation"),
+                );
+            }
+        }
     };
     let epoch = state.lock().await.sessions.epoch().to_string();
     let mut backoff = RECONCILE_INITIAL_BACKOFF;
@@ -6172,9 +6342,25 @@ async fn synchronize_authoritative_history(
         let attempt_id = Uuid::new_v4().to_string();
         let validation_owner = {
             let mut state = state.lock().await;
-            session_mirror(&mut state)
-                .begin_load(session_id, incarnation, attempt_id.clone())
-                .map_err(mirror_error)?;
+            // Every attempt belongs to the registered flow: a superseded or
+            // retired owner never dispatches another load or replays into a
+            // successor's session.
+            match state.sessions.history_sync_status(flow) {
+                HistorySyncStatus::Owned if !flow.cancellation.is_cancelled() => {}
+                HistorySyncStatus::Owned | HistorySyncStatus::Superseded => {
+                    return HistorySyncOutcome::Superseded;
+                }
+                HistorySyncStatus::Gone => {
+                    return HistorySyncOutcome::Stopped(
+                        Error::request_cancelled().data("history workflow owner was retired"),
+                    );
+                }
+            }
+            if let Err(error) =
+                session_mirror(&mut state).begin_load(session_id, incarnation, attempt_id.clone())
+            {
+                return HistorySyncOutcome::Failed(mirror_error(error));
+            }
             let validation_owner = begin_replay_validation(&mut state, session_id);
             take_sync_control_candidate(&mut state, session_id);
             let phase = match session_mirror(&mut state)
@@ -6184,14 +6370,18 @@ async fn synchronize_authoritative_history(
                 Some(MirrorPhase::Loading) => "loading",
                 _ => "reconciling",
             };
-            sink.send(session_delta_value(
+            let delta = match session_delta_value(
                 &state,
                 session_id,
                 incarnation,
                 json!({
                     "kind": "sync_state", "phase": phase, "attemptId": attempt_id,
                 }),
-            )?);
+            ) {
+                Ok(delta) => delta,
+                Err(error) => return HistorySyncOutcome::Failed(error),
+            };
+            sink.send(delta);
             sink.send(json!({
                 "type": "bridge/session_sync", "sessionId": session_id,
                 "phase": phase, "attemptId": attempt_id,
@@ -6205,7 +6395,7 @@ async fn synchronize_authoritative_history(
             operation_id,
             Some(&attempt_id),
         );
-        let result = send_history(
+        let result = match send_history(
             connection,
             ingress,
             execution,
@@ -6215,18 +6405,25 @@ async fn synchronize_authoritative_history(
                 .additional_directories(local_additional_directories(options))
                 .mcp_servers(options.mcp_servers.clone()),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => return HistorySyncOutcome::Stopped(error),
+        };
 
         let failure = {
             let mut state = state.lock().await;
             if !validation_owner.matches(&state, session_id) {
-                return Err(
-                    Error::invalid_request().data("session history synchronization owner changed")
+                return HistorySyncOutcome::Stopped(
+                    Error::invalid_request().data("session history synchronization owner changed"),
                 );
             }
             let failure = match result {
                 Ok(response) => {
-                    let response_value = serde_json::to_value(&response)?;
+                    let response_value = match serde_json::to_value(&response) {
+                        Ok(value) => value,
+                        Err(error) => return HistorySyncOutcome::Failed(error.into()),
+                    };
                     let validation_error = relay_bytes(&response)
                         .err()
                         .or_else(|| response_controls(&response_value).err())
@@ -6245,16 +6442,16 @@ async fn synchronize_authoritative_history(
                     if let Some(error) = validation_error {
                         rollback_replay_validation(&mut state, session_id, &validation_owner);
                         take_sync_control_candidate(&mut state, session_id);
-                        session_mirror(&mut state)
-                            .fail_load(
-                                session_id,
-                                incarnation,
-                                &attempt_id,
-                                error.message.clone(),
-                                false,
-                            )
-                            .map_err(mirror_error)?;
-                        let delta = session_delta_value(
+                        if let Err(mirror) = session_mirror(&mut state).fail_load(
+                            session_id,
+                            incarnation,
+                            &attempt_id,
+                            error.message.clone(),
+                            false,
+                        ) {
+                            return HistorySyncOutcome::Failed(mirror_error(mirror));
+                        }
+                        let delta = match session_delta_value(
                             &state,
                             session_id,
                             incarnation,
@@ -6263,7 +6460,10 @@ async fn synchronize_authoritative_history(
                                 "phase": "blocked",
                                 "message": error.message,
                             }),
-                        )?;
+                        ) {
+                            Ok(delta) => delta,
+                            Err(error) => return HistorySyncOutcome::Failed(error),
+                        };
                         Some((error, false, delta))
                     } else {
                         match session_mirror(&mut state).commit_load(
@@ -6275,7 +6475,7 @@ async fn synchronize_authoritative_history(
                                 let controls =
                                     take_sync_control_candidate(&mut state, session_id).updates;
                                 let epoch = state.sessions.epoch().to_string();
-                                state
+                                if let Err(error) = state
                                     .sessions
                                     .synchronize_loaded_session(
                                         &epoch,
@@ -6284,8 +6484,17 @@ async fn synchronize_authoritative_history(
                                         response_value.clone(),
                                         controls,
                                     )
-                                    .map_err(runtime_state_error)?;
-                                let view = session_view_value(&mut state, session_id, incarnation)?;
+                                    .map_err(runtime_state_error)
+                                {
+                                    return HistorySyncOutcome::Failed(error);
+                                }
+                                let view =
+                                    match session_view_value(&mut state, session_id, incarnation) {
+                                        Ok(view) => view,
+                                        Err(error) => {
+                                            return HistorySyncOutcome::Failed(error);
+                                        }
+                                    };
                                 commit_replay_validation(&mut state, session_id, &validation_owner);
                                 sink.send(json!({
                                     "type": "bridge/session_view",
@@ -6297,7 +6506,7 @@ async fn synchronize_authoritative_history(
                                     "sessionId": session_id,
                                     "phase": "ready",
                                 }));
-                                return Ok(());
+                                return HistorySyncOutcome::Loaded;
                             }
                             Err(error) => {
                                 rollback_replay_validation(
@@ -6307,16 +6516,16 @@ async fn synchronize_authoritative_history(
                                 );
                                 take_sync_control_candidate(&mut state, session_id);
                                 let error = mirror_error(error);
-                                session_mirror(&mut state)
-                                    .fail_load(
-                                        session_id,
-                                        incarnation,
-                                        &attempt_id,
-                                        error.message.clone(),
-                                        false,
-                                    )
-                                    .map_err(mirror_error)?;
-                                let delta = session_delta_value(
+                                if let Err(mirror) = session_mirror(&mut state).fail_load(
+                                    session_id,
+                                    incarnation,
+                                    &attempt_id,
+                                    error.message.clone(),
+                                    false,
+                                ) {
+                                    return HistorySyncOutcome::Failed(mirror_error(mirror));
+                                }
+                                let delta = match session_delta_value(
                                     &state,
                                     session_id,
                                     incarnation,
@@ -6325,7 +6534,10 @@ async fn synchronize_authoritative_history(
                                         "phase": "blocked",
                                         "message": error.message,
                                     }),
-                                )?;
+                                ) {
+                                    Ok(delta) => delta,
+                                    Err(error) => return HistorySyncOutcome::Failed(error),
+                                };
                                 Some((error, false, delta))
                             }
                         }
@@ -6335,16 +6547,16 @@ async fn synchronize_authoritative_history(
                     rollback_replay_validation(&mut state, session_id, &validation_owner);
                     take_sync_control_candidate(&mut state, session_id);
                     let retryable = retryable_reconcile_error(&error);
-                    session_mirror(&mut state)
-                        .fail_load(
-                            session_id,
-                            incarnation,
-                            &attempt_id,
-                            error.message.clone(),
-                            retryable,
-                        )
-                        .map_err(mirror_error)?;
-                    let delta = session_delta_value(
+                    if let Err(mirror) = session_mirror(&mut state).fail_load(
+                        session_id,
+                        incarnation,
+                        &attempt_id,
+                        error.message.clone(),
+                        retryable,
+                    ) {
+                        return HistorySyncOutcome::Failed(mirror_error(mirror));
+                    }
+                    let delta = match session_delta_value(
                         &state,
                         session_id,
                         incarnation,
@@ -6353,7 +6565,10 @@ async fn synchronize_authoritative_history(
                             "phase": if retryable { "retrying" } else { "blocked" },
                             "message": error.message,
                         }),
-                    )?;
+                    ) {
+                        Ok(delta) => delta,
+                        Err(error) => return HistorySyncOutcome::Failed(error),
+                    };
                     Some((error, retryable, delta))
                 }
             };
@@ -6373,14 +6588,23 @@ async fn synchronize_authoritative_history(
             unreachable!("successful reconciliation returns from the state transaction")
         };
         if !retryable {
-            return Err(error);
+            return HistorySyncOutcome::Failed(error);
         }
+        // The wait is part of the workflow, not of the Agent RPC: the ticket and
+        // the state lock are released so other sessions progress. A superseding
+        // admission or a retired owner wakes the continuation through the flow
+        // token; the next loop's identity check decides whether to proceed.
         drop(execution.take());
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+            _ = flow.cancellation.cancelled() => {}
+            _ = cancellation.cancelled() => {
+                return HistorySyncOutcome::Stopped(Error::request_cancelled());
+            }
         }
-        continue_execution(ingress, execution, &owner).await?;
+        if let Err(error) = continue_execution(ingress, execution, &owner).await {
+            return HistorySyncOutcome::Stopped(error);
+        }
         backoff = backoff.saturating_mul(2).min(RECONCILE_MAX_BACKOFF);
     }
 }
@@ -6667,6 +6891,11 @@ fn reserve_attachment_locked(
                 );
                 return Err(runtime_state_error(error));
             }
+            // The accepted reload owns the same incarnation's projection; a
+            // parked optional history flow yields instead of replaying over it.
+            state
+                .sessions
+                .supersede_history_sync(session_id, incarnation);
             AttachmentReservation::Reload { cwd, incarnation }
         }
         None => {

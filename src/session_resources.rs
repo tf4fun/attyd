@@ -21,6 +21,7 @@ pub(crate) struct SessionResources {
     pub(crate) replay_validation_backup: Option<ReplayValidationBackup>,
     pub(crate) attachment: AttachmentDelivery,
     pub(crate) materialization: Option<MaterializationResources>,
+    pub(crate) history_sync: Option<HistorySyncResources>,
     pub(crate) permissions: HashMap<String, PermissionResponder>,
     pub(crate) elicitations: HashMap<String, ElicitationResponder>,
     pub(crate) observers: SessionObservers,
@@ -56,6 +57,23 @@ pub(crate) struct MaterializationResources {
     pub(crate) cancellation: CancellationToken,
 }
 
+/// One optional history workflow owns this slot for its whole lifetime:
+/// every load attempt, every retry wait, and the final cached fallback.
+/// The slot is work evidence; the token is a termination request.
+pub(crate) struct HistorySyncResources {
+    pub(crate) flow_id: String,
+    pub(crate) cancellation: CancellationToken,
+}
+
+/// A lightweight continuation identity for one history workflow. It carries
+/// no history payload: attempts still allocate their own replay candidates.
+#[derive(Clone)]
+pub(crate) struct HistorySyncOwner {
+    pub(crate) session: SessionResourceOwner,
+    pub(crate) flow_id: String,
+    pub(crate) cancellation: CancellationToken,
+}
+
 pub(crate) struct PermissionResponder {
     pub(crate) tool_call_id: String,
     pub(crate) option_ids: HashSet<String>,
@@ -88,6 +106,9 @@ impl SessionResources {
             for waiter in materialization.waiters {
                 waiter.cancel(reason);
             }
+        }
+        if let Some(history_sync) = self.history_sync.take() {
+            history_sync.cancellation.cancel();
         }
         self.observers.shutdown();
     }

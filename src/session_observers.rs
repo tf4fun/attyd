@@ -6,7 +6,7 @@ use tokio::time::Instant;
 use crate::auto_close::AutoClosePermit;
 use crate::runtime_state::SessionLifecycle;
 use crate::session_observation::ObservationLease;
-use crate::session_state::SessionState;
+use crate::session_registry::SessionEntry;
 
 /// Attention state machine input: what an unobserved session is doing.
 /// Only `Idle` arms the closing countdown; every other state is live work.
@@ -17,8 +17,8 @@ use crate::session_state::SessionState;
 ///   OBSERVED ── ≥1 observation lease; never retires
 ///      │ last observer leaves (classified by work)
 ///      ▼
-///   WORKING ── active_turn / operation / load_attempt / live terminal
-///      │         in-flight: real work, no countdown
+///   WORKING ── active_turn / operation / load_attempt / live terminal /
+///      │         materialization / history sync: real work, no countdown
 ///      │ interaction request arrives (permission, elicitation, url flow)
 ///      ▼
 ///   AWAITING ── interaction pending: the Agent is parked on a user decision
@@ -36,8 +36,9 @@ use crate::session_state::SessionState;
 pub(crate) enum SessionWork {
     /// Nothing in-flight: the unobserved countdown may arm.
     Idle,
-    /// A turn, exclusive operation, materialization attempt, or live managed
-    /// terminal is in-flight: real work that must not be cut off.
+    /// A turn, exclusive operation, materialization attempt, live managed
+    /// terminal, or unfinished history workflow is in-flight: real work that
+    /// must not be cut off.
     Running,
     /// The Agent is parked on a user decision (permission, elicitation, or URL
     /// flow). Cancelling it changes Agent state, so it must block retirement.
@@ -45,8 +46,11 @@ pub(crate) enum SessionWork {
 }
 
 impl SessionWork {
-    /// Derive the work state from the session owner.
-    pub(crate) fn of(session: &SessionState) -> Self {
+    /// Derive the work state from the complete allocation: state owns
+    /// admission-visible progress while resources own flows that are still
+    /// awaiting or running outside a single RPC.
+    pub(crate) fn of(entry: &SessionEntry) -> Self {
+        let session = &entry.state;
         if session.live.as_ref().is_some_and(|live| {
             !live.permissions.is_empty()
                 || !live.elicitations.is_empty()
@@ -61,6 +65,8 @@ impl SessionWork {
                 .live
                 .as_ref()
                 .is_some_and(|live| live.terminals.values().any(terminal_is_running))
+            || entry.resources.materialization.is_some()
+            || entry.resources.history_sync.is_some()
         {
             return Self::Running;
         }
