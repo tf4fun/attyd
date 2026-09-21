@@ -125,11 +125,14 @@ impl SessionRegistry {
         }
         let key = SessionKey::new(session_id, incarnation);
         self.history.begin_candidate(key, attempt_id.clone())?;
-        let session = self
+        let entry = self
             .sessions
             .get_mut(session_id)
-            .map(|entry| &mut entry.state)
             .expect("session was validated above");
+        // A load attempt is live work: cancel the idle countdown now so a
+        // stale deadline cannot survive past the load's completion.
+        entry.resources.observers.stop_absence();
+        let session = &mut entry.state;
         session.load_origin = Some(session.phase);
         if session.phase == MirrorPhase::Blocked {
             session.phase = if session.active_turn.is_some() {
