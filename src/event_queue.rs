@@ -47,9 +47,9 @@ impl TestEventFault {
     }
 
     fn rejects(&self, event: &str) -> bool {
-        if serde_json::from_str::<serde_json::Value>(event).is_ok_and(|value| {
-            value["type"] == "bridge/internal_runtime_delta"
-        }) {
+        if serde_json::from_str::<serde_json::Value>(event)
+            .is_ok_and(|value| value["type"] == "bridge/internal_runtime_delta")
+        {
             self.delta_attempts.fetch_add(1, Ordering::AcqRel);
         }
         self.attempts.fetch_add(1, Ordering::AcqRel) >= self.fail_after

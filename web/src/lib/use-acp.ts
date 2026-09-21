@@ -253,6 +253,20 @@ export function useAcp() {
       if (event.type === "bridge/session_turn_failed") {
         clearMatchingPromptAdmission(promptAdmissionsRef.current, event);
         if (!advanceSessionViewToTurnOutcome(sessionViewRef, event)) {
+          const current = sessionViewRef.current;
+          if (
+            current != null &&
+            current.sessionId === event.sessionId &&
+            current.bridgeEpoch === event.bridgeEpoch &&
+            current.sessionIncarnation === event.sessionIncarnation &&
+            event.viewRevision < current.viewRevision
+          ) {
+            // A stale-revision failure for the same owner is an outcome the
+            // newer view cannot reconstruct from turnOutcomes. Surface the
+            // error and its retry prompt without rolling the view back.
+            dispatch({ type: "bridge/turn_failed", event });
+            return;
+          }
           refreshSessionRef.current(sessionId);
           return;
         }

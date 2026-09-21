@@ -55,9 +55,9 @@ mod coordinator;
 #[cfg(test)]
 mod coordinator_tests;
 mod inbound_requests;
-mod scheduling;
 #[cfg(test)]
 mod memory_retention_tests;
+mod scheduling;
 #[cfg(test)]
 mod unobserved_tests;
 
@@ -95,22 +95,26 @@ impl EventSink {
         }));
     }
 
-    fn internal_typed(&self, kind: &str, value: impl Serialize) {
+    fn internal_typed(&self, kind: &str, value: impl Serialize) -> bool {
         match serde_json::to_value(value) {
-            Ok(value) => {
-                let _ = self.tx.send(
+            Ok(value) => self
+                .tx
+                .send(
                     json!({
                         "type": kind,
                         "value": value,
                     })
                     .to_string(),
+                )
+                .is_ok(),
+            Err(error) => {
+                self.error(
+                    format!("failed to serialize canonical runtime state: {error}"),
+                    None,
+                    Some("canonical/runtime"),
                 );
+                false
             }
-            Err(error) => self.error(
-                format!("failed to serialize canonical runtime state: {error}"),
-                None,
-                Some("canonical/runtime"),
-            ),
         }
     }
 
@@ -436,7 +440,12 @@ fn session_view_value(
         .sessions
         .session(session_id)
         .filter(|session| session.incarnation == incarnation)
-        .map(serde_json::to_value)
+        // The live projection drops activeTurn below; do not serialize a
+        // potentially multi-megabyte turn payload just to discard it.
+        .map(|mut session| {
+            session.active_turn = None;
+            serde_json::to_value(session)
+        })
         .transpose()?
         .unwrap_or(Value::Null);
     let mut view = session_mirror(state)
@@ -1075,16 +1084,26 @@ fn flush_runtime(state: &mut BridgeState, sink: &EventSink) {
     match state.sessions.deltas_after(state.published_runtime_seq) {
         Some(deltas) => {
             for delta in deltas {
-                state.published_runtime_seq = delta.seq;
-                sink.internal_typed("bridge/internal_runtime_delta", delta);
+                let seq = delta.seq;
+                if !sink.internal_typed("bridge/internal_runtime_delta", delta) {
+                    break;
+                }
+                state.published_runtime_seq = seq;
             }
         }
         None => {
             let snapshot = state.sessions.snapshot();
-            state.published_runtime_seq = snapshot.through_seq;
-            sink.internal_typed("bridge/internal_runtime_snapshot", snapshot);
+            let through = snapshot.through_seq;
+            if sink.internal_typed("bridge/internal_runtime_snapshot", snapshot) {
+                state.published_runtime_seq = through;
+            }
         }
     }
+    // The journal is only a delivery buffer: handoffs that reached the sink
+    // release their payloads so covered overlay versions die immediately.
+    state
+        .sessions
+        .release_published_runtime(state.published_runtime_seq);
     refresh_observer_timers(state);
 }
 
@@ -2363,8 +2382,11 @@ where
                     Some(BridgeInput::RuntimeSnapshotRequest) => {
                         let mut state = state.lock().await;
                         let snapshot = state.sessions.snapshot();
-                        state.published_runtime_seq = snapshot.through_seq;
-                        sink.internal_typed("bridge/internal_runtime_snapshot", snapshot);
+                        let through = snapshot.through_seq;
+                        if sink.internal_typed("bridge/internal_runtime_snapshot", snapshot) {
+                            state.published_runtime_seq = through;
+                            state.sessions.release_published_runtime(through);
+                        }
                         continue;
                     }
                     Some(BridgeInput::FinishHistorySync { owner }) => {

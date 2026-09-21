@@ -607,6 +607,61 @@ struct SessionSubscriber {
     input: Option<mpsc::UnboundedSender<bridge::BridgeInput>>,
     ready: Option<oneshot::Sender<()>>,
     owner: Option<(String, u64)>,
+    state_slot: Option<std::sync::Weak<StateSlot>>,
+}
+
+impl SessionSubscriber {
+    /// Deliver a reconstructible session state event. While an earlier state
+    /// payload is still queued, replace it with the latest reset instead of
+    /// stacking another serialized copy behind a slow consumer.
+    fn deliver_state(
+        &mut self,
+        canonical: &CanonicalProjection,
+        event: Arc<str>,
+        position: (String, u64, u64),
+    ) -> bool {
+        if let Some(slot) = self.state_slot.as_ref().and_then(std::sync::Weak::upgrade) {
+            let (epoch, incarnation, view_revision) = position;
+            let next = if is_session_reset(&event) {
+                event.clone()
+            } else {
+                // A reset is always a valid replacement for queued state: the
+                // consumer refetches the current view instead of walking a
+                // delta suffix it can no longer verify.
+                canonical_reset_event(
+                    canonical,
+                    &self.session_id,
+                    &epoch,
+                    incarnation,
+                    view_revision,
+                )
+                .unwrap_or_else(|| {
+                    Arc::from(
+                        json!({
+                            "type": "bridge/session_reset",
+                            "bridgeEpoch": epoch,
+                            "sessionId": self.session_id,
+                            "sessionIncarnation": incarnation,
+                            "viewRevision": view_revision,
+                            "historyRevision": null,
+                            "phase": null,
+                            "syncError": null,
+                        })
+                        .to_string(),
+                    )
+                })
+            };
+            slot.replace(next);
+            return true;
+        }
+        match self.sender.try_send_state(event) {
+            Ok(slot) => {
+                self.state_slot = Some(Arc::downgrade(&slot));
+                true
+            }
+            Err(()) => false,
+        }
+    }
 }
 
 impl Drop for SessionSubscriber {
@@ -633,26 +688,92 @@ struct SubscriberSender {
     queued_bytes: Arc<AtomicUsize>,
 }
 
+/// A queued presentation payload. `Fixed` events (failures, retirement and
+/// other outcomes the current view cannot reconstruct) always deliver
+/// verbatim. `Shared` slots carry reconstructible session state: while the
+/// slot is still queued, a newer state event replaces its payload in place so
+/// a slow subscriber's backlog coalesces into the latest reset.
+enum QueuedPayload {
+    Fixed(Arc<str>),
+    Shared(Arc<StateSlot>),
+}
+
+struct StateSlot {
+    payload: std::sync::Mutex<Arc<str>>,
+    bytes: AtomicUsize,
+    ledger: Arc<AtomicUsize>,
+}
+
 struct QueuedSubscriberEvent {
-    event: Arc<str>,
+    event: QueuedPayload,
     queued_bytes: Arc<AtomicUsize>,
     bytes: usize,
 }
 
 impl QueuedSubscriberEvent {
-    #[cfg(test)]
-    fn into_arc(mut self) -> Arc<str> {
-        std::mem::replace(&mut self.event, Arc::from(""))
+    fn payload(&self) -> Arc<str> {
+        match &self.event {
+            QueuedPayload::Fixed(event) => event.clone(),
+            QueuedPayload::Shared(slot) => slot.payload(),
+        }
     }
 
-    fn into_string(mut self) -> String {
-        std::mem::replace(&mut self.event, Arc::from("")).to_string()
+    fn accounted_bytes(&self) -> usize {
+        match &self.event {
+            QueuedPayload::Fixed(_) => self.bytes,
+            QueuedPayload::Shared(slot) => slot.bytes.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_arc(self) -> Arc<str> {
+        self.payload()
+    }
+
+    fn into_string(self) -> String {
+        self.payload().to_string()
     }
 }
 
 impl Drop for QueuedSubscriberEvent {
     fn drop(&mut self) {
-        self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.queued_bytes
+            .fetch_sub(self.accounted_bytes(), Ordering::AcqRel);
+    }
+}
+
+impl StateSlot {
+    fn new(payload: Arc<str>, ledger: Arc<AtomicUsize>) -> Self {
+        Self {
+            bytes: AtomicUsize::new(payload.len()),
+            payload: std::sync::Mutex::new(payload),
+            ledger,
+        }
+    }
+
+    fn payload(&self) -> Arc<str> {
+        self.payload
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replace the queued payload and keep the subscriber's byte ledger exact.
+    fn replace(&self, next: Arc<str>) {
+        let new_len = next.len();
+        let old_len = {
+            let mut payload = self
+                .payload
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::replace(&mut *payload, next).len()
+        };
+        self.bytes.store(new_len, Ordering::Release);
+        if new_len >= old_len {
+            self.ledger.fetch_add(new_len - old_len, Ordering::AcqRel);
+        } else {
+            self.ledger.fetch_sub(old_len - new_len, Ordering::AcqRel);
+        }
     }
 }
 
@@ -674,10 +795,25 @@ impl SubscriberSender {
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.tx
             .send(QueuedSubscriberEvent {
-                event,
+                event: QueuedPayload::Fixed(event),
                 queued_bytes: self.queued_bytes.clone(),
                 bytes,
             })
+            .map_err(|_| ())
+    }
+
+    /// Queue a reconstructible state event through a replaceable slot.
+    fn try_send_state(&self, event: Arc<str>) -> Result<Arc<StateSlot>, ()> {
+        let slot = Arc::new(StateSlot::new(event, self.queued_bytes.clone()));
+        self.queued_bytes
+            .fetch_add(slot.bytes.load(Ordering::Acquire), Ordering::AcqRel);
+        self.tx
+            .send(QueuedSubscriberEvent {
+                event: QueuedPayload::Shared(slot.clone()),
+                queued_bytes: self.queued_bytes.clone(),
+                bytes: 0,
+            })
+            .map(|_| slot)
             .map_err(|_| ())
     }
 }
@@ -696,12 +832,14 @@ fn publish_shared_event(state: &mut BridgeHubState, event: Arc<str>) {
 }
 
 fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
-    let Some((event_session_id, event)) = business_session_event(&event) else {
+    let Some((event_session_id, event, event_owner, position)) =
+        business_session_event_routed(&event)
+    else {
         return;
     };
-    let event_owner = session_event_owner(&event);
+    let canonical = &state.canonical;
     let mut failed = Vec::new();
-    for (&subscriber_id, subscriber) in &state.session_subscribers {
+    for (&subscriber_id, subscriber) in state.session_subscribers.iter_mut() {
         if subscriber.session_id != event_session_id {
             continue;
         }
@@ -724,7 +862,11 @@ fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
             failed.push(subscriber_id);
             continue;
         }
-        if subscriber.sender.try_send(event.clone()).is_err() {
+        let delivered = match &position {
+            Some(position) => subscriber.deliver_state(canonical, event.clone(), position.clone()),
+            None => subscriber.sender.try_send(event.clone()).is_ok(),
+        };
+        if !delivered {
             failed.push(subscriber_id);
         }
     }
@@ -746,24 +888,97 @@ fn publish_to_global_subscribers(state: &mut BridgeHubState, event: &str) {
         .retain(|_, subscriber| subscriber.try_send(event.clone()).is_ok());
 }
 
+#[cfg(test)]
 fn business_session_event(event: &str) -> Option<(String, Arc<str>)> {
+    business_session_event_routed(event).map(|(session_id, event, ..)| (session_id, event))
+}
+
+/// Session-scoped business event reduced to its delivery shape: the session
+/// id it targets, the owner it belongs to, and — for state events — the
+/// (epoch, incarnation, revision) position used by the coalescing slot.
+fn business_session_event_routed(
+    event: &str,
+) -> Option<(
+    String,
+    Arc<str>,
+    Option<(String, u64)>,
+    Option<(String, u64, u64)>,
+)> {
     let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    let owner = |value: &serde_json::Value| {
+        Some((
+            value.get("bridgeEpoch")?.as_str()?.to_string(),
+            value.get("sessionIncarnation")?.as_u64()?,
+        ))
+    };
+    let position = |value: &serde_json::Value| {
+        Some((
+            value.get("bridgeEpoch")?.as_str()?.to_string(),
+            value.get("sessionIncarnation")?.as_u64()?,
+            value.get("viewRevision")?.as_u64()?,
+        ))
+    };
+    let session_id = value.get("sessionId")?.as_str()?.to_string();
     match value.get("type").and_then(serde_json::Value::as_str)? {
-        "bridge/session_delta" | "bridge/session_retired" => {
-            let session_id = value.get("sessionId")?.as_str()?.to_string();
-            Some((session_id, Arc::from(event)))
-        }
+        "bridge/session_delta" => Some((
+            session_id,
+            Arc::from(event),
+            owner(&value),
+            position(&value),
+        )),
+        "bridge/session_retired" => Some((session_id, Arc::from(event), owner(&value), None)),
         "bridge/session_view" => {
-            let session_id = value.get("sessionId")?.as_str()?.to_string();
             let reset = session_reset_value(&session_id, value.get("view")?)?;
-            Some((session_id, Arc::from(reset.to_string())))
+            Some((
+                session_id,
+                Arc::from(reset.to_string()),
+                owner(&reset),
+                position(&reset),
+            ))
         }
         "bridge/session_turn_complete" | "bridge/session_turn_failed" => {
-            let session_id = value.get("sessionId")?.as_str()?.to_string();
-            Some((session_id, Arc::from(event)))
+            Some((session_id, Arc::from(event), owner(&value), None))
         }
         _ => None,
     }
+}
+
+fn is_session_reset(event: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(event)
+        .ok()
+        .is_some_and(|value| {
+            value.get("type").and_then(serde_json::Value::as_str) == Some("bridge/session_reset")
+        })
+}
+
+/// Rebuild the reset recovery hint from canonical session state so a
+/// superseded backlog coalesces into the latest revision without keeping the
+/// intermediate serialized copies alive.
+fn canonical_reset_event(
+    canonical: &CanonicalProjection,
+    session_id: &str,
+    epoch: &str,
+    incarnation: u64,
+    view_revision: u64,
+) -> Option<Arc<str>> {
+    let snapshot = canonical.snapshot.as_ref()?;
+    let session = snapshot.sessions.get(session_id)?;
+    if session.incarnation != incarnation {
+        return None;
+    }
+    Some(Arc::from(
+        json!({
+            "type": "bridge/session_reset",
+            "bridgeEpoch": epoch,
+            "sessionId": session_id,
+            "sessionIncarnation": incarnation,
+            "viewRevision": view_revision,
+            "historyRevision": session.history_revision,
+            "phase": session.phase,
+            "syncError": session.sync_error,
+        })
+        .to_string(),
+    ))
 }
 
 fn session_reset_value(session_id: &str, view: &serde_json::Value) -> Option<serde_json::Value> {
@@ -926,6 +1141,7 @@ impl BridgeHub {
                     input: Some(input.clone()),
                     ready: Some(ready),
                     owner: None,
+                    state_slot: None,
                 },
             );
             (input, state.generation)
@@ -1031,6 +1247,7 @@ impl BridgeHub {
                     input: None,
                     ready: None,
                     owner: None,
+                    state_slot: None,
                 },
             );
             generation
@@ -1076,6 +1293,7 @@ impl BridgeHub {
             if state.generation != generation || state.input.is_none() {
                 return;
             }
+            let state = &mut *state;
             let Some(id) = marker.get("observerId").and_then(serde_json::Value::as_u64) else {
                 return;
             };
@@ -1115,6 +1333,8 @@ impl BridgeHub {
                 return;
             }
             let position = position.unwrap();
+            // The activation reset is the delivery cut itself, so it must be
+            // delivered verbatim; only later state events coalesce.
             let delivered = subscriber
                 .sender
                 .try_send(Arc::<str>::from(reset_event.unwrap()))
@@ -1262,6 +1482,13 @@ impl BridgeHub {
             }
             state.input = None;
             state.cancellation = None;
+            // The ended epoch's projections and subscriber backlogs belong to
+            // it; keeping them would pin obsolete payloads past teardown. The
+            // bootstrap marker stays: it records the last lifecycle phase, not
+            // retained payload.
+            state.canonical = CanonicalProjection::default();
+            state.runtime = ActiveRuntimeProjection::default();
+            state.canonical_resync_pending = false;
             (
                 std::mem::take(&mut state.subscribers),
                 std::mem::take(&mut state.global_subscribers),
@@ -2501,14 +2728,6 @@ fn session_event_cursor(event: &str) -> Option<String> {
     Some(format!("{epoch}:{incarnation}:{revision}"))
 }
 
-fn session_event_owner(event: &str) -> Option<(String, u64)> {
-    let event = serde_json::from_str::<serde_json::Value>(event).ok()?;
-    Some((
-        event.get("bridgeEpoch")?.as_str()?.to_string(),
-        event.get("sessionIncarnation")?.as_u64()?,
-    ))
-}
-
 fn session_event_position(event: &str) -> Option<(String, u64, u64)> {
     let event = serde_json::from_str::<serde_json::Value>(event).ok()?;
     if !matches!(
@@ -2864,6 +3083,7 @@ mod tests {
                     input: None,
                     ready: None,
                     owner: None,
+                    state_slot: None,
                 },
             );
         }
@@ -3708,7 +3928,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_retention_slow_session_delivery_keeps_its_lease_and_preserves_other_observers() {
+    async fn memory_retention_slow_session_delivery_keeps_its_lease_and_preserves_other_observers()
+    {
         let (hub, mut commands) = observation_hub(8).await;
         let mut observations = Vec::new();
         let mut leases = Vec::new();
@@ -5510,7 +5731,10 @@ mod tests {
                 let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
                 if event["type"] == "bridge/session_reset" {
                     assert_eq!(event["bridgeEpoch"], initial["bridgeEpoch"]);
-                    assert_eq!(event["sessionIncarnation"], initial["session"]["incarnation"]);
+                    assert_eq!(
+                        event["sessionIncarnation"],
+                        initial["session"]["incarnation"]
+                    );
                     // A compacted reset carries no transcript. Recover through
                     // the same fenced GET as a browser, then ignore older
                     // queued deltas already represented by that snapshot.
@@ -5527,7 +5751,8 @@ mod tests {
                         .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
                         .map(|update| update["content"]["text"].as_str().unwrap())
                         .collect::<String>();
-                    if let Some(updates) = recovered["session"]["activeTurn"]["updates"].as_array() {
+                    if let Some(updates) = recovered["session"]["activeTurn"]["updates"].as_array()
+                    {
                         for update in updates
                             .iter()
                             .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
@@ -5539,9 +5764,9 @@ mod tests {
                         && recovered["session"]["turnOutcomes"]
                             .as_array()
                             .is_some_and(|outcomes| {
-                                outcomes.iter().any(|outcome| {
-                                    outcome["response"]["stopReason"] == "end_turn"
-                                })
+                                outcomes
+                                    .iter()
+                                    .any(|outcome| outcome["response"]["stopReason"] == "end_turn")
                             })
                     {
                         // Completion may already be represented by the full

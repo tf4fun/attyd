@@ -41,6 +41,12 @@ pub(crate) struct SessionRuntime {
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
+    // View header fields let a downstream hub build a reset recovery hint
+    // without holding the mirror's private session state.
+    #[serde(rename = "baselineRevision")]
+    pub history_revision: Option<String>,
+    pub phase: crate::session_state::MirrorPhase,
+    pub sync_error: Option<String>,
 }
 
 /// Mutable live resources and lifecycle. Operation and turn execution belong to SessionState.
@@ -55,6 +61,11 @@ pub(crate) struct SessionLiveState {
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
+    // Mirror view headers captured at the last commit so a journal snapshot or
+    // hub reset only ever exposes the published view, never uncommitted state.
+    pub history_revision: Option<String>,
+    pub phase: crate::session_state::MirrorPhase,
+    pub sync_error: Option<String>,
     resolved_permissions: VecDeque<String>,
     resolved_elicitations: VecDeque<String>,
     resolved_url_flows: VecDeque<String>,
@@ -310,11 +321,21 @@ pub(crate) enum RuntimeStateError {
     InteractionCollision,
 }
 
+/// A journaled delta plus its serialized length, so a release or retirement
+/// does not have to serialize the payload a second time to keep `bytes` exact.
+#[derive(Serialize)]
+struct JournalDelta {
+    #[serde(flatten)]
+    delta: RuntimeDelta,
+    #[serde(skip)]
+    bytes: usize,
+}
+
 /// Retains the published delta suffix without owning session business state.
 /// The caller supplies committed changes and decides when a turn is retired.
 pub(crate) struct RuntimeJournal {
     seq: u64,
-    deltas: VecDeque<RuntimeDelta>,
+    deltas: VecDeque<JournalDelta>,
     bytes: usize,
 }
 
@@ -335,15 +356,18 @@ impl RuntimeJournal {
         if seq > self.seq {
             return None;
         }
-        let first = self.deltas.front().map_or(self.seq + 1, |delta| delta.seq);
+        let first = self
+            .deltas
+            .front()
+            .map_or(self.seq + 1, |entry| entry.delta.seq);
         if seq.saturating_add(1) < first {
             return None;
         }
         Some(
             self.deltas
                 .iter()
-                .filter(|delta| delta.seq > seq)
-                .cloned()
+                .filter(|entry| entry.delta.seq > seq)
+                .map(|entry| entry.delta.clone())
                 .collect(),
         )
     }
@@ -356,8 +380,22 @@ impl RuntimeJournal {
             scope_revision,
             change,
         };
-        self.bytes = self.bytes.saturating_add(serialized_len(&delta));
-        self.deltas.push_back(delta);
+        let bytes = serialized_len(&delta);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.deltas.push_back(JournalDelta { delta, bytes });
+    }
+
+    /// Drop the contiguous prefix that a successful publication covered.
+    /// Unpublished records must stay so a later flush can still deliver them.
+    fn release_through(&mut self, seq: u64) {
+        while let Some(entry) = self.deltas.front() {
+            if entry.delta.seq > seq {
+                break;
+            }
+            let bytes = entry.bytes;
+            self.deltas.pop_front();
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
     }
 
     fn retire_turn_payload(&mut self, session_id: &str, incarnation: u64, operation_id: &str) {
@@ -367,7 +405,7 @@ impl RuntimeJournal {
         let discard_through = self
             .deltas
             .iter()
-            .filter(|delta| match &delta.change {
+            .filter(|entry| match &entry.delta.change {
                 RuntimeChange::SessionUpsert { session } => {
                     session.session_id == session_id && session.incarnation == incarnation
                 }
@@ -384,18 +422,18 @@ impl RuntimeJournal {
                 | RuntimeChange::ConnectionUpsert { .. }
                 | RuntimeChange::SessionRemoved { .. } => false,
             })
-            .map(|delta| delta.seq)
+            .map(|entry| entry.delta.seq)
             .max();
         if let Some(discard_through) = discard_through {
             while self
                 .deltas
                 .front()
-                .is_some_and(|delta| delta.seq <= discard_through)
+                .is_some_and(|entry| entry.delta.seq <= discard_through)
             {
                 self.deltas.pop_front();
             }
         }
-        self.bytes = self.deltas.iter().map(serialized_len).sum();
+        self.bytes = self.deltas.iter().map(|entry| entry.bytes).sum();
     }
 }
 
@@ -423,6 +461,10 @@ impl SessionRegistry {
         self.journal.deltas_after(seq)
     }
 
+    pub(crate) fn release_published_runtime(&mut self, seq: u64) {
+        self.journal.release_through(seq);
+    }
+
     /// Build a disposable wire projection from the one mutable session owner.
     pub(crate) fn session(&self, session_id: &str) -> Option<SessionRuntime> {
         let state = &self.sessions.get(session_id)?.state;
@@ -443,6 +485,9 @@ impl SessionRegistry {
             session: live.session.clone(),
             control_state: live.control_state.clone(),
             lifecycle: live.lifecycle.clone(),
+            history_revision: live.history_revision.clone(),
+            phase: live.phase,
+            sync_error: live.sync_error.clone(),
             active_turn: state.active_turn.as_ref().and_then(|turn| {
                 turn.execution.as_ref().map(|execution| ActiveTurn {
                     operation_id: execution.rpc_operation_id.clone(),
@@ -539,6 +584,9 @@ impl SessionRegistry {
                 released_terminals: VecDeque::new(),
                 attachment_candidate: Vec::new(),
                 attachment_candidate_bytes: 0,
+                history_revision: None,
+                phase: crate::session_state::MirrorPhase::Ready,
+                sync_error: None,
             },
         );
         self.sessions
@@ -847,6 +895,9 @@ impl SessionRegistry {
                 released_terminals: VecDeque::new(),
                 attachment_candidate: Vec::new(),
                 attachment_candidate_bytes: 0,
+                history_revision: None,
+                phase: crate::session_state::MirrorPhase::Ready,
+                sync_error: None,
             },
         );
         self.commit_session(&session_id);
@@ -2104,15 +2155,18 @@ impl SessionRegistry {
     }
 
     fn commit_session(&mut self, session_id: &str) {
-        let Some(session) = self
-            .sessions
-            .get_mut(session_id)
-            .and_then(|entry| entry.state.live.as_mut())
-        else {
+        let Some(entry) = self.sessions.get_mut(session_id) else {
             return;
         };
-        session.revision = session.revision.wrapping_add(1).max(1);
-        let revision = session.revision;
+        let Some(live) = entry.state.live.as_mut() else {
+            return;
+        };
+        live.revision = live.revision.wrapping_add(1).max(1);
+        live.history_revision
+            .clone_from(&entry.state.history_revision);
+        live.phase = entry.state.phase;
+        live.sync_error.clone_from(&entry.state.sync_error);
+        let revision = live.revision;
         let session = self
             .session(session_id)
             .expect("published session remains live");

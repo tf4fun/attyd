@@ -42,19 +42,16 @@ struct RuntimeSession {
 impl ActiveRuntimeProjection {
     pub(crate) fn update(&mut self, event: &str) {
         let (_, materialized) = self.normalize_terminal_event(event);
-        self.update_normalized(&materialized);
+        self.update_normalized_value(&materialized);
     }
 
     pub(crate) fn update_and_normalize(&mut self, event: &str) -> String {
         let (public, materialized) = self.normalize_terminal_event(event);
-        self.update_normalized(&materialized);
+        self.update_normalized_value(&materialized);
         public
     }
 
-    fn update_normalized(&mut self, event: &str) {
-        let Ok(value) = serde_json::from_str::<Value>(event) else {
-            return;
-        };
+    fn update_normalized_value(&mut self, value: &Value) {
         let Some(kind) = value.get("type").and_then(Value::as_str) else {
             return;
         };
@@ -145,9 +142,9 @@ impl ActiveRuntimeProjection {
                 }
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session.clear_turn_events();
-                    session.active_prompt = Some(event.to_string());
+                    session.active_prompt = Some(value.to_string());
                 }
-                self.record_session_event(session_id, event);
+                self.record_session_event(session_id, &value.to_string());
             }
             "bridge/session_operation_started" => {
                 let Some(request_id) = value.get("requestId").and_then(Value::as_str) else {
@@ -161,9 +158,9 @@ impl ActiveRuntimeProjection {
                         .insert(request_id.to_string(), session_id.to_string());
                 }
                 if let Some(session) = self.sessions.get_mut(session_id) {
-                    session.active_operation = Some(event.to_string());
+                    session.active_operation = Some(value.to_string());
                 }
-                self.record_session_event(session_id, event);
+                self.record_session_event(session_id, &value.to_string());
             }
             "acp/prompt_complete" => {
                 let Some(session_id) = value.get("sessionId").and_then(Value::as_str) else {
@@ -178,12 +175,16 @@ impl ActiveRuntimeProjection {
                 }
             }
             "acp/session_update" => {
+                // Conversation content is delivered verbatim through the public
+                // event and folded into the canonical projection; the legacy
+                // replay keeps only current resource identities, so a second
+                // raw copy must not be archived here.
                 if let Some(session_id) = value
                     .get("notification")
                     .and_then(|notification| notification.get("sessionId"))
                     .and_then(Value::as_str)
                 {
-                    self.record_session_event(session_id, event);
+                    self.touch_session(session_id);
                 }
             }
             "acp/terminal_state" => {
@@ -209,7 +210,7 @@ impl ActiveRuntimeProjection {
                     } else {
                         session
                             .terminal_states
-                            .insert(terminal_id.to_string(), event.to_string());
+                            .insert(terminal_id.to_string(), value.to_string());
                     }
                 } else if let Some(session_id) = value
                     .get("terminal")
@@ -224,7 +225,7 @@ impl ActiveRuntimeProjection {
                     {
                         self.remove_pending_terminal(session_id, &value);
                     } else {
-                        self.record_session_event(session_id, event);
+                        self.record_session_event(session_id, &value.to_string());
                     }
                 }
             }
@@ -246,16 +247,16 @@ impl ActiveRuntimeProjection {
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session
                         .pending_permissions
-                        .insert(permission_id.to_string(), event.to_string());
+                        .insert(permission_id.to_string(), value.to_string());
                 }
-                self.record_session_event(session_id, event);
+                self.record_session_event(session_id, &value.to_string());
             }
             "acp/permission_resolved" => {
                 let Some(permission_id) = value.get("permissionId").and_then(Value::as_str) else {
                     return;
                 };
                 if let Some(session_id) = self.permission_sessions.remove(permission_id) {
-                    self.record_session_event(&session_id, event);
+                    self.record_session_event(&session_id, &value.to_string());
                     if let Some(session) = self.sessions.get_mut(&session_id) {
                         session.pending_permissions.remove(permission_id);
                     }
@@ -294,9 +295,9 @@ impl ActiveRuntimeProjection {
                 {
                     session
                         .pending_elicitations
-                        .insert(elicitation_id.to_string(), event.to_string());
+                        .insert(elicitation_id.to_string(), value.to_string());
                 }
-                self.record_optional_session_event(session_id.as_deref(), event);
+                self.record_optional_session_event(session_id.as_deref(), &value.to_string());
             }
             "acp/elicitation_resolved" => {
                 let Some(elicitation_id) = value.get("elicitationId").and_then(Value::as_str)
@@ -304,7 +305,7 @@ impl ActiveRuntimeProjection {
                     return;
                 };
                 let session_id = self.elicitation_sessions.remove(elicitation_id).flatten();
-                self.record_optional_session_event(session_id.as_deref(), event);
+                self.record_optional_session_event(session_id.as_deref(), &value.to_string());
                 if let Some(session_id) = session_id.as_deref()
                     && let Some(session) = self.sessions.get_mut(session_id)
                     && let Some(request_event) = session.pending_elicitations.remove(elicitation_id)
@@ -317,7 +318,7 @@ impl ActiveRuntimeProjection {
                 {
                     session
                         .active_url_flows
-                        .insert(url_id, vec![request_event, event.to_string()]);
+                        .insert(url_id, vec![request_event, value.to_string()]);
                 }
             }
             "acp/elicitation_complete" => {
@@ -332,7 +333,7 @@ impl ActiveRuntimeProjection {
                     .url_elicitation_sessions
                     .remove(elicitation_id)
                     .flatten();
-                self.record_optional_session_event(session_id.as_deref(), event);
+                self.record_optional_session_event(session_id.as_deref(), &value.to_string());
                 if let Some(session_id) = session_id.as_deref()
                     && let Some(session) = self.sessions.get_mut(session_id)
                 {
@@ -349,11 +350,11 @@ impl ActiveRuntimeProjection {
                         session.active_url_flows.remove(elicitation_id);
                     }
                 }
-                self.record_optional_session_event(session_id, event);
+                self.record_optional_session_event(session_id, &value.to_string());
             }
             "acp/mode_changed" | "acp/config_changed" => {
                 if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
-                    self.record_session_event(session_id, event);
+                    self.record_session_event(session_id, &value.to_string());
                 }
                 if let Some(request_id) = value.get("requestId").and_then(Value::as_str) {
                     self.complete_operation(request_id);
@@ -377,38 +378,38 @@ impl ActiveRuntimeProjection {
             | "acp/authenticated"
             | "acp/logged_out"
             | "acp/mcp_connection"
-            | "acp/mcp_message" => Self::record_global_event(event),
+            | "acp/mcp_message" => Self::record_global_event(&value.to_string()),
             _ => {}
         }
     }
 
-    fn normalize_terminal_event(&mut self, event: &str) -> (String, String) {
+    fn normalize_terminal_event(&mut self, event: &str) -> (String, Value) {
         let Ok(mut value) = serde_json::from_str::<Value>(event) else {
-            return (event.to_string(), event.to_string());
+            return (event.to_string(), Value::Null);
         };
         if value.get("type").and_then(Value::as_str) != Some("acp/terminal_state") {
-            return (event.to_string(), event.to_string());
+            return (event.to_string(), value);
         }
         let mut public = value.clone();
         let Some(terminal) = value.get_mut("terminal").and_then(Value::as_object_mut) else {
-            return (event.to_string(), event.to_string());
+            return (event.to_string(), value);
         };
         let Some(session_id) = terminal
             .get("sessionId")
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
-            return (event.to_string(), event.to_string());
+            return (event.to_string(), value);
         };
         if self.retired_sessions.contains(&session_id) {
-            return (event.to_string(), event.to_string());
+            return (event.to_string(), value);
         }
         let Some(terminal_id) = terminal
             .get("terminalId")
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
-            return (event.to_string(), event.to_string());
+            return (event.to_string(), value);
         };
         let append = terminal
             .get("outputAppend")
@@ -469,7 +470,7 @@ impl ActiveRuntimeProjection {
         terminal.remove("outputBytes");
         terminal.remove("outputAppend");
         terminal.remove("retainedBytes");
-        (public.to_string(), value.to_string())
+        (public.to_string(), value)
     }
 
     #[cfg(test)]
@@ -615,7 +616,23 @@ impl ActiveRuntimeProjection {
     }
 
     fn record_session_value(&mut self, session_id: &str, event: Value) {
-        self.record_session_event(session_id, &event.to_string());
+        if event.get("type").and_then(Value::as_str) == Some("acp/session_update") {
+            self.touch_session(session_id);
+        } else {
+            self.record_session_event(session_id, &event.to_string());
+        }
+    }
+
+    /// Conversation and other folded events only refresh session liveness; the
+    /// raw payload belongs to the canonical projection, not this archive.
+    fn touch_session(&mut self, session_id: &str) {
+        self.clock = self.clock.wrapping_add(1);
+        if self.retired_sessions.contains(session_id) {
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.updated_at = self.clock;
+        }
     }
 
     fn record_session_event(&mut self, session_id: &str, event: &str) {
@@ -952,7 +969,10 @@ mod tests {
             0,
             "delivered conversation belongs to canonical history, not another raw replay archive"
         );
-        assert_eq!(memory_retention_tests::raw_conversation_bytes(&projection), 0);
+        assert_eq!(
+            memory_retention_tests::raw_conversation_bytes(&projection),
+            0
+        );
         assert!(!session.truncated);
     }
 
