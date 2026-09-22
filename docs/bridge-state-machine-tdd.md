@@ -153,8 +153,9 @@ reset, followed by an owner-fenced view refresh. Final state must equal uninterr
 Retirement and failures that the current snapshot cannot reconstruct remain reliable semantic
 events; a reset cannot discard their outcome or retry prompt. Baseline payload is shared/chunked
 rather than cloned into every subscriber queue. Coalescing never cancels Agent work or evicts an
-otherwise connected observer. This target is in the Red phase; see
-[memory acceptance](runtime-memory-retention-tests.md) for implemented tests and current failures.
+otherwise connected observer. The retention gates pass after `802c20b`; see
+[memory acceptance](runtime-memory-retention-tests.md) for the historical Red baseline and
+[memory efficiency](runtime-memory-efficiency.md) for the subsequent implementation and Green gates.
 
 Directory management is global. Cold deletion reserves only its catalog ID, with no session
 runtime allocation. Deleting an existing runtime coordinates its lifecycle and resource cleanup.
@@ -276,16 +277,18 @@ On `9485496`, the original nine cases pass, but the two added short-load cases f
 both resume and fork close after only **6s of idle**, rather than the required **10s**.
 The expanded gate therefore records **2 failures and 9 passes**. These cases preserve the
 original assertions and vary only the load duration; they catch a fix that cancels the old
-countdown only when its deadline happens to expire during loading. This follow-up adds tests
-and documentation only; the incomplete implementation remains unchanged.
+countdown only when its deadline happens to expire during loading. That follow-up added tests
+and documentation only; the production correction followed in `a65d5d1`.
 
 On `a65d5d1`, all 11 existing cases pass after `begin_load` cancels the previous idle countdown.
 That result covers the listed scenarios, not the entire retry workflow. A later review confirmed
 that an unobserved fork target can still retire during a 2s load backoff with a 1s idle timeout
-and a concurrent catalog refresh. The required next Red/Green gates are W1–W8 in
+and a concurrent catalog refresh. The follow-up Red/Green gates are W1–W8 in
 [history-sync-lifecycle.md](history-sync-lifecycle.md#8-tdd-合并准入). The 31 follow-up behavior
 tests now live in `src/bridge/unobserved_tests/workflow*.rs`; they extend the gate to 42 cases
-and are separate from that historical 11-case green result. Production code is unchanged.
+and are separate from that historical 11-case green result. `0857250` subsequently implemented
+the workflow owner, retry protection, business-operation handoff, and identity-checked cleanup.
+All 42 cases now pass; the Red records below describe the earlier test-only baseline.
 
 Keep the defect cases as ordinary failing tests during the Red phase: do not ignore them, mark
 them `should_panic`, weaken their assertions or make the gate accept a nonzero exit status.
@@ -317,8 +320,21 @@ remains a Green-phase requirement after the production fix; this Red test change
 those release gates were rerun.
 
 See the [W1–W8 coverage mapping](history-sync-lifecycle.md#可执行覆盖映射) for the exact modules
-and the remaining implementation-layer flow-ID cleanup checks. Keep all six failures executable
-and preserve the 25 control cases; both groups are required to establish Green.
+and current cleanup/handoff coverage. The six defect cases and 25 control cases remain executable
+with their original behavior requirements and now pass together.
+
+## Current merge acceptance
+
+The [successful CI run for `5f66a6a`](https://github.com/tf4fun/attyd/actions/runs/35682667713)
+on September 22, 2026 passed all 14 applicable jobs: dependency audits, release metadata,
+frontend checks/build, backend integrations, browser tests, coverage, and seven native release
+targets. It includes 588 Rust tests, 456 frontend/shared tests, and 94 browser tests;
+instrumented Rust line coverage is 93.39%, above the unchanged 85% gate. The release publication
+job was correctly skipped because this was a branch build, not a version tag.
+
+These results supersede the historical Red counts above. Long-running workload RSS and actual
+browser heap measurements remain deployment follow-ups, as described in the memory ledgers;
+the passing gates validate behavior, ownership, and retained payloads rather than a fixed RSS limit.
 
 ## Removal ledger
 

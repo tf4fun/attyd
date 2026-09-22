@@ -1,19 +1,22 @@
 # 历史同步与空闲回收：生命周期修复方案
 
-状态：技术方案与 Red 测试已落地，生产修复尚未实现。
-代码基线：`a65d5d16fc0eb8674c2f9b26888eb9dbda7933c8`。
+状态：已实施，生命周期验收门槛已 Green。生产修复自 `0857250` 落地。
+历史 Red 基线：`a65d5d16fc0eb8674c2f9b26888eb9dbda7933c8`；当前验证提交：`5f66a6a`。
+最新 [CI 35682667713](https://github.com/tf4fun/attyd/actions/runs/35682667713)
+的 14 个执行 job 全部成功：Rust 588 项、Vitest 456 项、浏览器 94 项通过，
+Rust 行覆盖率 93.39%（门槛 85%）。该运行不是 tag 触发，release job 按条件跳过。
 本文补充 [runtime contract](active-turn-runtime.md) 与
 [TDD ledger](bridge-state-machine-tdd.md)，新增准入用例位于
 [`src/bridge/unobserved_tests/`](../src/bridge/unobserved_tests.rs)。
 
-## 1. 已确认的问题与边界
+## 1. 修复前的问题与边界
 
 成功 fork 后，Bridge 先为目标安装 Agent 返回的上下文或带来源说明的源会话快照，
 再尝试可选的权威历史加载。加载的可重试失败会清除 `load_attempt`，并把目标恢复到
-`Ready`。当前 `SessionWork::of` 只查看 turn、operation、load attempt、终端及交互；
+`Ready`。修复前的 `SessionWork::of` 只查看 turn、operation、load attempt、终端及交互；
 它看不到仍在等待重试的同步任务，因此可能将目标判断为 Idle。
 
-已通过原生 ACP 测试和真实 stdio + REST/SSE 时钟复现：
+Red 阶段已通过原生 ACP 测试和真实 stdio + REST/SSE 时钟复现：
 
 1. source 保持观察；目标尚未观察；配置 `--session-unobserved-timeout 1`。
 2. Agent 成功返回 fork 目标；连续四次可选 load 返回可重试错误 `-32603`。
@@ -31,13 +34,13 @@
 
 ## 2. 设计决策：三个互相独立的维度
 
-| 维度 | 当前归属 | 修复后的含义 |
+| 维度 | 当前归属 | 含义 |
 | --- | --- | --- |
 | 历史投影与业务准入 | `SessionState`：phase、active turn、operation、load attempt | 决定能否接受 prompt/control/attachment 等；保留当前规则 |
-| 正在等待或执行的工作 | `SessionEntry.resources`：materialization、拟新增 history sync | 整个流程未终止就属于工作，包含退避；不等同于独占业务操作 |
+| 正在等待或执行的工作 | `SessionEntry.resources`：materialization、history sync | 整个流程未终止就属于工作，包含退避；不等同于独占业务操作 |
 | 观察与自动回收 | `SessionObservers` + 派生的 `SessionWork` | 仅 Active、无 session observer 且无工作时，启动完整空闲区间 |
 
-推荐在 **`SessionResources` 增加可选历史同步 owner，并从完整 `SessionEntry` 统一派生
+实现已在 **`SessionResources` 增加可选历史同步 owner，并从完整 `SessionEntry` 统一派生
 `SessionWork`**。复用既有 cold materialization owner 保护外层重试。每个会话仍只有一个
 Registry allocation，不增加全局任务表或第二份会话状态。
 
@@ -49,7 +52,7 @@ Agent 继续是唯一持久化权威；Bridge 保持内存投影；浏览器只�
 
 ## 3. 资源与身份模型
 
-以下为拟议内部结构，不是新增对外 API：
+以下为已实施的内部结构摘要，不是新增对外 API：
 
 ```rust
 // SessionResources 内新增；整个 optional history 流程只有一个。
@@ -64,6 +67,7 @@ struct HistorySyncResources {
 struct HistorySyncOwner {
     session: SessionResourceOwner, // epoch + session_id + incarnation
     flow_id: String,
+    cancellation: CancellationToken,
 }
 ```
 
@@ -76,15 +80,18 @@ struct HistorySyncOwner {
   可选同步可以作为其子流程；两种资源的存在通过布尔 OR 判定工作，不维护引用计数。
 - token 表示“请求终止”，资源槽表示“尚未完成收尾”。仅 token 被取消不代表已经 Idle。
 
-Registry 提供受身份校验的 `begin_history_sync`、`supersede_history_sync`、
-`finish_history_sync` 及工作状态查询。
-完成必须同时匹配 epoch、incarnation 和 flow ID；重复完成无副作用，旧完成不能清除新 flow。
+Registry 提供 `begin_history_sync`、`supersede_history_sync`、`finish_history_sync`、
+`history_sync_status` 及工作状态查询。注册和续跑状态查询校验 epoch 与 incarnation；
+完成在所属连接的 Registry 内按 session ID、incarnation 和 flow ID 精确匹配。
+重复完成无副作用，旧完成不能清除新 flow；收尾事件不跨连接 generation 复用。
 已有 replay allocation/attempt 校验继续保留，flow ID 不能替代它们。
 
-正常 begin 遇到活跃 flow 必须拒绝，不能无条件覆盖。通过既有 admission 的后继业务在
-同一事务内精确取消被接管的旧 flow；若后继还需登记新的 history flow，则只允许原子替换
-这个已明确取消的旧 owner，并立即撤销旧 absence permit。旧 guard 仍只持旧 flow ID，
-迟到 finish 成为无副作用操作。单纯 token 取消、但没有合法接管，不授予任意请求覆盖权。
+正常 begin 遇到活跃 flow 会拒绝，不能无条件覆盖。通过既有 admission 的后继业务在
+同一事务内调用 `supersede_history_sync` 释放旧槽，由后继工作接管空闲区间。
+此路径不触发旧 token；旧 continuation 在原退避到期后检查到 `Superseded`，
+不再 load 或 fallback，并按后继留下的当前投影完成。退休则通过资源取消触发 token。
+旧 guard 仍只持旧 flow ID，迟到 finish 成为无副作用操作；新 flow 登记仍要求槽为空，
+并立即撤销旧 absence permit。单纯 token 取消不授予任意请求覆盖权。
 
 同 incarnation 的 `register_history` 只重建历史投影，继续保留资源 owner；不同 incarnation
 替换必须先取消旧资源。既有 cold materialization 在 attachment 分配新 incarnation 时的
@@ -92,8 +99,10 @@ Registry 提供受身份校验的 `begin_history_sync`、`supersede_history_sync
 
 ## 4. 唯一工作判定与回收入口
 
-统一从 Registry 的完整 allocation 读取状态和资源，例如提供
-`SessionRegistry::work(session_id, incarnation)`，内部交给 `SessionWork::of(&SessionEntry)`：
+统一从 Registry 的完整 allocation 读取状态和资源：
+`SessionRegistry::work(&self, session_id: &str) -> Option<SessionWork>`
+内部交给 `SessionWork::of(&SessionEntry)`；调用方另行校验 incarnation 与 absence permit。
+批量计时器刷新从 `iter_entries()` 读取同一 allocation，使用相同派生规则：
 
 ```text
 pending permission / elicitation / URL interaction  -> AwaitingInteraction
@@ -147,18 +156,19 @@ attachment 成功，建立目标资源 owner（发布可路由目标之前）
 ### 尝试与等待
 
 成功加载仍原子安装 baseline 和 controls；失败仍回滚 candidate 与 replay validation。
-可重试失败只结束 attempt，保留 flow。等待必须释放 `ExecutionTurn` 和状态锁，并同时
-监听 flow、materialization 父流程（若有）及连接的取消信号。唤醒后重新取得执行权、
-校验完整 owner，再开始下一次 RPC；取消和超时同时就绪也不能绕过该检查。
+可重试失败只结束 attempt，保留 flow。等待释放 `ExecutionTurn` 和状态锁，并监听
+flow 及连接的取消信号；cold materialization 的父资源独立管理其 waiters 和外层生命周期。
+唤醒后重新取得执行权、校验完整 owner，再开始下一次 RPC；取消和超时同时就绪也不能
+绕过该检查。
 
 ### 统一收尾
 
-将 attempt loop 封装为内层结果，外层负责 fallback/让位及唯一 finalizer，避免各个 `?`
-跳过清理。finalizer 必须覆盖成功、不可重试失败、无 load 能力、fallback 自身错误和取消。
+attempt loop 已封装为内层结果，外层负责 fallback/让位及唯一 finalizer，避免各个 `?`
+跳过 flow 清理。finalizer 覆盖成功、不可重试失败、无 load 能力、fallback 自身错误和取消。
 错误退出时，仍需确保 candidate/validation/attempt 已回滚或对应 owner 已被退休。
 
-内层结果应明确区分 `Loaded`、`FallbackRequired(error)`、`Superseded` 与
-`OwnerRetired/ConnectionStopped`。仅历史失败进入缓存 fallback；业务接管直接让位，
+内层 `HistorySyncOutcome` 区分 `Loaded`、`Failed(error)`、`Superseded` 与
+`Stopped(error)`。仅 `Failed` 可进入缓存 fallback；业务接管直接让位，
 退休或断连直接取消。不能把所有取消都当作普通 load 错误，否则会再次安装旧缓存。
 
 流程 guard 由命令级收尾持有，记录真正的目标 owner（fork 时不是 source）。
@@ -167,18 +177,16 @@ attachment 成功，建立目标资源 owner（发布可路由目标之前）
 这样 timeout=0 也不会在取 view 前回收目标。冷恢复的父 materialization 继续保护其后的
 waiter/observer 原子交付。
 
-推荐把带 history flow 的命令终态统一到 `handle_command` 的 finalizer：将成功响应或
-错误响应的发送纳入同一执行边界，再释放 flow、执行 `flush_runtime`。当前 fork 在 inner
-内发送业务响应，但 resume 的通用响应在 `run_connection` 外层、`handle_command` 返回后
-才发送，必须一起调整，避免提前释放或重复响应。不能照搬现有函数边界后就宣称响应已发布；
-收尾也不能跨过终端资源释放等异步等待后才补发响应。
+带 history flow 的命令终态已统一到 `handle_command` 的 finalizer：先通过
+`BusinessResponder` 发布成功或错误响应，再释放 flow、执行 `flush_runtime`。
+fork 在 inner 中先发送具体业务响应；finalizer 的再次发送由 responder 的一次性 sender
+保护，不会重复投递。resume 的通用响应也在 flow 释放前发送，不再依赖外层补发。
+此边界位于后续终端资源释放等异步等待之前。
 
-正常收尾在合法 execution turn 内完成；不能先释放 flow 再异步进行 fallback 或组装响应。
-若取消发生在退避、当前没有 execution ticket，使用带完整 owner 身份的 continuation
-回到调度器完成收尾；owner 已失效则由 Registry retirement cleanup 负责，不创建新 owner。
-取消后的 owner 可以进入精确清理 continuation，但不能进入继续派发 load 的 continuation。
-现有 `handle_command` 的部分收尾受 `execution.is_some()` 限制，新增 finalizer 不能只放在
-该条件分支，否则 `continue_execution` 失败仍会泄漏工作 owner。
+fallback 和最终 view 组装仍遵守执行权及 owner 校验，不能先释放 flow 再异步进行这些步骤。
+`handle_command` 的 flow finalizer 位于 `execution.is_some()` 条件之外：即使重新取得
+执行权失败，也会在状态锁内按精确身份收尾并刷新计时器，且不会创建 owner 或派发新 RPC。
+owner 已退休时，Registry 的资源清理已取消旧资源，迟到 finalizer 不影响后继 allocation。
 
 任务意外 drop 使用轻量 guard 投递带身份的收尾事件，不能在 `Drop` 中跨 FIFO 直接修改
 canonical state。连接已关闭时由 `SessionResources::cancel`/`Drop` 兜底取消资源。
@@ -191,22 +199,23 @@ canonical state。连接已关闭时由 `SessionResources::cancel`/`Drop` 兜底
 | --- | --- | --- |
 | observe / view / list | 保留现有快照与 single-flight 规则 | 正常读取/观察，不启动重复 load，不取消同步 |
 | 自动回收 | 工作阻止回收 | flow 阻止回收 |
-| prompt / control / fork | 保留现有 admission 拒绝或协调规则 | 保留现有 admission；成功接受后终止旧 optional flow |
+| prompt / control / fork | 保留现有 admission 拒绝或协调规则 | 保留现有 admission；成功接受后令旧 optional flow 让位 |
 | 通过既有 admission 的显式 attachment | 保留既有 attachment 互斥规则 | 由成功接受的新 attachment 接管，旧 flow 不再重试 |
 | 手动 close / delete | 保留既有 admission，不引入强制中断 RPC | 可以按既有规则接受；旧 flow 让位于生命周期操作 |
 | 连接关闭 / owner 替换 | 连接和资源清理负责终止 | 取消等待，旧 continuation 不再派发 |
 
-“成功接受后终止”必须与新的业务 reservation/CAS 在同一事务内发生。CAS 失败、重复意图
+“成功接受后让位”与新的业务 reservation/CAS 在同一事务内发生。CAS 失败、重复意图
 查询或其他被拒绝的请求不能取消同步。这里不改变 `SessionState::can_begin` 的基本许可；
-只补上成功 admission 时对可选后台流程的精确取消。
+只补上成功 admission 时对可选后台流程的不可逆接管。
 例如当前 Active 会话允许显式 `session/load` 重载，但不接受再次 `session/resume`；
-本修复不放开后者。合法接管需要新 flow 时，按第 3 节的精确替换规则处理单槽资源。
+本修复不放开后者。合法接管按第 3 节的槽释放与登记规则处理资源。
 
 不能只在重试醒来时检查 `active_turn` 或 `operation`：新 prompt/control 可能已经在退避
 期间开始并完成，此时这些字段又为空。必须在接受新操作时记录不可逆的让位，防止旧 load
-事后覆盖新 turn、控件结果或 Bridge 保留的 PromptResponse 边界。新增测试已独立复现：
+事后覆盖新 turn、控件结果或 Bridge 保留的 PromptResponse 边界。Red 阶段测试已独立复现：
 prompt、control 和显式 load 完成后，旧 flow 仍派发 load；即使 Agent 忠实重放当前消息，
-prompt 用例中已保留的 turn outcome 仍被清空。这些是可执行的回归证据，不推断线上发生频率。
+prompt 用例中已保留的 turn outcome 仍被清空。修复后对应门槛已通过；这些历史回归证据
+不用于推断线上发生频率。
 
 让位后的旧任务不能再执行 `use_cached_history` 或修改后继 flow 的 sync 状态。若原 fork
 目标仍是同一 Active owner，返回当前视图，保持已成功创建的目标；若已经关闭、正在被
@@ -215,16 +224,16 @@ prompt 用例中已保留的 turn outcome 仍被清空。这些是可执行的�
 
 ## 7. 文件级实施范围
 
-| 文件 | 计划变更 |
+| 文件 | 已实施职责或保留契约 |
 | --- | --- |
 | `src/session_resources.rs` | history flow 资源与取消；扩展 `cancel`/`Drop` |
 | `src/session_registry.rs` | 精确注册/完成 flow，统一工作查询，owner 退休清理 |
 | `src/session_observers.rs` | 从完整 allocation 派生 work；保留 timer/permit 状态机 |
 | `src/bridge.rs` | fork/resume 交接注册、attempt loop/统一收尾、取消监听、成功业务 admission 让位、所有 auto-retire guard 使用同一查询 |
 | `src/session_mirror.rs` | 保持 attempt/candidate 语义；核验同 incarnation 历史重建不丢 flow，替换不继承旧 flow |
-| `src/bridge/unobserved_tests/history.rs` | 行为级回归，必要时补充同目录 harness |
+| `src/bridge/unobserved_tests/workflow*.rs` | 31 项流程级行为门槛及共享 harness；既有 `history.rs` 保留单次 load 的计时回归 |
 
-只有 guard 收尾需要时才扩展现有内部调度事件；不新建通用工作框架，也不修改浏览器来
+guard 收尾使用内部调度事件 `BridgeInput::FinishHistorySync`；未新建通用工作框架，也未修改浏览器来
 制造观察租约。flow 不携带历史 payload，不克隆 baseline，不加入对外快照。
 
 ## 8. TDD 合并准入
@@ -244,8 +253,8 @@ prompt 用例中已保留的 turn outcome 仍被清空。这些是可执行的�
 | W7 | timeout=0 的目标发布交接，以及 cold materialization 外层重试 | 已接受且未完成的流程不出现假 Idle；最终结束后遵守 zero/observer 规则；多个 observer 只加入一个 materialization |
 | W8 | finalizer 提前错误/取消、观察者回归、无 load 能力 | 不泄漏永久 busy，不误清其他 owner；正常 fallback 保持 resume/fork 可用；observer 加入不触发第二次 load |
 
-W1 必须先在 `a65d5d1` 上得到行为断言失败，再修实现；其余隔离/进展门槛可能在原代码
-已通过，也应保留为兼容性保护。测试不仅断言“不 close”，还要证明最终可完成和最终可回收。
+W1 已先在 `a65d5d1` 上得到行为断言失败，再修实现；其余隔离/进展门槛在原代码中
+已有部分通过，继续保留为兼容性保护。测试不仅断言“不 close”，还证明最终可完成和最终可回收。
 暂停时钟用协议响应或事件作为屏障，逐段推进时间，避免一次大幅 advance 跳过目标交错。
 
 ### 可执行覆盖映射
@@ -266,22 +275,39 @@ W1 必须先在 `a65d5d1` 上得到行为断言失败，再修实现；其余隔
 本地退休。源会话上下文在创建后写入，以 canonical view 发布作为屏障，保证 fallback
 断言验证真实安装的 baseline。
 
-W4 的第二次 fork 用例把新流程推进到旧退避 deadline 之前；允许正确实现更早取消旧流程。
-它验证可观察的后继保护，不强制一个正确实现延迟取消，也不冒充尚不存在的新资源类型的
-单元测试。同 incarnation 用例覆盖已完成的显式重载；尚未直接构造两个同时存活的同
-incarnation history flow。未来引入 flow owner 后，还应在其实现层验证精确 flow ID
-的幂等清理和后继槽隔离，不能为此放开现有 resume admission。
+W4 的第二次 fork 用例把新流程推进到旧退避 deadline 之前，验证可观察的后继保护，
+允许正确实现更早取消旧流程。同 incarnation 用例覆盖已完成的显式重载；W6 另覆盖
+prompt/control 在旧退避结束前完成，旧同步不再恢复。新 incarnation reload 与替代 fork
+用例验证旧完成不清除后继保护、后继仍可完成且最终可回收。
+
+实现中的 `finish_history_sync` 按 incarnation 和 flow ID 精确匹配，重复清理或不匹配
+均不修改槽；命令 guard 的 `take` 也只交出一次 owner。这是代码层面的清理保证。
+当前没有直接构造两个同 incarnation history flow 的 Registry 单元测试，也没有单独
+重复调用 `finish_history_sync` 的幂等性测试；上述行为覆盖不能冒充这两项专门测试。
+如后续补充，应保持现有 admission，不为构造测试放开 active session 的 resume。
 
 只运行新增门槛：`ATTYD_SKIP_WEB_BUILD=1 cargo test bridge::unobserved_tests::workflow`。
-连同原 11 项门槛运行：`npm run test:idle-retirement`。Red 阶段命令应返回失败，不修改
-退出状态，也不通过忽略用例获得 Green。
+连同原 11 项门槛运行：`npm run test:idle-retirement`。当前两者均为 Green；历史 Red
+阶段保留原失败退出状态，未通过忽略用例或放宽断言获得 Green。
 
-当前 Red 结果：新增 31 项中 **25 通过、6 失败**；合并原 11 项后为 **36 通过、6 失败**。
+### 历史 Red 基线
+
+以下为修复前 `a65d5d1` 上的结果，不代表当前状态：新增 31 项中 **25 通过、6 失败**；
+合并原 11 项后为 **36 通过、6 失败**。
 全量 Rust 为 **510 通过、同样 6 失败**，原有 485 项全部通过；`npm run check` 通过，
 包含 318 项前端/共享测试。具体失败断言记录于
 [History-workflow Red baseline](bridge-state-machine-tdd.md#history-workflow-red-baseline)。
 
-验证顺序：
+### Green 与当前验收
+
+`0857250` 已完成资源生命周期、统一工作派生、精确收尾与业务让位，31 项新增门槛和
+原 11 项 idle-retirement 门槛均已通过。最新远端提交 `5f66a6a` 的
+[CI 35682667713](https://github.com/tf4fun/attyd/actions/runs/35682667713)
+再次通过全部 14 个执行 job：Rust **588/588**、Vitest **456/456**、浏览器 **94/94**，
+Rust 行覆盖率 **93.39% ≥ 85%**；非 tag 运行的 release job 按条件跳过，不能据此宣称
+已发布版本。
+
+后续修改仍遵守以下验证顺序：
 
 1. Red：新增 W1 和其他行为测试，记录失败断言，不忽略、不 `should_panic`、不放宽 exit code。
 2. Green：统一工作派生、资源生命周期与让位逻辑；上述门槛全部通过。
@@ -298,6 +324,6 @@ incarnation history flow。未来引入 flow owner 后，还应在其实现层�
 日志可记录 epoch/incarnation/flow/attempt、retry delay、完成或取消原因；不记录历史正文，
 不为本修复引入新的公开协议或监控平台。
 
-建议按「规范与 Red 测试 → 完整生命周期修复 → 集成验证」交付。同一个修复必须包含
-清理和业务让位，不能只增加 busy 标记就声明完成。新增测试建立 Red 门槛，尚未修改生产
-实现；合并判断需以修复提交上的完整准入结果为准。
+本次已按「规范与 Red 测试 → 完整生命周期修复 → 集成验证」完成，生产实现包含
+清理和业务让位，并通过上述 Green 准入。历史 Red 数据作为回归依据保留；后续合并和
+发布仍以目标提交的 CI 及版本发布流程结果为准。
