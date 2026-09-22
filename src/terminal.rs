@@ -922,13 +922,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn preserves_explicit_command_and_arguments_as_literal_values() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = tempfile::tempdir().unwrap();
         let (terminals, _events) = manager(root.path());
         let unexpected = root.path().join("unexpected");
 
         // Whitespace and shell metacharacters remain part of an executable path.
+        // Use a standalone fixture: multicall coreutils dispatches on argv[0]
+        // and cannot be invoked through an arbitrarily named printf symlink.
         let executable = root.path().join("printf with spaces;$VALUE");
-        std::os::unix::fs::symlink("/usr/bin/printf", &executable).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nprintf \"$@\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let created = create_terminal(
             &terminals,
             CreateTerminalRequest::new("session", executable.to_string_lossy())
@@ -948,6 +953,7 @@ mod tests {
             output.output,
             "\n$(touch unexpected); $HOME\ntwo words\n'single' \"double\" \\ *\n"
         );
+        assert_eq!(output.exit_status.unwrap().exit_code, Some(0));
         assert!(!unexpected.exists());
 
         let builtin = create_terminal(
