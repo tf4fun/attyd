@@ -491,6 +491,7 @@ function validateServerEventEnvelope(
         [
           "connection_upsert",
           "session_upsert",
+          "session_control_updated",
           "turn_update_appended",
           "terminal_updated",
           "session_removed",

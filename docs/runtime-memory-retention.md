@@ -1,6 +1,8 @@
 # 运行时内存过度保留：诊断记录与优化方案
 
-状态：**诊断与方案已记录，TDD 验收测试已进入 Red 阶段，生产内存修复尚未实施。**
+状态：**第一阶段生产修复 `802c20b` 已拉取；第二阶段的局部更新、分配、浏览器诊断
+保留和状态槽交接优化也已实现，并通过完整测试。** 最新方案与门槛见
+[运行期内存优化第二阶段](runtime-memory-efficiency.md)。下文保留 2026-09-21 的诊断与原始方案。
 诊断日期：2026-09-21；下文实机时间均为北京时间（UTC+8）。
 记录时仓库 HEAD：`be6f4ca`。远端版本输出为 `0.2.8`；复现基线为
 `v0.2.8` / `a5b07ff11ccdc8e338d222a578854ab2cb2158d6`。
@@ -9,10 +11,11 @@
 最初按用户要求仅保存本文档。随后用户授权拉取已完成的上一轮生命周期优化，
 并将本方案转化为测试准入。当前测试基线为 `0857250`
 （`fix: own optional history workflows through retry backoff`），原有 516 项 Rust 测试全部通过。
-本轮更新测试、仅测试支持与验收记录，不修改生产内存行为或部署。
+该轮更新测试、仅测试支持与验收记录，不修改生产内存行为或部署。
+2026-09-22 已拉取其后续修复 `802c20b`；当前轮先建立第二阶段 Red 门槛，再完成实现，未部署。
 本文补充 [运行时设计](active-turn-runtime.md) 与
 [状态机 TDD 约束](bridge-state-machine-tdd.md)。最新状态交付已写成目标契约，
-实际实现仍以 [可执行验收记录](runtime-memory-retention-tests.md) 的 Red/Green 结果为准。
+实际实现以 [可执行验收记录](runtime-memory-retention-tests.md) 的分阶段 Red/Green 结果为准。
 
 ## 1. 结论与证据边界
 
@@ -198,6 +201,10 @@ N=128 时，fold 后只有一个工具及最新 524,288 B 正文，legacy 保存
 
 ## 6. 后续实施方案
 
+以下 A/B/C 中的 journal 释放、legacy conversation 清理、慢端状态合并及迟到失败展示
+已在 `802c20b` 实现。轻量控制发布、进一步减少复制与新增的消费交接竞态门槛
+见 [第二阶段方案](runtime-memory-efficiency.md)，不要将原始待办措辞视为当前实现状态。
+
 ### A. 先修复已确认的 journal 生命周期
 
 为 journal 增加按发布水位释放前缀的能力；成功转交内部 EventQueue 后释放
@@ -265,10 +272,11 @@ canonical baseline + overlay + live resources。停止把已折叠的 conversati
 保留会话正文不截断、观察者不取消工作等约束。
 既有慢订阅测试已更新为 `memory_retention_slow_session_delivery_keeps_its_lease_and_preserves_other_observers`，
 将“慢客户端最终收到全部 65 条记录”的断言改为最终状态等价和 lease 保持。
-测试与契约在本轮先行更新，生产合并逻辑仍待后续实现。
+测试与契约最初先行更新，生产合并逻辑已由 `802c20b` 实现；并发领取/替换的边界
+继续由第二阶段 E00 检查。
 
 连接代结束还应释放 Hub 中不再有合法 owner 的 canonical/legacy 投影；本轮 M12 测试
-确认 `finish_generation` 当前未完成这部分清理。普通 turn 完成后的内存回落不能代替
+曾确认 `finish_generation` 未完成这部分清理，现已由 `802c20b` 修复。普通 turn 完成后的内存回落不能代替
 连接退出边界的独立验收。
 
 ### D. 增加分项观测，验证没有转移保留位置

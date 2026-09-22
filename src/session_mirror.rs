@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -545,7 +546,7 @@ impl SessionRegistry {
                 })
                 .collect::<Vec<_>>()
         };
-        suffix.extend(turn.updates.iter().cloned());
+        suffix.extend(turn.updates.iter().map(|update| (**update).clone()));
         let snapshot = self
             .history
             .append_committed_updates(&SessionKey::new(session_id, incarnation), &suffix)?;
@@ -814,13 +815,17 @@ fn references_terminal(update: &Value, terminal_id: &str) -> bool {
         })
 }
 
-fn replay_suffix_starts_with_prompt(updates: &[Value], prompt: &[Value]) -> bool {
+fn replay_suffix_starts_with_prompt<T: Borrow<Value>>(updates: &[T], prompt: &[Value]) -> bool {
     let replay_prompt = updates
         .iter()
         .take_while(|update| {
-            update.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
+            (*update)
+                .borrow()
+                .get("sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("user_message_chunk")
         })
-        .filter_map(|update| update.get("content").cloned())
+        .filter_map(|update| Borrow::<Value>::borrow(update).get("content").cloned())
         .collect::<Vec<_>>();
     normalize_prompt_blocks(&replay_prompt) == normalize_prompt_blocks(prompt)
 }
@@ -848,8 +853,8 @@ fn history_prefix_end(candidate: &[Value], prior: &[Value]) -> Option<usize> {
     None
 }
 
-fn replay_contains_completed_turn(replay: &[Value], live_updates: &[Value]) -> bool {
-    fn durable(update: &&Value) -> bool {
+fn replay_contains_completed_turn<T: Borrow<Value>>(replay: &[Value], live_updates: &[T]) -> bool {
+    fn durable(update: &Value) -> bool {
         matches!(
             update.get("sessionUpdate").and_then(Value::as_str),
             Some("agent_message_chunk" | "tool_call" | "tool_call_update")
@@ -858,12 +863,13 @@ fn replay_contains_completed_turn(replay: &[Value], live_updates: &[Value]) -> b
 
     let replay = replay
         .iter()
-        .filter(durable)
+        .filter(|update| durable(update))
         .map(history_update_identity)
         .collect::<Vec<_>>();
     let live = live_updates
         .iter()
-        .filter(durable)
+        .map(Borrow::borrow)
+        .filter(|update| durable(update))
         .map(history_update_identity)
         .collect::<Vec<_>>();
     let Ok(replay) = normalize_history_updates(&replay) else {

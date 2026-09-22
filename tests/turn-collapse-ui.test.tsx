@@ -4,7 +4,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Conversation } from "../web/src/components/acp/conversation";
-import type { TimelineItem } from "../web/src/lib/state";
+import { appReducer, initialState, type TimelineItem } from "../web/src/lib/state";
+import type { BridgeSessionView } from "../web/src/lib/business-api";
 import { scanThreadSearchDom } from "../web/src/components/acp/thread-search";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -85,6 +86,47 @@ describe("completed turn presentation", () => {
     await act(async () => root.render(<Conversation timeline={[...live, stop]} atBottom canAutoCollapse={canAutoCollapse} />));
     expect(container.querySelector(".turn-process-trigger")?.getAttribute("aria-expanded")).toBe("false");
     expect(scanThreadSearchDom(container, "Intermediate", searchOptions).matches).toHaveLength(0);
+  });
+
+  it("keeps mounted reading content and explicit expansion when compact hydration includes an observed turn", async () => {
+    const owner = { bridgeEpoch: "epoch", sessionId: "session", sessionIncarnation: 1 };
+    const updates = [
+      { sessionUpdate: "agent_message_chunk" as const, messageId: "progress", content: { type: "text" as const, text: "Intermediate explanation" } },
+      { sessionUpdate: "agent_thought_chunk" as const, messageId: "thought", content: { type: "text" as const, text: "Private reasoning" } },
+      { sessionUpdate: "agent_message_chunk" as const, messageId: "answer", content: { type: "text" as const, text: "Final answer" } },
+    ];
+    const running: BridgeSessionView = {
+      ...owner, viewRevision: 1, historyRevision: "before", phase: "running", syncError: null,
+      timeline: [], collapsedTurns: [], activeTurn: { operationId: "observed", clientIntentId: "intent", prompt: [{ type: "text", text: "My request" }], updates, terminal: null },
+      workspace: { cwd: "/work", session: {} }, controls: {}, interactions: { permissions: {}, elicitations: {}, urlFlows: {} }, operation: null, terminals: {},
+    };
+    let state = appReducer(initialState, { type: "bridge/session_hydrate", view: running });
+    let following = false;
+    const canAutoCollapse = () => following;
+    await act(async () => root.render(<Conversation timeline={state.timeline} atBottom={false} canAutoCollapse={canAutoCollapse} />));
+    const turn = container.querySelector(".conversation-turn");
+    const anchor = container.querySelector(".message-content");
+    const completed: BridgeSessionView = {
+      ...running, viewRevision: 2, historyRevision: "after", phase: "ready", activeTurn: null,
+      timeline: [{ sessionUpdate: "user_message_chunk", content: { type: "text", text: "My request" } }, ...updates],
+      collapsedTurns: [{ turnId: "observed-history", beforeUpdate: 0, afterUpdate: 4, processCount: 2, processIncluded: true, historyRevision: "after",
+        outcomes: [{ operationId: "observed", afterUpdate: 4, response: { stopReason: "end_turn" } }] }],
+    };
+    state = appReducer(state, { type: "bridge/session_hydrate", view: completed });
+    await act(async () => root.render(<Conversation timeline={state.timeline} settled atBottom={false} canAutoCollapse={canAutoCollapse} />));
+    expect(container.querySelector(".conversation-turn")).toBe(turn);
+    expect(container.querySelector(".message-content")).toBe(anchor);
+    expect(container.querySelector(".turn-process-content")?.hasAttribute("hidden")).toBe(false);
+    expect(scanThreadSearchDom(container, "Intermediate", searchOptions).matches).toHaveLength(1);
+    following = true;
+    await act(async () => root.render(<Conversation timeline={state.timeline} settled atBottom canAutoCollapse={canAutoCollapse} />));
+    const button = container.querySelector<HTMLButtonElement>(".turn-process-trigger")!;
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    await act(async () => button.click());
+    state = appReducer(state, { type: "bridge/session_hydrate", view: { ...completed, viewRevision: 3 } });
+    await act(async () => root.render(<Conversation timeline={state.timeline} settled atBottom canAutoCollapse={canAutoCollapse} />));
+    expect(container.querySelector(".turn-process-trigger")).toBe(button);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
   });
 
   it("folds loaded histories without stop events only when settled or followed by another prompt", async () => {

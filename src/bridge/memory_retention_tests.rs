@@ -75,7 +75,7 @@ impl JournalTurn {
         self.intent = intent.into();
     }
 
-    fn append(&mut self, update: Value) -> Weak<Vec<Value>> {
+    fn append(&mut self, update: Value) -> Weak<Vec<Arc<Value>>> {
         append_unpublished_update(
             &mut self.state,
             &mut self.validation,
@@ -85,7 +85,7 @@ impl JournalTurn {
         )
     }
 
-    fn text(&mut self, text: &str) -> Weak<Vec<Value>> {
+    fn text(&mut self, text: &str) -> Weak<Vec<Arc<Value>>> {
         self.append(json!({
             "sessionUpdate": "agent_message_chunk", "messageId": "answer",
             "content": {"type": "text", "text": text},
@@ -99,6 +99,17 @@ impl JournalTurn {
             self.incarnation,
             used,
         );
+    }
+
+    fn pin_overlay_with_cancel(&mut self) {
+        // Cancel intent is a real full-session transition. It must still carry
+        // the current turn even when usage publication becomes a small patch.
+        // No Agent terminal response is injected; subsequent output is legal.
+        let epoch = self.state.sessions.epoch().to_string();
+        self.state
+            .sessions
+            .request_cancel(&epoch, SESSION, self.incarnation)
+            .unwrap();
     }
 
     fn complete(&mut self) {
@@ -125,7 +136,7 @@ impl JournalTurn {
         self.validation.retire_turn();
     }
 
-    fn current_updates(&self) -> &Arc<Vec<Value>> {
+    fn current_updates(&self) -> &crate::runtime_state::SharedTurnUpdates {
         &self
             .state
             .sessions
@@ -158,7 +169,7 @@ fn append_unpublished_update(
     incarnation: u64,
     operation_id: &str,
     update: Value,
-) -> Weak<Vec<Value>> {
+) -> Weak<Vec<Arc<Value>>> {
     validate_and_track_session_update(validation, &update).unwrap();
     state
         .sessions
@@ -227,6 +238,7 @@ fn memory_retention_delta_transfer_releases_old_overlay_before_queue_consumption
     let before = turn.state.published_runtime_seq;
     let old = turn.text("first-");
     turn.usage(1);
+    turn.pin_overlay_with_cancel();
     let current = turn.text("second");
     turn.usage(2);
     assert!(
@@ -297,7 +309,7 @@ fn fixed_output_with_replacements(replacements: usize) -> (usize, Value) {
         .filter(|version| version.upgrade().is_some())
         .count();
     assert_eq!(turn.current_updates().len(), 1);
-    let final_tool = turn.current_updates()[0].clone();
+    let final_tool = (*turn.current_updates()[0]).clone();
     assert_eq!(
         final_tool["content"][0]["content"]["text"],
         "F".repeat(4096)
@@ -325,7 +337,7 @@ fn memory_retention_fixed_final_output_does_not_retain_more_intermediate_version
     );
 }
 
-fn fallback_snapshot_fixture() -> (JournalTurn, Weak<Vec<Value>>) {
+fn fallback_snapshot_fixture() -> (JournalTurn, Weak<Vec<Arc<Value>>>) {
     let mut turn = JournalTurn::new();
     let (sink, mut receiver) = publication_queue();
     flush_runtime(&mut turn.state, &sink);
@@ -338,6 +350,7 @@ fn fallback_snapshot_fixture() -> (JournalTurn, Weak<Vec<Value>>) {
     turn.start_turn("publication-second-turn");
     let old = turn.text("new-");
     turn.usage(2);
+    turn.pin_overlay_with_cancel();
     turn.text("answer");
     turn.usage(3);
     assert!(
@@ -392,6 +405,7 @@ fn memory_retention_closed_publication_queue_keeps_watermark_and_unpublished_suf
     let mut turn = JournalTurn::new();
     let old = turn.text("unpublished-");
     turn.usage(1);
+    turn.pin_overlay_with_cancel();
     turn.text("suffix");
     turn.usage(2);
     let before = turn.state.published_runtime_seq;
@@ -412,6 +426,7 @@ fn memory_retention_mid_batch_failure_acknowledges_only_the_contiguous_prefix() 
     let mut turn = JournalTurn::new();
     let old = turn.text("pending-");
     turn.usage(1);
+    turn.pin_overlay_with_cancel();
     turn.text("replacement");
     turn.usage(2);
     let pending = pending_sequences(&turn.state, 0);
@@ -445,6 +460,7 @@ fn memory_retention_later_changes_remain_an_unpublished_contiguous_suffix() {
     let cut = turn.state.published_runtime_seq;
     let pending = turn.text("-pending");
     turn.usage(2);
+    turn.pin_overlay_with_cancel();
     turn.text("-latest");
     assert!(pending.upgrade().is_some());
     assert_eq!(turn.state.published_runtime_seq, cut);
@@ -466,6 +482,7 @@ fn memory_retention_epoch_teardown_releases_payloads_even_after_failed_publicati
     let mut turn = JournalTurn::new();
     let old = turn.text("old epoch");
     turn.usage(1);
+    turn.pin_overlay_with_cancel();
     let current = turn.text(" still running");
     turn.usage(2);
     let (sink, receiver) = publication_queue();
@@ -663,9 +680,9 @@ async fn live_publication_peer() -> (PublicationPeer, Weak<Mutex<BridgeState>>, 
 
 async fn unpublished_overlay_versions(
     state_probe: &Weak<Mutex<BridgeState>>,
-) -> (Weak<Vec<Value>>, Weak<Vec<Value>>) {
+) -> (Weak<Vec<Arc<Value>>>, Weak<Vec<Arc<Value>>>) {
     // Establish unflushed changes at the real coordinator's publication boundary.
-    // This hook calls the same registry transitions as the Agent reducer; it does
+    // This hook calls the same registry transitions as the live reducers; it does
     // not fabricate journal records or require an epoch to survive a Closed send.
     {
         let state = state_probe.upgrade().unwrap();
@@ -684,6 +701,11 @@ async fn unpublished_overlay_versions(
             }),
         );
         append_unpublished_usage(&mut state, &mut validation, incarnation, 1);
+        let epoch = state.sessions.epoch().to_string();
+        state
+            .sessions
+            .request_cancel(&epoch, SESSION, incarnation)
+            .unwrap();
         let current = append_unpublished_update(
             &mut state,
             &mut validation,

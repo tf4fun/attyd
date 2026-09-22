@@ -183,13 +183,13 @@ fn tool_content(text: String, first: bool) -> Value {
     update
 }
 
-fn tool_text(updates: &[Value]) -> &str {
+fn tool_text<T: std::borrow::Borrow<Value>>(updates: &[T]) -> &str {
     assert_eq!(
         updates.len(),
         1,
         "replacing one tool must not duplicate entities"
     );
-    updates[0]["content"][0]["content"]["text"]
+    updates[0].borrow()["content"][0]["content"]["text"]
         .as_str()
         .unwrap()
 }

@@ -51,6 +51,8 @@
     "file": "计划文件",
     "event": "计划事件",
     "title": "计划",
+    "collapse": "收起计划详情",
+    "expand": "展开计划详情",
     "progress": "{{completed}}/{{total}}",
     "priority": {
       "high": "高",
@@ -65,7 +67,7 @@
     "cancelled": "上下文压缩已取消",
     "title": "上下文压缩",
     "noSummarySupplied": "Agent 未提供保留的摘要。",
-    "events": "压缩事件",
+    "events": "最近的压缩事件",
     "summary_zero": "没有保留的摘要",
     "summary_one": "{{count, number}} 个摘要块",
     "summary_other": "{{count, number}} 个摘要块",
@@ -108,7 +110,7 @@
     "locations": "位置",
     "annotations": "内容注解",
     "terminals": "终端",
-    "events": "消息事件",
+    "events": "最近的来源事件",
     "kind": {
       "read": "读取",
       "edit": "编辑",

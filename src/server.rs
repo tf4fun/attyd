@@ -32,12 +32,17 @@ use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
 use crate::runtime_cache::ActiveRuntimeProjection;
-use crate::runtime_state::{RuntimeChange, RuntimeDelta, RuntimeSnapshot, fold_active_turn_update};
+#[cfg(test)]
+use crate::runtime_state::fold_active_turn_update;
+use crate::runtime_state::{
+    RuntimeChange, RuntimeDelta, RuntimeSnapshot, fold_shared_active_turn_update,
+};
 use crate::session_observation::ObservationLease;
 use crate::session_resources::SessionResourceOwner;
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const HTTP_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(6);
+const JSON_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(not(feature = "dev"))]
 #[derive(RustEmbed)]
@@ -120,6 +125,34 @@ async fn enforce_origin(
     next.run(request).await
 }
 
+async fn enforce_json_request_timeout(request: Request, next: Next) -> Response {
+    let operation_may_continue = !request.method().is_safe();
+    match tokio::time::timeout(JSON_REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => {
+            // Dropping the HTTP waiter does not withdraw commands already queued
+            // in the bridge or cancel ACP work. A mutation's outcome is unknown
+            // until the caller refreshes the authoritative view.
+            let error = if operation_may_continue {
+                "Request timed out after 60 seconds. The operation may still be running; refresh its state before retrying."
+            } else {
+                "Request timed out after 60 seconds. Please retry."
+            };
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                [(header::CACHE_CONTROL, "no-store")],
+                axum::Json(json!({
+                    "error": error,
+                    "code": "request_timeout",
+                    "timeoutMs": JSON_REQUEST_TIMEOUT.as_millis() as u64,
+                    "operationMayContinue": operation_may_continue,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StartTurnBody {
@@ -139,6 +172,19 @@ struct SessionViewQuery {
     cwd: Option<String>,
     expected_epoch: Option<String>,
     expected_incarnation: Option<u64>,
+    presentation: Option<String>,
+    include_process_from: Option<String>,
+    exclude_process_for: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TurnProcessQuery {
+    expected_epoch: String,
+    expected_incarnation: u64,
+    history_revision: String,
+    #[serde(default)]
+    offset: usize,
 }
 
 impl SessionViewQuery {
@@ -452,6 +498,33 @@ impl CanonicalProjection {
                     .sessions
                     .insert(session.session_id.clone(), *session);
             }
+            RuntimeChange::SessionControlUpdated {
+                session_id,
+                incarnation,
+                revision,
+                key,
+                update,
+                history_revision,
+                phase,
+                sync_error,
+            } => {
+                if delta.scope_revision != Some(revision) {
+                    return false;
+                }
+                let Some(session) = snapshot.sessions.get_mut(&session_id) else {
+                    return false;
+                };
+                if session.incarnation != incarnation
+                    || revision != session.revision.saturating_add(1)
+                {
+                    return false;
+                }
+                session.control_state.insert(key, update);
+                session.revision = revision;
+                session.history_revision = history_revision;
+                session.phase = phase;
+                session.sync_error = sync_error;
+            }
             RuntimeChange::TurnUpdateAppended {
                 session_id,
                 incarnation,
@@ -476,7 +549,7 @@ impl CanonicalProjection {
                 if turn.operation_id != operation_id {
                     return false;
                 }
-                let Ok(folded) = fold_active_turn_update(&turn.updates, &update) else {
+                let Ok(folded) = fold_shared_active_turn_update(&turn.updates, &update) else {
                     return false;
                 };
                 turn.updates = folded.into();
@@ -651,8 +724,18 @@ impl SessionSubscriber {
                     )
                 })
             };
-            slot.replace(next);
-            return true;
+            match slot.replace(next) {
+                Ok(()) => return true,
+                Err(next) => {
+                    return match self.sender.try_send_state(next) {
+                        Ok(slot) => {
+                            self.state_slot = Some(Arc::downgrade(&slot));
+                            true
+                        }
+                        Err(()) => false,
+                    };
+                }
+            }
         }
         match self.sender.try_send_state(event) {
             Ok(slot) => {
@@ -699,9 +782,13 @@ enum QueuedPayload {
 }
 
 struct StateSlot {
-    payload: std::sync::Mutex<Arc<str>>,
-    bytes: AtomicUsize,
+    state: std::sync::Mutex<StateSlotState>,
     ledger: Arc<AtomicUsize>,
+}
+
+struct StateSlotState {
+    payload: Option<Arc<str>>,
+    accounted_bytes: usize,
 }
 
 struct QueuedSubscriberEvent {
@@ -711,68 +798,98 @@ struct QueuedSubscriberEvent {
 }
 
 impl QueuedSubscriberEvent {
-    fn payload(&self) -> Arc<str> {
+    fn claim_payload(&self) -> Arc<str> {
         match &self.event {
             QueuedPayload::Fixed(event) => event.clone(),
-            QueuedPayload::Shared(slot) => slot.payload(),
-        }
-    }
-
-    fn accounted_bytes(&self) -> usize {
-        match &self.event {
-            QueuedPayload::Fixed(_) => self.bytes,
-            QueuedPayload::Shared(slot) => slot.bytes.load(Ordering::Acquire),
+            QueuedPayload::Shared(slot) => slot.claim(),
         }
     }
 
     #[cfg(test)]
     fn into_arc(self) -> Arc<str> {
-        self.payload()
+        self.claim_payload()
     }
 
     fn into_string(self) -> String {
-        self.payload().to_string()
+        let payload = self.claim_payload();
+        #[cfg(test)]
+        delivery_handoff_tests::after_payload_capture(&self.queued_bytes);
+        payload.to_string()
     }
 }
 
 impl Drop for QueuedSubscriberEvent {
     fn drop(&mut self) {
-        self.queued_bytes
-            .fetch_sub(self.accounted_bytes(), Ordering::AcqRel);
+        if matches!(self.event, QueuedPayload::Fixed(_)) {
+            self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
     }
 }
 
 impl StateSlot {
     fn new(payload: Arc<str>, ledger: Arc<AtomicUsize>) -> Self {
+        let accounted_bytes = payload.len();
         Self {
-            bytes: AtomicUsize::new(payload.len()),
-            payload: std::sync::Mutex::new(payload),
+            state: std::sync::Mutex::new(StateSlotState {
+                payload: Some(payload),
+                accounted_bytes,
+            }),
             ledger,
         }
     }
 
-    fn payload(&self) -> Arc<str> {
-        self.payload
+    /// Atomically transfer ownership from the replaceable queue slot to the
+    /// consumer. Once claimed, producers must enqueue a new slot.
+    fn claim(&self) -> Arc<str> {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let payload = state
+            .payload
+            .take()
+            .expect("a queued state slot is claimed exactly once");
+        let accounted_bytes = std::mem::take(&mut state.accounted_bytes);
+        self.ledger.fetch_sub(accounted_bytes, Ordering::AcqRel);
+        payload
     }
 
-    /// Replace the queued payload and keep the subscriber's byte ledger exact.
-    fn replace(&self, next: Arc<str>) {
+    /// Replace an unclaimed payload and its accounting as one critical
+    /// section. Return the payload when the consumer already owns the slot.
+    fn replace(&self, next: Arc<str>) -> Result<(), Arc<str>> {
         let new_len = next.len();
-        let old_len = {
-            let mut payload = self
-                .payload
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::replace(&mut *payload, next).len()
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_len = state.accounted_bytes;
+        let Some(payload) = state.payload.as_mut() else {
+            return Err(next);
         };
-        self.bytes.store(new_len, Ordering::Release);
+        *payload = next;
+        state.accounted_bytes = new_len;
         if new_len >= old_len {
             self.ledger.fetch_add(new_len - old_len, Ordering::AcqRel);
         } else {
             self.ledger.fetch_sub(old_len - new_len, Ordering::AcqRel);
+        }
+        drop(state);
+        #[cfg(test)]
+        delivery_handoff_tests::after_payload_replace(&self.ledger);
+        Ok(())
+    }
+}
+
+impl Drop for StateSlot {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.payload.is_some() {
+            self.ledger
+                .fetch_sub(state.accounted_bytes, Ordering::AcqRel);
+            state.accounted_bytes = 0;
         }
     }
 }
@@ -804,9 +921,9 @@ impl SubscriberSender {
 
     /// Queue a reconstructible state event through a replaceable slot.
     fn try_send_state(&self, event: Arc<str>) -> Result<Arc<StateSlot>, ()> {
+        let bytes = event.len();
         let slot = Arc::new(StateSlot::new(event, self.queued_bytes.clone()));
-        self.queued_bytes
-            .fetch_add(slot.bytes.load(Ordering::Acquire), Ordering::AcqRel);
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.tx
             .send(QueuedSubscriberEvent {
                 event: QueuedPayload::Shared(slot.clone()),
@@ -1776,7 +1893,6 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/v1/runtime", get(get_runtime))
-        .route("/api/v1/events", get(global_events))
         .route("/api/v1/auth/{method_id}", post(authenticate))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/terminal", post(start_auth_terminal))
@@ -1807,6 +1923,10 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
             post(start_session_turn),
         )
         .route(
+            "/api/v1/sessions/{session_id}/turns/{operation_id}/process",
+            get(get_turn_process),
+        )
+        .route(
             "/api/v1/sessions/{session_id}/turns/{operation_id}/cancel",
             post(cancel_session_turn),
         )
@@ -1821,6 +1941,10 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
             "/api/v1/sessions/{session_id}/interactions/{interaction_id}/response",
             post(respond_to_interaction),
         )
+        // Only finite JSON requests share a deadline, including body extraction.
+        // Event streams and frontend/HMR proxying are added after this layer.
+        .route_layer(middleware::from_fn(enforce_json_request_timeout))
+        .route("/api/v1/events", get(global_events))
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
@@ -2386,8 +2510,9 @@ fn business_session_view(view: &serde_json::Value) -> Option<serde_json::Value> 
 }
 
 fn normalize_embedded_session_view(mut value: serde_json::Value) -> Option<serde_json::Value> {
-    let view = business_session_view(value.get("view")?)?;
-    value["view"] = view;
+    let raw = value.get("view")?;
+    let view = business_session_view(raw)?;
+    value["view"] = crate::session_presentation::compact_view(view, raw.pointer("/live/terminals"));
     Some(value)
 }
 
@@ -2414,6 +2539,42 @@ async fn get_session_view(
         Ok(owner) => owner,
         Err(message) => return api_bad_request(message),
     };
+    if query
+        .presentation
+        .as_deref()
+        .is_some_and(|value| value != "full" && value != "compact")
+    {
+        return api_bad_request("presentation must be full or compact");
+    }
+    if let Some(operation_id) = query.include_process_from.as_deref()
+        && (operation_id.is_empty()
+            || operation_id.contains('\0')
+            || expected_owner.is_none()
+            || query.presentation.as_deref() != Some("compact"))
+    {
+        return api_bad_request(
+            "includeProcessFrom requires compact presentation, a session owner and an operation ID",
+        );
+    }
+    let excluded_operations = match query.exclude_process_for.as_deref() {
+        Some(encoded) => {
+            let Ok(operations) = serde_json::from_str::<Vec<String>>(encoded) else {
+                return api_bad_request("excludeProcessFor must be a JSON array of operation IDs");
+            };
+            if expected_owner.is_none()
+                || query.presentation.as_deref() != Some("compact")
+                || operations
+                    .iter()
+                    .any(|operation_id| operation_id.is_empty() || operation_id.contains('\0'))
+            {
+                return api_bad_request(
+                    "excludeProcessFor requires compact presentation, a session owner and valid operation IDs",
+                );
+            }
+            operations
+        }
+        None => Vec::new(),
+    };
     match state
         .bridge
         .session_view_for_owner(session_id, query.cwd, expected_owner)
@@ -2424,14 +2585,22 @@ async fn get_session_view(
                 .pointer("/session/historyRevision")
                 .and_then(serde_json::Value::as_str)
                 .map(|revision| format!("\"{revision}\""));
-            let Some(view) = business_session_view(&view) else {
+            let Some(mut business_view) = business_session_view(&view) else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::Json(json!({ "error": "bridge returned an invalid session view" })),
                 )
                     .into_response();
             };
-            let mut response = axum::Json(view).into_response();
+            if query.presentation.as_deref() == Some("compact") {
+                business_view = crate::session_presentation::compact_view_from(
+                    business_view,
+                    view.pointer("/live/terminals"),
+                    query.include_process_from.as_deref(),
+                    &excluded_operations,
+                );
+            }
+            let mut response = axum::Json(business_view).into_response();
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("no-store"),
@@ -2445,6 +2614,70 @@ async fn get_session_view(
         }
         Err(error) => session_view_error(error),
     }
+}
+
+async fn get_turn_process(
+    Path((session_id, turn_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Query(query): Query<TurnProcessQuery>,
+) -> Response {
+    if !valid_api_identifier(&session_id)
+        || !valid_api_identifier(&turn_id)
+        || query.expected_epoch.is_empty()
+        || query.expected_epoch.contains('\0')
+        || query.expected_incarnation == 0
+        || query.history_revision.is_empty()
+    {
+        return api_bad_request("process pages require a session owner, turn and history revision");
+    }
+    let owner = SessionResourceOwner::new(
+        query.expected_epoch,
+        session_id.clone(),
+        query.expected_incarnation,
+    );
+    let raw = match state
+        .bridge
+        .session_view_for_owner(session_id, None, Some(owner))
+        .await
+    {
+        Ok(view) => view,
+        Err(error) => return session_view_error(error),
+    };
+    let Some(view) = business_session_view(&raw) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": "bridge returned an invalid session view"})),
+        )
+            .into_response();
+    };
+    let mut response = match crate::session_presentation::process_page(
+        &view,
+        &turn_id,
+        &query.history_revision,
+        query.offset,
+    ) {
+        Ok(page) => axum::Json(page).into_response(),
+        Err(crate::session_presentation::PageError::StaleHistory) => (
+            StatusCode::CONFLICT,
+            axum::Json(
+                json!({"error": "history revision is stale", "code": "history_revision_changed"}),
+            ),
+        )
+            .into_response(),
+        Err(crate::session_presentation::PageError::TurnNotFound) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "completed turn was not found", "code": "turn_not_found"})),
+        )
+            .into_response(),
+        Err(crate::session_presentation::PageError::InvalidOffset) => {
+            api_bad_request("invalid process page offset")
+        }
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 fn session_view_error(error: bridge::SessionViewError) -> Response {
@@ -2803,6 +3036,15 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod memory_retention_tests;
+
+#[cfg(test)]
+mod control_efficiency_tests;
+#[cfg(test)]
+mod delivery_handoff_tests;
+#[cfg(test)]
+mod request_timeout_tests;
+#[cfg(test)]
+mod session_presentation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3301,7 +3543,7 @@ mod tests {
         };
         assert_eq!(prompt.len(), 65);
         assert_eq!(prompt[0]["text"].as_str().unwrap().len(), 6 * 1024 * 1024);
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_secs(59)).await;
         assert!(futures::poll!(pending.as_mut()).is_pending());
         response
             .send(Ok(json!({"disposition":"accepted"})))
@@ -3563,6 +3805,7 @@ mod tests {
                 cwd: Some("/workspace".into()),
                 expected_epoch: Some(owner.epoch.clone()),
                 expected_incarnation: Some(owner.incarnation),
+                ..Default::default()
             }),
         ));
         assert!(futures::poll!(view.as_mut()).is_pending());

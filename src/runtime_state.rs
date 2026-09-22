@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -117,9 +118,11 @@ pub(crate) struct ActiveTurn {
     pub operation_id: String,
     pub turn_id: String,
     pub prompt: Arc<Vec<Value>>,
-    pub updates: Arc<Vec<Value>>,
+    pub updates: SharedTurnUpdates,
     pub cancel_requested: bool,
 }
+
+pub(crate) type SharedTurnUpdates = Arc<Vec<Arc<Value>>>;
 
 struct TurnTerminal {
     lifecycle: Option<SessionLifecycle>,
@@ -220,6 +223,16 @@ pub(crate) enum RuntimeChange {
     },
     SessionUpsert {
         session: Box<SessionRuntime>,
+    },
+    SessionControlUpdated {
+        session_id: String,
+        incarnation: u64,
+        revision: u64,
+        key: String,
+        update: Value,
+        history_revision: Option<String>,
+        phase: crate::session_state::MirrorPhase,
+        sync_error: Option<String>,
     },
     TurnUpdateAppended {
         session_id: String,
@@ -409,6 +422,7 @@ impl RuntimeJournal {
                 RuntimeChange::SessionUpsert { session } => {
                     session.session_id == session_id && session.incarnation == incarnation
                 }
+                RuntimeChange::SessionControlUpdated { .. } => false,
                 RuntimeChange::TurnUpdateAppended {
                     session_id: delta_session_id,
                     incarnation: delta_incarnation,
@@ -1003,7 +1017,7 @@ impl SessionRegistry {
             .as_ref()
             .ok_or(RuntimeStateError::NoActiveTurn)?;
         let operation_id = execution.rpc_operation_id.clone();
-        turn.updates = Arc::new(fold_active_turn_update(&turn.updates, &update)?);
+        turn.updates = Arc::new(fold_shared_active_turn_update(&turn.updates, &update)?);
         self.commit_turn_update(session_id, incarnation, operation_id, update);
         Ok(())
     }
@@ -1059,8 +1073,8 @@ impl SessionRegistry {
         if session.control_state.get(&key) == Some(&update) {
             return Ok(());
         }
-        session.control_state.insert(key, update);
-        self.commit_session(session_id);
+        session.control_state.insert(key.clone(), update.clone());
+        self.commit_control_update(session_id, incarnation, key, update);
         Ok(())
     }
 
@@ -2189,6 +2203,43 @@ impl SessionRegistry {
         );
     }
 
+    fn commit_control_update(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        key: String,
+        update: Value,
+    ) {
+        let Some(entry) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        let Some(live) = entry.state.live.as_mut() else {
+            return;
+        };
+        live.revision = live.revision.wrapping_add(1).max(1);
+        live.history_revision
+            .clone_from(&entry.state.history_revision);
+        live.phase = entry.state.phase;
+        live.sync_error.clone_from(&entry.state.sync_error);
+        let revision = live.revision;
+        let history_revision = live.history_revision.clone();
+        let phase = live.phase;
+        let sync_error = live.sync_error.clone();
+        self.commit_delta(
+            Some(revision),
+            RuntimeChange::SessionControlUpdated {
+                session_id: session_id.to_string(),
+                incarnation,
+                revision,
+                key,
+                update,
+                history_revision,
+                phase,
+                sync_error,
+            },
+        );
+    }
+
     fn commit_turn_update(
         &mut self,
         session_id: &str,
@@ -2659,23 +2710,50 @@ fn drain_session_liveness(
 }
 
 fn serialized_len(value: &impl Serialize) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+    let mut counter = SerializedByteCounter(0);
+    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |_| counter.0)
+}
+
+struct SerializedByteCounter(usize);
+
+impl Write for SerializedByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn fold_active_turn_update(
     retained: &[Value],
     update: &Value,
 ) -> Result<Vec<Value>, RuntimeStateError> {
+    let retained = retained.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+    let folded = fold_shared_active_turn_update(&retained, update)?;
+    drop(retained);
+    Ok(folded
+        .into_iter()
+        .map(|value| Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()))
+        .collect())
+}
+
+pub(crate) fn fold_shared_active_turn_update(
+    retained: &[Arc<Value>],
+    update: &Value,
+) -> Result<Vec<Arc<Value>>, RuntimeStateError> {
     let mut folded = retained.to_vec();
     let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
-        folded.push(update.clone());
+        folded.push(Arc::new(update.clone()));
         return Ok(folded);
     };
 
     match kind {
         "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" => {
             let Some((shape, text)) = text_chunk_shape(update)? else {
-                folded.push(update.clone());
+                folded.push(Arc::new(update.clone()));
                 return Ok(folded);
             };
             if let Some(previous) = folded.last_mut() {
@@ -2683,6 +2761,7 @@ pub(crate) fn fold_active_turn_update(
                     .as_ref()
                     .is_some_and(|(previous_shape, _)| previous_shape == &shape)
                 {
+                    let previous = Arc::make_mut(previous);
                     let previous_text = previous
                         .get_mut("content")
                         .and_then(Value::as_object_mut)
@@ -2696,7 +2775,7 @@ pub(crate) fn fold_active_turn_update(
                     return Ok(folded);
                 }
             }
-            folded.push(update.clone());
+            folded.push(Arc::new(update.clone()));
         }
         "tool_call" | "tool_call_update" => {
             let tool_call_id = required_fold_string(update, "toolCallId")?;
@@ -2707,22 +2786,23 @@ pub(crate) fn fold_active_turn_update(
                 ) && candidate.get("toolCallId").and_then(Value::as_str) == Some(tool_call_id)
             }) {
                 let retained_kind = folded[position]["sessionUpdate"].clone();
-                replace_tool_fields(&mut folded[position], update)?;
-                folded[position]["sessionUpdate"] = if kind == "tool_call" {
+                let target = Arc::make_mut(&mut folded[position]);
+                replace_tool_fields(target, update)?;
+                target["sessionUpdate"] = if kind == "tool_call" {
                     Value::String("tool_call".to_string())
                 } else {
                     retained_kind
                 };
-                folded[position]["toolCallId"] = Value::String(tool_call_id.to_string());
+                target["toolCallId"] = Value::String(tool_call_id.to_string());
             } else {
-                folded.push(update.clone());
+                folded.push(Arc::new(update.clone()));
             }
         }
         "plan" => {
             if !update.get("entries").is_some_and(Value::is_array) {
                 return Err(RuntimeStateError::OperationMismatch);
             }
-            replace_fold_slot(
+            replace_shared_fold_slot(
                 &mut folded,
                 |candidate| candidate.get("sessionUpdate").and_then(Value::as_str) == Some("plan"),
                 update,
@@ -2743,7 +2823,7 @@ pub(crate) fn fold_active_turn_update(
             {
                 return Err(RuntimeStateError::OperationMismatch);
             }
-            replace_fold_slot(
+            replace_shared_fold_slot(
                 &mut folded,
                 |candidate| {
                     candidate.get("sessionUpdate").and_then(Value::as_str) == Some("plan_update")
@@ -2769,7 +2849,7 @@ pub(crate) fn fold_active_turn_update(
                 folded.remove(position);
             }
         }
-        _ => folded.push(update.clone()),
+        _ => folded.push(Arc::new(update.clone())),
     }
     Ok(folded)
 }
@@ -2821,15 +2901,18 @@ fn required_fold_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Ru
         .ok_or(RuntimeStateError::OperationMismatch)
 }
 
-fn replace_fold_slot(
-    folded: &mut Vec<Value>,
+fn replace_shared_fold_slot(
+    folded: &mut Vec<Arc<Value>>,
     matches_slot: impl Fn(&Value) -> bool,
     update: &Value,
 ) {
-    if let Some(position) = folded.iter().position(matches_slot) {
-        folded[position] = update.clone();
+    if let Some(position) = folded
+        .iter()
+        .position(|candidate| matches_slot(candidate.as_ref()))
+    {
+        folded[position] = Arc::new(update.clone());
     } else {
-        folded.push(update.clone());
+        folded.push(Arc::new(update.clone()));
     }
 }
 
@@ -4201,7 +4284,7 @@ mod tests {
 
         let active = state.session("session").unwrap().active_turn.unwrap();
         assert!(active.cancel_requested);
-        assert_eq!(*active.updates, vec![json!("after cancel")]);
+        assert_eq!(*active.updates[0], json!("after cancel"));
     }
 
     #[test]
@@ -4265,7 +4348,7 @@ mod tests {
             .clone();
         assert!(Arc::ptr_eq(&current.prompt, &overlay.prompt));
         assert!(Arc::ptr_eq(&current.updates, &overlay.updates));
-        assert_eq!(current.updates.as_slice(), &[update]);
+        assert_eq!(*current.updates[0], update);
         assert!(
             projected.updates.is_empty(),
             "an already published view is immutable"
@@ -4317,6 +4400,25 @@ mod tests {
                 RuntimeChange::SessionUpsert { session } => {
                     projection.insert(session.session_id.clone(), *session);
                 }
+                RuntimeChange::SessionControlUpdated {
+                    session_id,
+                    incarnation,
+                    revision,
+                    key,
+                    update,
+                    history_revision,
+                    phase,
+                    sync_error,
+                } => {
+                    let session = projection.get_mut(&session_id).unwrap();
+                    assert_eq!(session.incarnation, incarnation);
+                    assert_eq!(session.revision + 1, revision);
+                    session.control_state.insert(key, update);
+                    session.revision = revision;
+                    session.history_revision = history_revision;
+                    session.phase = phase;
+                    session.sync_error = sync_error;
+                }
                 RuntimeChange::TurnUpdateAppended {
                     session_id,
                     incarnation,
@@ -4329,7 +4431,7 @@ mod tests {
                     assert_eq!(session.revision + 1, revision);
                     let turn = session.active_turn.as_mut().unwrap();
                     assert_eq!(turn.operation_id, operation_id);
-                    Arc::make_mut(&mut turn.updates).push(update);
+                    Arc::make_mut(&mut turn.updates).push(Arc::new(update));
                     session.revision = revision;
                 }
                 RuntimeChange::TerminalUpdated { .. } => {

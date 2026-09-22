@@ -8,7 +8,7 @@
     "turnResponse": "Turn response",
     "errorDetails": "ACP error details",
     "messageId": "Message ID",
-    "messageEvents": "Message events"
+    "messageEvents": "Latest source event"
   },
   "message": {
     "editAndResendLabel": "Edit and resend user message",
@@ -200,6 +200,12 @@
     "collapse": "Collapse execution process",
     "show": "Show",
     "hide": "Hide",
+    "loading": "Loading execution details…",
+    "loadMore": "Load 10 more",
+    "loadError": "Unable to load execution details.",
+    "loadTimeout": "Loading execution details timed out. Retry when ready.",
+    "retry": "Retry loading",
+    "loaded": "{{count, number}} of {{total, number}} loaded",
     "count_one": "{{count, number}} item",
     "count_other": "{{count, number}} items"
   },

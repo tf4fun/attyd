@@ -69,6 +69,8 @@
     "working": "Agent 正在工作"
   },
   "errors": {
+    "requestTimeout": "请求超过 {{seconds}} 秒未完成，请重试。",
+    "requestTimeoutUncertain": "请求超过 {{seconds}} 秒未完成，操作可能仍在执行，请确认状态后再重试。",
     "repeatedCursor": "Agent 的会话列表返回了重复的游标",
     "searchNotReady": "请等待 ACP 会话就绪后再搜索工作区上下文",
     "contextNotReady": "请等待 ACP 会话就绪后再添加工作区上下文",

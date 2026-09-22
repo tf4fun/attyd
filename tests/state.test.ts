@@ -61,7 +61,11 @@ describe("ACP UI state", () => {
       state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "user_message_chunk", messageId: "echo", content } } }));
     }
     expect(state.timeline).toHaveLength(1);
-    expect(state.timeline[0]).toMatchObject({ role: "user", messageId: "echo", blocks, raw: [expect.anything(), expect.anything()] });
+    expect(state.timeline[0]).toMatchObject({ role: "user", messageId: "echo", blocks });
+    const message = state.timeline[0];
+    if (message.type === "message") {
+      expect(message.raw.at(-1)).toMatchObject({ update: { messageId: "echo", content: blocks[1] } });
+    }
   });
 
   it("derives cancellation for unfinished tools and accepts later session-scoped completion", () => {
@@ -2059,7 +2063,7 @@ describe("ACP UI state", () => {
     expect(item.type).toBe("tool");
     if (item.type === "tool") {
       expect(item.call).toMatchObject({ title: "Read file", kind: "read", status: "completed" });
-      expect(item.raw).toHaveLength(2);
+      expect(item.raw.at(-1)).toMatchObject({ update: { toolCallId: "t1", status: "completed" } });
     }
   });
 
@@ -2105,7 +2109,7 @@ describe("ACP UI state", () => {
       status: "completed",
       content: [{ type: "diff", newText: "second turn" }],
     });
-    expect(tools[1].raw).toHaveLength(2);
+    expect(tools[1].raw.at(-1)).toMatchObject({ update: { toolCallId: "reused", status: "completed" } });
   });
 
   it("applies an update to the session's tool even after another prompt starts", () => {
@@ -2796,7 +2800,7 @@ describe("ACP UI state", () => {
     expect(plan.type).toBe("plan");
     if (plan.type === "plan" && plan.update.sessionUpdate === "plan_update") {
       expect(plan.update.plan).toMatchObject({ content: "second" });
-      expect(plan.raw).toHaveLength(2);
+      expect(plan.raw.at(-1)).toMatchObject({ update: { plan: { planId: "p1", content: "second" } } });
     }
 
     const removed = appReducer(updated, event({
@@ -2814,7 +2818,7 @@ describe("ACP UI state", () => {
       raw: expect.any(Array),
     });
     if (removed.timeline[0].type === "plan") {
-      expect(removed.timeline[0].raw).toHaveLength(3);
+      expect(removed.timeline[0].raw.at(-1)).toMatchObject({ update: { sessionUpdate: "plan_removed", planId: "p1" } });
     }
 
     const orphanRemoval = appReducer(active, event({
@@ -2919,7 +2923,7 @@ describe("ACP UI state", () => {
     if (compaction.type === "compaction") {
       expect(compaction.status).toBe("completed");
       expect(compaction.blocks).toEqual([{ type: "text", text: "summary" }]);
-      expect(compaction.raw).toHaveLength(3);
+      expect(compaction.raw.at(-1)).toMatchObject({ update: { compactionId: "c1", status: "completed" } });
     }
   });
 

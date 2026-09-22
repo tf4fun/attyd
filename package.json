@@ -16,6 +16,8 @@
     "test:idle-retirement": "ATTYD_SKIP_WEB_BUILD=1 cargo test bridge::unobserved_tests",
     "test:memory:rust": "ATTYD_SKIP_WEB_BUILD=1 cargo test memory_retention",
     "test:memory:web": "vitest run tests/runtime-memory-retention.test.tsx",
+    "test:memory:efficiency:rust": "ATTYD_SKIP_WEB_BUILD=1 cargo test memory_efficiency",
+    "test:memory:efficiency:web": "vitest run tests/runtime-memory-efficiency.test.ts",
     "test:remote": "ATTYD_SKIP_WEB_BUILD=1 cargo build && node --import tsx scripts/rust-remote-smoke.ts",
     "test:browser": "npm run build:client && ATTYD_SKIP_WEB_BUILD=1 cargo build && playwright test",
     "test:goose": "ATTYD_SKIP_WEB_BUILD=1 cargo build && node --import tsx scripts/goose-smoke.ts",

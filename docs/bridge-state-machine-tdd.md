@@ -95,6 +95,12 @@ CAS-protected turn. Until that moment the Bridge has not accepted it and owns no
 This keeps queue semantics independent of ACP: page disposal may discard unsent queue items, and
 two pages with queued items compete for the next append slot through the normal history CAS.
 
+An HTTP admission response timeout is not an Agent turn failure. The browser must keep a submitted
+prompt pending until a fresh authoritative view resolves its outcome, reject pre-timeout refresh
+responses as evidence for that resolution, and never automatically replay the mutation. A preflight
+GET timeout has not submitted the prompt and remains a retryable local failure. The finite HTTP
+request deadlines do not bound ACP turn execution; see [HTTP timeouts](http-request-timeouts.md).
+
 ## Turn-commit contract
 
 Prompt terminal delivery and history checkpoint are separate transitions for every Agent:
@@ -192,7 +198,17 @@ history, invents missing Agent data or silently treats a partial replay as autho
 - Session subscriber presentation data may be coalesced into a latest reset when complete state
   can be recovered. Non-reconstructible semantic events remain reliable. Byte ledgers measure
   retained payload and release it on consumption, replacement or teardown; they are not a reason
-  to truncate valid conversation content. These memory targets have explicit Red regression gates.
+  to truncate valid conversation content. The first retention gates pass on `802c20b`; the
+  [follow-up efficiency gates](runtime-memory-efficiency.md) now pass controlled consumer handoff races.
+- After a consumer captures a state payload, a new publication must be in that delivery or a
+  subsequent deliverable event; a still-live slot cannot silently absorb an update already missed
+  by that consumer. Queue accounting must settle exactly once at the same ownership boundaries.
+- Control-only publication must not scale with existing turn body size. Explicit partial changes
+  preserve omitted fields; a full upsert continues to mean replacement.
+- Small changes must not allocate in proportion to unrelated retained body size; held snapshots
+  stay immutable and invalid changes leave revision/state/accounting untouched.
+- Browser diagnostic source arrays keep the latest event per logical entity/chunk. Current
+  rawInput/rawOutput, complete message text, permissions and reliable errors remain business data.
 - Wire values and live resources retain their independent validation and lifecycle rules.
 - Load/resume registers one replay candidate before sending its RPC. Historical notifications
   validate and fold directly into that separate allocation; they consume no live ingress items,

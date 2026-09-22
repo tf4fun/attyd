@@ -242,13 +242,13 @@ describe("project navigation", () => {
         initialized: { type: "acp/initialized", response: { protocolVersion: 1, agentCapabilities: { loadSession: true } } },
         error: null, phase: { type: "bridge/phase", phase: "ready" },
       });
-      if (String(input) === "/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha") return response(sessionView("alpha-one"));
+      if (String(input) === "/api/v1/sessions/alpha-one?presentation=compact&cwd=%2Fwork%2Falpha") return response(sessionView("alpha-one"));
       if (String(input).startsWith("/api/v1/sessions")) throw new Error(`Unexpected cold request: ${String(input)}`);
       return defaultFetch(input, init);
     });
     await mount(sessionPath("alpha-one", "/work/alpha"));
     expect(acp.state.session?.sessionId).toBe("alpha-one");
-    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?presentation=compact&cwd=%2Fwork%2Falpha");
     expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
   });
 
@@ -355,19 +355,19 @@ describe("project navigation", () => {
       if (path === "/api/v1/sessions?cursor=more") {
         return new Promise<Response>((resolve) => { finishPage = resolve; });
       }
-      if (path === "/api/v1/sessions/alpha-two") {
+      if (path === "/api/v1/sessions/alpha-two?presentation=compact") {
         return response({ error: "Not materialized or listed", code: "session_not_found" }, 404);
       }
       return defaultFetch(input, init);
     });
     await mount("/sessions/alpha-two");
-    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-two");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-two?presentation=compact");
     expect(window.location.pathname).toBe("/sessions/alpha-two");
     expect(acp.state.session).toBeUndefined();
     expect(acp.state.timeline.some(({ type }) => type === "error")).toBe(false);
     await act(async () => finishPage(response({ sessions: list.slice(2) })));
     expect(fetchMock.mock.calls.map(([path]) => path))
-      .toContain("/api/v1/sessions/alpha-two?cwd=%2Fwork%2Falpha");
+      .toContain("/api/v1/sessions/alpha-two?presentation=compact&cwd=%2Fwork%2Falpha");
     expect(acp.state.session?.sessionId).toBe("alpha-two");
     expect(window.location.pathname).toBe(sessionPath("alpha-two", "/work/alpha"));
   });
@@ -425,7 +425,7 @@ describe("project navigation", () => {
   it("keeps a cold bare link when listing fails after the initial local miss", async () => {
     fetchMock.mockImplementation(async (input, init) => {
       if (String(input) === "/api/v1/sessions") return response({ error: "Listing timed out" }, 503);
-      if (String(input) === "/api/v1/sessions/alpha-two") {
+      if (String(input) === "/api/v1/sessions/alpha-two?presentation=compact") {
         return response({ code: "session_not_found" }, 404);
       }
       return defaultFetch(input, init);
@@ -433,31 +433,31 @@ describe("project navigation", () => {
     await mount("/sessions/alpha-two");
     expect(window.location.pathname).toBe("/sessions/alpha-two");
     expect(acp.state.socketOpen).toBe(true);
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-two")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/v1/sessions/alpha-two?presentation=compact")).toHaveLength(1);
   });
 
   it("offers the route workspace for a cold ID absent from an available session list", async () => {
-    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/unlisted"
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/unlisted?presentation=compact"
       ? response({ code: "session_not_found" }, 404)
       : defaultFetch(input, init));
     await mount(sessionPath("unlisted", "/work/alpha"));
     expect(acp.state.session?.sessionId).toBe("unlisted");
-    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/unlisted?cwd=%2Fwork%2Falpha");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/unlisted?presentation=compact&cwd=%2Fwork%2Falpha");
   });
 
   it("uses the listed workspace to cold-load a mismatched route and subscribe", async () => {
-    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one"
+    fetchMock.mockImplementation(async (input, init) => String(input) === "/api/v1/sessions/alpha-one?presentation=compact"
       ? response({ code: "session_not_found" }, 404)
       : defaultFetch(input, init));
     await mount(sessionPath("alpha-one", "/work/wrong"));
-    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?presentation=compact&cwd=%2Fwork%2Falpha");
     expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha&expectedEpoch=epoch&expectedIncarnation=1");
   });
 
   it("passes the selected workspace on ordinary session clicks for view and stream", async () => {
     await mount(projectPath("/work/alpha"));
     await act(async () => acp.attachSession(list[0]));
-    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?cwd=%2Fwork%2Falpha");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/v1/sessions/alpha-one?presentation=compact&cwd=%2Fwork%2Falpha");
     expect(TestEventSource.instances.map(({ url }) => url)).toContain("/api/v1/sessions/alpha-one/events?cwd=%2Fwork%2Falpha&expectedEpoch=epoch&expectedIncarnation=1");
   });
 
@@ -974,7 +974,7 @@ describe("project navigation", () => {
       if (String(input) === "/api/v1/sessions?cursor=more") {
         return new Promise<Response>((resolve) => { finishPage = resolve; });
       }
-      if (String(input) === "/api/v1/sessions/alpha-two") {
+      if (String(input) === "/api/v1/sessions/alpha-two?presentation=compact") {
         return response({ code: "session_not_found" }, 404);
       }
       return defaultFetch(input, init);

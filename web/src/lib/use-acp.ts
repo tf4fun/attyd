@@ -9,6 +9,7 @@ import type {
 import type { ServerEvent, TerminalSnapshot } from "../../../shared/bridge";
 import {
   type BridgeSessionView,
+  type BridgeTurnProcessPage,
   type CreatedSessionResult,
   type GlobalBusinessEvent,
   type RuntimeView,
@@ -19,6 +20,7 @@ import {
   type WorkspaceContextAttachment,
   type WorkspaceContextMatch,
   ApiError,
+  RequestTimeoutError,
   parseGlobalBusinessEvent,
   parseSessionBusinessEvent,
   requestJson,
@@ -28,7 +30,8 @@ import {
 } from "./business-api";
 import { randomId } from "./id";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
-import { appReducer, initialState } from "./state";
+import { appReducer, initialState, type DeferredTurnProcess } from "./state";
+import { releaseSessionViewProcess, sameTurnProcess } from "./process-retention";
 
 export function useAcp() {
   const [state, dispatch] = useReducer(appReducer, initialState);
@@ -44,6 +47,8 @@ export function useAcp() {
   const promptAdmissionsRef = useRef(new Map<string, {
     requestId: string;
     baseRevision: string;
+    owner: SessionOwner;
+    timeoutMessage?: string;
   }>());
   const refreshInFlightRef = useRef<{ sessionId: string; pending: boolean } | undefined>(undefined);
   const runtimeRefreshRef = useRef<{ pending: boolean } | undefined>(undefined);
@@ -55,6 +60,26 @@ export function useAcp() {
   const sessionListSupportedRef = useRef(false);
   const sessionLoadSupportedRef = useRef(false);
   const navigationRef = useRef(0);
+  const observedProcessRef = useRef<{ owner: SessionOwner; operationId: string; navigation: number } | undefined>(undefined);
+  const releasedProcessesRef = useRef<{
+    owner: SessionOwner; navigation: number; operations: Set<string>; turns: Map<string, string>;
+  } | undefined>(undefined);
+  const releasedFor = useCallback((owner?: SessionOwner) => {
+    const released = releasedProcessesRef.current;
+    return released?.navigation === navigationRef.current && sameSessionOwner(released.owner, owner) ? released : undefined;
+  }, []);
+  const filterReleasedView = useCallback((view: BridgeSessionView) => {
+    const released = releasedFor(view);
+    if (released == null) return view;
+    return releaseSessionViewProcess(view, (turn) =>
+      released.operations.has(turn.operationId ?? turn.outcomes.at(-1)?.operationId ?? "") ||
+      released.turns.get(turn.turnId) === turn.historyRevision);
+  }, [releasedFor]);
+  const includedProcessFrom = useCallback((owner?: SessionOwner) => {
+    const observed = observedProcessRef.current;
+    return observed?.navigation === navigationRef.current && sameSessionOwner(observed.owner, owner)
+      ? observed.operationId : undefined;
+  }, []);
   const reconnectRef = useRef<() => void>(() => undefined);
   const refreshSessionRef = useRef<(sessionId: string) => void>(() => undefined);
   const connectSessionEventsRef = useRef<(sessionId: string) => void>(() => undefined);
@@ -65,6 +90,8 @@ export function useAcp() {
     sessionEventsRef.current = undefined;
     activeSessionIdRef.current = undefined;
     sessionViewRef.current = undefined;
+    observedProcessRef.current = undefined;
+    releasedProcessesRef.current = undefined;
     refreshInFlightRef.current = undefined;
     promptAdmissionsRef.current.clear();
     // Keep the route and mounted draft while replacing the old connection's
@@ -77,6 +104,8 @@ export function useAcp() {
     sessionEventsRef.current = undefined;
     activeSessionIdRef.current = undefined;
     sessionViewRef.current = undefined;
+    observedProcessRef.current = undefined;
+    releasedProcessesRef.current = undefined;
     refreshInFlightRef.current = undefined;
     dispatch({ type: preserve ? "session/deselect" : "session/reset" });
   }, []);
@@ -145,14 +174,6 @@ export function useAcp() {
   const hydrateSession = useCallback((view: BridgeSessionView) => {
     if (activeSessionIdRef.current !== view.sessionId) return;
     const current = sessionViewRef.current;
-    const admission = promptAdmissionsRef.current.get(view.sessionId);
-    if (admission != null) {
-      const reflectsAdmission =
-        view.activeTurn?.clientIntentId === admission.requestId ||
-        (view.phase === "ready" && view.historyRevision !== admission.baseRevision);
-      if (!reflectsAdmission && view.phase === "ready") return;
-      if (reflectsAdmission) promptAdmissionsRef.current.delete(view.sessionId);
-    }
     if (
       current != null &&
       current.sessionId === view.sessionId &&
@@ -160,11 +181,38 @@ export function useAcp() {
       current.sessionIncarnation === view.sessionIncarnation &&
       view.viewRevision < current.viewRevision
     ) return;
+    const admission = promptAdmissionsRef.current.get(view.sessionId);
+    let failedPrompt: { requestId: string; message: string } | undefined;
+    if (admission != null) {
+      if (!sameSessionOwner(view, admission.owner)) {
+        promptAdmissionsRef.current.delete(view.sessionId);
+      } else {
+        const reflectsAdmission =
+          view.activeTurn?.clientIntentId === admission.requestId ||
+          (view.phase === "ready" && view.historyRevision !== admission.baseRevision);
+        const confirmsUnaccepted = admission.timeoutMessage != null && view.phase === "ready" &&
+          view.activeTurn == null && view.historyRevision === admission.baseRevision;
+        if (!reflectsAdmission && !confirmsUnaccepted && view.phase === "ready") return;
+        if (confirmsUnaccepted) failedPrompt = { requestId: admission.requestId, message: admission.timeoutMessage! };
+        // Keep an unaccepted timeout's metadata until retry/history change, so
+        // subsequent ready refreshes preserve its manual retry presentation.
+        if (reflectsAdmission) promptAdmissionsRef.current.delete(view.sessionId);
+      }
+    }
+    // A response sent before a local release must not restore evicted bodies.
+    view = filterReleasedView(view);
     const cwd = view.workspace.cwd;
     if (cwd != null) navigateSession(view.sessionId, cwd, true);
     sessionViewRef.current = view;
-    dispatch({ type: "bridge/session_hydrate", view });
-  }, [navigateSession]);
+    if (includedProcessFrom(view) == null) {
+      observedProcessRef.current = view.activeTurn == null ? undefined : {
+        owner: { bridgeEpoch: view.bridgeEpoch, sessionId: view.sessionId, sessionIncarnation: view.sessionIncarnation },
+        operationId: view.activeTurn.operationId,
+        navigation: navigationRef.current,
+      };
+    }
+    dispatch({ type: "bridge/session_hydrate", view, failedPrompt });
+  }, [filterReleasedView, includedProcessFrom, navigateSession]);
 
   const refreshSession = useCallback((sessionId: string) => {
     if (!connectionReadyRef.current || activeSessionIdRef.current !== sessionId) return;
@@ -179,7 +227,8 @@ export function useAcp() {
         do {
           refresh.pending = false;
           const cwd = sessionViewRef.current?.workspace.cwd ?? readProjectCwdFromPath(window.location.pathname);
-          const query = sessionCwdQuery(cwd, sessionLoadSupportedRef.current, sessionViewRef.current);
+          const query = sessionCwdQuery(cwd, sessionLoadSupportedRef.current, sessionViewRef.current, true,
+            includedProcessFrom(sessionViewRef.current), releasedFor(sessionViewRef.current)?.operations);
           const view = await requestJson<BridgeSessionView>(
             `/api/v1/sessions/${encodeURIComponent(sessionId)}${query}`,
           );
@@ -210,12 +259,14 @@ export function useAcp() {
         }
       }
     })();
-  }, [hydrateSession, prepareConnectionRestore, reportError, returnToSessionProject]);
+  }, [hydrateSession, includedProcessFrom, prepareConnectionRestore, releasedFor, reportError, returnToSessionProject]);
   refreshSessionRef.current = refreshSession;
 
   const connectSessionEvents = useCallback((sessionId: string) => {
-    const owner = sessionViewRef.current;
-    if (owner == null || owner.sessionId !== sessionId) return;
+    const current = sessionViewRef.current;
+    if (current == null || current.sessionId !== sessionId) return;
+    // The SSE error handler lives for the session: capture identity, not bodies.
+    const owner: SessionOwner = { bridgeEpoch: current.bridgeEpoch, sessionId, sessionIncarnation: current.sessionIncarnation };
     sessionEventsRef.current?.close();
     const cwd = sessionViewRef.current?.workspace.cwd ?? readProjectCwdFromPath(window.location.pathname);
     const query = sessionCwdQuery(cwd, sessionLoadSupportedRef.current, owner);
@@ -542,7 +593,7 @@ export function useAcp() {
       }
       void (async () => {
         const readView = (cwd?: string) => requestJson<BridgeSessionView>(
-          `/api/v1/sessions/${encodeURIComponent(routeSessionId)}${sessionCwdQuery(cwd, canLoad)}`,
+          `/api/v1/sessions/${encodeURIComponent(routeSessionId)}${sessionCwdQuery(cwd, canLoad, undefined, true)}`,
         );
         let view: BridgeSessionView;
         try {
@@ -743,19 +794,24 @@ export function useAcp() {
       current.runtimeOperation != null || view == null || view.phase !== "ready" ||
       view.historyRevision == null
     ) return false;
+    const owner = sessionIdentity(view);
     const requestId = randomId();
     const sessionId = current.session.sessionId;
+    const navigation = navigationRef.current;
     promptAdmissionsRef.current.set(sessionId, {
       requestId,
       baseRevision: view.historyRevision,
+      owner,
     });
     dispatch({ type: "user/prompt", requestId, sessionId, blocks });
+    let submitted = false;
     void (async () => {
       // A reset token can settle the visible turn before its authoritative
       // session GET completes. Resolve the append point immediately before
       // admission so a queued prompt never reuses the preceding revision.
       const latest = await requestJson<BridgeSessionView>(
-        `/api/v1/sessions/${encodeURIComponent(sessionId)}${sessionCwdQuery(undefined, false, view)}`,
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}${sessionCwdQuery(undefined, false, owner, true,
+          includedProcessFrom(owner), releasedFor(owner)?.operations)}`,
       );
       if (
         latest.sessionId !== sessionId || latest.phase !== "ready" ||
@@ -770,7 +826,8 @@ export function useAcp() {
           baseRevision: latest.historyRevision,
         });
       }
-      if (sameSessionOwner(sessionViewRef.current, latest)) sessionViewRef.current = latest;
+      if (sameSessionOwner(sessionViewRef.current, latest)) sessionViewRef.current = filterReleasedView(latest);
+      submitted = true;
       return requestJson<StartTurnResult>(
         `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
         {
@@ -782,24 +839,48 @@ export function useAcp() {
           body: JSON.stringify({ prompt: blocks }),
         },
       );
-    })().then(() => refreshSessionRef.current(sessionId)).catch((error) => {
-      const admission = promptAdmissionsRef.current.get(sessionId);
-      if (admission?.requestId === requestId) {
-        promptAdmissionsRef.current.delete(sessionId);
+    })().then((result) => {
+      if (navigationRef.current === navigation && sameSessionOwner(sessionViewRef.current, owner) &&
+        includedProcessFrom(owner) == null) {
+        observedProcessRef.current = {
+          owner,
+          operationId: result.operationId, navigation,
+        };
       }
-      reportRequestError(error, requestId, "session/prompt");
+      refreshSessionRef.current(sessionId);
+    }).catch((error) => {
+      const admission = promptAdmissionsRef.current.get(sessionId);
+      if (submitted && error instanceof RequestTimeoutError) {
+        if (admission?.requestId === requestId) {
+          // Keep only identity/error metadata; pendingPrompt already owns the input.
+          promptAdmissionsRef.current.set(sessionId, { ...admission, timeoutMessage: error.message });
+        }
+        // A lost admission response does not mean the Agent rejected the turn.
+        // Keep the prompt busy until a fresh authoritative read settles it.
+        if (navigationRef.current === navigation && sameSessionOwner(sessionViewRef.current, owner)) {
+          reportError(error);
+        }
+        if (refreshInFlightRef.current?.sessionId === sessionId) {
+          // An older ready snapshot cannot resolve this uncertain submission.
+          refreshInFlightRef.current = undefined;
+        }
+      } else {
+        if (admission?.requestId === requestId) promptAdmissionsRef.current.delete(sessionId);
+        reportRequestError(error, requestId, "session/prompt");
+      }
       refreshSessionRef.current(sessionId);
     });
     return true;
-  }, [reportRequestError]);
+  }, [filterReleasedView, includedProcessFrom, releasedFor, reportError, reportRequestError]);
 
   const cancel = useCallback(() => {
     const view = sessionViewRef.current;
     if (view?.activeTurn == null || view.phase !== "running") return;
+    const sessionId = view.sessionId;
     void requestJson(
       `/api/v1/sessions/${encodeURIComponent(view.sessionId)}/turns/${encodeURIComponent(view.activeTurn.operationId)}/cancel`,
       { method: "POST" },
-    ).then(() => refreshSessionRef.current(view.sessionId)).catch(reportError);
+    ).then(() => refreshSessionRef.current(sessionId)).catch(reportError);
   }, [reportError]);
 
   const setMode = useCallback((modeId: string) => {
@@ -947,7 +1028,7 @@ export function useAcp() {
     if (sessionId == null || stateRef.current.sessionTransition || stateRef.current.pendingSessionControl || stateRef.current.runtimeOperation) return;
     const requestId = randomId();
     const navigation = navigationRef.current;
-    const owner = sessionViewRef.current;
+    const owner = sessionViewRef.current == null ? undefined : sessionIdentity(sessionViewRef.current);
     dispatch({ type: "session/transition_start", kind: "close", requestId, sessionId });
     void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/close`, {
       method: "POST",
@@ -994,7 +1075,7 @@ export function useAcp() {
     const requestId = randomId();
     const navigation = navigationRef.current;
     const owner = sessionViewRef.current?.sessionId === sessionId
-      ? sessionViewRef.current
+      ? sessionIdentity(sessionViewRef.current)
       : stateRef.current.cachedSessions.get(sessionId)?.sessionOwner;
     dispatch({ type: "session/delete_start", requestId, sessionId, stage: "deleting" });
     void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
@@ -1012,6 +1093,100 @@ export function useAcp() {
   const dismissExternalFlow = useCallback((elicitationId: string) => {
     dispatch({ type: "elicitation/dismiss_flow", elicitationId });
   }, []);
+
+  const loadTurnProcess = useCallback(async (
+    process: DeferredTurnProcess, offset: number, signal: AbortSignal,
+  ): Promise<BridgeTurnProcessPage> => {
+    const navigation = navigationRef.current;
+    const ownsSession = () => navigationRef.current === navigation &&
+      activeSessionIdRef.current === process.owner.sessionId &&
+      sameSessionOwner(sessionViewRef.current, process.owner);
+    const isCurrent = () => ownsSession() &&
+      sessionViewRef.current?.historyRevision === process.historyRevision;
+    const rejectStale = () => {
+      if (!signal.aborted && ownsSession() && !isCurrent()) {
+        refreshSessionRef.current(process.owner.sessionId);
+      }
+      throw new DOMException("Session history changed", "AbortError");
+    };
+    if (signal.aborted || !isCurrent()) rejectStale();
+    const query = new URLSearchParams({
+      expectedEpoch: process.owner.bridgeEpoch,
+      expectedIncarnation: String(process.owner.sessionIncarnation),
+      historyRevision: process.historyRevision,
+      offset: String(offset),
+    });
+    try {
+      const page = await requestJson<BridgeTurnProcessPage>(
+        `/api/v1/sessions/${encodeURIComponent(process.owner.sessionId)}/turns/${encodeURIComponent(process.turnId)}/process?${query}`,
+        { signal },
+      );
+      if (signal.aborted || !isCurrent()) rejectStale();
+      if (!isRecord(page) || !sameSessionOwner(page, process.owner) || page.turnId !== process.turnId ||
+        page.historyRevision !== process.historyRevision || page.offset !== offset ||
+        page.total !== process.processCount || !Array.isArray(page.items) ||
+        page.items.length !== Math.min(10, process.processCount - offset) ||
+        !page.items.every((item) => Array.isArray(item) && item.length > 0 &&
+          item.every((update) => isRecord(update) && typeof update.sessionUpdate === "string")) ||
+        !isRecord(page.terminals) || !Object.entries(page.terminals).every(([id, terminal]) =>
+          isRecord(terminal) && terminal.terminalId === id && terminal.sessionId === process.owner.sessionId &&
+          typeof terminal.output === "string" && typeof terminal.truncated === "boolean" &&
+          typeof terminal.released === "boolean") ||
+        (page.response != null && (!isRecord(page.response) || typeof page.response.stopReason !== "string")) ||
+        (page.nextOffset !== null && page.nextOffset !== offset + page.items.length) ||
+        offset + page.items.length > page.total ||
+        (page.nextOffset === null) !== (offset + page.items.length === page.total)) {
+        throw new Error("Bridge returned an invalid process page");
+      }
+      return page;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409 && isCurrent()) {
+        refreshSessionRef.current(process.owner.sessionId);
+      }
+      throw error;
+    }
+  }, []);
+
+  const releaseTurnProcess = useCallback((process: DeferredTurnProcess) => {
+    const view = sessionViewRef.current;
+    if (view == null || activeSessionIdRef.current !== process.owner.sessionId || !sameSessionOwner(view, process.owner) ||
+      !stateRef.current.timeline.some((item) => sameTurnProcess(item.retainedProcess, process))) return;
+    // Prompt preflight can advance the raw snapshot before the visible state.
+    // A stable operation still identifies that same completed turn at expiry.
+    const turn = view.collapsedTurns?.find((turn) => process.operationId != null
+      ? (turn.operationId ?? turn.outcomes.at(-1)?.operationId) === process.operationId
+      : turn.turnId === process.turnId && turn.historyRevision === process.historyRevision);
+    if (!turn?.processIncluded || turn.visibleRanges == null) return;
+    let released = releasedFor(view);
+    if (released == null) {
+      released = { owner: process.owner, navigation: navigationRef.current, operations: new Set(), turns: new Map() };
+      releasedProcessesRef.current = released;
+    }
+    if (process.operationId != null) released.operations.add(process.operationId);
+    released.turns.set(process.turnId, process.historyRevision);
+    sessionViewRef.current = filterReleasedView(view);
+    dispatch({ type: "session/release_turn_process", process });
+  }, [filterReleasedView, releasedFor]);
+
+  const readThreadForExport = useCallback(async () => {
+    if (!stateRef.current.timeline.some((item) => item.deferredProcess != null)) return stateRef.current;
+    const owner = sessionViewRef.current == null ? undefined : sessionIdentity(sessionViewRef.current);
+    if (owner == null) return undefined;
+    const navigation = navigationRef.current;
+    try {
+      const view = await requestJson<BridgeSessionView>(
+        `/api/v1/sessions/${encodeURIComponent(owner.sessionId)}${sessionCwdQuery(undefined, false, owner)}`,
+      );
+      if (navigationRef.current !== navigation || !sameSessionOwner(view, owner) ||
+        !sameSessionOwner(sessionViewRef.current, owner)) return undefined;
+      // Export requests a complete snapshot explicitly; it never expands the
+      // visible timeline or replaces a newer live revision.
+      return appReducer(stateRef.current, { type: "bridge/session_hydrate", view });
+    } catch (error) {
+      if (navigationRef.current === navigation && sameSessionOwner(sessionViewRef.current, owner)) reportError(error);
+      return undefined;
+    }
+  }, [reportError]);
 
   return {
     state,
@@ -1040,16 +1215,26 @@ export function useAcp() {
     deleteSession,
     searchWorkspaceContext,
     readWorkspaceContext,
+    loadTurnProcess,
+    releaseTurnProcess,
+    readThreadForExport,
   };
 }
 
-function sessionCwdQuery(cwd: string | null | undefined, canLoad: boolean | undefined, owner?: SessionOwner): string {
+function sessionIdentity(owner: SessionOwner): SessionOwner {
+  return { bridgeEpoch: owner.bridgeEpoch, sessionId: owner.sessionId, sessionIncarnation: owner.sessionIncarnation };
+}
+
+function sessionCwdQuery(cwd: string | null | undefined, canLoad: boolean | undefined, owner?: SessionOwner, compact = false, includeProcessFrom?: string, excludedOperations?: ReadonlySet<string>): string {
   const query = new URLSearchParams();
+  if (compact) query.set("presentation", "compact");
   if (canLoad === true && cwd != null) query.set("cwd", cwd);
   if (owner != null) {
     query.set("expectedEpoch", owner.bridgeEpoch);
     query.set("expectedIncarnation", String(owner.sessionIncarnation));
   }
+  if (compact && owner != null && includeProcessFrom != null) query.set("includeProcessFrom", includeProcessFrom);
+  if (compact && owner != null && excludedOperations?.size) query.set("excludeProcessFor", JSON.stringify([...excludedOperations]));
   return query.size === 0 ? "" : `?${query}`;
 }
 

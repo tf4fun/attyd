@@ -442,7 +442,12 @@ button, input, textarea, select { color: inherit; }
 
 .plan-card { margin-left: 38px; padding: 11px 13px; border: 1px solid var(--theme-border-default); border-radius: 9px; background: var(--theme-surface-panel); font-size: 11px; }
 .plan-heading { display: flex; align-items: center; gap: 7px; font-weight: 700; }
-.plan-heading span { margin-left: auto; color: var(--muted); font: 9px var(--mono); }
+.plan-disclosure { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.plan-disclosure > svg { flex: 0 0 auto; }
+.plan-progress { color: var(--muted); font: 9px var(--mono); white-space: nowrap; }
+.plan-heading .chevron { transition: transform .15s ease; }
+.plan-card[data-open="true"] .plan-heading .chevron { transform: rotate(90deg); }
+.plan-body > code { display: block; margin-top: 8px; overflow-wrap: anywhere; }
 .plan-card ol { display: flex; flex-direction: column; gap: 8px; margin: 11px 0 0; padding: 0; list-style: none; }
 .plan-card li { display: grid; grid-template-columns: 15px 1fr auto; align-items: start; gap: 7px; color: var(--theme-text-muted); }
 .plan-card li.in_progress { color: var(--theme-text-primary); font-weight: 600; }
@@ -1285,6 +1290,12 @@ button, input, textarea, select { color: inherit; }
 .turn-agent-label { display: flex; align-items: center; gap: 7px; color: var(--theme-role-agent-ink); font-size: 12px; font-weight: 650; margin-bottom: -8px; }
 .turn-agent-label > svg, .turn-agent-label > span { flex: 0 0 auto; }
 .turn-process-content[hidden] { display: none; }
+.turn-process-pagination { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 0; }
+.turn-process-pagination button { padding: 7px 10px; border: 1px solid var(--theme-border-default); border-radius: 6px; background: var(--theme-surface-panel); color: var(--theme-text-primary); font: inherit; cursor: pointer; }
+.turn-process-pagination button:hover:not(:disabled) { border-color: var(--theme-accent-border); background: var(--theme-surface-raised); }
+.turn-process-pagination button:focus-visible { outline: 2px solid var(--theme-accent-border); outline-offset: 2px; }
+.turn-process-pagination button:disabled { opacity: .6; cursor: default; }
+.turn-process-load-error { color: var(--danger); font-size: 12px; }
 .turn-process { min-width: 0; }
 .turn-process-trigger {
   display: flex; align-items: center; gap: 10px; width: 100%; min-height: 46px; padding: 10px 12px;
@@ -1652,7 +1663,7 @@ button, input, textarea, select { color: inherit; }
 .terminal-embed,
 .terminal-embed pre,
 .diff-card summary,
-.plan-heading span,
+.plan-progress,
 .plan-card li small,
 .compaction-heading small,
 .compaction-heading code,

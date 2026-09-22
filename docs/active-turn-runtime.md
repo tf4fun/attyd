@@ -249,8 +249,11 @@ from disposable presentation delivery. Agent input must be applied completely an
 Successful internal publication must release the journal's old payloads. A slow session observer's
 reconstructible backlog may be coalesced into a latest reset without clipping conversation data,
 cancelling work or releasing its observation lease. Errors and other semantic outcomes absent from
-the current snapshot remain reliable events. These targets are being tested in Red before the
-production memory optimization is implemented; see the [diagnosis and plan](runtime-memory-retention.md).
+the current snapshot remain reliable events. The first retention implementation landed in `802c20b`;
+see the [diagnosis and plan](runtime-memory-retention.md) for its historical Red baseline.
+The [efficiency gates](runtime-memory-efficiency.md) now pass for consumer handoff races, small control
+publications, allocations independent of unchanged content, and current browser diagnostic sources.
+Their implementation does not clip business history or weaken atomic snapshot commits.
 
 In practice the Agent/model context window and available process memory bound useful history, but
 the bridge does not infer that context window or reinterpret it as an ACP admission rule. Resource

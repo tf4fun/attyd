@@ -1196,7 +1196,7 @@ describe("ACP interactive UI contract", () => {
     expect(answer.querySelector(".debug-info-panel")?.textContent)
       .toContain("router-message-id");
     expect(userMessage.querySelector(".debug-info-panel")?.textContent)
-      .toContain("Message events");
+      .toContain("Latest source event");
     expect([...requireElement(userMessage.querySelector(".message-meta-actions")).children].map(
       (element) => element.getAttribute("aria-label"),
     )).toEqual(["Message info", "Edit and resend user message"]);

@@ -51,6 +51,8 @@
     "file": "Plan file",
     "event": "Plan event",
     "title": "Plan",
+    "collapse": "Collapse plan details",
+    "expand": "Expand plan details",
     "progress": "{{completed}}/{{total}}",
     "priority": {
       "high": "high",
@@ -65,7 +67,7 @@
     "cancelled": "Context compaction cancelled",
     "title": "Context compaction",
     "noSummarySupplied": "No retained summary was supplied by the Agent.",
-    "events": "Compaction events",
+    "events": "Latest compaction event",
     "summary_zero": "no retained summary",
     "summary_one": "{{count, number}} summary block",
     "summary_other": "{{count, number}} summary blocks",
@@ -108,7 +110,7 @@
     "locations": "Locations",
     "annotations": "Content annotations",
     "terminals": "Terminals",
-    "events": "Message events",
+    "events": "Latest source event",
     "kind": {
       "read": "Read",
       "edit": "Edit",

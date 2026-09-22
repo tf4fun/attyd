@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::history_cache::HistoryCacheError;
 use crate::runtime_state::{
     SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
-    fold_active_turn_update,
+    SharedTurnUpdates, fold_shared_active_turn_update,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,7 +29,7 @@ pub(crate) struct TurnOverlay {
     pub operation_id: String,
     pub client_intent_id: String,
     pub prompt: Arc<Vec<Value>>,
-    pub updates: Arc<Vec<Value>>,
+    pub updates: SharedTurnUpdates,
     pub terminal: Option<Value>,
     #[serde(skip)]
     pub(crate) execution: Option<TurnExecution>,
@@ -360,7 +361,7 @@ impl SessionState {
             .ok_or(MirrorError::OperationMismatch)?;
         let mut candidate = turn.clone();
         candidate.updates = Arc::new(
-            fold_active_turn_update(&turn.updates, &update)
+            fold_shared_active_turn_update(&turn.updates, &update)
                 .map_err(|_| MirrorError::InconsistentHistory)?,
         );
         self.active_overlay_bytes = serialized_len(&candidate);
@@ -505,7 +506,21 @@ fn payload_digest(prompt: &[Value]) -> [u8; 32] {
 }
 
 fn serialized_len(value: &impl Serialize) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |value| value.len())
+    let mut counter = SerializedByteCounter(0);
+    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |_| counter.0)
+}
+
+struct SerializedByteCounter(usize);
+
+impl Write for SerializedByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -871,3 +886,6 @@ mod tests {
         assert!(session.active_turn.is_none());
     }
 }
+
+#[cfg(test)]
+mod memory_efficiency_tests;

@@ -54,6 +54,49 @@ test("shows the live process and keeps only the final answer after completion at
   await page.screenshot({ path: testInfo.outputPath("turn-process-desktop-collapsed.png"), animations: "disabled" });
 });
 
+test("releases an observed completed turn after five minutes folded and restores it through pagination", async ({ page, collapseFixture }) => {
+  await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
+  const processRequests: string[] = [];
+  const isProcessUrl = (url: string) => /\/api\/v1\/sessions\/saved-session\/turns\/[^/]+\/process$/u.test(new URL(url).pathname);
+  page.on("request", (request) => {
+    if (isProcessUrl(request.url())) processRequests.push(request.url());
+  });
+  const { turn } = await startTurn(page);
+  await collapseFixture.advance("append");
+  await expect(turn.getByText("The final answer is ready.", { exact: true })).toBeVisible();
+  await collapseFixture.advance("finish");
+  await expectFolded(turn);
+  await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"));
+  await turn.getByRole("button", { name: "Expand execution process", exact: true }).click();
+  await expect(turn.getByText("Inspect collapse fixture", { exact: true })).toBeVisible();
+  await turn.getByRole("button", { name: "Collapse execution process", exact: true }).click();
+  expect(processRequests).toEqual([]);
+
+  await page.clock.fastForward("04:59");
+  await expect(turn.getByText("Inspect collapse fixture", { exact: true })).toHaveCount(1);
+  await expect(turn.getByText("Inspect collapse fixture", { exact: true })).toBeHidden();
+  await page.clock.fastForward("00:01");
+  await expect(turn.locator(".tool-card")).toHaveCount(0);
+  await expect(turn.locator(".message-content").getByText("Process paragraph 20:", { exact: false })).toHaveCount(0);
+  await expect(turn.getByText("The final answer is ready.", { exact: true })).toBeVisible();
+  await expect(turn.locator('[data-stop-reason="end_turn"]')).toBeVisible();
+  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveAttribute("aria-expanded", "false");
+  expect(processRequests).toEqual([]);
+
+  const response = page.waitForResponse((candidate) => isProcessUrl(candidate.url()));
+  await turn.getByRole("button", { name: "Expand execution process", exact: true }).click();
+  const result = await response;
+  expect(result.ok()).toBe(true);
+  const details = await result.json();
+  expect(details).toMatchObject({ offset: 0 });
+  expect(details.items.length).toBeGreaterThan(0);
+  expect(details.items.length).toBeLessThanOrEqual(10);
+  await expect(turn.getByText("Inspect collapse fixture", { exact: true })).toBeVisible();
+  await expect(turn.locator(".message-content").getByText("Process paragraph 20:", { exact: false })).toBeVisible();
+  await expect(turn.getByText("The final answer is ready.", { exact: true })).toBeVisible();
+  expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0"]);
+});
+
 for (const distance of [24, 500]) {
   test(`preserves the reading position ${distance}px above the bottom until the user returns`, async ({ page, collapseFixture }) => {
     await page.setViewportSize({ width: 900, height: 420 });

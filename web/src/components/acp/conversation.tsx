@@ -14,17 +14,21 @@ import {
   UserRound,
 } from "lucide-react";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import i18n, { useTranslation } from "../../i18n";
 import type {
   AgentActivity,
   AssistantMessageChunk,
+  DeferredTurnProcess,
   TimelineItem,
 } from "../../lib/state";
+import { processPageTimeline } from "../../lib/state";
+import { COLLAPSED_PROCESS_RETENTION_MS } from "../../lib/process-retention";
+import { RequestTimeoutError, sameSessionOwner, type BridgeTurnProcessPage } from "../../lib/business-api";
 import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { contentBlocksToMarkdown } from "../../lib/thread-markdown";
-import { collectTurnReviewChanges, type ReviewSummary } from "../../lib/review-changes";
+import { collectReviewChanges, collectTurnReviewChanges, type ReviewSummary } from "../../lib/review-changes";
 import { splitTurnPresentation } from "../../lib/turn-presentation";
 import { ChangeReview } from "./change-review";
 import { ContentBlocks } from "./content-block";
@@ -47,6 +51,8 @@ export function Conversation({
   atBottom = true,
   canAutoCollapse,
   onProcessToggle,
+  onLoadTurnProcess,
+  onReleaseTurnProcess,
 }: {
   timeline: TimelineItem[];
   terminalSnapshots?: TerminalSnapshot[];
@@ -60,6 +66,8 @@ export function Conversation({
   atBottom?: boolean;
   canAutoCollapse?: () => boolean;
   onProcessToggle?: () => void;
+  onLoadTurnProcess?: TurnProcessLoader;
+  onReleaseTurnProcess?: (process: DeferredTurnProcess) => void;
 }) {
   const { t } = useTranslation("conversation");
   const turns = useMemo(() => collectTurnReviewChanges(timeline), [timeline]);
@@ -104,8 +112,10 @@ export function Conversation({
     <div className="conversation">
       {keyedTurns.entries.map(({ turn, key }, index) => {
         const reviewId = turn.summary.files[0]?.diffs[0]?.id;
+        const deferredProcess = turn.items.find((item) => item.deferredProcess)?.deferredProcess;
+        const retainedProcess = turn.items.find((item) => item.retainedProcess)?.retainedProcess;
         return <ConversationTurn
-          key={key}
+          key={deferredProcess ? `deferred:${turnProcessScope(deferredProcess)}` : key}
           number={index + 1}
           items={turn.items}
           summary={turn.summary}
@@ -116,6 +126,10 @@ export function Conversation({
           atBottom={atBottom}
           canAutoCollapse={canAutoCollapse}
           onProcessToggle={onProcessToggle}
+          deferredProcess={deferredProcess}
+          retainedProcess={retainedProcess}
+          onLoadTurnProcess={onLoadTurnProcess}
+          onReleaseTurnProcess={onReleaseTurnProcess}
           entryProps={{
             terminalSnapshots, canReusePrompt, onReusePrompt, onRetryPrompt,
             agentActivity, onNavigateThread, onOpenThreadMarkdown,
@@ -128,6 +142,7 @@ export function Conversation({
 
 function ConversationTurn({
   number, items, summary, reviewId, completed, atBottom, canAutoCollapse, onProcessToggle, entryProps,
+  deferredProcess, retainedProcess, onLoadTurnProcess, onReleaseTurnProcess,
 }: {
   number: number;
   items: TimelineItem[];
@@ -137,6 +152,10 @@ function ConversationTurn({
   atBottom: boolean;
   canAutoCollapse?: () => boolean;
   onProcessToggle?: () => void;
+  deferredProcess?: DeferredTurnProcess;
+  retainedProcess?: DeferredTurnProcess;
+  onLoadTurnProcess?: TurnProcessLoader;
+  onReleaseTurnProcess?: (process: DeferredTurnProcess) => void;
   entryProps: Omit<ComponentProps<typeof TimelineEntry>, "item">;
 }) {
   const { t } = useTranslation("conversation");
@@ -158,17 +177,26 @@ function ConversationTurn({
     disclosure.current?.dispatchEvent(new Event("toggle"));
   }, [compact, expanded]);
 
-  const folded = completed && compact;
+  const folded = deferredProcess != null || (completed && compact);
   const process = folded ? presentation.process : items.filter((item) =>
     item.type !== "message" && item.type !== "stop" && item.type !== "error"
   );
   const renderEntry = (item: TimelineItem) => <TimelineEntry key={item.id} item={item} {...entryProps} />;
-  const hasProcess = process.length > 0 || reviewId != null;
-  const processCount = presentation.process.reduce((count, item) =>
+  const hasProcess = deferredProcess ? deferredProcess.processCount > 0 : process.length > 0 || reviewId != null;
+  const processCount = deferredProcess?.processCount ?? presentation.process.reduce((count, item) =>
     count + (item.type === "assistant" ? item.chunks.length : 1), 0
   );
-  const hasAgentContent = items.some((item) =>
+  const hasAgentContent = (deferredProcess?.processCount ?? 0) > 0 || items.some((item) =>
     item.type === "assistant" || item.type === "tool" || item.type === "plan" || item.type === "compaction"
+  );
+  useCollapsedProcessRelease(
+    completed && folded && !expanded && hasProcess && !deferredProcess &&
+      retainedProcess != null && onReleaseTurnProcess != null,
+    retainedProcess ? JSON.stringify([
+      retainedProcess.owner.bridgeEpoch, retainedProcess.owner.sessionId, retainedProcess.owner.sessionIncarnation,
+      retainedProcess.operationId ?? retainedProcess.turnId,
+    ]) : undefined,
+    () => { if (retainedProcess) onReleaseTurnProcess?.(retainedProcess); },
   );
   return (
     <div ref={disclosure} className="conversation-turn" role="group" aria-label={t("turn.label", { number })}>
@@ -201,8 +229,15 @@ function ConversationTurn({
             </button>
           ) : null}
           <div id={panelId} className="turn-process-content" hidden={folded && !expanded}>
-            {process.map(renderEntry)}
-            {reviewId ? <TurnChangeReview key={`changes:${reviewId}`} turnId={reviewId} summary={summary} /> : null}
+            {deferredProcess ? <DeferredProcessContent
+              process={deferredProcess}
+              expanded={expanded}
+              onLoad={onLoadTurnProcess}
+              entryProps={entryProps}
+            /> : <>
+              {process.map(renderEntry)}
+              {reviewId ? <TurnChangeReview key={`changes:${reviewId}`} turnId={reviewId} summary={summary} /> : null}
+            </>}
           </div>
         </section>
       ) : null}
@@ -210,6 +245,130 @@ function ConversationTurn({
       {presentation.outcomes.map(renderEntry)}
     </div>
   );
+}
+
+type TurnProcessLoader = (
+  process: DeferredTurnProcess,
+  offset: number,
+  signal: AbortSignal,
+) => Promise<BridgeTurnProcessPage>;
+
+function turnProcessScope(process: DeferredTurnProcess): string {
+  return JSON.stringify([
+    process.owner.bridgeEpoch, process.owner.sessionId, process.owner.sessionIncarnation,
+    process.turnId, process.historyRevision,
+  ]);
+}
+
+function useCollapsedProcessRelease(collapsed: boolean, scope: string | undefined, release: () => void) {
+  const releaseRef = useRef(release);
+  useLayoutEffect(() => { releaseRef.current = release; }, [release]);
+  useEffect(() => {
+    if (!collapsed) return;
+    // Re-rendering or finishing a pending page must not restart the period.
+    // Only reopening the disclosure or changing its retention scope does so.
+    const timer = window.setTimeout(() => releaseRef.current(), COLLAPSED_PROCESS_RETENTION_MS);
+    return () => window.clearTimeout(timer);
+  }, [collapsed, scope]);
+}
+
+function DeferredProcessContent({ process, expanded, onLoad, entryProps }: {
+  process: DeferredTurnProcess;
+  expanded: boolean;
+  onLoad?: TurnProcessLoader;
+  entryProps: Omit<ComponentProps<typeof TimelineEntry>, "item">;
+}) {
+  const { t } = useTranslation("conversation");
+  const container = useRef<HTMLDivElement>(null);
+  const request = useRef<AbortController | null>(null);
+  const [pages, setPages] = useState<BridgeTurnProcessPage[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [failure, setFailure] = useState<"timeout" | "error" | null>(null);
+  const nextOffset = pages.at(-1)?.nextOffset ?? (pages.length === 0 ? 0 : null);
+  const items = useMemo(() => pages.flatMap(processPageTimeline), [pages]);
+  const summary = useMemo(() => collectReviewChanges(items), [items]);
+  const reviewId = summary.files[0]?.diffs[0]?.id;
+  const terminals = useMemo(() => {
+    const snapshots = new Map(pages.flatMap((page) => Object.values(page.terminals))
+      .map((terminal) => [terminal.terminalId, terminal]));
+    for (const terminal of entryProps.terminalSnapshots) snapshots.set(terminal.terminalId, terminal);
+    return [...snapshots.values()];
+  }, [pages, entryProps.terminalSnapshots]);
+
+  useLayoutEffect(() => () => {
+    request.current?.abort();
+    request.current = null;
+  }, []);
+
+  useCollapsedProcessRelease(!expanded && (pages.length > 0 || loading || failure != null), turnProcessScope(process), () => {
+    request.current?.abort();
+    request.current = null;
+    setPages([]);
+    setLoading(false);
+    setFailure(null);
+  });
+
+  const loadPage = useCallback(async () => {
+    if (request.current || nextOffset == null) return;
+    if (!onLoad) {
+      setFailure("error");
+      return;
+    }
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    setFailure(null);
+    try {
+      const page = await onLoad(process, nextOffset, controller.signal);
+      if (controller.signal.aborted || request.current !== controller) return;
+      // Pages belong to one immutable history and never enter the canonical
+      // timeline. A reset or session switch remounts this cache and aborts it.
+      const expectedEnd = Math.min(nextOffset + 10, process.processCount);
+      if (!sameSessionOwner(page, process.owner) || page.turnId !== process.turnId ||
+        page.historyRevision !== process.historyRevision || page.offset !== nextOffset ||
+        page.total !== process.processCount || page.items.length !== expectedEnd - nextOffset ||
+        page.nextOffset !== (expectedEnd === process.processCount ? null : expectedEnd)) {
+        throw new Error("Unexpected turn process page");
+      }
+      setPages((current) => [...current, page]);
+    } catch (error) {
+      if (!controller.signal.aborted && request.current === controller) {
+        setFailure(error instanceof RequestTimeoutError ? "timeout" : "error");
+      }
+    } finally {
+      if (request.current === controller) {
+        request.current = null;
+        setLoading(false);
+      }
+    }
+  }, [nextOffset, onLoad, process]);
+
+  useEffect(() => {
+    if (expanded && pages.length === 0 && failure == null) void loadPage();
+  }, [expanded, pages.length, failure, loadPage]);
+
+  useEffect(() => {
+    container.current?.dispatchEvent(new Event("toggle"));
+  }, [items]);
+
+  return <div ref={container} aria-busy={loading}>
+    {items.map((item) => <TimelineEntry key={item.id} item={item} {...entryProps} terminalSnapshots={terminals} />)}
+    {reviewId ? <TurnChangeReview key={`changes:${reviewId}`} turnId={reviewId} summary={summary} /> : null}
+    <div className="turn-process-pagination">
+      {loading ? <span role="status">{t("process.loading")}</span> : null}
+      {failure ? <span className="turn-process-load-error" role="alert">{t(failure === "timeout" ? "process.loadTimeout" : "process.loadError")}</span> : null}
+      {failure || (pages.length > 0 && nextOffset != null) ? <button
+        type="button"
+        className="turn-process-load-more"
+        disabled={loading}
+        onClick={() => { void loadPage(); }}
+      >{t(failure ? "process.retry" : "process.loadMore")}</button> : null}
+      {pages.length > 0 ? <span>{t("process.loaded", {
+        count: pages.reduce((count, page) => count + page.items.length, 0),
+        total: process.processCount,
+      })}</span> : null}
+    </div>
+  </div>;
 }
 
 function TurnChangeReview({ turnId, summary }: { turnId: string; summary: ReviewSummary }) {
@@ -435,7 +594,7 @@ function MessageEntry({
             hidden={!debugOpen}
             entries={[
               { label: t("debug.messageId"), value: item.messageId, format: "text" },
-              { label: t("debug.messageEvents"), value: item.raw, count: item.raw.length },
+              { label: t("debug.messageEvents"), value: item.raw },
             ]}
           />
         </div>
@@ -715,7 +874,7 @@ function ThinkingBlock({
             hidden={!debugOpen}
             entries={[
               { label: t("debug.messageId"), value: item.messageId, format: "text" },
-              { label: t("debug.messageEvents"), value: item.raw, count: item.raw.length },
+              { label: t("debug.messageEvents"), value: item.raw },
             ]}
           />
         </footer>
@@ -751,7 +910,7 @@ function MessageMeta({
         hidden={!open}
         entries={[
           { label: t("debug.messageId"), value: messageId, format: "text" },
-          { label: t("debug.messageEvents"), value: events, count: events.length },
+          { label: t("debug.messageEvents"), value: events },
         ]}
       />
     </footer>

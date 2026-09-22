@@ -5,6 +5,11 @@ The bridge-first state-machine migration and its executable acceptance ledger ar
 lifecycle, reconnect, concurrency, and subscriber correctness; browser tests validate only the
 projection after the bridge gates pass.
 
+Completed-turn transfer, on-demand process pagination, and the collapsible task bar have a
+separate [design and acceptance ledger](lazy-turn-process.md).
+Ordinary API deadlines, timeout messages, and explicit retry behavior are covered by the
+[HTTP timeout ledger](http-request-timeouts.md).
+
 The production host and every host-level integration harness run the Rust backend. TypeScript is
 used only for the browser application, shared browser protocol types, test Agents, and test
 drivers; there is no second backend implementation.

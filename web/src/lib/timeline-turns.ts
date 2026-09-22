@@ -3,7 +3,20 @@ import type { TimelineItem } from "./state";
 export function timelineTurnStarts(timeline: TimelineItem[]): number[] {
   const starts = [0];
   let operationId: string | undefined;
+  let historyTurnId: string | undefined;
   for (const [index, item] of timeline.entries()) {
+    // Compact history carries explicit boundaries. Removed process entries
+    // must not merge adjacent prompts, outputs, or turns without a prompt.
+    if (item.historyTurnId != null) {
+      if (item.historyTurnId !== historyTurnId && starts.at(-1) !== index) starts.push(index);
+      historyTurnId = item.historyTurnId;
+      operationId = undefined;
+      continue;
+    }
+    if (historyTurnId != null) {
+      if (starts.at(-1) !== index) starts.push(index);
+      historyTurnId = undefined;
+    }
     if (item.type === "message") {
       // Loaded histories may omit outcomes. A new prompt still separates turns;
       // multiple user chunks with the same operation ID belong to one prompt.

@@ -8,7 +8,7 @@
     "turnResponse": "轮次响应",
     "errorDetails": "ACP 错误详情",
     "messageId": "消息 ID",
-    "messageEvents": "消息事件"
+    "messageEvents": "最近的来源事件"
   },
   "message": {
     "editAndResendLabel": "编辑并重新发送用户消息",
@@ -200,6 +200,12 @@
     "collapse": "收起执行过程",
     "show": "展开",
     "hide": "收起",
+    "loading": "正在加载执行过程…",
+    "loadMore": "再加载 10 条",
+    "loadError": "无法加载执行过程。",
+    "loadTimeout": "执行过程加载超时，请点击重试。",
+    "retry": "重试加载",
+    "loaded": "已加载 {{count, number}} / {{total, number}} 条",
     "count_one": "{{count, number}} 条记录",
     "count_other": "{{count, number}} 条记录"
   },

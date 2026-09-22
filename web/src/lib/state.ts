@@ -28,6 +28,7 @@ import type {
 import { assertNever } from "../../../shared/exhaustive";
 import type {
   BridgeSessionView,
+  BridgeTurnProcessPage,
   SessionBusinessEvent,
   SessionOwner,
   SessionSyncPhase,
@@ -35,6 +36,7 @@ import type {
 import { sameSessionOwner } from "./business-api";
 import { randomId } from "./id";
 import { timelineTurnStarts } from "./timeline-turns";
+import { releaseTimelineProcess, releaseUnreferencedTerminals } from "./process-retention";
 
 export interface AssistantMessageChunk {
   id: string;
@@ -44,7 +46,15 @@ export interface AssistantMessageChunk {
   raw: unknown[];
 }
 
-export type TimelineItem =
+export interface DeferredTurnProcess {
+  turnId: string;
+  operationId?: string;
+  historyRevision: string;
+  processCount: number;
+  owner: SessionOwner;
+}
+
+export type TimelineItem = (
   | {
       id: string;
       type: "message";
@@ -90,7 +100,12 @@ export type TimelineItem =
       dataTruncated?: boolean;
       dataBytes?: number;
       retryBlocks?: ContentBlock[];
-    };
+    }
+) & {
+  historyTurnId?: string;
+  deferredProcess?: DeferredTurnProcess;
+  retainedProcess?: DeferredTurnProcess;
+};
 
 export interface PendingPermission {
   permissionId: string;
@@ -283,7 +298,8 @@ export type AppAction =
   | { type: "session/management_complete"; sessionId: string; requestId: string; owner?: SessionOwner; deleted: boolean }
   | { type: "socket/open" }
   | { type: "socket/closed" }
-  | { type: "bridge/session_hydrate"; view: BridgeSessionView }
+  | { type: "bridge/session_hydrate"; view: BridgeSessionView; failedPrompt?: { requestId: string; message: string } }
+  | { type: "session/release_turn_process"; process: DeferredTurnProcess }
   | {
       type: "bridge/turn_complete";
       event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_complete" }>;
@@ -490,8 +506,43 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           };
     case "socket/closed":
       return terminateBridgeState(state, "stopped", false);
-    case "bridge/session_hydrate":
-      return hydrateBridgeSession(state, action.view);
+    case "bridge/session_hydrate": {
+      const next = hydrateBridgeSession(state, action.view);
+      const failure = action.failedPrompt;
+      if (failure == null || action.view.phase !== "ready" || action.view.activeTurn != null) return next;
+      const snapshot = sameSessionOwner(state.sessionOwner, action.view)
+        ? state : state.cachedSessions.get(action.view.sessionId);
+      if (!sameSessionOwner(snapshot?.sessionOwner, action.view)) return next;
+      const pending = snapshot?.pendingPrompt;
+      const previousFailure = snapshot?.timeline.find((item) =>
+        item.type === "error" && item.requestId === failure.requestId && item.retryBlocks != null,
+      );
+      const blocks = pending?.requestId === failure.requestId ? pending.blocks
+        : previousFailure?.type === "error" ? previousFailure.retryBlocks : undefined;
+      if (blocks == null) return next;
+      // The authoritative read confirmed no admission. Reuse the existing input
+      // for its visible question and explicit retry, without another body copy.
+      return {
+        ...next,
+        timeline: [...next.timeline, {
+          id: randomId(), type: "message", role: "user", blocks, raw: [],
+        }, errorTimelineItem({
+          type: "bridge/error", operation: "session/prompt",
+          requestId: failure.requestId, message: failure.message,
+        }, blocks)],
+      };
+    }
+    case "session/release_turn_process": {
+      if (!sameSessionOwner(state.sessionOwner, action.process.owner)) return state;
+      const timeline = releaseTimelineProcess(state.timeline, action.process);
+      if (timeline === state.timeline) return state;
+      return { ...state, timeline, terminalSnapshots: releaseUnreferencedTerminals(state.terminalSnapshots,
+        state.timeline, [timeline, state.permissions, state.elicitations, state.activePlan]),
+        sessionTransition: state.sessionTransition == null ? undefined : {
+          ...state.sessionTransition, backup: compactSessionSnapshot(state.sessionTransition.backup),
+        },
+      };
+    }
     case "bridge/turn_complete":
       return applyBridgeTurnComplete(state, action.event);
     case "bridge/turn_failed":
@@ -1647,13 +1698,13 @@ function reduceSessionUpdate(
     // replay never creates a live composer card, even for unfinished entries.
     const turnStart = timelineTurnStarts(state.timeline).at(-1) ?? 0;
     const index = state.timeline.findIndex((item, index) => index >= turnStart &&
-      item.type === "plan" && item.update.sessionUpdate === "plan");
+      item.historyTurnId == null && item.type === "plan" && item.update.sessionUpdate === "plan");
     const previous = state.activePlan ?? state.timeline[index];
     const item: Extract<TimelineItem, { type: "plan" }> = {
       id: previous?.id ?? randomId(),
       type: "plan",
       update,
-      raw: [...(previous?.type === "plan" ? previous.raw : []), notification],
+      raw: [notification],
     };
     const active = state.running && state.sessionSyncPhase !== "reconciling" &&
       update.entries.some(({ status }) => status !== "completed");
@@ -1677,14 +1728,18 @@ function reduceSessionUpdate(
 
   if (update.sessionUpdate === "plan_update") {
     const planId = update.plan.planId;
-    const id = `plan:${planId}`;
-    const index = state.timeline.findIndex((item) => item.id === id);
+    const baseId = `plan:${planId}`;
+    const index = state.timeline.findIndex((item) => item.historyTurnId == null && item.type === "plan" && (
+      item.update.sessionUpdate === "plan_update" ? item.update.plan.planId === planId :
+        item.update.sessionUpdate === "plan_removed" && item.update.planId === planId
+    ));
     const current = index >= 0 ? state.timeline[index] : undefined;
+    const id = current?.id ?? (state.timeline.some((item) => item.id === baseId) ? `${baseId}:${state.timeline.length}` : baseId);
     const item: TimelineItem = {
       id,
       type: "plan",
       update,
-      raw: [...(current?.type === "plan" ? current.raw : []), notification],
+      raw: [notification],
     };
     const timeline = [...state.timeline];
     if (index >= 0) timeline[index] = item;
@@ -1697,8 +1752,10 @@ function reduceSessionUpdate(
   }
 
   if (update.sessionUpdate === "plan_removed") {
-    const id = `plan:${update.planId}`;
-    const index = state.timeline.findIndex((item) => item.id === id);
+    const index = state.timeline.findIndex((item) => item.historyTurnId == null && item.type === "plan" && (
+      item.update.sessionUpdate === "plan_update" ? item.update.plan.planId === update.planId :
+        item.update.sessionUpdate === "plan_removed" && item.update.planId === update.planId
+    ));
     const current = index >= 0 ? state.timeline[index] : undefined;
     if (current?.type !== "plan") {
       return {
@@ -1710,10 +1767,10 @@ function reduceSessionUpdate(
       };
     }
     const removed: TimelineItem = {
-      id,
+      id: current.id,
       type: "plan",
       update,
-      raw: [...current.raw, notification],
+      raw: [notification],
     };
     const timeline = [...state.timeline];
     timeline[index] = removed;
@@ -1819,7 +1876,7 @@ function upsertToolCall(
   let index = -1;
   for (let position = timeline.length - 1; position >= turnStart; position--) {
     const item = timeline[position];
-    if (item.type === "tool" && item.call.toolCallId === update.toolCallId) {
+    if (item.historyTurnId == null && item.type === "tool" && item.call.toolCallId === update.toolCallId) {
       index = position;
       break;
     }
@@ -1865,7 +1922,7 @@ function upsertToolCall(
     ...(previous?.cancelled && call.status !== "completed" && call.status !== "failed"
       ? { cancelled: true }
       : {}),
-    raw: [...(previous?.raw ?? []), raw],
+    raw: [raw],
   };
   const next = [...timeline];
   if (index >= 0) next[index] = item;
@@ -1890,10 +1947,12 @@ function reduceCompactionUpdate(
   ) {
     return state;
   }
-  const id = `compaction:${update.compactionId}`;
-  const index = state.timeline.findIndex((item) => item.id === id);
+  const baseId = `compaction:${update.compactionId}`;
+  const index = state.timeline.findIndex((item) => item.historyTurnId == null && item.type === "compaction" &&
+    item.compactionId === update.compactionId);
   const current = index >= 0 ? state.timeline[index] : undefined;
   const previous = current?.type === "compaction" ? current : undefined;
+  const id = previous?.id ?? (state.timeline.some((item) => item.id === baseId) ? `${baseId}:${state.timeline.length}` : baseId);
 
   let blocks = previous?.blocks ?? [];
   let status = previous?.status ?? "in_progress";
@@ -1913,7 +1972,7 @@ function reduceCompactionUpdate(
     status,
     blocks,
     error,
-    raw: [...(previous?.raw ?? []), notification],
+    raw: [notification],
   };
   const timeline = [...state.timeline];
   if (index >= 0) timeline[index] = item;
@@ -1941,12 +2000,15 @@ function appendProtocolUserContent(
   turnOperationId: string | undefined,
   raw: unknown,
 ): TimelineItem[] {
+  // Compact history is an immutable presentation slice. An Agent may reuse
+  // its protocol IDs in a later turn, including for the current prompt echo.
   const identified = messageId == null ? -1 : timeline.findIndex((item) =>
-    item.type === "message" && item.messageId === messageId &&
+    item.historyTurnId == null && item.type === "message" && item.messageId === messageId &&
     canMergeTurnOperationIds(item.turnOperationId, turnOperationId)
   );
   const index = identified >= 0 ? identified : timeline.length - 1;
-  const last = timeline[index];
+  const candidate = timeline[index];
+  const last = candidate?.historyTurnId == null ? candidate : undefined;
 
   // Match Zed's optimistic prompt echo handling: an Agent may replay the
   // prompt it just received. Keep one user entry while retaining the raw ACP
@@ -1963,7 +2025,7 @@ function appendProtocolUserContent(
       messageId: last.messageId ?? messageId,
       turnOperationId: last.turnOperationId ?? turnOperationId,
       echoBlocks: promptEchoRemainder(last.echoBlocks ?? last.blocks, block)!,
-      raw: [...last.raw, raw],
+      raw: [raw],
     };
     return next;
   }
@@ -1980,7 +2042,7 @@ function appendProtocolUserContent(
       messageId: last.messageId ?? messageId,
       turnOperationId: last.turnOperationId ?? turnOperationId,
       blocks: mergeTextBlock(last.blocks, block),
-      raw: [...last.raw, raw],
+      raw: [raw],
     };
     return next;
   }
@@ -2007,7 +2069,7 @@ function appendAssistantContent(
   raw: unknown,
 ): TimelineItem[] {
   if (messageId != null) {
-    const index = timeline.findIndex((item) => item.type === "assistant" &&
+    const index = timeline.findIndex((item) => item.historyTurnId == null && item.type === "assistant" &&
       item.chunks.some((chunk) => chunk.messageId === messageId && chunk.role === role)
     );
     const existing = timeline[index];
@@ -2016,14 +2078,14 @@ function appendAssistantContent(
       next[index] = {
         ...existing,
         chunks: existing.chunks.map((chunk) => chunk.messageId === messageId && chunk.role === role
-          ? { ...chunk, blocks: mergeTextBlock(chunk.blocks, block), raw: [...chunk.raw, raw] }
+          ? { ...chunk, blocks: mergeTextBlock(chunk.blocks, block), raw: [raw] }
           : chunk),
       };
       return next;
     }
   }
   const last = timeline.at(-1);
-  if (last?.type !== "assistant") {
+  if (last?.type !== "assistant" || last.historyTurnId != null) {
     return [
       ...timeline,
       {
@@ -2050,7 +2112,7 @@ function appendAssistantContent(
       ...previous,
       messageId: previous.messageId ?? messageId,
       blocks: mergeTextBlock(previous.blocks, block),
-      raw: [...previous.raw, raw],
+      raw: [raw],
     };
   } else {
     chunks.push({
@@ -2365,15 +2427,77 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
     outcomes.push(outcome);
     outcomesByOffset.set(outcome.afterUpdate, outcomes);
   }
-  for (const [index, update] of view.timeline.entries()) {
-    next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
-    for (const outcome of outcomesByOffset.get(index + 1) ?? []) {
-      const id = `bridge-turn-outcome:${outcome.operationId}`;
-      if (!next.timeline.some((item) => item.id === id)) {
-        next = {
-          ...next,
-          timeline: [...finishTurnTools(next.timeline, outcome.response), { id, type: "stop", response: outcome.response }],
-        };
+  if (view.collapsedTurns != null) {
+    const owner: SessionOwner = {
+      bridgeEpoch: view.bridgeEpoch, sessionId: view.sessionId, sessionIncarnation: view.sessionIncarnation,
+    };
+    const observedTurns = new Map<string, TimelineItem[]>();
+    if (state.session?.sessionId === view.sessionId && sameSessionOwner(state.sessionOwner, owner)) {
+      const starts = timelineTurnStarts(priorTimeline);
+      for (const [index, start] of starts.entries()) {
+        const items = priorTimeline.slice(start, starts[index + 1]);
+        if (items.length === 0 || items.some((item) => item.deferredProcess != null)) continue;
+        for (const item of items) {
+          if (item.type === "stop" && item.id.startsWith("bridge-turn-outcome:")) {
+            observedTurns.set(item.id.slice("bridge-turn-outcome:".length), items);
+          } else if (item.type === "message" && item.turnOperationId != null) {
+            observedTurns.set(item.turnOperationId, items);
+          }
+        }
+        if (start + items.length === priorTimeline.length && state.pendingPrompt != null) {
+          observedTurns.set(state.pendingPrompt.requestId, items);
+        }
+      }
+    }
+    for (const turn of view.collapsedTurns) {
+      // Reduce each compact turn independently: missing process rows must not
+      // make distinct final answers or reused Agent IDs merge across turns.
+      let projected = { ...next, timeline: [] as TimelineItem[] };
+      for (const update of view.timeline.slice(turn.beforeUpdate, turn.afterUpdate)) {
+        projected = reduceSessionUpdate(projected, { sessionId: view.sessionId, update });
+      }
+      for (const outcome of turn.outcomes) {
+        projected.timeline = [...finishTurnTools(projected.timeline, outcome.response), {
+          id: `bridge-turn-outcome:${outcome.operationId}`, type: "stop", response: outcome.response,
+        }];
+      }
+      const entries = projected.timeline.length > 0 ? projected.timeline : [{
+        id: `history:${turn.turnId}:empty`, type: "assistant" as const, chunks: [],
+      }];
+      let identified = entries.map((item, index): TimelineItem => ({
+        ...item, id: item.type === "stop" ? item.id : `history:${turn.turnId}:${index}`,
+      }));
+      if (turn.processIncluded) {
+        const previous = turn.outcomes.map((outcome) => observedTurns.get(outcome.operationId))
+          .find((items) => items != null) ?? projected.timeline.flatMap((item) =>
+            item.type === "message" && item.turnOperationId != null
+              ? [observedTurns.get(item.turnOperationId)] : []
+          ).find((items) => items != null);
+        if (previous != null) identified = preserveIncludedTurnIdentity(identified, previous);
+      }
+      next = {
+        ...next,
+        timeline: [...next.timeline, ...identified.map((item, index): TimelineItem => ({
+          ...item,
+          historyTurnId: turn.turnId,
+          ...(index === 0 ? { [turn.processIncluded ? "retainedProcess" : "deferredProcess"]: {
+            turnId: turn.turnId, operationId: turn.operationId ?? turn.outcomes.at(-1)?.operationId,
+            historyRevision: turn.historyRevision, processCount: turn.processCount, owner,
+          } } : {}),
+        }))],
+      };
+    }
+  } else {
+    for (const [index, update] of view.timeline.entries()) {
+      next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
+      for (const outcome of outcomesByOffset.get(index + 1) ?? []) {
+        const id = `bridge-turn-outcome:${outcome.operationId}`;
+        if (!next.timeline.some((item) => item.id === id)) {
+          next = {
+            ...next,
+            timeline: [...finishTurnTools(next.timeline, outcome.response), { id, type: "stop", response: outcome.response }],
+          };
+        }
       }
     }
   }
@@ -2427,6 +2551,49 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
     };
   }
   return next;
+}
+
+/** Keep mounted reading/disclosure state, while every body comes from the new view. */
+function preserveIncludedTurnIdentity(entries: TimelineItem[], previous: TimelineItem[]): TimelineItem[] {
+  const remaining = [...previous];
+  return entries.map((item) => {
+    let index = remaining.findIndex((prior) => {
+      if (prior.type !== item.type) return false;
+      if (item.type === "tool" && prior.type === "tool") return item.call.toolCallId === prior.call.toolCallId;
+      if (item.type === "compaction" && prior.type === "compaction") return item.compactionId === prior.compactionId;
+      if (item.type === "message" && prior.type === "message") return item.messageId != null && item.messageId === prior.messageId;
+      if (item.type === "assistant" && prior.type === "assistant") return item.chunks.some((chunk) =>
+        chunk.messageId != null && prior.chunks.some((old) => old.role === chunk.role && old.messageId === chunk.messageId));
+      return prior.id === item.id;
+    });
+    if (index < 0 && (item.type === "message" || item.type === "assistant" || item.type === "plan" || item.type === "protocol")) {
+      index = remaining.findIndex((prior) => prior.type === item.type);
+    }
+    if (index < 0) return item;
+    const [prior] = remaining.splice(index, 1);
+    if (item.type !== "assistant" || prior.type !== "assistant") return { ...item, id: prior.id };
+    const chunks = [...prior.chunks];
+    return { ...item, id: prior.id, chunks: item.chunks.map((chunk) => {
+      let match = chunks.findIndex((old) => old.role === chunk.role && old.messageId === chunk.messageId);
+      if (match < 0) match = chunks.findIndex((old) => old.role === chunk.role);
+      return match < 0 ? chunk : { ...chunk, id: chunks.splice(match, 1)[0].id };
+    }) };
+  });
+}
+
+/** Decode presentation-only pages without changing the live reducer's cut. */
+export function processPageTimeline(page: BridgeTurnProcessPage): TimelineItem[] {
+  return page.items.flatMap((updates, index) => {
+    let projected: AppState = { ...initialState, session: { sessionId: page.sessionId } };
+    for (const update of updates) {
+      projected = reduceSessionUpdate(projected, { sessionId: page.sessionId, update });
+    }
+    if (page.response != null) projected.timeline = finishTurnTools(projected.timeline, page.response);
+    return projected.timeline.map((item, itemIndex): TimelineItem => ({
+      ...item,
+      id: `process:${page.turnId}:${page.offset + index}:${itemIndex}`,
+    }));
+  });
 }
 
 function applyBridgeTurnComplete(
@@ -2752,7 +2919,7 @@ function withoutCachedSession(
 }
 
 function captureActiveSession(state: AppState): ActiveSessionSnapshot {
-  return {
+  return compactSessionSnapshot({
     cwd: state.cwd,
     session: state.session,
     sessionOwner: state.sessionOwner,
@@ -2774,6 +2941,17 @@ function captureActiveSession(state: AppState): ActiveSessionSnapshot {
     terminalSnapshots: state.terminalSnapshots,
     historyStatus: state.historyStatus,
     historyNotice: state.historyNotice,
+  });
+}
+
+function compactSessionSnapshot(snapshot: ActiveSessionSnapshot): ActiveSessionSnapshot {
+  let timeline = snapshot.timeline;
+  for (const item of snapshot.timeline) {
+    if (item.retainedProcess != null) timeline = releaseTimelineProcess(timeline, item.retainedProcess);
+  }
+  if (timeline === snapshot.timeline) return snapshot;
+  return { ...snapshot, timeline, terminalSnapshots: releaseUnreferencedTerminals(snapshot.terminalSnapshots,
+    snapshot.timeline, [timeline, snapshot.permissions, snapshot.elicitations, snapshot.activePlan]),
   };
 }
 

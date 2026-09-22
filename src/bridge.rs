@@ -56,6 +56,8 @@ mod coordinator;
 mod coordinator_tests;
 mod inbound_requests;
 #[cfg(test)]
+mod memory_efficiency_tests;
+#[cfg(test)]
 mod memory_retention_tests;
 mod scheduling;
 #[cfg(test)]

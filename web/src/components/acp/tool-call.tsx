@@ -175,7 +175,7 @@ export function ToolCallCard({
               ...(call.locations?.length ? [{ label: t("tool.locations"), value: call.locations }] : []),
               ...(annotations.length ? [{ label: t("tool.annotations"), value: annotations }] : []),
               ...(terminals.length ? [{ label: t("tool.terminals"), value: terminals }] : []),
-              { label: t("tool.events"), value: item.raw, count: item.raw.length },
+              { label: t("tool.events"), value: item.raw },
             ]}
           />
         </footer>

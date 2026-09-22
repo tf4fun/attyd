@@ -21,10 +21,13 @@ mod session_dispatch;
 mod session_mirror;
 mod session_observation;
 mod session_observers;
+mod session_presentation;
 mod session_registry;
 mod session_resources;
 mod session_state;
 mod terminal;
+#[cfg(test)]
+mod test_allocations;
 mod websocket_agent;
 
 use anyhow::Result;

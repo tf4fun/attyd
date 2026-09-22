@@ -220,7 +220,7 @@ describe("ACP UI component contract", () => {
     expect(html).toContain('aria-label="Thinking info"');
     expect(html).toContain('aria-label="Thinking debug information"');
     expect(html).toContain('class="message message-agent assistant-chunk"');
-    expect(html).toContain("Message events");
+    expect(html).toContain("Latest source event");
     expect(html).toContain('aria-label="Message info"');
     expect(html).toContain('aria-label="Message debug information"');
     expect(html).toContain('data-thread-search-ignore="true" hidden=""');
@@ -447,7 +447,7 @@ describe("ACP UI component contract", () => {
     expect(html).toContain('aria-label="Tool info"');
     expect(html).toContain('aria-label="Tool debug information"');
     expect(html).toContain("Tool call ID");
-    expect(html).toContain("Message events");
+    expect(html).toContain("Latest source event");
     expect(html).not.toContain("open=\"\"");
   });
 

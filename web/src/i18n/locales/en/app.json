@@ -69,6 +69,8 @@
     "working": "Agent is working"
   },
   "errors": {
+    "requestTimeout": "Request timed out after {{seconds}} seconds. Please retry.",
+    "requestTimeoutUncertain": "Request timed out after {{seconds}} seconds. The operation may still be running. Check its status before retrying.",
     "repeatedCursor": "Agent session list repeated a cursor",
     "searchNotReady": "Wait for an active ACP session before searching workspace context",
     "contextNotReady": "Wait for an active ACP session before adding workspace context",

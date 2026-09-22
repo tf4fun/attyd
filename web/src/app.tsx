@@ -86,6 +86,9 @@ export default function App() {
     deleteSession,
     searchWorkspaceContext,
     readWorkspaceContext,
+    loadTurnProcess,
+    releaseTurnProcess,
+    readThreadForExport,
   } = useAcp();
   const [newThreadOpen, setNewThreadOpen] = useState(false);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>();
@@ -535,17 +538,20 @@ export default function App() {
       </Suspense>
     ) : null}
   </>;
-  const openActiveThreadMarkdown = useCallback(() => {
-    openThreadMarkdown(timelineToMarkdown(state.timeline, {
+  const openActiveThreadMarkdown = useCallback(async () => {
+    const complete = await readThreadForExport();
+    if (complete == null) return;
+    openThreadMarkdown(timelineToMarkdown(complete.timeline, {
       title: state.title ?? t("agentThread"),
       agentName: agent?.title ?? agent?.name,
       sessionId: state.session?.sessionId,
       cwd: state.cwd,
-      terminalSnapshots: state.terminalSnapshots,
+      terminalSnapshots: complete.terminalSnapshots,
     }));
   }, [
     agent?.name,
     agent?.title,
+    readThreadForExport,
     state.cwd,
     state.session?.sessionId,
     state.terminalSnapshots,
@@ -932,6 +938,8 @@ export default function App() {
                 agentActivity={state.agentActivity}
                 onNavigateThread={navigateThread}
                 onOpenThreadMarkdown={openActiveThreadMarkdown}
+                onLoadTurnProcess={loadTurnProcess}
+                onReleaseTurnProcess={releaseTurnProcess}
                 canReusePrompt={ready && !state.running}
                 onReusePrompt={(blocks: ContentBlock[]) => setComposerDraft({
                   id: randomId(),
@@ -1123,10 +1131,11 @@ function openThreadMarkdown(markdown: string): void {
 }
 
 function findToolCall(timeline: TimelineItem[], toolCallId: string): ToolCall | undefined {
-  const item = timeline.find(
-    (candidate) => candidate.type === "tool" && candidate.call.toolCallId === toolCallId,
-  );
-  return item?.type === "tool" ? item.call : undefined;
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const item = timeline[index];
+    if (item.historyTurnId == null && item.type === "tool" && item.call.toolCallId === toolCallId) return item.call;
+  }
+  return undefined;
 }
 
 function StatusDot({ phase }: { phase: string }) {
