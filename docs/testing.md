@@ -37,6 +37,13 @@ drivers; there is no second backend implementation.
 runs the frontend, Rust backend, and Chromium browser suites as independent parallel jobs. Rust
 unit, remote-transport, REST/SSE host-smoke, release-build, and standalone-binary checks remain
 separate steps so failures identify their layer directly. See the workflow for CI gates.
+Linux CI jobs pin `ubuntu-26.04`, with `ubuntu-26.04-arm` for native ARM64 binaries.
+This adopts Ubuntu 26.04 explicitly ahead of the
+[`ubuntu-latest` migration to Ubuntu 26.04](https://github.com/actions/runner-images/issues/14748)
+starting October 19, 2026. Backend, browser, coverage, and release jobs validate the new
+image; future image upgrades also require an explicit workflow change.
+GNU binary smoke tests verify the build image, not compatibility with older glibc versions;
+the musl archives avoid a host glibc dependency.
 Conformance follows the [ACP compatibility contract](acp-coverage.md#compatibility-contract);
 backend-specific smoke tests remain optional.
 
@@ -124,6 +131,16 @@ project and send one of these fixture prompts:
 Type `/` for advertised commands or `@` for workspace context. Browser tests use
 isolated instances of this SDK fixture. Local Playwright runs require installed
 Chrome; CI installs Chromium. The coverage command uses the same browser setup.
+
+Browser assertions follow the current projection contract. Completed process bodies are absent
+after reload until the user expands their turn; locate that turn through its visible prompt or final
+answer before checking a historical tool or terminal. Diagnostic panels retain one latest source
+event, while the current business content remains complete.
+
+`tests/browser/browser-errors.ts` permits the initial retained-session probe's expected 404 with
+either no query or only `presentation=compact`. Directory lookups, owner-fenced reads, process pages,
+other resources, and other HTTP errors remain visible. `tests/browser-errors.test.ts` guards that
+boundary. The ordinary browser job and instrumented coverage job use these same checks.
 
 ## Backend behavior
 

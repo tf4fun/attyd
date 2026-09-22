@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer, type RustTestServer } from "../../scripts/rust-test-server";
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
+import { collectBrowserErrors } from "./browser-errors";
 
 const test = baseTest.extend<{ isolatedAttydUrl: string }>({
   isolatedAttydUrl: async ({}, use) => {
@@ -1542,7 +1543,11 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   await expect(tool).toHaveAttribute("data-open", "true");
   await expect(toolDebug).toBeVisible();
   await expect(toolDebug).toContainText("activity-tool");
-  await expect(toolDebug).toContainText("Message events");
+  await expect(toolDebug).toContainText("Latest source event");
+  const toolSourceEvents = toolDebug.locator(".debug-info-entry").filter({
+    has: page.locator(".debug-info-label > span", { hasText: "Latest source event" }),
+  });
+  expect(JSON.parse(await toolSourceEvents.locator("pre").innerText())).toHaveLength(1);
   await expect(toolDebug.locator("pre")).toContainText('"sessionUpdate": "tool_call"');
   await expect(toolDebug.locator("pre")).toContainText('"status": "completed"');
   await expect(toolDebug.locator(".raw-json")).toHaveCount(0);
@@ -2138,7 +2143,22 @@ test("keeps live terminal output across reconnect and retains released output fo
 
     await page.reload();
     const restored = cardFor(page);
-    await revealTurnProcess(restored);
+    const restoredPrompt = page.locator(".message-user").filter({ hasText: `terminal-live-flow ${gatePath}` });
+    await expect(restoredPrompt).toBeVisible();
+    await expect(restored).toHaveCount(0);
+    const processResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname.startsWith("/api/v1/sessions/saved-session/turns/") &&
+        url.pathname.endsWith("/process") && url.searchParams.get("offset") === "0";
+    });
+    await revealTurnProcess(restoredPrompt);
+    const loadedProcess = await processResponse;
+    expect(loadedProcess.ok()).toBe(true);
+    const processPage = await loadedProcess.json();
+    expect(processPage.offset).toBe(0);
+    expect(Object.values(processPage.terminals)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ released: true, output: "LIVE_START中😀\nLIVE_END\n" }),
+    ]));
     await expect(restored).toHaveAttribute("data-tool-status", "completed");
     await restored.locator(":scope > .tool-card-header .tool-disclosure").click();
     await expect(restored.locator(".terminal-heading")).toHaveText("TerminalCompleted");
@@ -2238,7 +2258,11 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page 
   const infoPanel = answer.locator('[aria-label="Message debug information"]');
   await expect(infoPanel).toBeVisible();
   await expect(infoPanel).toContainText("message-actions-answer");
-  await expect(infoPanel).toContainText("Message events");
+  await expect(infoPanel).toContainText("Latest source event");
+  const messageSourceEvents = infoPanel.locator(".debug-info-entry").filter({
+    has: page.locator(".debug-info-label > span", { hasText: "Latest source event" }),
+  });
+  expect(JSON.parse(await messageSourceEvents.locator("pre").innerText())).toHaveLength(1);
   expect(await answer.locator(".message-meta").evaluate((footer) => {
     const actions = footer.querySelector(".message-meta-actions")!.getBoundingClientRect();
     const debug = footer.querySelector(".debug-info-panel")!.getBoundingClientRect();
@@ -3216,32 +3240,6 @@ async function expectTurnMarkerOrder(page: Page): Promise<void> {
   expect(firstStop).toBeGreaterThan(firstAnswer);
   expect(secondPrompt).toBeGreaterThan(firstStop);
   expect(secondStop).toBeGreaterThan(secondPrompt);
-}
-
-function collectBrowserErrors(page: Page, expectedHttpStatuses: number[] = []): string[] {
-  const errors: string[] = [];
-  page.on("console", (message) => {
-    if (message.type() !== "error") return;
-    const text = message.text();
-    const location = message.location().url;
-    const resource = URL.canParse(location) ? new URL(location) : undefined;
-    if (
-      text.startsWith("Failed to load resource: the server responded with a status of 404 (") &&
-      resource?.origin === new URL(page.url()).origin &&
-      /^\/api\/v1\/sessions\/[^/]+$/u.test(resource.pathname) && resource.search === ""
-    ) {
-      // An optimistic retained-view lookup may miss before directory discovery.
-      // Errors from the subsequent cwd lookup or any other resource remain visible.
-      return;
-    }
-    if (
-      text.startsWith("Failed to load resource: the server responded with a status of") &&
-      expectedHttpStatuses.some((status) => text.includes(`status of ${status} (`))
-    ) return;
-    errors.push(text);
-  });
-  page.on("pageerror", (error) => errors.push(error.message));
-  return errors;
 }
 
 async function readMarker(path: string): Promise<string> {
