@@ -69,6 +69,9 @@ test("releases an observed completed turn after five minutes folded and restores
   await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"));
   await turn.getByRole("button", { name: "Expand execution process", exact: true }).click();
   await expect(turn.getByText("Inspect collapse fixture", { exact: true })).toBeVisible();
+  const beforeRelease = await processGeometry(turn);
+  expect(beforeRelease.agentThoughtGap).toBeCloseTo(9, 0);
+  expect(beforeRelease.thoughtToolGap).toBeCloseTo(18, 0);
   await turn.getByRole("button", { name: "Collapse execution process", exact: true }).click();
   expect(processRequests).toEqual([]);
 
@@ -95,6 +98,13 @@ test("releases an observed completed turn after five minutes folded and restores
   await expect(turn.locator(".message-content").getByText("Process paragraph 20:", { exact: false })).toBeVisible();
   await expect(turn.getByText("The final answer is ready.", { exact: true })).toBeVisible();
   expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0"]);
+  const afterRelease = await processGeometry(turn);
+  expect(afterRelease.agentThoughtGap).toBeCloseTo(beforeRelease.agentThoughtGap, 0);
+  expect(afterRelease.thoughtToolGap).toBeCloseTo(beforeRelease.thoughtToolGap, 0);
+  for (const [index, before] of beforeRelease.entries.entries()) {
+    expect(afterRelease.entries[index].x).toBeCloseTo(before.x, 0);
+    expect(afterRelease.entries[index].width).toBeCloseTo(before.width, 0);
+  }
 });
 
 for (const distance of [24, 500]) {
@@ -221,4 +231,17 @@ async function expectBottom(thread: Locator) {
   await expect.poll(() => thread.evaluate((element) =>
     element.scrollHeight - element.clientHeight - element.scrollTop
   )).toBeLessThan(3);
+}
+
+async function processGeometry(turn: Locator) {
+  return turn.locator(".turn-process-content").evaluate((content) => {
+    const agent = content.querySelector(".assistant-chunk")!.getBoundingClientRect();
+    const thought = content.querySelector(".thinking-block")!.getBoundingClientRect();
+    const tool = content.querySelector(".tool-card")!.getBoundingClientRect();
+    return {
+      agentThoughtGap: thought.top - agent.bottom,
+      thoughtToolGap: tool.top - thought.bottom,
+      entries: [agent, thought, tool].map(({ x, width }) => ({ x, width })),
+    };
+  });
 }

@@ -30,6 +30,7 @@ import { ElicitationCard, ExternalFlowCard } from "./components/acp/elicitation"
 import { PermissionCard } from "./components/acp/permission";
 import { PlanCard } from "./components/acp/plan";
 import { SessionActionDialog } from "./components/acp/session-action-dialog";
+import { SessionOpening } from "./components/acp/session-opening";
 import { NewSessionDialog } from "./components/acp/new-session-dialog";
 import {
   PromptComposer,
@@ -61,6 +62,8 @@ export default function App() {
   const [sessionAction, setSessionAction] = useState<{ kind: "close" | "delete"; sessionId: string }>();
   const {
     state,
+    sessionOpening,
+    retrySessionOpening,
     reconnect,
     authenticate,
     writeAuthTerminal,
@@ -451,7 +454,7 @@ export default function App() {
   const authTerminalMethod = state.authTerminal == null
     ? undefined
     : authMethods.find(({ id }) => id === state.authTerminal?.methodId);
-  const transitioning = state.sessionTransition != null;
+  const transitioning = state.sessionTransition != null || sessionOpening != null;
   const changingControl = state.pendingSessionControl != null;
   const authBlocksCurrent = state.authStatus === "required" || state.pendingAuth != null;
   const authBlocksNewSession = authBlocksCurrent || state.authStatus === "logged_out";
@@ -731,7 +734,7 @@ export default function App() {
           }
         }}
       >
-        {state.session ? (
+        {state.session && !sessionOpening ? (
           <header className="session-header" ref={sessionHeading}>
             {parentNavigation}
             <div className="session-header-main">
@@ -824,7 +827,7 @@ export default function App() {
           </header>
         ) : null}
 
-        {state.session && threadSearchOpen ? (
+        {state.session && !sessionOpening && threadSearchOpen ? (
           <ThreadSearchBar
             rootRef={scroll}
             containerRef={threadSearchContainer}
@@ -836,7 +839,12 @@ export default function App() {
           />
         ) : null}
 
-        {!state.session ? <div className="browse-panel">
+        {sessionOpening && !showAuthCard && !terminalAuthOwnsInteraction ? <SessionOpening
+          error={sessionOpening.error}
+          backLabel={selectedProjectCwd ? t("backProject") : t("backProjects")}
+          onBack={() => selectedProjectCwd ? browseProject(selectedProjectCwd) : browseHome()}
+          onRetry={retrySessionOpening}
+        >{authContent}</SessionOpening> : !state.session ? <div className="browse-panel">
           {authContent}
           {state.elicitations.map((pending) => (
             <ElicitationCard

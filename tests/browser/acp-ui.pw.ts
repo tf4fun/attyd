@@ -3109,6 +3109,7 @@ test("recovers startup through Agent-owned ACP authentication", async ({ page })
     const signIn = page.getByRole("button", { name: "Authenticate with Continue with Fake Agent" });
     await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeVisible();
     await expect(signIn).toBeFocused();
+    await expect(page.locator(".session-opening-panel")).toHaveCount(0);
     await expect(page.locator('textarea[role="combobox"]')).toHaveCount(0);
     await expect(page.getByRole("button", { name: /^(?:New project|New session in project)$/u })).toBeDisabled();
     await signIn.click();

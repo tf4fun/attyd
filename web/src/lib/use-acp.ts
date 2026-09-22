@@ -36,6 +36,11 @@ import { releaseSessionViewProcess, sameTurnProcess } from "./process-retention"
 export function useAcp() {
   const [state, dispatch] = useReducer(appReducer, initialState);
   const [projectCwd, setProjectCwd] = useState(() => readProjectCwdFromPath(window.location.pathname));
+  // Presentation for a foreground history read, separate from background SSE refreshes.
+  const [sessionOpening, setSessionOpening] = useState<{ sessionId: string; error?: string } | undefined>(() => {
+    const sessionId = readSessionIdFromPath(window.location.pathname);
+    return sessionId == null ? undefined : { sessionId };
+  });
   const stateRef = useRef(state);
   stateRef.current = state;
 
@@ -100,6 +105,7 @@ export function useAcp() {
   }, []);
 
   const resetSession = useCallback((preserve = false) => {
+    setSessionOpening(undefined);
     sessionEventsRef.current?.close();
     sessionEventsRef.current = undefined;
     activeSessionIdRef.current = undefined;
@@ -212,6 +218,7 @@ export function useAcp() {
       };
     }
     dispatch({ type: "bridge/session_hydrate", view, failedPrompt });
+    setSessionOpening((opening) => opening?.sessionId === view.sessionId ? undefined : opening);
   }, [filterReleasedView, includedProcessFrom, navigateSession]);
 
   const refreshSession = useCallback((sessionId: string) => {
@@ -249,7 +256,11 @@ export function useAcp() {
           promptAdmissionsRef.current.delete(sessionId);
           returnToSessionProject(sessionId);
         }
-        else reportError(error);
+        else {
+          setSessionOpening((opening) => opening?.sessionId === sessionId
+            ? { sessionId, error: error instanceof Error ? error.message : String(error) } : opening);
+          reportError(error);
+        }
       } finally {
         if (refreshInFlightRef.current === refresh) {
           refreshInFlightRef.current = undefined;
@@ -413,6 +424,7 @@ export function useAcp() {
       return;
     }
     const requestId = randomId();
+    setSessionOpening({ sessionId: session.sessionId });
     activeSessionIdRef.current = session.sessionId;
     sessionViewRef.current = undefined;
     sessionEventsRef.current?.close();
@@ -529,11 +541,17 @@ export function useAcp() {
         returnHome(true, false);
         return;
       }
+      if (routeSessionId != null && sessionViewRef.current == null) setSessionOpening({
+        sessionId: routeSessionId, error: error instanceof Error ? error.message : String(error),
+      });
       if (!(error instanceof ApiError) || error.status >= 500) {
         dispatch({ type: "socket/closed" });
       }
       reportError(error);
     };
+    if (routeSessionId != null && sessionViewRef.current == null) {
+      setSessionOpening({ sessionId: routeSessionId });
+    }
     try {
       const runtime = await requestJson<RuntimeView>("/api/v1/runtime");
       if (!stillCurrent()) return;
@@ -554,7 +572,10 @@ export function useAcp() {
       if (runtime.phase != null) dispatch({ type: "server/event", event: runtime.phase });
       else if (!runtime.connected) dispatch({ type: "socket/closed" });
 
-      if (!runtime.connected || runtime.phase?.phase !== "ready") return;
+      if (!runtime.connected || runtime.phase?.phase !== "ready") {
+        setSessionOpening(undefined);
+        return;
+      }
 
       const canList = sessionListSupportedRef.current;
       const canLoad = sessionLoadSupportedRef.current;
@@ -578,7 +599,7 @@ export function useAcp() {
         (error: unknown) => {
           // Directory failures do not invalidate the connection or a readable session.
           if (stillCurrent()) reportError(error);
-          return { ok: false as const };
+          return { ok: false as const, error };
         },
       );
 
@@ -602,7 +623,12 @@ export function useAcp() {
         } catch (error) {
           if (!isMissingSession(error) || !canList) throw error;
           const discovered = await discovery;
-          if (!stillCurrent() || !discovered.ok) return;
+          if (!stillCurrent()) return;
+          if (!discovered.ok) {
+            setSessionOpening({ sessionId: routeSessionId,
+              error: discovered.error instanceof Error ? discovered.error.message : String(discovered.error) });
+            return;
+          }
           // A local miss before listing is not an authoritative missing session.
           view = await readView(discovered.selected?.cwd ?? routeProjectCwd);
         }
@@ -634,6 +660,13 @@ export function useAcp() {
     })();
   }, [refreshRuntimeOnce]);
   refreshRuntimeRef.current = refreshRuntime;
+
+  const retrySessionOpening = useCallback(() => {
+    const sessionId = readSessionIdFromPath(window.location.pathname);
+    if (sessionId == null) return;
+    setSessionOpening({ sessionId });
+    refreshRuntime();
+  }, [refreshRuntime]);
 
   const openProject = useCallback((cwd: string) => {
     const path = projectPath(cwd);
@@ -1190,6 +1223,8 @@ export function useAcp() {
 
   return {
     state,
+    sessionOpening,
+    retrySessionOpening,
     reconnect,
     authenticate,
     writeAuthTerminal,

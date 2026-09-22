@@ -1,4 +1,4 @@
-import { expect, test as baseTest, type Page } from "@playwright/test";
+import { expect, test as baseTest, type Locator, type Page } from "@playwright/test";
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
 
@@ -49,6 +49,7 @@ test("transmits the final answer first and fetches execution details only in req
   await expect(turn.getByText("Inspect process item 01", { exact: true })).toBeVisible();
   await expect(turn.getByText("Inspect process item 11", { exact: true })).toHaveCount(0);
   await expect(turn.getByText("10 of 25 loaded", { exact: true })).toBeVisible();
+  await expectToolSpacing(turn.locator(".tool-card").nth(0), turn.locator(".tool-card").nth(1));
   expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0"]);
 
   const secondPage = await requestPage(page, () => turn.getByRole("button", { name: "Load 10 more", exact: true }).click());
@@ -56,6 +57,7 @@ test("transmits the final answer first and fetches execution details only in req
   expect(secondPage.items).toHaveLength(10);
   await expect(turn.locator(".tool-card")).toHaveCount(20);
   await expect(turn.getByText("Inspect process item 21", { exact: true })).toHaveCount(0);
+  await expectToolSpacing(turn.locator(".tool-card").nth(9), turn.locator(".tool-card").nth(10));
 
   const finalPage = await requestPage(page, () => turn.getByRole("button", { name: "Load 10 more", exact: true }).click());
   expect(finalPage).toMatchObject({ offset: 20, total: 25, nextOffset: null });
@@ -105,40 +107,73 @@ test("releases pages after five minutes folded and refetches only the first ten 
   expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0", "10", "0"]);
 });
 
-test("shows a page request timeout and retries the same page only after the user clicks retry", async ({ page }, testInfo) => {
-  await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
-  const processRequests: string[] = [];
-  page.on("request", (request) => {
-    if (isProcessUrl(request.url())) processRequests.push(request.url());
-  });
-  await page.goto("/sessions/lazy-process-session");
-  const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
-  await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
-  await requestPage(page, () => turn.getByRole("button", { name: "Expand execution process", exact: true }).click());
-  await expect(turn.locator(".tool-card")).toHaveCount(10);
-  await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"));
-  // Hold a real browser fetch before headers. Subsequent requests pass through.
-  let holdNext = true;
-  await page.route((url) => isProcessUrl(url.href), async (route) => {
-    if (holdNext) { holdNext = false; return; }
-    await route.continue();
-  });
-  const stalled = page.waitForRequest((request) => isProcessUrl(request.url()));
-  await turn.getByRole("button", { name: "Load 10 more", exact: true }).click();
-  await stalled;
-  await page.clock.fastForward("00:30");
-  await expect(turn.getByRole("alert")).toHaveText("Loading execution details timed out. Retry when ready.");
-  await expect(turn.locator(".tool-card")).toHaveCount(10);
-  await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
-  await page.clock.fastForward("01:00");
-  expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0", "10"]);
-  await page.screenshot({ path: testInfo.outputPath("process-request-timeout.png"), animations: "disabled" });
-  const retried = await requestPage(page, () => turn.getByRole("button", { name: "Retry loading", exact: true }).click());
-  expect(retried).toMatchObject({ offset: 10, nextOffset: 20 });
-  await expect(turn.locator(".tool-card")).toHaveCount(20);
-  await expect(turn.getByRole("alert")).toHaveCount(0);
-  expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0", "10", "10"]);
-});
+for (const language of ["en", "zh-CN"] as const) {
+  const copy = language === "en" ? {
+    expand: "Expand execution process",
+    loadMore: "Load 10 more",
+    loading: "Loading execution details…",
+    loaded: "10 of 25 loaded",
+    timeout: "Loading execution details timed out. Retry when ready.",
+    retry: "Retry loading",
+  } : {
+    expand: "展开执行过程",
+    loadMore: "再加载 10 条",
+    loading: "正在加载执行过程…",
+    loaded: "已加载 10 / 25 条",
+    timeout: "执行过程加载超时，请点击重试。",
+    retry: "重试加载",
+  };
+  for (const theme of ["light", "dark"] as const) {
+    test(`keeps the mobile process footer readable through loading, timeout and manual retry (${language}, ${theme})`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.addInitScript(({ language, theme }) => {
+        localStorage.setItem("attyd.language", language);
+        localStorage.setItem("attyd.theme", theme);
+      }, { language, theme });
+      await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
+      const processRequests: string[] = [];
+      page.on("request", (request) => {
+        if (isProcessUrl(request.url())) processRequests.push(request.url());
+      });
+      await page.goto("/sessions/lazy-process-session");
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
+      await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
+      await requestPage(page, () => turn.getByRole("button", { name: copy.expand, exact: true }).click());
+      await expect(turn.locator(".tool-card")).toHaveCount(10);
+      await expect(turn.getByText(copy.loaded, { exact: true })).toBeVisible();
+      await expectMobileFooterLayout(page, turn);
+      await page.screenshot({ path: testInfo.outputPath("process-footer-ready.png"), animations: "disabled" });
+      await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"));
+      // Hold a real browser fetch before headers. Subsequent requests pass through.
+      let holdNext = true;
+      await page.route((url) => isProcessUrl(url.href), async (route) => {
+        if (holdNext) { holdNext = false; return; }
+        await route.continue();
+      });
+      const stalled = page.waitForRequest((request) => isProcessUrl(request.url()));
+      await turn.getByRole("button", { name: copy.loadMore, exact: true }).click();
+      await stalled;
+      await expect(turn.getByRole("status")).toHaveText(copy.loading);
+      await expect(turn.getByRole("button", { name: copy.loadMore, exact: true })).toBeDisabled();
+      await expectMobileFooterLayout(page, turn);
+      await page.screenshot({ path: testInfo.outputPath("process-footer-loading.png"), animations: "disabled" });
+      await page.clock.fastForward("00:30");
+      await expect(turn.getByRole("alert")).toHaveText(copy.timeout);
+      await expect(turn.locator(".tool-card")).toHaveCount(10);
+      await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
+      await page.clock.fastForward("01:00");
+      expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0", "10"]);
+      await expectMobileFooterLayout(page, turn);
+      await page.screenshot({ path: testInfo.outputPath("process-footer-timeout.png"), animations: "disabled" });
+      const retried = await requestPage(page, () => turn.getByRole("button", { name: copy.retry, exact: true }).click());
+      expect(retried).toMatchObject({ offset: 10, nextOffset: 20 });
+      await expect(turn.locator(".tool-card")).toHaveCount(20);
+      await expect(turn.getByRole("alert")).toHaveCount(0);
+      expect(processRequests.map((url) => new URL(url).searchParams.get("offset"))).toEqual(["0", "10", "10"]);
+    });
+  }
+}
 
 test("keeps task progress on the left and recovers composer space when the mobile plan is collapsed", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -186,6 +221,56 @@ test("keeps task progress on the left and recovers composer space when the mobil
 function isProcessUrl(url: string): boolean {
   const path = new URL(url).pathname;
   return path.startsWith(`${SESSION_PATH}/turns/`) && path.endsWith("/process");
+}
+
+async function expectToolSpacing(before: Locator, after: Locator) {
+  const first = await before.boundingBox();
+  const second = await after.boundingBox();
+  expect(first).not.toBeNull();
+  expect(second).not.toBeNull();
+  expect(second!.y - first!.y - first!.height).toBeCloseTo(18, 0);
+  expect(second!.x).toBeCloseTo(first!.x, 0);
+  expect(second!.width).toBeCloseTo(first!.width, 0);
+}
+
+async function expectMobileFooterLayout(page: Page, turn: Locator) {
+  const footer = turn.locator(".turn-process-pagination");
+  await footer.scrollIntoViewIfNeeded();
+  await expect(footer).toBeInViewport();
+  const layout = await footer.evaluate((element) => {
+    const { x, y, width, height } = element.getBoundingClientRect();
+    return {
+      bounds: { x, y, width, height },
+      overflow: element.scrollWidth - element.clientWidth,
+      items: Array.from(element.querySelectorAll("button, [role=status], [role=alert], .turn-process-loaded"))
+        .map((item) => {
+          const { x, y, width, height } = item.getBoundingClientRect();
+          return { text: item.textContent, x, y, width, height };
+        }),
+    };
+  });
+  expect(layout.overflow).toBeLessThanOrEqual(1);
+  for (const item of layout.items) {
+    expect(item.width, item.text ?? "footer item").toBeGreaterThan(0);
+    expect(item.x).toBeGreaterThanOrEqual(layout.bounds.x - 1);
+    expect(item.x + item.width).toBeLessThanOrEqual(layout.bounds.x + layout.bounds.width + 1);
+    expect(item.y).toBeGreaterThanOrEqual(layout.bounds.y - 1);
+    expect(item.y + item.height).toBeLessThanOrEqual(layout.bounds.y + layout.bounds.height + 1);
+    expect(item.x).toBeGreaterThanOrEqual(0);
+    expect(item.x + item.width).toBeLessThanOrEqual(390);
+  }
+  for (let index = 0; index < layout.items.length; index++) {
+    const first = layout.items[index];
+    for (const second of layout.items.slice(index + 1)) {
+      const overlapWidth = Math.min(first.x + first.width, second.x + second.width) - Math.max(first.x, second.x);
+      const overlapHeight = Math.min(first.y + first.height, second.y + second.height) - Math.max(first.y, second.y);
+      expect(overlapWidth > 1 && overlapHeight > 1, `${first.text} overlaps ${second.text}`).toBe(false);
+    }
+  }
+  expect(await page.evaluate(() => Math.max(
+    document.documentElement.scrollWidth - innerWidth,
+    document.body.scrollWidth - innerWidth,
+  ))).toBeLessThanOrEqual(1);
 }
 
 async function requestPage(page: Page, trigger: () => Promise<void>) {

@@ -148,6 +148,81 @@ describe("lazy process REST hook", () => {
     expect(stream.searchParams.get("expectedIncarnation")).toBe(String(owner.sessionIncarnation));
   });
 
+  it("shows opening until the initial history arrives, without covering background refreshes", async () => {
+    const pending = deferredResponse();
+    readCompact = () => pending.promise;
+    window.history.replaceState(null, "", sessionPath(owner.sessionId, cwd));
+    await act(async () => root.render(createElement(Harness)));
+    expect(acp.sessionOpening).toEqual({ sessionId: owner.sessionId });
+    await act(async () => pending.finish(currentView));
+    expect(acp.sessionOpening).toBeUndefined();
+    const refresh = deferredResponse();
+    readCompact = () => refresh.promise;
+    await act(async () => emitReset());
+    expect(acp.sessionOpening).toBeUndefined();
+    await act(async () => refresh.finish(currentView));
+  });
+
+  it("stops the loading indicator on timeout and retries history only on request", async () => {
+    vi.useFakeTimers();
+    readCompact = () => new Promise(() => undefined);
+    window.history.replaceState(null, "", sessionPath(owner.sessionId, cwd));
+    await act(async () => root.render(createElement(Harness)));
+    await act(async () => vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS));
+    expect(acp.sessionOpening?.error).toMatch(/timed out/i);
+    expect(sessionReads()).toHaveLength(1);
+    const retry = deferredResponse();
+    readCompact = () => retry.promise;
+    await act(async () => acp.retrySessionOpening());
+    expect(acp.sessionOpening).toEqual({ sessionId: owner.sessionId });
+    await act(async () => retry.finish(currentView));
+    expect(acp.sessionOpening).toBeUndefined();
+    expect(acp.state.session?.sessionId).toBe(owner.sessionId);
+  });
+
+  it.each([200, 503])("clears an abandoned opening and ignores its late response (%s)", async (status) => {
+    const pending = deferredResponse();
+    readCompact = () => pending.promise;
+    window.history.replaceState(null, "", sessionPath(owner.sessionId, cwd));
+    await act(async () => root.render(createElement(Harness)));
+    expect(acp.sessionOpening).toBeDefined();
+    await act(async () => acp.goHome());
+    expect(acp.sessionOpening).toBeUndefined();
+    await act(async () => pending.finish(status === 200 ? currentView : { error: "Late failure" }, status));
+    expect(acp.sessionOpening).toBeUndefined();
+    expect(acp.state.session).toBeUndefined();
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("tracks the target while switching away from an already loaded session", async () => {
+    await mount();
+    const pending = deferredResponse();
+    const defaultFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, init) => String(input).startsWith("/api/v1/sessions/second?")
+      ? pending.promise : defaultFetch(input, init));
+    await act(async () => acp.attachSession({ sessionId: "second", cwd }));
+    expect(acp.sessionOpening).toEqual({ sessionId: "second" });
+    expect(acp.state.session?.sessionId).toBe(owner.sessionId);
+    await act(async () => pending.finish(view({ sessionId: "second" })));
+    expect(acp.sessionOpening).toBeUndefined();
+    expect(acp.state.session?.sessionId).toBe("second");
+  });
+
+  it("shows opening when attaching from the project browser and supports retry after failure", async () => {
+    window.history.replaceState(null, "", "/");
+    await act(async () => root.render(createElement(Harness)));
+    const pending = deferredResponse();
+    readCompact = () => pending.promise;
+    await act(async () => acp.attachSession({ sessionId: owner.sessionId, cwd }));
+    expect(acp.sessionOpening).toEqual({ sessionId: owner.sessionId });
+    await act(async () => pending.finish({ error: "History unavailable" }, 503));
+    expect(acp.sessionOpening?.error).toContain("History unavailable");
+    readCompact = async () => response(currentView);
+    await act(async () => acp.retrySessionOpening());
+    expect(acp.sessionOpening).toBeUndefined();
+    expect(acp.state.session?.sessionId).toBe(owner.sessionId);
+  });
+
   it("requests one owner/history/offset page with cancellation support without mutating canonical state", async () => {
     await mount();
     const before = acp.state;

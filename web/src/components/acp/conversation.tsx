@@ -3,11 +3,13 @@ import {
   ArrowUpToLine,
   Bot,
   Brain,
+  ChevronDown,
   ChevronRight,
   CircleAlert,
   Copy,
   FileText,
   ListChecks,
+  LoaderCircle,
   Pencil,
   RotateCcw,
   TextSelect,
@@ -285,7 +287,17 @@ function DeferredProcessContent({ process, expanded, onLoad, entryProps }: {
   const [loading, setLoading] = useState(false);
   const [failure, setFailure] = useState<"timeout" | "error" | null>(null);
   const nextOffset = pages.at(-1)?.nextOffset ?? (pages.length === 0 ? 0 : null);
-  const items = useMemo(() => pages.flatMap(processPageTimeline), [pages]);
+  const items = useMemo(() => {
+    const entries: TimelineItem[] = [];
+    for (const item of pages.flatMap(processPageTimeline)) {
+      const previous = entries.at(-1);
+      // Page boundaries must not change the live timeline's message grouping.
+      if (previous?.type === "assistant" && item.type === "assistant") {
+        previous.chunks.push(...item.chunks);
+      } else entries.push(item.type === "assistant" ? { ...item, chunks: [...item.chunks] } : item);
+    }
+    return entries;
+  }, [pages]);
   const summary = useMemo(() => collectReviewChanges(items), [items]);
   const reviewId = summary.files[0]?.diffs[0]?.id;
   const terminals = useMemo(() => {
@@ -351,22 +363,31 @@ function DeferredProcessContent({ process, expanded, onLoad, entryProps }: {
     container.current?.dispatchEvent(new Event("toggle"));
   }, [items]);
 
-  return <div ref={container} aria-busy={loading}>
+  return <div ref={container} className="turn-process-entries" aria-busy={loading}>
     {items.map((item) => <TimelineEntry key={item.id} item={item} {...entryProps} terminalSnapshots={terminals} />)}
     {reviewId ? <TurnChangeReview key={`changes:${reviewId}`} turnId={reviewId} summary={summary} /> : null}
     <div className="turn-process-pagination">
-      {loading ? <span role="status">{t("process.loading")}</span> : null}
-      {failure ? <span className="turn-process-load-error" role="alert">{t(failure === "timeout" ? "process.loadTimeout" : "process.loadError")}</span> : null}
+      <div className="turn-process-page-status">
+        {loading ? <span className="turn-process-loading" role="status">
+          <LoaderCircle size={13} className="spin" aria-hidden="true" />
+          <span>{t("process.loading")}</span>
+        </span> : null}
+        {failure ? <span className="turn-process-load-error" role="alert">
+          <CircleAlert size={13} aria-hidden="true" />
+          <span>{t(failure === "timeout" ? "process.loadTimeout" : "process.loadError")}</span>
+        </span> : null}
+        {pages.length > 0 ? <span className="turn-process-loaded">{t("process.loaded", {
+          count: pages.reduce((count, page) => count + page.items.length, 0),
+          total: process.processCount,
+        })}</span> : null}
+      </div>
       {failure || (pages.length > 0 && nextOffset != null) ? <button
         type="button"
         className="turn-process-load-more"
         disabled={loading}
         onClick={() => { void loadPage(); }}
-      >{t(failure ? "process.retry" : "process.loadMore")}</button> : null}
-      {pages.length > 0 ? <span>{t("process.loaded", {
-        count: pages.reduce((count, page) => count + page.items.length, 0),
-        total: process.processCount,
-      })}</span> : null}
+      >{failure ? <RotateCcw size={13} aria-hidden="true" /> : <ChevronDown size={13} aria-hidden="true" />}
+        {t(failure ? "process.retry" : "process.loadMore")}</button> : null}
     </div>
   </div>;
 }

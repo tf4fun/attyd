@@ -6,6 +6,12 @@
   },
   "agent": "Agent",
   "openingTerminal": "Opening Agent terminal…",
+  "sessionOpening": {
+    "loading": "Loading conversation…",
+    "description": "Conversations with a long history may take a little longer to open.",
+    "failed": "Could not load conversation",
+    "retry": "Retry loading"
+  },
   "agentThread": "Agent thread",
   "queue": {
     "sessionChanged": "A queued message was discarded because its ACP session changed.",

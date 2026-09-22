@@ -120,6 +120,34 @@ describe("deferred completed turn process", () => {
     expect(tools()[0].closest("[hidden]")).toBeNull();
   });
 
+  it("keeps adjacent replies and thoughts grouped across pages without closing an expanded thought", async () => {
+    load.mockImplementation(async (descriptor, offset) => {
+      const result = page(offset, descriptor);
+      if (offset === 0) result.items[9] = [{
+        sessionUpdate: "agent_message_chunk", messageId: "process-answer",
+        content: { type: "text", text: "A process reply" },
+      }];
+      if (offset === 10) result.items[0] = [{
+        sessionUpdate: "agent_thought_chunk", messageId: "process-thought",
+        content: { type: "text", text: "A process thought" },
+      }];
+      return result;
+    });
+    await render();
+    await act(async () => trigger().click());
+    await act(async () => more().click());
+    const content = container.querySelector(".turn-process-content")!;
+    expect(content.querySelectorAll(".assistant-entry")).toHaveLength(1);
+    const thought = content.querySelector<HTMLElement>(".thinking-block")!;
+    await act(async () => thought.querySelector<HTMLButtonElement>(".thinking-disclosure")!.click());
+    expect(thought.dataset.open).toBe("true");
+    await act(async () => more().click());
+    expect(content.querySelector(".thinking-block")).toBe(thought);
+    expect(thought.dataset.open).toBe("true");
+    expect(content.textContent).toContain("A process reply");
+    expect(content.textContent).toContain("A process thought");
+  });
+
   it("retries a failed page at the same offset and retains already loaded details and the final answer", async () => {
     load.mockRejectedValueOnce(new Error("Temporary disconnect"));
     await render();

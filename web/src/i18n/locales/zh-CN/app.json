@@ -1,5 +1,11 @@
 {
   "pageTitle": "attyd · ACP 工作区",
+  "sessionOpening": {
+    "loading": "正在加载会话…",
+    "description": "历史消息较多时，加载可能需要一些时间。",
+    "failed": "会话加载失败",
+    "retry": "重新加载"
+  },
   "language": {
     "label": "界面语言",
     "system": "跟随浏览器"

@@ -2589,10 +2589,12 @@ export function processPageTimeline(page: BridgeTurnProcessPage): TimelineItem[]
       projected = reduceSessionUpdate(projected, { sessionId: page.sessionId, update });
     }
     if (page.response != null) projected.timeline = finishTurnTools(projected.timeline, page.response);
-    return projected.timeline.map((item, itemIndex): TimelineItem => ({
-      ...item,
-      id: `process:${page.turnId}:${page.offset + index}:${itemIndex}`,
-    }));
+    return projected.timeline.map((item, itemIndex): TimelineItem => {
+      const id = `process:${page.turnId}:${page.offset + index}:${itemIndex}`;
+      return item.type === "assistant"
+        ? { ...item, id, chunks: item.chunks.map((chunk, chunkIndex) => ({ ...chunk, id: `${id}:chunk:${chunkIndex}` })) }
+        : { ...item, id };
+    });
   });
 }
 
