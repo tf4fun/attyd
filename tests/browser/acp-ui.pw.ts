@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer, type RustTestServer } from "../../scripts/rust-test-server";
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
-import { collectBrowserErrors } from "./browser-errors";
+import { collectBrowserErrors, type ExpectedHttpError } from "./browser-errors";
 
 const test = baseTest.extend<{ isolatedAttydUrl: string }>({
   isolatedAttydUrl: async ({}, use) => {
@@ -885,11 +885,24 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await expect.poll(() => player.evaluate((media) => (media as HTMLMediaElement).readyState)).toBeGreaterThanOrEqual(2);
   await audioTab.close();
 
-  const pdfTab = await openCard("report.pdf");
-  await expect(pdfTab).toHaveURL(/\/api\/v1\/sessions\/saved-session\/attachments\//);
-  expect(await page.evaluate(async (url) => (await fetch(url)).headers.get("Content-Type"), pdfTab.url()))
-    .toBe("application/pdf");
-  await pdfTab.close();
+  const pdfLink = content.getByRole("link", { name: "Open report.pdf in a new tab", exact: true });
+  const pdfHref = (await pdfLink.getAttribute("href"))!;
+  const pdfResponse = await page.request.get(pdfHref);
+  expect(pdfResponse.status()).toBe(200);
+  expect(pdfResponse.headers()["content-type"]).toBe("application/pdf");
+  expect(pdfResponse.headers()["content-disposition"]).toMatch(/^inline;/u);
+  expect(await pdfResponse.body()).toEqual(Buffer.from(pdf));
+  // Full Chrome can preview PDFs; the CI headless shell downloads them instead.
+  // Both are browser-native outcomes of the same link and unchanged file bytes.
+  if (await page.evaluate(() => navigator.pdfViewerEnabled)) {
+    const pdfTab = await openCard("report.pdf");
+    await expect(pdfTab).toHaveURL(new URL(pdfHref, page.url()).href);
+    await pdfTab.close();
+  } else {
+    const [pdfDownload] = await Promise.all([page.waitForEvent("download"), pdfLink.click()]);
+    expect(pdfDownload.suggestedFilename()).toBe("report.pdf");
+    expect(await readFile((await pdfDownload.path())!)).toEqual(Buffer.from(pdf));
+  }
 
   const download = page.waitForEvent("download");
   await content.getByRole("link", { name: new RegExp("Open long-filename-") }).click();
@@ -3290,12 +3303,15 @@ test("keeps completed turn markers at their original boundaries across reload", 
 });
 
 test("offers an explicit reconnect over the composer after the ACP connection stops", async ({ page }) => {
-  const browserErrors = collectBrowserErrors(page);
+  const expectedHttpErrors: ExpectedHttpError[] = [];
+  const browserErrors = collectBrowserErrors(page, expectedHttpErrors);
   await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
   await composer.fill("disconnect-flow");
+  // The fixture exits the Agent while a session-view refresh may be in flight.
+  expectedHttpErrors.push({ status: 503, pathname: "/api/v1/sessions/saved-session" });
   await composer.press("Enter");
 
   const recovery = page.locator(".composer-reconnect");
@@ -3305,6 +3321,7 @@ test("offers an explicit reconnect over the composer after the ACP connection st
   await recovery.getByRole("button", { name: "Reconnect" }).click();
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  expectedHttpErrors.length = 0;
   expect(browserErrors).toEqual([]);
 });
 
@@ -3361,18 +3378,22 @@ test("keeps an active stdio prompt alive across browser reconnect", async ({ bro
 });
 
 test("reconnects a stale mobile-style socket after a focus liveness probe", async ({ page }) => {
-  const browserErrors = collectBrowserErrors(page);
+  const expectedHttpErrors: ExpectedHttpError[] = [];
+  const browserErrors = collectBrowserErrors(page, expectedHttpErrors);
   await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
   await composer.fill("disconnect-flow");
+  // Only the stopped session's GET may return 503 during this deliberate outage.
+  expectedHttpErrors.push({ status: 503, pathname: "/api/v1/sessions/saved-session" });
   await composer.press("Enter");
   await expect(page.locator(".composer-reconnect")).toBeVisible();
 
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  expectedHttpErrors.length = 0;
   expect(browserErrors).toEqual([]);
 });
 

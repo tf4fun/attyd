@@ -150,6 +150,11 @@ project and send one of these fixture prompts:
 Type `/` for advertised commands or `@` for workspace context. Browser tests use
 isolated instances of this SDK fixture. Local Playwright runs require installed
 Chrome; CI installs Chromium. The coverage command uses the same browser setup.
+Set `CI=1` when running Playwright locally to use its installed Chromium headless shell
+and reproduce CI browser behavior. The attachment case checks the PDF's MIME type,
+inline disposition, and original bytes, then follows `navigator.pdfViewerEnabled`:
+full Chrome may open its PDF viewer, while the headless shell downloads the file.
+Both are expected outcomes of handing the link to the browser.
 
 Browser assertions follow the current projection contract. Completed process bodies are absent
 after reload until the user expands their turn; locate that turn through its visible prompt or final
@@ -160,6 +165,10 @@ event, while the current business content remains complete.
 either no query or only `presentation=compact`. Directory lookups, owner-fenced reads, process pages,
 other resources, and other HTTP errors remain visible. `tests/browser-errors.test.ts` guards that
 boundary. The ordinary browser job and instrumented coverage job use these same checks.
+The two deliberate Agent-exit cases also allow a 503 from the same-origin current-session
+view endpoint while the Agent is unavailable: an in-flight refresh can race the exit.
+That exception ends when the composer recovers; unrelated endpoints and page errors
+remain failures. The classifier tests cover the endpoint, origin, and status boundaries.
 
 ## Backend behavior
 
