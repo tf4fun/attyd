@@ -60,6 +60,13 @@ export function useAcp() {
   const runtimeRefreshRef = useRef<{ pending: boolean } | undefined>(undefined);
   const runtimeRestoreRef = useRef<object | undefined>(undefined);
   const sessionListQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const authInputQueueRef = useRef<{
+    requestId: string; tail: Promise<void>; closed: boolean;
+  } | undefined>(undefined);
+  const closeAuthInput = useCallback((requestId?: string) => {
+    const queue = authInputQueueRef.current;
+    if (queue != null && (requestId == null || queue.requestId === requestId)) queue.closed = true;
+  }, []);
   const sessionCatalogRevisionRef = useRef<string | undefined>(undefined);
   const catalogInvalidationRef = useRef(0);
   const catalogRefreshRef = useRef<{ pending: boolean } | undefined>(undefined);
@@ -92,6 +99,7 @@ export function useAcp() {
   const refreshRuntimeRef = useRef<() => void>(() => undefined);
 
   const prepareConnectionRestore = useCallback(() => {
+    closeAuthInput();
     sessionEventsRef.current?.close();
     sessionEventsRef.current = undefined;
     activeSessionIdRef.current = undefined;
@@ -103,7 +111,7 @@ export function useAcp() {
     // Keep the route and mounted draft while replacing the old connection's
     // presentation with a fresh Agent-owned history baseline.
     dispatch({ type: "bridge/connection_replaced" });
-  }, []);
+  }, [closeAuthInput]);
 
   const resetSession = useCallback((preserve = false) => {
     setSessionOpening(undefined);
@@ -683,6 +691,7 @@ export function useAcp() {
   }, [refreshRuntime, resetSession, returnHome]);
 
   const handleGlobalEvent = useCallback((event: GlobalBusinessEvent) => {
+    if (event.type === "bridge/auth_terminal_exited") closeAuthInput(event.requestId);
     switch (event.type) {
       case "bridge/connection":
         connectionReadyRef.current = event.phase === "ready";
@@ -692,6 +701,7 @@ export function useAcp() {
         if (!connectionReadyRef.current) refreshInFlightRef.current = undefined;
         if (event.phase === "stopped" || event.phase === "error") {
           promptAdmissionsRef.current.clear();
+          closeAuthInput();
         }
         dispatch({
           type: "server/event",
@@ -723,7 +733,7 @@ export function useAcp() {
       default:
         dispatch({ type: "server/event", event: event as ServerEvent });
     }
-  }, [refreshRuntime, invalidateSessionList]);
+  }, [closeAuthInput, refreshRuntime, invalidateSessionList]);
 
   const connectGlobalEvents = useCallback(() => {
     globalEventsRef.current?.close();
@@ -782,6 +792,7 @@ export function useAcp() {
     document.addEventListener("visibilitychange", recoverClosedStreams);
     return () => {
       disposed = true;
+      closeAuthInput();
       navigationRef.current += 1;
       reconnectRef.current = () => undefined;
       window.removeEventListener("online", recoverClosedStreams);
@@ -793,7 +804,7 @@ export function useAcp() {
       sessionEventsRef.current?.close();
       refreshInFlightRef.current = undefined;
     };
-  }, [connectGlobalEvents, refreshRuntime, resetSession, returnHome]);
+  }, [closeAuthInput, connectGlobalEvents, refreshRuntime, resetSession, returnHome]);
 
   const searchWorkspaceContext = useCallback(async (query: string) => {
     const sessionId = activeSessionIdRef.current;
@@ -995,11 +1006,34 @@ export function useAcp() {
   }, [handleGlobalEvent, refreshRuntime, reportError]);
 
   const writeAuthTerminal = useCallback((requestId: string, data: string) => {
-    void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/input`, {
-      method: "POST",
-      body: JSON.stringify({ data }),
-    }).catch(reportError);
-  }, [reportError]);
+    const acceptsInput = () => {
+      const terminal = stateRef.current.authTerminal;
+      return terminal?.requestId === requestId &&
+        (terminal.status === "starting" || terminal.status === "running");
+    };
+    if (!acceptsInput()) return;
+    const queue = authInputQueueRef.current?.requestId === requestId
+      ? authInputQueueRef.current
+      : { requestId, tail: Promise.resolve(), closed: false };
+    authInputQueueRef.current = queue;
+    if (queue.closed) return;
+    // Separate HTTP requests can arrive out of order. Wait for each PTY write
+    // before sending the next keystroke, including Enter.
+    queue.tail = queue.tail.then(async () => {
+      if (authInputQueueRef.current !== queue || queue.closed || !acceptsInput()) return;
+      await requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/input`, {
+        method: "POST",
+        body: JSON.stringify({ data }),
+      });
+    }).catch((error) => {
+      if (authInputQueueRef.current !== queue || queue.closed || !acceptsInput()) return;
+      // Delivery may be uncertain: discard the queued suffix and never replay
+      // it. A later explicit keystroke starts a fresh queue for this terminal.
+      queue.closed = true;
+      authInputQueueRef.current = undefined;
+      reportRequestError(error, requestId, "auth/terminal_input");
+    });
+  }, [reportRequestError]);
 
   const resizeAuthTerminal = useCallback((requestId: string, cols: number, rows: number) => {
     void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/resize`, {
@@ -1009,10 +1043,11 @@ export function useAcp() {
   }, [reportError]);
 
   const cancelAuthTerminal = useCallback((requestId: string) => {
+    closeAuthInput(requestId);
     void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/cancel`, {
       method: "POST",
     }).catch(reportError);
-  }, [reportError]);
+  }, [closeAuthInput, reportError]);
 
   const dismissAuthTerminal = useCallback(() => dispatch({ type: "auth/dismiss_terminal" }), []);
 

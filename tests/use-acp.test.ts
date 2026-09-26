@@ -213,6 +213,110 @@ describe("project navigation", () => {
     vi.unstubAllGlobals();
   });
 
+  async function authEvent(type: "started" | "exited", requestId = "auth") {
+    await act(async () => TestEventSource.instances[0].onmessage?.({ data: JSON.stringify({
+      type: `bridge/auth_terminal_${type}`, requestId, methodId: "login",
+      ...(type === "exited" ? { status: "cancelled" } : {}),
+    }) }));
+  }
+
+  it("preserves terminal keystrokes and Enter order while an input request is delayed", async () => {
+    await mount("/");
+    await authEvent("started");
+    const inputs: string[] = [];
+    let acknowledge!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).endsWith("/input")) {
+        inputs.push(JSON.parse(String(init?.body)).data);
+        if (inputs.length === 1) return new Promise<Response>((resolve) => { acknowledge = resolve; });
+        return response({});
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => {
+      for (const data of ["o", "pen-", "sesame", "\r"]) acp.writeAuthTerminal("auth", data);
+    });
+    expect(inputs).toEqual(["o"]);
+    await act(async () => acknowledge(response({})));
+    expect(inputs.join("")).toBe("open-sesame\r");
+  });
+
+  it.each(["cancel", "exit", "unmount"])("discards queued authentication input after %s", async (stop) => {
+    await mount("/");
+    await authEvent("started");
+    const inputs: string[] = [];
+    let acknowledge!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).endsWith("/input")) {
+        inputs.push(JSON.parse(String(init?.body)).data);
+        if (inputs.length === 1) return new Promise<Response>((resolve) => { acknowledge = resolve; });
+        return response({});
+      }
+      if (String(input).endsWith("/cancel")) return response({});
+      return defaultFetch(input, init);
+    });
+    await act(async () => { acp.writeAuthTerminal("auth", "o"); });
+    await act(async () => { acp.writeAuthTerminal("auth", "pen-sesame\r"); });
+    if (stop === "cancel") await act(async () => acp.cancelAuthTerminal("auth"));
+    else if (stop === "exit") await authEvent("exited");
+    else await act(async () => root.unmount());
+    await act(async () => acknowledge(response({})));
+    expect(inputs).toEqual(["o"]);
+  });
+
+  it("drops unsent authentication input on a failed write without replaying it", async () => {
+    await mount("/");
+    await authEvent("started");
+    const inputs: string[] = [];
+    let acknowledge!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).endsWith("/input")) {
+        inputs.push(JSON.parse(String(init?.body)).data);
+        if (inputs.length === 1) return new Promise<Response>((resolve) => { acknowledge = resolve; });
+        return response({});
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => {
+      acp.writeAuthTerminal("auth", "o");
+      acp.writeAuthTerminal("auth", "pen-sesame\r");
+    });
+    await act(async () => acknowledge(response({ error: "Input delivery failed" }, 500)));
+    expect(inputs).toEqual(["o"]);
+    expect(acp.state.authTerminal?.message).toContain("Input delivery failed");
+    await act(async () => acp.writeAuthTerminal("auth", "manual input"));
+    expect(inputs).toEqual(["o", "manual input"]);
+  });
+
+  it("isolates a new authentication attempt from old pending input and late failures", async () => {
+    await mount("/");
+    await authEvent("started");
+    const inputs: string[] = [];
+    let acknowledge!: (value: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).endsWith("/input")) {
+        inputs.push(`${String(input)}:${JSON.parse(String(init?.body)).data}`);
+        if (inputs.length === 1) return new Promise<Response>((resolve) => { acknowledge = resolve; });
+        return response({});
+      }
+      return defaultFetch(input, init);
+    });
+    await act(async () => {
+      acp.writeAuthTerminal("auth", "old");
+      acp.writeAuthTerminal("auth", "queued");
+    });
+    await authEvent("exited");
+    await authEvent("started", "next");
+    await act(async () => acp.writeAuthTerminal("next", "new\r"));
+    await act(async () => acknowledge(response({ error: "Old attempt failed" }, 500)));
+    expect(inputs).toEqual([
+      "/api/v1/auth/terminal/auth/input:old",
+      "/api/v1/auth/terminal/next/input:new\r",
+    ]);
+    expect(acp.state.authTerminal).toMatchObject({ requestId: "next", status: "running" });
+    expect(acp.state.authTerminal?.message).toBeUndefined();
+  });
+
   it("uses new and materialized sessions when the Agent has no list capability", async () => {
     fetchMock.mockImplementation(async (input, init) => {
       if (String(input) === "/api/v1/runtime") return response({

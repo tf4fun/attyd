@@ -155,6 +155,8 @@ and reproduce CI browser behavior. The attachment case checks the PDF's MIME typ
 inline disposition, and original bytes, then follows `navigator.pdfViewerEnabled`:
 full Chrome may open its PDF viewer, while the headless shell downloads the file.
 Both are expected outcomes of handing the link to the browser.
+CI retains one diagnostic retry but fails on flaky tests, so a retry cannot turn a
+first-attempt failure into a successful browser or coverage gate.
 
 Browser assertions follow the current projection contract. Completed process bodies are absent
 after reload until the user expands their turn; locate that turn through its visible prompt or final
@@ -169,6 +171,14 @@ The two deliberate Agent-exit cases also allow a 503 from the same-origin curren
 view endpoint while the Agent is unavailable: an in-flight refresh can race the exit.
 That exception ends when the composer recovers; unrelated endpoints and page errors
 remain failures. The classifier tests cover the endpoint, origin, and status boundaries.
+
+Terminal authentication input is sent in keystroke order, waiting for each PTY write's
+HTTP response before sending the next input. The browser authentication case holds the
+first keystroke in transit while typing the remaining access code and Enter, then checks
+that authentication completes after releasing it. `tests/use-acp.test.ts` also covers
+discarding unsent input on cancellation, terminal exit, unmount, or a failed write, and
+isolating a new authentication attempt from late replies. A failed write is never replayed.
+The native `auth_terminal::tests` gate verifies PTY input and lifecycle behavior first.
 
 ## Backend behavior
 

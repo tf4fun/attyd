@@ -3468,6 +3468,14 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
     ],
   });
   const browserErrors = collectBrowserErrors(page, [409]);
+  let releaseFirstInput!: () => void;
+  const firstInputGate = new Promise<void>((resolve) => { releaseFirstInput = resolve; });
+  const inputChunks: string[] = [];
+  await page.route("**/api/v1/auth/terminal/*/input", async (route) => {
+    inputChunks.push(route.request().postDataJSON().data);
+    if (inputChunks.length === 1) await firstInputGate;
+    await route.continue();
+  });
 
   try {
     await page.goto(`http://127.0.0.1:${authServer.port}/sessions/saved-session`);
@@ -3485,8 +3493,13 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
     await expect(terminal.getByRole("button", { name: "Cancel" })).toBeVisible();
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
     await terminalInput.focus();
-    await terminalInput.pressSequentially("open-sesame");
+    await terminalInput.pressSequentially("o");
+    await expect.poll(() => inputChunks).toEqual(["o"]);
+    await terminalInput.pressSequentially("pen-sesame");
     await terminalInput.press("Enter");
+    // A delayed keystroke must reach the PTY before any later text or Enter.
+    expect(inputChunks).toEqual(["o"]);
+    releaseFirstInput();
 
     await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
     await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
@@ -3495,6 +3508,8 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
   } finally {
+    releaseFirstInput();
+    await page.unrouteAll({ behavior: "wait" });
     await authServer.close();
     await rm(root, { recursive: true, force: true });
   }
