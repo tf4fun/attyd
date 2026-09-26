@@ -293,10 +293,49 @@ stage and OS cause. A failure after mutation starts can leave partial content;
 the Agent decides how to recover. Cancellation is checked before mutation, then
 an ongoing write finishes and reports its actual result.
 
-Images and audio have previews, including embedded resources. Binary attachments
-show their name, MIME type and decoded size, with a download action for available
-bytes. Links without bytes open only on a user click; attyd does not fetch them to
-make previews. Downloads are exports, not a persistent conversation cache.
+Before sending, attachments appear as removable name/type/size chips in the
+composer; queued prompts also use compact labels. In the conversation, all file,
+image, and audio attachments appear as compact clickable chips with a name and
+size. Chips wrap onto the next line when needed; the MIME type is available in
+the tooltip. Tool outputs use borderless resource rows with the name, size, and
+file directory or web address. This presentation applies to every tool kind.
+File contents and media are never expanded inline.
+
+The host retains complete attachment content in its existing session memory cache.
+Normal HTTP views, process pages, and live events send attachment metadata and
+session-scoped references to the browser. Unsent drafts remain browser-local.
+Clicking a chip opens the host's attachment URL in a new tab, with no frontend
+Blob allocation, object URL cleanup, or format-specific preview library.
+The host serves text as UTF-8 and preserves binary MIME types and bytes.
+Active documents such as HTML/SVG receive a sandbox CSP with scripts disabled. The browser
+decides whether to display or download other formats according to their MIME type
+and browser settings; unsupported types normally trigger a download. There are
+no separate preview/download modes in the client.
+The host resolves attachment references back to the original ACP blocks on prompt
+reuse. Explicit exports request full content without installing it in browser
+conversation state. Attachment URLs are tied to the bridge epoch and session
+incarnation: closing/retiring a session or restarting the host invalidates old
+URLs, and loading Agent history supplies fresh references. Attachments introduce
+no separate disk store or cache lifetime. Responses use `Cache-Control: no-store`.
+Restoration requires the Agent to replay the original attachment content blocks.
+If an Agent flattens attachments into ordinary text, attyd displays that text;
+it does not reconstruct files from vendor-specific text markers.
+User messages render Markdown/GFM in the same reading column as other messages.
+Messages taller than nine rendered lines initially show a compact preview with an
+expand/collapse control on the right, without an enclosing card or background.
+Folding uses the actual Markdown height and updates when content or viewport width
+changes; messages that fit remain fully visible without a fade or toggle. The last
+three preview lines fade gently. Markdown is parsed in full, preserving formatting
+and links; reusing and exporting retain its complete original source.
+When editing a reused prompt, text fields and attachment chips follow the original
+content-block order. Editing changes only that text block, removing an attachment
+removes only that block, and new attachments append at the end. Block metadata is
+retained; separate text blocks are not combined or given extra separators.
+MIME parameters accept standard whitespace and quoted values. Text attachments
+are served with one UTF-8 charset parameter; binary attachment bytes and MIME
+parameters are preserved.
+Links without bytes open only on a user click; attyd does not fetch them to make
+previews. Downloads are exports, not a persistent conversation cache.
 
 ## Terminal command semantics
 

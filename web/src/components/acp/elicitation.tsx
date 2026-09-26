@@ -10,7 +10,7 @@ import type {
   StringPropertySchema,
 } from "@agentclientprotocol/sdk";
 import { CircleCheck, CircleX, ExternalLink, ListTodo, LoaderCircle, X } from "lucide-react";
-import { useMemo, useState, type FormEvent } from "react";
+import { useId, useMemo, useState, type FormEvent } from "react";
 import { useTranslation } from "../../i18n";
 import type { ExternalElicitationFlow, PendingElicitation } from "../../lib/state";
 import { safeHttpUrl } from "../../lib/safe-url";
@@ -226,6 +226,7 @@ function ElicitationField({
 }) {
   const { t } = useTranslation("cards");
   const common = schema as { title?: string | null; description?: string | null };
+  const choiceDescriptionId = useId();
   const title = common.title ?? name;
   const description = common.description;
 
@@ -243,9 +244,9 @@ function ElicitationField({
     const arraySchema = schema as MultiSelectPropertySchema & { type: "array" };
     const items = arraySchema.items as { anyOf?: EnumOption[]; enum?: string[] };
     const choices = items.anyOf && items.anyOf.length > 0
-      ? items.anyOf.map((item) => ({ value: item.const, label: item.title }))
+      ? items.anyOf.map((item) => ({ value: item.const, label: item.title, description: item.description }))
       : items.enum
-        ? items.enum.map((item) => ({ value: item, label: item }))
+        ? items.enum.map((item) => ({ value: item, label: item, description: undefined }))
         : [];
     const selected = Array.isArray(value) ? value : [];
     return (
@@ -265,7 +266,7 @@ function ElicitationField({
                 onChange(next.length > 0 || required ? next : undefined);
               }}
             />
-            {choice.label}
+            <span>{choice.label}{choice.description ? <small>{choice.description}</small> : null}</span>
           </label>
         ))}
       </fieldset>
@@ -279,18 +280,20 @@ function ElicitationField({
   ) {
     const stringSchema = schema as StringPropertySchema & { type: "string" };
     const choices = stringSchema.oneOf && stringSchema.oneOf.length > 0
-      ? stringSchema.oneOf.map((item) => ({ value: item.const, label: item.title }))
-      : (stringSchema.enum ?? []).map((item) => ({ value: item, label: item }));
+      ? stringSchema.oneOf.map((item) => ({ value: item.const, label: item.title, description: item.description }))
+      : (stringSchema.enum ?? []).map((item) => ({ value: item, label: item, description: undefined }));
+    const choiceDescription = choices.find((choice) => choice.value === value)?.description;
     let unspecified = "__attyd_unspecified__";
     while (choices.some((choice) => choice.value === unspecified)) unspecified += "_";
     return (
       <label>
         <strong>{title}{required ? " *" : ""}</strong>
         {description ? <small>{description}</small> : null}
-        <select disabled={disabled} aria-required={required} value={value === undefined ? unspecified : String(value)} onChange={(event) => onChange(event.target.value === unspecified ? undefined : event.target.value)}>
+        <select disabled={disabled} aria-required={required} aria-describedby={choiceDescription ? choiceDescriptionId : undefined} value={value === undefined ? unspecified : String(value)} onChange={(event) => onChange(event.target.value === unspecified ? undefined : event.target.value)}>
           {!required ? <option value={unspecified}>{t("elicitation.unspecified")}</option> : null}
           {choices.map((choice) => <option value={choice.value} key={choice.value}>{choice.label}</option>)}
         </select>
+        {choiceDescription ? <small id={choiceDescriptionId}>{choiceDescription}</small> : null}
       </label>
     );
   }

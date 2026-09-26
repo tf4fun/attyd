@@ -32,6 +32,90 @@ describe("ACP interactive UI contract", () => {
     container.remove();
   });
 
+  it("keeps permission input when its patch is null and renders the approval content in order", async () => {
+    const onRespond = vi.fn();
+    await render(root, <PermissionCard
+      pending={{ permissionId: "context", request: {
+        sessionId: "session", toolCall: { toolCallId: "tool", rawInput: null },
+        options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+      } }}
+      toolCall={{ toolCallId: "tool", title: "Review changes", rawInput: { path: "/workspace/config.ts" }, content: [
+        { type: "content", content: { type: "text", text: "## Implementation plan\n\nReview before continuing." } },
+        { type: "diff", path: "/workspace/config.ts", oldText: "old", newText: "new" },
+        { type: "terminal", terminalId: "terminal" },
+      ] }}
+      terminalSnapshots={[{ terminalId: "terminal", sessionId: "session", output: "Checked configuration", truncated: false }]}
+      onRespond={onRespond}
+    />);
+    const subject = requireElement(container.querySelector(".permission-subject"));
+    expect(subject.querySelector(".raw-json")?.textContent).toContain("/workspace/config.ts");
+    expect(subject.querySelector(".markdown")?.textContent).toContain("Implementation plan");
+    expect(subject.textContent).toContain("Checked configuration");
+    expect([...subject.querySelectorAll(".permission-content > *")].map((node) => node.className))
+      .toEqual([expect.stringContaining("content-block"), expect.stringContaining("diff"), "terminal-embed"]);
+    expect(subject.querySelector(".permission-warning")).toBeNull();
+    expect(onRespond).not.toHaveBeenCalled();
+    await click(buttonWithText(container, "Allow once"));
+    expect(onRespond).toHaveBeenCalledWith({ outcome: "selected", optionId: "allow" });
+  });
+
+  it("shows a content-only permission request without an uninspectable warning", async () => {
+    await render(root, <PermissionCard pending={{ permissionId: "plan", request: {
+      sessionId: "session", toolCall: { toolCallId: "switch", title: "Ready for implementation", kind: "switch_mode",
+        content: [{ type: "content", content: { type: "text", text: "Plan supplied by the Agent" } }],
+      }, options: [],
+    } }} onRespond={vi.fn()} />);
+    expect(container.querySelector(".permission-subject .markdown")?.textContent).toContain("Plan supplied by the Agent");
+    expect(container.querySelector(".permission-warning")).toBeNull();
+  });
+
+  it("preserves config group labels for duplicate names and searches by group", async () => {
+    const onConfig = vi.fn();
+    await render(root, <SessionControls modes={null} disabled={false} onMode={vi.fn()} onConfig={onConfig}
+      options={[{ type: "select", id: "model", name: "Model", currentValue: "a-0", options: [
+        { group: "a", name: "Provider A", options: Array.from({ length: 4 }, (_, i) => ({ value: `a-${i}`, name: `Model ${i}` })) },
+        { group: "b", name: "Provider B", options: Array.from({ length: 4 }, (_, i) => ({ value: `b-${i}`, name: `Model ${i}` })) },
+      ] }]} />);
+    await click(requireElement(container.querySelector(".config-trigger")));
+    expect([...container.querySelectorAll('[role="group"]')].map((group) => group.getAttribute("aria-label")))
+      .toEqual(["Provider A", "Provider B"]);
+    await replaceInput(requireElement(container.querySelector(".config-search input")), "Provider B");
+    expect(container.querySelectorAll('[role="option"]')).toHaveLength(4);
+    expect(container.querySelector('[role="group"]')?.getAttribute("aria-label")).toBe("Provider B");
+    await click(requireElement(container.querySelector('[role="option"]')));
+    expect(onConfig).toHaveBeenCalledWith("model", "b-0");
+  });
+
+  it("shows descriptions supplied with legacy modes", async () => {
+    await render(root, <SessionControls options={null} disabled={false} onMode={vi.fn()} onConfig={vi.fn()}
+      modes={{ currentModeId: "code", availableModes: [{ id: "code", name: "Code", description: "Changes files without asking" }] }} />);
+    await click(requireElement(container.querySelector(".config-trigger")));
+    expect(container.querySelector('[role="option"]')?.textContent).toContain("Changes files without asking");
+  });
+
+  it("shows enum choice descriptions while submitting their original values", async () => {
+    const onRespond = vi.fn();
+    await render(root, <ElicitationCard pending={{ elicitationId: "choices", request: {
+      sessionId: "session", mode: "form", message: "Choose a strategy", requestedSchema: { type: "object", properties: {
+        strategy: { type: "string", default: "safe", oneOf: [
+          { const: "safe", title: "Safe", description: "Request approval for each change" },
+          { const: "fast", title: "Fast", description: "Apply all approved changes together" },
+        ] },
+        checks: { type: "array", items: { anyOf: [{ const: "tests", title: "Tests", description: "Run the test suite" }] } },
+      } },
+    } }} onRespond={onRespond} />);
+    const fields = requireElement(container.querySelector(".elicitation-fields"));
+    expect(fields.textContent).toContain("Request approval for each change");
+    expect(fields.textContent).toContain("Run the test suite");
+    const select = requireElement<HTMLSelectElement>(fields.querySelector("select"));
+    await act(async () => { select.value = "fast"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    expect(fields.textContent).toContain("Apply all approved changes together");
+    expect(fields.textContent).not.toContain("Request approval for each change");
+    await click(requireElement(fields.querySelector('input[type="checkbox"]')));
+    await click(buttonWithText(container, "Submit"));
+    expect(onRespond).toHaveBeenCalledWith({ action: "accept", content: { strategy: "fast", checks: ["tests"] } });
+  });
+
   it("displays the requesting Agent, host and full external URL before consent", async () => {
     const onRespond = vi.fn();
     const url = "https://accounts.example.test:8443/connect?project=demo#consent";
@@ -628,24 +712,27 @@ describe("ACP interactive UI contract", () => {
         onCancel={vi.fn()}
       />
     ));
-    const composer = requireElement<HTMLTextAreaElement>(
+    let composer = requireElement<HTMLTextAreaElement>(
       container.querySelector('textarea[role="combobox"]'),
     );
 
     await press(composer, "ArrowUp");
+    composer = requireElement(container.querySelector<HTMLTextAreaElement>("textarea"));
     expect(composer.value).toBe("review this file");
     expect(container.querySelector(".attachment-list")?.textContent)
       .toContain("Applicationlink");
-    expect(container.querySelector(".attachment-list")?.textContent)
+    expect(container.querySelector(".composer-document")?.textContent)
       .toContain("file:///workspace/note.mdcontext");
     expect(container.querySelector(".composer-bar")?.textContent)
       .toContain("2 of 2 previous prompts");
 
     await press(composer, "ArrowUp");
+    composer = requireElement(container.querySelector<HTMLTextAreaElement>("textarea"));
     expect(composer.value).toBe("inspect the image");
     expect(container.querySelector(".attachment-list")?.textContent)
       .toContain("file:///workspace/pixel.pngimage · 3 B");
     await press(composer, "ArrowDown");
+    composer = requireElement(container.querySelector<HTMLTextAreaElement>("textarea"));
     expect(composer.value).toBe("review this file");
 
     await press(composer, "Enter");
@@ -654,7 +741,7 @@ describe("ACP interactive UI contract", () => {
       [latest[0], latest[2]],
       latest,
     );
-    expect(composer.value).toBe("");
+    expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("");
     expect(container.querySelector(".attachment-list")).toBeNull();
   });
 
@@ -669,7 +756,7 @@ describe("ACP interactive UI contract", () => {
         onCancel={vi.fn()}
       />
     ));
-    const composer = requireElement<HTMLTextAreaElement>(
+    let composer = requireElement<HTMLTextAreaElement>(
       container.querySelector('textarea[role="combobox"]'),
     );
     await replaceText(composer, "current\nmultiline draft");
@@ -680,9 +767,10 @@ describe("ACP interactive UI contract", () => {
 
     await replaceText(composer, "");
     await press(composer, "ArrowUp");
+    composer = requireElement(container.querySelector<HTMLTextAreaElement>("textarea"));
     expect(composer.value).toBe("previous");
     await press(composer, "ArrowDown");
-    expect(composer.value).toBe("");
+    expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("");
   });
 
   it("toggles Zed-style full message-editor mode without replacing the ACP draft", async () => {
@@ -1135,6 +1223,113 @@ describe("ACP interactive UI contract", () => {
         { type: "resource_link", uri: "file:///workspace/a.ts", name: "a.ts" },
       ],
     );
+  });
+
+  it("edits interleaved prompt text in place and retains source metadata", async () => {
+    const onSubmit = vi.fn();
+    const blocks: ContentBlock[] = [
+      { type: "text", text: "Description A:", annotations: { audience: ["user"] }, _meta: { source: "A" } },
+      { type: "image", uri: "file:///A.png", mimeType: "image/png", data: "AQID" },
+      { type: "text", text: "Description B:", _meta: { source: "B" } },
+      { type: "resource_link", uri: "attyd://attachment/B.png", name: "B.png", _meta: {
+        "attyd/attachment": { id: "a".repeat(64), sessionId: "session", bridgeEpoch: "epoch", sessionIncarnation: 1 },
+      } },
+    ];
+    await render(root, <PromptComposer disabled={false} running={false} commands={[]}
+      draft={{ id: "interleaved", blocks }} onSubmit={onSubmit} onCancel={vi.fn()} />);
+    const fields = container.querySelectorAll<HTMLTextAreaElement>('textarea[role="combobox"]');
+    expect([...fields].map((field) => field.value)).toEqual(["Description A:", "Description B:"]);
+    await replaceText(fields[1], "Description B: revised");
+    await press(fields[1], "Enter");
+    expect(onSubmit).toHaveBeenCalledWith(
+      "Description A:Description B: revised", [blocks[1], blocks[3]],
+      [blocks[0], blocks[1], { ...blocks[2], text: "Description B: revised" }, blocks[3]],
+    );
+    expect(container.querySelectorAll("textarea")).toHaveLength(1);
+    expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("");
+  });
+
+  it("removes only the selected attachment from a restored prompt", async () => {
+    const onSubmit = vi.fn();
+    const blocks: ContentBlock[] = [
+      { type: "text", text: "Before", _meta: { source: "first" } },
+      { type: "image", uri: "file:///A.png", mimeType: "image/png", data: "AQID" },
+      { type: "text", text: "After", annotations: { priority: 0.5 } },
+      { type: "resource_link", uri: "urn:fixture:B", name: "B" },
+    ];
+    await render(root, <PromptComposer disabled={false} running={false} commands={[]}
+      draft={{ id: "remove", blocks }} onSubmit={onSubmit} onCancel={vi.fn()} />);
+    await click(requireElement(container.querySelector(".attachment-list button")));
+    await click(requireElement(container.querySelector('[aria-label="Send prompt"]')));
+    expect(onSubmit.mock.calls[0][2]).toEqual([blocks[0], blocks[2], blocks[3]]);
+  });
+
+  it("uses commands in the focused restored text and appends links without reordering", async () => {
+    const onSubmit = vi.fn(() => false);
+    const blocks: ContentBlock[] = [
+      { type: "text", text: "First", _meta: { keep: true } },
+      { type: "resource_link", uri: "urn:fixture:A", name: "A" },
+      { type: "text", text: "Second" },
+    ];
+    await render(root, <PromptComposer disabled={false} running={false}
+      commands={[{ name: "review", description: "Review changes", input: { hint: "changes" } }]}
+      draft={{ id: "command", blocks }} onSubmit={onSubmit} onCancel={vi.fn()} />);
+    const fields = container.querySelectorAll<HTMLTextAreaElement>("textarea");
+    expect(fields).toHaveLength(2);
+    await replaceText(fields[1], "/rev");
+    await press(fields[1], "Enter");
+    expect(fields[0].value).toBe("First");
+    expect(fields[1].value).toBe("/review ");
+    await click(requireElement(container.querySelector('[aria-label="Add ACP resource link"]')));
+    await replaceInput(requireElement(container.querySelector<HTMLInputElement>('[aria-label="Resource URI"]')), "https://example.com/new");
+    await click(requireElement(container.querySelector('[aria-label="Add resource link"]')));
+    await click(requireElement(container.querySelector('[aria-label="Send prompt"]')));
+    expect(onSubmit.mock.calls[0][2]).toEqual([
+      blocks[0], blocks[1], { ...blocks[2], text: "/review " },
+      { type: "resource_link", uri: "https://example.com/new", name: "new" },
+    ]);
+    expect([...container.querySelectorAll<HTMLTextAreaElement>("textarea")].map((field) => field.value))
+      .toEqual(["First", "/review "]);
+    expect(container.querySelectorAll(".attachment-list button")).toHaveLength(2);
+  });
+
+  it("keeps multiple text blocks distinct, including an edited empty block", async () => {
+    const onSubmit = vi.fn();
+    const blocks: ContentBlock[] = [
+      { type: "text", text: "First", _meta: { source: "first" } },
+      { type: "text", text: "Second", annotations: { audience: ["assistant"] } },
+    ];
+    await render(root, <PromptComposer disabled={false} running={false} commands={[]}
+      history={[[{ type: "text", text: "Older prompt" }]]}
+      draft={{ id: "texts", blocks }} onSubmit={onSubmit} onCancel={vi.fn()} />);
+    const fields = container.querySelectorAll<HTMLTextAreaElement>("textarea");
+    expect(fields).toHaveLength(2);
+    await replaceText(fields[0], "");
+    await press(fields[0], "ArrowUp");
+    expect([...container.querySelectorAll<HTMLTextAreaElement>("textarea")].map((field) => field.value))
+      .toEqual(["", "Second"]);
+    const send = requireElement(container.querySelector<HTMLButtonElement>('[aria-label="Send prompt"]'));
+    expect(send.disabled).toBe(false);
+    await click(send);
+    expect(onSubmit.mock.calls[0][2]).toEqual([{ ...blocks[0], text: "" }, blocks[1]]);
+  });
+
+  it("preserves attachment-only prompts and appends newly pasted files in order", async () => {
+    const onSubmit = vi.fn(() => false);
+    const blocks: ContentBlock[] = [{ type: "resource_link", uri: "urn:fixture:original", name: "Original" }];
+    await render(root, <PromptComposer disabled={false} running={false} commands={[]}
+      capabilities={{ embeddedContext: true }}
+      draft={{ id: "attachments", blocks }} onSubmit={onSubmit} onCancel={vi.fn()} />);
+    await click(requireElement(container.querySelector('[aria-label="Send prompt"]')));
+    expect(onSubmit.mock.calls[0][2]).toEqual(blocks);
+    const editor = requireElement(container.querySelector<HTMLTextAreaElement>("textarea"));
+    await replaceText(editor, "Follow-up");
+    await dispatchFileEvent(editor, "paste", [new File(["# Context"], "new.md", { type: "text/markdown" })]);
+    await press(editor, "Enter");
+    expect(onSubmit.mock.calls[1][2]).toEqual([
+      ...blocks, { type: "text", text: "Follow-up" },
+      { type: "resource", resource: { uri: "attyd://attachment/new.md", mimeType: "text/markdown", text: "# Context" } },
+    ]);
   });
 
   it("offers message actions without conflating them with ACP metadata", async () => {

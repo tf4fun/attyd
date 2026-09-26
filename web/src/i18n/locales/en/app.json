@@ -72,7 +72,8 @@
     "planning": "Agent is planning",
     "compacting": "Agent is compacting context",
     "responding": "Agent is responding",
-    "working": "Agent is working"
+    "working": "Agent is working",
+    "cancelling": "Cancelling the current turn…"
   },
   "errors": {
     "requestTimeout": "Request timed out after {{seconds}} seconds. Please retry.",

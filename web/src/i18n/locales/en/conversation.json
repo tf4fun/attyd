@@ -95,6 +95,7 @@
     "description": "{{kind}} · {{size}}"
   },
   "composer": {
+    "textPart": "Message text {{index}}",
     "connectionUnavailable": "Agent connection unavailable",
     "context": {
       "files": "Files from this workspace",
@@ -145,6 +146,7 @@
     },
     "stop": "Stop current turn",
     "cancel": "Cancel turn",
+    "cancelling": "Cancelling the current turn…",
     "send": "Send prompt",
     "history_one": "{{index}} of {{count, number}} previous prompts",
     "history_other": "{{index}} of {{count, number}} previous prompts"

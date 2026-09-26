@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -42,6 +43,12 @@ export interface ComposerDraft {
   blocks: ContentBlock[];
 }
 
+interface RestoredPromptPart {
+  id: string;
+  block: ContentBlock;
+  placeholder?: boolean;
+}
+
 export type ThreadNavigationTarget =
   | "top"
   | "bottom"
@@ -56,6 +63,7 @@ export type ThreadNavigationTarget =
 export function PromptComposer({
   disabled,
   running,
+  cancelling = false,
   capabilities,
   commands,
   sessionControls,
@@ -72,6 +80,7 @@ export function PromptComposer({
 }: {
   disabled: boolean;
   running: boolean;
+  cancelling?: boolean;
   capabilities?: PromptCapabilities | null;
   commands: AvailableCommand[];
   sessionControls?: ReactNode;
@@ -94,6 +103,7 @@ export function PromptComposer({
   onReadWorkspaceContext?: (path: string) => Promise<WorkspaceContextAttachment>;
 }) {
   const { t } = useTranslation("conversation");
+  // Autocomplete follows the focused text field; restoredParts owns the whole prompt.
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<Error | string>();
@@ -111,6 +121,7 @@ export function PromptComposer({
   const [activeContextIndex, setActiveContextIndex] = useState(0);
   const [expanded, setExpanded] = useState(false);
   const [historyIndex, setHistoryIndex] = useState<number>();
+  const [restoredParts, setRestoredParts] = useState<RestoredPromptPart[]>();
   const area = useRef<HTMLTextAreaElement>(null);
   const activeCommand = useRef<HTMLButtonElement>(null);
   const picker = useRef<HTMLInputElement>(null);
@@ -122,9 +133,15 @@ export function PromptComposer({
   const historyScratch = useRef<{
     value: string;
     attachments: PromptAttachment[];
+    blocks?: ContentBlock[];
   } | undefined>(undefined);
-  const restoredBlocksRef = useRef<ContentBlock[] | undefined>(undefined);
+  const restoredPartsRef = useRef<RestoredPromptPart[] | undefined>(undefined);
+  const focusedPartId = useRef<string | undefined>(undefined);
+  const restoredCaret = useRef<number | undefined>(undefined);
   attachmentsRef.current = attachments;
+  const promptText = restoredParts
+    ? restoredParts.flatMap(({ block }) => block.type === "text" ? [block.text] : []).join("")
+    : value;
   const attachmentsSupported = Boolean(
     capabilities?.image || capabilities?.audio || capabilities?.embeddedContext,
   );
@@ -157,9 +174,37 @@ export function PromptComposer({
     historyScratch.current = undefined;
   };
 
-  const markRestoredBlocksChanged = () => {
-    restoredBlocksRef.current = undefined;
+  const updateRestoredParts = (parts: RestoredPromptPart[] | undefined) => {
+    restoredPartsRef.current = parts;
+    setRestoredParts(parts);
+  };
+
+  const changeText = (text: string, partId = focusedPartId.current) => {
     leaveHistory();
+    setValue(text);
+    if (restoredPartsRef.current && partId) {
+      focusedPartId.current = partId;
+      updateRestoredParts(restoredPartsRef.current.map((part) =>
+        part.id === partId && part.block.type === "text"
+          ? { ...part, block: { ...part.block, text } }
+          : part
+      ));
+    }
+  };
+
+  const updateAttachments = (next: PromptAttachment[]) => {
+    leaveHistory();
+    const parts = restoredPartsRef.current;
+    if (parts) {
+      const nextIds = new Set(next.map(({ id }) => id));
+      const previousIds = new Set(parts.map(({ id }) => id));
+      updateRestoredParts([
+        ...parts.filter(({ id, block }) => block.type === "text" || nextIds.has(id)),
+        ...next.filter(({ id }) => !previousIds.has(id)).map(({ id, block }) => ({ id, block })),
+      ]);
+    }
+    attachmentsRef.current = next;
+    setAttachments(next);
   };
 
   const restoreComposer = (
@@ -167,31 +212,32 @@ export function PromptComposer({
     restoredAttachments: PromptAttachment[],
     restoredBlocks?: ContentBlock[],
   ) => {
+    let attachmentIndex = 0;
+    const parts: RestoredPromptPart[] | undefined = restoredBlocks?.map((block) => ({
+      id: block.type === "text" ? randomId() : restoredAttachments[attachmentIndex++].id,
+      block,
+    }));
+    if (parts && !parts.some(({ block }) => block.type === "text")) {
+      parts.push({ id: randomId(), block: { type: "text", text: "" }, placeholder: true });
+    }
+    const firstText = parts?.find(({ block }) => block.type === "text");
+    focusedPartId.current = firstText?.id;
+    updateRestoredParts(parts);
     setValue(restoredValue);
     attachmentsRef.current = restoredAttachments;
     setAttachments(restoredAttachments);
-    restoredBlocksRef.current = restoredBlocks;
     setAttachmentError(undefined);
     setDragActive(false);
     setLinkOpen(false);
     setCommandMenuDismissed(false);
     setContextMenuDismissed(false);
     setCaret(restoredValue.length);
-    requestAnimationFrame(() => {
-      area.current?.focus();
-      area.current?.setSelectionRange(restoredValue.length, restoredValue.length);
-      if (area.current) {
-        area.current.style.height = "auto";
-        area.current.style.height = `${Math.min(area.current.scrollHeight, 220)}px`;
-      }
-    });
+    restoredCaret.current = restoredValue.length;
   };
 
   const restoreBlocks = (blocks: ContentBlock[]) => {
     const restoredText = blocks
-      .filter((block): block is Extract<ContentBlock, { type: "text" }> => block.type === "text")
-      .map(({ text }) => text)
-      .join("\n\n");
+      .find((block): block is Extract<ContentBlock, { type: "text" }> => block.type === "text")?.text ?? "";
     const restoredAttachments = blocks
       .filter((block) => block.type !== "text")
       .map((block, index) => promptAttachment(block, index));
@@ -203,10 +249,13 @@ export function PromptComposer({
     if (direction < 0) {
       if (history.length === 0) return false;
       if (current == null) {
-        if (value.length > 0 || attachmentsRef.current.length > 0) return false;
+        if (promptText.length > 0 || attachmentsRef.current.length > 0) return false;
         historyScratch.current = {
           value,
           attachments: [...attachmentsRef.current],
+          blocks: restoredPartsRef.current
+            ?.filter(({ block, placeholder }) => !placeholder || block.type !== "text" || block.text.length > 0)
+            .map(({ block }) => block),
         };
       }
       const next = current == null
@@ -231,7 +280,7 @@ export function PromptComposer({
     historyIndexRef.current = undefined;
     historyScratch.current = undefined;
     setHistoryIndex(undefined);
-    restoreComposer(scratch.value, scratch.attachments);
+    restoreComposer(scratch.value, scratch.attachments, scratch.blocks);
     return true;
   };
 
@@ -275,9 +324,21 @@ export function PromptComposer({
     restoreBlocks(draft.blocks);
   }, [draft]);
 
+  useLayoutEffect(() => {
+    // Restoring ordered blocks can replace the textarea. Focus its committed
+    // DOM node before a stale field can reset the active part through onFocus.
+    const caret = restoredCaret.current;
+    const element = area.current;
+    if (caret == null || element == null) return;
+    restoredCaret.current = undefined;
+    element.focus();
+    element.setSelectionRange(caret, caret);
+    element.style.height = "auto";
+    element.style.height = `${Math.min(element.scrollHeight, expanded ? Infinity : 220)}px`;
+  }, [restoredParts, value, expanded]);
+
   const selectCommand = (command: AvailableCommand) => {
-    markRestoredBlocksChanged();
-    setValue(`/${command.name}${command.input ? " " : ""}`);
+    changeText(`/${command.name}${command.input ? " " : ""}`);
     setCommandMenuDismissed(true);
     area.current?.focus();
   };
@@ -289,7 +350,7 @@ export function PromptComposer({
   };
 
   const submit = () => {
-    const text = value.trim();
+    const text = promptText.trim();
     const currentAttachments = attachmentsRef.current;
     if ((!text && currentAttachments.length === 0) || disabled) return;
     if (pendingFileCount.current > 0) {
@@ -297,7 +358,9 @@ export function PromptComposer({
       return;
     }
     const currentBlocks = currentAttachments.map(({ block }) => block);
-    const restoredBlocks = restoredBlocksRef.current;
+    const restoredBlocks = restoredPartsRef.current
+      ?.filter(({ block, placeholder }) => !placeholder || block.type !== "text" || block.text.length > 0)
+      .map(({ block }) => block);
     const accepted = restoredBlocks
       ? onSubmit(text, currentBlocks, restoredBlocks)
       : onSubmit(text, currentBlocks);
@@ -305,7 +368,8 @@ export function PromptComposer({
     setValue("");
     setAttachments([]);
     attachmentsRef.current = [];
-    restoredBlocksRef.current = undefined;
+    updateRestoredParts(undefined);
+    focusedPartId.current = undefined;
     leaveHistory();
     setAttachmentError(undefined);
     setLinkOpen(false);
@@ -313,6 +377,7 @@ export function PromptComposer({
     setLinkName("");
     setCommandMenuDismissed(false);
     if (area.current) area.current.style.height = "auto";
+    requestAnimationFrame(() => area.current?.focus());
   };
 
   const attachFiles = async (files: File[]) => {
@@ -334,9 +399,7 @@ export function PromptComposer({
       setPendingFiles(pendingFileCount.current);
       const next = await createPromptAttachments(files, capabilities);
       const combined = [...attachmentsRef.current, ...next];
-      markRestoredBlocksChanged();
-      attachmentsRef.current = combined;
-      setAttachments(combined);
+      updateAttachments(combined);
       setAttachmentError(undefined);
     } catch (error) {
       setAttachmentError(error instanceof Error ? error : String(error));
@@ -373,9 +436,7 @@ export function PromptComposer({
         block: attachment.block,
       };
       const combined = [...attachmentsRef.current, next];
-      markRestoredBlocksChanged();
-      attachmentsRef.current = combined;
-      setAttachments(combined);
+      updateAttachments(combined);
       setAttachmentError(undefined);
     } catch (error) {
       setAttachmentError(error instanceof Error ? error : String(error));
@@ -396,8 +457,7 @@ export function PromptComposer({
     if (!mention) return;
     const nextValue = `${value.slice(0, mention.start)}${value.slice(mention.end)}`;
     const nextCaret = mention.start;
-    markRestoredBlocksChanged();
-    setValue(nextValue);
+    changeText(nextValue);
     setCaret(nextCaret);
     setContextMenuDismissed(true);
     setContextMatches([]);
@@ -479,9 +539,7 @@ export function PromptComposer({
         },
       },
     ];
-    markRestoredBlocksChanged();
-    attachmentsRef.current = next;
-    setAttachments(next);
+    updateAttachments(next);
     setLinkUrl("");
     setLinkName("");
     setLinkOpen(false);
@@ -570,6 +628,84 @@ export function PromptComposer({
     }
   };
 
+  const renderAttachment = (attachment: PromptAttachment) => (
+    <span key={attachment.id}>
+      <AttachmentIcon block={attachment.block} />
+      <span>{attachment.name}</span>
+      <small>{attachmentLabel(attachment)}</small>
+      <button
+        type="button"
+        aria-label={t("attachments.remove", { name: attachment.name })}
+        onClick={() => updateAttachments(attachmentsRef.current.filter(({ id }) => id !== attachment.id))}
+      >
+        <X size={11} />
+      </button>
+    </span>
+  );
+
+  const renderTextArea = (text: string, partId?: string, index?: number) => {
+    const active = partId == null || focusedPartId.current === partId;
+    return (
+      <textarea
+        key={partId}
+        ref={(element) => {
+          if (partId == null || focusedPartId.current === partId) area.current = element;
+          if (element && partId != null) {
+            element.style.height = "auto";
+            element.style.height = `${Math.min(element.scrollHeight, expanded ? Infinity : 220)}px`;
+          }
+        }}
+        rows={1}
+        value={text}
+        disabled={disabled}
+        role="combobox"
+        aria-label={index == null ? undefined : t("composer.textPart", { index: index + 1 })}
+        aria-keyshortcuts={running ? "Alt+Shift+Escape Escape" : "Alt+Shift+Escape"}
+        aria-autocomplete="list"
+        aria-controls={active ? contextMenuOpen ? "workspace-context-menu" : "agent-command-menu" : undefined}
+        aria-expanded={active && (contextMenuOpen || commandMatches.length > 0)}
+        aria-activedescendant={!active ? undefined : contextMenuOpen && contextMatches.length > 0
+          ? `workspace-context-${activeContextIndex}`
+          : commandMatches.length > 0 ? `agent-command-${activeCommandIndex}` : undefined}
+        placeholder={disabled
+          ? t("composer.placeholder.disabled")
+          : running ? t("composer.placeholder.running") : t("composer.placeholder.ready")}
+        onFocus={(event) => {
+          const switched = focusedPartId.current !== partId;
+          focusedPartId.current = partId;
+          area.current = event.currentTarget;
+          const part = restoredPartsRef.current?.find(({ id }) => id === partId);
+          if (part?.block.type === "text") setValue(part.block.text);
+          setCaret(event.currentTarget.selectionStart);
+          if (switched) {
+            setCommandMenuDismissed(false);
+            setContextMenuDismissed(false);
+          }
+        }}
+        onChange={(event) => {
+          area.current = event.currentTarget;
+          changeText(event.target.value, partId);
+          setCaret(event.target.selectionStart);
+          setCommandMenuDismissed(false);
+          setContextMenuDismissed(false);
+          event.target.style.height = "auto";
+          event.target.style.height = `${Math.min(event.target.scrollHeight, expanded ? Infinity : 220)}px`;
+        }}
+        onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+        onPaste={pasteFiles}
+        onKeyDown={onKeyDown}
+      />
+    );
+  };
+
+  let textPartIndex = 0;
+  const restoredFields = restoredParts?.map((part) => part.block.type === "text"
+    ? renderTextArea(part.block.text, part.id, textPartIndex++)
+    : <div className="attachment-list" key={part.id}>
+      {renderAttachment(attachments.find(({ id }) => id === part.id)!)}
+    </div>
+  );
+
   return (
     <div
       className={`composer${dragActive ? " drag-active" : ""}${expanded ? " composer-expanded" : ""}`}
@@ -653,27 +789,9 @@ export function PromptComposer({
           ))}
         </div>
       ) : null}
-      {attachments.length > 0 ? (
+      {!restoredParts && attachments.length > 0 ? (
         <div className="attachment-list">
-          {attachments.map((attachment) => (
-            <span key={attachment.id}>
-              <AttachmentIcon block={attachment.block} />
-              <span>{attachment.name}</span>
-              <small>{attachmentLabel(attachment)}</small>
-              <button
-                type="button"
-                aria-label={t("attachments.remove", { name: attachment.name })}
-                onClick={() => {
-                  const next = attachmentsRef.current.filter(({ id }) => id !== attachment.id);
-                  markRestoredBlocksChanged();
-                  attachmentsRef.current = next;
-                  setAttachments(next);
-                }}
-              >
-                <X size={11} />
-              </button>
-            </span>
-          ))}
+          {attachments.map(renderAttachment)}
         </div>
       ) : null}
       {attachmentError ? <div className="attachment-error">{promptAttachmentErrorMessage(attachmentError)}</div> : null}
@@ -690,39 +808,11 @@ export function PromptComposer({
           <button type="button" aria-label={t("composer.link.add")} disabled={!linkUrl.trim()} onClick={addResourceLink}><Plus size={13} /></button>
         </div>
       ) : null}
-      <textarea
-        ref={area}
-        rows={1}
-        value={value}
-        disabled={disabled}
-        role="combobox"
-        aria-keyshortcuts={running ? "Alt+Shift+Escape Escape" : "Alt+Shift+Escape"}
-        aria-autocomplete="list"
-        aria-controls={contextMenuOpen ? "workspace-context-menu" : "agent-command-menu"}
-        aria-expanded={contextMenuOpen || commandMatches.length > 0}
-        aria-activedescendant={contextMenuOpen && contextMatches.length > 0
-          ? `workspace-context-${activeContextIndex}`
-          : commandMatches.length > 0
-            ? `agent-command-${activeCommandIndex}`
-            : undefined}
-        placeholder={disabled
-          ? t("composer.placeholder.disabled")
-          : running
-            ? t("composer.placeholder.running")
-            : t("composer.placeholder.ready")}
-        onChange={(event) => {
-          markRestoredBlocksChanged();
-          setValue(event.target.value);
-          setCaret(event.target.selectionStart);
-          setCommandMenuDismissed(false);
-          setContextMenuDismissed(false);
-          event.target.style.height = "auto";
-          event.target.style.height = `${Math.min(event.target.scrollHeight, 220)}px`;
-        }}
-        onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
-        onPaste={pasteFiles}
-        onKeyDown={onKeyDown}
-      />
+      {restoredParts ? (
+        <div className="composer-document">
+          {restoredFields}
+        </div>
+      ) : renderTextArea(value)}
       <div className="composer-bar">
         <input
           ref={picker}
@@ -770,6 +860,8 @@ export function PromptComposer({
         </button>
         <span>{historyIndex != null
           ? t("composer.history", { index: historyIndex + 1, count: history.length })
+          : cancelling
+          ? t("composer.cancelling")
           : running
           ? t("composer.hint.queue")
           : capabilities?.embeddedContext
@@ -781,17 +873,18 @@ export function PromptComposer({
           <button
             type="button"
             className="send-button stop-button"
-            aria-label={t("composer.stop")}
+            aria-label={t(cancelling ? "composer.cancelling" : "composer.stop")}
+            disabled={cancelling}
             onClick={onCancel}
-            title={t("composer.cancel")}
+            title={t(cancelling ? "composer.cancelling" : "composer.cancel")}
           >
-            <Square size={13} fill="currentColor" />
+            {cancelling ? <LoaderCircle className="spin" size={13} /> : <Square size={13} fill="currentColor" />}
           </button>
         ) : (
           <button
             className="send-button"
             aria-label={t("composer.send")}
-            disabled={disabled || pendingFiles > 0 || (!value.trim() && attachments.length === 0)}
+            disabled={disabled || pendingFiles > 0 || (!promptText.trim() && attachments.length === 0)}
             onClick={submit}
           >
             <CornerDownLeft size={16} />

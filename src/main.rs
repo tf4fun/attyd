@@ -1,4 +1,5 @@
 mod agent_process;
+mod attachments;
 mod auth_terminal;
 mod auto_close;
 mod bridge;

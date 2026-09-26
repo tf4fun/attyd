@@ -1,0 +1,935 @@
+{
+  "sessionId": "style-showcase",
+  "title": "样式检查 · ACP 内容块",
+  "updates": [
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-01",
+      "content": {
+        "type": "text",
+        "text": "01 · 会话样式总览：用户文字、Agent 名称、正文与长文本。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-01",
+      "content": {
+        "type": "text",
+        "text": "## 样式检查会话\n\n这里的消息、附件和工具结果都是示例数据。可以切换明暗主题、调整窗口宽度、展开工具详情，检查字体、间距和换行。\n\n**检查目录**\n\n1. 用户长文本\n2. Markdown 排版\n3. 交错文本与附件\n4. Agent 附件与资源链接\n5. 工具输出\n6. 文件差异与终端\n7. 思考、计划和压缩摘要\n\n工具位于「执行过程」中，可展开检查各类输出。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-long",
+      "content": {
+        "type": "text",
+        "text": "## 任务说明\n\n**目标**：检查长 prompt 的 Markdown 排版和折叠。\n\n- 保留正文样式\n- 右侧展开、收起\n\n```ts\nconst preview = \"Markdown\";\n```\n\n第 1 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 2 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 3 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 4 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 5 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 6 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 7 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 8 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 9 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 10 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 11 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 12 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 13 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。\n\n第 14 段：这是一段较长的用户输入，用来检查默认折叠、展开全文和中英文混排。Style consistency — 0123456789。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-long",
+      "content": {
+        "type": "text",
+        "text": "长文本可以展开阅读，检查折叠与完整显示的排版。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-02",
+      "content": {
+        "type": "text",
+        "text": "02 · Markdown：标题、列表、引用、表格、链接和代码块。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-02",
+      "content": {
+        "type": "text",
+        "text": "# 一级标题 · Heading 1\n\n## 二级标题 · Heading 2\n\n### 三级标题 · Heading 3\n\n#### 四级标题\n\n##### 五级标题\n\n###### 六级标题\n\n普通文本、**加粗**、*斜体*、~~删除线~~、`package.json` 与 [示例链接](https://example.com)。\n\n> 引用：用于检查边框、缩进、行高和中文换行。\n\n- 无序列表\n  - 嵌套条目\n- 第二项\n\n1. 有序列表\n2. 第二项\n\n- [x] 已完成\n- [ ] 待处理\n\n| 文件 | 结果 | 数量 |\n| --- | --- | ---: |\n| package.json | 已找到 | 3 |\n| 中文文件.md | 待检查 | 12 |\n\n```ts\nconst message = \"Hello，世界\";\nconsole.log(message);\n```"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-03",
+      "content": {
+        "type": "text",
+        "text": "03 · 多内容块：第一段文字后接图片。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-03",
+      "content": {
+        "type": "image",
+        "mimeType": "image/png",
+        "uri": "attyd://showcase/pixel.png",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-03",
+      "content": {
+        "type": "text",
+        "text": "第二段文字后接 Markdown 文件与音频。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-03",
+      "content": {
+        "type": "resource",
+        "resource": {
+          "uri": "attyd://showcase/%E4%B8%AD%E6%96%87%E8%AF%B4%E6%98%8E.md",
+          "mimeType": "text/markdown; charset=utf-8",
+          "text": "# 中文附件\n\n用于检查原生浏览器打开与 UTF-8 编码。\n"
+        }
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-03",
+      "content": {
+        "type": "audio",
+        "mimeType": "audio/wav",
+        "data": "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"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-03",
+      "content": {
+        "type": "text",
+        "text": "最后一段文字：用于检查文本与附件交错显示。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-03",
+      "content": {
+        "type": "text",
+        "text": "文字、图片、文本资源和音频已按原始顺序排列。附件采用紧凑标签，检查文件名、大小与文字的对齐。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-04",
+      "content": {
+        "type": "text",
+        "text": "04 · Agent 附件：图片、音频、文本、HTML、PDF、二进制和不同类型的资源链接。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "text",
+        "text": "### 附件与资源链接\n\n检查文件名、大小、长文件名省略和悬停详情。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "image",
+        "mimeType": "image/png",
+        "uri": "attyd://showcase/pixel.png",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "audio",
+        "mimeType": "audio/wav",
+        "data": "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"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource",
+        "resource": {
+          "uri": "attyd://showcase/%E8%AF%B4%E6%98%8E.txt",
+          "mimeType": "text/plain; charset=utf-8",
+          "text": "中文文本预览\nEnglish text preview\n"
+        }
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource",
+        "resource": {
+          "uri": "attyd://showcase/%E9%A1%B5%E9%9D%A2.html",
+          "mimeType": "text/html",
+          "text": "<!doctype html><meta charset=utf-8><title>附件示例</title><h1>附件预览</h1><p>你好，世界。</p>"
+        }
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource",
+        "resource": {
+          "uri": "attyd://showcase/sample.pdf",
+          "mimeType": "application/pdf",
+          "blob": "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTgwXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA1IDAgUiA+PiA+PiAvQ29udGVudHMgNCAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA1MiA+PgpzdHJlYW0KQlQgL0YxIDE2IFRmIDMwIDEyMCBUZCAoQUNQIGF0dGFjaG1lbnQgc2FtcGxlKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNDEgMDAwMDAgbiAKMDAwMDAwMDM0MyAwMDAwMCBuIAp0cmFpbGVyCjw8IC9Sb290IDEgMCBSIC9TaXplIDYgPj4Kc3RhcnR4cmVmCjQxMwolJUVPRgo="
+        }
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource",
+        "resource": {
+          "uri": "attyd://showcase/sample.bin",
+          "mimeType": "application/octet-stream",
+          "blob": "AAECA/8="
+        }
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource_link",
+        "name": "ACP documentation",
+        "title": "ACP 文档",
+        "uri": "https://agentclientprotocol.com",
+        "description": "HTTP 资源链接",
+        "mimeType": "text/html"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource_link",
+        "name": "package.json",
+        "uri": "file:///workspace/app/package.json",
+        "mimeType": "application/json",
+        "size": 2048
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource_link",
+        "name": "报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-报告-很长的文件名-.md",
+        "uri": "file:///workspace/reports/long-name.md",
+        "description": "完整文件名与 URI 可通过悬停查看；本地文件引用不会被转换为浏览器下载地址。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-04",
+      "content": {
+        "type": "resource",
+        "resource": {
+          "uri": "attyd://showcase/%E5%B8%A6%E6%A0%87%E6%B3%A8%E7%9A%84%E9%99%84%E4%BB%B6.md",
+          "mimeType": "text/markdown",
+          "text": "# 标注附件\n"
+        },
+        "annotations": {
+          "audience": [
+            "user",
+            "assistant"
+          ],
+          "priority": 0.8,
+          "lastModified": "2026-09-26T00:00:00Z"
+        }
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-05",
+      "content": {
+        "type": "text",
+        "text": "05 · 工具输出：文件搜索、Markdown、宽表格、结构化数据、附加结果、空结果与失败状态。"
+      }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "find-files",
+      "title": "Find files matching **/package.json",
+      "kind": "search",
+      "status": "completed",
+      "rawInput": {
+        "query": "**/package.json"
+      },
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "resource_link",
+            "name": "package.json",
+            "uri": "file:///workspace/app/package.json",
+            "mimeType": "application/json"
+          }
+        },
+        {
+          "type": "content",
+          "content": {
+            "type": "resource_link",
+            "name": "package.json",
+            "uri": "file:///workspace/packages/client/package.json",
+            "mimeType": "application/json"
+          }
+        },
+        {
+          "type": "content",
+          "content": {
+            "type": "resource_link",
+            "name": "package.json",
+            "uri": "file:///workspace/packages/server/package.json",
+            "mimeType": "application/json"
+          }
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "read-markdown",
+      "title": "Read formatted output · 检查标题与正文的字号",
+      "kind": "read",
+      "status": "completed",
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "text",
+            "text": "# 一级标题 · Heading 1\n\n## 二级标题 · Heading 2\n\n### 三级标题 · Heading 3\n\n#### 四级标题\n\n##### 五级标题\n\n###### 六级标题\n\n普通文本、**加粗**、*斜体*、~~删除线~~、`package.json` 与 [示例链接](https://example.com)。\n\n> 引用：用于检查边框、缩进、行高和中文换行。\n\n- 无序列表\n  - 嵌套条目\n- 第二项\n\n1. 有序列表\n2. 第二项\n\n- [x] 已完成\n- [ ] 待处理\n\n| 文件 | 结果 | 数量 |\n| --- | --- | ---: |\n| package.json | 已找到 | 3 |\n| 中文文件.md | 待检查 | 12 |\n\n```ts\nconst message = \"Hello，世界\";\nconsole.log(message);\n```"
+          }
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "wide-table",
+      "title": "Inspect a wide table",
+      "kind": "read",
+      "status": "completed",
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "text",
+            "text": "| Column_1 | Column_2 | Column_3 | Column_4 | Column_5 | Column_6 | Column_7 | Column_8 | Column_9 | Column_10 | Column_11 | Column_12 | Column_13 | Column_14 | Column_15 | Column_16 |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| value_1 | value_2 | value_3 | value_4 | value_5 | value_6 | value_7 | value_8 | value_9 | value_10 | value_11 | value_12 | value_13 | value_14 | value_15 | value_16 |"
+          }
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "structured-output",
+      "title": "Inspect structured input and output",
+      "kind": "read",
+      "status": "completed",
+      "rawInput": {
+        "path": "/workspace/package.json",
+        "recursive": true,
+        "limit": 20
+      },
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "text",
+            "text": "**检查完成**\n\n- `package.json`\n- `Cargo.toml`"
+          }
+        }
+      ],
+      "rawOutput": {
+        "name": "package.json",
+        "count": 3,
+        "ok": true,
+        "optional": null,
+        "multiline": "第一行\nSecond line\n第三行",
+        "nested": {
+          "files": [
+            "package.json",
+            "Cargo.toml"
+          ],
+          "empty": []
+        }
+      }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "scalar-output",
+      "title": "Read plain structured output",
+      "kind": "read",
+      "status": "completed",
+      "rawOutput": "第一行：原始文本\nSecond line: plain output"
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "empty-output",
+      "title": "Check empty output",
+      "kind": "other",
+      "status": "completed"
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "failed-output",
+      "title": "Fetch unavailable sample",
+      "kind": "fetch",
+      "status": "failed",
+      "rawOutput": {
+        "error": "示例请求失败",
+        "status": 404,
+        "retryable": false
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-05",
+      "content": {
+        "type": "text",
+        "text": "工具输出检查点：资源以紧凑文件行显示，同名文件通过目录区分；Markdown 表格与正文大小一致，JSON 换行与代码字体一致。宽表格可以横向滚动。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-06",
+      "content": {
+        "type": "text",
+        "text": "06 · 文件差异与终端：文件路径、增删行、行号、命令输出和退出状态。"
+      }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "edit-files",
+      "title": "Edit example files",
+      "kind": "edit",
+      "status": "completed",
+      "content": [
+        {
+          "type": "diff",
+          "path": "/workspace/src/settings.ts",
+          "oldText": "export const theme = \"light\";\nexport const compact = false;\n",
+          "newText": "export const theme = \"dark\";\nexport const compact = true;\n"
+        },
+        {
+          "type": "diff",
+          "path": "/workspace/新增文件.md",
+          "oldText": null,
+          "newText": "# 新文件\n\n用于检查中文路径与新增状态。\n"
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "terminal-output",
+      "title": "Run sample terminal output",
+      "kind": "execute",
+      "status": "completed",
+      "content": [
+        {
+          "type": "terminal",
+          "terminalId": "sample-terminal"
+        }
+      ],
+      "rawOutput": {
+        "exitCode": 0,
+        "durationMs": 10
+      }
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-06",
+      "content": {
+        "type": "text",
+        "text": "文件差异与终端输出都是静态样例，可以检查等宽字体与行号是否协调。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-07",
+      "content": {
+        "type": "text",
+        "text": "07 · 思考、计划与压缩摘要。"
+      }
+    },
+    {
+      "sessionUpdate": "agent_thought_chunk",
+      "messageId": "thought-07",
+      "content": {
+        "type": "text",
+        "text": "检查名称、正文、代码和辅助信息之间的层级。\n\n**检查重点**：长内容换行、中文标点、移动端宽度和明暗主题。"
+      }
+    },
+    {
+      "sessionUpdate": "plan",
+      "entries": [
+        {
+          "content": "准备各种内容块",
+          "priority": "high",
+          "status": "completed"
+        },
+        {
+          "content": "检查工具输出字体",
+          "priority": "high",
+          "status": "completed"
+        },
+        {
+          "content": "人工检查主题和窄屏布局",
+          "priority": "medium",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "compaction_update",
+      "compactionId": "showcase-compaction",
+      "status": "in_progress"
+    },
+    {
+      "sessionUpdate": "compaction_summary_chunk",
+      "compactionId": "showcase-compaction",
+      "content": {
+        "type": "text",
+        "text": "## 示例摘要\n\n已展示普通回复、所有 ACP 内容块、工具输出、文件差异和终端。\n\n- 保留检查目录\n- 保留当前样式结论"
+      }
+    },
+    {
+      "sessionUpdate": "compaction_update",
+      "compactionId": "showcase-compaction",
+      "status": "completed"
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-07",
+      "content": {
+        "type": "text",
+        "text": "样例已准备好。可以展开工具和执行过程，并切换明暗主题检查样式。"
+      }
+    },
+    {
+      "sessionUpdate": "user_message_chunk",
+      "messageId": "prompt-08",
+      "content": {
+        "type": "text",
+        "text": "08 · 其余工具类型：delete、move、think、switch_mode，以及成功的 fetch。所有操作均为静态样例。"
+      }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "delete-sample",
+      "title": "Delete an obsolete example file",
+      "kind": "delete",
+      "status": "completed",
+      "rawInput": {
+        "path": "/workspace/旧文件.txt"
+      },
+      "rawOutput": {
+        "deleted": "/workspace/旧文件.txt"
+      }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "move-sample",
+      "title": "Move an example report",
+      "kind": "move",
+      "status": "completed",
+      "rawInput": {
+        "from": "/workspace/报告.md",
+        "to": "/workspace/docs/报告.md"
+      },
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "resource_link",
+            "name": "报告.md",
+            "uri": "file:///workspace/docs/%E6%8A%A5%E5%91%8A.md",
+            "mimeType": "text/markdown"
+          }
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "think-sample",
+      "title": "Review the display options",
+      "kind": "think",
+      "status": "completed",
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "text",
+            "text": "**评估结果**\n\n- 文件资源使用紧凑列表行\n- 文本、结构化结果、差异和终端按内容类型展示"
+          }
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "switch-mode-sample",
+      "title": "Switch to review mode",
+      "kind": "switch_mode",
+      "status": "completed",
+      "rawOutput": {
+        "previousMode": "code",
+        "currentMode": "review"
+      }
+    },
+    {
+      "sessionUpdate": "tool_call",
+      "toolCallId": "fetch-sample",
+      "title": "Fetch example documentation",
+      "kind": "fetch",
+      "status": "completed",
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "text",
+            "text": "文档资源链接："
+          }
+        },
+        {
+          "type": "content",
+          "content": {
+            "type": "resource_link",
+            "name": "ACP documentation",
+            "uri": "https://agentclientprotocol.com/",
+            "mimeType": "text/html"
+          }
+        }
+      ]
+    },
+    {
+      "sessionUpdate": "agent_message_chunk",
+      "messageId": "answer-08",
+      "content": {
+        "type": "text",
+        "text": "全部 10 种 ACP 工具类型已覆盖：read、edit、delete、move、search、execute、think、fetch、switch_mode、other。工具类型决定图标和分类，输出继续按实际内容块展示。"
+      }
+    },
+    {
+      "sessionUpdate": "usage_update",
+      "used": 12800,
+      "size": 128000
+    },
+    {
+      "sessionUpdate": "available_commands_update",
+      "availableCommands": [
+        {
+          "name": "review",
+          "description": "检查修改",
+          "input": {
+            "hint": "文件路径或检查重点"
+          }
+        }
+      ]
+    }
+  ],
+  "terminals": [
+    {
+      "sessionId": "style-showcase",
+      "terminalId": "sample-terminal",
+      "output": "Style showcase terminal\n你好，世界 / Hello, world\n3 files matched · 0 errors\n",
+      "truncated": false,
+      "exitStatus": {
+        "exitCode": 0
+      },
+      "released": true
+    }
+  ],
+  "examples": {
+    "permissions": [
+      {
+        "name": "仅包含计划正文的审批",
+        "request": {
+          "sessionId": "style-showcase",
+          "toolCall": {
+            "toolCallId": "approve-plan",
+            "title": "准备实施修改",
+            "kind": "switch_mode",
+            "status": "pending",
+            "content": [
+              {
+                "type": "content",
+                "content": {
+                  "type": "text",
+                  "text": "## 实施计划\n\n1. 保留已有输入和附件顺序。\n2. 更新通用展示组件。\n3. 运行测试并检查窄屏布局。"
+                }
+              }
+            ]
+          },
+          "options": [
+            {
+              "optionId": "allow",
+              "name": "允许一次",
+              "kind": "allow_once"
+            },
+            {
+              "optionId": "reject",
+              "name": "拒绝",
+              "kind": "reject_once"
+            }
+          ]
+        }
+      },
+      {
+        "name": "已有输入、文件差异与终端的审批",
+        "request": {
+          "sessionId": "style-showcase",
+          "toolCall": {
+            "toolCallId": "approve-edit",
+            "rawInput": null
+          },
+          "options": [
+            {
+              "optionId": "allow",
+              "name": "允许一次",
+              "kind": "allow_once"
+            },
+            {
+              "optionId": "always",
+              "name": "始终允许",
+              "kind": "allow_always"
+            },
+            {
+              "optionId": "reject",
+              "name": "拒绝",
+              "kind": "reject_once"
+            }
+          ]
+        },
+        "toolCall": {
+          "toolCallId": "approve-edit",
+          "title": "更新配置文件",
+          "kind": "edit",
+          "rawInput": {
+            "path": "/workspace/config.ts",
+            "mode": "review"
+          },
+          "content": [
+            {
+              "type": "content",
+              "content": {
+                "type": "text",
+                "text": "请检查下列修改及验证输出。"
+              }
+            },
+            {
+              "type": "diff",
+              "path": "/workspace/config.ts",
+              "oldText": "export const enabled = false;\n",
+              "newText": "export const enabled = true;\n"
+            },
+            {
+              "type": "terminal",
+              "terminalId": "sample-terminal"
+            }
+          ]
+        }
+      }
+    ],
+    "elicitations": [
+      {
+        "name": "包含选项说明的表单",
+        "request": {
+          "sessionId": "style-showcase",
+          "mode": "form",
+          "message": "请选择执行方式和验证范围。",
+          "requestedSchema": {
+            "type": "object",
+            "required": [
+              "strategy"
+            ],
+            "properties": {
+              "strategy": {
+                "type": "string",
+                "title": "执行方式",
+                "description": "切换选项查看对应说明。",
+                "default": "review",
+                "oneOf": [
+                  {
+                    "const": "review",
+                    "title": "逐项确认",
+                    "description": "每次修改前展示计划，等待确认后继续。"
+                  },
+                  {
+                    "const": "batch",
+                    "title": "批量执行",
+                    "description": "一次执行已批准的修改，随后汇总结果。"
+                  }
+                ]
+              },
+              "checks": {
+                "type": "array",
+                "title": "验证范围",
+                "items": {
+                  "anyOf": [
+                    {
+                      "const": "unit",
+                      "title": "单元测试",
+                      "description": "验证组件行为和状态变化。"
+                    },
+                    {
+                      "const": "browser",
+                      "title": "浏览器检查",
+                      "description": "检查窄屏、明暗主题和交互样式。"
+                    }
+                  ]
+                }
+              },
+              "note": {
+                "type": "string",
+                "title": "补充说明"
+              },
+              "count": {
+                "type": "integer",
+                "title": "执行次数",
+                "minimum": 1,
+                "default": 1
+              },
+              "confirm": {
+                "type": "boolean",
+                "title": "保留执行记录",
+                "default": true
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "打开外部页面的请求",
+        "request": {
+          "sessionId": "style-showcase",
+          "mode": "url",
+          "elicitationId": "showcase-url",
+          "message": "这是样式示例，点击后在新页面打开 example.com。",
+          "url": "https://example.com/?from=attyd-style-showcase"
+        }
+      }
+    ],
+    "configOptions": [
+      {
+        "type": "select",
+        "id": "showcase-model",
+        "name": "模型",
+        "currentValue": "a-fast",
+        "options": [
+          {
+            "group": "a",
+            "name": "服务商 A",
+            "options": [
+              {
+                "value": "a-fast",
+                "name": "Fast",
+                "description": "适合快速交互。"
+              },
+              {
+                "value": "a-balanced",
+                "name": "Balanced",
+                "description": "平衡响应速度和质量。"
+              },
+              {
+                "value": "a-reason",
+                "name": "Reasoning",
+                "description": "适合复杂推理任务。"
+              },
+              {
+                "value": "a-long",
+                "name": "Long context",
+                "description": "适合长文档分析。"
+              }
+            ]
+          },
+          {
+            "group": "b",
+            "name": "服务商 B",
+            "options": [
+              {
+                "value": "b-fast",
+                "name": "Fast",
+                "description": "来自另一服务商的同名选项。"
+              },
+              {
+                "value": "b-balanced",
+                "name": "Balanced",
+                "description": "适合日常开发。"
+              },
+              {
+                "value": "b-reason",
+                "name": "Reasoning",
+                "description": "适合深入分析。"
+              },
+              {
+                "value": "b-long",
+                "name": "Long context",
+                "description": "支持较长的输入内容。"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "boolean",
+        "id": "showcase-confirm",
+        "name": "逐次确认",
+        "description": "每次执行前请求确认。",
+        "currentValue": true
+      }
+    ],
+    "modes": {
+      "currentModeId": "ask",
+      "availableModes": [
+        {
+          "id": "ask",
+          "name": "Ask",
+          "description": "修改文件前请求许可。"
+        },
+        {
+          "id": "code",
+          "name": "Code",
+          "description": "按照已授权的计划修改文件。"
+        }
+      ]
+    },
+    "runningUpdates": [
+      {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "running-tool",
+        "title": "检查配置文件",
+        "kind": "read",
+        "status": "in_progress"
+      },
+      {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "pending-tool",
+        "title": "等待执行后续检查",
+        "kind": "execute",
+        "status": "pending"
+      },
+      {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "complete-tool",
+        "title": "已完成的工作",
+        "kind": "search",
+        "status": "completed"
+      },
+      {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "failed-tool",
+        "title": "失败的工作",
+        "kind": "fetch",
+        "status": "failed"
+      }
+    ]
+  }
+}

@@ -957,7 +957,9 @@ export default function App() {
               /> : null}
               {state.running && state.timeline.at(-1)?.type !== "stop" ? (
                 <div className="agent-working" role="status">
-                  <Activity size={14} /> {agentActivityLabel(state.agentActivity, state.permissions.length > 0 || state.elicitations.length > 0, t)}<span /><span /><span />
+                  <Activity size={14} /> {state.pendingPrompt?.cancelRequested
+                    ? t("activity.cancelling")
+                    : agentActivityLabel(state.agentActivity, state.permissions.length > 0 || state.elicitations.length > 0, t)}<span /><span /><span />
                 </div>
               ) : null}
             </div>
@@ -989,6 +991,7 @@ export default function App() {
                 key={pending.permissionId}
                 pending={pending}
                 toolCall={findToolCall(state.timeline, pending.request.toolCall.toolCallId)}
+                terminalSnapshots={state.terminalSnapshots}
                 onRespond={(outcome) => respondPermission(pending.permissionId, outcome)}
               />
             ))}
@@ -1045,6 +1048,7 @@ export default function App() {
               key={state.session?.sessionId ?? "no-session"}
               disabled={!composerAvailable}
               running={state.running}
+              cancelling={state.pendingPrompt?.cancelRequested}
               capabilities={agentCapabilities?.promptCapabilities}
               commands={state.availableCommands}
               draft={composerDraft}

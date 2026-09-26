@@ -32,6 +32,7 @@ export interface BridgeTurnOverlay {
   prompt: ContentBlock[];
   updates: SessionUpdate[];
   terminal: unknown | null;
+  cancelRequested?: boolean;
 }
 
 export interface BridgeTurnOutcome {

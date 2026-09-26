@@ -438,6 +438,7 @@ fn session_view_value(
     session_id: &str,
     incarnation: u64,
 ) -> Result<Value, Error> {
+    let mut cancel_requested = false;
     let mut live = state
         .sessions
         .session(session_id)
@@ -445,6 +446,10 @@ fn session_view_value(
         // The live projection drops activeTurn below; do not serialize a
         // potentially multi-megabyte turn payload just to discard it.
         .map(|mut session| {
+            cancel_requested = session
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.cancel_requested);
             session.active_turn = None;
             serde_json::to_value(session)
         })
@@ -453,6 +458,14 @@ fn session_view_value(
     let mut view = session_mirror(state)
         .view_value(session_id, incarnation)
         .map_err(mirror_error)?;
+    if let Some(turn) = view
+        .pointer_mut("/session/activeTurn")
+        .and_then(Value::as_object_mut)
+    {
+        // Expose the existing execution intent without serializing its private
+        // state or another copy of the active turn's content.
+        turn.insert("cancelRequested".into(), json!(cancel_requested));
+    }
     if let Some(live) = live.as_object_mut() {
         live.remove("activeTurn");
     }
@@ -7514,6 +7527,62 @@ mod tests {
 
         session_mirror(state).register_new(session_id, incarnation);
         incarnation
+    }
+
+    #[test]
+    fn session_view_exposes_cancel_intent_before_completion_and_keeps_late_updates() {
+        let mut state = BridgeState::default();
+        let incarnation = register_test_session(&mut state, "session", "/workspace");
+        let other = register_test_session(&mut state, "other", "/workspace");
+        let operation = start_test_turn(&mut state, "session", "intent").unwrap();
+        start_test_turn(&mut state, "other", "other-intent").unwrap();
+        state.sessions.append_turn_update("session", incarnation, &operation, json!({
+            "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run", "status": "in_progress"
+        })).unwrap();
+        let before = session_view_value(&mut state, "session", incarnation).unwrap();
+        assert_eq!(before["session"]["activeTurn"]["cancelRequested"], false);
+
+        let epoch = state.sessions.epoch().to_string();
+        state
+            .sessions
+            .request_cancel(&epoch, "session", incarnation)
+            .unwrap();
+        let cancelling = session_view_value(&mut state, "session", incarnation).unwrap();
+        assert_eq!(cancelling["session"]["phase"], "running");
+        assert_eq!(cancelling["session"]["activeTurn"]["cancelRequested"], true);
+        assert!(cancelling["session"]["activeTurn"]["terminal"].is_null());
+        assert_eq!(before["session"]["activeTurn"]["cancelRequested"], false);
+        assert_eq!(
+            session_view_value(&mut state, "other", other).unwrap()["session"]["activeTurn"]["cancelRequested"],
+            false
+        );
+
+        state
+            .sessions
+            .append_turn_update(
+                "session",
+                incarnation,
+                &operation,
+                json!({
+                    "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed"
+                }),
+            )
+            .unwrap();
+        let late = session_view_value(&mut state, "session", incarnation).unwrap();
+        assert_eq!(late["session"]["activeTurn"]["cancelRequested"], true);
+        assert_eq!(
+            late["session"]["activeTurn"]["updates"][0]["status"],
+            "completed"
+        );
+
+        complete_test_turn(&mut state, "session", &operation);
+        assert!(session_view_value(&mut state, "session", incarnation).unwrap()["session"]["activeTurn"].is_null());
+        start_test_turn(&mut state, "session", "next-intent").unwrap();
+        assert_eq!(
+            session_view_value(&mut state, "session", incarnation).unwrap()["session"]["activeTurn"]
+                ["cancelRequested"],
+            false
+        );
     }
 
     #[test]

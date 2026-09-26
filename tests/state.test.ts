@@ -9,6 +9,53 @@ function event(value: ServerEvent) {
 }
 
 describe("ACP UI state", () => {
+  it("projects a pending cancellation without ending the turn and accepts late tool results", () => {
+    const view: BridgeSessionView = {
+      bridgeEpoch: "epoch", sessionId: "s1", sessionIncarnation: 1, viewRevision: 3,
+      historyRevision: "revision", phase: "running", syncError: null,
+      timeline: [
+        { sessionUpdate: "user_message_chunk", content: { type: "text", text: "Earlier" } },
+        { sessionUpdate: "tool_call", toolCallId: "earlier", title: "Earlier tool", status: "in_progress" },
+      ],
+      activeTurn: { operationId: "op", clientIntentId: "intent", cancelRequested: true,
+        prompt: [{ type: "text", text: "Run" }], terminal: null,
+        updates: [
+          { sessionUpdate: "tool_call", toolCallId: "tool", title: "Run", status: "in_progress" },
+          { sessionUpdate: "tool_call", toolCallId: "done", title: "Done", status: "completed" },
+        ],
+      },
+      workspace: { cwd: "/workspace", session: {} }, controls: {},
+      interactions: { permissions: {}, elicitations: {}, urlFlows: {} }, operation: null, terminals: {},
+    };
+    let state = appReducer(initialState, { type: "bridge/session_hydrate", view });
+    expect(state.running).toBe(true);
+    expect(state.pendingPrompt).toMatchObject({ cancelRequested: true });
+    expect(state.timeline.some((item) => item.type === "stop")).toBe(false);
+    expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "earlier"))
+      .not.toHaveProperty("cancelled", true);
+    expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "tool"))
+      .toMatchObject({ cancelled: true, call: { status: "in_progress" } });
+    expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "done"))
+      .not.toHaveProperty("cancelled", true);
+    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: {
+      sessionUpdate: "tool_call_update", toolCallId: "tool", status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "Late result" } }],
+    } } }));
+    expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "tool"))
+      .toMatchObject({ call: { status: "completed", content: [{ content: { text: "Late result" } }] } });
+    expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "tool"))
+      .not.toHaveProperty("cancelled", true);
+    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: {
+      sessionUpdate: "tool_call", toolCallId: "late", title: "Late tool", status: "pending",
+    } } }));
+    expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "late"))
+      .toHaveProperty("cancelled", true);
+    state = appReducer(state, { type: "bridge/session_hydrate", view: {
+      ...view, viewRevision: 4, activeTurn: { ...view.activeTurn!, operationId: "new-op", cancelRequested: false, updates: [] },
+    } });
+    expect(state.pendingPrompt?.cancelRequested).not.toBe(true);
+  });
+
   it("rebuilds cancelled tool display from completed and reconciling memory views", () => {
     const updates: SessionUpdate[] = [
       { sessionUpdate: "user_message_chunk", content: { type: "text", text: "Run" } },

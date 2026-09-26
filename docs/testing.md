@@ -98,6 +98,25 @@ standalone executable.
 
 ## Interactive fixture
 
+For a static style review, open `/style-showcase.html` on the existing Vite development server
+(normally `http://127.0.0.1:5173/style-showcase.html`). The page fetches
+`web/dev/style-session.json` and reuses the normal conversation renderer, including terminal
+snapshots and all ten ACP tool kinds. Edit the JSON and reload to change the samples; expand execution processes and tools
+to review their output. The page needs no ACP Agent or backend requests and is not part of the
+production build.
+
+Its **审批、设置与状态** tab also offers permission content/input, form choice descriptions, URL
+elicitation, grouped/boolean controls, legacy modes, context usage, and running/cancelling/late-result
+examples. These use the real components with local state and no backend calls. The dedicated
+`style-showcase.pw.ts` case checks those interactions at desktop/mobile widths. The
+[display audit](acp-display-audit-2026-09-26.md#10-补齐实现) distinguishes these samples from full
+protocol/lifecycle coverage.
+
+`prompt-folding.pw.ts` fetches a separate set of static samples to verify the nine-line
+rendered-height boundary, short labels with long Markdown URLs, headings/tables, responsive
+wrapping, delayed image sizing, and keyboard access to folded links. The production
+`acp-ui.pw.ts` prompt case also checks expand/collapse, search visibility, and source reuse.
+
 To explore the interface without installing an Agent or configuring a model provider:
 
 ```bash

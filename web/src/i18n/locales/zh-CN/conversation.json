@@ -95,6 +95,7 @@
     "description": "{{kind}} · {{size}}"
   },
   "composer": {
+    "textPart": "第 {{index}} 段文字",
     "connectionUnavailable": "Agent 连接不可用",
     "context": {
       "files": "此工作区中的文件",
@@ -145,6 +146,7 @@
     },
     "stop": "停止当前轮次",
     "cancel": "取消轮次",
+    "cancelling": "正在取消当前轮次…",
     "send": "发送提示词",
     "history_one": "历史提示词 {{index}} / {{count, number}}",
     "history_other": "历史提示词 {{index}} / {{count, number}}"

@@ -608,7 +608,7 @@ function MessageEntry({
             </div>
           </header>
           <div className="message-content" data-thread-searchable>
-            <ContentBlocks blocks={item.blocks} />
+            <ContentBlocks blocks={item.blocks} presentation="prompt" />
           </div>
           <DebugInfoPanel
             label={t("message.debug")}

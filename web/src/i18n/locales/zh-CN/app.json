@@ -72,7 +72,8 @@
     "planning": "Agent 正在制定计划",
     "compacting": "Agent 正在压缩上下文",
     "responding": "Agent 正在回复",
-    "working": "Agent 正在工作"
+    "working": "Agent 正在工作",
+    "cancelling": "正在取消当前轮次…"
   },
   "errors": {
     "requestTimeout": "请求超过 {{seconds}} 秒未完成，请重试。",

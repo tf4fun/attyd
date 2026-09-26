@@ -1,29 +1,34 @@
 import type { Annotations, ContentBlock } from "@agentclientprotocol/sdk";
 import {
   Bot,
+  ChevronRight,
   CircleAlert,
   Clock3,
-  Download,
-  FileText,
+  File,
   Gauge,
   Link2,
+  Paperclip,
   UserRound,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "../../i18n";
 import { safeHttpUrl } from "../../lib/safe-url";
-import { safeMediaDataUrl, validateContentBlockSemantics } from "../../../../shared/content-validation";
+import { attachmentHref } from "../../lib/hosted-attachment";
+import { validateContentBlockSemantics } from "../../../../shared/content-validation";
 import { assertNever } from "../../../../shared/exhaustive";
 
-export function ContentBlocks({ blocks }: { blocks: ContentBlock[] }) {
+export function ContentBlocks({ blocks, presentation = "message" }: {
+  blocks: ContentBlock[];
+  presentation?: "message" | "prompt";
+}) {
   return (
-    <>
+    <div className="content-blocks">
       {blocks.map((block, index) => (
-        <ContentBlockView key={`${block.type}:${index}`} block={block} />
+        <ContentBlockView key={`${block.type}:${index}`} block={block} presentation={presentation} />
       ))}
-    </>
+    </div>
   );
 }
 
@@ -32,14 +37,15 @@ export function ContentBlockView({
   presentation = "message",
 }: {
   block: ContentBlock;
-  presentation?: "message" | "tool";
+  presentation?: "message" | "tool" | "prompt";
 }) {
-  const { i18n } = useTranslation("cards");
   switch (block.type) {
     case "text":
       return (
         <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
-          {presentation === "tool" ? (
+          {presentation === "prompt" ? (
+            <PromptText text={block.text} />
+          ) : presentation === "tool" ? (
             <div className="structured-scalar structured-markdown">
               <div className="markdown">
                 <Markdown remarkPlugins={[remarkGfm]}>{block.text}</Markdown>
@@ -54,67 +60,79 @@ export function ContentBlockView({
       );
     case "image":
     case "audio":
+    case "resource":
+    case "resource_link":
       return (
         <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
-          <BinaryAttachment data={block.data} mimeType={block.mimeType} mediaKind={block.type}
-            uri={block.type === "image" ? block.uri ?? undefined : undefined} />
+          <Attachment block={block} tool={presentation === "tool"} />
         </ContentBlockFrame>
       );
-    case "resource_link": {
-      const details = [
-        block.mimeType,
-        block.size != null ? formatBytes(block.size, i18n.resolvedLanguage) : undefined,
-      ].filter(Boolean).join(" · ");
-      const contents = (
-        <>
-          <Link2 size={16} />
-          <span>
-            <strong>{block.title ?? block.name}</strong>
-            {block.description ? (
-              <small className="resource-description">{block.description}</small>
-            ) : null}
-            <small title={block.uri}>{block.uri}</small>
-            {details ? <em>{details}</em> : null}
-          </span>
-        </>
-      );
-      const href = safeHttpUrl(block.uri);
-      return (
-        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
-          {href ? (
-            <a className="resource-card" href={href} target="_blank" rel="noreferrer">
-              {contents}
-            </a>
-          ) : (
-            <div className="resource-card">{contents}</div>
-          )}
-        </ContentBlockFrame>
-      );
-    }
-    case "resource": {
-      const resource = block.resource;
-      if ("blob" in resource) {
-        return (
-          <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
-            <BinaryAttachment data={resource.blob} mimeType={resource.mimeType ?? "application/octet-stream"} uri={resource.uri} />
-          </ContentBlockFrame>
-        );
-      }
-      return (
-        <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
-          <div className="embedded-resource">
-            <div className="resource-heading">
-              <FileText size={15} />
-              <span title={resource.uri}>{resource.uri}</span>
-              {resource.mimeType ? <code>{resource.mimeType}</code> : null}
-            </div>
-            <pre>{resource.text}</pre>
-          </div>
-        </ContentBlockFrame>
-      );
-    }
   }
   return assertNever(block, "ACP content block");
+}
+
+function PromptText({ text }: { text: string }) {
+  const { t } = useTranslation("cards");
+  const id = useId();
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [collapsible, setCollapsible] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const markdown = useMemo(() => <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>, [text]);
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    const content = contentRef.current;
+    if (!body || !content) return;
+    const measure = () => {
+      const style = getComputedStyle(body);
+      // Share the CSS height budget; source length cannot predict Markdown layout.
+      const limit = Number.parseFloat(style.lineHeight)
+        * Number.parseFloat(style.getPropertyValue("--prompt-preview-lines"));
+      const bounds = content.getBoundingClientRect();
+      if (!bounds.width || !Number.isFinite(limit)) return;
+      const overflow = bounds.height > limit + 1;
+      setCollapsible(overflow);
+      if (!overflow) setExpanded(false);
+      body.dispatchEvent(new Event("toggle", { bubbles: true }));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    // The inner content keeps its natural height while the outer body is clipped.
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [text]);
+  useLayoutEffect(() => {
+    bodyRef.current?.dispatchEvent(new Event("toggle", { bubbles: true }));
+  }, [expanded]);
+  return (
+    <div className="prompt-text" data-collapsible={collapsible} data-expanded={expanded}>
+      <div className="prompt-text-body" id={id} ref={bodyRef}
+        data-thread-search-clip={collapsible && !expanded || undefined}
+        onFocusCapture={(event) => {
+          if (collapsible && !expanded
+            && event.target.getBoundingClientRect().bottom > event.currentTarget.getBoundingClientRect().bottom) {
+            setExpanded(true);
+          }
+        }}
+      >
+        <div className="prompt-text-content markdown" ref={contentRef}>{markdown}</div>
+      </div>
+      {collapsible ? (
+        <button
+          type="button"
+          className="prompt-text-toggle"
+          aria-expanded={expanded}
+          aria-controls={id}
+          data-thread-search-ignore
+          onClick={() => setExpanded((value) => !value)}
+        >
+          {t(expanded ? "content.collapseText" : "content.expandText")}
+          <ChevronRight size={13} aria-hidden="true" />
+        </button>
+      ) : null}
+    </div>
+  );
 }
 
 function ContentBlockFrame({
@@ -127,7 +145,7 @@ function ContentBlockFrame({
   showAnnotations?: boolean;
 }) {
   return (
-    <div className={`content-block content-block-${block.type}`}>
+    <div className={`content-block content-block-${block.type === "resource_link" ? "resource" : block.type}`}>
       {children}
       {showAnnotations ? <ContentAnnotations annotations={block.annotations} /> : null}
     </div>
@@ -203,64 +221,70 @@ function formatBytes(value: number, language: string | undefined): string {
   return `${amount.toLocaleString(language, { maximumFractionDigits: 1 })} ${unit}`;
 }
 
-function BinaryAttachment({ data, mimeType, uri, mediaKind }: {
-  data: string;
-  mimeType: string;
-  uri?: string;
-  mediaKind?: "image" | "audio";
+function Attachment({ block, tool }: {
+  block: Extract<ContentBlock, { type: "image" | "audio" | "resource" | "resource_link" }>;
+  tool: boolean;
 }) {
   const { t, i18n } = useTranslation("cards");
-  const [failedPreview, setFailedPreview] = useState<string>();
-  const [downloadError, setDownloadError] = useState(false);
+  const hostedHref = attachmentHref(block);
+  const href = hostedHref ?? (block.type === "resource_link" ? safeHttpUrl(block.uri) : undefined);
+  const resource = block.type === "resource" ? block.resource : block;
+  const uri = "uri" in resource ? resource.uri ?? undefined : undefined;
+  const text = "text" in resource ? resource.text : undefined;
+  const data = "data" in resource ? resource.data : "blob" in resource ? resource.blob : "";
+  const mimeType = resource.mimeType ?? (block.type === "resource_link" ? undefined
+    : text == null ? "application/octet-stream" : "text/plain");
+  const name = block.type === "resource_link" ? block.title ?? block.name
+    : attachmentName(uri, mimeType ?? "application/octet-stream");
+  const location = tool ? attachmentLocation(uri) : undefined;
+  const bytes = useMemo(() => block.type === "resource_link" ? block.size : text != null
+    ? new TextEncoder().encode(text).byteLength
+    : data.length / 4 * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0), [block, text, data]);
+  const size = bytes == null ? undefined : formatBytes(bytes, i18n.resolvedLanguage);
   let valid = true;
   try {
-    validateContentBlockSemantics(mediaKind
-      ? { type: mediaKind, mimeType, data }
-      : { type: "resource", resource: { uri: uri ?? "attachment:content", mimeType, blob: data } });
+    validateContentBlockSemantics(block);
   } catch { valid = false; }
-  const kind = mimeType.toLowerCase().startsWith("image/") ? "image"
-    : mimeType.toLowerCase().startsWith("audio/") ? "audio" : undefined;
-  const source = valid && kind ? safeMediaDataUrl({ type: kind, mimeType, data }) : undefined;
-  const name = attachmentName(uri, mimeType);
-  const bytes = data.length / 4 * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
-  const download = () => {
-    if (!valid) return;
-    setDownloadError(false);
-    try {
-      const decoded = Uint8Array.from(atob(data), (character) => character.charCodeAt(0));
-      const url = URL.createObjectURL(new Blob([decoded], { type: mimeType }));
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = name;
-      document.body.append(link);
-      try { link.click(); } finally {
-        link.remove();
-        // Let the browser consume the click before releasing the temporary export.
-        setTimeout(() => URL.revokeObjectURL(url), 0);
-      }
-    } catch { setDownloadError(true); }
-  };
-  return (
-    <div className="binary-attachment">
-      {source && source !== failedPreview ? (
-        kind === "image"
-          ? <figure className="media-block"><img src={source} alt={uri ? name : t("content.imageAlt")} onError={() => setFailedPreview(source)} /></figure>
-          : <audio controls preload="metadata" src={source} onError={() => setFailedPreview(source)} />
-      ) : null}
-      <div className={`resource-card${valid ? "" : " invalid-content"}`}>
-        {valid ? <FileText size={16} /> : <CircleAlert size={16} />}
-        <span>
-          <strong title={uri}>{name}</strong>
-          <small>{valid ? t("content.attachmentDetails", { mimeType, size: formatBytes(bytes, i18n.resolvedLanguage) }) : t("content.invalidAttachment", { mimeType })}</small>
-          {source && source === failedPreview ? <small>{t("content.previewUnavailable")}</small> : null}
-          {downloadError ? <small role="status">{t("content.downloadFailed")}</small> : null}
-        </span>
-        <button type="button" className="attachment-download" disabled={!valid} onClick={download} aria-label={t("content.downloadNamed", { name })}>
-          <Download size={15} /> {t("content.download")}
-        </button>
-      </div>
-    </div>
+  const Icon = !valid ? CircleAlert
+    : block.type === "resource_link" && !hostedHref && !(tool && uri?.startsWith("file:")) ? Link2
+    : tool ? File : Paperclip;
+  const contents = (
+    <>
+      <Icon size={tool ? 12 : 14} aria-hidden="true" />
+      <strong>{name}</strong>
+      {location ? <span className="attachment-location">{location}</span> : null}
+      {valid && size != null ? <small>{size}</small> : null}
+    </>
   );
+  const details = valid ? [mimeType, size].filter(Boolean).join(" · ")
+    : t("content.invalidAttachment", { mimeType: mimeType ?? "application/octet-stream" });
+  const title = [...new Set([
+    name,
+    block.type === "resource_link" ? block.name : undefined,
+    uri,
+    block.type === "resource_link" ? block.description : undefined,
+    details,
+  ].filter(Boolean))].join("\n");
+  const props = {
+    className: `attachment-chip${tool ? " attachment-row" : ""}${valid ? "" : " invalid-content"}`,
+    title,
+    "aria-description": title,
+  };
+  return href && valid
+    ? <a {...props} href={href} target="_blank" rel="noopener noreferrer" aria-label={t("content.openNamed", { name })}>{contents}</a>
+    : <span {...props} aria-label={name} aria-disabled="true">{contents}</span>;
+}
+
+function attachmentLocation(uri: string | undefined): string | undefined {
+  if (!uri) return undefined;
+  try {
+    const url = new URL(uri);
+    const path = url.protocol === "file:"
+      ? `${url.host ? `//${url.host}` : ""}${url.pathname.slice(0, url.pathname.lastIndexOf("/") + 1)}`
+      : url.protocol === "http:" || url.protocol === "https:" ? `${url.host}${url.pathname}` : undefined;
+    if (!path) return undefined;
+    try { return decodeURIComponent(path); } catch { return path; }
+  } catch { return undefined; }
 }
 
 function attachmentName(uri: string | undefined, mimeType: string): string {

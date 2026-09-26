@@ -568,6 +568,78 @@ test("keeps queued ACP work paused after Stop and resumes it after a new message
   expect(browserErrors).toEqual([]);
 });
 
+test("renders folded prompt Markdown without cards and preserves the full source", async ({ page }, testInfo) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/sessions/saved-session");
+  const composer = page.locator('textarea[role="combobox"]');
+  await expect(composer).toBeEnabled();
+  const text = `attachment-input-flow 请查看这份文档--- Resource: attyd://attachment/${encodeURIComponent("项目启动文档.md")} ---\n`
+    + "# Project notes 项目说明\n\n**Literal source**, including <script>tags</script>.\n".repeat(80)
+    + "Final line of the attachment.";
+  await composer.fill(text);
+  await page.getByRole("button", { name: "Send prompt", exact: true }).click();
+  const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow" });
+  const body = prompt.locator(".prompt-text-body");
+  await expect(page.getByText("Received prompt blocks: text.", { exact: true })).toBeVisible();
+  await expect(prompt.getByRole("button", { name: "Show full message", exact: true })).toHaveAttribute("aria-expanded", "false");
+  await expect(body).toHaveAttribute("data-thread-search-clip", "true");
+  await expect(body.locator("h1").first()).toHaveText("Project notes 项目说明");
+  await expect(body.locator("strong").first()).toHaveText("Literal source");
+  await expect(body.locator("script")).toHaveCount(0);
+
+  for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport);
+    const dimensions = await body.evaluate((element) => ({
+      height: element.getBoundingClientRect().height,
+      lineHeight: Number.parseFloat(getComputedStyle(element).lineHeight),
+      mask: getComputedStyle(element).maskImage,
+      clamp: getComputedStyle(element).webkitLineClamp,
+    }));
+    expect(dimensions.height).toBeLessThanOrEqual(dimensions.lineHeight * 9 + 1);
+    expect(dimensions.mask).toContain("linear-gradient");
+    expect(dimensions.clamp).toBe("none");
+    const layout = await prompt.locator(".prompt-text").evaluate((element) => {
+      const style = getComputedStyle(element);
+      const body = element.querySelector(".prompt-text-body")!.getBoundingClientRect();
+      const button = element.querySelector(".prompt-text-toggle")!.getBoundingClientRect();
+      return { border: style.borderTopWidth, background: style.backgroundColor, padding: style.paddingLeft,
+        buttonRight: button.right, contentRight: body.right, buttonTop: button.top, contentBottom: body.bottom };
+    });
+    expect(layout.border).toBe("0px");
+    expect(layout.background).toBe("rgba(0, 0, 0, 0)");
+    expect(layout.padding).toBe("0px");
+    expect(Math.abs(layout.buttonRight - layout.contentRight)).toBeLessThanOrEqual(1);
+    expect(layout.buttonTop).toBeGreaterThanOrEqual(layout.contentBottom);
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    for (const theme of ["light", "dark"]) {
+      await page.getByRole("button", { name: "Interface settings", exact: true }).click();
+      await page.getByRole("combobox", { name: "Appearance", exact: true }).selectOption(theme);
+      await page.keyboard.press("Escape");
+      await prompt.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: testInfo.outputPath(`prompt-text-${viewport.width}-${theme}.png`) });
+    }
+  }
+
+  await page.getByRole("button", { name: "Search Agent thread" }).click();
+  const search = page.getByRole("search", { name: "Search this Agent thread" });
+  const query = search.getByRole("searchbox", { name: "Search this thread" });
+  await query.fill("Final line of the attachment.");
+  await expect(search.locator("output")).toHaveText("0/0");
+  await prompt.getByRole("button", { name: "Show full message", exact: true }).click();
+  await expect(body).toContainText("Final line of the attachment.");
+  await expect(body.locator("h1")).toHaveCount(80);
+  await expect(body.locator("script")).toHaveCount(0);
+  await expect(body).toHaveCSS("mask-image", "none");
+  await expect(search.locator("output")).toHaveText("1/1");
+  expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+  await prompt.getByRole("button", { name: "Show less", exact: true }).click();
+  await expect(search.locator("output")).toHaveText("0/0");
+  await query.press("Escape");
+  await prompt.getByRole("button", { name: "Edit and resend user message", exact: true }).click();
+  await expect(composer).toHaveValue(text);
+  expect(browserErrors).toEqual([]);
+});
+
 test("pastes and drops negotiated ACP context into the Zed-style composer", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");
@@ -622,18 +694,228 @@ test("pastes and drops negotiated ACP context into the Zed-style composer", asyn
   await expect(page.getByText("Received prompt blocks: text,image,resource.", { exact: true }))
     .toBeVisible();
   const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow" });
-  await expect(prompt.getByAltText("clipboard.png")).toBeVisible();
-  await expect(prompt).toContainText("# Project context");
+  await expect(prompt.locator(".attachment-chip")).toHaveCount(2);
+  await expect(prompt.getByRole("link", { name: "Open context.md in a new tab" })).toBeVisible();
+  await expect(prompt.locator(".message-content img, .message-content pre")).toHaveCount(0);
+  const [imageTab] = await Promise.all([
+    page.waitForEvent("popup"),
+    prompt.getByRole("link", { name: "Open clipboard.png in a new tab" }).click(),
+  ]);
+  await expect(imageTab.locator("img")).toBeVisible();
+  expect(await imageTab.evaluate(() => window.opener)).toBeNull();
+  await imageTab.close();
 
   await editor.press("ArrowUp");
   await expect(editor).toHaveValue("attachment-input-flow");
-  await expect(attachments).toContainText("clipboard.png");
-  await expect(attachments).toContainText("context.md");
+  await expect(page.locator(".composer-document")).toContainText("clipboard.png");
+  await expect(page.locator(".composer-document")).toContainText("context.md");
   await expect(page.locator(".composer-bar")).toContainText(/previous prompts/);
-  await editor.press("ArrowDown");
+  const resend = page.waitForRequest((request) => request.method() === "POST" && new URL(request.url()).pathname.endsWith("/turns"));
+  await editor.press("Enter");
+  const resent = (await resend).postDataJSON();
+  expect(resent.prompt[1].type).toBe("resource_link");
+  expect(resent.prompt[1]._meta["attyd/attachment"]).toBeTruthy();
+  expect(JSON.stringify(resent.prompt)).not.toContain("# Project context");
+  await expect(page.getByText("Received prompt blocks: text,image,resource.", { exact: true })).toHaveCount(2);
   await expect(editor).toHaveValue("");
   await expect(attachments).toBeHidden();
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+  expect(browserErrors).toEqual([]);
+});
+
+test("edits and resends ordered prompt blocks without moving attachments", async ({ page }, testInfo) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/sessions/saved-session");
+  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  const blocks = [
+    { type: "text", text: "attachment-input-flow First image:", _meta: { source: "first" } },
+    { type: "image", uri: "attyd://attachment/a.png", mimeType: "image/png", data: "AQID" },
+    { type: "text", text: "Second attachment:\n" + "Long source line 中文.\n".repeat(40), _meta: { source: "second" } },
+    { type: "resource", resource: { uri: "attyd://attachment/note.txt", mimeType: 'text/plain; charset="utf-8"', text: "中文 context" } },
+  ];
+  const view = await (await page.request.get("/api/v1/sessions/saved-session")).json();
+  const accepted = await page.request.post("/api/v1/sessions/saved-session/turns", {
+    headers: { "If-Match": JSON.stringify(view.historyRevision), "Idempotency-Key": "ordered-prompt-seed" },
+    data: { prompt: blocks },
+  });
+  expect(accepted.status()).toBe(202);
+  await expect(page.getByText("Received prompt blocks: text,image,text,resource.", { exact: true })).toBeVisible();
+  const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow First image:" });
+  const attachmentUrl = await prompt.getByRole("link", { name: "Open note.txt in a new tab" }).getAttribute("href");
+  const attachment = await page.request.get(attachmentUrl!);
+  expect(attachment.headers()["content-type"]).toBe("text/plain;charset=utf-8");
+  expect(await attachment.text()).toBe("中文 context");
+  await prompt.getByRole("button", { name: "Edit and resend user message" }).click();
+  const document = page.locator(".composer-document");
+  const fields = document.locator("textarea");
+  await expect(fields).toHaveCount(2);
+  await expect(fields.nth(0)).toHaveValue(blocks[0].text!);
+  await expect(fields.nth(1)).toHaveValue(blocks[2].text!);
+  await expect(fields.nth(0)).toBeFocused();
+  expect(await document.evaluate((element) => [...element.children].map((child) => child.tagName)))
+    .toEqual(["TEXTAREA", "DIV", "TEXTAREA", "DIV"]);
+  const edited = blocks[2].text + "Revised ending.";
+  await fields.nth(1).fill(edited);
+  await page.getByRole("button", { name: "Expand message composer", exact: true }).click();
+  expect(await fields.nth(1).evaluate((element) => element.clientHeight)).toBeGreaterThan(220);
+  await page.getByRole("button", { name: "Collapse message composer", exact: true }).click();
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+  }
+  await testInfo.attach("ordered-prompt-mobile", { body: await page.locator(".composer").screenshot(), contentType: "image/png" });
+  const submitted = page.waitForRequest((request) => request.method() === "POST" && new URL(request.url()).pathname.endsWith("/turns"));
+  await fields.nth(1).press("Enter");
+  const body = (await submitted).postDataJSON();
+  expect(body.prompt.map((block: { type: string }) => block.type)).toEqual(["text", "resource_link", "text", "resource_link"]);
+  expect(body.prompt[0]).toEqual(blocks[0]);
+  expect(body.prompt[2]).toEqual({ ...blocks[2], text: edited });
+  expect(body.prompt[1]._meta["attyd/attachment"]).toBeTruthy();
+  await expect(page.getByText("Received prompt blocks: text,image,text,resource.", { exact: true })).toHaveCount(2);
+  const editor = page.locator('textarea[role="combobox"]');
+  await expect(editor).toHaveValue("");
+  await expect(editor).toBeFocused();
+  await editor.press("ArrowUp");
+  await expect(fields).toHaveCount(2);
+  await expect(fields.nth(0)).toBeFocused();
+  await document.locator(".attachment-list button").first().click();
+  const removed = page.waitForRequest((request) => request.method() === "POST" && new URL(request.url()).pathname.endsWith("/turns"));
+  await fields.nth(1).press("Enter");
+  const remaining = (await removed).postDataJSON().prompt;
+  expect(remaining.map((block: { type: string }) => block.type)).toEqual(["text", "text", "resource_link"]);
+  expect(remaining[0]).toEqual(blocks[0]);
+  expect(remaining[1]).toEqual({ ...blocks[2], text: edited });
+  await expect(page.getByText("Received prompt blocks: text,text,resource.", { exact: true })).toBeVisible();
+  expect(browserErrors).toEqual([]);
+});
+
+test("opens attachment chips with native browser viewing and automatic downloads", async ({ page }, testInfo) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/sessions/saved-session");
+  const editor = page.locator('textarea[role="combobox"]');
+  await expect(editor).toBeEnabled();
+  const markdown = "# 完整的中文附件 📝\n".repeat(200);
+  const word = Buffer.from("Original DOC bytes\0\x01");
+  const wave = Buffer.alloc(8_044, 128);
+  wave.write("RIFF", 0);
+  wave.writeUInt32LE(wave.length - 8, 4);
+  wave.write("WAVEfmt ", 8);
+  wave.writeUInt32LE(16, 16);
+  wave.writeUInt16LE(1, 20);
+  wave.writeUInt16LE(1, 22);
+  wave.writeUInt32LE(8_000, 24);
+  wave.writeUInt32LE(8_000, 28);
+  wave.writeUInt16LE(1, 32);
+  wave.writeUInt16LE(8, 34);
+  wave.write("data", 36);
+  wave.writeUInt32LE(8_000, 40);
+  const pdfObjects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+    "<< /Length 0 >>\nstream\n\nendstream",
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, object] of pdfObjects.entries()) {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 5\n0000000000 65535 f \n${offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("")}trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n${xref}\n%%EOF\n`;
+  await page.locator('input[type="file"]').setInputFiles([
+    { name: "context.md", mimeType: "text/markdown", buffer: Buffer.from(markdown) },
+    { name: "note.txt", mimeType: "text/plain", buffer: Buffer.from("原生文本 Native text") },
+    { name: "page.html", mimeType: "text/html", buffer: Buffer.from('<h1>中文页面 Native HTML</h1><script>document.body.dataset.executed="true"</script>') },
+    { name: "voice.wav", mimeType: "audio/wav", buffer: wave },
+    { name: "report.pdf", mimeType: "application/pdf", buffer: Buffer.from(pdf) },
+    { name: `${"long-filename-".repeat(12)}.doc`, mimeType: "application/msword", buffer: word },
+  ]);
+  await expect(page.locator(".attachment-list > span")).toHaveCount(6);
+  const request = page.waitForRequest((request) => request.method() === "POST" && new URL(request.url()).pathname.endsWith("/turns"));
+  await editor.fill("attachment-input-flow");
+  await editor.press("Enter");
+  const sent = (await request).postDataJSON();
+  expect(sent.prompt[1].resource.text).toBe(markdown);
+  await expect(page.getByText("Received prompt blocks: text,resource,resource,resource,audio,resource,resource.", { exact: true })).toBeVisible();
+  const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow" });
+  const content = prompt.locator(".message-content");
+  await expect(content.locator("a.attachment-chip")).toHaveCount(6);
+  await expect(content.locator("pre, img, audio, iframe, object, embed, [download]")).toHaveCount(0);
+  await expect(content).not.toContainText("# 完整的中文附件");
+  const view = await (await page.request.get("/api/v1/sessions/saved-session?presentation=compact")).json();
+  expect(JSON.stringify(view)).not.toContain("# 完整的中文附件");
+  expect(JSON.stringify(view)).not.toContain(wave.toString("base64"));
+  const hosted = view.timeline.filter((update: { sessionUpdate: string; content?: { _meta?: Record<string, unknown> } }) =>
+    update.sessionUpdate === "user_message_chunk" && update.content?._meta?.["attyd/attachment"]);
+  expect(hosted).toHaveLength(6);
+  expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("attachment-chips-mobile.png") });
+
+  const openCard = async (name: string) => {
+    const [tab] = await Promise.all([
+      page.waitForEvent("popup"),
+      content.getByRole("link", { name: `Open ${name} in a new tab`, exact: true }).click(),
+    ]);
+    return tab;
+  };
+  const textTab = await openCard("note.txt");
+  await expect(textTab).toHaveURL(/\/attachments\//);
+  await expect(textTab.locator("pre")).toHaveText("原生文本 Native text");
+  expect(await textTab.evaluate(() => document.characterSet)).toBe("UTF-8");
+  expect(await textTab.evaluate(() => window.opener)).toBeNull();
+  await textTab.reload();
+  await expect(textTab.locator("pre")).toHaveText("原生文本 Native text");
+  await textTab.close();
+
+  const markdownTab = await openCard("context.md");
+  await expect(markdownTab.locator("pre")).toHaveText(markdown);
+  expect(await markdownTab.evaluate(() => document.characterSet)).toBe("UTF-8");
+  await markdownTab.close();
+
+  const htmlTab = await openCard("page.html");
+  await expect(htmlTab.getByRole("heading", { name: "中文页面 Native HTML" })).toBeVisible();
+  await expect(htmlTab.locator("[data-executed]")).toHaveCount(0);
+  await htmlTab.close();
+
+  const audioTab = await openCard("attachment.wav");
+  const player = audioTab.locator("audio, video");
+  await expect(player).toBeVisible();
+  await expect.poll(() => player.evaluate((media) => (media as HTMLMediaElement).readyState)).toBeGreaterThanOrEqual(2);
+  await audioTab.close();
+
+  const pdfTab = await openCard("report.pdf");
+  await expect(pdfTab).toHaveURL(/\/api\/v1\/sessions\/saved-session\/attachments\//);
+  expect(await page.evaluate(async (url) => (await fetch(url)).headers.get("Content-Type"), pdfTab.url()))
+    .toBe("application/pdf");
+  await pdfTab.close();
+
+  const download = page.waitForEvent("download");
+  await content.getByRole("link", { name: new RegExp("Open long-filename-") }).click();
+  const path = await (await download).path();
+  expect(await readFile(path!)).toEqual(word);
+  await expect(content.locator('[role="status"]')).toHaveCount(0);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+  const chips = content.locator(".attachment-chip");
+  const first = await chips.nth(0).boundingBox();
+  const second = await chips.nth(1).boundingBox();
+  expect(Math.abs(first!.y - second!.y)).toBeLessThan(1);
+  expect(first!.height).toBeLessThanOrEqual(34);
+  expect(second!.x).toBeGreaterThan(first!.x + first!.width);
+  await page.screenshot({ path: testInfo.outputPath("attachment-chips-desktop.png") });
+  await page.getByRole("button", { name: "Thread actions" }).click();
+  const exportRequest = page.waitForRequest((request) => new URL(request.url()).searchParams.get("includeAttachmentContent") === "true");
+  const [exported] = await Promise.all([
+    page.waitForEvent("popup"),
+    page.getByRole("button", { name: "Open as Markdown" }).click(),
+  ]);
+  await exportRequest;
+  await expect(exported.locator("body")).toContainText("# 完整的中文附件 📝");
+  await expect(exported.locator("body")).toContainText("Binary · application/msword · 20 bytes");
+  await exported.close();
+  await expect(content).not.toContainText("# 完整的中文附件");
   expect(browserErrors).toEqual([]);
 });
 
@@ -751,7 +1033,9 @@ test("adds a workspace file through a Zed-style @ mention", async ({ page }) => 
   await expect(page.getByText("Received prompt blocks: text,resource.", { exact: true }))
     .toBeVisible();
   const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow" });
-  await expect(prompt).toContainText("# Workspace context");
+  await expect(prompt.getByRole("link", { name: "Open workspace-context-note.md in a new tab" })).toBeVisible();
+  await expect(prompt.locator(".message-content pre")).toHaveCount(0);
+  await expect(prompt.locator(".message-content")).not.toContainText("# Workspace context");
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   expect(browserErrors).toEqual([]);
 });
@@ -1645,7 +1929,7 @@ test("uses one visual language for structured tool input and Markdown tool outpu
   expect(browserErrors).toEqual([]);
 });
 
-test("keeps wide tool tables scrollable and long resource names fully readable", async ({ page }) => {
+test("keeps wide tool tables scrollable and long resource names compact with full tooltips", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");
   const composer = page.locator('textarea[role="combobox"]');
@@ -1657,9 +1941,10 @@ test("keeps wide tool tables scrollable and long resource names fully readable",
   await revealTurnProcess(tool);
   await tool.locator(":scope > .tool-card-header .tool-disclosure").click();
   const markdown = tool.locator(".structured-markdown > .markdown");
-  const resource = tool.locator(".resource-card");
+  const resource = tool.locator(".attachment-chip");
   await expect(markdown.locator("thead th")).toHaveCount(20);
   await expect(resource.locator("strong")).toHaveText("x".repeat(300));
+  await expect(resource).toHaveAttribute("title", new RegExp("x".repeat(300)));
 
   for (const width of [1280, 320]) {
     await page.setViewportSize({ width, height: 844 });
@@ -1689,8 +1974,6 @@ test("keeps wide tool tables scrollable and long resource names fully readable",
 
     const resourceLayout = await resource.evaluate((element) => {
       const name = element.querySelector("strong")!;
-      const text = document.createRange();
-      text.selectNodeContents(name);
       return {
         width: name.clientWidth,
         contentWidth: name.scrollWidth,
@@ -1698,13 +1981,15 @@ test("keeps wide tool tables scrollable and long resource names fully readable",
         contentHeight: name.scrollHeight,
         nameBottom: name.getBoundingClientRect().bottom,
         cardBottom: element.getBoundingClientRect().bottom,
-        renderedLines: text.getClientRects().length,
+        whiteSpace: getComputedStyle(name).whiteSpace,
+        textOverflow: getComputedStyle(name).textOverflow,
       };
     });
-    expect(resourceLayout.contentWidth).toBeLessThanOrEqual(resourceLayout.width + 1);
+    expect(resourceLayout.contentWidth).toBeGreaterThan(resourceLayout.width);
     expect(resourceLayout.contentHeight).toBeLessThanOrEqual(resourceLayout.height + 1);
     expect(resourceLayout.nameBottom).toBeLessThanOrEqual(resourceLayout.cardBottom);
-    expect(resourceLayout.renderedLines).toBeGreaterThan(1);
+    expect(resourceLayout.whiteSpace).toBe("nowrap");
+    expect(resourceLayout.textOverflow).toBe("ellipsis");
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   }
   expect(browserErrors).toEqual([]);

@@ -57,11 +57,7 @@ export function ToolCallCard({
   const kind = toolKindLabel(call.kind, t);
   const title = call.title.trim() || call.name?.trim() || kind || t("tool.fallbackTitle");
   const content = call.content ?? [];
-  const visibleContent = content.flatMap((item, index) =>
-    item.type === "content" && item.content.type === "text" && item.content.text.trim().length === 0
-      ? []
-      : [{ item, index }]
-  );
+  const visibleContent = visibleToolContents(content);
   const annotations = content.flatMap((item, index) =>
     item.type === "content" && item.content.annotations
       ? [{ index, ...item.content.annotations }]
@@ -218,7 +214,15 @@ function ToolStatus({ status }: { status: ToolCall["status"] | "cancelled" }) {
   );
 }
 
-function ToolContentView({
+export function visibleToolContents(content: ToolCallContent[]) {
+  return content.flatMap((item, index) =>
+    item.type === "content" && item.content.type === "text" && item.content.text.trim().length === 0
+      ? []
+      : [{ item, index }]
+  );
+}
+
+export function ToolContentView({
   content,
   terminalSnapshots,
 }: {

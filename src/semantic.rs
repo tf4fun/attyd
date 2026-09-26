@@ -1,14 +1,27 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 const MAX_TOOL_LOCATION_LINE: u64 = u32::MAX as u64;
+
+// RFC 9110 media types: token names and token or quoted-string parameter values.
+const MIME_TOKEN: &str = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+";
+const MIME_QUOTED: &str =
+    r#""(?:[\t\x20\x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\t\x20-\x7e\x80-\xff])*""#;
+static MIME_TYPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"\A({MIME_TOKEN}/{MIME_TOKEN})((?:[ \t]*;[ \t]*(?:{MIME_TOKEN}=(?:{MIME_TOKEN}|{MIME_QUOTED}))?)*[ \t]*)\z"
+    )).unwrap()
+});
+static MIME_PARAMETER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"({MIME_TOKEN})=({MIME_TOKEN}|{MIME_QUOTED})")).unwrap());
 
 pub type ValidationResult<T = ()> = Result<T, String>;
 
@@ -751,22 +764,8 @@ fn validate_mime_type(
     subject: &str,
     expected_family: Option<&str>,
 ) -> ValidationResult {
-    let mut parts = value.split(';');
-    let essence = parts.next().unwrap_or_default();
-    let Some((family, subtype)) = essence.split_once('/') else {
-        return Err(format!("{subject} is invalid"));
-    };
-    if value.is_empty()
-        || !mime_token(family)
-        || !mime_token(subtype)
-        || parts.any(|parameter| {
-            parameter
-                .split_once('=')
-                .is_none_or(|(name, value)| !mime_token(name) || !mime_token(value))
-        })
-    {
-        return Err(format!("{subject} is invalid"));
-    }
+    let (essence, _) = parse_mime_type(value).ok_or_else(|| format!("{subject} is invalid"))?;
+    let family = essence.split_once('/').unwrap().0;
     if expected_family.is_some_and(|expected| !family.eq_ignore_ascii_case(expected)) {
         return Err(format!(
             "{subject} must use the {}/* family",
@@ -776,28 +775,19 @@ fn validate_mime_type(
     Ok(())
 }
 
-fn mime_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
+/// Preserve parameter spelling and quoting so serving text can replace only charset.
+pub(crate) fn parse_mime_type(value: &str) -> Option<(&str, Vec<(&str, &str)>)> {
+    let captures = MIME_TYPE.captures(value)?;
+    let parameters = MIME_PARAMETER
+        .captures_iter(captures.get(2)?.as_str())
+        .map(|parameter| {
+            (
+                parameter.get(1).unwrap().as_str(),
+                parameter.get(2).unwrap().as_str(),
+            )
         })
+        .collect();
+    Some((captures.get(1)?.as_str(), parameters))
 }
 
 fn validate_uri(value: &str, subject: &str) -> ValidationResult {
@@ -967,6 +957,49 @@ mod tests {
             }),
         ] {
             validate_content_block(&block, "ACP content block").unwrap();
+        }
+    }
+
+    #[test]
+    fn accepts_mime_parameters_and_rejects_header_injection() {
+        for mime in [
+            "text/plain; charset=utf-8",
+            "Text/Plain \t; CHARSET=\"UTF-8\"; format=flowed",
+            r#"text/plain; label="a; b, c"; note="a\"b\\c""#,
+            "text/plain; label=\"\"; ; charset=utf-8;\t",
+        ] {
+            validate_content_block(
+                &json!({"type":"resource","resource":{"uri":"urn:fixture:text","mimeType":mime,"text":"中文"}}),
+                "ACP content block",
+            ).unwrap();
+        }
+        validate_mime_type(
+            "IMAGE/PNG; profile=\"Display P3\"",
+            "MIME type",
+            Some("image"),
+        )
+        .unwrap();
+        validate_mime_type("Audio/OGG; codecs=\"opus\"", "MIME type", Some("audio")).unwrap();
+        for mime in [
+            "text/",
+            "/plain",
+            "text /plain",
+            "text/plain; charset=",
+            "text/plain; charset =utf-8",
+            "text/plain; charset= utf-8",
+            "text/plain; note=\"unterminated",
+            "text/plain; note=\"value\"extra",
+            "text/plain\n",
+            "text/plain\r\nX-Injected: yes",
+            "text/plain; note=\"bad\r\nheader\"",
+            "text/plain; note=\"bad\\\nheader\"",
+            "text/plain; note=\"bad\0value\"",
+            "text/plain; note=\"bad\u{7f}value\"",
+        ] {
+            assert!(
+                validate_mime_type(mime, "MIME type", None).is_err(),
+                "{mime:?}"
+            );
         }
     }
 

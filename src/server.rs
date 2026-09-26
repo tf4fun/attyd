@@ -175,6 +175,14 @@ struct SessionViewQuery {
     presentation: Option<String>,
     include_process_from: Option<String>,
     exclude_process_for: Option<String>,
+    include_attachment_content: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttachmentQuery {
+    expected_epoch: String,
+    expected_incarnation: u64,
 }
 
 #[derive(Deserialize)]
@@ -1021,7 +1029,8 @@ fn business_session_event_routed(
     Option<(String, u64)>,
     Option<(String, u64, u64)>,
 )> {
-    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    let mut value = serde_json::from_str::<serde_json::Value>(event).ok()?;
+    crate::attachments::project(&mut value);
     let owner = |value: &serde_json::Value| {
         Some((
             value.get("bridgeEpoch")?.as_str()?.to_string(),
@@ -1039,7 +1048,7 @@ fn business_session_event_routed(
     match value.get("type").and_then(serde_json::Value::as_str)? {
         "bridge/session_delta" => Some((
             session_id,
-            Arc::from(event),
+            Arc::from(value.to_string()),
             owner(&value),
             position(&value),
         )),
@@ -1053,9 +1062,12 @@ fn business_session_event_routed(
                 position(&reset),
             ))
         }
-        "bridge/session_turn_complete" | "bridge/session_turn_failed" => {
-            Some((session_id, Arc::from(event), owner(&value), None))
-        }
+        "bridge/session_turn_complete" | "bridge/session_turn_failed" => Some((
+            session_id,
+            Arc::from(value.to_string()),
+            owner(&value),
+            None,
+        )),
         _ => None,
     }
 }
@@ -1923,6 +1935,10 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
             post(start_session_turn),
         )
         .route(
+            "/api/v1/sessions/{session_id}/attachments/{attachment_id}",
+            get(get_attachment),
+        )
+        .route(
             "/api/v1/sessions/{session_id}/turns/{operation_id}/process",
             get(get_turn_process),
         )
@@ -2513,6 +2529,7 @@ fn normalize_embedded_session_view(mut value: serde_json::Value) -> Option<serde
     let raw = value.get("view")?;
     let view = business_session_view(raw)?;
     value["view"] = crate::session_presentation::compact_view(view, raw.pointer("/live/terminals"));
+    crate::attachments::project(&mut value["view"]);
     Some(value)
 }
 
@@ -2600,6 +2617,9 @@ async fn get_session_view(
                     &excluded_operations,
                 );
             }
+            if query.include_attachment_content != Some(true) {
+                crate::attachments::project(&mut business_view);
+            }
             let mut response = axum::Json(business_view).into_response();
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
@@ -2656,7 +2676,10 @@ async fn get_turn_process(
         &query.history_revision,
         query.offset,
     ) {
-        Ok(page) => axum::Json(page).into_response(),
+        Ok(mut page) => {
+            crate::attachments::project(&mut page);
+            axum::Json(page).into_response()
+        }
         Err(crate::session_presentation::PageError::StaleHistory) => (
             StatusCode::CONFLICT,
             axum::Json(
@@ -2738,7 +2761,7 @@ async fn start_session_turn(
     Path(session_id): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<StartTurnBody>,
+    axum::Json(mut body): axum::Json<StartTurnBody>,
 ) -> Response {
     if session_id.is_empty() {
         return (
@@ -2779,6 +2802,50 @@ async fn start_session_turn(
         )
             .into_response();
     }
+    // Browser history contains references. Resolve them against the existing
+    // owner before admission; the bridge still checks the append CAS atomically.
+    let mut cached_view = None;
+    let mut reference_owner = None;
+    for block in &mut body.prompt {
+        if block
+            .get("_meta")
+            .and_then(|meta| meta.get(crate::attachments::REFERENCE_KEY))
+            .is_none()
+        {
+            continue;
+        }
+        let Some(reference) = crate::attachments::reference(block) else {
+            return api_bad_request("invalid attachment reference");
+        };
+        let owner = reference.owner();
+        if owner.session_id != session_id
+            || reference_owner
+                .as_ref()
+                .is_some_and(|expected| expected != &owner)
+        {
+            return api_bad_request("attachment reference belongs to another session owner");
+        }
+        if cached_view.is_none() {
+            cached_view = match state
+                .bridge
+                .session_view_for_owner(session_id.clone(), None, Some(owner.clone()))
+                .await
+            {
+                Ok(view) => Some(view),
+                Err(error) => return session_view_error(error),
+            };
+            reference_owner = Some(owner);
+        }
+        let Some(original) = crate::attachments::find(cached_view.as_mut().unwrap(), &reference.id)
+        else {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({"error": "attachment is no longer available"})),
+            )
+                .into_response();
+        };
+        *block = original;
+    }
     match state
         .bridge
         .start_turn(session_id, history_revision, client_intent_id, body.prompt)
@@ -2791,6 +2858,84 @@ async fn start_session_turn(
         )
             .into_response(),
     }
+}
+
+async fn get_attachment(
+    Path((session_id, attachment_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Query(query): Query<AttachmentQuery>,
+) -> Response {
+    if !valid_api_identifier(&session_id)
+        || !valid_api_identifier(&query.expected_epoch)
+        || query.expected_incarnation == 0
+        || attachment_id.len() != 64
+        || !attachment_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return api_bad_request("invalid attachment reference");
+    }
+    let owner = SessionResourceOwner::new(
+        query.expected_epoch,
+        &session_id,
+        query.expected_incarnation,
+    );
+    let mut view = match state
+        .bridge
+        .session_view_for_owner(session_id, None, Some(owner))
+        .await
+    {
+        Ok(view) => view,
+        Err(error) => return session_view_error(error),
+    };
+    let Some(file) = crate::attachments::find(&mut view, &attachment_id)
+        .and_then(|block| crate::attachments::file(&block))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store")],
+            "Attachment is no longer available",
+        )
+            .into_response();
+    };
+    let name = url::form_urlencoded::byte_serialize(file.name.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    let active = file.mime_type.split(';').next().is_some_and(|mime| {
+        let mime = mime.trim_matches([' ', '\t']).to_ascii_lowercase();
+        mime.ends_with("html") || mime.ends_with("xml")
+    });
+    let mut response = file.bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        file.mime_type
+            .parse()
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        format!("inline; filename*=UTF-8''{name}")
+            .parse()
+            .expect("encoded filename is a header value"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    if active {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("sandbox allow-downloads"),
+        );
+    }
+    response
 }
 
 fn parse_strong_etag(value: &str) -> Option<String> {
@@ -3037,6 +3182,8 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
 #[cfg(test)]
 mod memory_retention_tests;
 
+#[cfg(test)]
+mod attachment_tests;
 #[cfg(test)]
 mod control_efficiency_tests;
 #[cfg(test)]

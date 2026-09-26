@@ -154,6 +154,8 @@
     "stoppedSignal": "已停止（{{signal}}）"
   },
   "content": {
+    "expandText": "展开全文",
+    "collapseText": "收起全文",
     "annotations": "ACP 内容注解",
     "intendedFor": "面向{{role}}",
     "audience": {
@@ -163,13 +165,9 @@
     "priorityLabel": "ACP 内容优先级",
     "priority": "优先级 {{value}}",
     "modified": "修改于 {{timestamp}}",
-    "imageAlt": "ACP 图片内容",
     "attachmentDetails": "{{mimeType}} · {{size}}",
-    "invalidAttachment": "{{mimeType}} · 附件数据无效",
-    "previewUnavailable": "无法预览。你仍可下载此附件。",
-    "downloadFailed": "下载失败，请重试。",
-    "downloadNamed": "下载 {{name}}",
-    "download": "下载"
+    "openNamed": "在新标签页打开 {{name}}",
+    "invalidAttachment": "{{mimeType}} · 附件数据无效"
   },
   "elicitation": {
     "label": "Agent 输入请求",

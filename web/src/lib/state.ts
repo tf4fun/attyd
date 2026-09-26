@@ -209,6 +209,7 @@ export interface PendingPrompt {
   requestId: string;
   sessionId: string;
   blocks: ContentBlock[];
+  cancelRequested?: boolean;
 }
 
 export type AgentAuthStatus =
@@ -1670,7 +1671,7 @@ function reduceSessionUpdate(
     );
     return {
       ...state,
-      timeline,
+      timeline: state.pendingPrompt?.cancelRequested ? cancelTurnTools(timeline) : timeline,
       agentActivity: state.running
         ? toolActivity(call)
         : state.agentActivity,
@@ -1686,7 +1687,7 @@ function reduceSessionUpdate(
     );
     return {
       ...state,
-      timeline,
+      timeline: state.pendingPrompt?.cancelRequested ? cancelTurnTools(timeline) : timeline,
       agentActivity: state.running
         ? toolActivity(call)
         : state.agentActivity,
@@ -2204,7 +2205,10 @@ function promptEchoRemainder(blocks: ContentBlock[], incoming: ContentBlock): Co
 }
 
 function finishTurnTools(timeline: TimelineItem[], response: PromptResponse): TimelineItem[] {
-  if (response.stopReason !== "cancelled") return timeline;
+  return response.stopReason === "cancelled" ? cancelTurnTools(timeline) : timeline;
+}
+
+function cancelTurnTools(timeline: TimelineItem[]): TimelineItem[] {
   const start = timelineTurnStarts(timeline).at(-1) ?? 0;
   return timeline.map((item, index) => index >= start && item.type === "tool" &&
     (item.call.status == null || item.call.status === "pending" || item.call.status === "in_progress")
@@ -2513,6 +2517,13 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
     );
     for (const update of view.activeTurn.updates) {
       next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
+    }
+    if (view.activeTurn.cancelRequested && view.phase === "running" && next.pendingPrompt != null) {
+      next = {
+        ...next,
+        pendingPrompt: { ...next.pendingPrompt, cancelRequested: true },
+        timeline: cancelTurnTools(next.timeline),
+      };
     }
     if (isStateRecord(view.activeTurn.terminal) && view.activeTurn.terminal.stopReason === "cancelled") {
       next = { ...next, timeline: finishTurnTools(next.timeline, { stopReason: "cancelled" }) };

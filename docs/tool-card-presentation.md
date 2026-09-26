@@ -31,15 +31,27 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
 
 ## Media and attachments
 
-- Native image/audio and embedded resources with those MIME types share previews. A failed preview
-  retains download when valid bytes are present.
-- Other binary resources use an attachment card with a filename, MIME type and decoded byte size.
-  Download is a user-triggered export from memory; temporary object URLs are released afterward.
-- Do not embed PDF/Office viewers. Invalid or missing payloads have no enabled download action.
-- Resource links show the supplied name/address and open HTTP(S) URLs on click. Do not fetch remote
-  bytes for previews or promise downloads when only a link was supplied.
-- Raw JSON and Base64 remain in folded technical details, not the ordinary result summary.
+- Native image/audio and embedded text/binary resources use the same compact attachment entry.
+  Tool results use plain file rows; message attachments use compact chips. File names, available
+  sizes, and tool-result locations remain readable, with MIME/address/description in the tooltip.
+- Open available attachments in a new browser page with one ordinary link. Browser behavior and
+  the response MIME type determine preview or download; do not add separate preview/download modes,
+  inline media players, or PDF/Office renderers.
+- Normal browser views contain references to content already held in the bridge's session memory.
+  The HTTP attachment endpoint resolves those references without a separate store, filesystem
+  lookup, or browser Blob cache. Session release or bridge restart ends that availability unless
+  the Agent supplies the content again during history restoration.
+- Resource links can open HTTP(S) URLs or attyd-hosted attachment references. Other URI schemes
+  remain descriptive entries. Do not fetch remote bytes just to build a preview or download action.
+  Invalid payloads have no enabled open action.
+- Keep protocol diagnostics in folded details. Inline payloads are omitted from ordinary browser
+  attachment views; explicit session export retains the original available protocol content.
 
 ## Technical details
 
 Keep IDs, file locations, content annotations, and raw message events in **Tool info**. These remain available for diagnosis without appearing as ordinary task results. Hiding an annotation never removes its associated content.
+
+Permission cards reuse tool-content rendering, including diffs and terminal snapshots, and apply
+the same null/omission semantics to inherited input. Cancellation intent comes from the bridge's
+active-turn projection before the final prompt response. See the
+[2026-09-26 display audit](acp-display-audit-2026-09-26.md) for the original findings and follow-up.

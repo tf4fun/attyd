@@ -297,10 +297,16 @@ export function scanThreadSearchDom(
   for (const document of documents) {
     const result = compiled.find(document.text);
     for (const match of result.matches) {
+      const range = createDomRange(document, match.start, match.end);
+      const clip = range?.startContainer.parentElement?.closest<HTMLElement>('[data-thread-search-clip="true"]');
+      if (range && clip) {
+        const bounds = clip.getBoundingClientRect();
+        if (![...range.getClientRects()].some((rect) => rect.top < bounds.bottom && rect.bottom > bounds.top)) continue;
+      }
       matches.push({
         key: `${document.key}:${match.start}:${match.end}`,
         entry: document.entry,
-        range: createDomRange(document, match.start, match.end),
+        range,
       });
     }
   }

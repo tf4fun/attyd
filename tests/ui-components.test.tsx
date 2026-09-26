@@ -315,7 +315,7 @@ describe("ACP UI component contract", () => {
     expect(html).not.toContain(" open=\"");
   });
 
-  it("renders valid multimodal content and degrades invalid media safely", () => {
+  it("renders attachment chips and degrades invalid media safely", () => {
     const html = renderToStaticMarkup(<ContentBlocks blocks={[
       { type: "image", data: "iVBORw==", mimeType: "image/png" },
       { type: "audio", data: "AA==", mimeType: "audio/mpeg" },
@@ -345,17 +345,20 @@ describe("ACP UI component contract", () => {
       { type: "image", data: "not-base64", mimeType: "image/png" },
     ]} />);
 
-    expect(html).toContain('src="data:image/png;base64,iVBORw=="');
-    expect(html).toContain('src="data:audio/mpeg;base64,AA=="');
+    expect(html).toContain("attachment.png");
+    expect(html).toContain("attachment.mpeg");
+    expect(html).not.toContain('src="data:');
     expect(html).toContain("README");
     expect(html).toContain("Project overview");
     expect(html).toContain("text/markdown · 2 KiB");
+    expect(html).not.toContain('class="resource-card"');
     expect(html).toContain("priority 0.75");
     expect(html).toContain("Intended for user");
     expect(html).toContain("ACP content annotations");
     expect(html).toContain("Intended for assistant");
     expect(html).not.toContain('href="file:///workspace/README.md"');
-    expect(html).toContain("Embedded note");
+    expect(html).not.toContain("Embedded note");
+    expect(html).toContain("urn:fixture:note");
     expect(html).toContain("Invalid attachment data");
     expect(html).not.toContain("not-base64");
   });

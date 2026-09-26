@@ -54,6 +54,55 @@ describe("ACP content block semantic validation", () => {
     })).toBeUndefined();
   });
 
+  it("accepts MIME parameter whitespace, quoted strings, and case-insensitive media families", () => {
+    for (const mimeType of [
+      "text/plain; charset=utf-8",
+      "Text/Plain \t; CHARSET=\"UTF-8\"; format=flowed",
+      'text/plain; label="a; b, c"; note="a\\\"b\\\\c"',
+      'text/plain; label=""; ; charset=utf-8;\t',
+    ]) {
+      expect(() => validateContentBlockSemantics({
+        type: "resource",
+        resource: { uri: "urn:fixture:text", mimeType, text: "中文" },
+      })).not.toThrow();
+    }
+    expect(() => validateContentBlockSemantics({
+      type: "image", data: "AA==", mimeType: "IMAGE/PNG; profile=\"Display P3\"",
+    })).not.toThrow();
+    expect(() => validateContentBlockSemantics({
+      type: "audio", data: "AA==", mimeType: "Audio/OGG; codecs=\"opus\"",
+    })).not.toThrow();
+  });
+
+  it("rejects invalid MIME syntax and control characters even inside quoted parameters", () => {
+    for (const mimeType of [
+      "text/", "/plain", "text /plain", "text/plain; charset=",
+      "text/plain; charset =utf-8", "text/plain; charset= utf-8",
+      'text/plain; note="unterminated', 'text/plain; note="value"extra',
+      "text/plain\n", "text/plain\r\nX-Injected: yes",
+      'text/plain; note="bad\r\nheader"', 'text/plain; note="bad\\\nheader"',
+      'text/plain; note="bad\u0000value"',
+      'text/plain; note="bad\u007fvalue"',
+    ]) {
+      expect(() => validateContentBlockSemantics({
+        type: "resource",
+        resource: { uri: "urn:fixture:text", mimeType, text: "hello" },
+      }), mimeType).toThrow("MIME type is invalid");
+    }
+  });
+
+  it("keeps MIME parameter delimiters out of the data URL payload and fragment", async () => {
+    const url = safeMediaDataUrl({
+      type: "image", data: "AQID", mimeType: 'IMAGE/PNG; note="a,b#c?d"',
+    });
+    expect(url).toBeDefined();
+    expect(new URL(url!).hash).toBe("");
+    expect(new URL(url!).search).toBe("");
+    const response = await fetch(url!);
+    expect(response.headers.get("content-type")).toMatch(/^image\/png;/);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
   it("rejects MIME injection and a media block with the wrong MIME family", () => {
     expect(() => validateContentBlockSemantics({
       type: "image",

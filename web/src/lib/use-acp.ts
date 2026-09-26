@@ -32,6 +32,7 @@ import { randomId } from "./id";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
 import { appReducer, initialState, type DeferredTurnProcess } from "./state";
 import { releaseSessionViewProcess, sameTurnProcess } from "./process-retention";
+import { containsHostedAttachment } from "./hosted-attachment";
 
 export function useAcp() {
   const [state, dispatch] = useReducer(appReducer, initialState);
@@ -908,7 +909,7 @@ export function useAcp() {
 
   const cancel = useCallback(() => {
     const view = sessionViewRef.current;
-    if (view?.activeTurn == null || view.phase !== "running") return;
+    if (view?.activeTurn == null || view.phase !== "running" || view.activeTurn.cancelRequested) return;
     const sessionId = view.sessionId;
     void requestJson(
       `/api/v1/sessions/${encodeURIComponent(view.sessionId)}/turns/${encodeURIComponent(view.activeTurn.operationId)}/cancel`,
@@ -1202,13 +1203,14 @@ export function useAcp() {
   }, [filterReleasedView, releasedFor]);
 
   const readThreadForExport = useCallback(async () => {
-    if (!stateRef.current.timeline.some((item) => item.deferredProcess != null)) return stateRef.current;
+    if (!stateRef.current.timeline.some((item) => item.deferredProcess != null) &&
+      !containsHostedAttachment(stateRef.current.timeline)) return stateRef.current;
     const owner = sessionViewRef.current == null ? undefined : sessionIdentity(sessionViewRef.current);
     if (owner == null) return undefined;
     const navigation = navigationRef.current;
     try {
       const view = await requestJson<BridgeSessionView>(
-        `/api/v1/sessions/${encodeURIComponent(owner.sessionId)}${sessionCwdQuery(undefined, false, owner)}`,
+        `/api/v1/sessions/${encodeURIComponent(owner.sessionId)}${sessionCwdQuery(undefined, false, owner)}&includeAttachmentContent=true`,
       );
       if (navigationRef.current !== navigation || !sameSessionOwner(view, owner) ||
         !sameSessionOwner(sessionViewRef.current, owner)) return undefined;

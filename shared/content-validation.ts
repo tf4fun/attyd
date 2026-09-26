@@ -1,8 +1,10 @@
 import type { Annotations, ContentBlock } from "@agentclientprotocol/sdk";
 
 const MIME_TOKEN = "[A-Za-z0-9!#$%&'*+.^_`|~-]+";
+// RFC 9110 parameter values allow quoted strings, including escaped characters.
+const MIME_QUOTED = String.raw`"(?:[\t\x20\x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\t\x20-\x7e\x80-\xff])*"`;
 const MIME_TYPE = new RegExp(
-  `^${MIME_TOKEN}/${MIME_TOKEN}(?:;${MIME_TOKEN}=${MIME_TOKEN})*$`,
+  `^${MIME_TOKEN}/${MIME_TOKEN}(?:[ \\t]*;[ \\t]*(?:${MIME_TOKEN}=(?:${MIME_TOKEN}|${MIME_QUOTED}))?)*[ \\t]*(?![\\s\\S])`,
 );
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
@@ -77,7 +79,9 @@ function validateAnnotations(
 export function safeMediaDataUrl(block: MediaContentBlock): string | undefined {
   try {
     validateContentBlockSemantics(block);
-    return `data:${block.mimeType};base64,${block.data}`;
+    // Quoted MIME parameters may contain URL or data-URL delimiters.
+    const mimeType = block.mimeType.replace(/[#,?]/g, encodeURIComponent);
+    return `data:${mimeType};base64,${block.data}`;
   } catch {
     return undefined;
   }

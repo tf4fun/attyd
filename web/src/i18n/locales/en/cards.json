@@ -154,6 +154,8 @@
     "stoppedSignal": "Stopped ({{signal}})"
   },
   "content": {
+    "expandText": "Show full message",
+    "collapseText": "Show less",
     "annotations": "ACP content annotations",
     "intendedFor": "Intended for {{role}}",
     "audience": {
@@ -163,13 +165,9 @@
     "priorityLabel": "ACP content priority",
     "priority": "priority {{value}}",
     "modified": "modified {{timestamp}}",
-    "imageAlt": "ACP image content",
     "attachmentDetails": "{{mimeType}} · {{size}}",
-    "invalidAttachment": "{{mimeType}} · Invalid attachment data",
-    "previewUnavailable": "Preview unavailable. You can still download this attachment.",
-    "downloadFailed": "Download failed. Try again.",
-    "downloadNamed": "Download {{name}}",
-    "download": "Download"
+    "openNamed": "Open {{name}} in a new tab",
+    "invalidAttachment": "{{mimeType}} · Invalid attachment data"
   },
   "elicitation": {
     "label": "Agent input request",

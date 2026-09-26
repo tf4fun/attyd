@@ -22,7 +22,7 @@ interface SessionView {
   historyRevision: string | null;
   phase: string;
   timeline: unknown[];
-  activeTurn: { operationId: string; prompt: unknown[] } | null;
+  activeTurn: { operationId: string; prompt: unknown[]; cancelRequested?: boolean; terminal?: unknown } | null;
 }
 
 interface CreatedSession {
@@ -85,8 +85,6 @@ for (const transport of ["http", "ws"] as const) {
     .onNotification(acp.methods.agent.session.cancel, () => {
       record("agent.session.cancel");
       cancellationObserved = true;
-      finishPrompt?.();
-      finishPrompt = undefined;
     });
   const remote = await startRemoteAgent(agent, record);
   const endpoint = `${transport === "http" ? "http" : "ws"}://127.0.0.1:${remote.port}/acp`;
@@ -198,6 +196,13 @@ for (const transport of ["http", "ws"] as const) {
       () => cancellationObserved,
       `${transport} explicit cancellation after reconnect`,
     );
+    const cancelling = await getSession(origin, created.sessionId);
+    assert.equal(cancelling.phase, "running");
+    assert.equal(cancelling.activeTurn?.cancelRequested, true);
+    assert.equal(cancelling.activeTurn?.terminal, null);
+    assert.equal(cancelling.activeTurn?.operationId, firstTurn.operationId);
+    finishPrompt?.();
+    finishPrompt = undefined;
     await waitForValue(
       () => getSession(origin, created.sessionId),
       (view) => view.phase === "ready" && view.activeTurn == null,

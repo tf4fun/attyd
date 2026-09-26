@@ -1,0 +1,17 @@
+.showcase-tabs, .showcase-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 20px; }
+.showcase-tabs { border-bottom: 1px solid var(--theme-border-default); }
+.showcase-tabs button, .showcase-actions button, .showcase-selector select {
+  border: 1px solid var(--theme-border-default); border-radius: 6px;
+  padding: 7px 10px; background: var(--theme-surface-raised); color: var(--ink); font: inherit; font-size: 12px;
+}
+.showcase-tabs [aria-pressed="true"] { background: var(--theme-accent-surface); color: var(--theme-accent-ink); }
+.showcase-actions { padding: 0 0 16px; }
+.showcase-actions button:disabled { opacity: .45; }
+.showcase-interactions { width: 100%; min-width: 0; padding: 12px 0 60px; }
+.showcase-selector { display: grid; gap: 6px; margin-bottom: 20px; font-size: 12px; }
+.showcase-selector select { min-width: 0; width: 100%; }
+.showcase-interactions h2 { margin: 24px 0 12px; font-size: 14px; }
+.showcase-settings { position: relative; }
+.showcase-interactions .config-popover,
+.showcase-interactions .context-usage-popover { top: calc(100% + 8px); bottom: auto; }
+.showcase-result { overflow-wrap: anywhere; color: var(--muted); font-size: 12px; }

@@ -1,17 +1,21 @@
 import type { RequestPermissionResponse, ToolCall } from "@agentclientprotocol/sdk";
 import { ShieldAlert } from "lucide-react";
+import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { useTranslation } from "../../i18n";
 import type { PendingPermission } from "../../lib/state";
 import { useInteractionFocus } from "../../lib/use-interaction-focus";
 import { RawJson } from "./raw-json";
+import { ToolContentView, visibleToolContents } from "./tool-call";
 
 export function PermissionCard({
   pending,
   toolCall,
+  terminalSnapshots = [],
   onRespond,
 }: {
   pending: PendingPermission;
   toolCall?: ToolCall;
+  terminalSnapshots?: TerminalSnapshot[];
   onRespond: (outcome: RequestPermissionResponse["outcome"]) => void;
 }) {
   const { t } = useTranslation("cards");
@@ -21,10 +25,9 @@ export function PermissionCard({
   const name = request.toolCall.name ?? toolCall?.name;
   const kind = request.toolCall.kind ?? toolCall?.kind;
   const locations = request.toolCall.locations ?? toolCall?.locations;
-  const rawInput = Object.prototype.hasOwnProperty.call(request.toolCall, "rawInput")
-    ? request.toolCall.rawInput
-    : toolCall?.rawInput;
-  const inspectable = rawInput !== undefined || (locations?.length ?? 0) > 0;
+  const rawInput = request.toolCall.rawInput ?? toolCall?.rawInput ?? undefined;
+  const content = visibleToolContents(request.toolCall.content ?? toolCall?.content ?? []);
+  const inspectable = rawInput !== undefined || (locations?.length ?? 0) > 0 || content.length > 0;
   const card = useInteractionFocus<HTMLDivElement>();
   return (
     <div
@@ -64,6 +67,13 @@ export function PermissionCard({
           </div>
         ) : null}
         {rawInput !== undefined ? <RawJson label={t("permission.input")} value={rawInput} open /> : null}
+        {content.length > 0 ? (
+          <div className="permission-content tool-output-content">
+            {content.map(({ item, index }) => (
+              <ToolContentView key={index} content={item} terminalSnapshots={terminalSnapshots} />
+            ))}
+          </div>
+        ) : null}
         {!inspectable ? (
           <p className="permission-warning">{t("permission.uninspectable")}</p>
         ) : null}

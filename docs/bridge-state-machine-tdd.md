@@ -234,6 +234,18 @@ history, invents missing Agent data or silently treats a partial replay as autho
 
 ## Proof gates
 
+### Cancellation intent presentation (2026-09-26)
+
+`session_view_exposes_cancel_intent_before_completion_and_keeps_late_updates` initially failed
+because the public active turn omitted cancellation intent. The correction projects the existing
+execution flag in `session_view_value`, preserving the canonical lifecycle and avoiding another
+turn payload serialization. The same test now passes: cancellation remains nonterminal, an older
+snapshot and another session stay unchanged, late tool results survive, and a new turn resets the
+flag. Browser tests follow this native gate. HTTP/SSE and WebSocket smoke fixtures hold the final
+prompt response until the public view exposes `cancelRequested: true` with a null terminal result.
+
+### Existing migration gates
+
 | Gate | Required evidence | Current implementation / verification |
 | --- | --- | --- |
 | S0 specification | authority/state/API/memory contract and adversarial test plan | this ledger and the linked runtime documents |
