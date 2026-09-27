@@ -894,7 +894,7 @@ export default function App() {
             ref={scroll}
             role="region"
             aria-label={t("conversationThread")}
-            aria-keyshortcuts="Escape Home End Shift+PageUp Shift+PageDown"
+            aria-keyshortcuts="Home End Shift+PageUp Shift+PageDown"
             tabIndex={0}
             onScroll={handleThreadScroll}
             onPointerDown={(event) => {
@@ -913,11 +913,7 @@ export default function App() {
                 followLatestContent.current = false;
                 followLatestOnViewport.current = false;
               }
-              if (event.key === "Escape" && state.running) {
-                event.preventDefault();
-                setQueuePaused(true);
-                cancel();
-              } else if (event.key === "Home" && !event.ctrlKey && !event.metaKey) {
+              if (event.key === "Home" && !event.ctrlKey && !event.metaKey) {
                 event.preventDefault();
                 navigateThread("top");
               } else if (event.key === "End" && !event.ctrlKey && !event.metaKey) {

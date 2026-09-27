@@ -594,13 +594,24 @@ describe("ACP interactive UI contract", () => {
     );
     expect(runningComposer.placeholder).toBe("Queue a follow-up…");
     await press(runningComposer, "Escape");
-    expect(onCancel).toHaveBeenCalledOnce();
+    expect(onCancel).not.toHaveBeenCalled();
     await replaceText(runningComposer, "queued follow-up");
     await press(runningComposer, "Enter");
     expect(onSubmit).toHaveBeenLastCalledWith("queued follow-up", []);
     expect(runningComposer.value).toBe("");
     await click(requireElement(container.querySelector('button[aria-label="Stop current turn"]')));
-    expect(onCancel).toHaveBeenCalledTimes(2);
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it("submits the prompt with its original whitespace", async () => {
+    const onSubmit = vi.fn();
+    await render(root, <PromptComposer disabled={false} running={false} commands={[]}
+      onSubmit={onSubmit} onCancel={vi.fn()} />);
+    const composer = requireElement<HTMLTextAreaElement>(container.querySelector('textarea[role="combobox"]'));
+    const prompt = "  First line\n  indented second line\n\nLast line  ";
+    await replaceText(composer, prompt);
+    await press(composer, "Enter");
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(prompt, []);
   });
 
   it.each([

@@ -350,9 +350,9 @@ export function PromptComposer({
   };
 
   const submit = () => {
-    const text = promptText.trim();
+    const text = promptText;
     const currentAttachments = attachmentsRef.current;
-    if ((!text && currentAttachments.length === 0) || disabled) return;
+    if ((!text.trim() && currentAttachments.length === 0) || disabled) return;
     if (pendingFileCount.current > 0) {
       setAttachmentError(new PromptAttachmentError("preparing"));
       return;
@@ -610,11 +610,6 @@ export function PromptComposer({
         return;
       }
     }
-    if (event.key === "Escape" && running) {
-      event.preventDefault();
-      onCancel();
-      return;
-    }
     if (event.key === "ArrowUp" || event.key === "ArrowDown") {
       const handled = navigateHistory(event.key === "ArrowUp" ? -1 : 1);
       if (handled) {
@@ -660,7 +655,7 @@ export function PromptComposer({
         disabled={disabled}
         role="combobox"
         aria-label={index == null ? undefined : t("composer.textPart", { index: index + 1 })}
-        aria-keyshortcuts={running ? "Alt+Shift+Escape Escape" : "Alt+Shift+Escape"}
+        aria-keyshortcuts="Alt+Shift+Escape"
         aria-autocomplete="list"
         aria-controls={active ? contextMenuOpen ? "workspace-context-menu" : "agent-command-menu" : undefined}
         aria-expanded={active && (contextMenuOpen || commandMatches.length > 0)}

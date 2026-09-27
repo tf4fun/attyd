@@ -113,6 +113,8 @@ function PromptText({ text }: { text: string }) {
           if (collapsible && !expanded
             && event.target.getBoundingClientRect().bottom > event.currentTarget.getBoundingClientRect().bottom) {
             setExpanded(true);
+            const target = event.target;
+            requestAnimationFrame(() => target.scrollIntoView({ block: "nearest" }));
           }
         }}
       >

@@ -16,6 +16,7 @@ test("folds prompts only when their rendered height exceeds the preview and foll
     if (address == null || typeof address === "string") throw new Error("Vite did not bind a port");
     const browserErrors = collectBrowserErrors(page);
     const samples = [
+      "First line\nSecond line",
       `Blank source lines${"\n".repeat(40)}Still a short message.`,
       `[Long URL, short label](https://example.com/${"path/".repeat(180)})`,
       Array.from({ length: 9 }, (_, index) => `Nine rendered lines ${index + 1}`).join("  \n"),
@@ -45,12 +46,14 @@ test("folds prompts only when their rendered height exceeds the preview and foll
     const prompts = page.locator(".message-user");
     await expect(prompts).toHaveCount(samples.length);
     const prompt = (label: string) => prompts.filter({ hasText: label });
-    for (const label of ["Blank source lines", "Long URL, short label", "Nine rendered lines", "Responsive paragraph", "Short code block", "Delayed image"]) {
+    await expect(prompt("First line").locator(".prompt-text-content")).toHaveCSS("white-space", "pre-wrap");
+    expect(await prompt("First line").locator(".prompt-text-content").innerText()).toBe("First line\nSecond line");
+    for (const label of ["Blank source lines", "Long URL, short label", "Responsive paragraph", "Short code block", "Delayed image"]) {
       await expect(prompt(label).locator(".prompt-text")).toHaveAttribute("data-collapsible", "false");
       await expect(prompt(label).locator(".prompt-text-toggle")).toHaveCount(0);
       await expect(prompt(label).locator(".prompt-text-body")).toHaveCSS("mask-image", "none");
     }
-    for (const label of ["Ten rendered lines", "Tall heading", "Tall table", "Keyboard access"]) {
+    for (const label of ["Nine rendered lines", "Ten rendered lines", "Tall heading", "Tall table", "Keyboard access"]) {
       await expect(prompt(label).getByRole("button", { name: "Show full message", exact: true })).toHaveAttribute("aria-expanded", "false");
     }
 
