@@ -542,19 +542,32 @@ test("preserves queued prompts beyond the former eight-message limit", async ({ 
 
 test("keeps queued ACP work paused after Stop and resumes it after a new message", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
+  let cancelRequests = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && /\/turns\/[^/]+\/cancel$/.test(new URL(request.url()).pathname)) {
+      cancelRequests += 1;
+    }
+  });
   await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
   await composer.fill("browser permission flow");
   await composer.press("Enter");
-  await expect(page.getByRole("alertdialog", { name: "Agent permission request" })).toBeVisible();
+  const permission = page.getByRole("alertdialog", { name: "Agent permission request" });
+  await expect(permission).toBeVisible();
 
   await composer.fill("usage-flow");
   await composer.press("Enter");
   const queue = page.getByRole("region", { name: "Queued messages" });
   await expect(queue).toContainText("1 queued");
-  await composer.press("Escape");
+  for (const target of [composer, page.getByRole("region", { name: "Conversation thread", exact: true })]) {
+    await target.press("Escape");
+    await expect(permission).toBeVisible();
+    await expect(queue).not.toContainText("paused");
+  }
+  expect(cancelRequests).toBe(0);
+  await page.getByRole("button", { name: "Stop current turn", exact: true }).click();
   await expect(queue).toContainText("1 queued · paused");
   await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
   await expect(page.locator(".message-user").filter({ hasText: "usage-flow" })).toHaveCount(0);
@@ -565,6 +578,7 @@ test("keeps queued ACP work paused after Stop and resumes it after a new message
   await expect(page.locator(".message-user").filter({ hasText: "usage-flow" })).toBeVisible();
   await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
   await expect(queue).toBeHidden();
+  expect(cancelRequests).toBe(1);
   expect(browserErrors).toEqual([]);
 });
 
