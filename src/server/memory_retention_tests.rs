@@ -247,19 +247,10 @@ async fn hub_retention_with_observers(count: usize) -> (usize, usize) {
             .active_turn
             .as_ref()
             .unwrap();
-        assert_eq!(tool_text(&canonical.updates), latest);
-        state
-            .runtime
-            .replay_events()
-            .iter()
-            .filter_map(|raw| {
-                let event: Value = serde_json::from_str(raw).unwrap();
-                event
-                    .pointer("/notification/update/content/0/content/text")
-                    .and_then(Value::as_str)
-                    .map(str::len)
-            })
-            .sum::<usize>()
+        // The canonical projection is the Hub's only conversation store.
+        let retained = tool_text(&canonical.updates);
+        assert_eq!(retained, latest);
+        retained.len()
     };
     drop(observers);
     hub.shutdown().await;
@@ -271,7 +262,7 @@ async fn memory_retention_m04_hub_without_observers_keeps_only_current_conversat
     let (retained, current) = hub_retention_with_observers(0).await;
     assert!(
         retained <= current,
-        "no browser exists, but legacy replay retains {retained} text bytes for {current} current bytes"
+        "no browser exists, but the Hub retains {retained} text bytes for {current} current bytes"
     );
 }
 
@@ -417,7 +408,6 @@ async fn memory_retention_m08_snapshot_suffix_and_gap_recovery_match_current_sta
         ),
         "ABC"
     );
-    drop(subscriber);
     hub.shutdown().await;
 }
 
