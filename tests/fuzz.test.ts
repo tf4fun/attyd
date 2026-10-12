@@ -1,37 +1,44 @@
-import type { ServerEvent, ClientCommand } from "../shared/bridge";
+import type { ServerEvent } from "../shared/bridge";
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
-import { parseClientCommand } from "../shared/bridge";
+import {
+  parseGlobalBusinessEvent,
+  parseSessionBusinessEvent,
+  type GlobalBusinessEvent,
+  type SessionBusinessEvent,
+} from "../shared/business-api";
 import { appReducer, initialState } from "../web/src/lib/state";
 
-const commandTypes = new Set<ClientCommand["type"]>([
-  "session/new",
-  "session/list",
-  "session/load",
-  "session/resume",
-  "session/fork",
-  "session/close",
-  "session/delete",
-  "session/prompt",
-  "session/cancel",
-  "session/set_mode",
-  "session/set_config_option",
-  "permission/respond",
-  "elicitation/respond",
+const eventTypes = new Set<GlobalBusinessEvent["type"] | SessionBusinessEvent["type"]>([
+  "bridge/catalog_changed",
+  "bridge/connection",
+  "bridge/connection_error",
+  "acp/authenticated",
+  "acp/logged_out",
+  "bridge/auth_terminal_started",
+  "bridge/auth_terminal_output",
+  "bridge/auth_terminal_exited",
+  "bridge/session_retired",
+  "bridge/session_reset",
+  "bridge/session_delta",
+  "bridge/session_turn_complete",
+  "bridge/session_turn_failed",
 ]);
 
 describe("deterministic adversarial generation", () => {
-  it("never accepts an unknown command or throws a non-Error for arbitrary JSON", () => {
+  it("never accepts an unknown business event or throws a non-Error for arbitrary JSON", () => {
     const random = prng(0xaced_0001);
     let accepted = 0;
     for (let index = 0; index < 5_000; index += 1) {
       const source = JSON.stringify(randomJson(random, 0));
-      try {
-        const command = parseClientCommand(source);
-        accepted += 1;
-        expect(commandTypes.has(command.type)).toBe(true);
-      } catch (error) {
-        expect(error).toBeInstanceOf(Error);
+      for (const parse of [parseGlobalBusinessEvent, parseSessionBusinessEvent]) {
+        try {
+          const event = parse(source);
+          accepted += 1;
+          expect(eventTypes.has(event.type)).toBe(true);
+        } catch (error) {
+          expect(error).toBeInstanceOf(Error);
+        }
       }
     }
     // The corpus is not useful if it only exercises rejection paths.
@@ -160,15 +167,12 @@ function randomJson(random: () => number, depth: number): unknown {
       return Array.from({ length: Math.floor(random() * 5) }, () => randomJson(random, depth + 1));
     default: {
       const result: Record<string, unknown> = {};
-      const keys = ["type", "requestId", "sessionId", "prompt", "outcome", "response", "value", "content"];
+      const keys = ["type", "requestId", "sessionId", "bridgeEpoch", "viewRevision", "change", "phase", "response"];
       for (let index = 0; index < Math.floor(random() * 7); index += 1) {
         result[keys[Math.floor(random() * keys.length)]] = randomJson(random, depth + 1);
       }
-      if (random() < 0.12) result.type = [...commandTypes][Math.floor(random() * commandTypes.size)];
-      if (random() < 0.06) {
-        result.type = "session/new";
-        result.requestId = `generated-${Math.floor(random() * 1000)}`;
-      }
+      if (random() < 0.12) result.type = [...eventTypes][Math.floor(random() * eventTypes.size)];
+      if (random() < 0.06) result.type = "bridge/connection";
       return result;
     }
   }

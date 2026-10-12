@@ -2,11 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import type {
-  BridgeSessionView,
-  CreatedSessionResult,
-  RuntimeView,
-} from "../web/src/lib/business-api.js";
+import type { BridgeSessionView, CreatedSessionResult, RuntimeView } from "../shared/business-api.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
 // SDK Agent -> ACP client terminal/MCP services, with the same REST/SSE

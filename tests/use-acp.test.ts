@@ -7,9 +7,9 @@ import {
   parseGlobalBusinessEvent,
   parseSessionBusinessEvent,
   strongEtag,
-  workspaceContextSearchPath,
   type BridgeSessionView,
-} from "../web/src/lib/business-api";
+} from "../shared/business-api";
+import { workspaceContextSearchPath } from "../web/src/lib/api-client";
 import { projectPath, sessionPath } from "../web/src/lib/session-route";
 import { useAcp } from "../web/src/lib/use-acp";
 import type { TerminalSnapshot } from "../shared/bridge";

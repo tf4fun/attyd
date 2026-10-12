@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ServerEvent } from "../shared/bridge";
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
-import type { BridgeSessionView } from "../web/src/lib/business-api";
+import type { BridgeSessionView } from "../shared/business-api";
 import { appReducer, initialState, type AppState } from "../web/src/lib/state";
 
 function event(value: ServerEvent) {

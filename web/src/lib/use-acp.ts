@@ -19,15 +19,12 @@ import {
   type StartTurnResult,
   type WorkspaceContextAttachment,
   type WorkspaceContextMatch,
-  ApiError,
-  RequestTimeoutError,
   parseGlobalBusinessEvent,
   parseSessionBusinessEvent,
-  requestJson,
   sameSessionOwner,
   strongEtag,
-  workspaceContextSearchPath,
-} from "./business-api";
+} from "../../../shared/business-api";
+import { ApiError, RequestTimeoutError, requestJson, workspaceContextSearchPath } from "./api-client";
 import { randomId } from "./id";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
 import { appReducer, initialState, type DeferredTurnProcess } from "./state";

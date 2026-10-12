@@ -1,4 +1,4 @@
-import type { BridgeSessionView, SessionDeltaChange } from "./business-api";
+import type { BridgeSessionView, SessionDeltaChange } from "../../../shared/business-api";
 
 export type SessionControlKind = "mode" | "config";
 

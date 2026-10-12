@@ -12,7 +12,6 @@ import type {
   NewSessionResponse,
   PromptResponse,
   RequestPermissionRequest,
-  RequestPermissionResponse,
   ResumeSessionResponse,
   SessionNotification,
   SetSessionConfigOptionResponse,
@@ -81,91 +80,6 @@ export type SessionRuntimeOperation =
   | "mode"
   | "config";
 
-export type ClientCommand =
-  | { type: "auth/authenticate"; requestId: string; methodId: string }
-  | {
-      type: "auth/terminal_start";
-      requestId: string;
-      methodId: string;
-      cols: number;
-      rows: number;
-    }
-  | { type: "auth/terminal_input"; requestId: string; data: string }
-  | {
-      type: "auth/terminal_resize";
-      requestId: string;
-      cols: number;
-      rows: number;
-    }
-  | { type: "auth/terminal_cancel"; requestId: string }
-  | { type: "auth/logout"; requestId: string }
-  | { type: "context/search"; requestId: string; sessionId: string; query: string }
-  | {
-      type: "context/read";
-      requestId: string;
-      sessionId: string;
-      path: string;
-    }
-  | { type: "session/new"; requestId: string; cwd?: string }
-  | { type: "session/list"; requestId: string; cursor?: string }
-  | {
-      type: "session/load";
-      requestId: string;
-      sessionId: string;
-    }
-  | {
-      type: "session/resume";
-      requestId: string;
-      sessionId: string;
-    }
-  | {
-      type: "session/fork";
-      requestId: string;
-      sessionId: string;
-    }
-  | {
-      type: "session/close";
-      requestId: string;
-      sessionId: string;
-    }
-  | {
-      type: "session/delete";
-      requestId: string;
-      sessionId: string;
-    }
-  | {
-      type: "session/prompt";
-      requestId: string;
-      sessionId: string;
-      prompt: ContentBlock[];
-    }
-  | { type: "session/cancel"; sessionId: string }
-  | {
-      type: "session/set_mode";
-      requestId: string;
-      sessionId: string;
-      modeId: string;
-    }
-  | {
-      type: "session/set_config_option";
-      requestId: string;
-      sessionId: string;
-      configId: string;
-      value: string | boolean;
-    }
-  | {
-      type: "permission/respond";
-      requestId: string;
-      permissionId: string;
-      outcome: RequestPermissionResponse["outcome"];
-    }
-  | {
-      type: "elicitation/respond";
-      requestId: string;
-      elicitationId: string;
-      response: CreateElicitationResponse;
-    };
-
 export type ServerEvent =
   | {
       type: "bridge/hello";
@@ -211,7 +125,7 @@ export type ServerEvent =
       type: "bridge/error";
       message: string;
       requestId?: string;
-      operation?: ClientCommand["type"];
+      operation?: string;
       code?: number;
       data?: unknown;
       dataTruncated?: boolean;
@@ -894,186 +808,6 @@ function requireEnum(
   }
 }
 
-export function parseClientCommand(raw: string): ClientCommand {
-  const value: unknown = JSON.parse(raw);
-  if (!isRecord(value) || typeof value.type !== "string") {
-    throw new Error("Bridge command must be an object with a type");
-  }
-  if (Object.hasOwn(value, "history")) {
-    throw new Error("Bridge commands must not contain completed browser history");
-  }
-  switch (value.type) {
-    case "auth/authenticate":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "methodId");
-      break;
-    case "auth/terminal_start":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "methodId");
-      requireTerminalSize(value.cols, value.rows, "auth/terminal_start");
-      break;
-    case "auth/terminal_input":
-      requireBridgeIdentifier(value, "requestId");
-      requireStringValue(value.data, "auth/terminal_input data");
-      break;
-    case "auth/terminal_resize":
-      requireBridgeIdentifier(value, "requestId");
-      requireTerminalSize(value.cols, value.rows, "auth/terminal_resize");
-      break;
-    case "auth/terminal_cancel":
-      requireBridgeIdentifier(value, "requestId");
-      break;
-    case "auth/logout":
-      requireBridgeIdentifier(value, "requestId");
-      break;
-    case "context/search":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireStringField(value, "query");
-      break;
-    case "context/read":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireNonemptyString(value, "path");
-      break;
-    case "session/new":
-      requireBridgeIdentifier(value, "requestId");
-      validateOptionalWorkspacePath(value.cwd, "session/new cwd");
-      break;
-    case "session/list":
-      requireBridgeIdentifier(value, "requestId");
-      if (value.cursor != null && typeof value.cursor !== "string") {
-        throw new Error("session/list has an invalid cursor");
-      }
-      break;
-    case "session/load":
-    case "session/resume":
-    case "session/fork":
-    case "session/close":
-    case "session/delete":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      break;
-    case "session/prompt":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      if (!Array.isArray(value.prompt)) throw new Error("session/prompt requires a prompt array");
-      validatePrompt(value.prompt);
-      break;
-    case "session/cancel":
-      requireBridgeIdentifier(value, "sessionId");
-      break;
-    case "session/set_mode":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBridgeIdentifier(value, "modeId");
-      break;
-    case "session/set_config_option":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "sessionId");
-      requireBridgeIdentifier(value, "configId");
-      if (!["string", "boolean"].includes(typeof value.value)) {
-        throw new Error("session/set_config_option has an invalid value");
-      }
-      break;
-    case "permission/respond":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "permissionId");
-      if (!isRecord(value.outcome)) throw new Error("permission/respond requires an outcome");
-      if (value.outcome.outcome === "selected") requireBridgeIdentifier(value.outcome, "optionId");
-      else if (value.outcome.outcome !== "cancelled") throw new Error("Invalid permission outcome");
-      break;
-    case "elicitation/respond":
-      requireBridgeIdentifier(value, "requestId");
-      requireBridgeIdentifier(value, "elicitationId");
-      if (!isRecord(value.response) || typeof value.response.action !== "string") {
-        throw new Error("elicitation/respond requires a response action");
-      }
-      if (!["accept", "decline", "cancel"].includes(value.response.action)) {
-        throw new Error(`Unsupported elicitation response action: ${value.response.action}`);
-      }
-      if (value.response.action !== "accept" && value.response.content != null) {
-        throw new Error("Only accepted elicitation responses may contain content");
-      }
-      if (value.response.content != null) {
-        if (!isRecord(value.response.content)) {
-          throw new Error("elicitation/respond content must be an object");
-        }
-        for (const contentValue of Object.values(value.response.content)) {
-          if (!isElicitationValue(contentValue)) {
-            throw new Error("elicitation/respond contains an invalid content value");
-          }
-        }
-      }
-      break;
-    default:
-      throw new Error(`Unknown Bridge command: ${value.type}`);
-  }
-  return value as ClientCommand;
-}
-
-function requireTerminalSize(cols: unknown, rows: unknown, label: string): void {
-  if (!Number.isSafeInteger(cols) || Number(cols) < 1 || Number(cols) > 65_535) {
-    throw new Error(`${label} cols must be an integer between 1 and 65535`);
-  }
-  if (!Number.isSafeInteger(rows) || Number(rows) < 1 || Number(rows) > 65_535) {
-    throw new Error(`${label} rows must be an integer between 1 and 65535`);
-  }
-}
-
-function validatePrompt(prompt: unknown[]): void {
-  if (prompt.length === 0) {
-    throw new Error("session/prompt requires at least one content block");
-  }
-  for (const block of prompt) {
-    if (!isRecord(block) || typeof block.type !== "string") {
-      throw new Error("session/prompt contains an invalid content block");
-    }
-    switch (block.type) {
-      case "text":
-        requireStringValue(block.text, "text block text");
-        break;
-      case "image":
-        requireStringValue(block.data, "image block data");
-        requireStringValue(block.mimeType, "image block mimeType");
-        requireOptionalString(block.uri, "image block uri");
-        break;
-      case "audio":
-        requireStringValue(block.data, "audio block data");
-        requireStringValue(block.mimeType, "audio block mimeType");
-        break;
-      case "resource_link":
-        requireStringValue(block.name, "resource link name");
-        requireStringValue(block.uri, "resource link uri");
-        requireOptionalString(block.description, "resource link description");
-        requireOptionalString(block.mimeType, "resource link mimeType");
-        requireOptionalString(block.title, "resource link title");
-        if (block.size != null && typeof block.size !== "number") {
-          throw new Error("resource link size must be a number when provided");
-        }
-        break;
-      case "resource": {
-        if (!isRecord(block.resource)) {
-          throw new Error("resource block requires a resource object");
-        }
-        requireStringValue(block.resource.uri, "embedded resource uri");
-        const hasText = Object.hasOwn(block.resource, "text");
-        const hasBlob = Object.hasOwn(block.resource, "blob");
-        if (hasText === hasBlob) {
-          throw new Error("embedded resource requires exactly one of text or blob");
-        }
-        if (hasText) requireStringValue(block.resource.text, "embedded resource text");
-        if (hasBlob) requireStringValue(block.resource.blob, "embedded resource blob");
-        requireOptionalString(block.resource.mimeType, "embedded resource mimeType");
-        break;
-      }
-      default:
-        throw new Error(`Unsupported prompt content block: ${block.type}`);
-    }
-    validateContentBlockSemantics(block as ContentBlock, "Prompt content block");
-  }
-}
-
 function requireStringValue(value: unknown, label: string): asserts value is string {
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
 }
@@ -1082,15 +816,6 @@ function requireOptionalString(value: unknown, label: string): void {
   if (value != null && typeof value !== "string") {
     throw new Error(`${label} must be a string when provided`);
   }
-}
-
-function isElicitationValue(value: unknown): boolean {
-  return (
-    typeof value === "string" ||
-    (typeof value === "number" && Number.isFinite(value)) ||
-    typeof value === "boolean" ||
-    (Array.isArray(value) && value.every((item) => typeof item === "string"))
-  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

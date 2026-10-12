@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, REQUEST_TIMEOUT_MS, RequestTimeoutError, requestJson } from "../web/src/lib/business-api";
+import { ApiError, REQUEST_TIMEOUT_MS, RequestTimeoutError, requestJson } from "../web/src/lib/api-client";
 import i18n from "../web/src/i18n";
 
 describe("ordinary API request deadlines", () => {

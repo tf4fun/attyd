@@ -27,7 +27,8 @@ import type {
 } from "../../lib/state";
 import { processPageTimeline } from "../../lib/state";
 import { COLLAPSED_PROCESS_RETENTION_MS } from "../../lib/process-retention";
-import { RequestTimeoutError, sameSessionOwner, type BridgeTurnProcessPage } from "../../lib/business-api";
+import { sameSessionOwner, type BridgeTurnProcessPage } from "../../../../shared/business-api";
+import { RequestTimeoutError } from "../../lib/api-client";
 import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { contentBlocksToMarkdown } from "../../lib/thread-markdown";
 import { collectReviewChanges, collectTurnReviewChanges, type ReviewSummary } from "../../lib/review-changes";

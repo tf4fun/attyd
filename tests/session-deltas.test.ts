@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { BridgeSessionView, SessionDeltaChange } from "../web/src/lib/business-api";
+import type { BridgeSessionView, SessionDeltaChange } from "../shared/business-api";
 import { applyLocalSessionDelta } from "../web/src/lib/session-deltas";
 
 function view(overrides: Partial<BridgeSessionView> = {}): BridgeSessionView {
