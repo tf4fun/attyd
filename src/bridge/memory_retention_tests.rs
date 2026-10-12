@@ -605,6 +605,9 @@ impl PublicationPeer {
             .unwrap()
             .unwrap()
             .unwrap();
+        // Like `forward_generation_events`, consume the ended generation's
+        // queued suffix: typed transfers share state until delivered.
+        while self.events.try_recv().is_ok() {}
     }
 }
 
