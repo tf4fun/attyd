@@ -808,6 +808,59 @@ function requireEnum(
   }
 }
 
+function validatePrompt(prompt: unknown[]): void {
+  if (prompt.length === 0) {
+    throw new Error("session/prompt requires at least one content block");
+  }
+  for (const block of prompt) {
+    if (!isRecord(block) || typeof block.type !== "string") {
+      throw new Error("session/prompt contains an invalid content block");
+    }
+    switch (block.type) {
+      case "text":
+        requireStringValue(block.text, "text block text");
+        break;
+      case "image":
+        requireStringValue(block.data, "image block data");
+        requireStringValue(block.mimeType, "image block mimeType");
+        requireOptionalString(block.uri, "image block uri");
+        break;
+      case "audio":
+        requireStringValue(block.data, "audio block data");
+        requireStringValue(block.mimeType, "audio block mimeType");
+        break;
+      case "resource_link":
+        requireStringValue(block.name, "resource link name");
+        requireStringValue(block.uri, "resource link uri");
+        requireOptionalString(block.description, "resource link description");
+        requireOptionalString(block.mimeType, "resource link mimeType");
+        requireOptionalString(block.title, "resource link title");
+        if (block.size != null && typeof block.size !== "number") {
+          throw new Error("resource link size must be a number when provided");
+        }
+        break;
+      case "resource": {
+        if (!isRecord(block.resource)) {
+          throw new Error("resource block requires a resource object");
+        }
+        requireStringValue(block.resource.uri, "embedded resource uri");
+        const hasText = Object.hasOwn(block.resource, "text");
+        const hasBlob = Object.hasOwn(block.resource, "blob");
+        if (hasText === hasBlob) {
+          throw new Error("embedded resource requires exactly one of text or blob");
+        }
+        if (hasText) requireStringValue(block.resource.text, "embedded resource text");
+        if (hasBlob) requireStringValue(block.resource.blob, "embedded resource blob");
+        requireOptionalString(block.resource.mimeType, "embedded resource mimeType");
+        break;
+      }
+      default:
+        throw new Error(`Unsupported prompt content block: ${block.type}`);
+    }
+    validateContentBlockSemantics(block as ContentBlock, "Prompt content block");
+  }
+}
+
 function requireStringValue(value: unknown, label: string): asserts value is string {
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
 }
