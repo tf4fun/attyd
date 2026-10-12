@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::bridge;
 #[cfg(test)]
 use crate::bridge_event::session_reset_value;
-use crate::bridge_event::{BridgeEvent, SessionEvent};
+use crate::bridge_event::{BridgeEvent, SessionEvent, SessionPosition};
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
@@ -656,10 +656,11 @@ impl SessionSubscriber {
                     )
                 })
             };
-            match slot.replace(next) {
+            let position = (epoch, incarnation, view_revision);
+            match slot.replace(next, position.clone()) {
                 Ok(()) => return true,
                 Err(next) => {
-                    return match self.sender.try_send_state(next) {
+                    return match self.sender.try_send_state(next, position) {
                         Ok(slot) => {
                             self.state_slot = Some(Arc::downgrade(&slot));
                             true
@@ -669,7 +670,7 @@ impl SessionSubscriber {
                 }
             }
         }
-        match self.sender.try_send_state(event) {
+        match self.sender.try_send_state(event, position) {
             Ok(slot) => {
                 self.state_slot = Some(Arc::downgrade(&slot));
                 true
@@ -720,33 +721,42 @@ struct StateSlot {
 
 struct StateSlotState {
     payload: Option<Arc<str>>,
+    position: Option<SessionPosition>,
     accounted_bytes: usize,
 }
 
 struct QueuedSubscriberEvent {
     event: QueuedPayload,
+    /// Coalescing position of a `Fixed` session state payload.
+    position: Option<SessionPosition>,
     queued_bytes: Arc<AtomicUsize>,
     bytes: usize,
 }
 
 impl QueuedSubscriberEvent {
-    fn claim_payload(&self) -> Arc<str> {
+    fn claim_payload(&self) -> (Arc<str>, Option<SessionPosition>) {
         match &self.event {
-            QueuedPayload::Fixed(event) => event.clone(),
+            QueuedPayload::Fixed(event) => (event.clone(), self.position.clone()),
             QueuedPayload::Shared(slot) => slot.claim(),
         }
     }
 
     #[cfg(test)]
     fn into_arc(self) -> Arc<str> {
-        self.claim_payload()
+        self.claim_payload().0
+    }
+
+    /// The SSE payload with the position it was routed with, so delivery
+    /// never re-parses what the Hub already classified.
+    fn into_delivery(self) -> (String, Option<SessionPosition>) {
+        let (payload, position) = self.claim_payload();
+        #[cfg(test)]
+        delivery_handoff_tests::after_payload_capture(&self.queued_bytes);
+        (payload.to_string(), position)
     }
 
     fn into_string(self) -> String {
-        let payload = self.claim_payload();
-        #[cfg(test)]
-        delivery_handoff_tests::after_payload_capture(&self.queued_bytes);
-        payload.to_string()
+        self.into_delivery().0
     }
 }
 
@@ -759,11 +769,12 @@ impl Drop for QueuedSubscriberEvent {
 }
 
 impl StateSlot {
-    fn new(payload: Arc<str>, ledger: Arc<AtomicUsize>) -> Self {
+    fn new(payload: Arc<str>, position: SessionPosition, ledger: Arc<AtomicUsize>) -> Self {
         let accounted_bytes = payload.len();
         Self {
             state: std::sync::Mutex::new(StateSlotState {
                 payload: Some(payload),
+                position: Some(position),
                 accounted_bytes,
             }),
             ledger,
@@ -772,7 +783,7 @@ impl StateSlot {
 
     /// Atomically transfer ownership from the replaceable queue slot to the
     /// consumer. Once claimed, producers must enqueue a new slot.
-    fn claim(&self) -> Arc<str> {
+    fn claim(&self) -> (Arc<str>, Option<SessionPosition>) {
         let mut state = self
             .state
             .lock()
@@ -783,12 +794,12 @@ impl StateSlot {
             .expect("a queued state slot is claimed exactly once");
         let accounted_bytes = std::mem::take(&mut state.accounted_bytes);
         self.ledger.fetch_sub(accounted_bytes, Ordering::AcqRel);
-        payload
+        (payload, state.position.take())
     }
 
     /// Replace an unclaimed payload and its accounting as one critical
     /// section. Return the payload when the consumer already owns the slot.
-    fn replace(&self, next: Arc<str>) -> Result<(), Arc<str>> {
+    fn replace(&self, next: Arc<str>, position: SessionPosition) -> Result<(), Arc<str>> {
         let new_len = next.len();
         let mut state = self
             .state
@@ -799,6 +810,7 @@ impl StateSlot {
             return Err(next);
         };
         *payload = next;
+        state.position = Some(position);
         state.accounted_bytes = new_len;
         if new_len >= old_len {
             self.ledger.fetch_add(new_len - old_len, Ordering::AcqRel);
@@ -839,12 +851,21 @@ impl SubscriberSender {
     }
 
     fn try_send(&self, event: impl Into<Arc<str>>) -> Result<(), ()> {
+        self.try_send_at(event, None)
+    }
+
+    fn try_send_at(
+        &self,
+        event: impl Into<Arc<str>>,
+        position: Option<SessionPosition>,
+    ) -> Result<(), ()> {
         let event = event.into();
         let bytes = event.len();
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.tx
             .send(QueuedSubscriberEvent {
                 event: QueuedPayload::Fixed(event),
+                position,
                 queued_bytes: self.queued_bytes.clone(),
                 bytes,
             })
@@ -852,13 +873,18 @@ impl SubscriberSender {
     }
 
     /// Queue a reconstructible state event through a replaceable slot.
-    fn try_send_state(&self, event: Arc<str>) -> Result<Arc<StateSlot>, ()> {
+    fn try_send_state(
+        &self,
+        event: Arc<str>,
+        position: SessionPosition,
+    ) -> Result<Arc<StateSlot>, ()> {
         let bytes = event.len();
-        let slot = Arc::new(StateSlot::new(event, self.queued_bytes.clone()));
+        let slot = Arc::new(StateSlot::new(event, position, self.queued_bytes.clone()));
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.tx
             .send(QueuedSubscriberEvent {
                 event: QueuedPayload::Shared(slot.clone()),
+                position: None,
                 queued_bytes: self.queued_bytes.clone(),
                 bytes: 0,
             })
@@ -1260,7 +1286,10 @@ impl BridgeHub {
                 let (epoch, incarnation, _) = reset.position.clone().expect("validated reset");
                 // The activation reset is the delivery cut itself, so it must be
                 // delivered verbatim; only later state events coalesce.
-                let delivered = subscriber.sender.try_send(reset.payload).is_ok();
+                let delivered = subscriber
+                    .sender
+                    .try_send_at(reset.payload, reset.position.clone())
+                    .is_ok();
                 subscriber.owner = Some((epoch, incarnation));
                 if !delivered
                     || subscriber
@@ -2754,14 +2783,13 @@ async fn session_events(
     };
     let stream = futures::stream::unfold(
         (
-            None::<String>,
             subscription.initial_events.into_iter(),
             subscription.events,
             session_id,
-            None::<(String, u64, u64)>,
+            None::<SessionPosition>,
             guard,
         ),
-        |(mut initial, mut bootstrap, mut events, session_id, mut position, guard)| async move {
+        |(mut bootstrap, mut events, session_id, mut position, guard)| async move {
             loop {
                 if guard
                     .lease
@@ -2770,12 +2798,15 @@ async fn session_events(
                 {
                     return None;
                 }
-                let is_initial = initial.is_some();
-                let event = if let Some(initial_event) = initial.take() {
-                    initial_event
-                } else if let Some(event) = bootstrap.next() {
-                    event
+                let (event, next_position) = if let Some(event) = bootstrap.next() {
+                    if !session_event_matches(&event, &session_id) {
+                        continue;
+                    }
+                    let next_position = session_event_position(&event);
+                    (event, next_position)
                 } else {
+                    // Queued events were routed to this session by the Hub and
+                    // carry the position they were classified with.
                     let event = if let Some(lease) = &guard.lease {
                         tokio::select! {
                             biased;
@@ -2785,31 +2816,30 @@ async fn session_events(
                     } else {
                         events.recv().await?
                     };
-                    event.into_string()
+                    event.into_delivery()
                 };
-                if !session_event_matches(&event, &session_id) {
-                    continue;
-                }
-                let next_position = session_event_position(&event);
-                if !is_initial
-                    && let (Some(current), Some(next)) = (&position, &next_position)
+                if let (Some(current), Some(next)) = (&position, &next_position)
                     && current.0 == next.0
                     && current.1 == next.1
                     && next.2 <= current.2
                 {
                     continue;
                 }
+                let id = next_position
+                    .as_ref()
+                    .map(|(epoch, incarnation, revision)| {
+                        format!("{epoch}:{incarnation}:{revision}")
+                    });
                 if next_position.is_some() {
                     position = next_position;
                 }
-                let id = session_event_cursor(&event);
                 let mut outgoing = SseEvent::default().data(event);
                 if let Some(id) = id {
                     outgoing = outgoing.id(id);
                 }
                 return Some((
                     Ok::<_, Infallible>(outgoing),
-                    (initial, bootstrap, events, session_id, position, guard),
+                    (bootstrap, events, session_id, position, guard),
                 ));
             }
         },
@@ -2845,6 +2875,7 @@ fn session_event_id(event: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 fn session_event_cursor(event: &str) -> Option<String> {
     let (epoch, incarnation, revision) = session_event_position(event)?;
     Some(format!("{epoch}:{incarnation}:{revision}"))
