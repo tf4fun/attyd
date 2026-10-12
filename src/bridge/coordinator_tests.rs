@@ -21,7 +21,7 @@ fn setup() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
     (
         AgentContext {
             state,
-            mcp: McpManager::new(PathBuf::from("/workspace"), Vec::new(), sink.tx.clone()),
+            mcp: McpManager::new(PathBuf::from("/workspace"), Vec::new()),
             sink,
             terminals: None,
             filesystem: None,
@@ -189,36 +189,26 @@ async fn assert_interaction_sequence(
     let mut published = Vec::new();
     loop {
         let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
-        let updated = event["type"] == "acp/session_update";
+        let updated = event["sessionId"] == SESSION
+            && (event["type"] == "bridge/session_view"
+                || (event["type"] == "bridge/session_delta"
+                    && event["change"]["kind"] == "turn_update"));
         published.push(event);
         if updated {
             break;
         }
     }
-    let (request_type, resolved_type, id_field) = if permission {
-        (
-            "acp/permission_request",
-            "acp/permission_resolved",
-            "permissionId",
-        )
-    } else {
-        (
-            "acp/elicitation_request",
-            "acp/elicitation_resolved",
-            "elicitationId",
-        )
+    let delta = |kind: &str| {
+        published.iter().position(|event| {
+            event["type"] == "bridge/session_delta"
+                && event["change"]["kind"] == kind
+                && (event["change"]["interaction"]["interactionId"] == allocation
+                    || event["change"]["interactionId"] == allocation)
+        })
     };
-    let created = published
-        .iter()
-        .position(|event| event["type"] == request_type)
-        .unwrap();
-    let removed = published
-        .iter()
-        .position(|event| event["type"] == resolved_type)
-        .unwrap();
+    let created = delta("interaction_upsert").unwrap();
+    let removed = delta("interaction_remove").unwrap();
     assert!(created < removed && removed < published.len() - 1);
-    assert_eq!(published[created][id_field], allocation);
-    assert_eq!(published[removed][id_field], allocation);
     let mut state = services.state.lock().await;
     let view = state.sessions.view(SESSION, incarnation).unwrap();
     assert_eq!(view.baseline.updates().len(), 1);

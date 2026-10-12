@@ -8,13 +8,10 @@ use agent_client_protocol::{Agent, ConnectionTo, Error, RequestCancellation};
 use serde_json::{Map, Value, json, value::to_raw_value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
-#[cfg(test)]
-use tokio::sync::mpsc;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::event_queue::EventSender;
 use crate::mcp_config::AcpMcpProvider;
 
 type PendingResult = Result<Value, Error>;
@@ -30,7 +27,6 @@ pub struct McpManager {
     providers: Arc<HashMap<String, AcpMcpProvider>>,
     connections: Arc<Mutex<HashMap<String, Arc<McpConnection>>>>,
     connect_lock: Arc<Mutex<()>>,
-    events: EventSender,
 }
 
 struct McpConnection {
@@ -46,10 +42,7 @@ struct McpConnection {
 }
 
 impl McpManager {
-    pub fn new<E>(cwd: std::path::PathBuf, providers: Vec<AcpMcpProvider>, events: E) -> Self
-    where
-        E: Into<EventSender>,
-    {
+    pub fn new(cwd: std::path::PathBuf, providers: Vec<AcpMcpProvider>) -> Self {
         Self {
             cwd,
             providers: Arc::new(
@@ -60,7 +53,6 @@ impl McpManager {
             ),
             connections: Arc::new(Mutex::new(HashMap::new())),
             connect_lock: Arc::new(Mutex::new(())),
-            events: events.into(),
         }
     }
 
@@ -108,7 +100,6 @@ impl McpManager {
             .take()
             .ok_or_else(|| Error::internal_error().data("MCP child did not provide stdout"))?;
         if let Some(stderr) = child.stderr.take() {
-            let events = self.events.clone();
             let name = provider.name.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -119,13 +110,7 @@ impl McpManager {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
                             let text = String::from_utf8_lossy(&chunk);
-                            let _ = events.send(
-                                json!({
-                                    "type": "bridge/stderr",
-                                    "chunk": format!("[MCP {name}] {text}"),
-                                })
-                                .to_string(),
-                            );
+                            tracing::debug!(target: "attyd::mcp", "[MCP {name}] {}", text.trim_end());
                         }
                     }
                 }
@@ -207,17 +192,7 @@ impl McpManager {
                 },
             );
         }
-        self.activity(
-            "agent-to-server",
-            &connection,
-            &request.method,
-            "request",
-            request
-                .params
-                .as_ref()
-                .map(|value| Value::Object(value.clone())),
-            None,
-        );
+        self.activity("agent-to-server", &connection, &request.method, "request");
         let message = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -238,14 +213,7 @@ impl McpManager {
                     "method": "notifications/cancelled",
                     "params": params,
                 })).await;
-                self.activity(
-                    "agent-to-server",
-                    &connection,
-                    "notifications/cancelled",
-                    "notification",
-                    Some(params),
-                    None,
-                );
+                self.activity("agent-to-server", &connection, "notifications/cancelled", "notification");
                 return Err(Error::request_cancelled());
             }
         };
@@ -262,11 +230,6 @@ impl McpManager {
             &connection,
             &notification.method,
             "notification",
-            notification
-                .params
-                .as_ref()
-                .map(|value| Value::Object(value.clone())),
-            None,
         );
         write_json(
             &connection,
@@ -433,14 +396,7 @@ impl McpManager {
         if let Some(method) = object.get("method").and_then(Value::as_str) {
             let params = parse_params(object.get("params"))?;
             if let Some(id) = object.get("id") {
-                self.activity(
-                    "server-to-agent",
-                    connection,
-                    method,
-                    "request",
-                    params.clone().map(Value::Object),
-                    None,
-                );
+                self.activity("server-to-agent", connection, method, "request");
                 let response = acp
                     .send_request(
                         MessageMcpRequest::new(connection.id.clone(), method.to_string())
@@ -460,14 +416,7 @@ impl McpManager {
                             }),
                         )
                         .await?;
-                        self.activity(
-                            "agent-to-server",
-                            connection,
-                            method,
-                            "response",
-                            None,
-                            Some(result),
-                        );
+                        self.activity("agent-to-server", connection, method, "response");
                     }
                     Err(error) => {
                         write_json(
@@ -487,14 +436,7 @@ impl McpManager {
                     }
                 }
             } else {
-                self.activity(
-                    "server-to-agent",
-                    connection,
-                    method,
-                    "notification",
-                    params.clone().map(Value::Object),
-                    None,
-                );
+                self.activity("server-to-agent", connection, method, "notification");
                 acp.send_notification(
                     MessageMcpNotification::new(connection.id.clone(), method.to_string())
                         .params(params),
@@ -537,14 +479,7 @@ impl McpManager {
                 Err(Error::internal_error().data("MCP response has neither result nor error"))
             };
         match &result {
-            Ok(result) => self.activity(
-                "server-to-agent",
-                connection,
-                &pending.method,
-                "response",
-                None,
-                Some(result.clone()),
-            ),
+            Ok(_) => self.activity("server-to-agent", connection, &pending.method, "response"),
             Err(error) => {
                 self.activity_error("server-to-agent", connection, &pending.method, error)
             }
@@ -581,41 +516,25 @@ impl McpManager {
     }
 
     fn connection_event(&self, action: &str, connection: &McpConnection) {
-        let _ = self.events.send(
-            json!({
-                "type": "acp/mcp_connection",
-                "action": action,
-                "serverId": connection.provider.server_id,
-                "connectionId": connection.id,
-                "name": connection.provider.name,
-            })
-            .to_string(),
+        tracing::debug!(
+            target: "attyd::mcp",
+            action,
+            server_id = %connection.provider.server_id,
+            connection_id = %connection.id,
+            name = %connection.provider.name,
+            "MCP connection"
         );
     }
 
-    fn activity(
-        &self,
-        direction: &str,
-        connection: &McpConnection,
-        method: &str,
-        kind: &str,
-        params: Option<Value>,
-        result: Option<Value>,
-    ) {
-        let mut event = json!({
-            "type": "acp/mcp_message",
-            "direction": direction,
-            "connectionId": connection.id,
-            "method": method,
-            "kind": kind,
-        });
-        if let Some(params) = params {
-            event["params"] = params;
-        }
-        if let Some(result) = result {
-            event["result"] = result;
-        }
-        let _ = self.events.send(event.to_string());
+    fn activity(&self, direction: &str, connection: &McpConnection, method: &str, kind: &str) {
+        tracing::debug!(
+            target: "attyd::mcp",
+            direction,
+            connection_id = %connection.id,
+            method,
+            kind,
+            "MCP message"
+        );
     }
 
     fn activity_error(
@@ -625,34 +544,19 @@ impl McpManager {
         method: &str,
         error: &Error,
     ) {
-        let mut activity_error = json!({
-            "code": i32::from(error.code),
-            "message": error.message,
-        });
-        if let Some(data) = &error.data {
-            activity_error["data"] = data.clone();
-        }
-        let _ = self.events.send(
-            json!({
-                "type": "acp/mcp_message",
-                "direction": direction,
-                "connectionId": connection.id,
-                "method": method,
-                "kind": "response",
-                "error": activity_error,
-            })
-            .to_string(),
+        tracing::debug!(
+            target: "attyd::mcp",
+            direction,
+            connection_id = %connection.id,
+            method,
+            code = i32::from(error.code),
+            "MCP error response: {}",
+            error.message
         );
     }
 
     fn stderr(&self, connection: &McpConnection, message: &str) {
-        let _ = self.events.send(
-            json!({
-                "type": "bridge/stderr",
-                "chunk": format!("[MCP {}] {message}\n", connection.provider.name),
-            })
-            .to_string(),
-        );
+        tracing::debug!(target: "attyd::mcp", "[MCP {}] {message}", connection.provider.name);
     }
 }
 
@@ -739,8 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn isolates_unknown_connections_and_closes_empty_manager() {
-        let (events, mut receiver) = mpsc::unbounded_channel();
-        let manager = McpManager::new(std::env::temp_dir(), Vec::new(), events);
+        let manager = McpManager::new(std::env::temp_dir(), Vec::new());
         let error = match manager.require("unknown").await {
             Ok(_) => panic!("unknown MCP connection unexpectedly resolved"),
             Err(error) => error,
@@ -753,6 +656,5 @@ mod tests {
                 .is_some_and(|data| data.to_string().contains("unknown MCP connection"))
         );
         manager.close_all().await;
-        assert!(receiver.try_recv().is_err());
     }
 }

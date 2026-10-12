@@ -426,7 +426,7 @@ impl TerminalManager {
             return;
         }
         state.released_published = state.released;
-        let (snapshot, internal_snapshot) = {
+        let snapshot = {
             let (output, append) = if !state.pending_output.is_empty() {
                 (std::mem::take(&mut state.pending_output), true)
             } else if state.output.starts_with(&state.last_published_output) {
@@ -449,22 +449,13 @@ impl TerminalManager {
                 "exitStatus": state.exit_status,
                 "released": state.released,
             });
-
-            let internal_snapshot = snapshot.clone();
-            (snapshot, internal_snapshot)
+            snapshot
         };
-        let _ = self.events.send(
-            json!({
-                "type": "acp/terminal_state",
-                "terminal": snapshot,
-            })
-            .to_string(),
-        );
         if let Some(snapshots) = &self.snapshots
             && snapshots
                 .send(TerminalSnapshot {
                     incarnation: terminal.incarnation,
-                    value: internal_snapshot,
+                    value: snapshot,
                 })
                 .is_err()
         {
@@ -587,14 +578,14 @@ mod tests {
     const FORMER_TERMINALS: usize = 32;
     const FORMER_TERMINAL_COMMAND_LENGTH: usize = 16_384;
 
-    use serde_json::Value;
     use std::time::Duration;
 
-    fn manager(root: &Path) -> (TerminalManager, mpsc::UnboundedReceiver<String>) {
+    fn manager(root: &Path) -> (TerminalManager, mpsc::UnboundedReceiver<TerminalSnapshot>) {
         let filesystem = Arc::new(WorkspaceFileSystem::new(root, false, &[]).unwrap());
-        let (events, receiver) = mpsc::unbounded_channel();
+        let (events, _) = mpsc::unbounded_channel::<String>();
+        let (snapshots, receiver) = mpsc::unbounded_channel();
         (
-            TerminalManager::new_with_snapshots(filesystem, events, None),
+            TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots)),
             receiver,
         )
     }
@@ -683,7 +674,7 @@ mod tests {
     async fn snapshot_backlog_does_not_consume_or_reorder_output() {
         let root = tempfile::tempdir().unwrap();
         let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
-        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (events, _) = mpsc::unbounded_channel::<String>();
         let (snapshots, mut snapshot_rx) = mpsc::unbounded_channel();
         snapshots
             .send(TerminalSnapshot {
@@ -718,31 +709,25 @@ mod tests {
         snapshot_rx.recv().await.unwrap();
         assert_eq!(snapshot_rx.recv().await.unwrap().value["output"], "first");
         assert_eq!(snapshot_rx.recv().await.unwrap().value["output"], "second");
-        let first_public: Value = serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
-        let second_public: Value = serde_json::from_str(&event_rx.recv().await.unwrap()).unwrap();
-        assert_eq!(first_public["terminal"]["output"], "first");
-        assert_eq!(second_public["terminal"]["output"], "second");
         terminal.state.lock().await.released = true;
         terminals.emit_snapshot(&terminal).await;
         assert_eq!(snapshot_rx.recv().await.unwrap().value["released"], true);
-        event_rx.recv().await.unwrap();
         terminal.state.lock().await.exit_status = Some(TerminalExitStatus::new().exit_code(0));
         terminals.emit_snapshot(&terminal).await;
         assert!(
             snapshot_rx.try_recv().is_err(),
             "a late process waiter cannot publish after release"
         );
-        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn terminal_n_bytes_produce_linear_internal_and_public_bytes() {
+    async fn terminal_n_bytes_produce_linear_snapshot_bytes() {
         const CHUNK_COUNT: usize = 8;
         const CHUNK_BYTES: usize = 1_024;
 
         let root = tempfile::tempdir().unwrap();
         let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
-        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (events, _) = mpsc::unbounded_channel::<String>();
         let (snapshots, mut snapshot_rx) = mpsc::unbounded_channel();
         let terminals = TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots));
         let terminal = Arc::new(Terminal {
@@ -767,22 +752,14 @@ mod tests {
             terminals.emit_snapshot(&terminal).await;
         }
 
-        let public_output_bytes = std::iter::from_fn(|| event_rx.try_recv().ok())
-            .map(|event| {
-                serde_json::from_str::<Value>(&event).unwrap()["terminal"]["output"]
-                    .as_str()
-                    .unwrap()
-                    .len()
-            })
-            .sum::<usize>();
         let internal_output_bytes = std::iter::from_fn(|| snapshot_rx.try_recv().ok())
             .map(|snapshot| snapshot.value["output"].as_str().unwrap().len())
             .sum::<usize>();
         let input_bytes = CHUNK_COUNT * CHUNK_BYTES;
 
         assert!(
-            public_output_bytes + internal_output_bytes <= input_bytes * 2,
-            "each output byte may cross each publication channel once; cumulative full snapshots published {public_output_bytes} public bytes and {internal_output_bytes} internal bytes for {input_bytes} input bytes"
+            internal_output_bytes <= input_bytes,
+            "each output byte may cross the snapshot channel once; cumulative full snapshots published {internal_output_bytes} bytes for {input_bytes} input bytes"
         );
     }
 
@@ -825,11 +802,10 @@ mod tests {
         );
 
         let snapshots = std::iter::from_fn(|| events.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+            .map(|snapshot| snapshot.value)
             .collect::<Vec<_>>();
         let mut published_output = String::new();
-        for event in &snapshots {
-            let terminal = &event["terminal"];
+        for terminal in &snapshots {
             if terminal["outputAppend"] == false {
                 published_output.clear();
             }
@@ -839,9 +815,9 @@ mod tests {
         assert!(
             snapshots
                 .iter()
-                .any(|event| event["terminal"]["exitStatus"]["exitCode"] == 0)
+                .any(|terminal| terminal["exitStatus"]["exitCode"] == 0)
         );
-        assert_eq!(snapshots.last().unwrap()["terminal"]["released"], true);
+        assert_eq!(snapshots.last().unwrap()["released"], true);
     }
 
     #[cfg(unix)]

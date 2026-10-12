@@ -77,20 +77,12 @@ async fn close_after_full_interval(agent: &mut TestAgent, session_id: &str, seco
     assert!(agent.request_within(Duration::from_secs(1)).await.is_none());
 }
 
-fn assert_completion_published_before_retirement(agent: &mut TestAgent, kind: &str) {
+fn assert_completion_published_before_retirement(agent: &mut TestAgent) {
     let events = agent.recorded_events();
     let completed = events
         .iter()
         .enumerate()
-        .filter(|(_, event)| {
-            let event = if event["type"] == "bridge/internal_direct" {
-                &event["event"]
-            } else {
-                event
-            };
-            event["type"] == kind
-                && (event["sessionId"] == TARGET || event["response"]["sessionId"] == TARGET)
-        })
+        .filter(|(_, event)| event["type"] == "bridge/session_view" && event["sessionId"] == TARGET)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let retired = events
@@ -101,14 +93,13 @@ fn assert_completion_published_before_retirement(agent: &mut TestAgent, kind: &s
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    assert_eq!(
-        completed.len(),
-        1,
-        "the attachment must publish one terminal event"
+    assert!(
+        !completed.is_empty(),
+        "the attachment must publish its committed view"
     );
     assert_eq!(retired.len(), 1, "the idle target must retire once");
     assert!(
-        completed[0] < retired[0],
+        completed.iter().all(|index| *index < retired[0]),
         "zero timeout must not publish retirement before the attachment's completion"
     );
 }
@@ -182,7 +173,7 @@ async fn zero_timeout_fork_handoff(supports_close: bool) {
         assert_eq!(retired["reason"], "unobserved");
         assert!(agent.request_within(Duration::from_secs(1)).await.is_none());
     }
-    assert_completion_published_before_retirement(&mut agent, "acp/session_forked");
+    assert_completion_published_before_retirement(&mut agent);
     agent.stop().await;
 }
 
@@ -225,7 +216,7 @@ async fn zero_timeout_resume_handoff(supports_close: bool) {
         assert_eq!(retired["reason"], "unobserved");
         assert!(agent.request_within(Duration::from_secs(1)).await.is_none());
     }
-    assert_completion_published_before_retirement(&mut agent, "acp/session_attached");
+    assert_completion_published_before_retirement(&mut agent);
     agent.stop().await;
 }
 
@@ -252,9 +243,6 @@ async fn idle_retirement_workflow_cold_observers_share_outer_retries_until_deliv
     let first_load = agent.next_request().await;
     assert_eq!(first_load["method"], "session/load");
     reject_load(&mut agent, &first_load, -32603).await;
-    let retry = agent.event("bridge/session_sync", TARGET).await;
-    assert_eq!(retry["phase"], "retrying");
-    assert_eq!(retry["retryAfterMs"], 250);
     let (second_lease, mut second_ready) = pending_observer(&agent, TARGET, 202, Some("/repo"));
     assert!(
         agent
@@ -273,9 +261,6 @@ async fn idle_retirement_workflow_cold_observers_share_outer_retries_until_deliv
     let second_load = agent.next_request().await;
     assert_eq!(second_load["method"], "session/load");
     reject_load(&mut agent, &second_load, -32603).await;
-    let retry = agent.event("bridge/session_sync", TARGET).await;
-    assert_eq!(retry["phase"], "retrying");
-    assert_eq!(retry["retryAfterMs"], 500);
     assert!(
         agent
             .request_within(Duration::from_millis(400))

@@ -46,7 +46,9 @@ async fn answer_prompt(agent: &mut TestAgent, request: &Value, session_id: &str,
             {"jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}},
         ]))
         .await;
-    agent.event("acp/prompt_complete", session_id).await;
+    agent
+        .event("bridge/session_turn_complete", session_id)
+        .await;
 }
 
 async fn other_session_and_catalog_progress(backoff: bool) {

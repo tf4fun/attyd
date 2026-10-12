@@ -135,9 +135,9 @@ pub(super) async fn enter_two_second_backoff(
         assert_eq!(load["params"]["sessionId"], TARGET);
         reject_load(agent, &load, -32603).await;
         loop {
-            let event = agent.event("bridge/session_sync", TARGET).await;
-            if event["phase"] == "retrying" {
-                assert_eq!(event["retryAfterMs"], backoff_ms);
+            let event = agent.event("bridge/session_delta", TARGET).await;
+            if event["change"]["kind"] == "sync_state" && event["change"]["phase"] == "retrying" {
+                assert_eq!(event["change"]["retryAfterMs"], backoff_ms);
                 break;
             }
         }

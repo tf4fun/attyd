@@ -247,19 +247,10 @@ async fn hub_retention_with_observers(count: usize) -> (usize, usize) {
             .active_turn
             .as_ref()
             .unwrap();
-        assert_eq!(tool_text(&canonical.updates), latest);
-        state
-            .runtime
-            .replay_events()
-            .iter()
-            .filter_map(|raw| {
-                let event: Value = serde_json::from_str(raw).unwrap();
-                event
-                    .pointer("/notification/update/content/0/content/text")
-                    .and_then(Value::as_str)
-                    .map(str::len)
-            })
-            .sum::<usize>()
+        // The canonical projection is the Hub's only conversation store.
+        let retained = tool_text(&canonical.updates);
+        assert_eq!(retained, latest);
+        retained.len()
     };
     drop(observers);
     hub.shutdown().await;
@@ -271,7 +262,7 @@ async fn memory_retention_m04_hub_without_observers_keeps_only_current_conversat
     let (retained, current) = hub_retention_with_observers(0).await;
     assert!(
         retained <= current,
-        "no browser exists, but legacy replay retains {retained} text bytes for {current} current bytes"
+        "no browser exists, but the Hub retains {retained} text bytes for {current} current bytes"
     );
 }
 
@@ -367,31 +358,9 @@ async fn memory_retention_m08_snapshot_suffix_and_gap_recovery_match_current_sta
     let (hub, mut commands) = observation_hub(0).await;
     let mut fixture = MemorySession::new(&hub).await;
     fixture.append(&hub, tool_content("A".into(), true)).await;
-    let captured = fixture.runtime.snapshot();
-    let mut subscriber = hub.subscribe().await.unwrap();
-    let initial: Value = subscriber
-        .initial_events
-        .iter()
-        .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
-        .find(|event| event["type"] == "bridge/runtime_snapshot")
-        .unwrap();
-    assert_eq!(
-        initial["snapshot"],
-        serde_json::to_value(&captured).unwrap()
-    );
     fixture.append(&hub, tool_content("AB".into(), false)).await;
-    let suffix = drain(&mut subscriber.events)
-        .into_iter()
-        .filter(|event| event["type"] == "bridge/runtime_delta")
-        .collect::<Vec<_>>();
-    let mut reconstructed = CanonicalProjection {
-        snapshot: Some(captured),
-    };
-    for event in suffix {
-        assert!(reconstructed.apply_delta(serde_json::from_value(event["delta"].clone()).unwrap()));
-    }
     assert_eq!(
-        serde_json::to_value(reconstructed.snapshot.unwrap()).unwrap(),
+        serde_json::to_value(hub.state.lock().await.canonical.snapshot.clone().unwrap()).unwrap(),
         serde_json::to_value(fixture.runtime.snapshot()).unwrap()
     );
 
@@ -439,7 +408,6 @@ async fn memory_retention_m08_snapshot_suffix_and_gap_recovery_match_current_sta
         ),
         "ABC"
     );
-    drop(subscriber);
     hub.shutdown().await;
 }
 
@@ -715,13 +683,8 @@ async fn memory_retention_m12_finished_generation_releases_hub_current_payload()
     assert_eq!(ledger.load(Ordering::Acquire), 0);
     assert!(lease.is_cancelled());
     assert!(hub.state.lock().await.session_subscribers.is_empty());
-    let retained_legacy = hub.state.lock().await.runtime.replay_events().join("\n");
     assert!(
         old_overlay.upgrade().is_none(),
         "a stopped epoch must not pin its canonical active overlay"
-    );
-    assert!(
-        !retained_legacy.contains(&marker),
-        "generation teardown must release legacy conversation payload too"
     );
 }

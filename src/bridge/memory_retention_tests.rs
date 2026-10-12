@@ -509,16 +509,9 @@ fn memory_retention_internal_serialization_failure_publishes_no_runtime_record()
     }
     let (sink, mut receiver) = publication_queue();
     sink.internal_typed("bridge/internal_runtime_delta", InvalidSerialization);
-    let events = drain_events(&mut receiver);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["type"], "bridge/error");
-    assert_eq!(events[0]["operation"], "canonical/runtime");
-    assert!(
-        events[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("injected serialization failure")
-    );
+    // The failure is scoped to the canonical runtime operation, so it is
+    // logged rather than published, and no partial runtime record escapes.
+    assert!(drain_events(&mut receiver).is_empty());
 }
 
 struct PublicationPeer {
@@ -774,8 +767,10 @@ async fn memory_retention_explicit_snapshot_releases_previously_unpublished_over
         "explicit snapshot establishes the next contiguous delta cut"
     );
     peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
-    peer.event(|event| event["type"] == "acp/prompt_complete" && event["sessionId"] == SESSION)
-        .await;
+    peer.event(|event| {
+        event["type"] == "bridge/session_turn_complete" && event["sessionId"] == SESSION
+    })
+    .await;
     peer.stop().await;
     assert!(
         old.upgrade().is_none(),

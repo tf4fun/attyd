@@ -350,9 +350,6 @@ async fn cancel_permission(
             flush_runtime(&mut state, &context.sink);
             context.sink.send(delta);
         }
-        context
-            .sink
-            .send(json!({ "type": "acp/permission_resolved", "permissionId": permission_id }));
         drop(state);
         drop(pending);
     }
@@ -432,7 +429,6 @@ async fn permission(
             )?;
             flush_runtime(&mut state, &context.sink);
             context.sink.send(delta);
-            context.sink.send(json!({ "type": "acp/permission_request", "permissionId": permission_id, "request": request }));
             true
         }
     };
@@ -494,7 +490,6 @@ async fn cancel_elicitation(
                 context.sink.send(delta);
             }
         }
-        context.sink.send(json!({ "type": "acp/elicitation_resolved", "elicitationId": elicitation_id, "response": CreateElicitationResponse::new(ElicitationAction::Cancel) }));
         drop(state);
         drop(pending);
     }
@@ -579,7 +574,6 @@ async fn elicitation(
             if let Some(delta) = delta {
                 context.sink.send(delta);
             }
-            context.sink.send(json!({ "type": "acp/elicitation_request", "elicitationId": elicitation_id, "request": request }));
             (true, owner)
         }
     };
@@ -645,9 +639,6 @@ async fn complete_elicitation(
     }
     state.sessions.take_url_route(&elicitation_id, registration);
     flush_runtime(&mut state, &context.sink);
-    context
-        .sink
-        .send(json!({ "type": "acp/elicitation_complete", "notification": notification }));
     Ok(())
 }
 
@@ -890,7 +881,7 @@ mod tests {
         (
             AgentContext {
                 state,
-                mcp: McpManager::new(PathBuf::from("/tmp"), Vec::new(), sink.tx.clone()),
+                mcp: McpManager::new(PathBuf::from("/tmp"), Vec::new()),
                 sink,
                 terminals: None,
                 filesystem: None,
@@ -1038,19 +1029,13 @@ mod tests {
             if let Some(receiver) = elicitation {
                 assert!(receiver.await.is_err());
             }
-            let resolved = if kind == InboundRequestKind::Permission {
-                "acp/permission_resolved"
-            } else {
-                "acp/elicitation_resolved"
-            };
-            let mut resolution_count = 0;
-            while let Ok(event) = events.try_recv() {
-                let value: Value = serde_json::from_str(&event).unwrap();
-                if value["type"] == resolved {
-                    resolution_count += 1;
-                }
+            {
+                let state = context.state.lock().await;
+                assert!(!state.sessions.permission_owners.contains_key("old"));
+                assert!(!state.sessions.elicitation_owners.contains_key("old"));
+                assert!(!state.request_elicitations.contains_key("old"));
             }
-            assert_eq!(resolution_count, 1);
+            while events.try_recv().is_ok() {}
             drop(lease);
             assert!(inbound.finish(&id, "old"));
             route.dispatch_owner.attempt_id = Some("new".to_owned());

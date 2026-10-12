@@ -290,14 +290,6 @@ pub(crate) enum TerminalUpsert {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeEffect {
-    ResourcesCancelled {
-        session_id: String,
-        incarnation: u64,
-        permission_ids: Vec<String>,
-        elicitation_ids: Vec<String>,
-        url_ids: Vec<(String, String)>,
-        reason: String,
-    },
     CancelPermissionResponder {
         session_id: String,
         incarnation: u64,
