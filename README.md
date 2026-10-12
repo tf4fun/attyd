@@ -1,13 +1,34 @@
 # attyd
 
-**Your ACP agent, in the browser.**
+**Use Claude Code, Codex, Gemini CLI, or Goose from any browser, including your phone.**
 
-attyd is a lightweight web client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
-Connect a local or remote coding agent and follow conversations, tool activity, and file changes
-from desktop or mobile. Its focus is a simple Web ACP client, not a Web IDE: the agent handles
-the coding; attyd gives you a clear place to interact with it.
+attyd puts a web interface in front of the coding agent you already use. You can follow its replies,
+tool calls, and file diffs as they happen, approve permission requests, and queue the next message.
+It runs as one self-contained executable: no editor, no account, no cloud service.
 
-![An attyd demo session showing tool activity and file changes](docs/assets/session.png)
+![An attyd session showing tool activity and file changes](docs/assets/session.png)
+
+## Quick start
+
+Download the archive for your platform from [GitHub Releases](https://github.com/tf4fun/attyd/releases),
+extract it, then start attyd with your agent:
+
+```bash
+./attyd -- npx -y @agentclientprotocol/claude-agent-acp   # Claude Code
+./attyd -- npx -y @agentclientprotocol/codex-acp          # Codex
+./attyd -- gemini --acp                                   # Gemini CLI
+./attyd -- goose acp                                      # Goose
+```
+
+Open **http://127.0.0.1:7331**, choose **New project**, and enter a working directory.
+Sign-in and model selection stay with your agent, so set it up the way you normally would first.
+attyd listens only on localhost. To use it from your phone or another machine, put it behind
+access control first; see [deployment guidance](docs/usage.md#deployment-and-trust-boundaries).
+
+attyd works with any agent that speaks the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/),
+the open standard Zed and JetBrains use to connect editors to coding agents.
+Agents not listed above are supported too. Pass whatever command starts the agent in ACP mode.
+attyd aims to be a clear place to talk to your agent, not a Web IDE.
 
 ## In the workspace
 
@@ -16,22 +37,23 @@ the coding; attyd gives you a clear place to interact with it.
 - **Permissions and follow-ups.** Respond to approval requests, answer questions, ask the agent to stop, or queue your next message.
 - **Context and search.** Attach files and images, mention workspace files with `@`, search a conversation, and export it as Markdown.
 
-Models and sign-in stay with your agent. Features such as attachments and saved sessions
-depend on its [ACP capabilities](docs/acp-coverage.md).
+Features such as attachments and saved sessions depend on your agent's [ACP capabilities](docs/acp-coverage.md).
 The interface supports English and 简体中文, follows your browser by default, and lets you
 switch languages in Interface settings, alongside light, dark, and system themes.
 [Contribute another language](docs/i18n.md).
 
-## Get started
+## More ways to run
 
-Install and configure an ACP-compatible agent, then choose **one** launch method below.
-Replace `your-agent acp` with its actual command and arguments. For an existing remote service,
-see [remote agent connections](docs/usage.md#remote-agents).
+### Release executable
 
-After starting attyd, open **http://127.0.0.1:7331**. Choose **New project** and enter a working
-directory to start a conversation, or open an existing project to browse its sessions.
+The executable includes the web interface and needs neither Rust nor Node.js at runtime;
+your agent may have its own dependencies. On Windows, use `.\attyd.exe` in place of `./attyd`.
+To reach an agent that already runs as a remote service, see
+[remote agent connections](docs/usage.md#remote-agents). See also
+[release binaries](docs/usage.md#release-binaries) and
+[build your own executable](docs/usage.md#standalone-build).
 
-### Run from source
+### From source
 
 Building attyd requires both the Rust and Node.js toolchains:
 
@@ -43,41 +65,12 @@ Building attyd requires both the Rust and Node.js toolchains:
 git clone https://github.com/tf4fun/attyd.git
 cd attyd
 npm ci
-npm run dev -- -- your-agent acp
+npm run dev -- -- gemini --acp   # or any agent command from Quick start
 ```
 
 The first run compiles the Rust host and starts Vite for the web interface.
 Frontend edits update immediately; restart the command after Rust changes.
 See [local development](docs/usage.md#local-development) for separate processes and custom ports.
-
-### Run a compiled executable
-
-Download an archive for your platform from [GitHub Releases](https://github.com/tf4fun/attyd/releases),
-extract it, and run:
-
-```bash
-./attyd -- your-agent acp
-```
-
-On Windows, use `.\attyd.exe` in place of `./attyd`.
-The executable includes the web interface and needs neither Rust nor Node.js at runtime.
-Your agent may have its own dependencies. See [release binaries](docs/usage.md#release-binaries)
-or [build your own executable](docs/usage.md#standalone-build).
-
-### Example: Goose
-
-[Install the Goose CLI](https://goose-docs.ai/docs/getting-started/installation/), then configure
-its model provider and launch it through attyd:
-
-```bash
-goose configure
-./attyd -- goose acp
-```
-
-From a source checkout, use `npm run dev -- -- goose acp` instead of the second command.
-Goose is an optional backend; any compatible ACP agent can be used.
-See [Goose's ACP guide](https://goose-docs.ai/docs/gdk/acp/) and the
-[remote Goose example](docs/usage.md#optional-example-goose) for other connection options.
 
 ## History and access
 
