@@ -46,7 +46,7 @@ impl MemorySession {
             unreachable!("first prompt is a fresh admission")
         };
         let published_seq = runtime.seq();
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type":"bridge/internal_runtime_snapshot", "value":runtime.snapshot(),
@@ -54,10 +54,10 @@ impl MemorySession {
             .to_string(),
         )
         .await;
-        hub.publish(1, json!({
+        hub.publish_json(1, json!({
             "type":"acp/session_created", "cwd":"/workspace", "response":{"sessionId":"session"},
         }).to_string()).await;
-        hub.publish(1, json!({
+        hub.publish_json(1, json!({
             "type":"acp/prompt_started", "sessionId":"session", "requestId":"prompt", "prompt":prompt,
         }).to_string()).await;
         Self {
@@ -101,13 +101,13 @@ impl MemorySession {
             .unwrap();
         for delta in self.runtime.deltas_after(self.published_seq).unwrap() {
             self.published_seq = delta.seq;
-            hub.publish(
+            hub.publish_json(
                 1,
                 json!({"type":"bridge/internal_runtime_delta", "value":delta}).to_string(),
             )
             .await;
         }
-        hub.publish(
+        hub.publish_json(
             1,
             json!({"type":"acp/session_update", "notification":{
                 "sessionId":"session", "update":update,
@@ -120,7 +120,7 @@ impl MemorySession {
             "sessionIncarnation":self.incarnation, "fromRevision":from, "viewRevision":self.revision(),
             "change":{"kind":"turn_update", "operationId":self.operation, "update":update},
         });
-        hub.publish(1, delta.to_string()).await;
+        hub.publish_json(1, delta.to_string()).await;
         delta
     }
 }
@@ -152,7 +152,7 @@ async fn observe(
     let mut ready: Value = serde_json::from_str(&observer_ready(observer_id, revision)).unwrap();
     ready["reset"]["sessionIncarnation"] = json!(incarnation);
     ready["reset"]["phase"] = json!("running");
-    hub.publish(1, ready.to_string()).await;
+    hub.publish_json(1, ready.to_string()).await;
     reply.send(Ok(())).unwrap();
     let (mut subscription, guard) = pending.await.unwrap();
     let reset: Value =
@@ -366,7 +366,7 @@ async fn memory_retention_m08_snapshot_suffix_and_gap_recovery_match_current_sta
 
     let current_seq = fixture.runtime.seq();
     for seq in [current_seq + 2, current_seq + 3] {
-        hub.publish(
+        hub.publish_json(
             1,
             json!({"type":"bridge/internal_runtime_delta", "value":RuntimeDelta {
                 epoch:"epoch".into(), seq, scope_revision:None,
@@ -385,7 +385,7 @@ async fn memory_retention_m08_snapshot_suffix_and_gap_recovery_match_current_sta
         "one gap must share one snapshot recovery"
     );
     let recovery_cut = fixture.runtime.snapshot();
-    hub.publish(
+    hub.publish_json(
         1,
         json!({"type":"bridge/internal_runtime_snapshot", "value":recovery_cut}).to_string(),
     )
@@ -447,7 +447,7 @@ async fn memory_retention_m08_stale_sse_cursor_gets_current_reset_and_contiguous
             fixture.incarnation
         ))
     );
-    hub.publish(1, observer_ready(observer_id, cut)).await;
+    hub.publish_json(1, observer_ready(observer_id, cut)).await;
     reply.send(Ok(())).unwrap();
     let mut body = handshake.await.into_body().into_data_stream();
     let first = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
@@ -520,7 +520,7 @@ async fn memory_retention_m09_reset_preserves_unreconstructible_failure_and_retr
             .unwrap()
             .is_empty()
     );
-    hub.publish(
+    hub.publish_json(
         1,
         json!({"type":"bridge/internal_runtime_snapshot", "value":fixture.runtime.snapshot()})
             .to_string(),
@@ -532,7 +532,7 @@ async fn memory_retention_m09_reset_preserves_unreconstructible_failure_and_retr
         "operationId":fixture.operation, "clientIntentId":"prompt", "phase":"ready",
         "prompt":prompt, "error":error,
     });
-    hub.publish(1, failed.to_string()).await;
+    hub.publish_json(1, failed.to_string()).await;
     // A reset at a newer revision cannot reconstruct this RPC error from
     // turnOutcomes. It must not subsume the reliable failure notification.
     fixture
@@ -553,7 +553,7 @@ async fn memory_retention_m09_reset_preserves_unreconstructible_failure_and_retr
             .unwrap()
             .is_empty()
     );
-    hub.publish(
+    hub.publish_json(
         1,
         json!({"type":"bridge/session_view", "sessionId":"session", "view":view}).to_string(),
     )
@@ -592,7 +592,7 @@ async fn memory_retention_m11_retired_marker_survives_compaction_and_owner_end()
             )
             .await;
     }
-    hub.publish(
+    hub.publish_json(
         1,
         json!({"type":"bridge/session_view", "sessionId":"session", "view":fixture.view()})
             .to_string(),
@@ -600,8 +600,8 @@ async fn memory_retention_m11_retired_marker_survives_compaction_and_owner_end()
     .await;
     let retired = json!({"type":"bridge/session_retired", "bridgeEpoch":"epoch", "sessionId":"session",
         "sessionIncarnation":fixture.incarnation, "reason":"closed"});
-    hub.publish(1, retired.to_string()).await;
-    hub.publish(
+    hub.publish_json(1, retired.to_string()).await;
+    hub.publish_json(
         1,
         json!({"type":"bridge/internal_observer_end", "observerId":observer.subscription.id,
         "bridgeEpoch":"epoch", "sessionId":"session", "sessionIncarnation":fixture.incarnation})

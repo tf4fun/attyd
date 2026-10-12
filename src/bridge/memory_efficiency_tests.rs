@@ -116,7 +116,7 @@ fn queue() -> (EventSink, EventReceiver) {
 fn drain(receiver: &mut EventReceiver) -> Vec<String> {
     std::iter::from_fn(|| receiver.try_recv().ok())
         .map(|event| {
-            let (raw, _lease) = event.into_parts();
+            let (raw, _lease) = event.into_json_parts();
             raw
         })
         .collect()

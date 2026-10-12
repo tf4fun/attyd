@@ -192,7 +192,8 @@ async fn session_sse_handshake_and_stream_outlive_the_json_deadline() {
     tokio::time::advance(Duration::from_secs(61)).await;
     assert!(futures::poll!(pending.as_mut()).is_pending());
     assert!(!lease.is_cancelled());
-    hub.publish(1, tests::observer_ready(observer_id, 10)).await;
+    hub.publish_json(1, tests::observer_ready(observer_id, 10))
+        .await;
     reply.send(Ok(())).unwrap();
     let response = pending.await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);

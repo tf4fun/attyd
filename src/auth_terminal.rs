@@ -269,7 +269,7 @@ impl AuthTerminalManager {
     }
 
     fn send(&self, event: serde_json::Value) {
-        let _ = self.events.send(event.to_string());
+        let _ = self.events.send_value(event);
     }
 }
 

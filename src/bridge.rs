@@ -19,6 +19,7 @@ use uuid::Uuid;
 use self::scheduling::{ExecutionTurn, IngressSender};
 use crate::agent_process::StdioAcpAgent;
 use crate::auth_terminal::{AuthTerminalManager, validate_method as validate_terminal_auth_method};
+use crate::bridge_event::BridgeEvent;
 use crate::elicitation_validation::{
     validate_elicitation_request, validate_elicitation_response_value,
 };
@@ -74,8 +75,7 @@ struct EventSink {
 
 impl EventSink {
     fn send(&self, event: Value) {
-        let serialized = event.to_string();
-        let _ = self.tx.send(serialized);
+        let _ = self.tx.send_value(event);
     }
 
     fn typed(&self, kind: &str, value: impl Serialize) {
@@ -89,27 +89,9 @@ impl EventSink {
         }
     }
 
-    fn internal_typed(&self, kind: &str, value: impl Serialize) -> bool {
-        match serde_json::to_value(value) {
-            Ok(value) => self
-                .tx
-                .send(
-                    json!({
-                        "type": kind,
-                        "value": value,
-                    })
-                    .to_string(),
-                )
-                .is_ok(),
-            Err(error) => {
-                self.error(
-                    format!("failed to serialize canonical runtime state: {error}"),
-                    None,
-                    Some("canonical/runtime"),
-                );
-                false
-            }
-        }
+    /// Hand canonical runtime state to the Hub without serializing it.
+    fn runtime(&self, event: BridgeEvent) -> bool {
+        self.tx.send_event(event).is_ok()
     }
 
     fn error(&self, message: impl Into<String>, request_id: Option<&str>, operation: Option<&str>) {
@@ -1094,7 +1076,7 @@ fn flush_runtime(state: &mut BridgeState, sink: &EventSink) {
         Some(deltas) => {
             for delta in deltas {
                 let seq = delta.seq;
-                if !sink.internal_typed("bridge/internal_runtime_delta", delta) {
+                if !sink.runtime(BridgeEvent::RuntimeDelta(Box::new(delta))) {
                     break;
                 }
                 state.published_runtime_seq = seq;
@@ -1103,7 +1085,7 @@ fn flush_runtime(state: &mut BridgeState, sink: &EventSink) {
         None => {
             let snapshot = state.sessions.snapshot();
             let through = snapshot.through_seq;
-            if sink.internal_typed("bridge/internal_runtime_snapshot", snapshot) {
+            if sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(snapshot))) {
                 state.published_runtime_seq = through;
             }
         }
@@ -2234,10 +2216,9 @@ where
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
     }
-    sink.internal_typed(
-        "bridge/internal_runtime_snapshot",
+    sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(
         state.lock().await.sessions.snapshot(),
-    );
+    )));
     let filesystem = (options.transport == Transport::Stdio)
         .then(|| {
             WorkspaceFileSystem::new(
@@ -2384,7 +2365,7 @@ where
                         let mut state = state.lock().await;
                         let snapshot = state.sessions.snapshot();
                         let through = snapshot.through_seq;
-                        if sink.internal_typed("bridge/internal_runtime_snapshot", snapshot) {
+                        if sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(snapshot))) {
                             state.published_runtime_seq = through;
                             state.sessions.release_published_runtime(through);
                         }
