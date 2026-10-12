@@ -28,9 +28,13 @@ Red 用例使用正常的正确行为断言，不使用 `ignore`、`should_panic
 | 测试入口 | 验证对象 | 关键证据 |
 | --- | --- | --- |
 | [Bridge publication](../src/bridge/memory_retention_tests.rs) | 真实 `flush_runtime` 与协调器 snapshot 路径 | 旧 overlay 的 Weak 释放、成功发布的连续水位、未交付后缀 |
-| [Legacy projection](../src/runtime_cache/memory_retention_tests.rs) | 真实 `update_and_normalize`，生产 fold 对照 | 原始正文保留字节、完整工具内容、当前交互与终端资源 |
 | [Hub/SSE](../src/server/memory_retention_tests.rs) | 真实 `BridgeHub::publish`、订阅与事件流 | 慢队列替换、共享 payload 引用、reset/owner/revision 边界 |
 | [Browser](../tests/runtime-memory-retention.test.tsx) | 真实 `useAcp` hook，受控 REST/SSE 次序 | 刷新合并、完整状态重建、迟到失败、重试内容、旧 owner 隔离 |
+
+旧的 Legacy projection 层（`ActiveRuntimeProjection`）已在
+[#1](https://github.com/tf4fun/attyd/issues/1) 中删除：它只服务已移除的浏览器聚合事件流，
+生产环境中没有消费者。原先由它承担的 M02/M03/M10/M12 Legacy 用例随之移除；
+“没有第二份原始 conversation 归档”现在由结构保证，当前交互与终端资源只存在于 canonical 运行时状态中。
 
 单测统计可达引用与逻辑 payload/队列字节，不对进程 RSS 作精确断言。
 完整内容、实体身份与终态必须同时正确，避免通过截断正文、停止 turn 或删除资源令内存断言通过。
@@ -40,17 +44,17 @@ Red 用例使用正常的正确行为断言，不使用 `ignore`、`should_panic
 | 门槛 | 可执行覆盖 | 验收要求 |
 | --- | --- | --- |
 | M01 | Bridge `delta_transfer_releases_old_overlay_before_queue_consumption` | 入队后 journal 原引用释放；队列仍持有完整交付，当前 overlay 存活 |
-| M02 | Legacy `m02_growing_tool_replacements…`、`m02_message_chunks…`，以及更新后的大 burst 测试 | 工具替换只保留当前内容；消息追加逐字完整；没有第二份原始 conversation 归档 |
-| M03 | Bridge `fixed_final_output…`、Legacy `m03_fixed_final_tool…` | 最终正文与实体数量相同，增加中间更新不能增加稳态保留 |
+| M02 | 更新后的大 burst 测试；Hub 不再持有第二份原始事件归档 | 工具替换只保留当前内容；消息追加逐字完整；没有第二份原始 conversation 归档 |
+| M03 | Bridge `fixed_final_output…` | 最终正文与实体数量相同，增加中间更新不能增加稳态保留 |
 | M04 | Hub `m04_hub_without_observers…`、`m04_hub_one_healthy_observer…`、`m04_hub_multiple_observers…` | 无观察者也不保留旧版本；及时消费后的旧正文不随观察者数积累 |
 | M05 | Bridge delta transfer、fallback snapshot、explicit snapshot、`later_changes_remain…` | 所有发布路径释放正确前缀，seq 单调，后续未发布 suffix 保持连续 |
 | M06 | Bridge failed fallback、closed queue、mid-batch failure、serialization failure | 失败不能虚报成功水位；中途失败只认可连续成功前缀 |
 | M07 | Hub `m07_slow_observer…`、更新后的 slow session 测试；Browser reset burst | 慢端过时 payload 被最新 reset 替换，lease 和健康端保持；GET 请求合并 |
 | M08 | Hub snapshot/suffix/gap 与 stale SSE cursor；Browser folded tool/suffix 与旧 GET 响应 | 恢复等价、owner fencing、序号缺口触发正确恢复；迟到响应不覆盖新状态 |
 | M09 | Hub `m09_reset_preserves_unreconstructible_failure…`；Browser 失败前后两种次序、跨 turn 迟到失败、完成/cancelled 快照 | 失败与 retry prompt 不丢，旧失败不结束新 turn；终态不重复、不自动重发 prompt |
-| M10 | Legacy 当前交互、重复 resolution、UTF-8 终端追加/退出/释放、旧 operation 响应 | 迁移正文缓存时仍保留正确当前资源；cache 层只验证资源表示和索引，不冒充 responder 所有权测试 |
+| M10 | canonical 运行时状态中的当前交互、终端与 operation（`runtime_state`、Bridge 测试） | 当前资源只在 canonical 状态中表示，生命周期与 owner 校验不变 |
 | M11 | Hub retirement + owner end；Browser 旧 epoch/旧 incarnation 失败事件；原有 owner fencing 回归 | 退休终态不被 reset 吞掉，旧 owner 事件不能改变新 owner |
-| M12 | Bridge epoch teardown 与真实连接退出、Legacy 完成/失败/cancelled response/close-delete-retire、Hub 退订/结束 generation | 各层旧 payload 和资源引用在各自生命周期终点释放，不影响其他观察者 |
+| M12 | Bridge epoch teardown 与真实连接退出、Hub 退订/结束 generation | 各层旧 payload 和资源引用在各自生命周期终点释放，不影响其他观察者 |
 
 表中省略的名称可在相应测试入口中按 `memory_retention` 搜索。以下已有保护继续作为完整准入：
 

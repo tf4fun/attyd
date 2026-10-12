@@ -31,7 +31,6 @@ use crate::bridge;
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
-use crate::runtime_cache::ActiveRuntimeProjection;
 #[cfg(test)]
 use crate::runtime_state::fold_active_turn_update;
 use crate::runtime_state::{
@@ -322,11 +321,6 @@ impl BridgeBootstrap {
         }
     }
 
-    #[cfg(test)]
-    fn hello_event(&self) -> Option<&String> {
-        self.hello.as_ref()
-    }
-
     fn events_after_runtime(&self) -> impl Iterator<Item = &String> {
         self.initialized
             .iter()
@@ -357,19 +351,6 @@ fn terminal_auth_succeeded(event: &str) -> bool {
         })
 }
 
-fn opened_runtime_session_id(event: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
-    match value.get("type").and_then(serde_json::Value::as_str)? {
-        "acp/session_created" | "acp/session_forked" => value
-            .get("response")?
-            .get("sessionId")?
-            .as_str()
-            .map(str::to_string),
-        "acp/session_attached" => value.get("sessionId")?.as_str().map(str::to_string),
-        _ => None,
-    }
-}
-
 fn is_internal_direct_event(event: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(event)
         .ok()
@@ -392,25 +373,17 @@ fn is_internal_runtime_event(event: &str) -> bool {
         })
 }
 
-fn directed_bridge_event(event: &str) -> Option<(u64, String)> {
-    let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("bridge/internal_direct") {
-        return None;
-    }
-    let subscriber_id = value.get("subscriberId")?.as_u64()?;
-    let event = value.get("event")?;
-    Some((subscriber_id, event.to_string()))
-}
-
 #[derive(Default)]
 struct CanonicalProjection {
     snapshot: Option<RuntimeSnapshot>,
 }
 
 impl CanonicalProjection {
-    fn update_with_public_event(&mut self, event: &str) -> (bool, Option<String>) {
+    /// Fold an internal runtime event into the canonical projection and
+    /// report whether it was a runtime event at all.
+    fn update(&mut self, event: &str) -> bool {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(event) else {
-            return (false, None);
+            return false;
         };
         match value.get("type").and_then(serde_json::Value::as_str) {
             Some("bridge/internal_runtime_snapshot") => {
@@ -421,17 +394,8 @@ impl CanonicalProjection {
                 if let Some(snapshot) = snapshot.as_mut() {
                     retire_released_terminals(snapshot);
                 }
-                self.snapshot = snapshot.clone();
-                (
-                    true,
-                    snapshot.map(|snapshot| {
-                        json!({
-                            "type": "bridge/runtime_snapshot",
-                            "snapshot": snapshot,
-                        })
-                        .to_string()
-                    }),
-                )
+                self.snapshot = snapshot;
+                true
             }
             Some("bridge/internal_runtime_delta") => {
                 let delta = value
@@ -440,25 +404,18 @@ impl CanonicalProjection {
                     .and_then(|value| serde_json::from_value::<RuntimeDelta>(value).ok());
                 let Some(delta) = delta else {
                     self.snapshot = None;
-                    return (true, None);
+                    return true;
                 };
-                if !self.apply_delta(delta.clone()) {
+                if !self.apply_delta(delta) {
                     self.snapshot = None;
-                    return (true, None);
+                    return true;
                 }
-                let public_event = Some(
-                    json!({
-                        "type": "bridge/runtime_delta",
-                        "delta": delta,
-                    })
-                    .to_string(),
-                );
                 if let Some(snapshot) = self.snapshot.as_mut() {
                     retire_released_terminals(snapshot);
                 }
-                (true, public_event)
+                true
             }
-            _ => (false, None),
+            _ => false,
         }
     }
 
@@ -631,11 +588,9 @@ struct BridgeHubState {
     generation: u64,
     input: Option<mpsc::UnboundedSender<bridge::BridgeInput>>,
     cancellation: Option<CancellationToken>,
-    subscribers: HashMap<u64, SubscriberSender>,
     global_subscribers: HashMap<u64, SubscriberSender>,
     session_subscribers: HashMap<u64, SessionSubscriber>,
     bootstrap: BridgeBootstrap,
-    runtime: ActiveRuntimeProjection,
     canonical: CanonicalProjection,
     canonical_resync_pending: bool,
     shutting_down: bool,
@@ -943,19 +898,6 @@ impl SubscriberSender {
     }
 }
 
-fn publish_shared_event(state: &mut BridgeHubState, event: Arc<str>) {
-    let mut failed = Vec::new();
-    for (&subscriber_id, subscriber) in &state.subscribers {
-        if subscriber.try_send(event.clone()).is_err() {
-            failed.push(subscriber_id);
-        }
-    }
-    for subscriber_id in failed {
-        state.subscribers.remove(&subscriber_id);
-    }
-    publish_to_session_subscribers(state, event);
-}
-
 fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
     let Some((event_session_id, event, event_owner, position)) =
         business_session_event_routed(&event)
@@ -1149,7 +1091,6 @@ impl BridgeHub {
             } else {
                 state.generation = state.generation.wrapping_add(1).max(1);
                 state.bootstrap = BridgeBootstrap::default();
-                state.runtime = ActiveRuntimeProjection::default();
                 state.canonical = CanonicalProjection::default();
                 state.canonical_resync_pending = false;
                 let (input_tx, input) = mpsc::unbounded_channel();
@@ -1169,44 +1110,6 @@ impl BridgeHub {
         if let Some(runtime) = runtime {
             self.spawn_runtime(runtime);
         }
-    }
-
-    // Aggregate stream retained for test observation; business SSE uses
-    // subscriptions that only receive their own scope.
-    #[cfg(test)]
-    async fn subscribe(self: &Arc<Self>) -> Option<BridgeSubscription> {
-        self.ensure_runtime().await;
-        let id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
-        let (event_tx, event_rx) = SubscriberSender::channel();
-        let (generation, initial_events) = {
-            let mut state = self.state.lock().await;
-            if state.shutting_down || state.input.is_none() {
-                return None;
-            }
-            let mut initial_events = Vec::new();
-            if let Some(event) = state.bootstrap.hello_event() {
-                initial_events.push(event.clone());
-            }
-            if let Some(snapshot) = &state.canonical.snapshot {
-                initial_events.push(
-                    json!({
-                        "type": "bridge/runtime_snapshot",
-                        "snapshot": snapshot,
-                    })
-                    .to_string(),
-                );
-            }
-            initial_events.extend(state.runtime.replay_events());
-            initial_events.extend(state.bootstrap.events_after_runtime().cloned());
-            state.subscribers.insert(id, event_tx);
-            (state.generation, initial_events)
-        };
-        Some(BridgeSubscription {
-            id,
-            generation,
-            initial_events,
-            events: event_rx,
-        })
     }
 
     async fn subscribe_global(self: &Arc<Self>) -> Option<BridgeSubscription> {
@@ -1526,13 +1429,9 @@ impl BridgeHub {
                 if state.generation != generation || state.input.is_none() {
                     return;
                 }
-                let (recognized, public_event) = state.canonical.update_with_public_event(&event);
+                let recognized = state.canonical.update(&event);
                 if state.canonical.snapshot.is_some() {
                     state.canonical_resync_pending = false;
-                }
-                if let Some(public_event) = public_event {
-                    let public_event: Arc<str> = public_event.into();
-                    publish_shared_event(&mut state, public_event);
                 }
                 if recognized
                     && state.canonical.snapshot.is_none()
@@ -1550,17 +1449,8 @@ impl BridgeHub {
             return;
         }
         if is_internal_direct_event(&event) {
-            if let Some((subscriber_id, event)) = directed_bridge_event(&event) {
-                {
-                    let mut state = self.state.lock().await;
-                    if state.generation != generation || state.input.is_none() {
-                        return;
-                    }
-                    state.runtime.update(&event);
-                }
-                self.send_to_subscriber(subscriber_id, generation, event)
-                    .await;
-            }
+            // Directed events targeted the removed aggregate stream; no
+            // business subscriber can receive them.
             return;
         }
         let restart = terminal_auth_succeeded(&event);
@@ -1570,32 +1460,8 @@ impl BridgeHub {
                 return;
             }
             state.bootstrap.update(&event);
-            let event = state.runtime.update_and_normalize(&event);
-            let session_live_suffix = opened_runtime_session_id(&event)
-                .map(|session_id| state.runtime.replay_session_live_suffix(&session_id))
-                .unwrap_or_default()
-                .into_iter()
-                .map(Arc::<str>::from)
-                .collect::<Vec<_>>();
-            let event: Arc<str> = event.into();
-            let mut failed_subscribers = Vec::new();
-            for (&subscriber_id, subscriber) in &state.subscribers {
-                let mut delivered = subscriber.try_send(event.clone()).is_ok();
-                for live_event in &session_live_suffix {
-                    delivered &= subscriber.try_send(live_event.clone()).is_ok();
-                }
-                if !delivered {
-                    failed_subscribers.push(subscriber_id);
-                }
-            }
-            for subscriber_id in failed_subscribers {
-                state.subscribers.remove(&subscriber_id);
-            }
             publish_to_global_subscribers(&mut state, &event);
-            publish_to_session_subscribers(&mut state, event);
-            for live_event in session_live_suffix {
-                publish_to_session_subscribers(&mut state, live_event);
-            }
+            publish_to_session_subscribers(&mut state, event.into());
             restart.then(|| state.cancellation.clone()).flatten()
         };
         if let Some(cancellation) = restart_input {
@@ -1604,7 +1470,7 @@ impl BridgeHub {
     }
 
     async fn finish_generation(&self, generation: u64) {
-        let (subscribers, global_subscribers, session_subscribers) = {
+        let (global_subscribers, session_subscribers) = {
             let mut state = self.state.lock().await;
             if state.generation != generation {
                 return;
@@ -1616,15 +1482,12 @@ impl BridgeHub {
             // bootstrap marker stays: it records the last lifecycle phase, not
             // retained payload.
             state.canonical = CanonicalProjection::default();
-            state.runtime = ActiveRuntimeProjection::default();
             state.canonical_resync_pending = false;
             (
-                std::mem::take(&mut state.subscribers),
                 std::mem::take(&mut state.global_subscribers),
                 std::mem::take(&mut state.session_subscribers),
             )
         };
-        drop(subscribers);
         drop(global_subscribers);
         drop(session_subscribers);
         self.stopped.notify_waiters();
@@ -1745,20 +1608,9 @@ impl BridgeHub {
         })
     }
 
-    async fn send_to_subscriber(&self, subscriber_id: u64, generation: u64, event: String) {
-        let mut state = self.state.lock().await;
-        if state.generation == generation
-            && let Some(sender) = state.subscribers.get(&subscriber_id)
-            && sender.try_send(Arc::<str>::from(event)).is_err()
-        {
-            state.subscribers.remove(&subscriber_id);
-        }
-    }
-
     async fn unsubscribe(&self, subscriber_id: u64, generation: u64) {
         let mut state = self.state.lock().await;
         if state.generation == generation {
-            state.subscribers.remove(&subscriber_id);
             state.global_subscribers.remove(&subscriber_id);
             state.session_subscribers.remove(&subscriber_id);
         }
@@ -1770,7 +1622,6 @@ impl BridgeHub {
             state.shutting_down = true;
             // Event streams must finish before HTTP graceful draining can
             // complete, including when no Agent runtime is currently active.
-            state.subscribers.clear();
             state.global_subscribers.clear();
             state.session_subscribers.clear();
             state.cancellation.clone()
@@ -3292,15 +3143,33 @@ mod tests {
         }
     }
 
-    impl CanonicalProjection {
-        fn update(&mut self, event: &str) -> bool {
-            self.update_with_public_event(event).0
-        }
-    }
-
     fn test_hub() -> Arc<BridgeHub> {
         let options = Options::try_parse_from(["attyd", "--", "fake-agent"]).unwrap();
         BridgeHub::new(Arc::new(options))
+    }
+
+    /// Receive one session's business events without holding an observation
+    /// lease, so the listener never keeps the session observed.
+    async fn passive_session_listener(
+        hub: &Arc<BridgeHub>,
+        session_id: &str,
+    ) -> mpsc::UnboundedReceiver<QueuedSubscriberEvent> {
+        let (sender, events) = SubscriberSender::channel();
+        let id = hub.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
+        hub.state.lock().await.session_subscribers.insert(
+            id,
+            SessionSubscriber {
+                id,
+                session_id: session_id.to_string(),
+                sender,
+                lease: None,
+                input: None,
+                ready: None,
+                owner: None,
+                state_slot: None,
+            },
+        );
+        events
     }
 
     #[test]
@@ -3455,12 +3324,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_closes_event_streams_without_an_active_agent() {
         let hub = test_hub();
-        let (aggregate_tx, mut aggregate_rx) = SubscriberSender::channel();
         let (global_tx, mut global_rx) = SubscriberSender::channel();
         let (session_tx, mut session_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
-            state.subscribers.insert(1, aggregate_tx);
             state.global_subscribers.insert(3, global_tx);
             state.session_subscribers.insert(
                 2,
@@ -3478,13 +3345,11 @@ mod tests {
         }
         hub.shutdown().await;
         tokio::time::timeout(Duration::from_millis(100), async {
-            assert!(aggregate_rx.recv().await.is_none());
             assert!(global_rx.recv().await.is_none());
             assert!(session_rx.recv().await.is_none());
         })
         .await
         .expect("shutdown must close every SSE source before HTTP draining");
-        assert!(hub.subscribe().await.is_none());
         assert!(hub.subscribe_global().await.is_none());
         assert!(hub.subscribe_session("session".to_string()).await.is_none());
     }
@@ -3845,7 +3710,6 @@ mod tests {
     async fn observe_ready_marker_establishes_reset_before_the_live_suffix() {
         let (hub, mut commands) = observation_hub(4).await;
         let mut global = hub.subscribe_global().await.unwrap();
-        let mut aggregate = hub.subscribe().await.unwrap();
         let mut handshake = Box::pin(hub.observe_session("session".into(), None));
         assert!(futures::poll!(handshake.as_mut()).is_pending());
         let bridge::BridgeInput::ObserveSession {
@@ -3873,9 +3737,6 @@ mod tests {
         assert_eq!(delta["viewRevision"], 11);
         assert!(subscription.events.try_recv().is_err());
         assert!(global.events.try_recv().is_err());
-        while let Ok(event) = aggregate.events.try_recv() {
-            assert!(!event.into_string().contains("internal_observer_ready"));
-        }
         drop(guard);
     }
 
@@ -4525,7 +4386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_legacy_and_debug_state_does_not_change_canonical_projection() {
+    async fn legacy_lifecycle_events_do_not_change_canonical_projection() {
         let hub = test_hub();
         let (input, _commands) = mpsc::unbounded_channel();
         let mut runtime = RuntimeState::new("epoch");
@@ -4556,14 +4417,12 @@ mod tests {
         .await;
 
         let mut state = hub.state.lock().await;
-        assert!(!state.runtime.replay_events().is_empty());
         assert_eq!(state.canonical.snapshot, Some(canonical.clone()));
-        state.runtime = ActiveRuntimeProjection::default();
         state.bootstrap = BridgeBootstrap::default();
         assert_eq!(
             state.canonical.snapshot,
             Some(canonical),
-            "raw/legacy retention is not a materialized business-state dependency"
+            "lifecycle bootstrap is not a materialized business-state dependency"
         );
     }
 
@@ -4580,166 +4439,33 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn identifies_session_lifecycle_events_that_may_have_a_live_suffix() {
-        assert_eq!(
-            opened_runtime_session_id(
-                r#"{"type":"acp/session_created","response":{"sessionId":"created"}}"#
-            ),
-            Some("created".to_string())
-        );
-        assert_eq!(
-            opened_runtime_session_id(
-                r#"{"type":"acp/session_attached","sessionId":"attached","response":{}}"#
-            ),
-            Some("attached".to_string())
-        );
-        assert_eq!(
-            opened_runtime_session_id(r#"{"type":"acp/prompt_complete","sessionId":"done"}"#),
-            None
-        );
-    }
-
     #[tokio::test]
-    async fn live_session_open_is_not_followed_by_a_redundant_runtime_snapshot() {
+    async fn directed_events_reach_no_business_subscriber() {
         let hub = test_hub();
         let (input, _commands) = mpsc::unbounded_channel();
-        let (subscriber_tx, mut subscriber_rx) = SubscriberSender::channel();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
             state.input = Some(input);
-            state.subscribers.insert(1, subscriber_tx);
         }
-
-        hub.publish(
-            1,
-            json!({
-                "type": "acp/session_forked",
-                "requestId": "fork",
-                "sourceSessionId": "source",
-                "cwd": "/workspace",
-                "response": { "sessionId": "fork" },
-                "earlyUpdates": [{
-                    "sessionId": "fork",
-                    "update": {
-                        "sessionUpdate": "available_commands_update",
-                        "availableCommands": [{ "name": "inspect", "description": "Inspect" }],
-                    },
-                }],
-            })
-            .to_string(),
-        )
-        .await;
-
-        let lifecycle: serde_json::Value =
-            serde_json::from_str(&subscriber_rx.try_recv().unwrap().into_string()).unwrap();
-        assert_eq!(lifecycle["type"], "acp/session_forked");
-        assert!(
-            std::iter::from_fn(|| subscriber_rx.try_recv().ok())
-                .map(QueuedSubscriberEvent::into_string)
-                .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event).ok())
-                .all(|event| event["type"] != "bridge/runtime_session"),
-            "the lifecycle response already carries the session and its atomic early updates"
-        );
-    }
-
-    #[test]
-    fn internal_direct_event_is_unwrapped_without_becoming_public_state() {
-        let event = r#"{"type":"bridge/internal_direct","subscriberId":42,"event":{"type":"bridge/error","requestId":"request","message":"collision"}}"#;
-
-        let (subscriber_id, direct) = directed_bridge_event(event).unwrap();
-        assert_eq!(subscriber_id, 42);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&direct).unwrap(),
-            json!({
-                "type": "bridge/error",
-                "requestId": "request",
-                "message": "collision",
-            }),
-        );
-        assert!(directed_bridge_event(r#"{"type":"bridge/phase","phase":"ready"}"#).is_none());
-    }
-
-    #[tokio::test]
-    async fn directed_event_reaches_only_the_requesting_subscriber() {
-        let hub = test_hub();
-        let (input, _commands) = mpsc::unbounded_channel();
-        let (target_tx, mut target_rx) = SubscriberSender::channel();
-        let (other_tx, mut other_rx) = SubscriberSender::channel();
-        {
-            let mut state = hub.state.lock().await;
-            state.generation = 1;
-            state.input = Some(input);
-            state.subscribers.insert(42, target_tx);
-            state.subscribers.insert(43, other_tx);
-        }
-
-        hub.publish(
-            1,
-            r#"{"type":"bridge/internal_direct","subscriberId":42,"event":{"type":"bridge/error","message":"collision"}}"#.to_string(),
-        )
-        .await;
-
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &target_rx.try_recv().unwrap().into_string(),
-            )
-            .unwrap(),
-            json!({ "type": "bridge/error", "message": "collision" }),
-        );
-        assert!(other_rx.try_recv().is_err());
-        assert!(
-            hub.state
-                .lock()
-                .await
-                .runtime
-                .replay_events()
-                .iter()
-                .all(|event| !event.contains("collision"))
-        );
-    }
-
-    #[tokio::test]
-    async fn load_replacement_is_private_and_never_becomes_completed_replay() {
-        let hub = test_hub();
-        let (input, _commands) = mpsc::unbounded_channel();
-        let (target_tx, mut target_rx) = SubscriberSender::channel();
-        let (other_tx, mut other_rx) = SubscriberSender::channel();
-        {
-            let mut state = hub.state.lock().await;
-            state.generation = 1;
-            state.input = Some(input);
-            state.subscribers.insert(42, target_tx);
-            state.subscribers.insert(43, other_tx);
-        }
+        let mut global = hub.subscribe_global().await.unwrap();
+        let mut session = passive_session_listener(&hub, "saved").await;
 
         for event in [
+            json!({ "type": "bridge/error", "message": "collision" }),
             json!({
-                "type": "acp/session_update",
-                "notification": {
-                    "sessionId": "saved",
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "messageId": "loaded",
-                        "content": { "type": "text", "text": "Agent history" },
-                    },
-                },
-            }),
-            json!({
-                "type": "acp/session_attached",
-                "requestId": "load",
-                "method": "load",
+                "type": "bridge/session_retired",
+                "bridgeEpoch": "epoch",
                 "sessionId": "saved",
-                "cwd": "/workspace",
-                "response": { "sessionId": "saved" },
+                "sessionIncarnation": 1,
+                "reason": "closed",
             }),
         ] {
             hub.publish(
                 1,
                 json!({
                     "type": "bridge/internal_direct",
-                    "subscriberId": 42,
+                    "subscriberId": global.id,
                     "event": event,
                 })
                 .to_string(),
@@ -4747,21 +4473,9 @@ mod tests {
             .await;
         }
 
-        let delivered = std::iter::from_fn(|| target_rx.try_recv().ok())
-            .map(QueuedSubscriberEvent::into_string)
-            .collect::<Vec<_>>();
-        assert_eq!(delivered.len(), 2);
-        assert!(delivered[0].contains("Agent history"));
-        assert!(delivered[1].contains("acp/session_attached"));
-        assert!(
-            other_rx.try_recv().is_err(),
-            "load staging must be private to the browser that requested replacement"
-        );
-
-        let replay = hub.state.lock().await.runtime.replay_events().join("\n");
-        assert!(!replay.contains("Agent history"));
-        assert!(!replay.contains("acp/session_attached"));
-        assert!(!replay.contains("bridge/runtime_session"));
+        assert!(global.events.try_recv().is_err());
+        assert!(session.try_recv().is_err());
+        assert_eq!(hub.state.lock().await.bootstrap.error, None);
     }
 
     async fn capability_fixture(flags: &[&str]) -> (Arc<BridgeHub>, BridgeSubscription) {
@@ -4781,12 +4495,12 @@ mod tests {
         let mut options = Options::try_parse_from(args).unwrap().normalized().unwrap();
         options.session_unobserved_timeout = timeout;
         let hub = BridgeHub::new(Arc::new(options));
-        let mut observer = hub.subscribe().await.unwrap();
+        let mut observer = hub.subscribe_global().await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = observer.events.recv().await {
                 let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
-                assert_ne!(event["type"], "bridge/error", "{event}");
-                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                assert_ne!(event["type"], "bridge/connection_error", "{event}");
+                if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                     return;
                 }
             }
@@ -4957,7 +4671,7 @@ mod tests {
 
         hub.unsubscribe(session.id, session.generation).await;
         hub.unsubscribe(browser.id, browser.generation).await;
-        browser = hub.subscribe().await.unwrap();
+        browser = hub.subscribe_global().await.unwrap();
         let view = hub.session_view("created".to_string()).await.unwrap();
         let interactions = format!("{kind}s");
         assert_eq!(view["session"]["phase"], "running");
@@ -5536,10 +5250,11 @@ mod tests {
     async fn expired_unobserved_timer_retires_session_without_agent_close() {
         // No "--close" flag: the Agent cannot close sessions, so expiry must
         // still release the local copy without sending any RPC.
-        let (hub, mut observer) = capability_fixture_with_timeout(&[], 1).await;
+        let (hub, observer) = capability_fixture_with_timeout(&[], 1).await;
         hub.business_request(json!({"type":"session/new", "requestId":"new"}))
             .await
             .unwrap();
+        let mut retirement = passive_session_listener(&hub, "created").await;
         let (session_stream, _session_guard) =
             hub.observe_session("created".into(), None).await.unwrap();
         hub.unsubscribe(session_stream.id, session_stream.generation)
@@ -5548,8 +5263,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let event: serde_json::Value =
-                    serde_json::from_str(&observer.events.recv().await.unwrap().into_string())
-                        .unwrap();
+                    serde_json::from_str(&retirement.recv().await.unwrap().into_string()).unwrap();
                 if event["type"] == "bridge/session_retired" && event["sessionId"] == "created" {
                     retired_reason = event["reason"].as_str().map(str::to_string);
                     break;
@@ -5572,11 +5286,6 @@ mod tests {
         assert!(
             !snapshot.sessions.contains_key("created"),
             "locally retired session must leave the runtime snapshot"
-        );
-        let replay = hub.state.lock().await.runtime.replay_events().join("\n");
-        assert!(
-            !replay.contains("\"created\""),
-            "local retirement must release the runtime projection: {replay}"
         );
         hub.unsubscribe(observer.id, observer.generation).await;
         hub.shutdown().await;
@@ -5727,11 +5436,11 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut browser = hub.subscribe().await.expect("browser subscription");
+        let mut browser = hub.subscribe_global().await.expect("browser subscription");
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = browser.events.recv().await {
                 let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
-                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                     return;
                 }
             }
@@ -5804,11 +5513,11 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut browser = hub.subscribe().await.expect("browser subscription");
+        let mut browser = hub.subscribe_global().await.expect("browser subscription");
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = browser.events.recv().await {
                 let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
-                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                     return;
                 }
             }
@@ -5903,17 +5612,17 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut requester = hub.subscribe().await.expect("requester subscription");
+        let mut requester = hub
+            .subscribe_global()
+            .await
+            .expect("requester subscription");
 
         loop {
             let event = next_event(&mut requester).await;
-            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+            if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                 break;
             }
         }
-        let mut observer = hub.subscribe().await.expect("observer subscription");
-        observer.initial_events.clear();
-
         hub.business_request(json!({
             "type": "session/new",
             "requestId": "new",
@@ -5921,18 +5630,6 @@ mod tests {
         }))
         .await
         .unwrap();
-        loop {
-            let event = next_event(&mut requester).await;
-            if event["type"] == "acp/session_created" {
-                assert_eq!(event["response"]["sessionId"], "test-session");
-                break;
-            }
-        }
-        loop {
-            if next_event(&mut observer).await["type"] == "acp/session_created" {
-                break;
-            }
-        }
         let queried = hub
             .session_view("test-session".to_string())
             .await
@@ -5940,6 +5637,7 @@ mod tests {
         assert_eq!(queried["session"]["phase"], "ready");
         assert!(queried["session"]["historyRevision"].is_string());
         assert_eq!(queried["baseline"]["updates"], json!([]));
+        let mut observer = passive_session_listener(&hub, "test-session").await;
 
         // No session/list precedes this request. The bridge must use the cwd
         // already associated with the tracked session and execute a reload,
@@ -5952,29 +5650,32 @@ mod tests {
         .await
         .unwrap();
 
-        for subscription in [&mut requester, &mut observer] {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let event = next_event(subscription).await;
-                assert_ne!(
-                    event["type"], "acp/session_update",
-                    "private load staging leaked to an observer"
-                );
-                assert_ne!(
-                    event["type"], "acp/session_attached",
-                    "internal attachment response leaked to an observer"
-                );
-                if event["type"] == "bridge/session_view"
-                    && event["view"]["baseline"]["updates"]
-                        .as_array()
-                        .is_some_and(|updates| {
-                            updates
-                                .iter()
-                                .any(|update| update["content"]["text"] == "Loaded history.")
-                        })
+                let view = hub.session_view("test-session".to_string()).await.unwrap();
+                if view["baseline"]["updates"]
+                    .as_array()
+                    .is_some_and(|updates| {
+                        updates
+                            .iter()
+                            .any(|update| update["content"]["text"] == "Loaded history.")
+                    })
                 {
                     break;
                 }
+                tokio::task::yield_now().await;
             }
+        })
+        .await
+        .expect("reload must commit the Agent history");
+        while let Ok(event) = observer.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
+            assert!(
+                event["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("bridge/session_")),
+                "private load staging leaked to a session observer: {event}"
+            );
         }
 
         let refreshed = hub
@@ -6011,12 +5712,17 @@ mod tests {
             .expect("idempotent REST retry");
         assert_eq!(duplicate["disposition"], "duplicate");
         assert_eq!(duplicate["operationId"], accepted["operationId"]);
-        loop {
-            let event = next_event(&mut requester).await;
-            if event["type"] == "acp/prompt_complete" && event["requestId"] == "rest-turn" {
-                break;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = hub.session_view("test-session".to_string()).await.unwrap();
+                if view["session"]["phase"] == "ready" && view["session"]["activeTurn"].is_null() {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-        }
+        })
+        .await
+        .expect("REST turn must complete");
 
         hub.unsubscribe(session_stream.id, session_stream.generation)
             .await;
@@ -6041,7 +5747,7 @@ mod tests {
             .normalized()
             .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut observer = hub.subscribe().await.unwrap();
+        let mut observer = hub.subscribe_global().await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let event = observer
@@ -6050,7 +5756,7 @@ mod tests {
                     .await
                     .expect("initialization stopped");
                 let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
-                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+                if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                     break;
                 }
             }
@@ -6082,16 +5788,11 @@ mod tests {
             // Leave the subscriber unread while the Agent completes. Delivery
             // backlog must neither cancel the turn nor evict this observer.
             loop {
-                let event = observer
-                    .events
-                    .recv()
-                    .await
-                    .expect("burst stopped the bridge");
-                let event: serde_json::Value = serde_json::from_str(&event.into_string()).unwrap();
-                assert_ne!(event["type"], "bridge/error", "{event}");
-                if event["type"] == "bridge/session_turn_complete" {
+                let view = hub.session_view("burst".into()).await.unwrap();
+                if view["session"]["phase"] == "ready" && view["session"]["activeTurn"].is_null() {
                     break;
                 }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let final_view = hub.session_view("burst".into()).await.unwrap();
             assert_eq!(final_view["session"]["phase"], "ready");
@@ -6231,11 +5932,14 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut browser = hub.subscribe().await.expect("test observer subscription");
+        let mut browser = hub
+            .subscribe_global()
+            .await
+            .expect("test observer subscription");
 
         loop {
             let event = next_event(&mut browser).await;
-            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+            if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                 break;
             }
         }
@@ -6270,14 +5974,16 @@ mod tests {
             .expect("turn admission");
         assert_eq!(accepted["disposition"], "accepted");
 
+        let mut retirement = passive_session_listener(&hub, "saved-session").await;
         hub.unsubscribe(session_stream.id, session_stream.generation)
             .await;
         drop(session_stream);
 
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let event = next_event(&mut browser).await;
-                if event["type"] == "acp/session_closed" && event["sessionId"] == "saved-session" {
+                let event = retirement.recv().await.unwrap().into_string();
+                let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+                if event["type"] == "bridge/session_retired" {
                     break;
                 }
             }
@@ -6334,10 +6040,10 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut browser = hub.subscribe().await.expect("browser subscription");
+        let mut browser = hub.subscribe_global().await.expect("browser subscription");
         loop {
             let event = next_event(&mut browser).await;
-            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+            if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                 break;
             }
         }
@@ -6456,10 +6162,10 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut browser = hub.subscribe().await.expect("browser subscription");
+        let mut browser = hub.subscribe_global().await.expect("browser subscription");
         loop {
             let event = next_event(&mut browser).await;
-            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+            if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                 break;
             }
         }
@@ -6524,10 +6230,10 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut browser = hub.subscribe().await.expect("browser subscription");
+        let mut browser = hub.subscribe_global().await.expect("browser subscription");
         loop {
             let event = next_event(&mut browser).await;
-            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+            if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                 break;
             }
         }
@@ -6590,10 +6296,10 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut observer = hub.subscribe().await.expect("observer subscription");
+        let mut observer = hub.subscribe_global().await.expect("observer subscription");
         loop {
             let event = next_event(&mut observer).await;
-            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+            if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                 break;
             }
         }
@@ -6714,10 +6420,10 @@ mod tests {
         .normalized()
         .unwrap();
         let hub = BridgeHub::new(Arc::new(options));
-        let mut observer = hub.subscribe().await.expect("observer subscription");
+        let mut observer = hub.subscribe_global().await.expect("observer subscription");
         loop {
             let event = next_event(&mut observer).await;
-            if event["type"] == "bridge/phase" && event["phase"] == "ready" {
+            if event["type"] == "bridge/connection" && event["phase"] == "ready" {
                 break;
             }
         }
@@ -6818,23 +6524,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_generation_direct_events_are_rejected() {
-        let hub = test_hub();
-        let (input, _commands) = mpsc::unbounded_channel();
-        let (subscriber, mut events) = SubscriberSender::channel();
-        {
-            let mut state = hub.state.lock().await;
-            state.generation = 2;
-            state.input = Some(input);
-            state.subscribers.insert(42, subscriber);
-        }
-
-        hub.send_to_subscriber(42, 1, "stale".to_string()).await;
-        assert!(events.try_recv().is_err());
-        assert!(hub.state.lock().await.subscribers.contains_key(&42));
-    }
-
-    #[tokio::test]
     async fn global_subscription_bootstrap_preserves_auth_without_session_or_request_replay() {
         let hub = test_hub();
         let (input, _commands) = mpsc::unbounded_channel();
@@ -6890,25 +6579,9 @@ mod tests {
             json!({ "type": "bridge/connection", "phase": "error" })
         );
 
-        let aggregate = hub.subscribe().await.unwrap();
-        let aggregate_events = aggregate
-            .initial_events
-            .iter()
-            .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            aggregate_events
-                .iter()
-                .any(|event| event["type"] == "bridge/runtime_snapshot")
-        );
-        assert!(
-            aggregate_events
-                .iter()
-                .any(|event| event["type"] == "bridge/runtime_session")
-        );
         for event in request_events {
             assert!(
-                !aggregate_events.contains(&event),
+                !initial.contains(&event),
                 "global events are logged, not retained for replay: {event}"
             );
         }
@@ -7014,13 +6687,13 @@ mod tests {
         let mut subscriptions = Vec::with_capacity(65);
         for index in 0..65 {
             let subscription = match index % 3 {
-                0 => hub.subscribe().await,
+                0 => hub.subscribe_global().await,
                 1 => hub.subscribe_global().await,
                 _ => hub.subscribe_session("session".to_string()).await,
             };
             subscriptions.push(subscription.expect("subscriber beyond former limit"));
         }
-        assert!(hub.subscribe().await.is_some());
+        assert!(hub.subscribe_global().await.is_some());
         assert!(hub.subscribe_global().await.is_some());
         assert!(hub.subscribe_session("session".to_string()).await.is_some());
 
@@ -7039,8 +6712,8 @@ mod tests {
             let mut state = hub.state.lock().await;
             state.generation = 1;
             state.input = Some(input);
-            state.subscribers.insert(1, slow_tx);
-            state.subscribers.insert(2, healthy_tx);
+            state.global_subscribers.insert(1, slow_tx);
+            state.global_subscribers.insert(2, healthy_tx);
         }
 
         hub.publish(
@@ -7052,90 +6725,23 @@ mod tests {
             .await;
 
         let state = hub.state.lock().await;
-        assert!(state.subscribers.contains_key(&1));
-        assert!(state.subscribers.contains_key(&2));
+        assert!(state.global_subscribers.contains_key(&1));
+        assert!(state.global_subscribers.contains_key(&2));
         drop(state);
-        assert_eq!(
-            slow_rx.try_recv().unwrap().into_string(),
-            r#"{"type":"bridge/phase","phase":"starting"}"#
-        );
-        assert_eq!(
-            slow_rx.try_recv().unwrap().into_string(),
-            r#"{"type":"bridge/phase","phase":"ready"}"#
-        );
-        assert_eq!(
-            healthy_rx.try_recv().unwrap().into_string(),
-            r#"{"type":"bridge/phase","phase":"starting"}"#
-        );
-        assert_eq!(
-            healthy_rx.try_recv().unwrap().into_string(),
-            r#"{"type":"bridge/phase","phase":"ready"}"#
-        );
-    }
-
-    #[tokio::test]
-    async fn released_terminal_is_not_replayed_to_a_new_subscriber() {
-        let hub = test_hub();
-        let (input, _commands) = mpsc::unbounded_channel();
-        {
-            let mut state = hub.state.lock().await;
-            state.generation = 1;
-            state.input = Some(input);
+        let next = |receiver: &mut mpsc::UnboundedReceiver<QueuedSubscriberEvent>| {
+            serde_json::from_str::<serde_json::Value>(&receiver.try_recv().unwrap().into_string())
+                .unwrap()
+        };
+        for receiver in [&mut slow_rx, &mut healthy_rx] {
+            assert_eq!(
+                next(receiver),
+                json!({ "type": "bridge/connection", "phase": "starting" })
+            );
+            assert_eq!(
+                next(receiver),
+                json!({ "type": "bridge/connection", "phase": "ready" })
+            );
         }
-        hub.publish(
-            1,
-            json!({
-                "type": "acp/session_created",
-                "cwd": "/workspace",
-                "response": { "sessionId": "session" },
-            })
-            .to_string(),
-        )
-        .await;
-        hub.publish(
-            1,
-            json!({
-                "type": "acp/terminal_state",
-                "terminal": {
-                    "sessionId": "session",
-                    "terminalId": "released-terminal",
-                    "output": "release-only-output",
-                    "truncated": false,
-                    "released": false,
-                },
-            })
-            .to_string(),
-        )
-        .await;
-        hub.publish(
-            1,
-            json!({
-                "type": "acp/terminal_state",
-                "terminal": {
-                    "sessionId": "session",
-                    "terminalId": "released-terminal",
-                    "output": "release-only-output",
-                    "truncated": false,
-                    "released": true,
-                },
-            })
-            .to_string(),
-        )
-        .await;
-
-        let subscription = hub.subscribe().await.unwrap();
-        assert!(
-            subscription.initial_events.iter().all(|event| {
-                serde_json::from_str::<serde_json::Value>(event)
-                    .ok()
-                    .is_none_or(|event| {
-                        event.get("type").and_then(serde_json::Value::as_str)
-                            != Some("acp/terminal_state")
-                            || event["terminal"]["terminalId"] != "released-terminal"
-                    })
-            }),
-            "release must remove terminal runtime output instead of retaining a replay tombstone"
-        );
     }
 
     #[tokio::test]
@@ -7180,7 +6786,7 @@ mod tests {
             hub.publish(1, event.to_string()).await;
         }
 
-        let subscription = hub.subscribe().await.unwrap();
+        let subscription = hub.subscribe_global().await.unwrap();
         assert!(
             subscription
                 .initial_events
@@ -7188,35 +6794,10 @@ mod tests {
                 .all(|event| !event.contains(COMPLETED_MARKER)),
             "ACP is the completed-history authority; Hub bootstrap must contain active state only"
         );
-        let initial = subscription
-            .initial_events
-            .iter()
-            .filter_map(|event| serde_json::from_str::<serde_json::Value>(event).ok())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            initial
-                .iter()
-                .find(|event| event["type"] == "bridge/runtime_replay_started")
-                .unwrap()["sessionCount"],
-            0
-        );
-        assert_eq!(
-            initial
-                .iter()
-                .find(|event| event["type"] == "bridge/runtime_replay_complete")
-                .unwrap()["sessionIds"],
-            json!([])
-        );
-        assert!(
-            initial
-                .iter()
-                .all(|event| event["type"] != "bridge/runtime_session"),
-            "an idle completed session shell would suppress the required session/load flow"
-        );
     }
 
     #[tokio::test]
-    async fn slow_subscriber_does_not_pin_a_completed_turn_in_hub_state() {
+    async fn completed_turn_is_not_pinned_in_hub_state() {
         const COMPLETED_MARKER: &str = "slow-subscriber-completed-turn";
 
         let hub = test_hub();
@@ -7246,14 +6827,11 @@ mod tests {
             )
             .unwrap();
         let active = runtime.snapshot();
-        let (slow_tx, _slow_rx) = SubscriberSender::channel();
-        let slow_queued_bytes = slow_tx.queued_bytes.clone();
         {
             let mut state = hub.state.lock().await;
             state.generation = 1;
             state.input = Some(input);
             state.canonical.snapshot = Some(active.clone());
-            state.subscribers.insert(1, slow_tx);
         }
 
         runtime
@@ -7277,15 +6855,11 @@ mod tests {
             .await;
         }
 
-        assert!(
-            slow_queued_bytes.load(Ordering::Acquire) > 0,
-            "the subscriber must still be holding the final publication for this test"
-        );
         let state = hub.state.lock().await;
         let retained = serde_json::to_string(&state.canonical.snapshot).unwrap();
         assert!(
             !retained.contains(COMPLETED_MARKER),
-            "final publication must retire Hub-owned turn state without waiting for a slow subscriber"
+            "final publication must retire Hub-owned turn state"
         );
     }
 
@@ -7298,18 +6872,19 @@ mod tests {
             let mut state = hub.state.lock().await;
             state.generation = 1;
             state.input = Some(input);
-            state.subscribers.insert(1, subscriber_tx);
+            state.global_subscribers.insert(1, subscriber_tx);
         }
         let large_event = json!({
-            "type": "bridge/stderr",
-            "chunk": "x".repeat(4 * 1024 * 1024 + 1),
+            "type": "bridge/auth_terminal_output",
+            "requestId": "auth",
+            "data": "x".repeat(4 * 1024 * 1024 + 1),
         })
         .to_string();
 
         hub.publish(1, large_event.clone()).await;
-        assert!(hub.state.lock().await.subscribers.contains_key(&1));
+        assert!(hub.state.lock().await.global_subscribers.contains_key(&1));
         hub.publish(1, large_event.clone()).await;
-        assert!(hub.state.lock().await.subscribers.contains_key(&1));
+        assert!(hub.state.lock().await.global_subscribers.contains_key(&1));
         for _ in 0..2 {
             assert_eq!(subscriber_rx.try_recv().unwrap().into_string(), large_event);
         }
@@ -7711,7 +7286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscriber_bootstrap_contains_atomic_canonical_snapshot_and_suffix() {
+    async fn canonical_projection_applies_a_contiguous_suffix() {
         let hub = test_hub();
         let (input, _commands) = mpsc::unbounded_channel();
         let mut runtime = RuntimeState::new("epoch");
@@ -7722,21 +7297,6 @@ mod tests {
             state.input = Some(input);
             state.canonical.snapshot = Some(initial.clone());
         }
-
-        let mut subscription = hub.subscribe().await.unwrap();
-        let snapshot_event = subscription
-            .initial_events
-            .iter()
-            .find_map(|event| {
-                let value = serde_json::from_str::<serde_json::Value>(event).ok()?;
-                (value.get("type")?.as_str()? == "bridge/runtime_snapshot").then_some(value)
-            })
-            .expect("canonical snapshot must be part of the atomic bootstrap");
-        assert_eq!(snapshot_event["snapshot"]["epoch"], initial.epoch);
-        assert_eq!(
-            snapshot_event["snapshot"]["throughSeq"],
-            initial.through_seq,
-        );
 
         runtime
             .open_new(
@@ -7757,15 +7317,13 @@ mod tests {
         )
         .await;
 
-        let delta_event =
-            tokio::time::timeout(Duration::from_millis(100), subscription.events.recv())
-                .await
-                .expect("canonical suffix was not delivered")
-                .expect("subscriber was disconnected before its suffix");
-        let delta_event: serde_json::Value =
-            serde_json::from_str(&delta_event.into_string()).unwrap();
-        assert_eq!(delta_event["type"], "bridge/runtime_delta");
-        assert_eq!(delta_event["delta"]["seq"], initial.through_seq + 1);
+        let canonical = hub.state.lock().await.canonical.snapshot.clone().unwrap();
+        assert_eq!(canonical.epoch, initial.epoch);
+        assert_eq!(canonical.through_seq, initial.through_seq + 1);
+        assert_eq!(
+            serde_json::to_value(canonical).unwrap(),
+            serde_json::to_value(runtime.snapshot()).unwrap(),
+        );
     }
 
     #[tokio::test]
@@ -7820,7 +7378,6 @@ mod tests {
             state.input = Some(input);
             state.canonical.snapshot = Some(runtime.snapshot());
         }
-        let mut subscription = hub.subscribe().await.unwrap();
 
         for seq in [2, 3] {
             hub.publish(
@@ -7867,11 +7424,17 @@ mod tests {
             .to_string(),
         )
         .await;
-        let replacement = subscription.events.recv().await.unwrap();
-        let replacement: serde_json::Value =
-            serde_json::from_str(&replacement.into_string()).unwrap();
-        assert_eq!(replacement["type"], "bridge/runtime_snapshot");
-        assert_eq!(replacement["snapshot"]["throughSeq"], 1);
+        assert_eq!(
+            hub.state
+                .lock()
+                .await
+                .canonical
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .through_seq,
+            1
+        );
 
         runtime
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
@@ -7886,14 +7449,16 @@ mod tests {
             .to_string(),
         )
         .await;
-        let suffix = subscription.events.recv().await.unwrap();
-        let suffix: serde_json::Value = serde_json::from_str(&suffix.into_string()).unwrap();
-        assert_eq!(suffix["type"], "bridge/runtime_delta");
-        assert_eq!(suffix["delta"]["seq"], 2);
+        let canonical = hub.state.lock().await.canonical.snapshot.clone().unwrap();
+        assert_eq!(canonical.through_seq, 2);
+        assert_eq!(
+            serde_json::to_value(canonical).unwrap(),
+            serde_json::to_value(runtime.snapshot()).unwrap(),
+        );
     }
 
     #[tokio::test]
-    async fn two_subscribers_receive_the_same_canonical_revision_and_state() {
+    async fn canonical_projection_folds_every_delta_in_order() {
         let hub = test_hub();
         let (input, _commands) = mpsc::unbounded_channel();
         let mut runtime = RuntimeState::new("epoch");
@@ -7903,8 +7468,6 @@ mod tests {
             state.input = Some(input);
             state.canonical.snapshot = Some(runtime.snapshot());
         }
-        let mut first = hub.subscribe().await.unwrap();
-        let mut second = hub.subscribe().await.unwrap();
         let incarnation = runtime
             .open_new(
                 "epoch",
@@ -7929,13 +7492,6 @@ mod tests {
             .await;
         }
 
-        for expected_seq in 1..=runtime.seq() {
-            let first_event = first.events.recv().await.unwrap().into_string();
-            let second_event = second.events.recv().await.unwrap().into_string();
-            assert_eq!(first_event, second_event);
-            let event: serde_json::Value = serde_json::from_str(&first_event).unwrap();
-            assert_eq!(event["delta"]["seq"], expected_seq);
-        }
         let canonical = hub.state.lock().await.canonical.snapshot.clone().unwrap();
         assert_eq!(
             serde_json::to_value(canonical).unwrap(),

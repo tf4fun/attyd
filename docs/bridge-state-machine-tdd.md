@@ -355,7 +355,7 @@ Keep these retired behaviors out of the production path:
 - dropping the completed overlay before the baseline commit;
 - retaining only control updates from an attachment replay;
 - requester-private load replay in `attachment_subscribers`;
-- `ActiveRuntimeProjection::clear_turn_events` on PromptResponse;
+- the Hub-side `ActiveRuntimeProjection` legacy replay journal and the aggregate browser event stream;
 - reconnect-driven session/load from `useAcp`;
 - browser shadowing/ignoring canonical runtime state;
 - completed intent IDs becoming immediately reusable;
