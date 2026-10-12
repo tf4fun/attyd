@@ -1,10 +1,17 @@
 name: ci
 
 on:
+  # Branch work is validated by its pull request; pushes only build main and
+  # release tags, so one commit never runs the same jobs twice.
   push:
-    branches: ["**"]
+    branches: [main]
     tags: ["v*"]
   pull_request:
+
+# A newer commit on the same pull request supersedes the running validation.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
