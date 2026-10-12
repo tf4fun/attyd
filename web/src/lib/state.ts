@@ -4,8 +4,6 @@ import type {
   CompactionStatus,
   ContentBlock,
   CreateElicitationRequest,
-  CreateElicitationResponse,
-  ForkSessionResponse,
   InitializeResponse,
   NewSessionResponse,
   LogoutResponse,
@@ -19,9 +17,8 @@ import type {
   ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 import type {
-  AgentTransport,
   ConnectionPhase,
-  ServerEvent,
+  ElicitationAbortReason,
   SessionRuntimeOperation,
   TerminalSnapshot,
 } from "../../../shared/bridge";
@@ -29,7 +26,10 @@ import { assertNever } from "../../../shared/exhaustive";
 import type {
   BridgeSessionView,
   BridgeTurnProcessPage,
+  GlobalBusinessEvent,
+  RuntimeView,
   SessionBusinessEvent,
+  SessionListResult,
   SessionOwner,
   SessionSyncPhase,
 } from "../../../shared/business-api";
@@ -95,7 +95,7 @@ export type TimelineItem = (
       type: "error";
       message: string;
       requestId?: string;
-      operation?: Extract<ServerEvent, { type: "bridge/error" }>["operation"];
+      operation?: string;
       code?: number;
       data?: unknown;
       dataTruncated?: boolean;
@@ -128,10 +128,21 @@ export interface ExternalElicitationFlow {
   url?: string;
   message: string;
   status: "waiting" | "completed" | "cancelled";
-  abortReason?: Extract<ServerEvent, { type: "acp/elicitation_aborted" }>["reason"];
+  abortReason?: ElicitationAbortReason;
 }
 
-export type McpActivity = Extract<ServerEvent, { type: "acp/mcp_message" }>;
+/** A failed request or connection, as reported by the business API. */
+export interface BridgeError {
+  message: string;
+  requestId?: string;
+  operation?: string;
+  code?: number;
+  data?: unknown;
+  dataTruncated?: boolean;
+  dataBytes?: number;
+}
+
+type RuntimeHello = NonNullable<RuntimeView["hello"]>;
 
 export type AgentActivity =
   | { kind: "waiting" }
@@ -140,12 +151,6 @@ export type AgentActivity =
   | { kind: "planning" }
   | { kind: "compacting" }
   | { kind: "responding" };
-
-export interface ActiveMcpConnection {
-  serverId: string;
-  connectionId: string;
-  name: string;
-}
 
 export interface ActiveSessionSnapshot {
   cwd: string;
@@ -245,17 +250,12 @@ export interface AppState {
   sessionOwner?: SessionOwner;
   phase: ConnectionPhase;
   socketOpen: boolean;
-  runtimeReplaying: boolean;
-  runtimeReplacement?: AppState;
-  sessionLoadReplacement?: AppState;
-  transport: AgentTransport;
+  transport: RuntimeHello["transport"];
   command: string[];
   defaultCwd: string;
   cwd: string;
   additionalDirectories: string[];
-  mcpServers: Array<{ name: string; type: "stdio" | "http" | "sse" | "acp" }>;
-  mcpConnections: ActiveMcpConnection[];
-  mcpActivity: McpActivity[];
+  mcpServers: RuntimeHello["mcpServers"];
   readOnly: boolean;
   initialized?: InitializeResponse;
   authStatus?: AgentAuthStatus;
@@ -285,7 +285,6 @@ export interface AppState {
   elicitations: PendingElicitation[];
   externalFlows: ExternalElicitationFlow[];
   backgroundEvents: unknown[];
-  stderr: string;
   running: boolean;
   sessionSyncPhase?: SessionSyncPhase;
   agentActivity?: AgentActivity;
@@ -312,11 +311,12 @@ export type AppAction =
       type: "bridge/turn_failed";
       event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_failed" }>;
     }
-  | {
-      type: "runtime/replay_complete";
-      preferredSessionId?: string;
-      fallbackSessionId?: string;
-    }
+  | { type: "runtime/loaded"; runtime: RuntimeView }
+  | { type: "global/event"; event: GlobalBusinessEvent }
+  | { type: "request/failed"; error: BridgeError }
+  | { type: "sessions/listed"; cursor?: string; response: SessionListResult }
+  | { type: "session/turn_update"; notification: SessionNotification }
+  | { type: "session/terminal_update"; terminal: TerminalSnapshot }
   | { type: "client/error"; message: string }
   | {
       type: "history/unavailable";
@@ -332,7 +332,6 @@ export type AppAction =
       methodId?: string;
     }
   | { type: "auth/dismiss_terminal" }
-  | { type: "server/event"; event: ServerEvent }
   | {
       type: "user/prompt";
       requestId: string;
@@ -374,15 +373,12 @@ export type AppAction =
 export const initialState: AppState = {
   phase: "starting",
   socketOpen: false,
-  runtimeReplaying: false,
   transport: "stdio",
   command: [],
   defaultCwd: "",
   cwd: "",
   additionalDirectories: [],
   mcpServers: [],
-  mcpConnections: [],
-  mcpActivity: [],
   readOnly: false,
   cachedSessions: new Map(),
   attentionSessionIds: [],
@@ -396,21 +392,8 @@ export const initialState: AppState = {
   elicitations: [],
   externalFlows: [],
   backgroundEvents: [],
-  stderr: "",
   running: false,
 };
-
-function withoutRuntimeReplacement(state: AppState): AppState {
-  return state.runtimeReplacement == null
-    ? state
-    : { ...state, runtimeReplacement: undefined };
-}
-
-function withoutSessionLoadReplacement(state: AppState): AppState {
-  return state.sessionLoadReplacement == null
-    ? state
-    : { ...state, sessionLoadReplacement: undefined };
-}
 
 function historyUnavailableMessage(
   reason: Extract<HistoryStatus, { state: "unavailable" }>["reason"],
@@ -420,65 +403,6 @@ function historyUnavailableMessage(
       return "History unavailable: this Agent does not support loading saved session history.";
     default:
       return assertNever(reason, "history unavailable reason");
-  }
-}
-
-function isMatchingSessionLoadUpdate(
-  state: AppState,
-  event: ServerEvent,
-): boolean {
-  const transition = state.sessionTransition;
-  return transition?.kind === "attach" &&
-    event.type === "acp/session_update" &&
-    event.notification.sessionId === transition.targetSessionId;
-}
-
-function isMatchingSessionLoadCommit(
-  state: AppState,
-  event: ServerEvent,
-): event is Extract<ServerEvent, { type: "acp/session_attached" }> {
-  const transition = state.sessionTransition;
-  return transition?.kind === "attach" &&
-    event.type === "acp/session_attached" &&
-    event.requestId === transition.requestId &&
-    event.sessionId === transition.targetSessionId;
-}
-
-function isMatchingSessionLoadFailure(
-  state: AppState,
-  event: ServerEvent,
-): event is Extract<ServerEvent, { type: "bridge/error" }> {
-  return state.sessionTransition?.kind === "attach" &&
-    event.type === "bridge/error" &&
-    event.requestId === state.sessionTransition.requestId;
-}
-
-function isRuntimeReplacementEvent(event: ServerEvent): boolean {
-  switch (event.type) {
-    case "bridge/phase":
-    case "bridge/runtime_session":
-    case "bridge/session_operation_started":
-    case "bridge/error":
-    case "acp/session_created":
-    case "acp/session_attached":
-    case "acp/session_forked":
-    case "acp/session_closed":
-    case "acp/session_deleted":
-    case "acp/session_update":
-    case "acp/terminal_state":
-    case "acp/prompt_started":
-    case "acp/prompt_complete":
-    case "acp/permission_request":
-    case "acp/permission_resolved":
-    case "acp/elicitation_request":
-    case "acp/elicitation_complete":
-    case "acp/elicitation_resolved":
-    case "acp/elicitation_aborted":
-    case "acp/mode_changed":
-    case "acp/config_changed":
-      return true;
-    default:
-      return false;
   }
 }
 
@@ -501,13 +425,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
     case "socket/open":
-      return state.runtimeReplacement == null
-        ? { ...state, socketOpen: true }
-        : {
-            ...state,
-            socketOpen: true,
-            runtimeReplacement: { ...state.runtimeReplacement, socketOpen: true },
-          };
+      return { ...state, socketOpen: true };
     case "socket/closed":
       return terminateBridgeState(state, "stopped", false);
     case "bridge/session_live_update":
@@ -537,8 +455,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         timeline: [...next.timeline, {
           id: randomId(), type: "message", role: "user", blocks, raw: [],
         }, errorTimelineItem({
-          type: "bridge/error", operation: "session/prompt",
-          requestId: failure.requestId, message: failure.message,
+          operation: "session/prompt", requestId: failure.requestId, message: failure.message,
         }, blocks)],
       };
     }
@@ -557,19 +474,35 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return applyBridgeTurnComplete(state, action.event);
     case "bridge/turn_failed":
       return applyBridgeTurnFailure(state, action.event);
-    case "runtime/replay_complete": {
-      const next = {
-        ...(state.runtimeReplacement ?? state),
-        runtimeReplaying: false,
-        runtimeReplacement: undefined,
-        sessionLoadReplacement: undefined,
-      };
-      const sessionId = action.preferredSessionId != null &&
-          next.cachedSessions.has(action.preferredSessionId)
-        ? action.preferredSessionId
-        : action.fallbackSessionId;
-      return sessionId == null ? next : activateCachedSession(next, sessionId);
-    }
+    case "runtime/loaded":
+      return applyRuntime(state, action.runtime);
+    case "global/event":
+      return applyGlobalEvent(state, action.event);
+    case "request/failed":
+      return applyBridgeError(state, action.error);
+    case "sessions/listed":
+      return applySessionsListed(state, action.cursor, action.response);
+    case "session/turn_update":
+      return isCurrentSession(state, action.notification.sessionId)
+        ? reduceSessionUpdate(state, action.notification)
+        : updateCachedSession(
+            state,
+            action.notification.sessionId,
+            (cached) => reduceSessionUpdate(cached, action.notification),
+            action,
+          );
+    case "session/terminal_update":
+      return isCurrentSession(state, action.terminal.sessionId)
+        ? { ...state, terminalSnapshots: upsertTerminalSnapshot(state.terminalSnapshots, action.terminal) }
+        : updateCachedSession(
+            state,
+            action.terminal.sessionId,
+            (cached) => ({
+              ...cached,
+              terminalSnapshots: upsertTerminalSnapshot(cached.terminalSnapshots, action.terminal),
+            }),
+            action,
+          );
     case "client/error":
       return {
         ...state,
@@ -684,25 +617,11 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         return { ...stateWithCachedCurrent, sessionTransition: transition };
       }
       if (action.kind === "attach" && action.sessionId != null) {
-        const historyStatus: HistoryStatus = {
-          state: "loading",
-          sessionId: action.sessionId,
-          requestId: action.requestId,
-        };
-        const sessionLoadReplacement: AppState = {
-          ...resetActiveSession(stateWithCachedCurrent, action.title ?? undefined),
-          cwd: action.cwd ?? state.defaultCwd,
-          pendingSessionId: action.sessionId,
-          sessionTransition: transition,
-          historyStatus,
-          sessionLoadReplacement: undefined,
-        };
         return {
           ...stateWithCachedCurrent,
           pendingSessionId: action.sessionId,
           sessionTransition: transition,
-          historyStatus,
-          sessionLoadReplacement,
+          historyStatus: { state: "loading", sessionId: action.sessionId, requestId: action.requestId },
         };
       }
       return {
@@ -774,320 +693,66 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return resetActiveSession(cacheCurrentSession(state));
     case "session/activate_cached":
       return activateCachedSession(state, action.sessionId);
-    case "server/event": {
-      const sessionLoadReplacement = state.sessionLoadReplacement;
-      if (sessionLoadReplacement != null) {
-        if (isMatchingSessionLoadUpdate(state, action.event)) {
-          return {
-            ...state,
-            sessionLoadReplacement: reduceServerEvent(
-              sessionLoadReplacement,
-              action.event,
-            ),
-          };
-        }
-        if (isMatchingSessionLoadCommit(state, action.event)) {
-          const committed = reduceServerEvent(sessionLoadReplacement, action.event);
-          return {
-            ...committed,
-            sessionLoadReplacement: undefined,
-            historyStatus: {
-              state: "available",
-              sessionId: action.event.sessionId,
-            },
-          };
-        }
-        if (isMatchingSessionLoadFailure(state, action.event)) {
-          return reduceServerEvent(
-            withoutSessionLoadReplacement(state),
-            action.event,
-          );
-        }
-      }
-      const replacement = state.runtimeReplacement;
-      if (replacement == null) return reduceServerEvent(state, action.event);
-      if (action.event.type === "bridge/runtime_replay_started") {
-        return reduceServerEvent(withoutRuntimeReplacement(state), action.event);
-      }
-      if (
-        action.event.type === "bridge/phase" &&
-        (action.event.phase === "error" || action.event.phase === "stopped")
-      ) {
-        return reduceServerEvent(withoutRuntimeReplacement(state), action.event);
-      }
-      if (isRuntimeReplacementEvent(action.event)) {
-        return {
-          ...state,
-          runtimeReplacement: reduceServerEvent(replacement, action.event),
-        };
-      }
-      return {
-        ...reduceServerEvent(withoutRuntimeReplacement(state), action.event),
-        runtimeReplaying: true,
-        runtimeReplacement: reduceServerEvent(replacement, action.event),
-      };
-    }
   }
 }
 
-function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
+function applyRuntime(state: AppState, runtime: RuntimeView): AppState {
+  let next = state;
+  if (runtime.hello != null) next = applyHello(next, runtime.hello);
+  if (runtime.initialized != null) next = applyInitialized(next, runtime.initialized.response);
+  if (runtime.error != null) next = applyBridgeError(next, runtime.error);
+  if (runtime.phase != null) next = applyConnectionPhase(next, runtime.phase.phase);
+  return next;
+}
+
+function applyHello(state: AppState, hello: RuntimeHello): AppState {
+  return {
+    ...state,
+    transport: hello.transport,
+    command: hello.command,
+    defaultCwd: hello.cwd,
+    cwd: state.session ? state.cwd : hello.cwd,
+    readOnly: hello.readOnly,
+    additionalDirectories: hello.additionalDirectories,
+    mcpServers: hello.mcpServers,
+  };
+}
+
+function applyConnectionPhase(state: AppState, phase: ConnectionPhase): AppState {
+  return phase === "error" || phase === "stopped"
+    ? terminateBridgeState(state, phase, state.socketOpen)
+    : { ...state, phase };
+}
+
+function applyInitialized(state: AppState, response: InitializeResponse): AppState {
+  const preserveRuntimeAuth = state.pendingAuth != null ||
+    state.authTerminal != null ||
+    state.authStatus === "authenticated" ||
+    state.authStatus === "logged_out";
+  return {
+    ...state,
+    initialized: response,
+    authStatus: preserveRuntimeAuth
+      ? state.authStatus
+      : (response.authMethods?.length ?? 0) > 0 || response.agentCapabilities?.auth?.logout != null
+        ? "available"
+        : undefined,
+    pendingAuth: preserveRuntimeAuth ? state.pendingAuth : undefined,
+    authTerminal: preserveRuntimeAuth ? state.authTerminal : undefined,
+    authError: preserveRuntimeAuth ? state.authError : undefined,
+    lastAuthResponse: preserveRuntimeAuth ? state.lastAuthResponse : undefined,
+  };
+}
+
+function applyGlobalEvent(state: AppState, event: GlobalBusinessEvent): AppState {
   switch (event.type) {
-    case "bridge/hello":
-      return {
-        ...state,
-        transport: event.transport,
-        command: event.command,
-        defaultCwd: event.cwd,
-        cwd: state.session ? state.cwd : event.cwd,
-        readOnly: event.readOnly,
-        additionalDirectories: event.additionalDirectories,
-        mcpServers: event.mcpServers,
-      };
-    case "bridge/runtime_replay_started": {
-      const visible = withoutSessionLoadReplacement(withoutRuntimeReplacement(state));
-      const reset = resetActiveSession(visible);
-      const runtimeReplacement: AppState = {
-        ...reset,
-        runtimeReplaying: true,
-        cachedSessions: new Map(),
-        attentionSessionIds: [],
-        sessions: [],
-        backgroundEvents: [],
-      };
-      return {
-        ...visible,
-        phase: visible.phase === "ready" ? "initializing" : visible.phase,
-        runtimeReplaying: true,
-        runtimeReplacement,
-        sessionLoadReplacement: undefined,
-      };
-    }
-    case "bridge/runtime_session":
-      return cacheRuntimeSession(state, event);
-    case "bridge/runtime_replay_complete":
-      // useAcp supplies the browser's preferred session ID when it handles
-      // this marker and dispatches runtime/replay_complete.
+    case "bridge/connection":
+      return applyConnectionPhase(state, event.phase);
+    case "bridge/connection_error":
+      return applyBridgeError(state, { message: event.message, code: event.code, data: event.data });
+    case "bridge/catalog_changed":
+      // useAcp refreshes the Agent-owned catalog; nothing is projected here.
       return state;
-    case "bridge/runtime_snapshot":
-    case "bridge/runtime_delta":
-      // The canonical stream is running in shadow mode until the backend
-      // state-machine and transport gates are complete. Legacy ACP events
-      // remain the renderer's source during this migration phase.
-      return state;
-    case "bridge/session_operation_started":
-      if (isCurrentSession(state, event.sessionId)) {
-        return {
-          ...state,
-          runtimeOperation: {
-            requestId: event.requestId,
-            operation: event.operation,
-          },
-        };
-      }
-      return updateCachedSession(
-        state,
-        event.sessionId,
-        (cached) => ({
-          ...cached,
-          runtimeOperation: {
-            requestId: event.requestId,
-            operation: event.operation,
-          },
-        }),
-        event,
-      );
-    case "bridge/phase":
-      const terminalPhase = event.phase === "error" || event.phase === "stopped";
-      return terminalPhase
-        ? terminateBridgeState(
-            state,
-            event.phase === "error" ? "error" : "stopped",
-            state.socketOpen,
-          )
-        : { ...state, phase: event.phase };
-    case "bridge/stderr":
-      return { ...state, stderr: state.stderr + event.chunk };
-    case "bridge/context_search_result":
-    case "bridge/context_attached":
-      // Request-scoped context responses are consumed by useAcp before dispatch.
-      return state;
-    case "bridge/error": {
-      state = clearRuntimeOperation(state, event.requestId);
-      if (
-        event.requestId != null &&
-        state.pendingAuth?.requestId === event.requestId
-      ) {
-        if (
-          state.pendingAuth.kind === "terminal" &&
-          event.operation !== "auth/terminal_start"
-        ) {
-          return {
-            ...state,
-            authError: event.message,
-            authTerminal: state.authTerminal == null
-              ? undefined
-              : { ...state.authTerminal, message: event.message },
-          };
-        }
-        const terminal = state.pendingAuth.kind === "terminal" && state.authTerminal
-          ? {
-              ...state.authTerminal,
-              status: "failed" as const,
-              message: event.message,
-            }
-          : state.authTerminal;
-        return {
-          ...state,
-          pendingAuth: undefined,
-          authTerminal: terminal,
-          authStatus: state.pendingAuth.kind === "authenticate" || state.pendingAuth.kind === "terminal"
-            ? "required"
-            : state.authStatus,
-          authError: event.message,
-        };
-      }
-      if (event.requestId != null && event.operation === "permission/respond") {
-        const pending = state.permissions.find(
-          ({ responseRequestId }) => responseRequestId === event.requestId,
-        );
-        if (pending) {
-          return failPermissionResponse(state, pending.permissionId, event.message);
-        }
-        for (const [sessionId, snapshot] of state.cachedSessions) {
-          const cached = snapshot.permissions.find(
-            ({ responseRequestId }) => responseRequestId === event.requestId,
-          );
-          if (!cached) continue;
-          return updateCachedSession(
-            state,
-            sessionId,
-            (cachedState) => failPermissionResponse(
-              cachedState,
-              cached.permissionId,
-              event.message,
-            ),
-            event,
-          );
-        }
-        return appendBackgroundEvent(state, event);
-      }
-      if (event.requestId != null && event.operation === "elicitation/respond") {
-        const pending = state.elicitations.find(
-          ({ responseRequestId }) => responseRequestId === event.requestId,
-        );
-        if (pending) {
-          return failElicitationResponse(state, pending.elicitationId, event.message);
-        }
-        for (const [sessionId, snapshot] of state.cachedSessions) {
-          const cached = snapshot.elicitations.find(
-            ({ responseRequestId }) => responseRequestId === event.requestId,
-          );
-          if (!cached) continue;
-          return updateCachedSession(
-            state,
-            sessionId,
-            (cachedState) => failElicitationResponse(
-              cachedState,
-              cached.elicitationId,
-              event.message,
-            ),
-            event,
-          );
-        }
-        return appendBackgroundEvent(state, event);
-      }
-      if (isAuthenticationRequired(state, event)) {
-        return settleAuthenticationRequired(state, event.requestId);
-      }
-      if (
-        event.requestId != null &&
-        event.requestId === state.sessionTransition?.requestId
-      ) {
-        const restored = rollbackSessionTransition(state);
-        const error = errorTimelineItem(event);
-        return {
-          ...restored,
-          timeline: [
-            ...restored.timeline.filter((item) =>
-              item.type !== "error" ||
-              item.message !== error.message ||
-              item.operation !== error.operation ||
-              item.code !== error.code
-            ),
-            error,
-          ],
-        };
-      }
-      if (event.requestId != null) {
-        if (
-          event.operation === "session/prompt" &&
-          state.pendingPrompt?.requestId === event.requestId
-        ) {
-          return failPrompt(state, event);
-        }
-        if (event.operation === "session/prompt") {
-          for (const [sessionId, snapshot] of state.cachedSessions) {
-            if (snapshot.pendingPrompt?.requestId !== event.requestId) continue;
-            return updateCachedSession(
-              state,
-              sessionId,
-              (cached) => failPrompt(cached, event),
-              event,
-            );
-          }
-        }
-        if (state.pendingSessionControl?.requestId === event.requestId) {
-          return {
-            ...state,
-            pendingSessionControl: undefined,
-            timeline: [
-              ...state.timeline,
-              errorTimelineItem(event),
-            ],
-          };
-        }
-        const pendingDeletion = state.pendingSessionDeletions.find(
-          ({ requestId }) => requestId === event.requestId,
-        );
-        if (pendingDeletion) {
-          return {
-            ...state,
-            pendingSessionDeletions: state.pendingSessionDeletions.filter(
-              ({ requestId }) => requestId !== event.requestId,
-            ),
-            timeline: [
-              ...state.timeline,
-              errorTimelineItem(event),
-            ],
-          };
-        }
-      }
-      return {
-        ...state,
-        timeline: [
-          ...state.timeline,
-          errorTimelineItem(event),
-        ],
-      };
-    }
-    case "acp/initialized":
-      const preserveRuntimeAuth = state.pendingAuth != null ||
-        state.authTerminal != null ||
-        state.authStatus === "authenticated" ||
-        state.authStatus === "logged_out";
-      return {
-        ...state,
-        initialized: event.response,
-        authStatus: preserveRuntimeAuth
-          ? state.authStatus
-          : (event.response.authMethods?.length ?? 0) > 0 || event.response.agentCapabilities?.auth?.logout != null
-            ? "available"
-            : undefined,
-        pendingAuth: preserveRuntimeAuth ? state.pendingAuth : undefined,
-        authTerminal: preserveRuntimeAuth ? state.authTerminal : undefined,
-        authError: preserveRuntimeAuth ? state.authError : undefined,
-        lastAuthResponse: preserveRuntimeAuth ? state.lastAuthResponse : undefined,
-      };
     case "acp/authenticated":
       if (
         state.pendingAuth != null &&
@@ -1174,377 +839,191 @@ function reduceServerEvent(state: AppState, event: ServerEvent): AppState {
         authError: undefined,
         lastAuthResponse: { kind: "logout", response: event.response },
       };
-    case "acp/session_created":
-      if (
-        state.sessionTransition?.kind !== "new" ||
-        state.sessionTransition.requestId !== event.requestId
-      ) {
-        if (state.sessionTransition?.kind === "new") {
-          return appendBackgroundEvent(state, event);
-        }
-        return openObservedSession(
-          state,
-          event.response,
-          event.cwd,
-          event.earlyUpdates,
-        );
-      }
-      return applyEarlySessionUpdates({
-        ...state,
-        cwd: event.cwd ?? state.sessionTransition.targetCwd ?? state.defaultCwd,
-        session: event.response,
-        pendingSessionId: undefined,
-        sessionTransition: undefined,
-        modeId: event.response.modes?.currentModeId,
-        configOptions: event.response.configOptions ?? null,
-      }, event.response, event.earlyUpdates);
-    case "acp/sessions_listed": {
-      const listedActive = state.session == null
-        ? undefined
-        : event.response.sessions.find(
-            ({ sessionId }) => sessionId === state.session?.sessionId,
-          );
+  }
+  return assertNever(event, "global business event");
+}
+
+function applySessionsListed(
+  state: AppState,
+  cursor: string | undefined,
+  response: SessionListResult,
+): AppState {
+  const listedActive = state.session == null
+    ? undefined
+    : response.sessions.find(
+        ({ sessionId }) => sessionId === state.session?.sessionId,
+      );
+  return {
+    ...state,
+    sessions: cursor
+      ? mergeSessions(state.sessions, response.sessions)
+      : mergeSessions(
+          state.sessions.filter(({ sessionId }) => state.cachedSessions.has(sessionId)),
+          response.sessions,
+        ),
+    nextSessionCursor: response.nextCursor,
+    title: state.title ?? listedActive?.title ?? undefined,
+  };
+}
+
+function applyBridgeError(state: AppState, event: BridgeError): AppState {
+  state = clearRuntimeOperation(state, event.requestId);
+  if (
+    event.requestId != null &&
+    state.pendingAuth?.requestId === event.requestId
+  ) {
+    if (
+      state.pendingAuth.kind === "terminal" &&
+      event.operation !== "auth/terminal_start"
+    ) {
       return {
         ...state,
-        sessions: event.cursor
-          ? mergeSessions(state.sessions, event.response.sessions)
-          : mergeSessions(
-              state.sessions.filter(({ sessionId }) => state.cachedSessions.has(sessionId)),
-              event.response.sessions,
-            ),
-        nextSessionCursor: event.response.nextCursor,
-        title: state.title ?? listedActive?.title ?? undefined,
+        authError: event.message,
+        authTerminal: state.authTerminal == null
+          ? undefined
+          : { ...state.authTerminal, message: event.message },
       };
     }
-    case "acp/session_attached": {
-      if (
-        state.sessionTransition?.kind !== "attach" ||
-        state.sessionTransition.requestId !== event.requestId ||
-        state.sessionTransition.targetSessionId !== event.sessionId
-      ) {
-        if (state.sessionTransition?.kind === "attach") {
-          return appendBackgroundEvent(state, event);
+    const terminal = state.pendingAuth.kind === "terminal" && state.authTerminal
+      ? {
+          ...state.authTerminal,
+          status: "failed" as const,
+          message: event.message,
         }
-        return openObservedSession(state, {
-          ...event.response,
-          sessionId: event.sessionId,
-        }, event.cwd);
-      }
-      const listed = state.sessions.find(({ sessionId }) => sessionId === event.sessionId);
-      const cachedSessions = new Map(state.cachedSessions);
-      cachedSessions.delete(event.sessionId);
-      return {
-        ...state,
-        cachedSessions,
-        cwd: event.cwd ?? listed?.cwd ?? state.defaultCwd,
-        session: { sessionId: event.sessionId, ...event.response },
-        historyStatus: {
-          state: "available",
-          sessionId: event.sessionId,
-        },
-        pendingSessionId: undefined,
-        sessionTransition: undefined,
-        modeId: event.response.modes?.currentModeId,
-        configOptions: event.response.configOptions ?? null,
-        title: state.title ?? listed?.title ?? undefined,
-      };
+      : state.authTerminal;
+    return {
+      ...state,
+      pendingAuth: undefined,
+      authTerminal: terminal,
+      authStatus: state.pendingAuth.kind === "authenticate" || state.pendingAuth.kind === "terminal"
+        ? "required"
+        : state.authStatus,
+      authError: event.message,
+    };
+  }
+  if (event.requestId != null && event.operation === "permission/respond") {
+    const pending = state.permissions.find(
+      ({ responseRequestId }) => responseRequestId === event.requestId,
+    );
+    if (pending) {
+      return failPermissionResponse(state, pending.permissionId, event.message);
     }
-    case "acp/session_forked": {
-      const settled = clearRuntimeOperation(state, event.requestId);
-      if (
-        !isCurrentSession(settled, event.sourceSessionId) ||
-        settled.sessionTransition?.kind !== "fork" ||
-        settled.sessionTransition.requestId !== event.requestId ||
-        settled.sessionTransition.targetSessionId !== event.sourceSessionId
-      ) {
-        if (settled.sessionTransition?.kind === "fork") {
-          return appendBackgroundEvent(settled, event);
-        }
-        return openObservedSession(
-          settled,
-          event.response,
-          event.cwd,
-          event.earlyUpdates,
-        );
-      }
-      return applyEarlySessionUpdates({
-        ...settled,
-        cwd: event.cwd ?? settled.cwd,
-        session: event.response,
-        pendingSessionId: undefined,
-        sessionTransition: undefined,
-        modeId: event.response.modes?.currentModeId,
-        configOptions: event.response.configOptions ?? null,
-        permissions: [],
-        elicitations: requestScopedElicitations(settled.elicitations),
-        running: false,
-        agentActivity: undefined,
-        pendingPrompt: undefined,
-      }, event.response, event.earlyUpdates);
-    }
-    case "acp/session_closed":
-      return removeAuthoritativeSessionRuntime(state, event.sessionId, false);
-    case "acp/session_deleted":
-      return removeAuthoritativeSessionRuntime(state, event.sessionId, true);
-    case "acp/session_update":
-      if (isCurrentSession(state, event.notification.sessionId)) {
-        return reduceSessionUpdate(state, event.notification);
-      }
-      return updateCachedSession(
-        state,
-        event.notification.sessionId,
-        (cached) => reduceSessionUpdate(cached, event.notification),
-        event,
+    for (const [sessionId, snapshot] of state.cachedSessions) {
+      const cached = snapshot.permissions.find(
+        ({ responseRequestId }) => responseRequestId === event.requestId,
       );
-    case "acp/terminal_state":
-      if (isCurrentSession(state, event.terminal.sessionId)) {
-        return {
-          ...state,
-          terminalSnapshots: upsertTerminalSnapshot(
-            state.terminalSnapshots,
-            event.terminal,
-            state.sessionSyncPhase != null,
-          ),
-        };
-      }
+      if (!cached) continue;
       return updateCachedSession(
         state,
-        event.terminal.sessionId,
-        (cached) => ({
-          ...cached,
-          terminalSnapshots: upsertTerminalSnapshot(
-            cached.terminalSnapshots,
-            event.terminal,
-            cached.sessionSyncPhase != null,
-          ),
-        }),
-        event,
-      );
-    case "acp/prompt_started":
-      if (isCurrentSession(state, event.sessionId)) {
-        return startPrompt(state, event.requestId, event.sessionId, event.prompt);
-      }
-      return updateCachedSession(
-        state,
-        event.sessionId,
-        (cached) => startPrompt(
-          cached,
-          event.requestId,
-          event.sessionId,
-          event.prompt,
+        sessionId,
+        (cachedState) => failPermissionResponse(
+          cachedState,
+          cached.permissionId,
+          event.message,
         ),
         event,
       );
-    case "acp/prompt_complete":
-      if (isCurrentSession(state, event.sessionId)) {
-        return completePrompt(state, event);
-      }
+    }
+    return appendBackgroundEvent(state, event);
+  }
+  if (event.requestId != null && event.operation === "elicitation/respond") {
+    const pending = state.elicitations.find(
+      ({ responseRequestId }) => responseRequestId === event.requestId,
+    );
+    if (pending) {
+      return failElicitationResponse(state, pending.elicitationId, event.message);
+    }
+    for (const [sessionId, snapshot] of state.cachedSessions) {
+      const cached = snapshot.elicitations.find(
+        ({ responseRequestId }) => responseRequestId === event.requestId,
+      );
+      if (!cached) continue;
       return updateCachedSession(
         state,
-        event.sessionId,
-        (cached) => completePrompt(cached, event),
+        sessionId,
+        (cachedState) => failElicitationResponse(
+          cachedState,
+          cached.elicitationId,
+          event.message,
+        ),
         event,
       );
-    case "acp/permission_request": {
-      if (!isCurrentSession(state, event.request.sessionId)) {
-        if (state.cachedSessions.has(event.request.sessionId)) {
-          return markSessionAttention(updateCachedSession(
-            state,
-            event.request.sessionId,
-            (cached) => reduceServerEvent(cached, event),
-            event,
-          ), event.request.sessionId);
-        }
-        return appendBackgroundEvent(state, event);
-      }
-      const { timeline } = upsertToolCall(
-        state.timeline,
-        event.request.toolCall,
-        event,
-        "permission",
-      );
-      return {
-        ...state,
-        timeline,
-        permissions: [
-          ...state.permissions.filter(
-            ({ permissionId }) => permissionId !== event.permissionId,
-          ),
-          { permissionId: event.permissionId, request: event.request },
-        ],
-      };
     }
-    case "acp/permission_resolved": {
-      const pending = state.permissions.find(
-        ({ permissionId }) => permissionId === event.permissionId,
-      );
-      if (pending) return removePermission(state, event.permissionId);
-      for (const [sessionId, snapshot] of state.cachedSessions) {
-        const cachedPending = snapshot.permissions.find(
-          ({ permissionId }) => permissionId === event.permissionId,
-        );
-        if (!cachedPending) continue;
-        return clearSessionAttentionIfSettled(updateCachedSession(
-          state,
-          sessionId,
-          (cached) => removePermission(cached, event.permissionId),
-          event,
-        ), sessionId);
-      }
-      return appendBackgroundEvent(state, event);
-    }
-    case "acp/elicitation_request": {
-      const scopedSessionId = elicitationSessionId(event.request);
-      const urlFlowId = event.request.mode === "url" && "elicitationId" in event.request
-        ? event.request.elicitationId
-        : undefined;
-      if (scopedSessionId != null && !isCurrentSession(state, scopedSessionId)) {
-        if (state.cachedSessions.has(scopedSessionId)) {
-          return markSessionAttention(updateCachedSession(
-            state,
-            scopedSessionId,
-            (cached) => reduceServerEvent(cached, event),
-            event,
-          ), scopedSessionId);
-        }
-        return appendBackgroundEvent(state, event);
-      }
-      return {
-        ...state,
-        externalFlows: urlFlowId != null
-          ? state.externalFlows.filter((flow) => flow.elicitationId !== urlFlowId)
-          : state.externalFlows,
-        elicitations: [
-          ...state.elicitations.filter(
-            ({ elicitationId }) => elicitationId !== event.elicitationId,
-          ),
-          { elicitationId: event.elicitationId, request: event.request },
-        ],
-      };
-    }
-    case "acp/elicitation_complete":
-      return completeExternalFlow(state, event.notification.elicitationId);
-    case "acp/elicitation_resolved": {
-      const pending = state.elicitations.find(
-        ({ elicitationId }) => elicitationId === event.elicitationId,
-      );
-      if (pending) return resolveElicitation(state, event.elicitationId, event.response);
-      for (const [sessionId, snapshot] of state.cachedSessions) {
-        const cachedPending = snapshot.elicitations.find(
-          ({ elicitationId }) => elicitationId === event.elicitationId,
-        );
-        if (!cachedPending) continue;
-        return clearSessionAttentionIfSettled(updateCachedSession(
-          state,
-          sessionId,
-          (cached) => resolveElicitation(
-            cached,
-            event.elicitationId,
-            event.response,
-          ),
-          event,
-        ), sessionId);
-      }
-      return appendBackgroundEvent(state, event);
-    }
-    case "acp/elicitation_aborted": {
-      const flow = state.externalFlows.find(
-        ({ elicitationId }) => elicitationId === event.elicitationId,
-      );
-      if (flow?.sessionId !== event.sessionId) {
-        return appendBackgroundEvent(state, event);
-      }
-      return abortExternalFlow(
-        state,
-        event.elicitationId,
-        event.sessionId,
-        event.reason,
-      );
-    }
-    case "acp/mode_changed":
-      if (!isCurrentSession(state, event.sessionId)) {
-        return updateCachedSession(
-          state,
-          event.sessionId,
-          (cached) => ({
-            ...cached,
-            modeId: event.modeId,
-            runtimeOperation: undefined,
-          }),
-          event,
-        );
-      }
-      if (
-        !state.runtimeReplaying &&
-        state.pendingSessionControl != null &&
-        (
-        state.pendingSessionControl?.kind !== "mode" ||
-        state.pendingSessionControl.requestId !== event.requestId ||
-        state.pendingSessionControl.sessionId !== event.sessionId
-        )
-      ) return appendBackgroundEvent(state, event);
-      return {
-        ...state,
-        modeId: event.modeId,
-        pendingSessionControl: undefined,
-        runtimeOperation: undefined,
-      };
-    case "acp/config_changed":
-      if (!isCurrentSession(state, event.sessionId)) {
-        return updateCachedSession(
-          state,
-          event.sessionId,
-          (cached) => ({
-            ...cached,
-            configOptions: event.response.configOptions,
-            runtimeOperation: undefined,
-          }),
-          event,
-        );
-      }
-      if (
-        !state.runtimeReplaying &&
-        state.pendingSessionControl != null &&
-        (
-        state.pendingSessionControl?.kind !== "config" ||
-        state.pendingSessionControl.requestId !== event.requestId ||
-        state.pendingSessionControl.sessionId !== event.sessionId
-        )
-      ) {
-        return appendBackgroundEvent(state, event);
-      }
-      return {
-        ...state,
-        configOptions: event.response.configOptions,
-        pendingSessionControl: undefined,
-        runtimeOperation: undefined,
-      };
-    case "acp/mcp_connection":
-      return {
-        ...state,
-        mcpConnections: event.action === "connected"
-          ? [
-              ...state.mcpConnections.filter(
-                ({ connectionId }) => connectionId !== event.connectionId,
-              ),
-              {
-                serverId: event.serverId,
-                connectionId: event.connectionId,
-                name: event.name,
-              },
-            ]
-          : state.mcpConnections.filter(
-              ({ connectionId }) => connectionId !== event.connectionId,
-            ),
-      };
-    case "acp/mcp_message":
-      return {
-        ...state,
-        mcpActivity: [...state.mcpActivity, event],
-      };
+    return appendBackgroundEvent(state, event);
   }
-
-  return assertNever(event, "attyd server event reducer");
+  if (isAuthenticationRequired(state, event)) {
+    return settleAuthenticationRequired(state, event.requestId);
+  }
+  if (
+    event.requestId != null &&
+    event.requestId === state.sessionTransition?.requestId
+  ) {
+    const restored = rollbackSessionTransition(state);
+    const error = errorTimelineItem(event);
+    return {
+      ...restored,
+      timeline: [
+        ...restored.timeline.filter((item) =>
+          item.type !== "error" ||
+          item.message !== error.message ||
+          item.operation !== error.operation ||
+          item.code !== error.code
+        ),
+        error,
+      ],
+    };
+  }
+  if (event.requestId != null) {
+    if (
+      event.operation === "session/prompt" &&
+      state.pendingPrompt?.requestId === event.requestId
+    ) {
+      return failPrompt(state, event);
+    }
+    if (event.operation === "session/prompt") {
+      for (const [sessionId, snapshot] of state.cachedSessions) {
+        if (snapshot.pendingPrompt?.requestId !== event.requestId) continue;
+        return updateCachedSession(
+          state,
+          sessionId,
+          (cached) => failPrompt(cached, event),
+          event,
+        );
+      }
+    }
+    if (state.pendingSessionControl?.requestId === event.requestId) {
+      return {
+        ...state,
+        pendingSessionControl: undefined,
+        timeline: [
+          ...state.timeline,
+          errorTimelineItem(event),
+        ],
+      };
+    }
+    const pendingDeletion = state.pendingSessionDeletions.find(
+      ({ requestId }) => requestId === event.requestId,
+    );
+    if (pendingDeletion) {
+      return {
+        ...state,
+        pendingSessionDeletions: state.pendingSessionDeletions.filter(
+          ({ requestId }) => requestId !== event.requestId,
+        ),
+        timeline: [
+          ...state.timeline,
+          errorTimelineItem(event),
+        ],
+      };
+    }
+  }
+  return {
+    ...state,
+    timeline: [
+      ...state.timeline,
+      errorTimelineItem(event),
+    ],
+  };
 }
 
 function startPrompt(
@@ -1581,31 +1060,9 @@ function startPrompt(
   };
 }
 
-function completePrompt(
-  state: AppState,
-  event: Extract<ServerEvent, { type: "acp/prompt_complete" }>,
-): AppState {
-  if (
-    state.session?.sessionId !== event.sessionId ||
-    state.pendingPrompt?.requestId !== event.requestId ||
-    state.pendingPrompt.sessionId !== event.sessionId
-  ) return appendBackgroundEvent(state, event);
-  state = archiveActivePlan(state);
-  return {
-    ...state,
-    running: false,
-    agentActivity: undefined,
-    pendingPrompt: undefined,
-    timeline: [
-      ...finishTurnTools(state.timeline, event.response),
-      { id: randomId(), type: "stop", response: event.response },
-    ],
-  };
-}
-
 function failPrompt(
   state: AppState,
-  event: Extract<ServerEvent, { type: "bridge/error" }>,
+  event: BridgeError,
 ): AppState {
   const pendingPrompt = state.pendingPrompt;
   if (pendingPrompt == null || pendingPrompt.requestId !== event.requestId) return state;
@@ -1856,23 +1313,6 @@ function reduceSessionUpdate(
         },
       },
     ],
-  };
-}
-
-function applyEarlySessionUpdates(
-  state: AppState,
-  response: NewSessionResponse | ForkSessionResponse,
-  updates: SessionNotification[] | undefined,
-): AppState {
-  let next = state;
-  for (const notification of updates ?? []) {
-    next = reduceSessionUpdate(next, notification);
-  }
-  return {
-    ...next,
-    session: response,
-    modeId: response.modes?.currentModeId,
-    configOptions: response.configOptions ?? null,
   };
 }
 
@@ -2241,14 +1681,10 @@ function terminateBridgeState(
     ...current,
     phase,
     socketOpen,
-    runtimeReplaying: false,
-    runtimeReplacement: undefined,
-    sessionLoadReplacement: undefined,
     cachedSessions: new Map(),
     attentionSessionIds: [],
     running: false,
     agentActivity: undefined,
-    mcpConnections: [],
     permissions: [],
     elicitations: [],
     externalFlows: [],
@@ -2288,7 +1724,7 @@ function appendAuthTerminalOutput(state: AppState, data: string): AppState {
 
 function isAuthenticationRequired(
   state: AppState,
-  event: Extract<ServerEvent, { type: "bridge/error" }>,
+  event: BridgeError,
 ): boolean {
   return event.code === -32_000 && (state.initialized?.authMethods?.length ?? 0) > 0;
 }
@@ -2774,91 +2210,6 @@ function cacheCurrentSession(state: AppState): AppState {
   };
 }
 
-function cacheRuntimeSession(
-  state: AppState,
-  event: Extract<ServerEvent, { type: "bridge/runtime_session" }>,
-): AppState {
-  const snapshot = runtimeSessionSnapshot(state, event);
-  const sessions = mergeSessions(state.sessions, [{
-    sessionId: event.sessionId,
-    cwd: snapshot.cwd,
-  }]);
-  if (state.session?.sessionId === event.sessionId) {
-    const title = state.title;
-    const reset = resetActiveSession(state);
-    return {
-      ...reset,
-      ...snapshot,
-      title: snapshot.title ?? title,
-      cachedSessions: withoutCachedSession(
-        state.cachedSessions,
-        event.sessionId,
-      ),
-      sessions,
-      elicitations: [
-        ...snapshot.elicitations,
-        ...requestScopedElicitations(state.elicitations),
-      ],
-    };
-  }
-  const cachedSessions = new Map(state.cachedSessions);
-  cachedSessions.set(event.sessionId, snapshot);
-  return {
-    ...state,
-    cachedSessions,
-    sessions,
-  };
-}
-
-function runtimeSessionSnapshot(
-  state: AppState,
-  event: Extract<ServerEvent, { type: "bridge/runtime_session" }>,
-): ActiveSessionSnapshot {
-  return {
-    cwd: event.cwd || state.defaultCwd,
-    session: event.session,
-    availableCommands: [],
-    modeId: event.session.modes?.currentModeId,
-    configOptions: event.session.configOptions ?? null,
-    timeline: event.truncated
-      ? [{
-          id: randomId(),
-          type: "error",
-          message: "Earlier in-memory runtime events were omitted because the replay limit was reached",
-        }]
-      : [],
-    permissions: [],
-    elicitations: [],
-    running: false,
-    terminalSnapshots: [],
-  };
-}
-
-function openObservedSession(
-  state: AppState,
-  response: NewSessionResponse | ForkSessionResponse,
-  cwd?: string,
-  earlyUpdates?: SessionNotification[],
-): AppState {
-  const sessionId = response.sessionId;
-  let next = cacheRuntimeSession(state, {
-    type: "bridge/runtime_session",
-    sessionId,
-    cwd: cwd ?? state.defaultCwd,
-    session: response,
-    truncated: false,
-  });
-  for (const notification of earlyUpdates ?? []) {
-    next = reduceServerEvent(next, {
-      type: "acp/session_update",
-      notification,
-    });
-  }
-  return state.session == null && state.sessionTransition == null
-    ? activateCachedSession(next, sessionId)
-    : next;
-}
-
 function activateCachedSession(state: AppState, sessionId: string): AppState {
   if (
     state.session?.sessionId === sessionId ||
@@ -3040,7 +2391,6 @@ function rollbackSessionTransition(state: AppState): AppState {
     ],
     pendingSessionId: undefined,
     sessionTransition: undefined,
-    sessionLoadReplacement: undefined,
   };
 }
 
@@ -3056,15 +2406,6 @@ function requestScopedElicitations(
   elicitations: PendingElicitation[],
 ): PendingElicitation[] {
   return elicitations.filter(({ request }) => elicitationSessionId(request) == null);
-}
-
-function removePermission(state: AppState, permissionId: string): AppState {
-  return {
-    ...state,
-    permissions: state.permissions.filter(
-      (permission) => permission.permissionId !== permissionId,
-    ),
-  };
 }
 
 function failPermissionResponse(
@@ -3097,34 +2438,12 @@ function failElicitationResponse(
   };
 }
 
-function markSessionAttention(state: AppState, sessionId: string): AppState {
-  return state.attentionSessionIds.includes(sessionId)
-    ? state
-    : {
-        ...state,
-        attentionSessionIds: [...state.attentionSessionIds, sessionId],
-      };
-}
-
-function clearSessionAttentionIfSettled(state: AppState, sessionId: string): AppState {
-  const session = state.cachedSessions.get(sessionId);
-  if ((session?.permissions.length ?? 0) > 0 || (session?.elicitations.length ?? 0) > 0) {
-    return state;
-  }
-  return {
-    ...state,
-    attentionSessionIds: state.attentionSessionIds.filter(
-      (candidate) => candidate !== sessionId,
-    ),
-  };
-}
-
 function isCurrentSession(state: AppState, sessionId: string): boolean {
   return (state.session?.sessionId ?? state.pendingSessionId) === sessionId;
 }
 
 function errorTimelineItem(
-  event: Extract<ServerEvent, { type: "bridge/error" }>,
+  event: BridgeError,
   retryBlocks?: ContentBlock[],
 ): Extract<TimelineItem, { type: "error" }> {
   return {
@@ -3151,7 +2470,6 @@ function appendBackgroundEvent(state: AppState, event: unknown): AppState {
 function upsertTerminalSnapshot(
   snapshots: TerminalSnapshot[],
   incoming: TerminalSnapshot,
-  _retainHistory = false,
 ): TerminalSnapshot[] {
   const previous = snapshots.find(
     ({ terminalId }) => terminalId === incoming.terminalId,
@@ -3168,100 +2486,6 @@ function upsertTerminalSnapshot(
   // A materialized business view owns its history retention. Live updates must
   // not evict terminal results that are still referenced by that history.
   return next;
-}
-
-function resolveElicitation(
-  state: AppState,
-  bridgeElicitationId: string,
-  response: CreateElicitationResponse,
-): AppState {
-  const pending = state.elicitations.find(
-    ({ elicitationId }) => elicitationId === bridgeElicitationId,
-  );
-  let externalFlows = state.externalFlows;
-  if (
-    response.action === "accept" &&
-    pending?.request.mode === "url" &&
-    "elicitationId" in pending.request &&
-    typeof pending.request.elicitationId === "string" &&
-    "url" in pending.request &&
-    typeof pending.request.url === "string"
-  ) {
-    const agentElicitationId = pending.request.elicitationId;
-    const flow: ExternalElicitationFlow = {
-      elicitationId: agentElicitationId,
-      sessionId: elicitationSessionId(pending.request),
-      url: pending.request.url,
-      message: pending.request.message,
-      status: externalFlows.some(
-        ({ elicitationId, status }) =>
-          elicitationId === agentElicitationId && status === "completed",
-      )
-        ? "completed"
-        : "waiting",
-    };
-    externalFlows = upsertExternalFlow(externalFlows, flow);
-  }
-  return {
-    ...state,
-    externalFlows,
-    elicitations: state.elicitations.filter(
-      ({ elicitationId }) => elicitationId !== bridgeElicitationId,
-    ),
-  };
-}
-
-function completeExternalFlow(state: AppState, elicitationId: string): AppState {
-  const existing = state.externalFlows.find(
-    (flow) => flow.elicitationId === elicitationId,
-  );
-  if (existing?.status === "cancelled") return state;
-  return {
-    ...state,
-    externalFlows: upsertExternalFlow(state.externalFlows, {
-      elicitationId,
-      sessionId: existing?.sessionId,
-      url: existing?.url,
-      message: existing?.message ?? "External flow",
-      status: "completed",
-    }),
-  };
-}
-
-function abortExternalFlow(
-  state: AppState,
-  elicitationId: string,
-  sessionId: string,
-  reason: Extract<ServerEvent, { type: "acp/elicitation_aborted" }>["reason"],
-): AppState {
-  const existing = state.externalFlows.find(
-    (flow) => flow.elicitationId === elicitationId,
-  );
-  if (existing?.status === "completed") return state;
-  return {
-    ...state,
-    externalFlows: upsertExternalFlow(state.externalFlows, {
-      elicitationId,
-      sessionId,
-      url: existing?.url,
-      message: existing?.message ?? "External flow",
-      status: "cancelled",
-      abortReason: reason,
-    }),
-  };
-}
-
-function upsertExternalFlow(
-  flows: ExternalElicitationFlow[],
-  next: ExternalElicitationFlow,
-): ExternalElicitationFlow[] {
-  const index = flows.findIndex(
-    ({ elicitationId }) => elicitationId === next.elicitationId,
-  );
-  if (index < 0) return [...flows, next];
-  const result = [...flows];
-  result[index] = next;
-  return result;
 }
 
 function mergeSessions(current: SessionInfo[], incoming: SessionInfo[]): SessionInfo[] {

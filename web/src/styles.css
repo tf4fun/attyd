@@ -76,10 +76,6 @@ button, input, textarea, select { color: inherit; }
 .sidebar-details summary svg:last-child { margin-left: auto; }
 .sidebar-details[open] summary svg:last-child { transform: rotate(180deg); }
 .sidebar-details > .raw-json { margin: 0 6px 10px; }
-.sidebar-details.logs pre {
-  max-height: 180px; margin: 0 6px 10px; padding: 8px; overflow: auto; white-space: pre-wrap;
-  background: var(--theme-code-surface); color: var(--theme-code-ink); border-radius: 6px; font: 9px/1.5 var(--mono);
-}
 .new-thread-overlay {
   position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px;
   background: var(--theme-overlay); backdrop-filter: blur(2px);
@@ -807,7 +803,7 @@ a.attachment-row:hover > strong { text-decoration: underline; text-underline-off
 .agent-details-body .mcp-summary { margin: 0 0 8px 22px; }
 .agent-details-body .sidebar-details:first-of-type { border-top: 1px solid var(--line); }
 .sidebar-details summary { padding: 9px 2px; font-size: 9px; }
-.sidebar-details > .raw-json, .sidebar-details.logs pre { margin-right: 0; margin-left: 0; }
+.sidebar-details > .raw-json { margin-right: 0; margin-left: 0; }
 .agent-auth-details > summary { gap: 6px; }
 .agent-auth-details > summary > svg:last-child { transform: rotate(0); }
 .agent-auth-details[open] > summary > svg:last-child { transform: rotate(90deg); }

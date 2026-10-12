@@ -48,9 +48,9 @@ function StyleShowcase() {
     if (!session) return initialState;
     let state: AppState = { ...initialState, session: { sessionId: session.sessionId } };
     for (const update of session.updates) {
-      state = appReducer(state, { type: "server/event", event: {
-        type: "acp/session_update", notification: { sessionId: session.sessionId, update },
-      } });
+      state = appReducer(state, {
+        type: "session/turn_update", notification: { sessionId: session.sessionId, update },
+      });
     }
     return state;
   }, [session]);

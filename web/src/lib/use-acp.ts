@@ -6,7 +6,7 @@ import type {
   RequestPermissionResponse,
   SessionInfo,
 } from "@agentclientprotocol/sdk";
-import type { ServerEvent, TerminalSnapshot } from "../../../shared/bridge";
+import type { TerminalSnapshot } from "../../../shared/bridge";
 import {
   type BridgeSessionView,
   type BridgeTurnProcessPage,
@@ -151,9 +151,8 @@ export function useAcp() {
       const body = error.body;
       if (isRecord(body) && typeof body.code === "number") {
         dispatch({
-          type: "server/event",
-          event: {
-            type: "bridge/error",
+          type: "request/failed",
+          error: {
             message: typeof body.message === "string" ? body.message : error.message,
             code: body.code,
             data: body.data,
@@ -171,12 +170,11 @@ export function useAcp() {
   const reportRequestError = useCallback((
     error: unknown,
     requestId: string,
-    operation: Extract<ServerEvent, { type: "bridge/error" }>["operation"],
+    operation: string,
   ) => {
     dispatch({
-      type: "server/event",
-      event: {
-        type: "bridge/error",
+      type: "request/failed",
+      error: {
         requestId,
         operation,
         message: error instanceof Error ? error.message : String(error),
@@ -378,18 +376,12 @@ export function useAcp() {
           viewRevision: event.viewRevision,
           terminals: { ...current.terminals, [terminal.terminalId]: terminal },
         };
-        dispatch({ type: "server/event", event: { type: "acp/terminal_state", terminal } });
+        dispatch({ type: "session/terminal_update", terminal });
         return;
       }
       if (event.change.kind === "turn_update" && event.change.update != null) {
         sessionViewRef.current = { ...current, viewRevision: event.viewRevision };
-        dispatch({
-          type: "server/event",
-          event: {
-            type: "acp/session_update",
-            notification: { sessionId, update: event.change.update },
-          },
-        });
+        dispatch({ type: "session/turn_update", notification: { sessionId, update: event.change.update } });
         return;
       }
       const local = applyLocalSessionDelta(current, event.change, event.viewRevision);
@@ -475,15 +467,7 @@ export function useAcp() {
       throw new ApiError("Session catalog changed", 409, { data: { kind: "session_catalog_changed" } });
     }
     sessionCatalogRevisionRef.current = response.catalogRevision;
-    dispatch({
-      type: "server/event",
-      event: {
-        type: "acp/sessions_listed",
-        requestId: randomId(),
-        cursor,
-        response,
-      },
-    });
+    dispatch({ type: "sessions/listed", cursor, response });
     return response;
   }, []);
 
@@ -576,15 +560,10 @@ export function useAcp() {
         prepareConnectionRestore();
       }
       dispatch({ type: "socket/open" });
-      if (runtime.hello != null) dispatch({ type: "server/event", event: runtime.hello });
-      if (runtime.initialized != null) {
-        dispatch({ type: "server/event", event: runtime.initialized });
-      }
+      dispatch({ type: "runtime/loaded", runtime });
+      if (runtime.phase == null && !runtime.connected) dispatch({ type: "socket/closed" });
       sessionListSupportedRef.current = runtime.initialized?.response.agentCapabilities?.sessionCapabilities?.list != null;
       sessionLoadSupportedRef.current = runtime.initialized?.response.agentCapabilities?.loadSession === true;
-      if (runtime.error != null) dispatch({ type: "server/event", event: runtime.error });
-      if (runtime.phase != null) dispatch({ type: "server/event", event: runtime.phase });
-      else if (!runtime.connected) dispatch({ type: "socket/closed" });
 
       if (!runtime.connected || runtime.phase?.phase !== "ready") {
         setSessionOpening(undefined);
@@ -708,10 +687,7 @@ export function useAcp() {
           promptAdmissionsRef.current.clear();
           closeAuthInput();
         }
-        dispatch({
-          type: "server/event",
-          event: { type: "bridge/phase", phase: event.phase },
-        });
+        dispatch({ type: "global/event", event });
         if (event.phase === "ready") {
           if (stateRef.current.authTerminal?.status === "succeeded") {
             dispatch({ type: "auth/dismiss_terminal" });
@@ -720,15 +696,7 @@ export function useAcp() {
         }
         return;
       case "bridge/connection_error":
-        dispatch({
-          type: "server/event",
-          event: {
-            type: "bridge/error",
-            message: event.message,
-            code: event.code,
-            data: event.data,
-          },
-        });
+        dispatch({ type: "global/event", event });
         void refreshRuntime();
         return;
       case "bridge/catalog_changed":
@@ -736,7 +704,7 @@ export function useAcp() {
         invalidateSessionList();
         return;
       default:
-        dispatch({ type: "server/event", event: event as ServerEvent });
+        dispatch({ type: "global/event", event });
     }
   }, [closeAuthInput, refreshRuntime, invalidateSessionList]);
 
