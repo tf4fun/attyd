@@ -1,11 +1,54 @@
 import { describe, expect, it } from "vitest";
-import type { ServerEvent } from "../shared/bridge";
-import type { SessionUpdate } from "@agentclientprotocol/sdk";
-import type { BridgeSessionView } from "../shared/business-api";
-import { appReducer, initialState, type AppState } from "../web/src/lib/state";
+import type { PromptResponse, SessionUpdate } from "@agentclientprotocol/sdk";
+import type {
+  BridgeSessionView,
+  GlobalBusinessEvent,
+  RuntimeView,
+  SessionOwner,
+} from "../shared/business-api";
+import { appReducer, initialState, type AppAction, type AppState, type BridgeError } from "../web/src/lib/state";
 
-function event(value: ServerEvent) {
-  return { type: "server/event" as const, event: value };
+function requestFailed(error: BridgeError): AppAction {
+  return { type: "request/failed", error };
+}
+
+function globalEvent(event: GlobalBusinessEvent): AppAction {
+  return { type: "global/event", event };
+}
+
+function runtime(
+  value: NonNullable<RuntimeView["hello"]> | NonNullable<RuntimeView["initialized"]>,
+): AppAction {
+  return {
+    type: "runtime/loaded",
+    runtime: {
+      generation: 1, connected: true, hello: null, initialized: null, phase: null, error: null,
+      ...(value.type === "bridge/hello" ? { hello: value } : { initialized: value }),
+    },
+  };
+}
+
+function owner(sessionId: string, sessionIncarnation = 1): SessionOwner {
+  return { bridgeEpoch: "epoch", sessionId, sessionIncarnation };
+}
+
+function sessionView(sessionId: string, patch: Partial<BridgeSessionView> = {}): BridgeSessionView {
+  return {
+    ...owner(sessionId), viewRevision: 1, historyRevision: "revision", phase: "ready", syncError: null,
+    timeline: [], activeTurn: null, workspace: { cwd: "/workspace", session: {} }, controls: {},
+    interactions: { permissions: {}, elicitations: {}, urlFlows: {} }, operation: null, terminals: {},
+    ...patch,
+  };
+}
+
+function turnComplete(sessionId: string, clientIntentId: string, response: PromptResponse): AppAction {
+  return {
+    type: "bridge/turn_complete",
+    event: {
+      type: "bridge/session_turn_complete", ...owner(sessionId), viewRevision: 1, historyRevision: null,
+      phase: "ready", operationId: `operation-${clientIntentId}`, clientIntentId, response,
+    },
+  };
 }
 
 describe("ACP UI state", () => {
@@ -37,7 +80,7 @@ describe("ACP UI state", () => {
       .toMatchObject({ cancelled: true, call: { status: "in_progress" } });
     expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "done"))
       .not.toHaveProperty("cancelled", true);
-    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: { sessionId: "s1", update: {
       sessionUpdate: "tool_call_update", toolCallId: "tool", status: "completed",
       content: [{ type: "content", content: { type: "text", text: "Late result" } }],
     } } }));
@@ -45,7 +88,7 @@ describe("ACP UI state", () => {
       .toMatchObject({ call: { status: "completed", content: [{ content: { text: "Late result" } }] } });
     expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "tool"))
       .not.toHaveProperty("cancelled", true);
-    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: { sessionId: "s1", update: {
       sessionUpdate: "tool_call", toolCallId: "late", title: "Late tool", status: "pending",
     } } }));
     expect(state.timeline.find((item) => item.type === "tool" && item.call.toolCallId === "late"))
@@ -77,12 +120,6 @@ describe("ACP UI state", () => {
     } });
     expect(reconciling.timeline.find((item) => item.type === "tool")).toMatchObject({ cancelled: true, call: { status: "in_progress" } });
   });
-  it("starts a reused URL elicitation ID as a new flow", () => {
-    let state: AppState = { ...initialState, session: { sessionId: "s1" }, externalFlows: [{ elicitationId: "flow", message: "Old", status: "completed" }] };
-    state = appReducer(state, event({ type: "acp/elicitation_request", elicitationId: "request-new", request: { sessionId: "s1", mode: "url", elicitationId: "flow", message: "New", url: "https://example.com/new" } }));
-    state = appReducer(state, event({ type: "acp/elicitation_resolved", elicitationId: "request-new", response: { action: "accept" } }));
-    expect(state.externalFlows).toEqual([{ elicitationId: "flow", sessionId: "s1", message: "New", url: "https://example.com/new", status: "waiting" }]);
-  });
   it("keeps identified messages in their first position around compaction and preserves annotations", () => {
     let state: AppState = { ...initialState, session: { sessionId: "s1" } };
     for (const update of [
@@ -91,7 +128,7 @@ describe("ACP UI state", () => {
       { sessionUpdate: "agent_message_chunk", messageId: "m", content: { type: "text", text: "B", annotations: { audience: ["assistant"] } } },
       { sessionUpdate: "agent_message_chunk", messageId: "m", content: { type: "text", text: "C", annotations: { audience: ["assistant"] } } },
     ] satisfies SessionUpdate[]) {
-      state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update } }));
+      state = appReducer(state, ({ type: "session/turn_update", notification: { sessionId: "s1", update } }));
     }
     expect(state.timeline).toHaveLength(2);
     expect(state.timeline[0]).toMatchObject({ type: "assistant", chunks: [{ messageId: "m", blocks: [
@@ -105,7 +142,7 @@ describe("ACP UI state", () => {
     const blocks = [{ type: "text" as const, text: "Inspect" }, { type: "resource_link" as const, uri: "file:///file", name: "file" }];
     let state: AppState = { ...initialState, session: { sessionId: "s1" }, timeline: [{ id: "local", type: "message", role: "user", blocks, raw: [] }] };
     for (const content of blocks) {
-      state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "user_message_chunk", messageId: "echo", content } } }));
+      state = appReducer(state, ({ type: "session/turn_update", notification: { sessionId: "s1", update: { sessionUpdate: "user_message_chunk", messageId: "echo", content } } }));
     }
     expect(state.timeline).toHaveLength(1);
     expect(state.timeline[0]).toMatchObject({ role: "user", messageId: "echo", blocks });
@@ -117,11 +154,11 @@ describe("ACP UI state", () => {
 
   it("derives cancellation for unfinished tools and accepts later session-scoped completion", () => {
     let state: AppState = { ...initialState, session: { sessionId: "s1" }, pendingPrompt: { requestId: "p", sessionId: "s1", blocks: [] }, running: true };
-    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: "Run", status: "in_progress" } } }));
-    state = appReducer(state, event({ type: "acp/prompt_complete", sessionId: "s1", requestId: "p", response: { stopReason: "cancelled" } }));
+    state = appReducer(state, ({ type: "session/turn_update", notification: { sessionId: "s1", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: "Run", status: "in_progress" } } }));
+    state = appReducer(state, turnComplete("s1", "p", { stopReason: "cancelled" }));
     expect(state.timeline[0]).toMatchObject({ type: "tool", cancelled: true, call: { status: "in_progress" } });
-    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "next" } } } }));
-    state = appReducer(state, event({ type: "acp/session_update", notification: { sessionId: "s1", update: { sessionUpdate: "tool_call_update", toolCallId: "tool", status: "completed" } } }));
+    state = appReducer(state, ({ type: "session/turn_update", notification: { sessionId: "s1", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "next" } } } }));
+    state = appReducer(state, ({ type: "session/turn_update", notification: { sessionId: "s1", update: { sessionUpdate: "tool_call_update", toolCallId: "tool", status: "completed" } } }));
     expect(state.timeline.filter((item) => item.type === "tool")).toHaveLength(1);
     expect(state.timeline[0]).toMatchObject({ type: "tool", call: { title: "Run", status: "completed" } });
     expect(state.timeline[0]).not.toHaveProperty("cancelled", true);
@@ -129,7 +166,7 @@ describe("ACP UI state", () => {
   it("keeps the active project's cwd when connection metadata refreshes", () => {
     const state = appReducer({
       ...initialState, session: { sessionId: "other" }, cwd: "/projects/other",
-    }, event({
+    }, runtime({
       type: "bridge/hello", transport: "stdio", command: ["goose", "acp"],
       cwd: "/projects/default", readOnly: false, additionalDirectories: [], mcpServers: [],
     }));
@@ -155,9 +192,6 @@ describe("ACP UI state", () => {
     expect(projects.cachedSessions.get("new-session")).toMatchObject({
       running: true, cwd: "/workspace/project", pendingPrompt: active.pendingPrompt,
     });
-    const restored = appReducer(projects, { type: "session/activate_cached", sessionId: "new-session" });
-    expect(restored.running).toBe(true);
-    expect(restored.pendingPrompt).toEqual(active.pendingPrompt);
   });
 
   it("rebuilds bridge-owned turn outcomes at their persisted turn boundaries", () => {
@@ -410,7 +444,7 @@ describe("ACP UI state", () => {
   });
 
   it("tracks a remote session workspace and clears it when the thread closes", () => {
-    let state = appReducer(initialState, event({
+    let state = appReducer(initialState, runtime({
       type: "bridge/hello",
       transport: "ws",
       command: ["ws://agent.example/acp"],
@@ -427,12 +461,10 @@ describe("ACP UI state", () => {
     });
     expect(state.cwd).toBe("/home/agent/project");
 
-    state = appReducer(state, event({
-      type: "acp/session_created",
-      requestId: "new",
-      cwd: "/home/agent/project",
-      response: { sessionId: "session" },
-    }));
+    state = appReducer(state, {
+      type: "bridge/session_hydrate",
+      view: sessionView("session", { workspace: { cwd: "/home/agent/project", session: {} } }),
+    });
     expect(state.cwd).toBe("/home/agent/project");
 
     state = appReducer(state, {
@@ -441,11 +473,13 @@ describe("ACP UI state", () => {
       requestId: "close",
       sessionId: "session",
     });
-    state = appReducer(state, event({
-      type: "acp/session_closed",
+    state = appReducer(state, {
+      type: "session/management_complete",
       requestId: "close",
       sessionId: "session",
-    }));
+      owner: owner("session"),
+      deleted: false,
+    });
     expect(state.cwd).toBe("");
   });
 
@@ -457,9 +491,7 @@ describe("ACP UI state", () => {
       { sessionUpdate: "user_message_chunk" as const, content: { type: "text" as const, text: "Echo" } },
     ];
     for (const update of updates) {
-      state = appReducer(state, event({
-        type: "acp/session_update",
-        notification: {
+      state = appReducer(state, ({ type: "session/turn_update", notification: {
           sessionId: "session",
           update: { ...update, messageId: "server-owned-id" },
         },
@@ -483,9 +515,7 @@ describe("ACP UI state", () => {
   it("keeps identical bridge-memory prompts in separate turn entries", () => {
     let state: AppState = { ...initialState, session: { sessionId: "session" } };
     for (const turnOperationId of ["turn-1", "turn-2"]) {
-      state = appReducer(state, event({
-        type: "acp/session_update",
-        notification: {
+      state = appReducer(state, ({ type: "session/turn_update", notification: {
           sessionId: "session",
           update: {
             sessionUpdate: "user_message_chunk",
@@ -525,8 +555,7 @@ describe("ACP UI state", () => {
       sessionId: "saved",
       title: "Saved",
     });
-    state = appReducer(state, event({
-      type: "bridge/error",
+    state = appReducer(state, requestFailed({
       requestId: "first-load",
       operation: "session/load",
       message: "First load failure",
@@ -540,8 +569,7 @@ describe("ACP UI state", () => {
       sessionId: "saved",
       title: "Saved",
     });
-    state = appReducer(state, event({
-      type: "bridge/error",
+    state = appReducer(state, requestFailed({
       requestId: "second-load",
       operation: "session/load",
       message: "Second load failure",
@@ -566,9 +594,7 @@ describe("ACP UI state", () => {
     });
     expect(state.agentActivity).toEqual({ kind: "waiting" });
 
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "session",
         update: {
           sessionUpdate: "agent_thought_chunk",
@@ -583,9 +609,7 @@ describe("ACP UI state", () => {
       : undefined;
     expect(state.agentActivity).toEqual({ kind: "thinking", timelineId: thought?.id });
 
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "session",
         update: {
           sessionUpdate: "tool_call",
@@ -601,9 +625,7 @@ describe("ACP UI state", () => {
       title: "Inspect workspace",
     });
 
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "session",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -614,12 +636,7 @@ describe("ACP UI state", () => {
     }));
     expect(state.agentActivity).toEqual({ kind: "responding" });
 
-    state = appReducer(state, event({
-      type: "acp/prompt_complete",
-      requestId: "prompt",
-      sessionId: "session",
-      response: { stopReason: "end_turn" },
-    }));
+    state = appReducer(state, turnComplete("session", "prompt", { stopReason: "end_turn" }));
     expect(state.agentActivity).toBeUndefined();
     expect(state.running).toBe(false);
   });
@@ -655,8 +672,7 @@ describe("ACP UI state", () => {
       sessionId: "session",
       blocks,
     });
-    state = appReducer(state, event({
-      type: "bridge/error",
+    state = appReducer(state, requestFailed({
       requestId: "prompt-error",
       operation: "session/prompt",
       code: -32_603,
@@ -678,7 +694,7 @@ describe("ACP UI state", () => {
   });
 
   it("tracks negotiated Agent authentication without turning it into chat state", () => {
-    let state = appReducer(initialState, event({
+    let state = appReducer(initialState, runtime({
       type: "acp/initialized",
       response: {
         protocolVersion: 1,
@@ -694,7 +710,7 @@ describe("ACP UI state", () => {
       requestId: "auth-request",
       methodId: "agent-login",
     });
-    state = appReducer(state, event({
+    state = appReducer(state, globalEvent({
       type: "acp/authenticated",
       requestId: "auth-request",
       methodId: "agent-login",
@@ -713,7 +729,7 @@ describe("ACP UI state", () => {
       kind: "logout",
       requestId: "logout-request",
     });
-    state = appReducer(state, event({
+    state = appReducer(state, globalEvent({
       type: "acp/logged_out",
       requestId: "logout-request",
       response: {},
@@ -723,7 +739,7 @@ describe("ACP UI state", () => {
   });
 
   it("exposes auth controls for logout without assuming external sign-in state", () => {
-    const state = appReducer(initialState, event({
+    const state = appReducer(initialState, runtime({
       type: "acp/initialized",
       response: { protocolVersion: 1, authMethods: [], agentCapabilities: { auth: { logout: {} } } },
     }));
@@ -745,8 +761,7 @@ describe("ACP UI state", () => {
       kind: "new",
       requestId: "new-session",
     });
-    state = appReducer(state, event({
-      type: "bridge/error",
+    state = appReducer(state, requestFailed({
       requestId: "new-session",
       operation: "session/new",
       code: -32_000,
@@ -763,8 +778,7 @@ describe("ACP UI state", () => {
       requestId: "failed-auth",
       methodId: "agent-login",
     });
-    state = appReducer(state, event({
-      type: "bridge/error",
+    state = appReducer(state, requestFailed({
       requestId: "failed-auth",
       operation: "auth/authenticate",
       code: -32_000,
@@ -790,12 +804,12 @@ describe("ACP UI state", () => {
       output: "",
       methodId: "terminal-login",
     });
-    state = appReducer(state, event({
+    state = appReducer(state, globalEvent({
       type: "bridge/auth_terminal_started",
       requestId: "terminal-auth",
       methodId: "terminal-login",
     }));
-    state = appReducer(state, event({
+    state = appReducer(state, globalEvent({
       type: "bridge/auth_terminal_output",
       requestId: "terminal-auth",
       data: "Enter code: ",
@@ -804,8 +818,7 @@ describe("ACP UI state", () => {
       status: "running",
       output: "Enter code: ",
     });
-    state = appReducer(state, event({
-      type: "bridge/error",
+    state = appReducer(state, requestFailed({
       requestId: "terminal-auth",
       operation: "auth/terminal_resize",
       message: "Resize was rejected",
@@ -815,7 +828,7 @@ describe("ACP UI state", () => {
       status: "running",
       message: "Resize was rejected",
     });
-    state = appReducer(state, event({
+    state = appReducer(state, globalEvent({
       type: "bridge/auth_terminal_exited",
       requestId: "terminal-auth",
       methodId: "terminal-login",
@@ -829,26 +842,17 @@ describe("ACP UI state", () => {
   });
 
   it("reconstructs an in-flight terminal authentication from Bridge runtime events", () => {
-    let state = appReducer(initialState, event({
-      type: "bridge/runtime_replay_started",
-      sessionCount: 0,
-    }));
-    state = appReducer(state, event({
+    let state = appReducer(initialState, globalEvent({
       type: "bridge/auth_terminal_started",
       requestId: "terminal-auth",
       methodId: "terminal-login",
     }));
-    state = appReducer(state, event({
+    state = appReducer(state, globalEvent({
       type: "bridge/auth_terminal_output",
       requestId: "terminal-auth",
       data: "Enter code: ",
     }));
-    state = appReducer(state, event({
-      type: "bridge/runtime_replay_complete",
-      sessionIds: [],
-    }));
-    state = appReducer(state, { type: "runtime/replay_complete" });
-    state = appReducer(state, event({
+    state = appReducer(state, runtime({
       type: "acp/initialized",
       response: {
         protocolVersion: 1,
@@ -867,50 +871,12 @@ describe("ACP UI state", () => {
     });
   });
 
-  it("tracks ephemeral MCP connections and preserves raw transport activity", () => {
-    let state = appReducer(initialState, event({
-      type: "acp/mcp_connection",
-      action: "connected",
-      serverId: "tools",
-      connectionId: "connection-1",
-      name: "Tools",
-    }));
-    for (let index = 0; index < 140; index += 1) {
-      state = appReducer(state, event({
-        type: "acp/mcp_message",
-        direction: index % 2 === 0 ? "agent-to-server" : "server-to-agent",
-        connectionId: "connection-1",
-        method: `fixture/${index}`,
-        kind: index % 3 === 0 ? "notification" : "request",
-        params: { index },
-      }));
-    }
-    expect(state.mcpConnections).toEqual([{
-      serverId: "tools",
-      connectionId: "connection-1",
-      name: "Tools",
-    }]);
-    expect(state.mcpActivity).toHaveLength(140);
-    expect(state.mcpActivity[0].method).toBe("fixture/0");
-
-    state = appReducer(state, event({
-      type: "acp/mcp_connection",
-      action: "disconnected",
-      serverId: "tools",
-      connectionId: "connection-1",
-      name: "Tools",
-    }));
-    expect(state.mcpConnections).toEqual([]);
-  });
-
   it("isolates, replaces, preserves, and releases terminal snapshots", () => {
     let state = {
       ...initialState,
       session: { sessionId: "current" },
     };
-    state = appReducer(state, event({
-      type: "acp/terminal_state",
-      terminal: {
+    state = appReducer(state, ({ type: "session/terminal_update", terminal: {
         sessionId: "current",
         terminalId: "terminal-0",
         output: "first",
@@ -918,9 +884,7 @@ describe("ACP UI state", () => {
         released: false,
       },
     }));
-    state = appReducer(state, event({
-      type: "acp/terminal_state",
-      terminal: {
+    state = appReducer(state, ({ type: "session/terminal_update", terminal: {
         sessionId: "current",
         terminalId: "terminal-0",
         output: "-append",
@@ -931,9 +895,7 @@ describe("ACP UI state", () => {
       },
     }));
     expect(state.terminalSnapshots[0].output).toBe("first-append");
-    state = appReducer(state, event({
-      type: "acp/terminal_state",
-      terminal: {
+    state = appReducer(state, ({ type: "session/terminal_update", terminal: {
         sessionId: "current",
         terminalId: "terminal-0",
         output: "second",
@@ -949,9 +911,7 @@ describe("ACP UI state", () => {
       released: true,
     })]);
 
-    state = appReducer(state, event({
-      type: "acp/terminal_state",
-      terminal: {
+    state = appReducer(state, ({ type: "session/terminal_update", terminal: {
         sessionId: "other",
         terminalId: "cross-session",
         output: "CROSS_SESSION_TERMINAL",
@@ -963,9 +923,7 @@ describe("ACP UI state", () => {
     expect(JSON.stringify(state.backgroundEvents)).toContain("CROSS_SESSION_TERMINAL");
 
     for (let index = 1; index <= 70; index += 1) {
-      state = appReducer(state, event({
-        type: "acp/terminal_state",
-        terminal: {
+      state = appReducer(state, ({ type: "session/terminal_update", terminal: {
           sessionId: "current",
           terminalId: `terminal-${index}`,
           output: String(index),
@@ -991,9 +949,7 @@ describe("ACP UI state", () => {
       session: { sessionId: "current" },
       sessionSyncPhase: "running",
       terminalSnapshots: retained,
-    }, event({
-      type: "acp/terminal_state",
-      terminal: {
+    }, ({ type: "session/terminal_update", terminal: {
         sessionId: "current", terminalId: "live", output: "Current output",
         truncated: false, released: false, outputAppend: false,
       },
@@ -1006,6 +962,7 @@ describe("ACP UI state", () => {
     const pending = appReducer({
       ...initialState,
       session: { sessionId: "session" },
+      sessionOwner: owner("session"),
       configOptions: [
         { type: "boolean", id: "verbose", name: "Verbose", currentValue: false },
       ],
@@ -1015,13 +972,10 @@ describe("ACP UI state", () => {
       requestId: "config",
       sessionId: "session",
     });
-    const state = appReducer(pending, event({
-      type: "acp/config_changed",
-      requestId: "config",
-      sessionId: "session",
-      configId: "verbose",
-      value: true,
-      response: {
+    const state = appReducer(pending, {
+      type: "bridge/session_live_update",
+      settledControl: "config",
+      view: sessionView("session", { workspace: { cwd: "/workspace", session: {
         configOptions: [
           { type: "boolean", id: "verbose", name: "Verbose", currentValue: false },
           {
@@ -1032,104 +986,12 @@ describe("ACP UI state", () => {
             options: [{ value: "agent-default", name: "Agent default" }],
           },
         ],
-      },
-    }));
+      } } }),
+    });
+    expect(state.pendingSessionControl).toBeUndefined();
     expect(state.configOptions).toHaveLength(2);
     expect(state.configOptions![0]).toMatchObject({ id: "verbose", currentValue: false });
     expect(state.configOptions![1]).toMatchObject({ id: "model", currentValue: "agent-default" });
-  });
-
-  it("accepts Bridge-owned lifecycle events while isolating unmatched controls", () => {
-    const active = {
-      ...initialState,
-      session: { sessionId: "current" },
-      modeId: "build",
-      configOptions: [
-        { type: "boolean" as const, id: "verbose", name: "Verbose", currentValue: false },
-      ],
-      sessions: [{ sessionId: "saved", cwd: "/workspace", title: "Saved" }],
-    };
-    const acknowledgements: ServerEvent[] = [
-      {
-        type: "acp/session_created",
-        requestId: "unsolicited-new",
-        response: { sessionId: "created" },
-      },
-      {
-        type: "acp/session_attached",
-        requestId: "unsolicited-attach",
-        method: "load",
-        sessionId: "saved",
-        response: {},
-      },
-      {
-        type: "acp/session_forked",
-        requestId: "unsolicited-fork",
-        sourceSessionId: "current",
-        response: { sessionId: "forked" },
-      },
-      {
-        type: "acp/session_closed",
-        requestId: "unsolicited-close",
-        sessionId: "current",
-      },
-      {
-        type: "acp/session_deleted",
-        requestId: "unsolicited-delete",
-        sessionId: "saved",
-      },
-      {
-        type: "acp/mode_changed",
-        requestId: "unsolicited-mode",
-        sessionId: "current",
-        modeId: "plan",
-      },
-      {
-        type: "acp/config_changed",
-        requestId: "unsolicited-config",
-        sessionId: "current",
-        configId: "verbose",
-        value: true,
-        response: {
-          configOptions: [
-            { type: "boolean", id: "verbose", name: "Verbose", currentValue: true },
-          ],
-        },
-      },
-    ];
-    const isolated = acknowledgements.reduce(
-      (state, acknowledgement) => appReducer(state, event(acknowledgement)),
-      active,
-    );
-    expect(isolated.session).toBeUndefined();
-    expect(isolated.modeId).toBeUndefined();
-    expect(isolated.configOptions).toBeNull();
-    expect(isolated.sessions.map(({ sessionId }) => sessionId).sort())
-      .toEqual(["created", "forked"]);
-    expect(isolated.cachedSessions.has("created")).toBe(true);
-    expect(isolated.cachedSessions.has("forked")).toBe(true);
-    expect(isolated.cachedSessions.has("saved")).toBe(false);
-    expect(isolated.backgroundEvents).toEqual(acknowledgements.slice(-2));
-
-    const pendingAttach = appReducer(isolated, {
-      type: "session/transition_start",
-      kind: "attach",
-      requestId: "attach-current",
-      sessionId: "saved",
-    });
-    const wrongTarget = appReducer(pendingAttach, event({
-      type: "acp/session_attached",
-      requestId: "attach-current",
-      method: "load",
-      sessionId: "other",
-      response: {},
-    }));
-    expect(wrongTarget.pendingSessionId).toBe("saved");
-    expect(wrongTarget.sessionTransition?.requestId).toBe("attach-current");
-    expect(wrongTarget.backgroundEvents.at(-1)).toMatchObject({
-      type: "acp/session_attached",
-      sessionId: "other",
-    });
   });
 
   it("commits a new session only through its matching transition", () => {
@@ -1138,11 +1000,7 @@ describe("ACP UI state", () => {
       kind: "new",
       requestId: "new-current",
     });
-    const committed = appReducer(pending, event({
-      type: "acp/session_created",
-      requestId: "new-current",
-      response: { sessionId: "created" },
-    }));
+    const committed = appReducer(pending, { type: "bridge/session_hydrate", view: sessionView("created") });
     expect(committed.session?.sessionId).toBe("created");
     expect(committed.sessionTransition).toBeUndefined();
   });
@@ -1151,6 +1009,7 @@ describe("ACP UI state", () => {
     const active = {
       ...initialState,
       session: { sessionId: "controls" },
+      sessionOwner: owner("controls"),
       modeId: "build",
       configOptions: [
         { type: "boolean" as const, id: "verbose", name: "Verbose", currentValue: false },
@@ -1168,18 +1027,7 @@ describe("ACP UI state", () => {
       sessionId: "controls",
     });
 
-    const stale = appReducer(pendingMode, event({
-      type: "acp/mode_changed",
-      requestId: "mode-stale",
-      sessionId: "controls",
-      modeId: "plan",
-    }));
-    expect(stale.modeId).toBe("build");
-    expect(stale.pendingSessionControl).toEqual(pendingMode.pendingSessionControl);
-    expect(stale.backgroundEvents).toHaveLength(1);
-
-    const failed = appReducer(stale, event({
-      type: "bridge/error",
+    const failed = appReducer(pendingMode, requestFailed({
       requestId: "mode-current",
       operation: "session/set_mode",
       message: "Synthetic control failure",
@@ -1205,29 +1053,29 @@ describe("ACP UI state", () => {
     });
     expect(blockedTransition).toBe(retrying);
 
-    const committed = appReducer(retrying, event({
-      type: "acp/config_changed",
-      requestId: "config-retry",
-      sessionId: "controls",
-      configId: "verbose",
-      value: true,
-      response: {
+    const committed = appReducer(retrying, {
+      type: "bridge/session_live_update",
+      settledControl: "config",
+      view: sessionView("controls", { workspace: { cwd: "/workspace", session: {
+        modes: { currentModeId: "build", availableModes: [] },
         configOptions: [
           { type: "boolean", id: "verbose", name: "Verbose", currentValue: true },
         ],
-      },
-    }));
+      } } }),
+    });
     expect(committed.pendingSessionControl).toBeUndefined();
     expect(committed.configOptions).toEqual([
       expect.objectContaining({ id: "verbose", currentValue: true }),
     ]);
+    expect(committed.modeId).toBe("build");
 
-    const recovered = appReducer(active, event({
-      type: "acp/mode_changed",
-      requestId: "mode-from-disconnected-browser",
-      sessionId: "controls",
-      modeId: "plan",
-    }));
+    const recovered = appReducer(active, {
+      type: "bridge/session_live_update",
+      settledControl: "mode",
+      view: sessionView("controls", { workspace: { cwd: "/workspace", session: {
+        modes: { currentModeId: "plan", availableModes: [] },
+      } } }),
+    });
     expect(recovered.modeId).toBe("plan");
   });
 
@@ -1235,6 +1083,7 @@ describe("ACP UI state", () => {
     const active = {
       ...initialState,
       session: { sessionId: "session" },
+      sessionOwner: owner("session"),
       permissions: [{
         permissionId: "permission",
         request: {
@@ -1267,23 +1116,26 @@ describe("ACP UI state", () => {
     expect(state.elicitations[0].responseRequestId).toBe("form-response");
 
     const responding = state;
-    const unrelated = appReducer(responding, event({
-      type: "acp/permission_resolved",
-      permissionId: "unknown-permission",
-      requestId: "stale-response",
-    }));
-    expect(unrelated.permissions).toHaveLength(1);
-    expect(unrelated.backgroundEvents).toHaveLength(1);
+    const pendingView = (permissions: boolean, elicitations: boolean) => ({
+      type: "bridge/session_live_update" as const,
+      view: sessionView("session", { interactions: {
+        permissions: permissions
+          ? { permission: { interactionId: "permission", request: active.permissions[0].request } }
+          : {},
+        elicitations: elicitations
+          ? { form: { interactionId: "form", request: active.elicitations[0].request } }
+          : {},
+        urlFlows: {},
+      } }),
+    });
+    const unrelated = appReducer(responding, pendingView(true, true));
+    expect(unrelated.permissions).toEqual(responding.permissions);
+    expect(unrelated.elicitations).toEqual(responding.elicitations);
 
-    const resolvedElsewhere = appReducer(responding, event({
-      type: "acp/permission_resolved",
-      permissionId: "permission",
-      requestId: "another-browser-response",
-    }));
+    const resolvedElsewhere = appReducer(responding, pendingView(false, true));
     expect(resolvedElsewhere.permissions).toEqual([]);
 
-    state = appReducer(responding, event({
-      type: "bridge/error",
+    state = appReducer(responding, requestFailed({
       requestId: "permission-response",
       operation: "permission/respond",
       message: "Permission response failed",
@@ -1300,18 +1152,10 @@ describe("ACP UI state", () => {
       permissionId: "permission",
       requestId: "permission-retry",
     });
-    state = appReducer(state, event({
-      type: "acp/permission_resolved",
-      permissionId: "permission",
-      requestId: "permission-retry",
-    }));
+    state = appReducer(state, pendingView(false, true));
     expect(state.permissions).toEqual([]);
 
-    state = appReducer(state, event({
-      type: "acp/elicitation_resolved",
-      elicitationId: "form",
-      response: { action: "cancel" },
-    }));
+    state = appReducer(state, pendingView(false, false));
     expect(state.elicitations).toEqual([]);
   });
 
@@ -1327,9 +1171,7 @@ describe("ACP UI state", () => {
         updatedAt: "2026-08-30T08:00:00.000Z",
       }],
     };
-    const timestampOnly = appReducer(active, event({
-      type: "acp/session_update",
-      notification: {
+    const timestampOnly = appReducer(active, ({ type: "session/turn_update", notification: {
         sessionId: "session",
         update: {
           sessionUpdate: "session_info_update",
@@ -1343,9 +1185,7 @@ describe("ACP UI state", () => {
       updatedAt: "2026-08-30T09:00:00.000Z",
     });
 
-    const cleared = appReducer(timestampOnly, event({
-      type: "acp/session_update",
-      notification: {
+    const cleared = appReducer(timestampOnly, ({ type: "session/turn_update", notification: {
         sessionId: "session",
         update: {
           sessionUpdate: "session_info_update",
@@ -1419,7 +1259,6 @@ describe("ACP UI state", () => {
       pendingSessionDeletions: [{
         requestId: "delete",
         sessionId: "saved",
-        stage: "deleting" as const,
       }],
       pendingSessionControl: {
         requestId: "control",
@@ -1434,8 +1273,7 @@ describe("ACP UI state", () => {
           options: [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }],
         },
       }],
-      mcpConnections: [{ serverId: "tools", connectionId: "connection", name: "Tools" }],
-    }, event({ type: "bridge/phase", phase: "error" }));
+    }, globalEvent({ type: "bridge/connection", phase: "error" }));
 
     expect(failed.phase).toBe("error");
     expect(failed.socketOpen).toBe(true);
@@ -1445,51 +1283,31 @@ describe("ACP UI state", () => {
     expect(failed.pendingSessionDeletions).toEqual([]);
     expect(failed.pendingSessionControl).toBeUndefined();
     expect(failed.permissions).toEqual([]);
-    expect(failed.mcpConnections).toEqual([]);
     expect(failed.terminalSnapshots[0]?.released).toBe(true);
   });
 
   it("isolates session-scoped elicitations while preserving request-scoped interactions", () => {
-    const active = {
+    const withRequestScope: AppState = {
       ...initialState,
       session: { sessionId: "current" },
+      elicitations: [{
+        elicitationId: "current-form",
+        request: {
+          sessionId: "current",
+          mode: "form",
+          message: "Current session",
+          requestedSchema: { type: "object", properties: {} },
+        },
+      }, {
+        elicitationId: "global-form",
+        request: {
+          requestId: "outer-request",
+          mode: "form",
+          message: "Connection-scoped request",
+          requestedSchema: { type: "object", properties: {} },
+        },
+      }],
     };
-    const background = appReducer(active, event({
-      type: "acp/elicitation_request",
-      elicitationId: "other-form",
-      request: {
-        sessionId: "other",
-        mode: "form",
-        message: "Wrong session",
-        requestedSchema: { type: "object", properties: {} },
-      },
-    }));
-    expect(background.elicitations).toEqual([]);
-    expect(background.backgroundEvents).toHaveLength(1);
-
-    const withCurrent = appReducer(background, event({
-      type: "acp/elicitation_request",
-      elicitationId: "current-form",
-      request: {
-        sessionId: "current",
-        mode: "form",
-        message: "Current session",
-        requestedSchema: { type: "object", properties: {} },
-      },
-    }));
-    const withRequestScope = appReducer(withCurrent, event({
-      type: "acp/elicitation_request",
-      elicitationId: "global-form",
-      request: {
-        requestId: "outer-request",
-        mode: "form",
-        message: "Connection-scoped request",
-        requestedSchema: { type: "object", properties: {} },
-      },
-    }));
-    expect(withRequestScope.elicitations.map(({ elicitationId }) => elicitationId))
-      .toEqual(["current-form", "global-form"]);
-
     const reset = appReducer(withRequestScope, { type: "session/reset" });
     expect(reset.elicitations.map(({ elicitationId }) => elicitationId))
       .toEqual(["global-form"]);
@@ -1525,9 +1343,7 @@ describe("ACP UI state", () => {
     expect(pending.pendingSessionId).toBe("saved");
     expect(pending.timeline).toEqual(previous.timeline);
 
-    pending = appReducer(pending, event({
-      type: "acp/session_update",
-      notification: {
+    pending = appReducer(pending, ({ type: "session/turn_update", notification: {
         sessionId: "saved",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -1539,8 +1355,7 @@ describe("ACP UI state", () => {
     expect(pending.timeline).toEqual(previous.timeline);
     expect(JSON.stringify(pending.timeline)).not.toContain("Loaded history");
 
-    const restored = appReducer(pending, event({
-      type: "bridge/error",
+    const restored = appReducer(pending, requestFailed({
       requestId: "attach-request",
       operation: "session/load",
       message: "Agent refused the load",
@@ -1557,191 +1372,7 @@ describe("ACP UI state", () => {
     expect(restored.sessionTransition).toBeUndefined();
   });
 
-  it("switches back to an already-open thread locally and keeps its background updates", () => {
-    const first = {
-      ...initialState,
-      phase: "ready" as const,
-      session: { sessionId: "first" },
-      cwd: "/workspace/first",
-      title: "First",
-      timeline: [{
-        id: "first-answer",
-        type: "assistant" as const,
-        chunks: [{
-          id: "first-answer-chunk",
-          role: "agent" as const,
-          blocks: [{ type: "text" as const, text: "First answer" }],
-          raw: [],
-        }],
-      }],
-    };
-    let state = appReducer(first, {
-      type: "session/transition_start",
-      kind: "attach",
-      requestId: "load-second",
-      sessionId: "second",
-      cwd: "/workspace/second",
-      title: "Second",
-    });
-    state = appReducer(state, event({
-      type: "acp/session_attached",
-      requestId: "load-second",
-      method: "load",
-      sessionId: "second",
-      cwd: "/workspace/second",
-      response: {},
-    }));
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
-        sessionId: "second",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "second-answer",
-          content: { type: "text", text: "Second answer" },
-        },
-      },
-    }));
-
-    state = appReducer(state, { type: "session/activate_cached", sessionId: "first" });
-    expect(state.session?.sessionId).toBe("first");
-    expect(JSON.stringify(state.timeline)).toContain("First answer");
-    expect(state.cachedSessions.has("second")).toBe(true);
-
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
-        sessionId: "second",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "second-late-answer",
-          content: { type: "text", text: "Late background update" },
-        },
-      },
-    }));
-    expect(state.backgroundEvents).toHaveLength(0);
-
-    state = appReducer(state, { type: "session/activate_cached", sessionId: "second" });
-    expect(state.session?.sessionId).toBe("second");
-    expect(JSON.stringify(state.timeline)).toContain("Second answer");
-    expect(JSON.stringify(state.timeline)).toContain("Late background update");
-    expect(state.cachedSessions.has("first")).toBe(true);
-  });
-
-  it("replays and independently tracks concurrent in-memory session turns", () => {
-    let state = appReducer(initialState, event({
-      type: "bridge/runtime_replay_started",
-      sessionCount: 2,
-    }));
-    for (const [sessionId, cwd] of [["first", "/workspace/first"], ["second", "/workspace/second"]]) {
-      state = appReducer(state, event({
-        type: "bridge/runtime_session",
-        sessionId,
-        cwd,
-        session: { sessionId },
-        truncated: false,
-      }));
-      state = appReducer(state, event({
-        type: "acp/prompt_started",
-        requestId: `${sessionId}-prompt`,
-        sessionId,
-        prompt: [{ type: "text", text: `Prompt ${sessionId}` }],
-      }));
-      state = appReducer(state, event({
-        type: "acp/session_update",
-        notification: {
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            messageId: `${sessionId}-answer`,
-            content: { type: "text", text: `Streaming ${sessionId}` },
-          },
-        },
-      }));
-    }
-    state = appReducer(state, event({
-      type: "bridge/runtime_replay_complete",
-      sessionIds: ["first", "second"],
-    }));
-    state = appReducer(state, {
-      type: "runtime/replay_complete",
-      preferredSessionId: "first",
-      fallbackSessionId: "second",
-    });
-
-    expect(state.session?.sessionId).toBe("first");
-    expect(state.running).toBe(true);
-    expect(JSON.stringify(state.timeline)).toContain("Streaming first");
-    expect(state.cachedSessions.get("second")?.running).toBe(true);
-
-    state = appReducer(state, { type: "session/activate_cached", sessionId: "second" });
-    expect(state.session?.sessionId).toBe("second");
-    expect(state.running).toBe(true);
-    expect(JSON.stringify(state.timeline)).toContain("Streaming second");
-
-    state = appReducer(state, event({
-      type: "acp/prompt_complete",
-      requestId: "first-prompt",
-      sessionId: "first",
-      response: { stopReason: "end_turn" },
-    }));
-    expect(state.running).toBe(true);
-    expect(state.cachedSessions.get("first")?.running).toBe(false);
-    expect(state.cachedSessions.get("first")?.timeline.at(-1)).toMatchObject({ type: "stop" });
-  });
-
-  it("caches background interactions without recursing while another session transitions", () => {
-    const background = {
-      cwd: "/workspace/background",
-      session: { sessionId: "background" },
-      availableCommands: [],
-      configOptions: [],
-      timeline: [],
-      permissions: [],
-      elicitations: [],
-      running: true,
-      terminalSnapshots: [],
-    };
-    let state = appReducer({
-      ...initialState,
-      session: { sessionId: "current" },
-      cwd: "/workspace/current",
-      cachedSessions: new Map([["background", background]]),
-    }, {
-      type: "session/transition_start",
-      kind: "new",
-      requestId: "new-current",
-      cwd: "/workspace/new",
-    });
-
-    state = appReducer(state, event({
-      type: "acp/permission_request",
-      permissionId: "background-permission",
-      request: {
-        sessionId: "background",
-        toolCall: { toolCallId: "background-tool", title: "Background tool" },
-        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
-      },
-    }));
-    state = appReducer(state, event({
-      type: "acp/elicitation_request",
-      elicitationId: "background-form",
-      request: {
-        sessionId: "background",
-        mode: "form",
-        message: "Background input",
-        requestedSchema: { type: "object", properties: {} },
-      },
-    }));
-
-    expect(state.sessionTransition?.requestId).toBe("new-current");
-    expect(state.cachedSessions.get("background")?.permissions)
-      .toHaveLength(1);
-    expect(state.cachedSessions.get("background")?.elicitations)
-      .toHaveLength(1);
-  });
-
-  it("commits replayed state only when the matching session transition succeeds", () => {
+  it("commits a loaded session only from its authoritative view", () => {
     let state = appReducer({
       ...initialState,
       session: { sessionId: "current" },
@@ -1762,24 +1393,14 @@ describe("ACP UI state", () => {
       sessionId: "saved",
       title: "Saved",
     });
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
-        sessionId: "saved",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "loaded",
-          content: { type: "text", text: "Loaded" },
-        },
-      },
-    }));
-    state = appReducer(state, event({
-      type: "acp/session_attached",
-      requestId: "load-request",
-      method: "load",
-      sessionId: "saved",
-      response: {},
-    }));
+    state = appReducer(state, {
+      type: "bridge/session_hydrate",
+      view: sessionView("saved", { timeline: [{
+        sessionUpdate: "agent_message_chunk",
+        messageId: "loaded",
+        content: { type: "text", text: "Loaded" },
+      }] }),
+    });
     expect(state.session?.sessionId).toBe("saved");
     expect(state.timeline).toHaveLength(1);
     expect(state.timeline[0]).toMatchObject({
@@ -1789,7 +1410,7 @@ describe("ACP UI state", () => {
     expect(state.sessionTransition).toBeUndefined();
   });
 
-  it("keeps load replay hidden until session/load attaches, then replaces atomically", () => {
+  it("keeps load updates hidden until the loaded view hydrates, then replaces atomically", () => {
     const original: AppState = {
       ...initialState,
       phase: "ready",
@@ -1814,9 +1435,7 @@ describe("ACP UI state", () => {
       sessionId: "saved",
       title: "Saved",
     });
-    loading = appReducer(loading, event({
-      type: "acp/session_update",
-      notification: {
+    loading = appReducer(loading, ({ type: "session/turn_update", notification: {
         sessionId: "saved",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -1830,13 +1449,14 @@ describe("ACP UI state", () => {
     expect(JSON.stringify(loading.timeline)).toContain("Stable current projection");
     expect(JSON.stringify(loading.timeline)).not.toContain("Hidden loaded projection");
 
-    const attached = appReducer(loading, event({
-      type: "acp/session_attached",
-      requestId: "load-saved",
-      method: "load",
-      sessionId: "saved",
-      response: {},
-    }));
+    const attached = appReducer(loading, {
+      type: "bridge/session_hydrate",
+      view: sessionView("saved", { timeline: [{
+        sessionUpdate: "agent_message_chunk",
+        messageId: "loaded-answer",
+        content: { type: "text", text: "Hidden loaded projection" },
+      }] }),
+    });
 
     expect(attached.session?.sessionId).toBe("saved");
     expect(JSON.stringify(attached.timeline)).toContain("Hidden loaded projection");
@@ -1867,9 +1487,7 @@ describe("ACP UI state", () => {
       requestId: "load-saved",
       sessionId: "saved",
     });
-    loading = appReducer(loading, event({
-      type: "acp/session_update",
-      notification: {
+    loading = appReducer(loading, ({ type: "session/turn_update", notification: {
         sessionId: "saved",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -1878,8 +1496,7 @@ describe("ACP UI state", () => {
         },
       },
     }));
-    const failed = appReducer(loading, event({
-      type: "bridge/error",
+    const failed = appReducer(loading, requestFailed({
       requestId: "load-saved",
       operation: "session/load",
       message: "Agent rejected load",
@@ -1918,9 +1535,7 @@ describe("ACP UI state", () => {
       requestId: "load-saved",
       sessionId: "saved",
     });
-    loading = appReducer(loading, event({
-      type: "acp/session_update",
-      notification: {
+    loading = appReducer(loading, ({ type: "session/turn_update", notification: {
         sessionId: "saved",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -1938,32 +1553,10 @@ describe("ACP UI state", () => {
     expect(disconnected.sessionTransition).toBeUndefined();
   });
 
-  it("represents unavailable saved history explicitly in state and the visible timeline", () => {
-    const unavailable = appReducer(initialState, {
-      type: "history/unavailable",
-      sessionId: "saved",
-      reason: "load_not_supported",
-    });
-
-    expect(unavailable.historyStatus).toMatchObject({
-      state: "unavailable",
-      sessionId: "saved",
-      reason: "load_not_supported",
-    });
-    expect(unavailable.timeline).toHaveLength(1);
-    expect(unavailable.timeline[0]).toMatchObject({
-      type: "error",
-      operation: "session/load",
-    });
-    expect(JSON.stringify(unavailable.timeline)).toContain("History unavailable");
-  });
-
   it("coalesces text chunks only when they belong to the same message", () => {
     const first = appReducer(
       { ...initialState, session: { sessionId: "s1" } },
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "s1",
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -1975,9 +1568,7 @@ describe("ACP UI state", () => {
     );
     const second = appReducer(
       first,
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "s1",
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -2000,9 +1591,7 @@ describe("ACP UI state", () => {
   it("keeps a message ID at its first position across an interleaved tool event", () => {
     let state = appReducer(
       { ...initialState, session: { sessionId: "s1" } },
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "s1",
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -2012,9 +1601,7 @@ describe("ACP UI state", () => {
         },
       }),
     );
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "tool_call",
@@ -2023,9 +1610,7 @@ describe("ACP UI state", () => {
         },
       },
     }));
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -2046,9 +1631,7 @@ describe("ACP UI state", () => {
   it("merges anonymous adjacent chunks with an identified message like Zed", () => {
     let state = appReducer(
       { ...initialState, session: { sessionId: "s1" } },
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "s1",
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -2058,9 +1641,7 @@ describe("ACP UI state", () => {
         },
       }),
     );
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -2081,9 +1662,7 @@ describe("ACP UI state", () => {
   it("applies sparse tool updates without losing prior fields", () => {
     const created = appReducer(
       { ...initialState, session: { sessionId: "s1" } },
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "s1",
           update: {
             sessionUpdate: "tool_call",
@@ -2097,9 +1676,7 @@ describe("ACP UI state", () => {
     );
     const updated = appReducer(
       created,
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "s1",
           update: { sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" },
         },
@@ -2116,9 +1693,7 @@ describe("ACP UI state", () => {
 
   it("preserves earlier diffs when a later turn reuses a tool call ID", () => {
     let state: AppState = { ...initialState, session: { sessionId: "s1" } };
-    const create = (newText: string) => event({
-      type: "acp/session_update",
-      notification: {
+    const create = (newText: string) => ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "tool_call",
@@ -2140,9 +1715,7 @@ describe("ACP UI state", () => {
       ],
     };
     state = appReducer(state, create("second turn"));
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: { sessionUpdate: "tool_call_update", toolCallId: "reused", status: "completed" },
       },
@@ -2167,9 +1740,7 @@ describe("ACP UI state", () => {
         { id: "old-tool", type: "tool", call: { toolCallId: "reused", title: "Previous edit" }, raw: [] },
         { id: "new-prompt", type: "message", role: "protocol-user", blocks: [], raw: [] },
       ],
-    }, event({
-      type: "acp/session_update",
-      notification: {
+    }, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: { sessionUpdate: "tool_call_update", toolCallId: "reused", status: "completed" },
       },
@@ -2182,9 +1753,7 @@ describe("ACP UI state", () => {
   it("renders a failed placeholder for a tool update without a creation", () => {
     const state = appReducer(
       { ...initialState, session: { sessionId: "s1" } },
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "s1",
           update: {
             sessionUpdate: "tool_call_update",
@@ -2206,17 +1775,13 @@ describe("ACP UI state", () => {
   });
 
   it("keeps session history agent-owned and attaches loaded sessions", () => {
-    const listed = appReducer(
-      initialState,
-      event({
-        type: "acp/sessions_listed",
-        requestId: "list-1",
-        response: {
-          sessions: [{ sessionId: "saved", cwd: "/workspace", title: "Saved" }],
-          nextCursor: "next",
-        },
-      }),
-    );
+    const listed = appReducer(initialState, {
+      type: "sessions/listed",
+      response: {
+        sessions: [{ sessionId: "saved", cwd: "/workspace", title: "Saved" }],
+        nextCursor: "next",
+      },
+    });
     const pending = appReducer(listed, {
       type: "session/transition_start",
       kind: "attach",
@@ -2224,16 +1789,7 @@ describe("ACP UI state", () => {
       sessionId: "saved",
       title: "Saved",
     });
-    const attached = appReducer(
-      pending,
-      event({
-        type: "acp/session_attached",
-        requestId: "load-1",
-        method: "load",
-        sessionId: "saved",
-        response: {},
-      }),
-    );
+    const attached = appReducer(pending, { type: "bridge/session_hydrate", view: sessionView("saved") });
 
     expect(attached.session?.sessionId).toBe("saved");
     expect(attached.title).toBe("Saved");
@@ -2271,53 +1827,28 @@ describe("ACP UI state", () => {
       requestId: "fork-current",
     });
 
-    const wrongRequest = appReducer(pending, event({
-      type: "acp/session_forked",
-      requestId: "fork-stale",
-      sourceSessionId: "source",
-      response: { sessionId: "stale-fork" },
-    }));
-    expect(wrongRequest.session?.sessionId).toBe("source");
-    expect(wrongRequest.backgroundEvents).toHaveLength(1);
-
-    const unrelated = appReducer(wrongRequest, event({
-      type: "acp/session_forked",
-      requestId: "fork-other",
-      sourceSessionId: "other",
-      response: { sessionId: "other-fork" },
-    }));
-    expect(unrelated.session?.sessionId).toBe("source");
-    expect(unrelated.backgroundEvents).toHaveLength(2);
-
-    const forked = appReducer(unrelated, event({
-      type: "acp/session_forked",
-      requestId: "fork-current",
-      sourceSessionId: "source",
-      response: {
-        sessionId: "forked",
-        modes: {
-          currentModeId: "plan",
-          availableModes: [{ id: "plan", name: "Plan" }],
-        },
-      },
-      earlyUpdates: [
-        {
-          sessionId: "forked",
-          update: {
+    const forked = appReducer(pending, {
+      type: "bridge/session_hydrate",
+      view: sessionView("forked", {
+        workspace: { cwd: "/workspace", session: {
+          modes: {
+            currentModeId: "plan",
+            availableModes: [{ id: "plan", name: "Plan" }],
+          },
+        } },
+        timeline: [{
+          sessionUpdate: "agent_message_chunk",
+          messageId: "early-fork-message",
+          content: { type: "text", text: "Fork ready" },
+        }],
+        controls: {
+          available_commands_update: {
             sessionUpdate: "available_commands_update",
             availableCommands: [{ name: "fork-status", description: "Inspect fork" }],
           },
         },
-        {
-          sessionId: "forked",
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            messageId: "early-fork-message",
-            content: { type: "text", text: "Fork ready" },
-          },
-        },
-      ],
-    }));
+      }),
+    });
     expect(forked.session?.sessionId).toBe("forked");
     expect(forked.modeId).toBe("plan");
     expect(forked.availableCommands).toEqual([
@@ -2327,8 +1858,7 @@ describe("ACP UI state", () => {
     expect(forked.running).toBe(false);
     expect(forked.sessionTransition).toBeUndefined();
 
-    const failed = appReducer(pending, event({
-      type: "bridge/error",
+    const failed = appReducer(pending, requestFailed({
       requestId: "fork-current",
       operation: "session/fork",
       message: "Agent refused to fork",
@@ -2346,6 +1876,7 @@ describe("ACP UI state", () => {
     const active = {
       ...initialState,
       session: { sessionId: "closing" },
+      sessionOwner: owner("closing"),
       title: "Keep until closed",
       timeline: [{
         id: "close-context",
@@ -2368,26 +1899,27 @@ describe("ACP UI state", () => {
     expect(pending.timeline).toEqual(active.timeline);
     expect(pending.sessionTransition?.kind).toBe("close");
 
-    const closedElsewhere = appReducer(pending, event({
-      type: "acp/session_closed",
-      requestId: "close-from-another-browser",
-      sessionId: "closing",
-    }));
+    const closedElsewhere = appReducer(pending, {
+      type: "session/retired",
+      owner: owner("closing"),
+      deleted: false,
+    });
     expect(closedElsewhere.session).toBeUndefined();
     expect(closedElsewhere.timeline).toEqual([]);
     expect(closedElsewhere.sessionTransition).toBeUndefined();
 
-    const repeated = appReducer(closedElsewhere, event({
-      type: "acp/session_closed",
+    const repeated = appReducer(closedElsewhere, {
+      type: "session/management_complete",
       requestId: "close-current",
       sessionId: "closing",
-    }));
+      owner: owner("closing"),
+      deleted: false,
+    });
     expect(repeated.session).toBeUndefined();
     expect(repeated.timeline).toEqual([]);
     expect(repeated.sessionTransition).toBeUndefined();
 
-    const failed = appReducer(pending, event({
-      type: "bridge/error",
+    const failed = appReducer(pending, requestFailed({
       requestId: "close-current",
       operation: "session/close",
       message: "Synthetic close failure",
@@ -2415,22 +1947,20 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "delete-current",
       sessionId: "saved",
-      stage: "deleting",
     });
     expect(pending.pendingSessionDeletions).toEqual([
-      { requestId: "delete-current", sessionId: "saved", stage: "deleting" },
+      { requestId: "delete-current", sessionId: "saved" },
     ]);
 
-    const deletedElsewhere = appReducer(pending, event({
-      type: "acp/session_deleted",
-      requestId: "delete-from-another-browser",
-      sessionId: "saved",
-    }));
+    const deletedElsewhere = appReducer(pending, {
+      type: "session/retired",
+      owner: owner("saved"),
+      deleted: true,
+    });
     expect(deletedElsewhere.sessions).toEqual([]);
     expect(deletedElsewhere.pendingSessionDeletions).toEqual([]);
 
-    const failed = appReducer(pending, event({
-      type: "bridge/error",
+    const failed = appReducer(pending, requestFailed({
       requestId: "delete-current",
       operation: "session/delete",
       message: "Synthetic delete failure",
@@ -2446,75 +1976,18 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "delete-retry",
       sessionId: "saved",
-      stage: "deleting",
     });
-    const deleted = appReducer(retrying, event({
-      type: "acp/session_deleted",
+    const deleted = appReducer(retrying, {
+      type: "session/management_complete",
       requestId: "delete-retry",
       sessionId: "saved",
-    }));
+      deleted: true,
+    });
     expect(deleted.sessions).toEqual([]);
     expect(deleted.pendingSessionDeletions).toEqual([]);
   });
 
-  it("keeps the current session until authoritative close-before-delete completes", () => {
-    const active = {
-      ...initialState,
-      session: { sessionId: "current" },
-      title: "Current thread",
-      cwd: "/workspace/current",
-      sessions: [{
-        sessionId: "current",
-        cwd: "/workspace/current",
-        title: "Current thread",
-      }],
-      timeline: [{ id: "answer", type: "agent_message" as const, text: "Kept snapshot" }],
-    };
-    const closing = appReducer(active, {
-      type: "session/delete_start",
-      requestId: "close-current-for-delete",
-      sessionId: "current",
-      stage: "closing",
-    });
-    expect(closing.session).toEqual(active.session);
-    expect(closing.title).toBe(active.title);
-    expect(closing.timeline).toEqual(active.timeline);
-    expect(closing.pendingSessionDeletions).toEqual([{
-      requestId: "close-current-for-delete",
-      sessionId: "current",
-      stage: "closing",
-    }]);
-
-    const closed = appReducer(closing, event({
-      type: "acp/session_closed",
-      requestId: "close-current-for-delete",
-      sessionId: "current",
-    }));
-    expect(closed.cachedSessions.has("current")).toBe(false);
-    expect(closed.backgroundEvents).toEqual([]);
-
-    const deleting = appReducer(closed, {
-      type: "session/delete_continue",
-      closeRequestId: "close-current-for-delete",
-      requestId: "delete-current",
-      sessionId: "current",
-    });
-    expect(deleting.pendingSessionDeletions).toEqual([{
-      requestId: "delete-current",
-      sessionId: "current",
-      stage: "deleting",
-    }]);
-
-    const deleted = appReducer(deleting, event({
-      type: "acp/session_deleted",
-      requestId: "delete-current",
-      sessionId: "current",
-    }));
-    expect(deleted.sessions).toEqual([]);
-    expect(deleted.pendingSessionDeletions).toEqual([]);
-  });
-
-  it("keeps the current session selected when delete close fails", () => {
+  it("keeps the current session selected when its deletion fails", () => {
     const active = {
       ...initialState,
       session: { sessionId: "current" },
@@ -2526,10 +1999,8 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "close-current-for-delete",
       sessionId: "current",
-      stage: "closing",
     });
-    const failed = appReducer(closing, event({
-      type: "bridge/error",
+    const failed = appReducer(closing, requestFailed({
       requestId: "close-current-for-delete",
       operation: "session/close",
       message: "Synthetic close failure",
@@ -2541,37 +2012,23 @@ describe("ACP UI state", () => {
       type: "error",
       message: "Synthetic close failure",
     });
-
-    const restored = appReducer(failed, {
-      type: "session/activate_cached",
-      sessionId: "current",
-    });
-    expect(restored.session?.sessionId).toBe("current");
-    expect(restored.timeline).toEqual(failed.timeline);
   });
 
   it("tracks URL consent and completion as separate states", () => {
-    const requested = appReducer(
-      { ...initialState, session: { sessionId: "s1" } },
-      event({
-        type: "acp/elicitation_request",
-        elicitationId: "bridge-flow",
-        request: {
-          sessionId: "s1",
-          mode: "url",
-          message: "Connect account",
-          elicitationId: "agent-flow",
-          url: "https://example.test/connect",
-        },
-      }),
-    );
-    const accepted = appReducer(requested, event({
-      type: "acp/elicitation_resolved",
-      elicitationId: "bridge-flow",
-      response: { action: "accept" },
-    }));
+    const request = {
+      sessionId: "s1",
+      mode: "url" as const,
+      message: "Connect account",
+      elicitationId: "agent-flow",
+      url: "https://example.test/connect",
+    };
+    const flowView = (status: "waiting" | "completed") => sessionView("s1", { interactions: {
+      permissions: {}, elicitations: {},
+      urlFlows: { "agent-flow": { elicitationId: "agent-flow", request, status } },
+    } });
+    const accepted = appReducer(initialState, { type: "bridge/session_hydrate", view: flowView("waiting") });
     expect(accepted.externalFlows).toEqual([
-      expect.objectContaining({ elicitationId: "agent-flow", status: "waiting" }),
+      expect.objectContaining({ elicitationId: "agent-flow", sessionId: "s1", status: "waiting" }),
     ]);
 
     const switched = appReducer(accepted, { type: "session/reset" });
@@ -2579,98 +2036,8 @@ describe("ACP UI state", () => {
       expect.objectContaining({ elicitationId: "agent-flow", status: "waiting" }),
     ]);
 
-    const completed = appReducer(
-      switched,
-      event({
-        type: "acp/elicitation_complete",
-        notification: { elicitationId: "agent-flow" },
-      }),
-    );
+    const completed = appReducer(switched, { type: "bridge/session_hydrate", view: flowView("completed") });
     expect(completed.externalFlows[0]?.status).toBe("completed");
-  });
-
-  it("does not regress an already completed external flow to waiting", () => {
-    const state = appReducer({
-      ...initialState,
-      session: { sessionId: "session" },
-      externalFlows: [{
-        elicitationId: "agent-flow",
-        message: "External flow",
-        status: "completed" as const,
-      }],
-      elicitations: [{
-        elicitationId: "bridge-flow",
-        request: {
-          sessionId: "session",
-          mode: "url" as const,
-          message: "Connect",
-          elicitationId: "agent-flow",
-          url: "https://example.test/connect",
-        },
-      }],
-    }, event({
-      type: "acp/elicitation_resolved",
-      elicitationId: "bridge-flow",
-      response: { action: "accept" },
-    }));
-    expect(state.externalFlows).toEqual([
-      expect.objectContaining({ elicitationId: "agent-flow", status: "completed" }),
-    ]);
-  });
-
-  it("terminates only the matching session-scoped external flow", () => {
-    const sessionRequested = appReducer(
-      { ...initialState, session: { sessionId: "session" } },
-      event({
-        type: "acp/elicitation_request",
-        elicitationId: "bridge-session-flow",
-        request: {
-          sessionId: "session",
-          mode: "url",
-          message: "Session connection",
-          elicitationId: "session-flow",
-          url: "https://example.test/session",
-        },
-      }),
-    );
-    const accepted = appReducer(sessionRequested, event({
-      type: "acp/elicitation_resolved",
-      elicitationId: "bridge-session-flow",
-      response: { action: "accept" },
-    }));
-    expect(accepted.externalFlows).toEqual([
-      expect.objectContaining({
-        elicitationId: "session-flow",
-        sessionId: "session",
-        status: "waiting",
-      }),
-    ]);
-
-    const wrongSession = appReducer(accepted, event({
-      type: "acp/elicitation_aborted",
-      elicitationId: "session-flow",
-      sessionId: "other",
-      reason: "session_closed",
-    }));
-    expect(wrongSession.externalFlows[0]?.status).toBe("waiting");
-    expect(wrongSession.backgroundEvents).toHaveLength(1);
-
-    const cancelled = appReducer(wrongSession, event({
-      type: "acp/elicitation_aborted",
-      elicitationId: "session-flow",
-      sessionId: "session",
-      reason: "session_cancelled",
-    }));
-    expect(cancelled.externalFlows[0]).toMatchObject({
-      status: "cancelled",
-      abortReason: "session_cancelled",
-    });
-
-    const lateCompletion = appReducer(cancelled, event({
-      type: "acp/elicitation_complete",
-      notification: { elicitationId: "session-flow" },
-    }));
-    expect(lateCompletion.externalFlows[0]?.status).toBe("cancelled");
   });
 
   it("does not end a prompt when an unrelated bridge operation fails", () => {
@@ -2690,8 +2057,7 @@ describe("ACP UI state", () => {
     });
     const listFailed = appReducer(
       running,
-      event({
-        type: "bridge/error",
+      requestFailed({
         requestId: "list",
         operation: "session/list",
         message: "list failed",
@@ -2702,8 +2068,7 @@ describe("ACP UI state", () => {
 
     const duplicatePromptFailed = appReducer(
       running,
-      event({
-        type: "bridge/error",
+      requestFailed({
         requestId: "prompt-duplicate",
         operation: "session/prompt",
         message: "A prompt is already running",
@@ -2714,8 +2079,7 @@ describe("ACP UI state", () => {
 
     const promptFailed = appReducer(
       running,
-      event({
-        type: "bridge/error",
+      requestFailed({
         requestId: "prompt-current",
         operation: "session/prompt",
         message: "prompt failed",
@@ -2726,8 +2090,7 @@ describe("ACP UI state", () => {
 
     const recoverableProtocolError = appReducer(
       running,
-      event({
-        type: "bridge/error",
+      requestFailed({
         message: "Invalid Agent update was dropped",
       }),
     );
@@ -2735,7 +2098,7 @@ describe("ACP UI state", () => {
 
     const stopped = appReducer(
       recoverableProtocolError,
-      event({ type: "bridge/phase", phase: "error" }),
+      globalEvent({ type: "bridge/connection", phase: "error" }),
     );
     expect(stopped.running).toBe(false);
     expect(stopped.pendingPrompt).toBeUndefined();
@@ -2767,9 +2130,7 @@ describe("ACP UI state", () => {
     });
     const lateUpdate = appReducer(
       active,
-      event({
-        type: "acp/session_update",
-        notification: {
+      ({ type: "session/turn_update", notification: {
           sessionId: "old",
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -2778,46 +2139,33 @@ describe("ACP UI state", () => {
         },
       }),
     );
-    const lateStop = appReducer(
-      lateUpdate,
-      event({
-        type: "acp/prompt_complete",
-        requestId: "old-prompt",
-        sessionId: "old",
-        response: { stopReason: "end_turn" },
-      }),
-    );
+    const lateStop = appReducer(lateUpdate, turnComplete("old", "old-prompt", { stopReason: "end_turn" }));
+    expect(lateStop).toBe(lateUpdate);
 
-    const staleCurrentStop = appReducer(lateStop, event({
-      type: "acp/prompt_complete",
-      requestId: "stale-current-prompt",
-      sessionId: "current",
-      response: { stopReason: "end_turn" },
-    }));
-    expect(staleCurrentStop.timeline).toHaveLength(1);
+    const staleCurrentStop = appReducer(
+      lateStop,
+      turnComplete("current", "stale-current-prompt", { stopReason: "end_turn" }),
+    );
     expect(staleCurrentStop.timeline[0]).toMatchObject({ role: "user" });
     expect(staleCurrentStop.running).toBe(true);
     expect(staleCurrentStop.pendingPrompt?.requestId).toBe("current-prompt");
 
-    const completed = appReducer(staleCurrentStop, event({
-      type: "acp/prompt_complete",
-      requestId: "current-prompt",
-      sessionId: "current",
-      response: { stopReason: "end_turn" },
-    }));
+    const completed = appReducer(
+      staleCurrentStop,
+      turnComplete("current", "current-prompt", { stopReason: "end_turn" }),
+    );
     expect(completed.timeline.at(-1)).toMatchObject({ type: "stop" });
     expect(completed.running).toBe(false);
     expect(completed.pendingPrompt).toBeUndefined();
 
     expect(lateStop.running).toBe(true);
-    expect(staleCurrentStop.backgroundEvents).toHaveLength(3);
+    expect(JSON.stringify(staleCurrentStop.timeline)).not.toContain("late");
+    expect(staleCurrentStop.backgroundEvents).toHaveLength(1);
   });
 
   it("updates ID-addressed plans in place and preserves their timeline position", () => {
     const active = { ...initialState, session: { sessionId: "s1" } };
-    const first = appReducer(active, event({
-      type: "acp/session_update",
-      notification: {
+    const first = appReducer(active, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "plan_update",
@@ -2831,9 +2179,7 @@ describe("ACP UI state", () => {
       sessionId: "s1",
       blocks: [{ type: "text", text: "next" }],
     });
-    const updated = appReducer(withMessage, event({
-      type: "acp/session_update",
-      notification: {
+    const updated = appReducer(withMessage, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "plan_update",
@@ -2850,9 +2196,7 @@ describe("ACP UI state", () => {
       expect(plan.raw.at(-1)).toMatchObject({ update: { plan: { planId: "p1", content: "second" } } });
     }
 
-    const removed = appReducer(updated, event({
-      type: "acp/session_update",
-      notification: {
+    const removed = appReducer(updated, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: { sessionUpdate: "plan_removed", planId: "p1" },
       },
@@ -2868,9 +2212,7 @@ describe("ACP UI state", () => {
       expect(removed.timeline[0].raw.at(-1)).toMatchObject({ update: { sessionUpdate: "plan_removed", planId: "p1" } });
     }
 
-    const orphanRemoval = appReducer(active, event({
-      type: "acp/session_update",
-      notification: {
+    const orphanRemoval = appReducer(active, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: { sessionUpdate: "plan_removed", planId: "unknown" },
       },
@@ -2888,9 +2230,7 @@ describe("ACP UI state", () => {
         blocks: [{ type: "text", text: "Do the work" }],
       },
     );
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "plan",
@@ -2904,9 +2244,7 @@ describe("ACP UI state", () => {
     expect(state.activePlan?.update).toMatchObject({ sessionUpdate: "plan" });
     expect(state.timeline.some(({ type }) => type === "plan")).toBe(false);
 
-    state = appReducer(state, event({
-      type: "acp/session_update",
-      notification: {
+    state = appReducer(state, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "plan",
@@ -2917,12 +2255,7 @@ describe("ACP UI state", () => {
         },
       },
     }));
-    state = appReducer(state, event({
-      type: "acp/prompt_complete",
-      requestId: "plan-turn",
-      sessionId: "s1",
-      response: { stopReason: "end_turn" },
-    }));
+    state = appReducer(state, turnComplete("s1", "plan-turn", { stopReason: "end_turn" }));
 
     expect(state.activePlan).toBeUndefined();
     expect(state.timeline.map(({ type }) => type)).toEqual(["message", "plan", "stop"]);
@@ -2930,9 +2263,7 @@ describe("ACP UI state", () => {
 
   it("applies compaction patch and streaming-summary semantics in place", () => {
     const active = { ...initialState, session: { sessionId: "s1" } };
-    const started = appReducer(active, event({
-      type: "acp/session_update",
-      notification: {
+    const started = appReducer(active, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "compaction_update",
@@ -2941,9 +2272,7 @@ describe("ACP UI state", () => {
         },
       },
     }));
-    const chunked = appReducer(started, event({
-      type: "acp/session_update",
-      notification: {
+    const chunked = appReducer(started, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "compaction_summary_chunk",
@@ -2952,9 +2281,7 @@ describe("ACP UI state", () => {
         },
       },
     }));
-    const completed = appReducer(chunked, event({
-      type: "acp/session_update",
-      notification: {
+    const completed = appReducer(chunked, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "compaction_update",
@@ -2976,9 +2303,7 @@ describe("ACP UI state", () => {
 
   it("preserves cumulative cost when a usage update only changes context tokens", () => {
     const active = { ...initialState, session: { sessionId: "s1" } };
-    const withCost = appReducer(active, event({
-      type: "acp/session_update",
-      notification: {
+    const withCost = appReducer(active, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: {
           sessionUpdate: "usage_update",
@@ -2988,9 +2313,7 @@ describe("ACP UI state", () => {
         },
       },
     }));
-    const tokensOnly = appReducer(withCost, event({
-      type: "acp/session_update",
-      notification: {
+    const tokensOnly = appReducer(withCost, ({ type: "session/turn_update", notification: {
         sessionId: "s1",
         update: { sessionUpdate: "usage_update", used: 60, size: 100 },
       },
@@ -3003,120 +2326,4 @@ describe("ACP UI state", () => {
     });
   });
 
-  it("atomically replaces the visible projection only after a replacement generation succeeds", () => {
-    const original: AppState = {
-      ...initialState,
-      phase: "ready",
-      socketOpen: true,
-      session: { sessionId: "completed" },
-      cwd: "/workspace/completed",
-      timeline: [{
-        id: "completed-answer",
-        type: "assistant",
-        chunks: [{
-          id: "completed-answer-chunk",
-          role: "agent",
-          blocks: [{ type: "text", text: "previous generation" }],
-          raw: [],
-        }],
-      }],
-    };
-
-    let replacing = appReducer(original, event({
-      type: "bridge/runtime_replay_started",
-      sessionCount: 1,
-    }));
-    replacing = appReducer(replacing, event({
-      type: "bridge/runtime_session",
-      sessionId: "active",
-      cwd: "/workspace/active",
-      session: { sessionId: "active" },
-      truncated: false,
-    }));
-    replacing = appReducer(replacing, event({
-      type: "acp/prompt_started",
-      requestId: "active-prompt",
-      sessionId: "active",
-      prompt: [{ type: "text", text: "still running" }],
-    }));
-    replacing = appReducer(replacing, event({
-      type: "acp/session_update",
-      notification: {
-        sessionId: "active",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "replacement-answer",
-          content: { type: "text", text: "replacement generation" },
-        },
-      },
-    }));
-
-    expect(replacing.session?.sessionId).toBe("completed");
-    expect(JSON.stringify(replacing.timeline)).toContain("previous generation");
-    expect(JSON.stringify(replacing.timeline)).not.toContain("replacement generation");
-
-    replacing = appReducer(replacing, event({
-      type: "bridge/runtime_replay_complete",
-      sessionIds: ["active"],
-    }));
-    const committed = appReducer(replacing, {
-      type: "runtime/replay_complete",
-      preferredSessionId: "active",
-    });
-
-    expect(committed.session?.sessionId).toBe("active");
-    expect(JSON.stringify(committed.timeline)).toContain("replacement generation");
-    expect(JSON.stringify(committed.timeline)).not.toContain("previous generation");
-  });
-
-  it("keeps the prior projection when a replacement generation fails without exposing partial state", () => {
-    const original: AppState = {
-      ...initialState,
-      phase: "ready",
-      socketOpen: true,
-      session: { sessionId: "completed" },
-      cwd: "/workspace/completed",
-      timeline: [{
-        id: "completed-answer",
-        type: "assistant",
-        chunks: [{
-          id: "completed-answer-chunk",
-          role: "agent",
-          blocks: [{ type: "text", text: "stable projection" }],
-          raw: [],
-        }],
-      }],
-    };
-
-    let replacing = appReducer(original, event({
-      type: "bridge/runtime_replay_started",
-      sessionCount: 1,
-    }));
-    replacing = appReducer(replacing, event({
-      type: "bridge/runtime_session",
-      sessionId: "partial",
-      cwd: "/workspace/partial",
-      session: { sessionId: "partial" },
-      truncated: false,
-    }));
-    replacing = appReducer(replacing, event({
-      type: "acp/session_update",
-      notification: {
-        sessionId: "partial",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "partial-answer",
-          content: { type: "text", text: "must stay hidden" },
-        },
-      },
-    }));
-    const failed = appReducer(replacing, event({
-      type: "bridge/phase",
-      phase: "error",
-    }));
-
-    expect(failed.session?.sessionId).toBe("completed");
-    expect(JSON.stringify(failed.timeline)).toContain("stable projection");
-    expect(JSON.stringify(failed.timeline)).not.toContain("must stay hidden");
-  });
 });

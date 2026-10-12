@@ -1,4 +1,3 @@
-import type { ServerEvent } from "../shared/bridge";
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import {
@@ -7,7 +6,7 @@ import {
   type GlobalBusinessEvent,
   type SessionBusinessEvent,
 } from "../shared/business-api";
-import { appReducer, initialState } from "../web/src/lib/state";
+import { appReducer, initialState, type AppAction } from "../web/src/lib/state";
 
 const eventTypes = new Set<GlobalBusinessEvent["type"] | SessionBusinessEvent["type"]>([
   "bridge/catalog_changed",
@@ -53,8 +52,7 @@ describe("deterministic adversarial generation", () => {
     };
 
     for (let index = 0; index < 2_500; index += 1) {
-      const event = generatedServerEvent(random, index);
-      state = appReducer(state, { type: "server/event", event });
+      state = appReducer(state, generatedSessionAction(random, index));
 
       expect(uniqueEntityIds(state.timeline, "tool")).toBe(true);
       expect(uniqueEntityIds(state.timeline, "plan")).toBe(true);
@@ -69,13 +67,13 @@ describe("deterministic adversarial generation", () => {
   }, 30_000);
 });
 
-function generatedServerEvent(random: () => number, index: number): ServerEvent {
+function generatedSessionAction(random: () => number, index: number): AppAction {
   const crossSession = random() < 0.22;
   const sessionId = crossSession ? "other" : "current";
   const marker = crossSession ? "CROSS_SESSION_SENTINEL" : `visible-${index}`;
   const choice = Math.floor(random() * 9);
-  const notification = (update: SessionUpdate): ServerEvent => ({
-    type: "acp/session_update",
+  const notification = (update: SessionUpdate): AppAction => ({
+    type: "session/turn_update",
     notification: { sessionId, update },
   });
 
@@ -135,7 +133,7 @@ function generatedServerEvent(random: () => number, index: number): ServerEvent 
       });
     default:
       return {
-        type: "acp/terminal_state",
+        type: "session/terminal_update",
         terminal: {
           sessionId,
           terminalId: `terminal-${index % 70}`,

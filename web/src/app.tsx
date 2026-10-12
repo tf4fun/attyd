@@ -671,7 +671,6 @@ export default function App() {
         {state.mcpServers.length > 0 ? (
           <div className="mcp-summary" title={state.mcpServers.map(({ name, type }) => `${name} (${type})`).join("\n")}>
             {t("mcpServers", { count: state.mcpServers.length })}
-            {state.mcpConnections.length > 0 ? ` · ${t("mcpActive", { count: state.mcpConnections.length })}` : ""}
           </div>
         ) : null}
         {(authMethods.length > 0 || agentCapabilities?.auth?.logout != null) && state.authStatus ? (
@@ -695,22 +694,10 @@ export default function App() {
             <RawJson label={t("initializeResponse")} value={state.initialized} />
           </details>
         ) : null}
-        {state.stderr ? (
-          <details className="sidebar-details logs">
-            <summary><ScrollText size={13} /> {t("stderr")} <ChevronDown size={12} /></summary>
-            <pre>{state.stderr}</pre>
-          </details>
-        ) : null}
         {state.backgroundEvents.length > 0 ? (
           <details className="sidebar-details">
             <summary><ScrollText size={13} /> {t("backgroundEvents", { count: state.backgroundEvents.length })} <ChevronDown size={12} /></summary>
             <RawJson label={t("otherSessionEvents")} value={state.backgroundEvents} />
-          </details>
-        ) : null}
-        {state.mcpActivity.length > 0 ? (
-          <details className="sidebar-details">
-            <summary><Activity size={13} /> MCP-over-ACP ({state.mcpActivity.length}) <ChevronDown size={12} /></summary>
-            <RawJson label={t("mcpActivity")} value={{ activeConnections: state.mcpConnections, messages: state.mcpActivity }} />
           </details>
         ) : null}
       </div>

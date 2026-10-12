@@ -14,10 +14,7 @@ function plan(status: PlanEntry["status"], content = "Inspect"): SessionUpdate {
 }
 
 function update(state: AppState, update: SessionUpdate): AppState {
-  return appReducer(state, {
-    type: "server/event",
-    event: { type: "acp/session_update", notification: { sessionId: "s1", update } },
-  });
+  return appReducer(state, { type: "session/turn_update", notification: { sessionId: "s1", update } });
 }
 
 function start(): AppState {
@@ -153,22 +150,20 @@ describe("plan lifecycle", () => {
     expect(state.running).toBe(true);
   });
 
-  it("also archives plans for legacy prompt cancellation and errors", () => {
+  it("also archives plans when the prompt request fails", () => {
     const active = update(start(), plan("in_progress"));
-    for (const event of [
-      { type: "acp/prompt_complete", requestId: "intent", sessionId: "s1", response: { stopReason: "cancelled" } },
-      { type: "bridge/error", requestId: "intent", operation: "session/prompt", message: "Failed" },
-    ] as const) {
-      const state = appReducer(active, { type: "server/event", event });
-      expect(state.activePlan).toBeUndefined();
-      expect(state.timeline[1]).toMatchObject({ update: plan("in_progress") });
-      expect(state.running).toBe(false);
-    }
+    const state = appReducer(active, {
+      type: "request/failed",
+      error: { requestId: "intent", operation: "session/prompt", message: "Failed" },
+    });
+    expect(state.activePlan).toBeUndefined();
+    expect(state.timeline[1]).toMatchObject({ update: plan("in_progress") });
+    expect(state.running).toBe(false);
   });
 
   it("archives the active plan when the bridge stops", () => {
     const state = appReducer(update(start(), plan("in_progress")), {
-      type: "server/event", event: { type: "bridge/phase", phase: "stopped" },
+      type: "global/event", event: { type: "bridge/connection", phase: "stopped" },
     });
     expect(state.activePlan).toBeUndefined();
     expect(state.timeline.find(({ type }) => type === "plan")).toMatchObject({ update: plan("in_progress") });
