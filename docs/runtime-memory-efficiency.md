@@ -71,7 +71,7 @@ Zed 的 [调试缓存](https://github.com/zed-industries/zed/blob/656e3aed84e0fe
   （如 title）继续按相应语义处理。缺字段与清空不得混同。
 - snapshot 保持完整；snapshot 加连续 suffix 应与权威 registry 的最新状态等价。
   seq 缺口仍请求 snapshot，旧 epoch/incarnation 不得污染新实例。
-- 新 runtime change kind 同步更新 Rust 序列化、Hub 解析和 `shared/bridge.ts` 验证。
+- 新 runtime change kind 同步更新 Rust 序列化、Hub 解析和 `shared/business-api.ts` 验证。
   浏览器业务 SSE 的控制恢复契约不在本阶段擅自变更。
 
 ### P2：减少与本次更新无关的正文分配

@@ -101,9 +101,9 @@ describe("compact completed-turn hydration", () => {
       { sessionUpdate: "compaction_summary_chunk", compactionId: "shared", content: { type: "text", text: "Live summary" } },
       { sessionUpdate: "compaction_update", compactionId: "shared", status: "completed" },
     ];
-    for (const update of next) state = appReducer(state, { type: "server/event", event: {
-      type: "acp/session_update", notification: { sessionId: owner.sessionId, update },
-    } });
+    for (const update of next) state = appReducer(state, {
+      type: "session/turn_update", notification: { sessionId: owner.sessionId, update },
+    });
     expect(state.timeline.filter((item) => item.historyTurnId != null)).toEqual(historical);
     const current = state.timeline.filter((item) => item.historyTurnId == null);
     expect(current.find((item) => item.type === "tool")).toMatchObject({ call: { title: "Tool call not found", status: "failed" } });
@@ -157,9 +157,9 @@ describe("compact completed-turn hydration", () => {
       updates: [{ sessionUpdate: "tool_call", toolCallId: "live", title: "Live tool", status: "in_progress" }],
     };
     let state = appReducer(initialState, { type: "bridge/session_hydrate", view: compact });
-    state = appReducer(state, { type: "server/event", event: { type: "acp/session_update", notification: {
+    state = appReducer(state, { type: "session/turn_update", notification: {
       sessionId: owner.sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "live", status: "completed", rawOutput: "complete output" },
-    } } });
+    } });
     const turns = collectTurnReviewChanges(state.timeline);
     expect(turns).toHaveLength(3);
     expect(splitTurnPresentation(turns[0].items).output?.chunks[0].blocks).toHaveLength(2);
@@ -183,7 +183,7 @@ describe("compact completed-turn hydration", () => {
       updates: source === "snapshot" ? updates : [], terminal: null };
     let state = appReducer(initialState, { type: "bridge/session_hydrate", view: compact });
     if (source === "stream") for (const update of updates) state = appReducer(state, {
-      type: "server/event", event: { type: "acp/session_update", notification: { sessionId: owner.sessionId, update } },
+      type: "session/turn_update", notification: { sessionId: owner.sessionId, update },
     });
     expect(state.timeline.filter((item) => item.historyTurnId != null).map((item) =>
       item.type === "assistant" ? item.chunks.map((chunk) => chunk.blocks) : item.type === "message" ? item.blocks : item.type
@@ -206,10 +206,10 @@ describe("compact completed-turn hydration", () => {
     compact.collapsedTurns = [{ turnId: "0", beforeUpdate: 0, afterUpdate: 1, processCount: 0, historyRevision: "history", outcomes: [] }];
     let state = appReducer(initialState, { type: "bridge/session_hydrate", view: compact });
     const historical = state.timeline[0];
-    state = appReducer(state, { type: "server/event", event: { type: "acp/session_update", notification: {
+    state = appReducer(state, { type: "session/turn_update", notification: {
       sessionId: owner.sessionId,
       update: kind === "user" ? user("new prompt") : { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "new answer" } },
-    } } });
+    } });
     expect(state.timeline).toHaveLength(2);
     expect(state.timeline[0]).toBe(historical);
     expect(state.timeline[1].historyTurnId).toBeUndefined();

@@ -1,7 +1,9 @@
 import type {
+  AuthenticateResponse,
   ContentBlock,
   CreateElicitationRequest,
   InitializeResponse,
+  LogoutResponse,
   NewSessionResponse,
   PromptResponse,
   RequestPermissionRequest,
@@ -15,7 +17,7 @@ import type {
   WorkspaceContextAttachment,
   WorkspaceContextMatch,
 } from "./bridge.js";
-import { parseServerEvent } from "./bridge.js";
+import { parseTerminalSnapshot } from "./bridge.js";
 
 export type SessionSyncPhase =
   | "cold"
@@ -131,8 +133,8 @@ export type GlobalBusinessEvent =
   | { type: "bridge/catalog_changed"; bridgeEpoch: string; revision: number }
   | { type: "bridge/connection"; phase: ConnectionPhase }
   | { type: "bridge/connection_error"; message: string; code?: number; data?: unknown }
-  | { type: "acp/authenticated"; requestId: string; methodId: string; response: unknown }
-  | { type: "acp/logged_out"; requestId: string; response: unknown }
+  | { type: "acp/authenticated"; requestId: string; methodId: string; response: AuthenticateResponse }
+  | { type: "acp/logged_out"; requestId: string; response: LogoutResponse }
   | { type: "bridge/auth_terminal_started"; requestId: string; methodId: string }
   | { type: "bridge/auth_terminal_output"; requestId: string; data: string }
   | {
@@ -306,8 +308,7 @@ export function parseSessionBusinessEvent(raw: string): SessionBusinessEvent {
     throw new Error("Session delta has an invalid predecessor or change");
   }
   if (value.type === "bridge/session_delta" && isRecord(value.change) && value.change.kind === "terminal_update") {
-    const parsed = parseServerEvent(JSON.stringify({ type: "acp/terminal_state", terminal: value.change.terminal }));
-    if (parsed.type !== "acp/terminal_state" || parsed.terminal.sessionId !== value.sessionId) {
+    if (parseTerminalSnapshot(value.change.terminal).sessionId !== value.sessionId) {
       throw new Error("Terminal delta does not match its session identity");
     }
   }

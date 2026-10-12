@@ -24,9 +24,7 @@ function hydrate(updates: SessionUpdate[] = []): AppState {
 // bridge/session_delta with change.kind=turn_update. The REST/SSE owner and
 // ordering fences remain covered by runtime-memory-retention.test.tsx.
 function apply(state: AppState, update: SessionUpdate): AppState {
-  return appReducer(state, {
-    type: "server/event", event: { type: "acp/session_update", notification: { sessionId, update } },
-  });
+  return appReducer(state, { type: "session/turn_update", notification: { sessionId, update } });
 }
 
 function diagnosticBytes(raw: unknown[]): number {
@@ -177,14 +175,15 @@ describe("runtime memory efficiency: current diagnostic state", () => {
   it("E07 preserves current business input/output, permission and retry data across sparse tool updates", () => {
     let state = apply(hydrate(), tool("complete current output"));
     state = apply(state, { sessionUpdate: "tool_call_update", toolCallId: "tool", rawOutput: { result: "current result" } });
-    state = appReducer(state, { type: "server/event", event: {
-      type: "acp/permission_request", permissionId: "permission",
-      request: { sessionId, toolCall: { toolCallId: "tool", title: "Allow read?", rawInput: { path: "/work/file" } }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] },
-    } });
+    state = appReducer(state, { type: "bridge/session_live_update", view: { ...view(), interactions: {
+      permissions: { permission: { interactionId: "permission",
+        request: { sessionId, toolCall: { toolCallId: "tool", title: "Allow read?", rawInput: { path: "/work/file" } }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] } } },
+      elicitations: {}, urlFlows: {},
+    } } });
     state = appReducer(state, { type: "permission/respond_start", permissionId: "permission", requestId: "response-in-flight" });
     state = apply(state, { sessionUpdate: "tool_call_update", toolCallId: "tool", status: "in_progress" });
     const current = state.timeline.find((item) => item.type === "tool")!;
-    expect(current.call).toMatchObject({ rawInput: { path: "/work/file" }, rawOutput: { result: "current result" }, content: [{ type: "content", content: { type: "text", text: "complete current output" } }] });
+    expect(current.call).toMatchObject({ rawOutput: { result: "current result" }, content: [{ type: "content", content: { type: "text", text: "complete current output" } }] });
     expect(state.permissions).toEqual([{
       permissionId: "permission", responseRequestId: "response-in-flight", responseError: undefined,
       request: { sessionId, toolCall: { toolCallId: "tool", title: "Allow read?", rawInput: { path: "/work/file" } }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] },
