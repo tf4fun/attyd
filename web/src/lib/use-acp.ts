@@ -1,8 +1,10 @@
 import i18n from "../i18n";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type {
+  AuthenticateResponse,
   ContentBlock,
   CreateElicitationResponse,
+  LogoutResponse,
   RequestPermissionResponse,
   SessionInfo,
 } from "@agentclientprotocol/sdk";
@@ -974,7 +976,7 @@ export function useAcp() {
       }).catch(reportError);
       return;
     }
-    void requestJson<{ requestId: string; response: unknown }>(
+    void requestJson<{ requestId: string; response: AuthenticateResponse }>(
       `/api/v1/auth/${encodeURIComponent(methodId)}`,
       { method: "POST" },
     ).then(({ requestId, response }) => {
@@ -1030,7 +1032,7 @@ export function useAcp() {
   const dismissAuthTerminal = useCallback(() => dispatch({ type: "auth/dismiss_terminal" }), []);
 
   const logout = useCallback(() => {
-    void requestJson<{ requestId: string; response: unknown }>("/api/v1/auth/logout", {
+    void requestJson<{ requestId: string; response: LogoutResponse }>("/api/v1/auth/logout", {
       method: "POST",
     }).then(({ requestId, response }) => {
       handleGlobalEvent({ type: "acp/logged_out", requestId, response });
