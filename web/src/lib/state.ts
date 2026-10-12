@@ -37,7 +37,7 @@ import { sameSessionOwner } from "../../../shared/business-api";
 import type { SessionControlKind } from "./session-deltas";
 import { randomId } from "./id";
 import { timelineTurnStarts } from "./timeline-turns";
-import { releaseTimelineProcess, releaseUnreferencedTerminals } from "./process-retention";
+import { releaseSessionViewProcess, releaseTimelineProcess, releaseUnreferencedTerminals } from "./process-retention";
 
 export interface AssistantMessageChunk {
   id: string;
@@ -447,7 +447,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       if (!sameSessionOwner(state.sessionOwner, action.process.owner)) return state;
       const timeline = releaseTimelineProcess(state.timeline, action.process);
       if (timeline === state.timeline) return state;
-      return { ...state, timeline, terminalSnapshots: releaseUnreferencedTerminals(state.terminalSnapshots,
+      const { process } = action;
+      const sessionView = state.sessionView != null && sameSessionOwner(state.sessionView, process.owner)
+        ? releaseSessionViewProcess(state.sessionView, (turn) =>
+          (process.operationId != null && (turn.operationId ?? turn.outcomes.at(-1)?.operationId) === process.operationId) ||
+          (turn.turnId === process.turnId && turn.historyRevision === process.historyRevision))
+        : state.sessionView;
+      return { ...state, timeline, sessionView, terminalSnapshots: releaseUnreferencedTerminals(state.terminalSnapshots,
         state.timeline, [timeline, state.permissions, state.elicitations, state.activePlan]),
         sessionTransition: state.sessionTransition == null ? undefined : {
           ...state.sessionTransition, backup: compactSessionSnapshot(state.sessionTransition.backup),

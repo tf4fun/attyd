@@ -1216,9 +1216,9 @@ export function useAcp() {
     }
     if (process.operationId != null) released.operations.add(process.operationId);
     released.turns.set(process.turnId, process.historyRevision);
-    dispatch({ type: "session/view_synced", view: filterReleasedView(view) });
+    // The reducer releases this turn from both the view and its projection.
     dispatch({ type: "session/release_turn_process", process });
-  }, [filterReleasedView, releasedFor]);
+  }, [releasedFor]);
 
   const readThreadForExport = useCallback(async () => {
     if (!store.getState().timeline.some((item) => item.deferredProcess != null) &&
