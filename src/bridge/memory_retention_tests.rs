@@ -230,7 +230,7 @@ fn pending_sequences(state: &BridgeState, after: u64) -> Vec<u64> {
 }
 
 #[test]
-fn memory_retention_delta_transfer_releases_old_overlay_before_queue_consumption() {
+fn memory_retention_delta_transfer_empties_journal_and_releases_overlay_on_consumption() {
     let mut turn = JournalTurn::new();
     let (sink, mut receiver) = publication_queue();
     flush_runtime(&mut turn.state, &sink);

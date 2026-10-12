@@ -43,7 +43,7 @@ Red 用例使用正常的正确行为断言，不使用 `ignore`、`should_panic
 
 | 门槛 | 可执行覆盖 | 验收要求 |
 | --- | --- | --- |
-| M01 | Bridge `delta_transfer_releases_old_overlay_before_queue_consumption` | 入队后 journal 原引用释放；队列仍持有完整交付，当前 overlay 存活 |
+| M01 | Bridge `delta_transfer_empties_journal_and_releases_overlay_on_consumption` | 入队后 journal 不再持有已发布增量；类型化队列共享（不复制）交付内容，消费后旧 overlay 立即释放，当前 overlay 存活 |
 | M02 | 更新后的大 burst 测试；Hub 不再持有第二份原始事件归档 | 工具替换只保留当前内容；消息追加逐字完整；没有第二份原始 conversation 归档 |
 | M03 | Bridge `fixed_final_output…` | 最终正文与实体数量相同，增加中间更新不能增加稳态保留 |
 | M04 | Hub `m04_hub_without_observers…`、`m04_hub_one_healthy_observer…`、`m04_hub_multiple_observers…` | 无观察者也不保留旧版本；及时消费后的旧正文不随观察者数积累 |
