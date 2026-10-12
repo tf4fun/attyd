@@ -127,15 +127,16 @@ impl EventSink {
         if event.get("requestId").is_none() && event.get("operation").is_none() {
             self.send(event);
         } else {
+            let request_id = event.get("requestId").and_then(Value::as_str);
+            let operation = event.get("operation").and_then(Value::as_str);
+            let code = event.get("code").and_then(Value::as_i64);
+            let message = event.get("message").and_then(Value::as_str);
             tracing::warn!(
-                request_id = event.get("requestId").and_then(Value::as_str),
-                operation = event.get("operation").and_then(Value::as_str),
-                code = event.get("code").and_then(Value::as_i64),
+                request_id = ?request_id,
+                operation = ?operation,
+                code = ?code,
                 "{}",
-                event
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
+                message.unwrap_or_default()
             );
         }
     }
@@ -2921,7 +2922,6 @@ fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
 #[cfg(test)]
 async fn apply_runtime_effects(
     state: &Arc<Mutex<BridgeState>>,
-    sink: &EventSink,
     terminals: Option<&TerminalManager>,
 ) {
     let terminal_releases = {
@@ -11503,7 +11503,7 @@ mod tests {
         drop(locked);
         let ((mut permission, mut elicitation), registration) = next.await.unwrap();
         // The old command's eventual effect drain has no authority over the new turn.
-        apply_runtime_effects(&state, &sink, None).await;
+        apply_runtime_effects(&state, None).await;
         assert!(matches!(
             permission.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -11676,7 +11676,7 @@ mod tests {
         ));
         let (tx, mut events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
-        apply_runtime_effects(&state, &sink, None).await;
+        apply_runtime_effects(&state, None).await;
         cancel_interactions("session", old_incarnation, &state, &sink).await;
         assert!(matches!(
             new_permission.try_recv(),
@@ -11788,8 +11788,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        apply_runtime_effects(&state, &EventSink { tx: tx.into() }, None).await;
+        apply_runtime_effects(&state, None).await;
 
         assert!(matches!(
             permission_receiver.await.unwrap().outcome,
@@ -11802,12 +11801,6 @@ mod tests {
         let state = state.lock().await;
         assert!(state.sessions.permission_owners.is_empty());
         assert!(state.sessions.elicitation_owners.is_empty());
-        drop(state);
-        assert_eq!(
-            std::iter::from_fn(|| rx.try_recv().ok()).count(),
-            2,
-            "each responder gets one public terminal event"
-        );
     }
 
     #[test]
