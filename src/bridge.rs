@@ -9848,8 +9848,7 @@ mod tests {
         ));
         assert!(!cancellation.is_cancelled());
         drop(state);
-        let error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert!(error["data"].as_str().unwrap().contains("more session IDs"));
+        // The rejected extra ID is an operation-scoped failure: logged, not published.
         assert!(rx.try_recv().is_err());
     }
 
