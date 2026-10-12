@@ -3,6 +3,7 @@ mod attachments;
 mod auth_terminal;
 mod auto_close;
 mod bridge;
+mod bridge_event;
 mod completion_handoff;
 mod dev_proxy;
 mod elicitation_validation;

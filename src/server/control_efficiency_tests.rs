@@ -120,7 +120,7 @@ impl ControlSession {
 
     async fn snapshot(&mut self, hub: &BridgeHub) {
         let snapshot = self.runtime.snapshot();
-        hub.publish(
+        hub.publish_json(
             1,
             json!({"type": "bridge/internal_runtime_snapshot", "value": snapshot}).to_string(),
         )
@@ -137,7 +137,7 @@ impl ControlSession {
         for delta in deltas {
             assert_eq!(delta.seq, self.published + 1);
             self.published = delta.seq;
-            hub.publish(
+            hub.publish_json(
                 1,
                 json!({"type": "bridge/internal_runtime_delta", "value": delta}).to_string(),
             )
@@ -261,7 +261,7 @@ async fn memory_efficiency_control_snapshot_suffix_and_gap_recovery_keep_one_cut
     fixture.text("-after-gap");
     let pending = fixture.runtime.deltas_after(fixture.published).unwrap();
     assert_eq!(pending.len(), 2);
-    hub.publish(
+    hub.publish_json(
         1,
         json!({"type": "bridge/internal_runtime_delta", "value": pending[1]}).to_string(),
     )
@@ -271,7 +271,7 @@ async fn memory_efficiency_control_snapshot_suffix_and_gap_recovery_keep_one_cut
         commands.try_recv().unwrap(),
         bridge::BridgeInput::RuntimeSnapshotRequest
     ));
-    hub.publish(
+    hub.publish_json(
         1,
         json!({"type": "bridge/internal_runtime_delta", "value": pending[1]}).to_string(),
     )

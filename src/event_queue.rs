@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::bridge_event::BridgeEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EventSendError {
@@ -67,7 +70,7 @@ enum EventReceiverInner {
 }
 
 pub(crate) struct QueuedEvent {
-    event: String,
+    event: BridgeEvent,
     lease: EventByteLease,
 }
 
@@ -86,21 +89,36 @@ impl Drop for EventByteLease {
 }
 
 impl QueuedEvent {
-    pub(crate) fn into_parts(mut self) -> (String, EventByteLease) {
-        (
-            std::mem::take(&mut self.event),
-            std::mem::take(&mut self.lease),
-        )
+    pub(crate) fn into_parts(self) -> (BridgeEvent, EventByteLease) {
+        (self.event, self.lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_json_parts(self) -> (String, EventByteLease) {
+        (self.event.to_json(), self.lease)
     }
 }
 
 impl EventSender {
-    pub(crate) fn send(&self, event: String) -> Result<(), EventSendError> {
+    /// Queue a JSON event built by the Bridge. Production queues carry its
+    /// typed form; events no Hub subscriber can receive are dropped here.
+    pub(crate) fn send_value(&self, event: Value) -> Result<(), EventSendError> {
+        match &self.inner {
+            EventSenderInner::Accounted { .. } => match BridgeEvent::from_value(event) {
+                Some(event) => self.send_event(event),
+                None => Ok(()),
+            },
+            #[cfg(test)]
+            _ => self.send_json(event.to_string()),
+        }
+    }
+
+    pub(crate) fn send_event(&self, event: BridgeEvent) -> Result<(), EventSendError> {
         match &self.inner {
             EventSenderInner::Accounted {
                 tx, queued_bytes, ..
             } => {
-                let bytes = event.len();
+                let bytes = event.encoded_len();
                 queued_bytes.fetch_add(bytes, Ordering::AcqRel);
                 let queued = QueuedEvent {
                     event,
@@ -112,6 +130,16 @@ impl EventSender {
                 tx.send(queued).map_err(|_| EventSendError::Closed)
             }
             #[cfg(test)]
+            _ => self.send_json(event.to_json()),
+        }
+    }
+
+    #[cfg(test)]
+    fn send_json(&self, event: String) -> Result<(), EventSendError> {
+        match &self.inner {
+            EventSenderInner::Accounted { .. } => {
+                unreachable!("accounted queues carry typed events")
+            }
             EventSenderInner::Unbounded(tx) => tx.send(event).map_err(|_| EventSendError::Closed),
             #[cfg(test)]
             EventSenderInner::FaultInjected { tx, fault } => {
@@ -173,10 +201,15 @@ impl EventReceiver {
         match &mut self.inner {
             EventReceiverInner::Accounted(rx) => rx.recv().await,
             #[cfg(test)]
-            EventReceiverInner::Unbounded(rx) => rx.recv().await.map(|event| QueuedEvent {
-                event,
-                lease: EventByteLease::default(),
-            }),
+            EventReceiverInner::Unbounded(rx) => loop {
+                let event = rx.recv().await?;
+                if let Some(event) = BridgeEvent::from_json(&event) {
+                    break Some(QueuedEvent {
+                        event,
+                        lease: EventByteLease::default(),
+                    });
+                }
+            },
         }
     }
 
@@ -184,10 +217,15 @@ impl EventReceiver {
         match &mut self.inner {
             EventReceiverInner::Accounted(rx) => rx.try_recv(),
             #[cfg(test)]
-            EventReceiverInner::Unbounded(rx) => rx.try_recv().map(|event| QueuedEvent {
-                event,
-                lease: EventByteLease::default(),
-            }),
+            EventReceiverInner::Unbounded(rx) => loop {
+                let event = rx.try_recv()?;
+                if let Some(event) = BridgeEvent::from_json(&event) {
+                    break Ok(QueuedEvent {
+                        event,
+                        lease: EventByteLease::default(),
+                    });
+                }
+            },
         }
     }
 }
@@ -231,19 +269,23 @@ impl From<mpsc::UnboundedReceiver<String>> for EventReceiver {
 mod tests {
     use super::*;
 
+    fn lifecycle(event: impl Into<String>) -> BridgeEvent {
+        BridgeEvent::Lifecycle(event.into())
+    }
+
     #[tokio::test]
     async fn bursts_preserve_order_and_never_cancel_the_generation() {
         let cancellation = CancellationToken::new();
         let (sender, mut receiver) = channel(cancellation.clone());
         for index in 0..4_096 {
             sender
-                .send(format!("{index}:{}", "x".repeat(8_192)))
+                .send_event(lifecycle(format!("{index}:{}", "x".repeat(8_192))))
                 .unwrap();
         }
         assert!(sender.queued_bytes() > 16 * 1024 * 1024);
         assert!(!cancellation.is_cancelled());
         for index in 0..4_096 {
-            let (event, _lease) = receiver.recv().await.unwrap().into_parts();
+            let (event, _lease) = receiver.recv().await.unwrap().into_json_parts();
             assert_eq!(event, format!("{index}:{}", "x".repeat(8_192)));
         }
         assert_eq!(sender.queued_bytes(), 0);
@@ -253,16 +295,19 @@ mod tests {
     async fn receive_completion_and_receiver_drop_release_bytes() {
         let cancellation = CancellationToken::new();
         let (sender, mut receiver) = channel(cancellation.clone());
-        sender.send("first".into()).unwrap();
-        let (event, lease) = receiver.recv().await.unwrap().into_parts();
+        sender.send_event(lifecycle("first")).unwrap();
+        let (event, lease) = receiver.recv().await.unwrap().into_json_parts();
         assert_eq!(event, "first");
         assert_eq!(sender.queued_bytes(), 5);
         drop(lease);
         assert_eq!(sender.queued_bytes(), 0);
-        sender.send("queued".into()).unwrap();
+        sender.send_event(lifecycle("queued")).unwrap();
         drop(receiver);
         assert_eq!(sender.queued_bytes(), 0);
-        assert_eq!(sender.send("closed".into()), Err(EventSendError::Closed));
+        assert_eq!(
+            sender.send_event(lifecycle("closed")),
+            Err(EventSendError::Closed)
+        );
         assert_eq!(sender.queued_bytes(), 0);
         assert!(!cancellation.is_cancelled());
         sender.cancel_generation();

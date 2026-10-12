@@ -28,6 +28,9 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::bridge;
+#[cfg(test)]
+use crate::bridge_event::session_reset_value;
+use crate::bridge_event::{BridgeEvent, SessionEvent, SessionPosition};
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
@@ -351,63 +354,37 @@ fn terminal_auth_succeeded(event: &str) -> bool {
         })
 }
 
-fn is_internal_runtime_event(event: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(event)
-        .ok()
-        .and_then(|value| value.get("type").cloned())
-        .and_then(|value| value.as_str().map(str::to_string))
-        .is_some_and(|kind| {
-            matches!(
-                kind.as_str(),
-                "bridge/internal_runtime_snapshot" | "bridge/internal_runtime_delta"
-            )
-        })
-}
-
 #[derive(Default)]
 struct CanonicalProjection {
     snapshot: Option<RuntimeSnapshot>,
 }
 
 impl CanonicalProjection {
-    /// Fold an internal runtime event into the canonical projection and
-    /// report whether it was a runtime event at all.
-    fn update(&mut self, event: &str) -> bool {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(event) else {
-            return false;
-        };
-        match value.get("type").and_then(serde_json::Value::as_str) {
-            Some("bridge/internal_runtime_snapshot") => {
-                let mut snapshot = value
-                    .get("value")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value::<RuntimeSnapshot>(value).ok());
-                if let Some(snapshot) = snapshot.as_mut() {
-                    retire_released_terminals(snapshot);
-                }
-                self.snapshot = snapshot;
-                true
-            }
-            Some("bridge/internal_runtime_delta") => {
-                let delta = value
-                    .get("value")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value::<RuntimeDelta>(value).ok());
-                let Some(delta) = delta else {
-                    self.snapshot = None;
-                    return true;
-                };
-                if !self.apply_delta(delta) {
-                    self.snapshot = None;
-                    return true;
-                }
-                if let Some(snapshot) = self.snapshot.as_mut() {
-                    retire_released_terminals(snapshot);
-                }
-                true
-            }
-            _ => false,
+    fn apply_snapshot(&mut self, mut snapshot: RuntimeSnapshot) {
+        retire_released_terminals(&mut snapshot);
+        self.snapshot = Some(snapshot);
+    }
+
+    /// Fold the next delta, or drop the projection when it does not continue
+    /// the current snapshot so the Hub requests a replacement.
+    fn apply_runtime_delta(&mut self, delta: RuntimeDelta) {
+        if !self.apply_delta(delta) {
+            self.snapshot = None;
+            return;
         }
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            retire_released_terminals(snapshot);
+        }
+    }
+
+    #[cfg(test)]
+    fn update(&mut self, event: &str) -> bool {
+        match BridgeEvent::from_json(event) {
+            Some(BridgeEvent::RuntimeSnapshot(snapshot)) => self.apply_snapshot(*snapshot),
+            Some(BridgeEvent::RuntimeDelta(delta)) => self.apply_runtime_delta(*delta),
+            _ => return false,
+        }
+        true
     }
 
     fn apply_delta(&mut self, delta: RuntimeDelta) -> bool {
@@ -645,11 +622,12 @@ impl SessionSubscriber {
         &mut self,
         canonical: &CanonicalProjection,
         event: Arc<str>,
+        reset: bool,
         position: (String, u64, u64),
     ) -> bool {
         if let Some(slot) = self.state_slot.as_ref().and_then(std::sync::Weak::upgrade) {
             let (epoch, incarnation, view_revision) = position;
-            let next = if is_session_reset(&event) {
+            let next = if reset {
                 event.clone()
             } else {
                 // A reset is always a valid replacement for queued state: the
@@ -678,10 +656,11 @@ impl SessionSubscriber {
                     )
                 })
             };
-            match slot.replace(next) {
+            let position = (epoch, incarnation, view_revision);
+            match slot.replace(next, position.clone()) {
                 Ok(()) => return true,
                 Err(next) => {
-                    return match self.sender.try_send_state(next) {
+                    return match self.sender.try_send_state(next, position) {
                         Ok(slot) => {
                             self.state_slot = Some(Arc::downgrade(&slot));
                             true
@@ -691,7 +670,7 @@ impl SessionSubscriber {
                 }
             }
         }
-        match self.sender.try_send_state(event) {
+        match self.sender.try_send_state(event, position) {
             Ok(slot) => {
                 self.state_slot = Some(Arc::downgrade(&slot));
                 true
@@ -742,33 +721,42 @@ struct StateSlot {
 
 struct StateSlotState {
     payload: Option<Arc<str>>,
+    position: Option<SessionPosition>,
     accounted_bytes: usize,
 }
 
 struct QueuedSubscriberEvent {
     event: QueuedPayload,
+    /// Coalescing position of a `Fixed` session state payload.
+    position: Option<SessionPosition>,
     queued_bytes: Arc<AtomicUsize>,
     bytes: usize,
 }
 
 impl QueuedSubscriberEvent {
-    fn claim_payload(&self) -> Arc<str> {
+    fn claim_payload(&self) -> (Arc<str>, Option<SessionPosition>) {
         match &self.event {
-            QueuedPayload::Fixed(event) => event.clone(),
+            QueuedPayload::Fixed(event) => (event.clone(), self.position.clone()),
             QueuedPayload::Shared(slot) => slot.claim(),
         }
     }
 
     #[cfg(test)]
     fn into_arc(self) -> Arc<str> {
-        self.claim_payload()
+        self.claim_payload().0
+    }
+
+    /// The SSE payload with the position it was routed with, so delivery
+    /// never re-parses what the Hub already classified.
+    fn into_delivery(self) -> (String, Option<SessionPosition>) {
+        let (payload, position) = self.claim_payload();
+        #[cfg(test)]
+        delivery_handoff_tests::after_payload_capture(&self.queued_bytes);
+        (payload.to_string(), position)
     }
 
     fn into_string(self) -> String {
-        let payload = self.claim_payload();
-        #[cfg(test)]
-        delivery_handoff_tests::after_payload_capture(&self.queued_bytes);
-        payload.to_string()
+        self.into_delivery().0
     }
 }
 
@@ -781,11 +769,12 @@ impl Drop for QueuedSubscriberEvent {
 }
 
 impl StateSlot {
-    fn new(payload: Arc<str>, ledger: Arc<AtomicUsize>) -> Self {
+    fn new(payload: Arc<str>, position: SessionPosition, ledger: Arc<AtomicUsize>) -> Self {
         let accounted_bytes = payload.len();
         Self {
             state: std::sync::Mutex::new(StateSlotState {
                 payload: Some(payload),
+                position: Some(position),
                 accounted_bytes,
             }),
             ledger,
@@ -794,7 +783,7 @@ impl StateSlot {
 
     /// Atomically transfer ownership from the replaceable queue slot to the
     /// consumer. Once claimed, producers must enqueue a new slot.
-    fn claim(&self) -> Arc<str> {
+    fn claim(&self) -> (Arc<str>, Option<SessionPosition>) {
         let mut state = self
             .state
             .lock()
@@ -805,12 +794,12 @@ impl StateSlot {
             .expect("a queued state slot is claimed exactly once");
         let accounted_bytes = std::mem::take(&mut state.accounted_bytes);
         self.ledger.fetch_sub(accounted_bytes, Ordering::AcqRel);
-        payload
+        (payload, state.position.take())
     }
 
     /// Replace an unclaimed payload and its accounting as one critical
     /// section. Return the payload when the consumer already owns the slot.
-    fn replace(&self, next: Arc<str>) -> Result<(), Arc<str>> {
+    fn replace(&self, next: Arc<str>, position: SessionPosition) -> Result<(), Arc<str>> {
         let new_len = next.len();
         let mut state = self
             .state
@@ -821,6 +810,7 @@ impl StateSlot {
             return Err(next);
         };
         *payload = next;
+        state.position = Some(position);
         state.accounted_bytes = new_len;
         if new_len >= old_len {
             self.ledger.fetch_add(new_len - old_len, Ordering::AcqRel);
@@ -861,12 +851,21 @@ impl SubscriberSender {
     }
 
     fn try_send(&self, event: impl Into<Arc<str>>) -> Result<(), ()> {
+        self.try_send_at(event, None)
+    }
+
+    fn try_send_at(
+        &self,
+        event: impl Into<Arc<str>>,
+        position: Option<SessionPosition>,
+    ) -> Result<(), ()> {
         let event = event.into();
         let bytes = event.len();
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.tx
             .send(QueuedSubscriberEvent {
                 event: QueuedPayload::Fixed(event),
+                position,
                 queued_bytes: self.queued_bytes.clone(),
                 bytes,
             })
@@ -874,13 +873,18 @@ impl SubscriberSender {
     }
 
     /// Queue a reconstructible state event through a replaceable slot.
-    fn try_send_state(&self, event: Arc<str>) -> Result<Arc<StateSlot>, ()> {
+    fn try_send_state(
+        &self,
+        event: Arc<str>,
+        position: SessionPosition,
+    ) -> Result<Arc<StateSlot>, ()> {
         let bytes = event.len();
-        let slot = Arc::new(StateSlot::new(event, self.queued_bytes.clone()));
+        let slot = Arc::new(StateSlot::new(event, position, self.queued_bytes.clone()));
         self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.tx
             .send(QueuedSubscriberEvent {
                 event: QueuedPayload::Shared(slot.clone()),
+                position: None,
                 queued_bytes: self.queued_bytes.clone(),
                 bytes: 0,
             })
@@ -889,12 +893,14 @@ impl SubscriberSender {
     }
 }
 
-fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
-    let Some((event_session_id, event, event_owner, position)) =
-        business_session_event_routed(&event)
-    else {
-        return;
-    };
+fn publish_to_session_subscribers(state: &mut BridgeHubState, event: SessionEvent) {
+    let SessionEvent {
+        session_id: event_session_id,
+        owner: event_owner,
+        position,
+        reset,
+        payload: event,
+    } = event;
     let canonical = &state.canonical;
     let mut failed = Vec::new();
     for (&subscriber_id, subscriber) in state.session_subscribers.iter_mut() {
@@ -921,7 +927,9 @@ fn publish_to_session_subscribers(state: &mut BridgeHubState, event: Arc<str>) {
             continue;
         }
         let delivered = match &position {
-            Some(position) => subscriber.deliver_state(canonical, event.clone(), position.clone()),
+            Some(position) => {
+                subscriber.deliver_state(canonical, event.clone(), reset, position.clone())
+            }
             None => subscriber.sender.try_send(event.clone()).is_ok(),
         };
         if !delivered {
@@ -948,69 +956,10 @@ fn publish_to_global_subscribers(state: &mut BridgeHubState, event: &str) {
 
 #[cfg(test)]
 fn business_session_event(event: &str) -> Option<(String, Arc<str>)> {
-    business_session_event_routed(event).map(|(session_id, event, ..)| (session_id, event))
-}
-
-/// Session-scoped business event reduced to its delivery shape: the session
-/// id it targets, the owner it belongs to, and — for state events — the
-/// (epoch, incarnation, revision) position used by the coalescing slot.
-fn business_session_event_routed(
-    event: &str,
-) -> Option<(
-    String,
-    Arc<str>,
-    Option<(String, u64)>,
-    Option<(String, u64, u64)>,
-)> {
-    let mut value = serde_json::from_str::<serde_json::Value>(event).ok()?;
-    crate::attachments::project(&mut value);
-    let owner = |value: &serde_json::Value| {
-        Some((
-            value.get("bridgeEpoch")?.as_str()?.to_string(),
-            value.get("sessionIncarnation")?.as_u64()?,
-        ))
-    };
-    let position = |value: &serde_json::Value| {
-        Some((
-            value.get("bridgeEpoch")?.as_str()?.to_string(),
-            value.get("sessionIncarnation")?.as_u64()?,
-            value.get("viewRevision")?.as_u64()?,
-        ))
-    };
-    let session_id = value.get("sessionId")?.as_str()?.to_string();
-    match value.get("type").and_then(serde_json::Value::as_str)? {
-        "bridge/session_delta" => Some((
-            session_id,
-            Arc::from(value.to_string()),
-            owner(&value),
-            position(&value),
-        )),
-        "bridge/session_retired" => Some((session_id, Arc::from(event), owner(&value), None)),
-        "bridge/session_view" => {
-            let reset = session_reset_value(&session_id, value.get("view")?)?;
-            Some((
-                session_id,
-                Arc::from(reset.to_string()),
-                owner(&reset),
-                position(&reset),
-            ))
-        }
-        "bridge/session_turn_complete" | "bridge/session_turn_failed" => Some((
-            session_id,
-            Arc::from(value.to_string()),
-            owner(&value),
-            None,
-        )),
+    match BridgeEvent::from_json(event)? {
+        BridgeEvent::Session(event) => Some((event.session_id, event.payload)),
         _ => None,
     }
-}
-
-fn is_session_reset(event: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(event)
-        .ok()
-        .is_some_and(|value| {
-            value.get("type").and_then(serde_json::Value::as_str) == Some("bridge/session_reset")
-        })
 }
 
 /// Rebuild the reset recovery hint from canonical session state so a
@@ -1041,19 +990,6 @@ fn canonical_reset_event(
         })
         .to_string(),
     ))
-}
-
-fn session_reset_value(session_id: &str, view: &serde_json::Value) -> Option<serde_json::Value> {
-    Some(json!({
-        "type": "bridge/session_reset",
-        "bridgeEpoch": view.get("bridgeEpoch")?.as_str()?,
-        "sessionId": session_id,
-        "sessionIncarnation": view.pointer("/session/incarnation")?.as_u64()?,
-        "viewRevision": view.pointer("/session/viewRevision")?.as_u64()?,
-        "historyRevision": view.pointer("/session/historyRevision").cloned().unwrap_or(serde_json::Value::Null),
-        "phase": view.pointer("/session/phase").cloned().unwrap_or(serde_json::Value::Null),
-        "syncError": view.pointer("/session/syncError").cloned().unwrap_or(serde_json::Value::Null),
-    }))
 }
 
 struct BridgeRuntime {
@@ -1307,151 +1243,151 @@ impl BridgeHub {
         ));
     }
 
-    async fn publish(&self, generation: u64, event: String) {
-        if let Ok(marker) = serde_json::from_str::<serde_json::Value>(&event)
-            && marker.get("type").and_then(serde_json::Value::as_str)
-                == Some("bridge/internal_observer_ready")
-        {
-            let mut state = self.state.lock().await;
-            if state.generation != generation || state.input.is_none() {
-                return;
-            }
-            let state = &mut *state;
-            let Some(id) = marker.get("observerId").and_then(serde_json::Value::as_u64) else {
-                return;
-            };
-            let known_epoch = state
-                .canonical
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.epoch.clone());
-            let Some(subscriber) = state.session_subscribers.get_mut(&id) else {
-                return;
-            };
-            if subscriber.owner.is_some() {
-                return;
-            }
-            let reset = marker.get("reset");
-            let reset_event = reset.map(serde_json::Value::to_string);
-            let position = reset_event.as_deref().and_then(session_event_position);
-            let valid = marker.get("sessionId").and_then(serde_json::Value::as_str)
-                == Some(subscriber.session_id.as_str())
-                && reset.is_some_and(|reset| {
-                    reset.get("type").and_then(serde_json::Value::as_str)
-                        == Some("bridge/session_reset")
-                        && reset.get("sessionId").and_then(serde_json::Value::as_str)
-                            == Some(subscriber.session_id.as_str())
-                })
-                && position.as_ref().is_some_and(|position| {
-                    known_epoch
-                        .as_ref()
-                        .is_none_or(|epoch| epoch == &position.0)
-                })
-                && subscriber
-                    .lease
-                    .as_ref()
-                    .is_some_and(|lease| !lease.is_cancelled());
-            if !valid {
-                state.session_subscribers.remove(&id);
-                return;
-            }
-            let position = position.unwrap();
-            // The activation reset is the delivery cut itself, so it must be
-            // delivered verbatim; only later state events coalesce.
-            let delivered = subscriber
-                .sender
-                .try_send(Arc::<str>::from(reset_event.unwrap()))
-                .is_ok();
-            subscriber.owner = Some((position.0, position.1));
-            if !delivered
-                || subscriber
-                    .ready
-                    .take()
-                    .is_none_or(|ready| ready.send(()).is_err())
-            {
-                state.session_subscribers.remove(&id);
-            }
-            return;
-        }
-        if let Ok(marker) = serde_json::from_str::<serde_json::Value>(&event)
-            && marker.get("type").and_then(serde_json::Value::as_str)
-                == Some("bridge/internal_observer_end")
-        {
-            let mut state = self.state.lock().await;
-            if state.generation != generation || state.input.is_none() {
-                return;
-            }
-            let Some(id) = marker.get("observerId").and_then(serde_json::Value::as_u64) else {
-                return;
-            };
-            let matches = state
-                .session_subscribers
-                .get(&id)
-                .is_some_and(|subscriber| {
-                    marker.get("sessionId").and_then(serde_json::Value::as_str)
-                        == Some(subscriber.session_id.as_str())
-                        && subscriber
-                            .owner
-                            .as_ref()
-                            .is_some_and(|(epoch, incarnation)| {
-                                marker
-                                    .get("bridgeEpoch")
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some(epoch.as_str())
-                                    && marker
-                                        .get("sessionIncarnation")
-                                        .and_then(serde_json::Value::as_u64)
-                                        == Some(*incarnation)
-                            })
-                });
-            if matches && let Some(mut subscriber) = state.session_subscribers.remove(&id) {
-                // End the sending side without aborting the receiving side. Its
-                // already committed prefix drains before the HTTP stream ends.
-                if let Some(lease) = subscriber.lease.take() {
-                    lease.finish();
-                }
-                subscriber.input.take();
-            }
-            return;
-        }
-        if is_internal_runtime_event(&event) {
-            let snapshot_request = {
+    async fn publish(&self, generation: u64, event: BridgeEvent) {
+        match event {
+            BridgeEvent::ObserverReady {
+                observer_id,
+                session_id,
+                reset,
+            } => {
                 let mut state = self.state.lock().await;
                 if state.generation != generation || state.input.is_none() {
                     return;
                 }
-                let recognized = state.canonical.update(&event);
-                if state.canonical.snapshot.is_some() {
-                    state.canonical_resync_pending = false;
+                let state = &mut *state;
+                let known_epoch = state
+                    .canonical
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.epoch.clone());
+                let Some(subscriber) = state.session_subscribers.get_mut(&observer_id) else {
+                    return;
+                };
+                if subscriber.owner.is_some() {
+                    return;
                 }
-                if recognized
-                    && state.canonical.snapshot.is_none()
-                    && !state.canonical_resync_pending
+                let reset = reset.filter(|reset| {
+                    session_id == subscriber.session_id
+                        && reset.session_id == subscriber.session_id
+                        && reset.position.as_ref().is_some_and(|position| {
+                            known_epoch
+                                .as_ref()
+                                .is_none_or(|epoch| epoch == &position.0)
+                        })
+                        && subscriber
+                            .lease
+                            .as_ref()
+                            .is_some_and(|lease| !lease.is_cancelled())
+                });
+                let Some(reset) = reset else {
+                    state.session_subscribers.remove(&observer_id);
+                    return;
+                };
+                let (epoch, incarnation, _) = reset.position.clone().expect("validated reset");
+                // The activation reset is the delivery cut itself, so it must be
+                // delivered verbatim; only later state events coalesce.
+                let delivered = subscriber
+                    .sender
+                    .try_send_at(reset.payload, reset.position.clone())
+                    .is_ok();
+                subscriber.owner = Some((epoch, incarnation));
+                if !delivered
+                    || subscriber
+                        .ready
+                        .take()
+                        .is_none_or(|ready| ready.send(()).is_err())
                 {
-                    state.canonical_resync_pending = true;
-                    state.input.clone()
-                } else {
-                    None
+                    state.session_subscribers.remove(&observer_id);
                 }
-            };
-            if let Some(input) = snapshot_request {
-                let _ = input.send(bridge::BridgeInput::RuntimeSnapshotRequest);
             }
-            return;
+            BridgeEvent::ObserverEnd {
+                observer_id,
+                session_id,
+                owner,
+            } => {
+                let mut state = self.state.lock().await;
+                if state.generation != generation || state.input.is_none() {
+                    return;
+                }
+                let matches =
+                    state
+                        .session_subscribers
+                        .get(&observer_id)
+                        .is_some_and(|subscriber| {
+                            session_id == subscriber.session_id
+                                && owner.is_some()
+                                && subscriber.owner == owner
+                        });
+                if matches
+                    && let Some(mut subscriber) = state.session_subscribers.remove(&observer_id)
+                {
+                    // End the sending side without aborting the receiving side. Its
+                    // already committed prefix drains before the HTTP stream ends.
+                    if let Some(lease) = subscriber.lease.take() {
+                        lease.finish();
+                    }
+                    subscriber.input.take();
+                }
+            }
+            BridgeEvent::RuntimeSnapshot(_) | BridgeEvent::RuntimeDelta(_) => {
+                let snapshot_request = {
+                    let mut state = self.state.lock().await;
+                    if state.generation != generation || state.input.is_none() {
+                        return;
+                    }
+                    match event {
+                        BridgeEvent::RuntimeSnapshot(snapshot) => {
+                            state.canonical.apply_snapshot(*snapshot);
+                        }
+                        BridgeEvent::RuntimeDelta(delta) => {
+                            state.canonical.apply_runtime_delta(*delta);
+                        }
+                        _ => unreachable!(),
+                    }
+                    if state.canonical.snapshot.is_some() {
+                        state.canonical_resync_pending = false;
+                        None
+                    } else if !state.canonical_resync_pending {
+                        state.canonical_resync_pending = true;
+                        state.input.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(input) = snapshot_request {
+                    let _ = input.send(bridge::BridgeInput::RuntimeSnapshotRequest);
+                }
+            }
+            BridgeEvent::Session(event) => {
+                let mut state = self.state.lock().await;
+                if state.generation != generation || state.input.is_none() {
+                    return;
+                }
+                publish_to_session_subscribers(&mut state, event);
+            }
+            BridgeEvent::Lifecycle(event) => {
+                let restart = terminal_auth_succeeded(&event);
+                let restart_input = {
+                    let mut state = self.state.lock().await;
+                    if state.generation != generation || state.input.is_none() {
+                        return;
+                    }
+                    state.bootstrap.update(&event);
+                    publish_to_global_subscribers(&mut state, &event);
+                    restart.then(|| state.cancellation.clone()).flatten()
+                };
+                if let Some(cancellation) = restart_input {
+                    cancellation.cancel();
+                }
+            }
         }
-        let restart = terminal_auth_succeeded(&event);
-        let restart_input = {
-            let mut state = self.state.lock().await;
-            if state.generation != generation || state.input.is_none() {
-                return;
-            }
-            state.bootstrap.update(&event);
-            publish_to_global_subscribers(&mut state, &event);
-            publish_to_session_subscribers(&mut state, event.into());
-            restart.then(|| state.cancellation.clone()).flatten()
-        };
-        if let Some(cancellation) = restart_input {
-            cancellation.cancel();
+    }
+
+    /// Publish a JSON event as the Bridge would; test fixtures speak JSON.
+    #[cfg(test)]
+    async fn publish_json(&self, generation: u64, event: String) {
+        if let Some(event) = BridgeEvent::from_json(&event) {
+            self.publish(generation, event).await;
         }
     }
 
@@ -2847,14 +2783,13 @@ async fn session_events(
     };
     let stream = futures::stream::unfold(
         (
-            None::<String>,
             subscription.initial_events.into_iter(),
             subscription.events,
             session_id,
-            None::<(String, u64, u64)>,
+            None::<SessionPosition>,
             guard,
         ),
-        |(mut initial, mut bootstrap, mut events, session_id, mut position, guard)| async move {
+        |(mut bootstrap, mut events, session_id, mut position, guard)| async move {
             loop {
                 if guard
                     .lease
@@ -2863,12 +2798,15 @@ async fn session_events(
                 {
                     return None;
                 }
-                let is_initial = initial.is_some();
-                let event = if let Some(initial_event) = initial.take() {
-                    initial_event
-                } else if let Some(event) = bootstrap.next() {
-                    event
+                let (event, next_position) = if let Some(event) = bootstrap.next() {
+                    if !session_event_matches(&event, &session_id) {
+                        continue;
+                    }
+                    let next_position = session_event_position(&event);
+                    (event, next_position)
                 } else {
+                    // Queued events were routed to this session by the Hub and
+                    // carry the position they were classified with.
                     let event = if let Some(lease) = &guard.lease {
                         tokio::select! {
                             biased;
@@ -2878,31 +2816,30 @@ async fn session_events(
                     } else {
                         events.recv().await?
                     };
-                    event.into_string()
+                    event.into_delivery()
                 };
-                if !session_event_matches(&event, &session_id) {
-                    continue;
-                }
-                let next_position = session_event_position(&event);
-                if !is_initial
-                    && let (Some(current), Some(next)) = (&position, &next_position)
+                if let (Some(current), Some(next)) = (&position, &next_position)
                     && current.0 == next.0
                     && current.1 == next.1
                     && next.2 <= current.2
                 {
                     continue;
                 }
+                let id = next_position
+                    .as_ref()
+                    .map(|(epoch, incarnation, revision)| {
+                        format!("{epoch}:{incarnation}:{revision}")
+                    });
                 if next_position.is_some() {
                     position = next_position;
                 }
-                let id = session_event_cursor(&event);
                 let mut outgoing = SseEvent::default().data(event);
                 if let Some(id) = id {
                     outgoing = outgoing.id(id);
                 }
                 return Some((
                     Ok::<_, Infallible>(outgoing),
-                    (initial, bootstrap, events, session_id, position, guard),
+                    (bootstrap, events, session_id, position, guard),
                 ));
             }
         },
@@ -2938,6 +2875,7 @@ fn session_event_id(event: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 fn session_event_cursor(event: &str) -> Option<String> {
     let (epoch, incarnation, revision) = session_event_position(event)?;
     Some(format!("{epoch}:{incarnation}:{revision}"))
@@ -3564,7 +3502,7 @@ mod tests {
             .expect("session subscription");
 
         for index in 0..64 * 2 {
-            hub.publish(
+            hub.publish_json(
                 1,
                 json!({
                     "type": "bridge/session_delta",
@@ -3579,7 +3517,7 @@ mod tests {
             )
             .await;
         }
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type": "bridge/session_delta",
@@ -3685,7 +3623,7 @@ mod tests {
         };
         assert_eq!(removed, observer_id);
         assert!(lease.same_identity(&removed_lease));
-        hub.publish(1, observer_ready(observer_id, 10)).await;
+        hub.publish_json(1, observer_ready(observer_id, 10)).await;
         assert!(
             hub.state.lock().await.session_subscribers.is_empty(),
             "late marker cannot revive cancelled HTTP"
@@ -3704,14 +3642,14 @@ mod tests {
         else {
             panic!("expected ObserveSession")
         };
-        hub.publish(1, observation_delta(9)).await;
+        hub.publish_json(1, observation_delta(9)).await;
         reply.send(Ok(())).unwrap();
         assert!(
             futures::poll!(handshake.as_mut()).is_pending(),
             "a reply without the outbox cut cannot activate delivery"
         );
-        hub.publish(1, observer_ready(observer_id, 10)).await;
-        hub.publish(1, observation_delta(11)).await;
+        hub.publish_json(1, observer_ready(observer_id, 10)).await;
+        hub.publish_json(1, observation_delta(11)).await;
         let (mut subscription, guard) = handshake.await.unwrap();
         let reset: serde_json::Value =
             serde_json::from_str(&subscription.events.try_recv().unwrap().into_string()).unwrap();
@@ -3902,8 +3840,8 @@ mod tests {
         else {
             panic!("HTTP stream must use ObserveSession")
         };
-        hub.publish(1, observer_ready(observer_id, 10)).await;
-        hub.publish(1, observation_delta(11)).await;
+        hub.publish_json(1, observer_ready(observer_id, 10)).await;
+        hub.publish_json(1, observation_delta(11)).await;
         reply.send(Ok(())).unwrap();
         let response = handshake.await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -3955,16 +3893,16 @@ mod tests {
         else {
             panic!("expected ObserveSession");
         };
-        hub.publish(1, observer_ready(observer_id, 10)).await;
+        hub.publish_json(1, observer_ready(observer_id, 10)).await;
         reply.send(Ok(())).unwrap();
         let mut body = handshake.await.into_body().into_data_stream();
-        hub.publish(1, observation_delta(11)).await;
-        hub.publish(1, json!({
+        hub.publish_json(1, observation_delta(11)).await;
+        hub.publish_json(1, json!({
             "type": "bridge/session_turn_complete", "bridgeEpoch": "epoch", "sessionId": "session",
             "sessionIncarnation": 1, "viewRevision": 12, "operationId": "last-turn",
             "phase": "ready", "historyRevision": "final-history", "response": { "stopReason": "end_turn" },
         }).to_string()).await;
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type": "bridge/session_retired", "bridgeEpoch": "epoch", "sessionId": "session",
@@ -3987,7 +3925,7 @@ mod tests {
             "type": "bridge/internal_observer_end", "observerId": observer_id, "sessionId": "session",
             "bridgeEpoch": "epoch", "sessionIncarnation": 2,
         });
-        hub.publish(1, end.to_string()).await;
+        hub.publish_json(1, end.to_string()).await;
         assert!(
             hub.state
                 .lock()
@@ -3997,7 +3935,7 @@ mod tests {
             "old or wrong owner cannot end the stream"
         );
         end["sessionIncarnation"] = json!(1);
-        hub.publish(1, end.to_string()).await;
+        hub.publish_json(1, end.to_string()).await;
         assert!(!lease.is_cancelled());
         assert!(hub.state.lock().await.session_subscribers.is_empty());
         let mut delivered = Vec::new();
@@ -4045,7 +3983,7 @@ mod tests {
         else {
             panic!("expected ObserveSession")
         };
-        hub.publish(1, observer_ready(observer_id, 10)).await;
+        hub.publish_json(1, observer_ready(observer_id, 10)).await;
         reply.send(Ok(())).unwrap();
         let mut body = handshake.await.into_body().into_data_stream();
         futures::StreamExt::next(&mut body).await.unwrap().unwrap();
@@ -4091,7 +4029,7 @@ mod tests {
         let mut marker: serde_json::Value =
             serde_json::from_str(&observer_ready(observer_id, 10)).unwrap();
         marker["reset"]["sessionId"] = json!("other");
-        hub.publish(1, marker.to_string()).await;
+        hub.publish_json(1, marker.to_string()).await;
         reply.send(Ok(())).unwrap();
         assert!(handshake.await.is_err());
         assert!(lease.is_cancelled());
@@ -4128,7 +4066,7 @@ mod tests {
             panic!("expected ObserveSession")
         };
         assert_eq!(cwd.as_deref(), Some("/tmp"));
-        hub.publish(1, observer_ready(observer_id, 10)).await;
+        hub.publish_json(1, observer_ready(observer_id, 10)).await;
         assert!(futures::poll!(handshake.as_mut()).is_pending());
         lease.cancel();
         reply.send(Err(bridge::SessionViewError::NotFound)).unwrap();
@@ -4182,14 +4120,14 @@ mod tests {
             else {
                 panic!("expected ObserveSession")
             };
-            hub.publish(1, observer_ready(observer_id, 1)).await;
+            hub.publish_json(1, observer_ready(observer_id, 1)).await;
             reply.send(Ok(())).unwrap();
             observations.push(handshake.await.unwrap());
             leases.push(lease);
         }
         observations[1].0.events.try_recv().unwrap();
         for revision in 2..=(64 as u64 + 1) {
-            hub.publish(1, observation_delta(revision)).await;
+            hub.publish_json(1, observation_delta(revision)).await;
             observations[1].0.events.try_recv().unwrap();
         }
         assert!(!leases[0].is_cancelled());
@@ -4243,12 +4181,12 @@ mod tests {
                     panic!("expected ObserveSession")
                 };
                 reply.send(Ok(())).unwrap();
-                hub.publish(0, observer_ready(observer_id, 10)).await;
+                hub.publish_json(0, observer_ready(observer_id, 10)).await;
                 assert!(
                     futures::poll!(handshake.as_mut()).is_pending(),
                     "old generation cannot activate a current delivery"
                 );
-                hub.publish(1, observer_ready(observer_id, 10)).await;
+                hub.publish_json(1, observer_ready(observer_id, 10)).await;
                 let (mut subscription, _guard) = handshake.await.unwrap();
                 subscription.events.try_recv().unwrap();
                 let mut event: serde_json::Value =
@@ -4259,7 +4197,7 @@ mod tests {
                 } else {
                     json!(2)
                 };
-                hub.publish(1, event.to_string()).await;
+                hub.publish_json(1, event.to_string()).await;
                 assert!(lease.is_cancelled());
                 assert!(subscription.events.recv().await.is_none());
                 assert!(matches!(
@@ -4328,7 +4266,7 @@ mod tests {
         else {
             panic!("expected ObserveSession")
         };
-        hub.publish(1, observer_ready(observer_id, 10)).await;
+        hub.publish_json(1, observer_ready(observer_id, 10)).await;
         reply.send(Ok(())).unwrap();
         let (_subscription, _guard) = first.await.unwrap();
         let mut second = Box::pin(hub.observe_session("session".into(), None));
@@ -4391,7 +4329,7 @@ mod tests {
             state.input = Some(input);
             state.canonical.snapshot = Some(canonical.clone());
         }
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type": "acp/session_created",
@@ -6508,7 +6446,7 @@ mod tests {
             &json!({ "type": "bridge/error", "message": "Agent exited" }),
             &json!({ "type": "bridge/phase", "phase": "error" }),
         ]) {
-            hub.publish(1, event.to_string()).await;
+            hub.publish_json(1, event.to_string()).await;
         }
 
         let global = hub.subscribe_global().await.unwrap();
@@ -6565,7 +6503,7 @@ mod tests {
                 json!({ "type": "bridge/session_delta", "sessionId": session_id, "viewRevision": 2, "change": { "kind": "turn_update" } }),
                 json!({ "type": "bridge/error", "requestId": session_id, "message": "Session request failed" }),
             ] {
-                hub.publish(1, event.to_string()).await;
+                hub.publish_json(1, event.to_string()).await;
             }
         }
         assert!(global.events.try_recv().is_err());
@@ -6574,7 +6512,7 @@ mod tests {
             let subscriber = state.global_subscribers.get(&global.id).unwrap();
             assert_eq!(subscriber.queued_bytes.load(Ordering::Acquire), 0);
         }
-        hub.publish(
+        hub.publish_json(
             1,
             json!({ "type": "bridge/phase", "phase": "ready" }).to_string(),
         )
@@ -6663,12 +6601,12 @@ mod tests {
             state.global_subscribers.insert(2, healthy_tx);
         }
 
-        hub.publish(
+        hub.publish_json(
             1,
             r#"{"type":"bridge/phase","phase":"starting"}"#.to_string(),
         )
         .await;
-        hub.publish(1, r#"{"type":"bridge/phase","phase":"ready"}"#.to_string())
+        hub.publish_json(1, r#"{"type":"bridge/phase","phase":"ready"}"#.to_string())
             .await;
 
         let state = hub.state.lock().await;
@@ -6730,7 +6668,7 @@ mod tests {
                 "response": { "stopReason": "end_turn" },
             }),
         ] {
-            hub.publish(1, event.to_string()).await;
+            hub.publish_json(1, event.to_string()).await;
         }
 
         let subscription = hub.subscribe_global().await.unwrap();
@@ -6791,7 +6729,7 @@ mod tests {
             )
             .unwrap();
         for delta in runtime.deltas_after(active.through_seq).unwrap() {
-            hub.publish(
+            hub.publish_json(
                 1,
                 json!({
                     "type": "bridge/internal_runtime_delta",
@@ -6828,9 +6766,9 @@ mod tests {
         })
         .to_string();
 
-        hub.publish(1, large_event.clone()).await;
+        hub.publish_json(1, large_event.clone()).await;
         assert!(hub.state.lock().await.global_subscribers.contains_key(&1));
-        hub.publish(1, large_event.clone()).await;
+        hub.publish_json(1, large_event.clone()).await;
         assert!(hub.state.lock().await.global_subscribers.contains_key(&1));
         for _ in 0..2 {
             assert_eq!(subscriber_rx.try_recv().unwrap().into_string(), large_event);
@@ -7254,7 +7192,7 @@ mod tests {
             )
             .unwrap();
         let delta = runtime.deltas_after(initial.through_seq).unwrap()[0].clone();
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type": "bridge/internal_runtime_delta",
@@ -7294,7 +7232,7 @@ mod tests {
             },
         };
 
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type": "bridge/internal_runtime_delta",
@@ -7327,7 +7265,7 @@ mod tests {
         }
 
         for seq in [2, 3] {
-            hub.publish(
+            hub.publish_json(
                 1,
                 json!({
                     "type": "bridge/internal_runtime_delta",
@@ -7362,7 +7300,7 @@ mod tests {
                 json!({ "sessionId": "session" }),
             )
             .unwrap();
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type": "bridge/internal_runtime_snapshot",
@@ -7387,7 +7325,7 @@ mod tests {
             .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
             .unwrap();
         let suffix = runtime.deltas_after(1).unwrap().remove(0);
-        hub.publish(
+        hub.publish_json(
             1,
             json!({
                 "type": "bridge/internal_runtime_delta",
@@ -7428,7 +7366,7 @@ mod tests {
             .unwrap();
 
         for delta in runtime.deltas_after(0).unwrap() {
-            hub.publish(
+            hub.publish_json(
                 1,
                 json!({
                     "type": "bridge/internal_runtime_delta",

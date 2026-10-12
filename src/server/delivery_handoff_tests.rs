@@ -159,7 +159,7 @@ impl Fixture {
             unreachable!("the first prompt must be admitted")
         };
         let published_seq = runtime.seq();
-        hub.publish(
+        hub.publish_json(
             1,
             json!({"type":"bridge/internal_runtime_snapshot", "value":runtime.snapshot()})
                 .to_string(),
@@ -177,7 +177,7 @@ impl Fixture {
             unreachable!("observation must be registered with the coordinator")
         };
         let view = runtime.view_value("session", incarnation).unwrap();
-        hub.publish(1, json!({
+        hub.publish_json(1, json!({
             "type":"bridge/internal_observer_ready", "observerId":observer_id, "sessionId":"session",
             "reset":session_reset_value("session", &view).unwrap(),
         }).to_string()).await;
@@ -319,7 +319,7 @@ impl Fixture {
 
 async fn publish(hub: &BridgeHub, events: Vec<Value>) {
     for event in events {
-        hub.publish(1, event.to_string()).await;
+        hub.publish_json(1, event.to_string()).await;
     }
 }
 

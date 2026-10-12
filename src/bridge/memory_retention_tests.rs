@@ -213,7 +213,7 @@ fn publication_queue() -> (EventSink, EventReceiver) {
 fn drain_events(receiver: &mut EventReceiver) -> Vec<Value> {
     let mut events = Vec::new();
     while let Ok(event) = receiver.try_recv() {
-        let (event, _lease) = event.into_parts();
+        let (event, _lease) = event.into_json_parts();
         events.push(serde_json::from_str(&event).unwrap());
     }
     events
@@ -230,7 +230,7 @@ fn pending_sequences(state: &BridgeState, after: u64) -> Vec<u64> {
 }
 
 #[test]
-fn memory_retention_delta_transfer_releases_old_overlay_before_queue_consumption() {
+fn memory_retention_delta_transfer_empties_journal_and_releases_overlay_on_consumption() {
     let mut turn = JournalTurn::new();
     let (sink, mut receiver) = publication_queue();
     flush_runtime(&mut turn.state, &sink);
@@ -256,7 +256,12 @@ fn memory_retention_delta_transfer_releases_old_overlay_before_queue_consumption
         current.upgrade().is_some(),
         "the live overlay must survive publication"
     );
-    let old_retained_after_transfer = old.upgrade().is_some();
+    // The typed queue shares the transferred state instead of copying it, so
+    // the journal must be empty while the queue alone owns the delivery.
+    assert!(
+        pending_sequences(&turn.state, turn.state.published_runtime_seq).is_empty(),
+        "successful transfer left deltas in the publication journal"
+    );
     let delivered = drain_events(&mut receiver);
     let sequences = delivered
         .iter()
@@ -272,8 +277,8 @@ fn memory_retention_delta_transfer_releases_old_overlay_before_queue_consumption
     assert_eq!(turn.current_updates()[0]["content"]["text"], "first-second");
     assert_eq!(sink.tx.queued_bytes(), 0);
     assert!(
-        !old_retained_after_transfer,
-        "successful transfer left the obsolete overlay alive in the publication journal"
+        old.upgrade().is_none(),
+        "a consumed transfer must not leave the obsolete overlay alive"
     );
 }
 
@@ -499,21 +504,6 @@ fn memory_retention_epoch_teardown_releases_payloads_even_after_failed_publicati
     assert!(replacement.current_updates().is_empty());
 }
 
-#[test]
-fn memory_retention_internal_serialization_failure_publishes_no_runtime_record() {
-    struct InvalidSerialization;
-    impl Serialize for InvalidSerialization {
-        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
-            Err(serde::ser::Error::custom("injected serialization failure"))
-        }
-    }
-    let (sink, mut receiver) = publication_queue();
-    sink.internal_typed("bridge/internal_runtime_delta", InvalidSerialization);
-    // The failure is scoped to the canonical runtime operation, so it is
-    // logged rather than published, and no partial runtime record escapes.
-    assert!(drain_events(&mut receiver).is_empty());
-}
-
 struct PublicationPeer {
     commands: mpsc::UnboundedSender<BridgeInput>,
     requests: futures::channel::mpsc::Receiver<String>,
@@ -597,7 +587,7 @@ impl PublicationPeer {
                     .recv()
                     .await
                     .expect("event stream closed")
-                    .into_parts();
+                    .into_json_parts();
                 let event: Value = serde_json::from_str(&event).unwrap();
                 if matches(&event) {
                     return event;
@@ -615,6 +605,9 @@ impl PublicationPeer {
             .unwrap()
             .unwrap()
             .unwrap();
+        // Like `forward_generation_events`, consume the ended generation's
+        // queued suffix: typed transfers share state until delivered.
+        while self.events.try_recv().is_ok() {}
     }
 }
 
