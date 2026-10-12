@@ -31,6 +31,7 @@ import {
 import { randomId } from "./id";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
 import { appReducer, initialState, type DeferredTurnProcess } from "./state";
+import { applyLocalSessionDelta } from "./session-deltas";
 import { releaseSessionViewProcess, sameTurnProcess } from "./process-retention";
 import { containsHostedAttachment } from "./hosted-attachment";
 
@@ -383,8 +384,8 @@ export function useAcp() {
         dispatch({ type: "server/event", event: { type: "acp/terminal_state", terminal } });
         return;
       }
-      sessionViewRef.current = { ...current, viewRevision: event.viewRevision };
       if (event.change.kind === "turn_update" && event.change.update != null) {
+        sessionViewRef.current = { ...current, viewRevision: event.viewRevision };
         dispatch({
           type: "server/event",
           event: {
@@ -392,9 +393,16 @@ export function useAcp() {
             notification: { sessionId, update: event.change.update },
           },
         });
-      } else {
-        refreshSessionRef.current(sessionId);
+        return;
       }
+      const local = applyLocalSessionDelta(current, event.change, event.viewRevision);
+      if (local == null) {
+        sessionViewRef.current = { ...current, viewRevision: event.viewRevision };
+        refreshSessionRef.current(sessionId);
+        return;
+      }
+      sessionViewRef.current = local.view;
+      dispatch({ type: "bridge/session_live_update", view: local.view, settledControl: local.settledControl });
     };
     let probingRecovery = false;
     source.onerror = () => {
@@ -933,10 +941,12 @@ export function useAcp() {
     if (sessionId == null || !["ready", "running", "reconciling"].includes(sessionViewRef.current?.phase ?? "")) return;
     const requestId = randomId();
     dispatch({ type: "session/control_start", kind: "mode", requestId, sessionId });
+    // The control delta carries the new mode; the acknowledgement only ends
+    // this request, whichever of the two arrives first.
     void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/mode`, {
       method: "POST",
       body: JSON.stringify({ modeId }),
-    }).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+    }).then(() => dispatch({ type: "session/control_settled", requestId })).catch((error) => {
       reportRequestError(error, requestId, "session/set_mode");
     });
   }, [reportRequestError]);
@@ -949,7 +959,7 @@ export function useAcp() {
     void requestJson(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/configuration/${encodeURIComponent(configId)}`,
       { method: "POST", body: JSON.stringify({ value }) },
-    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+    ).then(() => dispatch({ type: "session/control_settled", requestId })).catch((error) => {
       reportRequestError(error, requestId, "session/set_config_option");
     });
   }, [reportRequestError]);
@@ -962,10 +972,11 @@ export function useAcp() {
     if (sessionId == null) return;
     const requestId = randomId();
     dispatch({ type: "permission/respond_start", permissionId, requestId });
+    // The interaction_remove delta retires the request.
     void requestJson(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(permissionId)}/response`,
       { method: "POST", body: JSON.stringify({ kind: "permission", outcome }) },
-    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+    ).catch((error) => {
       reportRequestError(error, requestId, "permission/respond");
     });
   }, [reportRequestError]);
@@ -978,10 +989,12 @@ export function useAcp() {
     if (sessionId == null) return;
     const requestId = randomId();
     dispatch({ type: "elicitation/respond_start", elicitationId, requestId });
+    // The interaction_remove delta retires the request, and refetches the
+    // view when an accepted URL elicitation opens a flow.
     void requestJson(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(elicitationId)}/response`,
       { method: "POST", body: JSON.stringify({ kind: "elicitation", response }) },
-    ).then(() => refreshSessionRef.current(sessionId)).catch((error) => {
+    ).catch((error) => {
       reportRequestError(error, requestId, "elicitation/respond");
     });
   }, [reportRequestError]);

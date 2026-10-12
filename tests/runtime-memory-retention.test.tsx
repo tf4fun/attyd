@@ -219,11 +219,11 @@ describe("runtime memory retention: browser recovery acceptance", () => {
     await mount();
     const snapshot = deferredView();
     readView = () => snapshot.promise;
-    // A control delta starts a refresh without breaking SSE revision order.
+    // A history sync delta starts a refresh without breaking SSE revision order.
     await act(async () => emit({
       type: "bridge/session_delta", bridgeEpoch: "memory-epoch", sessionId,
       sessionIncarnation: 7, fromRevision: 1, viewRevision: 2,
-      change: { kind: "control_update", control: "mode", modeId: "build" },
+      change: { kind: "sync_state", phase: "loading" },
     }));
     await act(async () => emit(replacement(2, "output at revision 3")));
     expectToolOutput("output at revision 3");
