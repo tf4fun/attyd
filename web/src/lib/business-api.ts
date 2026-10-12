@@ -146,6 +146,27 @@ export type GlobalBusinessEvent =
       message?: string;
     };
 
+export type SessionInteractionChange =
+  | { interactionId: string; type: "permission"; request: RequestPermissionRequest }
+  | { interactionId: string; type: "elicitation"; request: CreateElicitationRequest };
+
+/** The `change` of a session delta. `sync_state` and unrecognized kinds are
+ * applied by refetching the session view. */
+export type SessionDeltaChange =
+  | { kind: "terminal_update"; terminal: TerminalSnapshot }
+  | { kind: "turn_update"; update: SessionUpdate }
+  | { kind: "interaction_upsert"; interaction: SessionInteractionChange }
+  | { kind: "interaction_remove"; interactionId: string }
+  | { kind: "control_update"; control: "mode"; modeId: string }
+  | {
+      kind: "control_update";
+      control: "configuration";
+      configId: string;
+      value: unknown;
+      configOptions: NonNullable<NewSessionResponse["configOptions"]>;
+    }
+  | { kind: "sync_state"; phase: string; message?: string; retryAfterMs?: number };
+
 export type SessionBusinessEvent =
   | (SessionOwner & { type: "bridge/session_retired"; reason: "closed" | "deleted" | "unobserved" })
   | {
@@ -165,14 +186,7 @@ export type SessionBusinessEvent =
       sessionIncarnation: number;
       fromRevision: number;
       viewRevision: number;
-      change: {
-        kind: "terminal_update";
-        terminal: TerminalSnapshot;
-      } | {
-        kind: "turn_update" | "sync_state" | "interaction_upsert" | "interaction_remove" | "control_update";
-        update?: SessionUpdate;
-        [key: string]: unknown;
-      };
+      change: SessionDeltaChange;
     }
   | {
       type: "bridge/session_turn_complete";

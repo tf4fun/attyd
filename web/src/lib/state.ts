@@ -34,6 +34,7 @@ import type {
   SessionSyncPhase,
 } from "./business-api";
 import { sameSessionOwner } from "./business-api";
+import type { SessionControlKind } from "./session-deltas";
 import { randomId } from "./id";
 import { timelineTurnStarts } from "./timeline-turns";
 import { releaseTimelineProcess, releaseUnreferencedTerminals } from "./process-retention";
@@ -300,6 +301,8 @@ export type AppAction =
   | { type: "socket/open" }
   | { type: "socket/closed" }
   | { type: "bridge/session_hydrate"; view: BridgeSessionView; failedPrompt?: { requestId: string; message: string } }
+  | { type: "bridge/session_live_update"; view: BridgeSessionView; settledControl?: SessionControlKind }
+  | { type: "session/control_settled"; requestId: string }
   | { type: "session/release_turn_process"; process: DeferredTurnProcess }
   | {
       type: "bridge/turn_complete";
@@ -507,6 +510,12 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           };
     case "socket/closed":
       return terminateBridgeState(state, "stopped", false);
+    case "bridge/session_live_update":
+      return applySessionLiveView(state, action.view, action.settledControl);
+    case "session/control_settled":
+      return state.pendingSessionControl?.requestId === action.requestId
+        ? { ...state, pendingSessionControl: undefined }
+        : state;
     case "bridge/session_hydrate": {
       const next = hydrateBridgeSession(state, action.view);
       const failure = action.failedPrompt;
@@ -2365,6 +2374,53 @@ function resetActiveSession(state: AppState, title?: string): AppState {
     usage: undefined,
     activePlan: undefined,
   };
+}
+
+/**
+ * Project the live parts of an incrementally updated view: pending
+ * interactions, and the session control a delta settled. Unlike a hydrate it
+ * never rebuilds the timeline, and it keeps the response state of
+ * interactions that are still pending.
+ */
+function applySessionLiveView(
+  state: AppState,
+  view: BridgeSessionView,
+  settledControl: SessionControlKind | undefined,
+): AppState {
+  if (state.session?.sessionId !== view.sessionId || !sameSessionOwner(state.sessionOwner, view)) {
+    return state;
+  }
+  const permissions = Object.values(view.interactions.permissions).map((pending) => {
+    const current = state.permissions.find(({ permissionId }) => permissionId === pending.interactionId);
+    return current != null && current.request === pending.request
+      ? current
+      : { ...current, permissionId: pending.interactionId, request: pending.request };
+  });
+  const elicitations = Object.values(view.interactions.elicitations).map((pending) => {
+    const current = state.elicitations.find(({ elicitationId }) => elicitationId === pending.interactionId);
+    return current != null && current.request === pending.request
+      ? current
+      : { ...current, elicitationId: pending.interactionId, request: pending.request };
+  });
+  let next: AppState = { ...state, permissions, elicitations };
+  if (settledControl != null) {
+    const session: NewSessionResponse = { ...(view.workspace.session ?? {}), sessionId: view.sessionId };
+    next = {
+      ...next,
+      session,
+      ...(settledControl === "mode"
+        ? { modeId: session.modes?.currentModeId }
+        : { configOptions: session.configOptions ?? null }),
+      pendingSessionControl: state.pendingSessionControl?.kind === settledControl &&
+          state.pendingSessionControl.sessionId === view.sessionId
+        ? undefined
+        : state.pendingSessionControl,
+      runtimeOperation: state.runtimeOperation?.operation === settledControl
+        ? undefined
+        : state.runtimeOperation,
+    };
+  }
+  return next;
 }
 
 function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppState {

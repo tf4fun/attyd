@@ -631,6 +631,86 @@ describe("project navigation", () => {
     expect(fetchMock.mock.calls.filter(([path]) => String(path).split("?")[0] === "/api/v1/sessions/alpha-one")).toHaveLength(1);
   });
 
+  function liveDelta(change: Record<string, unknown>, fromRevision: number) {
+    return {
+      type: "bridge/session_delta", bridgeEpoch: "epoch", sessionId: "alpha-one",
+      sessionIncarnation: 1, fromRevision, viewRevision: fromRevision + 1, change,
+    };
+  }
+
+  async function mountLiveSession() {
+    await mount(sessionPath("alpha-one", "/work/alpha"));
+    const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
+    return async (event: unknown) => act(async () => source.onmessage?.({ data: JSON.stringify(event) }));
+  }
+
+  const sessionReads = () => fetchMock.mock.calls.filter(([path, init]) =>
+    String(path).split("?")[0] === "/api/v1/sessions/alpha-one" && (init?.method ?? "GET") === "GET");
+
+  it("applies permission requests, responses and removal without refetching the session", async () => {
+    const emit = await mountLiveSession();
+    const request = {
+      sessionId: "alpha-one",
+      toolCall: { toolCallId: "tool-1", title: "Edit file" },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+    };
+    await emit(liveDelta({
+      kind: "interaction_upsert",
+      interaction: { interactionId: "permission-1", type: "permission", request },
+    }, 1));
+    expect(acp.state.permissions).toEqual([{ permissionId: "permission-1", request }]);
+
+    await act(async () => acp.respondPermission("permission-1", { outcome: "selected", optionId: "allow" }));
+    expect(acp.state.permissions[0].responseRequestId).toEqual(expect.any(String));
+    await emit(liveDelta({ kind: "interaction_remove", interactionId: "permission-1" }, 2));
+    expect(acp.state.permissions).toEqual([]);
+    expect(sessionReads()).toHaveLength(1);
+  });
+
+  it("applies a mode change from its control delta without refetching the session", async () => {
+    const modes = {
+      currentModeId: "ask",
+      availableModes: [{ id: "ask", name: "Ask" }, { id: "code", name: "Code" }],
+    };
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input).split("?")[0];
+      if (path === "/api/v1/sessions/alpha-one") {
+        return response({ ...sessionView("alpha-one"), workspace: { cwd: "/work/alpha", session: { modes } } });
+      }
+      if (path === "/api/v1/sessions/alpha-one/mode") return response({ status: "ok" });
+      return defaultFetch(input, init);
+    });
+    const emit = await mountLiveSession();
+    expect(acp.state.modeId).toBe("ask");
+
+    await act(async () => acp.setMode("code"));
+    await emit(liveDelta({ kind: "control_update", control: "mode", modeId: "code" }, 1));
+    expect(acp.state.modeId).toBe("code");
+    expect(acp.state.pendingSessionControl).toBeUndefined();
+    expect(sessionReads()).toHaveLength(1);
+  });
+
+  it("refetches the session when a delta cannot be applied locally", async () => {
+    const emit = await mountLiveSession();
+    const urlRequest = {
+      sessionId: "alpha-one", mode: "url", elicitationId: "flow-1",
+      url: "https://example.com/sign-in", message: "Sign in",
+    };
+    await emit(liveDelta({
+      kind: "interaction_upsert",
+      interaction: { interactionId: "elicitation-1", type: "elicitation", request: urlRequest },
+    }, 1));
+    expect(acp.state.elicitations).toHaveLength(1);
+    expect(sessionReads()).toHaveLength(1);
+
+    // Accepting a URL elicitation may open a flow the removal does not describe.
+    await emit(liveDelta({ kind: "interaction_remove", interactionId: "elicitation-1" }, 2));
+    expect(sessionReads()).toHaveLength(2);
+    // History sync may replace the baseline.
+    await emit(liveDelta({ kind: "sync_state", phase: "loading" }, 3));
+    expect(sessionReads()).toHaveLength(3);
+  });
+
   it("merges raw UTF-8 fragments and trims retained output by bytes", async () => {
     await mount(sessionPath("alpha-one", "/work/alpha"));
     const source = TestEventSource.instances.find(({ url }) => url.split("?")[0].endsWith("alpha-one/events"))!;
