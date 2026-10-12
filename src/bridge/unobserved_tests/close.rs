@@ -131,7 +131,7 @@ async fn idle_retirement_refused_close_preserves_turns_and_rearms_after_observat
     assert_eq!(prompt["method"], "session/prompt");
     assert_eq!(prompt["params"]["sessionId"], SESSION);
     agent.reply(&prompt, json!({"stopReason":"end_turn"})).await;
-    agent.event("acp/prompt_complete", SESSION).await;
+    agent.event("bridge/session_turn_complete", SESSION).await;
 
     lease.cancel();
     agent

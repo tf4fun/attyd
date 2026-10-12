@@ -89,14 +89,6 @@ impl EventSink {
         }
     }
 
-    fn send_to(&self, subscriber_id: u64, event: Value) {
-        self.send(json!({
-            "type": "bridge/internal_direct",
-            "subscriberId": subscriber_id,
-            "event": event,
-        }));
-    }
-
     fn internal_typed(&self, kind: &str, value: impl Serialize) -> bool {
         match serde_json::to_value(value) {
             Ok(value) => self
@@ -121,21 +113,31 @@ impl EventSink {
     }
 
     fn error(&self, message: impl Into<String>, request_id: Option<&str>, operation: Option<&str>) {
-        self.send(error_event(message, request_id, operation));
+        self.report(error_event(message, request_id, operation));
     }
 
     fn acp_error(&self, error: Error, request_id: Option<&str>, operation: Option<&str>) {
-        self.send(acp_error_event(error, request_id, operation));
+        self.report(acp_error_event(error, request_id, operation));
     }
 
-    fn acp_error_to(
-        &self,
-        subscriber_id: u64,
-        error: Error,
-        request_id: Option<&str>,
-        operation: Option<&str>,
-    ) {
-        self.send_to(subscriber_id, acp_error_event(error, request_id, operation));
+    /// Connection-level errors reach the browser as `bridge/connection_error`.
+    /// Request- and operation-scoped failures are answered through their own
+    /// REST response or session outcome, so they are only logged here.
+    fn report(&self, event: Value) {
+        if event.get("requestId").is_none() && event.get("operation").is_none() {
+            self.send(event);
+        } else {
+            tracing::warn!(
+                request_id = event.get("requestId").and_then(Value::as_str),
+                operation = event.get("operation").and_then(Value::as_str),
+                code = event.get("code").and_then(Value::as_i64),
+                "{}",
+                event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+        }
     }
 }
 
@@ -154,18 +156,12 @@ fn error_event(
     event
 }
 
-fn relay_interaction_resolution(
-    sink: &EventSink,
-    event: Value,
-    delivered: bool,
-    interaction: &str,
-) -> Result<(), Error> {
+fn ensure_interaction_delivered(delivered: bool, interaction: &str) -> Result<(), Error> {
     if !delivered {
         return Err(Error::request_cancelled().data(format!(
             "Agent cancelled the {interaction} request before delivery"
         )));
     }
-    sink.send(event);
     Ok(())
 }
 
@@ -359,13 +355,10 @@ fn replay_validation_backup<'a>(
         .as_ref()
 }
 
-fn clear_attachment_delivery(
-    state: &mut BridgeState,
-    session_id: &str,
-    incarnation: u64,
-) -> Option<u64> {
-    let resources = state.sessions.resources_mut(session_id, incarnation).ok()?;
-    std::mem::take(&mut resources.attachment).subscriber
+fn clear_attachment_delivery(state: &mut BridgeState, session_id: &str, incarnation: u64) {
+    if let Ok(resources) = state.sessions.resources_mut(session_id, incarnation) {
+        resources.attachment = AttachmentDelivery::default();
+    }
 }
 
 fn clear_ingest_resources(state: &mut BridgeState, session_id: &str, incarnation: u64) {
@@ -2131,14 +2124,10 @@ pub async fn run_with_cancellation(
         Transport::Stdio => {
             let config = AcpAgentConfig::new(&options.command[0])
                 .args(options.command.iter().skip(1).cloned());
-            let debug_sink = sink.clone();
             let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
             let agent = StdioAcpAgent::new(config)
                 .on_stderr(move |chunk| {
-                    debug_sink.send(json!({
-                        "type": "bridge/stderr",
-                        "chunk": chunk,
-                    }));
+                    tracing::debug!(target: "attyd::agent_stderr", "{chunk}");
                 })
                 .on_fatal(move |error| {
                     let _ = fatal_tx.send(error);
@@ -2284,11 +2273,7 @@ where
             }
         });
     }
-    let mcp = McpManager::new(
-        options.cwd.clone(),
-        options.acp_mcp_providers.clone(),
-        sink.tx.clone(),
-    );
+    let mcp = McpManager::new(options.cwd.clone(), options.acp_mcp_providers.clone());
     let auth_terminal = AuthTerminalManager::new(sink.tx.clone());
     let prompt_lifecycle = Arc::new(PromptLifecycle::default());
 
@@ -2649,7 +2634,6 @@ where
                             if materialization_cancel.is_cancelled() { break Err(Error::request_cancelled()); }
                             command["bridgeMaterializationFinalAttempt"] =
                                 json!(false);
-                            command["bridgeMaterializationRetryAfterMs"] = json!(backoff.as_millis());
                             let result = tokio::select! {
                                 _ = materialization_cancel.cancelled() => break Err(Error::request_cancelled()),
                                 result = handle_command(
@@ -2862,7 +2846,7 @@ fn resolve_session_view_waiters_locked(
     refresh_observer_timers(state);
 }
 
-fn drain_runtime_effects(state: &mut BridgeState, sink: &EventSink) -> Vec<(String, String)> {
+fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
     let effects = state.sessions.take_effects();
     let mut terminal_releases = Vec::new();
     for effect in effects {
@@ -2878,7 +2862,6 @@ fn drain_runtime_effects(state: &mut BridgeState, sink: &EventSink) -> Vec<(Stri
                     let _ = pending.sender.send(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
                     ));
-                    sink.send(json!({ "type": "acp/permission_resolved", "permissionId": interaction_id }));
                 }
             }
             RuntimeEffect::CancelElicitationResponder {
@@ -2898,9 +2881,9 @@ fn drain_runtime_effects(state: &mut BridgeState, sink: &EventSink) -> Vec<(Stri
                 if let Some(pending) =
                     take_pending_elicitation(state, &interaction_id, owner.as_ref())
                 {
-                    let response = CreateElicitationResponse::new(ElicitationAction::Cancel);
-                    let _ = pending.sender.send(response.clone());
-                    sink.send(json!({ "type": "acp/elicitation_resolved", "elicitationId": interaction_id, "response": response }));
+                    let _ = pending
+                        .sender
+                        .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
                 }
             }
             RuntimeEffect::AbortUrlFlow {
@@ -2922,41 +2905,9 @@ fn drain_runtime_effects(state: &mut BridgeState, sink: &EventSink) -> Vec<(Stri
                     owner,
                     registration_id,
                 };
-                if state
+                state
                     .sessions
-                    .take_url_route(&elicitation_id, &registration)
-                    .is_some()
-                {
-                    sink.send(json!({ "type": "acp/elicitation_aborted", "elicitationId": elicitation_id, "sessionId": session_id, "reason": "runtime_terminal" }));
-                }
-            }
-            RuntimeEffect::ResourcesCancelled {
-                session_id,
-                incarnation: _,
-                permission_ids,
-                elicitation_ids,
-                url_ids,
-                reason,
-            } => {
-                // Physical retirement already sent ACP terminal responses and
-                // removed routes synchronously. Do not terminate a reused ID.
-                for id in permission_ids {
-                    if !state.sessions.permission_owners.contains_key(&id) {
-                        sink.send(json!({ "type": "acp/permission_resolved", "permissionId": id }));
-                    }
-                }
-                for id in elicitation_ids {
-                    if !state.sessions.elicitation_owners.contains_key(&id)
-                        && !state.request_elicitations.contains_key(&id)
-                    {
-                        sink.send(json!({ "type": "acp/elicitation_resolved", "elicitationId": id, "response": CreateElicitationResponse::new(ElicitationAction::Cancel) }));
-                    }
-                }
-                for (id, _registration_id) in url_ids {
-                    if !state.sessions.url_owners.contains_key(&id) {
-                        sink.send(json!({ "type": "acp/elicitation_aborted", "elicitationId": id, "sessionId": session_id, "reason": reason }));
-                    }
-                }
+                    .take_url_route(&elicitation_id, &registration);
             }
             RuntimeEffect::ReleaseTerminal {
                 session_id,
@@ -2975,7 +2926,7 @@ async fn apply_runtime_effects(
 ) {
     let terminal_releases = {
         let mut locked = state.lock().await;
-        drain_runtime_effects(&mut locked, sink)
+        drain_runtime_effects(&mut locked)
     };
     if let Some(terminals) = terminals {
         for (session_id, terminal_id) in terminal_releases {
@@ -3016,11 +2967,6 @@ async fn handle_session_update(
     sink: &EventSink,
     _terminals: Option<&TerminalManager>,
 ) {
-    enum Delivery {
-        None,
-        Broadcast,
-        Direct(u64),
-    }
     if let Err(error) = relay_bytes(&notification) {
         sink.acp_error(error, None, Some("session/update"));
         return;
@@ -3116,12 +3062,6 @@ async fn handle_session_update(
                 .load_attempt(&session_id, incarnation)
                 .map(str::to_string)
         });
-        let attachment_subscriber = attachment
-            .then(|| {
-                session_ingest(&state, &session_id)
-                    .and_then(|resources| resources.attachment.subscriber)
-            })
-            .flatten();
         let reference_error = if tool_update && !attachment && mirror_replay_attempt.is_none() {
             validate_terminal_references(
                 &state,
@@ -3181,11 +3121,7 @@ async fn handle_session_update(
                         .map_err(runtime_state_error)
                 }
             });
-            runtime_result.map(|()| {
-                session_ingest(&state, &session_id)
-                    .and_then(|resources| resources.attachment.subscriber)
-                    .map_or(Delivery::Broadcast, Delivery::Direct)
-            })
+            runtime_result
         } else if active
             && !attachment
             && matches!(
@@ -3216,7 +3152,7 @@ async fn handle_session_update(
                 candidate.updates.push(update.clone());
                 Ok(())
             };
-            mirrored.map(|()| Delivery::None)
+            mirrored
         } else if early_creation {
             let notification_bytes = serde_json::to_vec(&notification)
                 .expect("ACP notification serializes")
@@ -3229,7 +3165,7 @@ async fn handle_session_update(
             staging.bytes += notification_bytes;
             state.early_update_count += 1;
             state.early_update_bytes += notification_bytes;
-            Ok(Delivery::None)
+            Ok(())
         } else {
             let incarnation = attached_session_incarnation(&state, &session_id).unwrap_or(0);
             if incarnation != 0 {
@@ -3319,10 +3255,10 @@ async fn handle_session_update(
                     if let Some(delta) = business_delta {
                         sink.send(delta);
                     }
-                    Ok(Delivery::Broadcast)
+                    Ok(())
                 }
             } else {
-                Ok(Delivery::Broadcast)
+                Ok(())
             }
         };
         if let Err(error) = &result
@@ -3350,24 +3286,11 @@ async fn handle_session_update(
                 session_mirror(&mut state).invalidate_load(&session_id, incarnation, &attempt_id);
         }
         flush_runtime(&mut state, sink);
-        match (
-            result,
-            attachment_subscriber,
-            mirror_replay_attempt.is_some(),
-        ) {
-            (Ok(Delivery::Broadcast), _, _) => {
-                sink.send(json!({ "type": "acp/session_update", "notification": notification }));
-            }
-            (Ok(Delivery::Direct(subscriber_id)), _, _) => sink.send_to(
-                subscriber_id,
-                json!({ "type": "acp/session_update", "notification": notification }),
-            ),
-            (Ok(Delivery::None), _, _) => {}
-            (Err(error), Some(subscriber_id), _) => {
-                sink.acp_error_to(subscriber_id, error, None, Some("session/update"));
-            }
-            (Err(_), None, true) => {}
-            (Err(error), None, false) => sink.acp_error(error, None, Some("session/update")),
+        // A failed replay attempt is reported through its load outcome.
+        if let Err(error) = result
+            && mirror_replay_attempt.is_none()
+        {
+            sink.acp_error(error, None, Some("session/update"));
         }
     }
 }
@@ -3402,7 +3325,7 @@ async fn cancel_prompts_on_shutdown(
         if !connection.is_incoming_closed() {
             let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
         }
-        cancel_interactions(session_id, *incarnation, "session_cancelled", state, sink).await;
+        cancel_interactions(session_id, *incarnation, state, sink).await;
     }
 
     // ACP cancellation completes through the original session/prompt response.
@@ -3710,30 +3633,11 @@ async fn handle_command(
     let terminal_releases = if context.ingress.is_none() || execution.is_some() {
         let mut state = context.state.lock().await;
         flush_runtime(&mut state, &context.sink);
-        let releases = drain_runtime_effects(&mut state, &context.sink);
+        let releases = drain_runtime_effects(&mut state);
         let final_attempt = command
             .get("bridgeMaterializationFinalAttempt")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if command
-            .get("bridgeManagedMaterialization")
-            .and_then(Value::as_bool)
-            == Some(true)
-            && !final_attempt
-            && !context.cancellation.is_cancelled()
-            && let Err(error) = &result
-            && retryable_reconcile_error(error)
-        {
-            context.sink.send(json!({
-                "type": "bridge/session_sync",
-                "sessionId": command.get("sessionId"),
-                "phase": "retrying",
-                "message": error.message,
-                "retryAfterMs": command.get("bridgeMaterializationRetryAfterMs")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(RECONCILE_INITIAL_BACKOFF.as_millis() as u64),
-            }));
-        }
         if command
             .get("bridgeManagedMaterialization")
             .and_then(Value::as_bool)
@@ -3955,15 +3859,6 @@ async fn handle_command_inner(
                     advance_catalog_revision(&mut state, &sink);
                     flush_runtime(&mut state, &sink);
                     let mirror_view = session_view_value(&mut state, &session_id, incarnation)?;
-                    let mut event = json!({
-                        "type": "acp/session_created",
-                        "requestId": request_id,
-                        "cwd": cwd,
-                        "response": response,
-                    });
-                    if !early_updates.is_empty() {
-                        event["earlyUpdates"] = json!(early_updates);
-                    }
                     if let Some(responder) = &business_responder {
                         responder.success(json!({
                             "sessionId": session_id,
@@ -3971,7 +3866,6 @@ async fn handle_command_inner(
                             "view": mirror_view,
                         }));
                     }
-                    sink.send(event);
                     sink.send(json!({
                         "type": "bridge/session_view",
                         "sessionId": session_id,
@@ -4049,12 +3943,6 @@ async fn handle_command_inner(
                 response["catalogRevision"] = json!(catalog_revision);
                 responder.success(response);
             }
-            sink.send(json!({
-                "type": "acp/sessions_listed",
-                "requestId": request_id,
-                "cursor": cursor,
-                "response": response,
-            }));
         }
         "session/load" | "session/resume" => {
             let request_id = string_field(&command, "requestId")?.to_string();
@@ -4111,14 +3999,6 @@ async fn handle_command_inner(
                 .clone();
             let cwd = reservation.cwd().clone();
             let reload = reservation.is_reload();
-            state
-                .lock()
-                .await
-                .sessions
-                .resources_mut(&session_id, reservation.incarnation())
-                .map_err(mirror_error)?
-                .attachment
-                .subscriber = Some(0);
             let attachment_incarnation = {
                 let mut state = state.lock().await;
                 let incarnation = reservation.incarnation();
@@ -4372,9 +4252,7 @@ async fn handle_command_inner(
                 &request_id,
             );
             flush_runtime(&mut state, &sink);
-            let attachment_subscriber =
-                clear_attachment_delivery(&mut state, &session_id, attachment_incarnation)
-                    .unwrap_or(0);
+            clear_attachment_delivery(&mut state, &session_id, attachment_incarnation);
             let mirror_view = (operation == "session/load")
                 .then(|| session_view_value(&mut state, &session_id, attachment_incarnation))
                 .transpose()?;
@@ -4404,17 +4282,6 @@ async fn handle_command_inner(
                 )
                 .await?;
             }
-            sink.send_to(
-                attachment_subscriber,
-                json!({
-                    "type": "acp/session_attached",
-                    "requestId": request_id,
-                    "method": if operation == "session/load" { "load" } else { "resume" },
-                    "sessionId": session_id,
-                    "cwd": cwd,
-                    "response": response,
-                }),
-            );
         }
         "session/fork" => {
             let request_id = string_field(&command, "requestId")?.to_string();
@@ -4466,12 +4333,6 @@ async fn handle_command_inner(
                 state.pending_creations += 1;
                 (cwd, source_incarnation, source_baseline)
             };
-            sink.send(json!({
-                "type": "bridge/session_operation_started",
-                "requestId": request_id,
-                "sessionId": source_id,
-                "operation": "fork",
-            }));
             let owner = rpc_owner(
                 &epoch,
                 Some((&source_id, source_incarnation)),
@@ -4708,17 +4569,6 @@ async fn handle_command_inner(
                     "view": view,
                 }));
             }
-            let mut event = json!({
-                "type": "acp/session_forked",
-                "requestId": request_id,
-                "sourceSessionId": source_id,
-                "cwd": cwd,
-                "response": response,
-            });
-            if !early_updates.is_empty() {
-                event["earlyUpdates"] = json!(early_updates);
-            }
-            sink.send(event);
         }
         "session/close" => {
             let request_id = string_field(&command, "requestId")?.to_string();
@@ -4805,12 +4655,6 @@ async fn handle_command_inner(
                 flush_runtime(&mut state, &sink);
                 incarnation
             };
-            sink.send(json!({
-                "type": "bridge/session_operation_started",
-                "requestId": request_id,
-                "sessionId": session_id,
-                "operation": "close",
-            }));
             let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
             let result = send_ordered(
                 &connection,
@@ -4850,15 +4694,9 @@ async fn handle_command_inner(
                     .close_session(&epoch, &session_id, incarnation, &request_id)
                     .map_err(runtime_state_error)?;
                 clear_ingest_resources(&mut state, &session_id, incarnation);
-                cancel_interactions_locked(
-                    &session_id,
-                    incarnation,
-                    "session_closed",
-                    &mut state,
-                    &sink,
-                );
+                cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
                 flush_runtime(&mut state, &sink);
-                drain_runtime_effects(&mut state, &sink)
+                drain_runtime_effects(&mut state)
             };
             drop(execution.take());
             release_runtime_terminals(terminals.as_ref(), terminal_releases).await;
@@ -4878,11 +4716,6 @@ async fn handle_command_inner(
                     "closed",
                 );
             }
-            sink.send(json!({
-                "type": "acp/session_closed",
-                "requestId": request_id,
-                "sessionId": session_id,
-            }));
         }
         // Local retirement for Agents without session/close: the Agent keeps
         // whatever it retains; we drop our copy and the session may still be
@@ -4976,15 +4809,9 @@ async fn handle_command_inner(
                     .close_session(&epoch, &session_id, incarnation, &request_id)
                     .map_err(runtime_state_error)?;
                 clear_ingest_resources(&mut state, &session_id, incarnation);
-                cancel_interactions_locked(
-                    &session_id,
-                    incarnation,
-                    "session_retired",
-                    &mut state,
-                    &sink,
-                );
+                cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
                 flush_runtime(&mut state, &sink);
-                drain_runtime_effects(&mut state, &sink)
+                drain_runtime_effects(&mut state)
             };
             drop(execution.take());
             release_runtime_terminals(terminals.as_ref(), terminal_releases).await;
@@ -5014,10 +4841,6 @@ async fn handle_command_inner(
             let DeletionReservation::Session(incarnation) = deletion else {
                 // An unopened history row is a catalog operation. Keep only the
                 // ID reservation; its RPC and completion use the global lane.
-                sink.send(json!({
-                    "type": "bridge/session_operation_started", "requestId": request_id,
-                    "sessionId": session_id, "operation": "delete",
-                }));
                 let result = send_ordered(
                     &connection,
                     ingress.as_ref(),
@@ -5032,9 +4855,6 @@ async fn handle_command_inner(
                 result?;
                 locked.listed_sessions.remove(&session_id);
                 advance_catalog_revision(&mut locked, &sink);
-                sink.send(json!({
-                    "type": "acp/session_deleted", "requestId": request_id, "sessionId": session_id,
-                }));
                 return Ok(());
             };
             let (close_before_delete, runtime_incarnation) = {
@@ -5063,12 +4883,6 @@ async fn handle_command_inner(
                 }
                 (close_before_delete, runtime_incarnation)
             };
-            sink.send(json!({
-                "type": "bridge/session_operation_started",
-                "requestId": request_id,
-                "sessionId": session_id,
-                "operation": "delete",
-            }));
             let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
             if close_before_delete {
                 let mut close_owner = owner.clone();
@@ -5114,15 +4928,9 @@ async fn handle_command_inner(
                 }
                 let terminal_releases = {
                     let mut state = state.lock().await;
-                    cancel_interactions_locked(
-                        &session_id,
-                        incarnation,
-                        "session_closed",
-                        &mut state,
-                        &sink,
-                    );
+                    cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
                     flush_runtime(&mut state, &sink);
-                    drain_runtime_effects(&mut state, &sink)
+                    drain_runtime_effects(&mut state)
                 };
                 drop(execution.take());
                 release_runtime_terminals(terminals.as_ref(), terminal_releases).await;
@@ -5137,11 +4945,6 @@ async fn handle_command_inner(
                     incarnation,
                     "closed",
                 );
-                sink.send(json!({
-                    "type": "acp/session_closed",
-                    "requestId": request_id,
-                    "sessionId": session_id,
-                }));
             }
             let mut delete_owner = owner.clone();
             delete_owner.attempt_id = Some(format!("delete-{}", Uuid::new_v4()));
@@ -5186,15 +4989,9 @@ async fn handle_command_inner(
                 }
                 let terminal_releases = {
                     let mut state = state.lock().await;
-                    cancel_interactions_locked(
-                        &session_id,
-                        incarnation,
-                        "session_closed",
-                        &mut state,
-                        &sink,
-                    );
+                    cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
                     flush_runtime(&mut state, &sink);
-                    drain_runtime_effects(&mut state, &sink)
+                    drain_runtime_effects(&mut state)
                 };
                 drop(execution.take());
                 release_runtime_terminals(terminals.as_ref(), terminal_releases).await;
@@ -5217,11 +5014,6 @@ async fn handle_command_inner(
                 state.listed_sessions.remove(&session_id);
                 advance_catalog_revision(&mut state, &sink);
             }
-            sink.send(json!({
-                "type": "acp/session_deleted",
-                "requestId": request_id,
-                "sessionId": session_id,
-            }));
         }
         "session/prompt" => {
             let turn_responder = turn_responder.ok_or_else(|| {
@@ -5293,10 +5085,6 @@ async fn handle_command_inner(
                 let view = session_view_value(&mut state, &session_id, incarnation)?;
                 sink.send(json!({
                     "type": "bridge/session_view", "sessionId": session_id, "view": view,
-                }));
-                sink.send(json!({
-                    "type": "acp/prompt_started", "requestId": request_id,
-                    "sessionId": session_id, "prompt": prompt,
                 }));
                 (incarnation, mirror_operation_id)
             };
@@ -5428,12 +5216,6 @@ async fn handle_command_inner(
                 flush_runtime(&mut state, &sink);
                 incarnation
             };
-            sink.send(json!({
-                "type": "bridge/session_operation_started",
-                "requestId": request_id,
-                "sessionId": session_id,
-                "operation": "mode",
-            }));
             let result = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -5528,12 +5310,6 @@ async fn handle_command_inner(
                     }),
                 )?;
                 sink.send(business_delta);
-                sink.send(json!({
-                    "type": "acp/mode_changed",
-                    "requestId": request_id,
-                    "sessionId": session_id,
-                    "modeId": mode_id,
-                }));
             }
         }
         "session/set_config_option" => {
@@ -5598,12 +5374,6 @@ async fn handle_command_inner(
                 flush_runtime(&mut state, &sink);
                 incarnation
             };
-            sink.send(json!({
-                "type": "bridge/session_operation_started",
-                "requestId": request_id,
-                "sessionId": session_id,
-                "operation": "config",
-            }));
             let result = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -5730,14 +5500,6 @@ async fn handle_command_inner(
                     }),
                 )?;
                 sink.send(business_delta);
-                sink.send(json!({
-                    "type": "acp/config_changed",
-                    "requestId": request_id,
-                    "sessionId": session_id,
-                    "configId": config_id,
-                    "value": value,
-                    "response": response,
-                }));
             }
         }
         "permission/respond" => {
@@ -5802,14 +5564,7 @@ async fn handle_command_inner(
             )?;
             flush_runtime(&mut locked, &sink);
             sink.send(business_delta);
-            relay_interaction_resolution(
-                &sink,
-                json!({
-                    "type": "acp/permission_resolved", "permissionId": permission_id, "requestId": request_id,
-                }),
-                delivered,
-                "permission",
-            )?;
+            ensure_interaction_delivered(delivered, "permission")?;
         }
         "elicitation/respond" => {
             let request_id = string_field(&command, "requestId")?.to_string();
@@ -5884,15 +5639,7 @@ async fn handle_command_inner(
             if let Some(delta) = business_delta {
                 sink.send(delta);
             }
-            relay_interaction_resolution(
-                &sink,
-                json!({
-                    "type": "acp/elicitation_resolved", "elicitationId": elicitation_id,
-                    "response": response, "requestId": request_id,
-                }),
-                delivered,
-                "elicitation",
-            )?;
+            ensure_interaction_delivered(delivered, "elicitation")?;
         }
         "context/search" => {
             let request_id = string_field(&command, "requestId")?;
@@ -5916,12 +5663,6 @@ async fn handle_command_inner(
             if let Some(responder) = &business_responder {
                 responder.success(json!({ "matches": matches }));
             }
-            sink.send(json!({
-                "type": "bridge/context_search_result",
-                "requestId": request_id,
-                "query": query,
-                "matches": matches,
-            }));
         }
         "context/read" => {
             let request_id = string_field(&command, "requestId")?;
@@ -5946,12 +5687,6 @@ async fn handle_command_inner(
             if let Some(responder) = &business_responder {
                 responder.success(json!({ "attachment": attachment }));
             }
-            sink.send(json!({
-                "type": "bridge/context_attached",
-                "requestId": request_id,
-                "sessionId": session_id,
-                "attachment": attachment,
-            }));
         }
         "auth/terminal_start" => {
             if options.transport != Transport::Stdio {
@@ -6097,7 +5832,7 @@ fn commit_completed_turn_history(
         }
         // Detach old responder handles before the next turn can consume quota or
         // reuse a tool-call identity. Physical terminal I/O stays outside the lock.
-        terminal_releases = drain_runtime_effects(state, sink);
+        terminal_releases = drain_runtime_effects(state);
         let sync_error = if uncertain {
             session_mirror(state)
                 .block_turn(
@@ -6158,20 +5893,7 @@ fn commit_completed_turn_history(
             },
         )?;
         sink.send(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": view }));
-        if !uncertain {
-            sink.send(json!({
-                "type": "bridge/session_sync", "sessionId": session_id,
-                "phase": if sync_error.is_some() { "blocked" } else { "ready" },
-                "message": sync_error.as_ref().map(|error| &error.message), "source": "bridge_memory",
-            }));
-        }
         sink.send(outcome);
-        if error.is_none() && sync_error.is_none() {
-            sink.send(
-                json!({ "type": "acp/prompt_complete", "requestId": runtime_operation_id,
-                "sessionId": session_id, "response": response }),
-            );
-        }
         if let Some(error) = error.or(sync_error) {
             Err(error)
         } else {
@@ -6341,7 +6063,6 @@ async fn synchronize_attached_history(
     }
     let view = session_view_value(&mut state, session_id, incarnation)?;
     sink.send(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": view }));
-    sink.send(json!({ "type": "bridge/session_sync", "sessionId": session_id, "phase": "ready" }));
     Ok(())
 }
 
@@ -6423,10 +6144,6 @@ async fn synchronize_authoritative_history(
                 Err(error) => return HistorySyncOutcome::Failed(error),
             };
             sink.send(delta);
-            sink.send(json!({
-                "type": "bridge/session_sync", "sessionId": session_id,
-                "phase": phase, "attemptId": attempt_id,
-            }));
             validation_owner
         };
 
@@ -6542,11 +6259,6 @@ async fn synchronize_authoritative_history(
                                     "sessionId": session_id,
                                     "view": view,
                                 }));
-                                sink.send(json!({
-                                    "type": "bridge/session_sync",
-                                    "sessionId": session_id,
-                                    "phase": "ready",
-                                }));
                                 return HistorySyncOutcome::Loaded;
                             }
                             Err(error) => {
@@ -6597,16 +6309,15 @@ async fn synchronize_authoritative_history(
                     ) {
                         return HistorySyncOutcome::Failed(mirror_error(mirror));
                     }
-                    let delta = match session_delta_value(
-                        &state,
-                        session_id,
-                        incarnation,
-                        json!({
-                            "kind": "sync_state",
-                            "phase": if retryable { "retrying" } else { "blocked" },
-                            "message": error.message,
-                        }),
-                    ) {
+                    let mut change = json!({
+                        "kind": "sync_state",
+                        "phase": if retryable { "retrying" } else { "blocked" },
+                        "message": error.message,
+                    });
+                    if retryable {
+                        change["retryAfterMs"] = json!(backoff.as_millis());
+                    }
+                    let delta = match session_delta_value(&state, session_id, incarnation, change) {
                         Ok(delta) => delta,
                         Err(error) => return HistorySyncOutcome::Failed(error),
                     };
@@ -6615,12 +6326,6 @@ async fn synchronize_authoritative_history(
             };
             failure.map(|(error, retryable, delta)| {
                 sink.send(delta);
-                let mut event = json!({
-                    "type": "bridge/session_sync", "sessionId": session_id,
-                    "phase": if retryable { "retrying" } else { "blocked" }, "message": error.message,
-                });
-                if retryable { event["retryAfterMs"] = json!(backoff.as_millis()); }
-                sink.send(event);
                 (error, retryable)
             })
         };
@@ -7292,12 +6997,11 @@ async fn require_session_workspace(
 async fn cancel_interactions(
     session_id: &str,
     incarnation: u64,
-    reason: &str,
     state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
 ) {
     let mut state = state.lock().await;
-    cancel_interactions_locked(session_id, incarnation, reason, &mut state, sink);
+    cancel_interactions_locked(session_id, incarnation, &mut state, sink);
 }
 
 fn commit_session_cancel(
@@ -7313,14 +7017,13 @@ fn commit_session_cancel(
         .map_err(runtime_state_error)?;
     // Select and retire this turn's current interactions before completion can
     // admit a new turn in the same incarnation.
-    cancel_interactions_locked(session_id, incarnation, "session_cancelled", state, sink);
+    cancel_interactions_locked(session_id, incarnation, state, sink);
     Ok(())
 }
 
 fn cancel_interactions_locked(
     session_id: &str,
     incarnation: u64,
-    reason: &str,
     state: &mut BridgeState,
     sink: &EventSink,
 ) {
@@ -7357,7 +7060,6 @@ fn cancel_interactions_locked(
             let _ = pending.sender.send(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,
             ));
-            sink.send(json!({ "type": "acp/permission_resolved", "permissionId": id }));
         }
     }
     let elicitation_ids = state
@@ -7379,9 +7081,9 @@ fn cancel_interactions_locked(
             {
                 sink.acp_error(runtime_state_error(error), None, Some("elicitation/cancel"));
             }
-            let response = CreateElicitationResponse::new(ElicitationAction::Cancel);
-            let _ = pending.sender.send(response.clone());
-            sink.send(json!({ "type": "acp/elicitation_resolved", "elicitationId": id, "response": response }));
+            let _ = pending
+                .sender
+                .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     }
     let url_ids = state
@@ -7407,13 +7109,9 @@ fn cancel_interactions_locked(
                 }
             }
         }
-        if state
+        state
             .sessions
-            .take_url_route(&elicitation_id, &registration)
-            .is_some()
-        {
-            sink.send(json!({ "type": "acp/elicitation_aborted", "elicitationId": elicitation_id, "sessionId": session_id, "reason": reason }));
-        }
+            .take_url_route(&elicitation_id, &registration);
     }
     flush_runtime(state, sink);
 }
@@ -8264,6 +7962,54 @@ mod tests {
         }
     }
 
+    /// A turn outcome is the business replacement for the removed
+    /// `acp/prompt_complete` event; the test request helper uses the request
+    /// ID as the client intent ID.
+    fn is_turn_outcome(event: &Value, client_intent_id: &str) -> bool {
+        matches!(
+            event["type"].as_str(),
+            Some("bridge/session_turn_complete" | "bridge/session_turn_failed")
+        ) && event["clientIntentId"] == client_intent_id
+    }
+
+    /// Business evidence that the bridge started (or retried) a history load.
+    fn is_history_load(event: &Value, session_id: &str) -> bool {
+        event["sessionId"] == session_id
+            && ((event["type"] == "bridge/session_delta"
+                && event["change"]["kind"] == "sync_state"
+                && matches!(
+                    event["change"]["phase"].as_str(),
+                    Some("loading" | "retrying")
+                ))
+                || (event["type"] == "bridge/session_view"
+                    && event["view"]["session"]["phase"] == "loading"))
+    }
+
+    async fn session_view(
+        commands: &mpsc::UnboundedSender<BridgeInput>,
+        session_id: &str,
+    ) -> Value {
+        let (response, result) = oneshot::channel();
+        commands
+            .send(BridgeInput::SessionViewRequest {
+                expected_owner: None,
+                session_id: session_id.to_string(),
+                cwd: None,
+                response,
+            })
+            .unwrap();
+        result.await.unwrap().unwrap()
+    }
+
+    /// The business publication of an accepted session update: a turn delta
+    /// while a turn runs, otherwise a refreshed session view.
+    fn is_relayed_update(event: &Value, session_id: &str) -> bool {
+        event["sessionId"] == session_id
+            && ((event["type"] == "bridge/session_delta"
+                && event["change"]["kind"] == "turn_update")
+                || event["type"] == "bridge/session_view")
+    }
+
     fn session_info(session_id: &str, cwd: &str) -> SessionInfo {
         serde_json::from_value(json!({
             "sessionId": session_id,
@@ -8345,10 +8091,11 @@ mod tests {
                 if matches!(event["type"].as_str(), Some("acp/error" | "bridge/error")) {
                     errors.push(event.clone());
                 }
-                if event["type"] == "acp/session_update"
-                    && event["notification"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                if event["type"] == "bridge/session_delta"
+                    && event["change"]["kind"] == "turn_update"
+                    && event["change"]["update"]["sessionUpdate"] == "agent_message_chunk"
                 {
-                    text.push_str(event["notification"]["update"]["content"]["text"].as_str().unwrap());
+                    text.push_str(event["change"]["update"]["content"]["text"].as_str().unwrap());
                 }
                 if matches!(event["type"].as_str(), Some("bridge/session_turn_complete" | "bridge/session_turn_failed")) {
                     outcomes.push(event.clone());
@@ -8778,7 +8525,7 @@ mod tests {
         })
         .await
         .expect("bridge did not initialize");
-        request(
+        let created = request(
             &commands,
             json!({
                 "type": "session/new",
@@ -8788,21 +8535,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .expect("bridge stopped before creating a session");
-                let event: Value = serde_json::from_str(&event).unwrap();
-                if event["type"] == "acp/session_created" {
-                    assert_eq!(event["response"]["sessionId"], "test-session");
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("session/new did not complete");
+        assert_eq!(created["sessionId"], "test-session");
 
         let first = request(
             &commands,
@@ -8815,20 +8548,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = events
-                    .recv()
-                    .await
-                    .expect("bridge stopped before first prompt started");
-                let event: Value = serde_json::from_str(&event).unwrap();
-                if event["type"] == "acp/prompt_started" && event["requestId"] == "first" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("first prompt did not start");
+        assert_eq!(first["disposition"], "accepted");
 
         let duplicate = request(
             &commands,
@@ -8884,11 +8604,14 @@ mod tests {
                     "requestId": event.get("requestId"),
                     "event": event.get("event"),
                 }));
-                assert_ne!(
-                    event["type"], "acp/prompt_started",
-                    "duplicate, conflicting or concurrent prompt reached the Agent"
-                );
-                if event["type"] == "acp/prompt_complete" && event["requestId"] == "first" {
+                if event["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("bridge/session_turn_"))
+                {
+                    assert_eq!(
+                        event["clientIntentId"], "first",
+                        "duplicate, conflicting or concurrent prompt reached the Agent"
+                    );
                     break;
                 }
             }
@@ -8930,8 +8653,7 @@ mod tests {
                         .expect("bridge stopped before follow-up"),
                 )
                 .unwrap();
-                if event["type"] == "acp/prompt_complete" && event["requestId"] == "after-reconcile"
-                {
+                if is_turn_outcome(&event, "after-reconcile") {
                     break;
                 }
             }
@@ -9065,13 +8787,13 @@ mod tests {
         let successor = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
-                if event["type"] == "acp/prompt_started" && event["requestId"] == "turn" {
+                if event["type"] == "bridge/session_view"
+                    && event["sessionId"] == "test-session"
+                    && event["view"]["session"]["phase"] == "running"
+                {
                     prompt_starts += 1;
                 }
-                if event["type"] == "bridge/session_sync"
-                    && event["sessionId"] == "test-session"
-                    && matches!(event["phase"].as_str(), Some("loading" | "retrying"))
-                {
+                if is_history_load(&event, "test-session") {
                     saw_post_turn_load = true;
                 }
                 if event["type"] == "bridge/session_view"
@@ -9191,12 +8913,10 @@ mod tests {
 
         let completed = loop {
             let event = next_event(&mut events).await;
-            if event["type"] == "bridge/session_sync" {
-                assert_ne!(
-                    event["phase"], "loading",
-                    "an Agent without loadSession must never receive session/load"
-                );
-            }
+            assert!(
+                !is_history_load(&event, "test-session"),
+                "an Agent without loadSession must never receive session/load"
+            );
             if event["type"] == "bridge/session_view"
                 && event["sessionId"] == "test-session"
                 && event["view"]["session"]["phase"] == "ready"
@@ -9344,10 +9064,12 @@ mod tests {
         .await
         .unwrap();
         loop {
-            if next_event(&mut events).await["type"] == "acp/session_created" {
+            let event = next_event(&mut events).await;
+            if event["type"] == "bridge/session_view" && event["sessionId"] == "test-session" {
                 break;
             }
         }
+        let before = session_view(&commands, "test-session").await;
 
         let rejection = request(
             &commands,
@@ -9360,13 +9082,12 @@ mod tests {
         .await
         .unwrap_err();
         assert!(rejection.contains("Synthetic load failure"), "{rejection}");
-        while let Ok(raw) = events.try_recv() {
-            let event: Value = serde_json::from_str(&raw).unwrap();
-            assert_ne!(
-                event["type"], "acp/session_attached",
-                "a rejected load must not commit replacement state"
-            );
-        }
+        let after = session_view(&commands, "test-session").await;
+        assert_eq!(
+            after["session"]["historyRevision"], before["session"]["historyRevision"],
+            "a rejected load must not commit replacement state"
+        );
+        assert_eq!(after["baseline"], before["baseline"]);
 
         request(
             &commands,
@@ -9381,8 +9102,7 @@ mod tests {
         .unwrap();
         loop {
             let event = next_event(&mut events).await;
-            if event["type"] == "acp/prompt_complete" && event["requestId"] == "after-rejected-load"
-            {
+            if is_turn_outcome(&event, "after-rejected-load") {
                 break;
             }
         }
@@ -9433,27 +9153,9 @@ mod tests {
 
     #[test]
     fn failed_interaction_delivery_is_never_reported_as_resolved() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
-        let success = json!({
-            "type": "acp/elicitation_resolved",
-            "elicitationId": "elicitation",
-            "requestId": "response",
-        });
-
-        let error =
-            relay_interaction_resolution(&sink, success.clone(), false, "elicitation").unwrap_err();
+        let error = ensure_interaction_delivered(false, "elicitation").unwrap_err();
         assert_eq!(error.code, ErrorCode::RequestCancelled);
-        assert!(
-            rx.try_recv().is_err(),
-            "an Agent-side cancellation must not look like a successful user response"
-        );
-
-        relay_interaction_resolution(&sink, success.clone(), true, "elicitation").unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&rx.try_recv().unwrap()).unwrap(),
-            success
-        );
+        ensure_interaction_delivered(true, "elicitation").unwrap();
     }
 
     #[tokio::test]
@@ -9522,12 +9224,11 @@ mod tests {
             state.published_runtime_seq = state.sessions.seq();
         }
         handle_session_update(notification, &state, &sink, None).await;
-        let relayed = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-            .find(|event| event["type"] == "acp/session_update")
-            .unwrap();
-        assert_eq!(relayed["type"], "acp/session_update");
-        assert_eq!(relayed["notification"]["sessionId"], "new-session");
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+                .any(|event| is_relayed_update(&event, "new-session"))
+        );
     }
 
     #[tokio::test]
@@ -9549,9 +9250,12 @@ mod tests {
         }))
         .unwrap();
         handle_session_update(invalid, &state, &sink, None).await;
-        let error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(error["type"], "bridge/error");
-        assert!(error["data"].as_str().unwrap().contains("image/* family"));
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+                .all(|event| !is_relayed_update(&event, "session")),
+            "an invalid update must not be published"
+        );
         assert_eq!(
             session_validation(&*state.lock().await, "session")
                 .unwrap()
@@ -9569,11 +9273,11 @@ mod tests {
         }))
         .unwrap();
         handle_session_update(recovery, &state, &sink, None).await;
-        let event = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-            .find(|event| event["type"] == "acp/session_update")
-            .unwrap();
-        assert_eq!(event["type"], "acp/session_update");
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+                .any(|event| is_relayed_update(&event, "session"))
+        );
         assert_eq!(
             session_validation(&*state.lock().await, "session")
                 .unwrap()
@@ -9652,9 +9356,7 @@ mod tests {
             vec![
                 json!("bridge/session_delta"),
                 json!("bridge/internal_runtime_delta"),
-                json!("acp/session_update"),
                 json!("bridge/internal_runtime_delta"),
-                json!("acp/session_update"),
             ],
         );
     }
@@ -9729,11 +9431,6 @@ mod tests {
                 .iter()
                 .any(|event| event["type"] == "bridge/session_view")
         );
-        assert!(
-            events
-                .iter()
-                .any(|event| event["type"] == "acp/session_update")
-        );
     }
 
     #[tokio::test]
@@ -9781,12 +9478,8 @@ mod tests {
             assert_eq!(
                 events
                     .iter()
-                    .any(|event| event["type"] == "acp/session_update"),
+                    .any(|event| is_relayed_update(event, "session")),
                 valid
-            );
-            assert_eq!(
-                events.iter().any(|event| event["type"] == "bridge/error"),
-                !valid
             );
         }
     }
@@ -10346,11 +10039,12 @@ mod tests {
                 .contains_key("pre-response-terminal")
         );
         drop(state);
-        let event = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-            .find(|event| event["type"] == "acp/session_update")
-            .expect("legacy update was not relayed");
-        assert_eq!(event["notification"]["sessionId"], "session");
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+                .all(|event| event["type"] != "bridge/session_delta"),
+            "attachment replay stays staged until the load commits"
+        );
     }
 
     #[tokio::test]
@@ -10367,12 +10061,6 @@ mod tests {
                 .sessions
                 .begin_load("session", incarnation, "test-attachment")
                 .unwrap();
-            state
-                .sessions
-                .resources_mut("session", incarnation)
-                .unwrap()
-                .attachment
-                .subscriber = Some(42);
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
@@ -10401,24 +10089,13 @@ mod tests {
             incarnation
         );
         drop(state);
-        let envelopes = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-            .collect::<Vec<_>>();
-        let envelope = envelopes
-            .iter()
-            .find(|event| event["type"] == "bridge/internal_direct")
-            .expect("invalid reload update error was not routed to its requester");
-        assert_eq!(envelope["type"], "bridge/internal_direct");
-        assert_eq!(envelope["subscriberId"], 42);
-        assert_eq!(envelope["event"]["type"], "bridge/error");
         assert!(
-            envelopes.iter().all(|event| {
-                !matches!(
-                    event["type"].as_str(),
-                    Some("bridge/error" | "acp/session_update")
-                )
-            }),
-            "invalid reload update escaped the private delivery path"
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
+                .all(|event| {
+                    event["type"] != "bridge/error" && !is_relayed_update(&event, "session")
+                }),
+            "invalid reload input is reported through the load outcome, not published"
         );
     }
 
@@ -10440,8 +10117,10 @@ mod tests {
         }))
         .unwrap();
         handle_session_update(invalid, &state, &sink, None).await;
-        let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(event["type"], "bridge/error");
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid early replay is reported by the creation outcome, not published"
+        );
 
         let mut state = state.lock().await;
         let response = json!({
@@ -10480,8 +10159,8 @@ mod tests {
         sink.acp_error(
             Error::internal_error()
                 .data(json!({ "payload": "x".repeat(FORMER_BRIDGE_ERROR_DATA_BYTES + 1) })),
-            Some("request"),
-            Some("session/prompt"),
+            None,
+            None,
         );
         let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(event["type"], "bridge/error");
@@ -10490,7 +10169,15 @@ mod tests {
             event["data"]["payload"].as_str().unwrap().len(),
             FORMER_BRIDGE_ERROR_DATA_BYTES + 1
         );
-        assert_eq!(event["requestId"], "request");
+
+        // Request- and operation-scoped failures answer their own caller and
+        // are only logged, so they never reach the connection error stream.
+        sink.acp_error(
+            Error::internal_error(),
+            Some("request"),
+            Some("session/prompt"),
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -11685,16 +11372,13 @@ mod tests {
                 registration_id: registration.registration_id.clone(),
             };
             state.sessions.effects.push_back(abort(&old));
-            let (tx, mut events) = mpsc::unbounded_channel();
-            let sink = EventSink { tx: tx.into() };
-            assert!(drain_runtime_effects(&mut state, &sink).is_empty());
+            assert!(drain_runtime_effects(&mut state).is_empty());
             assert_eq!(
                 state.sessions.url_owners.get("reusable-url"),
                 Some(&current)
             );
-            assert!(events.try_recv().is_err());
             // Once this precise registration retires, its duplicated local effects
-            // remove the lightweight route and publish only one terminal event.
+            // remove the lightweight route exactly once.
             state
                 .sessions
                 .settle_url_registration(
@@ -11709,11 +11393,8 @@ mod tests {
                 .sessions
                 .effects
                 .extend([abort(&current), abort(&current)]);
-            assert!(drain_runtime_effects(&mut state, &sink).is_empty());
+            assert!(drain_runtime_effects(&mut state).is_empty());
             assert!(!state.sessions.url_owners.contains_key("reusable-url"));
-            let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
-            assert_eq!(event["type"], "acp/elicitation_aborted");
-            assert!(events.try_recv().is_err());
         }
     }
 
@@ -11996,7 +11677,7 @@ mod tests {
         let (tx, mut events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         apply_runtime_effects(&state, &sink, None).await;
-        cancel_interactions("session", old_incarnation, "stale cleanup", &state, &sink).await;
+        cancel_interactions("session", old_incarnation, &state, &sink).await;
         assert!(matches!(
             new_permission.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -12658,7 +12339,7 @@ mod tests {
             .state("session")
             .unwrap()
             .incarnation;
-        cancel_interactions("session", incarnation, "session_cancelled", &state, &sink).await;
+        cancel_interactions("session", incarnation, &state, &sink).await;
 
         assert!(matches!(
             permission_receiver.await.unwrap().outcome,
@@ -12703,18 +12384,10 @@ mod tests {
                     .is_some_and(|kind| kind.starts_with("bridge/internal_"))
             })
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), 3);
-        assert!(events.iter().any(|event| {
-            event["type"] == "acp/permission_resolved" && event["permissionId"] == "permission"
-        }));
-        assert!(events.iter().any(|event| {
-            event["type"] == "acp/elicitation_resolved"
-                && event["elicitationId"] == "session-elicitation"
-                && event["response"]["action"] == "cancel"
-        }));
-        assert!(events.iter().any(|event| {
-            event["type"] == "acp/elicitation_aborted" && event["reason"] == "session_cancelled"
-        }));
+        assert!(
+            events.is_empty(),
+            "cancellation is reflected in canonical state, not legacy events: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -13065,9 +12738,6 @@ mod catalog_command_tests {
                 let event: Value = serde_json::from_str(&raw).unwrap();
                 if event["type"] == "bridge/catalog_changed" {
                     changes.push(event);
-                } else if event["type"] == "acp/sessions_listed" {
-                    assert_ne!(event["requestId"], "stale-snapshot");
-                    assert_ne!(event["requestId"], "old-page");
                 }
             }
             assert_eq!(

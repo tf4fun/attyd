@@ -351,15 +351,6 @@ fn terminal_auth_succeeded(event: &str) -> bool {
         })
 }
 
-fn is_internal_direct_event(event: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(event)
-        .ok()
-        .and_then(|value| value.get("type").cloned())
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-        == Some("bridge/internal_direct")
-}
-
 fn is_internal_runtime_event(event: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(event)
         .ok()
@@ -1446,11 +1437,6 @@ impl BridgeHub {
             if let Some(input) = snapshot_request {
                 let _ = input.send(bridge::BridgeInput::RuntimeSnapshotRequest);
             }
-            return;
-        }
-        if is_internal_direct_event(&event) {
-            // Directed events targeted the removed aggregate stream; no
-            // business subscriber can receive them.
             return;
         }
         let restart = terminal_auth_succeeded(&event);
@@ -4437,45 +4423,6 @@ mod tests {
         assert!(!terminal_auth_succeeded(
             r#"{"type":"acp/authenticated","status":"succeeded"}"#
         ));
-    }
-
-    #[tokio::test]
-    async fn directed_events_reach_no_business_subscriber() {
-        let hub = test_hub();
-        let (input, _commands) = mpsc::unbounded_channel();
-        {
-            let mut state = hub.state.lock().await;
-            state.generation = 1;
-            state.input = Some(input);
-        }
-        let mut global = hub.subscribe_global().await.unwrap();
-        let mut session = passive_session_listener(&hub, "saved").await;
-
-        for event in [
-            json!({ "type": "bridge/error", "message": "collision" }),
-            json!({
-                "type": "bridge/session_retired",
-                "bridgeEpoch": "epoch",
-                "sessionId": "saved",
-                "sessionIncarnation": 1,
-                "reason": "closed",
-            }),
-        ] {
-            hub.publish(
-                1,
-                json!({
-                    "type": "bridge/internal_direct",
-                    "subscriberId": global.id,
-                    "event": event,
-                })
-                .to_string(),
-            )
-            .await;
-        }
-
-        assert!(global.events.try_recv().is_err());
-        assert!(session.try_recv().is_err());
-        assert_eq!(hub.state.lock().await.bootstrap.error, None);
     }
 
     async fn capability_fixture(flags: &[&str]) -> (Arc<BridgeHub>, BridgeSubscription) {

@@ -48,7 +48,9 @@ async fn assert_no_resurrection_after_retirement(
         agent.recorded_events()[event_cut..].iter().all(|event| {
             event["sessionId"] != TARGET
                 || !(event["type"] == "bridge/session_view"
-                    || (event["type"] == "bridge/session_sync" && event["phase"] == "ready"))
+                    || (event["type"] == "bridge/session_delta"
+                        && event["change"]["kind"] == "sync_state"
+                        && event["change"]["phase"] == "ready"))
         }),
         "retired workflow published another target view or ready state"
     );
@@ -94,11 +96,6 @@ async fn manual_retirement_during_backoff(delete: bool, close_capability: bool) 
             "deleted"
         }
     );
-    if delete {
-        agent.event("acp/session_deleted", TARGET).await;
-    } else {
-        agent.event("acp/session_closed", TARGET).await;
-    }
     // Delete with close support has two existing terminal notifications: the
     // confirmed close, then the confirmed deletion. Neither is a retry.
     let expected_reasons = if delete && close_capability {
@@ -382,9 +379,6 @@ async fn connection_stop_during_history(backoff: bool) {
         agent.requests.next().await.is_none(),
         "a stopped connection dispatched another request"
     );
-    assert!(agent.recorded_events().iter().all(|event| {
-        !(event["type"] == "acp/session_forked" && event["response"]["sessionId"] == TARGET)
-    }));
 }
 
 #[tokio::test(start_paused = true)]

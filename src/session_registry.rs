@@ -381,38 +381,10 @@ impl SessionRegistry {
             return;
         }
         let owner = SessionResourceOwner::new(self.epoch.clone(), session_id, incarnation);
-        let permission_ids = self
-            .permission_owners
-            .iter()
-            .filter(|(_, route)| *route == &owner)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let elicitation_ids = self
-            .elicitation_owners
-            .iter()
-            .filter(|(_, route)| *route == &owner)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let url_ids = self
-            .url_owners
-            .iter()
-            .filter(|(_, route)| route.owner.as_ref() == Some(&owner))
-            .map(|(id, route)| (id.clone(), route.registration_id.clone()))
-            .collect::<Vec<_>>();
         self.permission_owners.retain(|_, route| route != &owner);
         self.elicitation_owners.retain(|_, route| route != &owner);
         self.url_owners
             .retain(|_, route| route.owner.as_ref() != Some(&owner));
-        if !permission_ids.is_empty() || !elicitation_ids.is_empty() || !url_ids.is_empty() {
-            self.effects.push_back(RuntimeEffect::ResourcesCancelled {
-                session_id: session_id.to_string(),
-                incarnation,
-                permission_ids,
-                elicitation_ids,
-                url_ids,
-                reason: reason.to_string(),
-            });
-        }
         self.sessions
             .get_mut(session_id)
             .expect("validated resource owner")
@@ -662,7 +634,6 @@ mod tests {
             },
             previous: Some(SessionUpdateSemanticState::default()),
         });
-        resources.attachment.subscriber = Some(7);
         resources
             .attachment
             .control_candidate
@@ -753,7 +724,6 @@ mod tests {
                 .allocation,
             &waiting.validation
         ));
-        assert_eq!(resources.attachment.subscriber, Some(7));
         assert_eq!(resources.attachment.control_candidate.updates.len(), 1);
         assert_eq!(resources.attachment.control_candidate.bytes, 12);
         assert_eq!(

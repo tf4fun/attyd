@@ -1,8 +1,6 @@
 use super::*;
 
-async fn creation_replay_after_retirement(
-    late_retired_update: bool,
-) -> (Value, Value, Value, Value) {
+async fn creation_replay_after_retirement(late_retired_update: bool) -> (Value, Value, Value) {
     let mut agent = TestAgent::start(0, json!({})).await;
     let first = agent.submit(json!({
         "type": "session/new", "requestId": "create-old", "cwd": "/repo",
@@ -59,33 +57,33 @@ async fn creation_replay_after_retirement(
     }));
     agent.send(Value::Array(batch)).await;
     let created = TestAgent::result(creating).await.unwrap();
-    let event = agent.event("acp/session_created", "new").await;
     agent.stop().await;
-    (created, event, controls, early)
+    let welcome = early[0]["update"].clone();
+    (created, controls, json!([welcome]))
 }
 
 #[tokio::test(start_paused = true)]
 async fn idle_retirement_late_update_preserves_other_sessions_creation_replay() {
-    let (created, event, controls, early) = creation_replay_after_retirement(true).await;
+    let (created, controls, replayed) = creation_replay_after_retirement(true).await;
     assert_eq!(
         (
             created["view"]["live"]["controlState"]["available_commands_update"].clone(),
-            event["earlyUpdates"].clone(),
+            created["view"]["baseline"]["updates"].clone(),
         ),
-        (controls, early),
+        (controls, replayed),
         "retired-session updates must not occupy another session's creation replay slot"
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn idle_retirement_preserves_new_session_early_replay_without_late_update() {
-    let (created, event, controls, early) = creation_replay_after_retirement(false).await;
+    let (created, controls, replayed) = creation_replay_after_retirement(false).await;
     assert_eq!(
         (
             created["view"]["live"]["controlState"]["available_commands_update"].clone(),
-            event["earlyUpdates"].clone(),
+            created["view"]["baseline"]["updates"].clone(),
         ),
-        (controls, early),
+        (controls, replayed),
         "new-session replay must preserve control state and message identity, text, and order"
     );
 }

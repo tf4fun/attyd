@@ -183,8 +183,8 @@ async fn history_workflow_dropped_business_reply_does_not_cancel_or_leak_sync() 
     assert_eq!(retry["method"], "session/load");
     assert_eq!(retry["params"]["sessionId"], TARGET);
     agent.reply(&retry, json!({})).await;
-    let forked = agent.event("acp/session_forked", TARGET).await;
-    assert_eq!(forked["response"]["sessionId"], TARGET);
+    let forked = agent.event("bridge/session_view", TARGET).await;
+    assert_eq!(forked["view"]["session"]["sessionId"], TARGET);
     assert_full_idle_interval(&mut agent, true).await;
     agent.stop().await;
 }
