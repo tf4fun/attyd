@@ -183,12 +183,6 @@ export type HistoryStatus =
   | {
       state: "available";
       sessionId: string;
-    }
-  | {
-      state: "unavailable";
-      sessionId?: string;
-      reason: "load_not_supported";
-      message: string;
     };
 
 export interface SessionTransition {
@@ -202,7 +196,6 @@ export interface SessionTransition {
 export interface PendingSessionDeletion {
   requestId: string;
   sessionId: string;
-  stage: "closing" | "deleting";
 }
 
 export interface PendingSessionControl {
@@ -247,6 +240,12 @@ export interface AuthTerminalState {
 }
 
 export interface AppState {
+  /**
+   * The authoritative view of the active session, as last read or advanced by
+   * a session event. Session presentation below is projected from it by this
+   * reducer; nothing else keeps a copy.
+   */
+  sessionView?: BridgeSessionView;
   sessionOwner?: SessionOwner;
   phase: ConnectionPhase;
   socketOpen: boolean;
@@ -306,23 +305,26 @@ export type AppAction =
   | {
       type: "bridge/turn_complete";
       event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_complete" }>;
+      /** The view advanced to this outcome, when the event applies to it. */
+      view?: BridgeSessionView;
     }
   | {
       type: "bridge/turn_failed";
       event: Extract<SessionBusinessEvent, { type: "bridge/session_turn_failed" }>;
+      view?: BridgeSessionView;
     }
   | { type: "runtime/loaded"; runtime: RuntimeView }
   | { type: "global/event"; event: GlobalBusinessEvent }
   | { type: "request/failed"; error: BridgeError }
   | { type: "sessions/listed"; cursor?: string; response: SessionListResult }
-  | { type: "session/turn_update"; notification: SessionNotification }
-  | { type: "session/terminal_update"; terminal: TerminalSnapshot }
+  | { type: "session/turn_update"; notification: SessionNotification; view?: BridgeSessionView }
+  | { type: "session/terminal_update"; terminal: TerminalSnapshot; view?: BridgeSessionView }
+  /**
+   * Record the authoritative view without re-projecting it: either the
+   * projection already shows it, or a hydrate that rebuilds it follows.
+   */
+  | { type: "session/view_synced"; view: BridgeSessionView | undefined }
   | { type: "client/error"; message: string }
-  | {
-      type: "history/unavailable";
-      sessionId?: string;
-      reason: Extract<HistoryStatus, { state: "unavailable" }>["reason"];
-    }
   | { type: "permission/respond_start"; permissionId: string; requestId: string }
   | { type: "elicitation/respond_start"; elicitationId: string; requestId: string }
   | {
@@ -347,19 +349,7 @@ export type AppAction =
       cwd?: string;
       title?: string | null;
     }
-  | {
-      type: "session/delete_start";
-      requestId: string;
-      sessionId: string;
-      stage: PendingSessionDeletion["stage"];
-    }
-  | {
-      type: "session/delete_continue";
-      closeRequestId: string;
-      requestId: string;
-      sessionId: string;
-    }
-  | { type: "session/delete_cancel"; requestId: string; sessionId: string }
+  | { type: "session/delete_start"; requestId: string; sessionId: string }
   | {
       type: "session/control_start";
       requestId: string;
@@ -367,8 +357,7 @@ export type AppAction =
       kind: PendingSessionControl["kind"];
     }
   | { type: "session/reset" }
-  | { type: "session/deselect" }
-  | { type: "session/activate_cached"; sessionId: string };
+  | { type: "session/deselect" };
 
 export const initialState: AppState = {
   phase: "starting",
@@ -395,21 +384,16 @@ export const initialState: AppState = {
   running: false,
 };
 
-function historyUnavailableMessage(
-  reason: Extract<HistoryStatus, { state: "unavailable" }>["reason"],
-): string {
-  switch (reason) {
-    case "load_not_supported":
-      return "History unavailable: this Agent does not support loading saved session history.";
-    default:
-      return assertNever(reason, "history unavailable reason");
-  }
-}
-
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "bridge/connection_replaced":
-      return { ...terminateBridgeState(state, "stopped", false), sessionSyncPhase: "loading" };
+      return {
+        ...terminateBridgeState(state, "stopped", false),
+        sessionView: undefined,
+        sessionSyncPhase: "loading",
+      };
+    case "session/view_synced":
+      return state.sessionView === action.view ? state : { ...state, sessionView: action.view };
     case "session/retired":
       return removeAuthoritativeSessionRuntime(state, action.owner.sessionId, action.deleted, action.owner);
     case "session/management_complete": {
@@ -429,13 +413,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case "socket/closed":
       return terminateBridgeState(state, "stopped", false);
     case "bridge/session_live_update":
-      return applySessionLiveView(state, action.view, action.settledControl);
+      return { ...applySessionLiveView(state, action.view, action.settledControl), sessionView: action.view };
     case "session/control_settled":
       return state.pendingSessionControl?.requestId === action.requestId
         ? { ...state, pendingSessionControl: undefined }
         : state;
     case "bridge/session_hydrate": {
-      const next = hydrateBridgeSession(state, action.view);
+      const next: AppState = { ...hydrateBridgeSession(state, action.view), sessionView: action.view };
       const failure = action.failedPrompt;
       if (failure == null || action.view.phase !== "ready" || action.view.activeTurn != null) return next;
       const snapshot = sameSessionOwner(state.sessionOwner, action.view)
@@ -471,9 +455,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
     case "bridge/turn_complete":
-      return applyBridgeTurnComplete(state, action.event);
+      return withSessionView(applyBridgeTurnComplete(state, action.event), action.view);
     case "bridge/turn_failed":
-      return applyBridgeTurnFailure(state, action.event);
+      return withSessionView(applyBridgeTurnFailure(state, action.event), action.view);
     case "runtime/loaded":
       return applyRuntime(state, action.runtime);
     case "global/event":
@@ -483,16 +467,16 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case "sessions/listed":
       return applySessionsListed(state, action.cursor, action.response);
     case "session/turn_update":
-      return isCurrentSession(state, action.notification.sessionId)
+      return withSessionView(isCurrentSession(state, action.notification.sessionId)
         ? reduceSessionUpdate(state, action.notification)
         : updateCachedSession(
             state,
             action.notification.sessionId,
             (cached) => reduceSessionUpdate(cached, action.notification),
             action,
-          );
+          ), action.view);
     case "session/terminal_update":
-      return isCurrentSession(state, action.terminal.sessionId)
+      return withSessionView(isCurrentSession(state, action.terminal.sessionId)
         ? { ...state, terminalSnapshots: upsertTerminalSnapshot(state.terminalSnapshots, action.terminal) }
         : updateCachedSession(
             state,
@@ -502,7 +486,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
               terminalSnapshots: upsertTerminalSnapshot(cached.terminalSnapshots, action.terminal),
             }),
             action,
-          );
+          ), action.view);
     case "client/error":
       return {
         ...state,
@@ -511,30 +495,6 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           { id: randomId(), type: "error", message: action.message },
         ],
       };
-    case "history/unavailable": {
-      const message = historyUnavailableMessage(action.reason);
-      const status: HistoryStatus = {
-        state: "unavailable",
-        sessionId: action.sessionId,
-        reason: action.reason,
-        message,
-      };
-      return {
-        ...state,
-        historyStatus: status,
-        timeline: [
-          ...state.timeline.filter((item) =>
-            item.type !== "error" || item.message !== message
-          ),
-          {
-            id: randomId(),
-            type: "error",
-            message,
-            operation: "session/load",
-          },
-        ],
-      };
-    }
     case "permission/respond_start":
       return {
         ...state,
@@ -640,38 +600,10 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           ...state,
           pendingSessionDeletions: [
             ...state.pendingSessionDeletions,
-            {
-              requestId: action.requestId,
-              sessionId: action.sessionId,
-              stage: action.stage,
-            },
+            { requestId: action.requestId, sessionId: action.sessionId },
           ],
         };
       }
-    case "session/delete_continue":
-      if (!state.pendingSessionDeletions.some(
-        ({ requestId, sessionId, stage }) =>
-          requestId === action.closeRequestId &&
-          sessionId === action.sessionId &&
-          stage === "closing",
-      )) return state;
-      return {
-        ...state,
-        pendingSessionDeletions: state.pendingSessionDeletions.map((pending) =>
-          pending.requestId === action.closeRequestId &&
-            pending.sessionId === action.sessionId
-            ? { ...pending, requestId: action.requestId, stage: "deleting" }
-            : pending
-        ),
-      };
-    case "session/delete_cancel":
-      return {
-        ...state,
-        pendingSessionDeletions: state.pendingSessionDeletions.filter(
-          ({ requestId, sessionId }) =>
-            requestId !== action.requestId || sessionId !== action.sessionId,
-        ),
-      };
     case "session/control_start":
       if (
         state.pendingSessionControl != null ||
@@ -688,12 +620,14 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         },
       };
     case "session/reset":
-      return resetActiveSession(state);
+      return { ...resetActiveSession(state), sessionView: undefined };
     case "session/deselect":
-      return resetActiveSession(cacheCurrentSession(state));
-    case "session/activate_cached":
-      return activateCachedSession(state, action.sessionId);
+      return { ...resetActiveSession(cacheCurrentSession(state)), sessionView: undefined };
   }
+}
+
+function withSessionView(state: AppState, view: BridgeSessionView | undefined): AppState {
+  return view == null || state.sessionView === view ? state : { ...state, sessionView: view };
 }
 
 function applyRuntime(state: AppState, runtime: RuntimeView): AppState {
@@ -2207,37 +2141,6 @@ function cacheCurrentSession(state: AppState): AppState {
     ...state,
     cachedSessions,
     sessions: mergeSessions(state.sessions, [openSession]),
-  };
-}
-
-function activateCachedSession(state: AppState, sessionId: string): AppState {
-  if (
-    state.session?.sessionId === sessionId ||
-    state.sessionTransition != null ||
-    state.pendingSessionControl != null
-  ) return state;
-  const snapshot = state.cachedSessions.get(sessionId);
-  if (!snapshot?.session) return state;
-  const listed = state.sessions.find((session) => session.sessionId === sessionId);
-
-  const withCurrentCached = cacheCurrentSession(state);
-  const cachedSessions = new Map(withCurrentCached.cachedSessions);
-  cachedSessions.delete(sessionId);
-  return {
-    ...withCurrentCached,
-    ...snapshot,
-    cachedSessions,
-    attentionSessionIds: state.attentionSessionIds.filter(
-      (candidate) => candidate !== sessionId,
-    ),
-    pendingSessionId: undefined,
-    sessionTransition: undefined,
-    pendingSessionControl: undefined,
-    title: snapshot.title ?? listed?.title ?? undefined,
-    elicitations: [
-      ...snapshot.elicitations,
-      ...requestScopedElicitations(state.elicitations),
-    ],
   };
 }
 

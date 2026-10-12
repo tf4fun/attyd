@@ -192,9 +192,6 @@ describe("ACP UI state", () => {
     expect(projects.cachedSessions.get("new-session")).toMatchObject({
       running: true, cwd: "/workspace/project", pendingPrompt: active.pendingPrompt,
     });
-    const restored = appReducer(projects, { type: "session/activate_cached", sessionId: "new-session" });
-    expect(restored.running).toBe(true);
-    expect(restored.pendingPrompt).toEqual(active.pendingPrompt);
   });
 
   it("rebuilds bridge-owned turn outcomes at their persisted turn boundaries", () => {
@@ -1262,7 +1259,6 @@ describe("ACP UI state", () => {
       pendingSessionDeletions: [{
         requestId: "delete",
         sessionId: "saved",
-        stage: "deleting" as const,
       }],
       pendingSessionControl: {
         requestId: "control",
@@ -1374,69 +1370,6 @@ describe("ACP UI state", () => {
       message: "Agent refused the load",
     });
     expect(restored.sessionTransition).toBeUndefined();
-  });
-
-  it("switches back to an already-open thread locally and keeps its background updates", () => {
-    const first = {
-      ...initialState,
-      phase: "ready" as const,
-      session: { sessionId: "first" },
-      cwd: "/workspace/first",
-      title: "First",
-      timeline: [{
-        id: "first-answer",
-        type: "assistant" as const,
-        chunks: [{
-          id: "first-answer-chunk",
-          role: "agent" as const,
-          blocks: [{ type: "text" as const, text: "First answer" }],
-          raw: [],
-        }],
-      }],
-    };
-    let state = appReducer(first, {
-      type: "session/transition_start",
-      kind: "attach",
-      requestId: "load-second",
-      sessionId: "second",
-      cwd: "/workspace/second",
-      title: "Second",
-    });
-    state = appReducer(state, {
-      type: "bridge/session_hydrate",
-      view: sessionView("second", { workspace: { cwd: "/workspace/second", session: {} } }),
-    });
-    state = appReducer(state, ({ type: "session/turn_update", notification: {
-        sessionId: "second",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "second-answer",
-          content: { type: "text", text: "Second answer" },
-        },
-      },
-    }));
-
-    state = appReducer(state, { type: "session/activate_cached", sessionId: "first" });
-    expect(state.session?.sessionId).toBe("first");
-    expect(JSON.stringify(state.timeline)).toContain("First answer");
-    expect(state.cachedSessions.has("second")).toBe(true);
-
-    state = appReducer(state, ({ type: "session/turn_update", notification: {
-        sessionId: "second",
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          messageId: "second-late-answer",
-          content: { type: "text", text: "Late background update" },
-        },
-      },
-    }));
-    expect(state.backgroundEvents).toHaveLength(0);
-
-    state = appReducer(state, { type: "session/activate_cached", sessionId: "second" });
-    expect(state.session?.sessionId).toBe("second");
-    expect(JSON.stringify(state.timeline)).toContain("Second answer");
-    expect(JSON.stringify(state.timeline)).toContain("Late background update");
-    expect(state.cachedSessions.has("first")).toBe(true);
   });
 
   it("commits a loaded session only from its authoritative view", () => {
@@ -1618,26 +1551,6 @@ describe("ACP UI state", () => {
     expect(JSON.stringify(disconnected.timeline)).toContain("Stable current projection");
     expect(JSON.stringify(disconnected.timeline)).not.toContain("Must remain hidden");
     expect(disconnected.sessionTransition).toBeUndefined();
-  });
-
-  it("represents unavailable saved history explicitly in state and the visible timeline", () => {
-    const unavailable = appReducer(initialState, {
-      type: "history/unavailable",
-      sessionId: "saved",
-      reason: "load_not_supported",
-    });
-
-    expect(unavailable.historyStatus).toMatchObject({
-      state: "unavailable",
-      sessionId: "saved",
-      reason: "load_not_supported",
-    });
-    expect(unavailable.timeline).toHaveLength(1);
-    expect(unavailable.timeline[0]).toMatchObject({
-      type: "error",
-      operation: "session/load",
-    });
-    expect(JSON.stringify(unavailable.timeline)).toContain("History unavailable");
   });
 
   it("coalesces text chunks only when they belong to the same message", () => {
@@ -2034,10 +1947,9 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "delete-current",
       sessionId: "saved",
-      stage: "deleting",
     });
     expect(pending.pendingSessionDeletions).toEqual([
-      { requestId: "delete-current", sessionId: "saved", stage: "deleting" },
+      { requestId: "delete-current", sessionId: "saved" },
     ]);
 
     const deletedElsewhere = appReducer(pending, {
@@ -2064,7 +1976,6 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "delete-retry",
       sessionId: "saved",
-      stage: "deleting",
     });
     const deleted = appReducer(retrying, {
       type: "session/management_complete",
@@ -2076,67 +1987,7 @@ describe("ACP UI state", () => {
     expect(deleted.pendingSessionDeletions).toEqual([]);
   });
 
-  it("keeps the current session until authoritative close-before-delete completes", () => {
-    const active = {
-      ...initialState,
-      session: { sessionId: "current" },
-      sessionOwner: owner("current"),
-      title: "Current thread",
-      cwd: "/workspace/current",
-      sessions: [{
-        sessionId: "current",
-        cwd: "/workspace/current",
-        title: "Current thread",
-      }],
-      timeline: [{ id: "answer", type: "agent_message" as const, text: "Kept snapshot" }],
-    };
-    const closing = appReducer(active, {
-      type: "session/delete_start",
-      requestId: "close-current-for-delete",
-      sessionId: "current",
-      stage: "closing",
-    });
-    expect(closing.session).toEqual(active.session);
-    expect(closing.title).toBe(active.title);
-    expect(closing.timeline).toEqual(active.timeline);
-    expect(closing.pendingSessionDeletions).toEqual([{
-      requestId: "close-current-for-delete",
-      sessionId: "current",
-      stage: "closing",
-    }]);
-
-    const closed = appReducer(closing, {
-      type: "session/retired",
-      owner: owner("current"),
-      deleted: false,
-    });
-    expect(closed.cachedSessions.has("current")).toBe(false);
-    expect(closed.backgroundEvents).toEqual([]);
-
-    const deleting = appReducer(closed, {
-      type: "session/delete_continue",
-      closeRequestId: "close-current-for-delete",
-      requestId: "delete-current",
-      sessionId: "current",
-    });
-    expect(deleting.pendingSessionDeletions).toEqual([{
-      requestId: "delete-current",
-      sessionId: "current",
-      stage: "deleting",
-    }]);
-
-    const deleted = appReducer(deleting, {
-      type: "session/management_complete",
-      requestId: "delete-current",
-      sessionId: "current",
-      owner: owner("current"),
-      deleted: true,
-    });
-    expect(deleted.sessions).toEqual([]);
-    expect(deleted.pendingSessionDeletions).toEqual([]);
-  });
-
-  it("keeps the current session selected when delete close fails", () => {
+  it("keeps the current session selected when its deletion fails", () => {
     const active = {
       ...initialState,
       session: { sessionId: "current" },
@@ -2148,7 +1999,6 @@ describe("ACP UI state", () => {
       type: "session/delete_start",
       requestId: "close-current-for-delete",
       sessionId: "current",
-      stage: "closing",
     });
     const failed = appReducer(closing, requestFailed({
       requestId: "close-current-for-delete",
@@ -2162,13 +2012,6 @@ describe("ACP UI state", () => {
       type: "error",
       message: "Synthetic close failure",
     });
-
-    const restored = appReducer(failed, {
-      type: "session/activate_cached",
-      sessionId: "current",
-    });
-    expect(restored.session?.sessionId).toBe("current");
-    expect(restored.timeline).toEqual(failed.timeline);
   });
 
   it("tracks URL consent and completion as separate states", () => {
