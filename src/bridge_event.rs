@@ -241,3 +241,59 @@ pub(crate) fn session_reset_value(session_id: &str, view: &Value) -> Option<Valu
         "syncError": view.pointer("/session/syncError").cloned().unwrap_or(Value::Null),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_queue;
+    use crate::runtime_state::RuntimeState;
+    use crate::test_allocations::measure_allocations;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn runtime_transfer_shares_large_state_without_serializing_it() {
+        const BODY_BYTES: usize = 1024 * 1024;
+        let mut runtime = RuntimeState::new("epoch");
+        let incarnation = runtime
+            .open_new(
+                "epoch",
+                "session",
+                "/workspace",
+                json!({ "sessionId": "session" }),
+            )
+            .unwrap();
+        runtime
+            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .unwrap();
+        runtime
+            .append_runtime_update_for_test(
+                "epoch",
+                "session",
+                incarnation,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "answer",
+                    "content": { "type": "text", "text": "x".repeat(BODY_BYTES) },
+                }),
+            )
+            .unwrap();
+        let snapshot = runtime.snapshot();
+        let (sender, mut receiver) = event_queue::channel(CancellationToken::new());
+
+        let (event, stats) = measure_allocations(|| {
+            sender
+                .send_event(BridgeEvent::RuntimeSnapshot(Box::new(snapshot)))
+                .unwrap();
+            receiver.try_recv().unwrap().into_parts().0
+        });
+
+        let BridgeEvent::RuntimeSnapshot(delivered) = event else {
+            panic!("runtime snapshot changed type in transit");
+        };
+        assert_eq!(delivered.sessions["session"].incarnation, incarnation);
+        assert!(
+            stats.requested_bytes < BODY_BYTES / 16,
+            "handoff allocated like a serialization of the {BODY_BYTES}-byte body: {stats:?}"
+        );
+    }
+}
