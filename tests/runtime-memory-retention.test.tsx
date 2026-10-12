@@ -4,7 +4,7 @@ import type { ContentBlock, SessionUpdate } from "@agentclientprotocol/sdk";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { BridgeSessionView } from "../web/src/lib/business-api";
+import type { BridgeSessionView } from "../shared/business-api";
 import { sessionPath } from "../web/src/lib/session-route";
 import { useAcp } from "../web/src/lib/use-acp";
 

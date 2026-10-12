@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { BridgeSessionView } from "../web/src/lib/business-api";
+import type { BridgeSessionView } from "../shared/business-api";
 import { appReducer, initialState } from "../web/src/lib/state";
 import { releaseSessionViewProcess } from "../web/src/lib/process-retention";
 

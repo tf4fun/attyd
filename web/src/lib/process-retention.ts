@@ -1,5 +1,5 @@
 import type { TerminalSnapshot } from "../../../shared/bridge";
-import { sameSessionOwner, type BridgeSessionView, type CollapsedTurn } from "./business-api";
+import { sameSessionOwner, type BridgeSessionView, type CollapsedTurn } from "../../../shared/business-api";
 import type { DeferredTurnProcess, TimelineItem } from "./state";
 import { splitTurnPresentation } from "./turn-presentation";
 

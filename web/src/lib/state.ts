@@ -32,8 +32,8 @@ import type {
   SessionBusinessEvent,
   SessionOwner,
   SessionSyncPhase,
-} from "./business-api";
-import { sameSessionOwner } from "./business-api";
+} from "../../../shared/business-api";
+import { sameSessionOwner } from "../../../shared/business-api";
 import type { SessionControlKind } from "./session-deltas";
 import { randomId } from "./id";
 import { timelineTurnStarts } from "./timeline-turns";

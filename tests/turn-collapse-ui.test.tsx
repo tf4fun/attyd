@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Conversation } from "../web/src/components/acp/conversation";
 import { appReducer, initialState, type TimelineItem } from "../web/src/lib/state";
-import type { BridgeSessionView } from "../web/src/lib/business-api";
+import type { BridgeSessionView } from "../shared/business-api";
 import { scanThreadSearchDom } from "../web/src/components/acp/thread-search";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

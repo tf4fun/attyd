@@ -1,6 +1,6 @@
 import type { SessionNotification, SessionUpdate } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
-import type { BridgeSessionView } from "../web/src/lib/business-api";
+import type { BridgeSessionView } from "../shared/business-api";
 import { appReducer, initialState, type AppState } from "../web/src/lib/state";
 
 const sessionId = "efficiency-session";

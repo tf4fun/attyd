@@ -4,7 +4,7 @@ import { act, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Conversation } from "../web/src/components/acp/conversation";
-import type { BridgeTurnProcessPage } from "../web/src/lib/business-api";
+import type { BridgeTurnProcessPage } from "../shared/business-api";
 import { COLLAPSED_PROCESS_RETENTION_MS } from "../web/src/lib/process-retention";
 import type { DeferredTurnProcess, TimelineItem } from "../web/src/lib/state";
 

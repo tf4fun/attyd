@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import type { BridgeSessionView, RuntimeView, SessionListResult } from "../web/src/lib/business-api.js";
+import type { BridgeSessionView, RuntimeView, SessionListResult } from "../shared/business-api.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
 const cwd = process.cwd();

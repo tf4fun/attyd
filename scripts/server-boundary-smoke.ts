@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { startRustTestServer } from "./rust-test-server.js";
-import type { BridgeSessionView, CreatedSessionResult } from "../web/src/lib/business-api.js";
+import type { BridgeSessionView, CreatedSessionResult } from "../shared/business-api.js";
 
 // Real HTTP and process-lifecycle checks; no model, account, or user workspace.
 const cwd = process.cwd();

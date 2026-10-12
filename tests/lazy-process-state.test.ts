@@ -1,6 +1,6 @@
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
-import type { BridgeSessionView, BridgeTurnProcessPage } from "../web/src/lib/business-api";
+import type { BridgeSessionView, BridgeTurnProcessPage } from "../shared/business-api";
 import { appReducer, initialState, processPageTimeline } from "../web/src/lib/state";
 import { collectTurnReviewChanges } from "../web/src/lib/review-changes";
 import { splitTurnPresentation } from "../web/src/lib/turn-presentation";
