@@ -181,6 +181,65 @@ async fn stream(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn production_global_read_preserves_an_ended_generation() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use clap::Parser;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing_agent = directory.path().join("agent-that-does-not-exist");
+        let options = crate::options::Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            directory.path().to_str().unwrap(),
+            "--",
+            missing_agent.to_str().unwrap(),
+        ])
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        hub.ensure_runtime().await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while hub.state.lock().await.input.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the unavailable Agent must finish its generation");
+        let (generation, final_source) = {
+            let state = hub.state.lock().await;
+            (state.generation, state.replication.clone().unwrap())
+        };
+        let final_snapshot = final_source.global().await.unwrap();
+        assert_eq!(
+            final_snapshot.state.agent.phase,
+            crate::protocol::AgentPhase::Error
+        );
+
+        let response = router(V2State::hub(hub.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v2/global")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let after_generation = hub.state.lock().await.generation;
+        hub.shutdown().await;
+
+        assert_eq!(
+            after_generation, generation,
+            "reading final global must not restart the Agent: status={status}, body={document}"
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(document, serde_json::to_value(final_snapshot).unwrap());
+    }
+
     #[test]
     fn stream_scopes_name_complete_owners_once() {
         let scopes = stream_scopes(Some(

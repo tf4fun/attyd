@@ -168,6 +168,53 @@ async fn sse_resume_returns_the_retired_owner_without_fresh_open() {
     peer.stop().await;
 }
 
+/// Direct delete has no successful close from which to inherit a retirement
+/// reason. Its first End and the retained owner record must both say deleted.
+#[tokio::test]
+async fn direct_delete_ends_existing_and_new_owner_streams_as_deleted() {
+    let mut peer = Peer::start(-1, json!({"sessionCapabilities": {"delete": {}}})).await;
+    create(&mut peer).await;
+    let owner = owner(&peer).await;
+    let scopes = [owner];
+    let scope = session_scope(SESSION);
+    let mut existing = HttpStream::open(&peer.router, &scopes).await;
+    let (seq, documents) = peer.cut().await;
+    assert!(existing.check(&peer.router, seq, &documents).await);
+
+    let deleted = peer.submit(json!({
+        "type": "session/delete", "requestId": "stream-direct-delete", "sessionId": SESSION,
+    }));
+    let delete = peer.next_request().await;
+    assert_eq!(delete["method"], "session/delete", "close is not supported");
+    peer.reply(&delete, json!({})).await;
+    tokio::time::timeout(Duration::from_secs(3), deleted)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    peer.until("the deleted session leaves", |documents| !held(documents))
+        .await;
+    let existing_reason = existing.until_ended(&scope).await;
+
+    // The reason is an owner lifecycle fact, even after the log is gone.
+    {
+        let state = peer.state.upgrade().unwrap();
+        let mut state = state.lock_without_commit().await;
+        let seq = state.replication.log().seq();
+        state.replication.log_mut_for_test().compact_through(seq);
+    }
+    let mut returned = HttpStream::open(&peer.router, &scopes).await;
+    let returned_reason = returned.until_ended(&scope).await;
+    peer.no_request().await;
+    peer.stop().await;
+
+    assert_eq!(
+        (existing_reason, returned_reason),
+        (EndReason::Deleted, EndReason::Deleted),
+        "successful direct deletion must not look like owner replacement or disappearance"
+    );
+}
+
 #[tokio::test]
 async fn an_old_epoch_owner_is_replaced_while_the_new_epoch_holds_the_same_incarnation() {
     let mut old = Peer::start(-1, json!({})).await;

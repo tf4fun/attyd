@@ -451,3 +451,119 @@ async fn ending_the_epoch_drains_and_closes_every_stream() {
         "a finished queue ends the stream"
     );
 }
+
+#[test]
+fn partial_initial_cut_survives_reconnect() {
+    let mut bench = Bench::new();
+    let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    bench.step();
+    let mut client = Client::subscribe(&mut bench, &[ScopeRequest::Global, owner("s", s)]);
+    let Message { id, data } = client.queue.try_next().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&data).unwrap()["type"],
+        "snapshot"
+    );
+    client.replica.receive(&id, &data).unwrap();
+    client.last_id = Some(id);
+    // Disconnect before the session's initial reset, which carries the same ID.
+    client.reconnect(&mut bench);
+    // The production subscription also commits when its bridge guard drops.
+    bench.step();
+    let entries = client.drain();
+    client.fetch(&bench);
+    assert_eq!(
+        client.replica.applied(),
+        bench.replication.log().seq(),
+        "entries: {entries:?}"
+    );
+    assert!(
+        client
+            .replica
+            .diverges(&fresh(&bench.agent, 0, &bench.registry))
+            .is_none(),
+        "the resumed cut must initialize every subscribed scope"
+    );
+}
+
+#[test]
+fn partial_coalesced_cut_survives_reconnect() {
+    let mut bench = Bench::new();
+    let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    bench.step();
+    let mut client = Client::subscribe(&mut bench, &[ScopeRequest::Global, owner("s", s)]);
+    client.sync(&bench);
+    bench.replication.set_subscriber_budget(EPOCH, 128);
+    bench.control(
+        "s",
+        s,
+        json!({ "sessionUpdate": "session_info_update", "title": "Changed" }),
+    );
+    bench.step();
+    let Message { id, data } = client.queue.try_next().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&data).unwrap()["type"],
+        "snapshot"
+    );
+    client.replica.receive(&id, &data).unwrap();
+    client.last_id = Some(id);
+    // Disconnect before the coalesced session reset at the same global position.
+    client.reconnect(&mut bench);
+    bench.step();
+    let entries = client.drain();
+    client.fetch(&bench);
+    assert_eq!(client.replica.applied(), bench.replication.log().seq());
+    assert!(
+        client
+            .replica
+            .diverges(&fresh(&bench.agent, 0, &bench.registry))
+            .is_none(),
+        "the replica claims to be current but its session is stale; entries: {entries:?}"
+    );
+}
+
+#[test]
+fn finished_turn_releases_slow_stream_process_bytes() {
+    const PROCESS_BODY: &str = "completed-process-must-leave-subscriber-queue";
+    let mut bench = Bench::new();
+    let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    bench.step();
+    let mut client = Client::subscribe(&mut bench, &[owner("s", s)]);
+    client.sync(&bench);
+    let operation = bench.start_turn("s", s, "intent");
+    bench.update(
+        "s",
+        s,
+        &operation,
+        json!({
+            "sessionUpdate": "tool_call", "toolCallId": "read-tool", "title": "Read",
+            "status": "completed", "content": [{ "type": "content", "content": {
+                "type": "text", "text": PROCESS_BODY,
+            } }],
+        }),
+    );
+    bench.step();
+    bench.update("s", s, &operation, chunk("Done"));
+    bench.finish_turn("s", s, "intent", &operation);
+    bench.step();
+    bench.registry.release_published_runtime(u64::MAX);
+    assert!(
+        !serde_json::to_string(&fresh(&bench.agent, 0, &bench.registry))
+            .unwrap()
+            .contains(PROCESS_BODY)
+    );
+    let log = bench.replication.log();
+    let retained = log
+        .after(log.seq() - log.len() as u64)
+        .unwrap()
+        .map(|entry| format!("{entry:?}"))
+        .collect::<Vec<_>>();
+    assert!(!retained.join("").contains(PROCESS_BODY));
+    let entries = client.drain();
+    assert!(
+        !serde_json::to_string(&entries)
+            .unwrap()
+            .contains(PROCESS_BODY),
+        "released process content remains queued: {entries:?}"
+    );
+    client.sync(&bench);
+}

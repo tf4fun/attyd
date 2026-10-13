@@ -7544,6 +7544,41 @@ async fn require_agent_method(operation: &str, state: &Arc<BridgeLock>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_waiting_on_final_cut_cannot_survive_epoch_finish() {
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let source = ReplicationSource::default();
+        source.attach(&state);
+        {
+            let mut state = state.lock().await;
+            state.agent.phase = AgentPhase::Stopped;
+        }
+        // Match the final finish/freeze transition, while another request
+        // has upgraded the source's Weak and is waiting for this lock.
+        let mut finishing = state.lock().await;
+        let mut subscribing = Box::pin(source.subscribe(vec![ScopeRequest::Global], None, 1));
+        assert!(futures::poll!(subscribing.as_mut()).is_pending());
+        {
+            let finishing = &mut *finishing;
+            finishing.replication.finish();
+            source.freeze(finishing.replication.global_snapshot(
+                &finishing.agent,
+                finishing.catalog_revision,
+                &finishing.sessions,
+            ));
+        }
+        drop(finishing);
+        if let Some(subscription) = subscribing.await {
+            // It may reject the stale source, or return a finite final cut;
+            // it must not keep an ended epoch's SSE connection open forever.
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while subscription.queue.next().await.is_some() {}
+            })
+            .await
+            .expect("a subscription racing epoch finish must close after draining");
+        }
+    }
     const FORMER_BRIDGE_MESSAGE_BYTES: usize = 5 * 1024 * 1024;
     const FORMER_BRIDGE_IDENTIFIER_LENGTH: usize = 1_024;
     const FORMER_BRIDGE_PATH_LENGTH: usize = 16_384;
