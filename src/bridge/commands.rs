@@ -486,18 +486,28 @@ fn done(response: Result<Value, BridgeRequestError>) -> Result<RequestResult, Pr
 /// owner's lease (protocol §4.2), from the tombstone once the record is gone.
 fn renew_returned_owner(state: &mut BridgeState, key: &str) {
     let owner = state.sessions.commands.intent(key).and_then(|intent| {
-        intent.owner.clone().or_else(|| {
-            // An open still running names its owner in the record's target.
-            let Subject::Request(request_id) = &intent.subject else {
-                return None;
-            };
-            let request = state.sessions.commands.request(request_id)?;
-            let target = request
-                .target
-                .as_ref()
-                .filter(|_| request.operation == RequestOperation::Open)?;
-            Some((target.session_id.clone(), target.incarnation?))
-        })
+        intent
+            .owner
+            .and_then(|incarnation| {
+                // Incarnations are unique within the epoch.
+                let session = state
+                    .sessions
+                    .iter_states()
+                    .find(|session| session.incarnation == incarnation)?;
+                Some((session.session_id.clone(), incarnation))
+            })
+            .or_else(|| {
+                // An open still running names its owner in the record's target.
+                let Subject::Request(request_id) = &intent.subject else {
+                    return None;
+                };
+                let request = state.sessions.commands.request(request_id)?;
+                let target = request
+                    .target
+                    .as_ref()
+                    .filter(|_| request.operation == RequestOperation::Open)?;
+                Some((target.session_id.clone(), target.incarnation?))
+            })
     });
     if let Some((session_id, incarnation)) = owner
         && state.replication.held_incarnation(&session_id) == Some(incarnation)
@@ -620,6 +630,24 @@ pub(super) fn fork_target_held(
     ) {
         grant_first_subscription_lease(state, session_id, incarnation);
     }
+}
+
+/// Frozen process terminals live exactly as long as their owner's revision:
+/// a retired owner or a replaced revision releases them in the same commit.
+pub(super) fn release_process_terminals(state: &mut BridgeState) {
+    if state.process_terminals.is_empty() {
+        return;
+    }
+    let sessions = &state.sessions;
+    state
+        .process_terminals
+        .retain(|session_id, (incarnation, revision, _)| {
+            sessions.state(session_id).is_some_and(|session| {
+                session.incarnation == *incarnation
+                    && session.history_revision.as_deref() == Some(revision.as_str())
+                    && session.live.is_some()
+            })
+        });
 }
 
 /// Turn intents settle once their turn leaves the session: completed when it
@@ -977,7 +1005,10 @@ impl ReplicationSource {
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
-                state.sessions.commands.turn_admitted(&key, &operation_id);
+                state
+                    .sessions
+                    .commands
+                    .turn_admitted(&key, &session_id, &operation_id);
                 let disposition = if value["disposition"] == "duplicate" {
                     Disposition::Duplicate
                 } else {
@@ -1293,10 +1324,19 @@ impl ReplicationSource {
                 "the history revision is no longer retained",
             ));
         };
-        let replication = &state.replication;
-        state
-            .process_terminals
-            .retain(|id, (held, _, _)| replication.held_incarnation(id) == Some(*held));
+        // An overtaken read of an older revision is gone; it must never
+        // replace the freeze a newer revision already published.
+        if state
+            .sessions
+            .state(session_id)
+            .and_then(|session| session.history_revision.as_deref())
+            != Some(revision)
+        {
+            return Err(rejection(
+                ErrorCode::Gone,
+                "the history revision is no longer retained",
+            ));
+        }
         let frozen = state
             .process_terminals
             .entry(session_id.to_string())

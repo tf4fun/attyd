@@ -297,6 +297,7 @@ impl BridgeState {
     /// The protocol v2 commit step for every scope (plan §2.2).
     fn commit(&mut self) {
         commands::settle_turn_intents(self);
+        commands::release_process_terminals(self);
         self.replication
             .commit(&self.agent, self.catalog_revision, &self.sessions);
     }
@@ -3008,8 +3009,10 @@ where
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
                         responder.error(error);
                         // A turn refused before admission leaves no v2 intent.
-                        if let Some(key) = request_id.as_deref() {
-                            context.state.lock().await.sessions.commands.turn_refused(key);
+                        if let (Some(key), Some(session_id)) =
+                            (request_id.as_deref(), intent_session_id.as_deref())
+                        {
+                            context.state.lock().await.sessions.commands.turn_refused(key, session_id);
                         }
                     }
                     match (&business_responder, &result) {
@@ -5433,10 +5436,11 @@ async fn handle_command_inner(
                     })? {
                     TurnAdmission::Accepted { operation_id } => operation_id,
                     TurnAdmission::Duplicate { operation_id } => {
-                        state
-                            .sessions
-                            .commands
-                            .turn_admitted(&client_intent_id, &operation_id);
+                        state.sessions.commands.turn_admitted(
+                            &client_intent_id,
+                            &session_id,
+                            &operation_id,
+                        );
                         turn_responder.success(json!({
                             "operationId": operation_id,
                             "disposition": "duplicate",
@@ -5446,10 +5450,11 @@ async fn handle_command_inner(
                 };
                 // A v2 intent settles with the admission, whether or not
                 // its HTTP caller still waits.
-                state
-                    .sessions
-                    .commands
-                    .turn_admitted(&client_intent_id, &mirror_operation_id);
+                state.sessions.commands.turn_admitted(
+                    &client_intent_id,
+                    &session_id,
+                    &mirror_operation_id,
+                );
                 // The accepted turn owns the projection now: an optional
                 // history workflow still parked in backoff yields instead of
                 // retrying over this turn's outcome.

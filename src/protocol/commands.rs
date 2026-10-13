@@ -123,9 +123,10 @@ pub(crate) struct Intent {
     pub subject: Subject,
     /// `None` while the subject runs.
     pub status: Option<FinalStatus>,
-    /// The session owner a finished request returned (open, fork), kept so a
-    /// resend can renew its lease after the record is gone.
-    pub owner: Option<(String, u64)>,
+    /// The incarnation a finished request returned (open, fork), kept so a
+    /// resend can renew its lease after the record is gone. Incarnations are
+    /// unique within an epoch, so this fits the fixed overhead.
+    pub owner: Option<u64>,
     /// Which admission produced this intent; a stale caller cannot withdraw
     /// a later one.
     attempt: u64,
@@ -277,17 +278,15 @@ impl CommandBook {
         }
     }
 
-    /// The bridge refused the turn of `key` before admitting it.
-    pub(crate) fn turn_refused(&mut self, key: &str) {
-        if self.intents.get(key).is_some_and(|intent| {
-            matches!(
-                intent.subject,
-                Subject::Turn {
-                    operation_id: None,
-                    ..
-                }
-            )
-        }) {
+    /// The bridge refused a turn of `key` on `session_id` before admitting
+    /// it. Only a still-unadmitted v2 intent for that session is withdrawn: a
+    /// v1 turn may reuse the key on another session.
+    pub(crate) fn turn_refused(&mut self, key: &str, session_id: &str) {
+        if self
+            .intents
+            .get(key)
+            .is_some_and(|intent| pending_turn_on(intent, session_id))
+        {
             self.withdraw(key);
         }
     }
@@ -301,16 +300,18 @@ impl CommandBook {
         self.running_turns.remove(key);
     }
 
-    /// The bridge admitted the turn of `key` as `operation_id`.
-    pub(crate) fn turn_admitted(&mut self, key: &str, operation_id: &str) {
-        if let Some(Intent {
-            subject:
-                Subject::Turn {
-                    operation_id: admitted,
-                    ..
-                },
-            ..
-        }) = self.intents.get_mut(key)
+    /// The bridge admitted a turn of `key` on `session_id` as
+    /// `operation_id`. It settles only a still-unadmitted v2 intent for that
+    /// session; another session's turn under the same key changes nothing.
+    pub(crate) fn turn_admitted(&mut self, key: &str, session_id: &str, operation_id: &str) {
+        if let Some(intent) = self
+            .intents
+            .get_mut(key)
+            .filter(|intent| pending_turn_on(intent, session_id))
+            && let Subject::Turn {
+                operation_id: admitted,
+                ..
+            } = &mut intent.subject
         {
             *admitted = Some(operation_id.to_string());
         }
@@ -408,15 +409,8 @@ impl CommandBook {
             .and_then(|key| self.intents.get_mut(key))
         {
             intent.status = Some(FinalStatus::Request(status));
-            if let Some(RequestResult::Session {
-                session_id,
-                incarnation,
-            }) = &request.result
-            {
-                // The owner joins the tombstone: its bytes count like its key.
-                intent.owner = Some((session_id.clone(), *incarnation));
-                intent.bytes += session_id.len() + 8;
-                self.intent_bytes += session_id.len() + 8;
+            if let Some(RequestResult::Session { incarnation, .. }) = &request.result {
+                intent.owner = Some(*incarnation);
             }
         }
         self.finished.push_back((request_id.to_string(), now));
@@ -454,6 +448,17 @@ impl CommandBook {
             self.finished.pop_front();
         }
     }
+}
+
+fn pending_turn_on(intent: &Intent, session: &str) -> bool {
+    matches!(
+        &intent.subject,
+        Subject::Turn {
+            session_id,
+            operation_id: None,
+            ..
+        } if session_id == session
+    )
 }
 
 fn intent_bytes(key: &str, subject: Option<&Subject>) -> usize {
@@ -747,7 +752,9 @@ mod tests {
                 operation_id: None,
             },
         );
-        book.turn_admitted("t", "op");
+        book.turn_admitted("t", "other", "op");
+        book.turn_admitted("t", "s", "op");
+        book.turn_admitted("t", "s", "later");
         assert_eq!(
             book.running_turns().collect::<Vec<_>>(),
             vec![("t", "s", 1, Some("op"))]
