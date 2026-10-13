@@ -130,9 +130,12 @@ interface Request {
                                              // "session/set_mode", "session/close",
                                              // "session/delete", "session/list", …)
                                              // or "attyd/auth_terminal"
-  clientIntentId: string | null;             // Idempotency-Key of the starting command
+  clientIntentId: string | null;             // Idempotency-Key of the command; null only for
+                                             // ACP requests the bridge starts itself (§5.2)
   target: { sessionId: string; incarnation: number | null } | null;  // null incarnation: cold
+  interactionId: string | null;              // interaction responses
   methodId: string | null;                   // authenticate, auth terminal: the chosen method
+  params: Record<string, unknown>;           // the command's non-secret parameters (below)
   status: "running" | "succeeded" | "failed" | "cancelled";
   result?: RequestResult;                    // succeeded
   error?: ProtocolError;                     // failed
@@ -140,7 +143,7 @@ interface Request {
 }
 
 type RequestResult =
-  | { kind: "session"; sessionId: string; incarnation: number }  // session/new, session/fork
+  | { kind: "session"; sessionId: string; incarnation: number }  // create, fork, open
   | { kind: "done" };                                            // everything else
 
 interface AuthTerminalState {
@@ -154,10 +157,29 @@ interface AuthTerminalState {
 
 **Request records.** `global.requests` has a record for each of these:
 
-- every accepted command except turn start (whose result is a `TurnOutcome`) and
-  interaction responses (whose result is the interaction's removal);
-- every ACP request the bridge sends outside a held session, including requests a
-  read starts: `GET /api/v2/catalog` sends `session/list`, so it gets a record.
+- every accepted **operation command** (§5): open, create, fork, set_mode,
+  set_config, close, delete, authenticate, logout, auth terminal start, and
+  interaction responses;
+- every ACP request the bridge sends outside a held session on its own, including
+  requests a read starts: `GET /api/v2/catalog` sends `session/list`, so it gets a
+  record with `clientIntentId: null`.
+
+Turn start records its result as a `TurnOutcome` instead. **Control actions**
+(acknowledgements, turn cancel, auth terminal input, resize and cancel) never create
+records. They only change their parent: the acknowledged record goes away, or
+`turn.cancelRequested` is set, or the auth terminal record changes status.
+
+`params` holds the parameters needed to tell two submissions apart, such as
+`modeId`, `configId` and `value`, `cwd`, or a permission `optionId` and elicitation
+`action`. It never holds prompts, form contents or terminal input.
+
+An interaction response record ends `succeeded` only once the bridge has delivered
+the response to the Agent. If the interaction ended first (the Agent cancelled it,
+its session or request ended) or delivery failed, the record ends `failed`, with
+`error.code = "interaction_ended"` and the reason in `error.data`. This keeps the
+guarantee tested by `failed_interaction_delivery_is_never_reported_as_resolved`.
+A response to an interaction that was already resolved is rejected synchronously
+(`conflict`).
 
 A command that is rejected synchronously (any 4xx in §7) commits nothing and gets no
 record. Retrying it gives the same answer. Records live in `global` even when they
@@ -310,7 +332,7 @@ Within those boundaries, a replica that reconnects sees every result.
 ## 4. Replication stream
 
 ```text
-GET /api/v2/stream?scope=global&scope=session/<id>[&cwd=<dir>]
+GET /api/v2/stream?scope=global&scope=session/<id>@<epoch>:<incarnation>
 Last-Event-ID: <epoch>:<seq>        (optional, set by EventSource on reconnect)
 ```
 
@@ -363,7 +385,14 @@ scope.
 
 After a `reset`, the replica fetches `GET /api/v2/sessions/<id>` (§6), whose `at` is
 at or after the reset position. It buffers entries for that scope until the snapshot
-arrives, drops buffered entries with `seq <= at.seq`, and applies the rest.
+arrives, then applies the rest.
+
+**Covered entries.** Once a snapshot at `a` is installed for a scope, the replica
+**ignores** every later-arriving entry for that scope, in the same epoch and owner,
+with `seq <= a`. It does this before checking `prev`, whether the entry was buffered
+or arrives over SSE after an HTTP snapshot that overtook it. Only entries with
+`seq > a` are checked against `prev`. A snapshot fetched ahead of the stream
+therefore never causes a second reset.
 
 **Lag.** For a subscriber that falls behind, the server may replace its queued
 entries for a scope with one `reset` or `snapshot` at the latest position. A replica
@@ -386,9 +415,16 @@ A replica tracks two positions:
 - **received:** the `at.seq` of the last entry it read from the stream;
 - **applied:** `min(received, min over pending scopes of installed(scope))`, where:
   - `installed(scope)` is the last `seq` actually applied to that scope: a snapshot's
-    `at.seq`, or the `seq` of the last applied `ops`;
-  - a scope is *pending* from a `reset` (or a failed `prev` check) until its snapshot
-    is installed and its buffered entries are drained.
+    `at.seq`, or the `seq` of the last applied `ops`. It is `0` while the scope has
+    nothing installed;
+  - **every subscribed scope starts pending when the subscription is made**. It
+    leaves pending once its first snapshot is installed and its buffer drained, or
+    once it receives `end`;
+  - a scope becomes pending again on a `reset` or a failed `prev` check, until its
+    next snapshot is installed and its buffer drained.
+
+  So on a new stream for `global` and `session/S`, `applied` stays `0` after
+  `global`'s `snapshot@20` arrives, until S's snapshot is installed too.
 
   A `reset` never advances `applied`. For example, a replica applied through 10, a
   command commits at 15, and a coalesced `reset@20` arrives: `applied` stays at 10
@@ -398,40 +434,55 @@ Read-your-writes (§5.1) uses **applied**, never received.
 
 ### 4.2 Observation and materialization
 
-Subscribing to `session/<id>` is an **observation**. It holds an observation lease
-that keeps the session materialized and stops unobserved retirement (H09, H13).
-Subscribing to `global` never observes a session.
+Observation keeps a session materialized and stops unobserved retirement (H09, H13).
+It has two halves:
 
-**Only observation starts materialization.** When a stream subscribes to a session
-the bridge doesn't hold, the bridge:
+- **Open** is a command (§5.5). It is an explicit user action, can be retried with
+  `Idempotency-Key`, and is the only thing that materializes a session.
+- **Subscribe** is a read. It always names a complete owner, and never
+  materializes anything.
 
-1. creates the session document with `history.phase = "cold"`;
-2. starts `load` or `resume` as the session's `operation`, following today's
-   capability rules and the stream's `cwd`;
-3. sends the scope's `reset` once the document exists.
+**Open.** `POST /api/v2/sessions/{id}/open` with `{ cwd }`:
 
-Load failure, retry and backoff appear as `history.phase`, `history.error` and
-`operation`, as they do today. Reads never start materialization (§6).
+- **Held session:** the bridge returns the current owner.
+- **Session the bridge doesn't hold:** in the same actor turn, the bridge creates
+  the session document (`history.phase = "cold"`), allocates its incarnation, and
+  starts `load` or `resume` as its `operation`. Today's capability rules and the
+  given `cwd` apply.
+- **Result:** in both cases, `{ sessionId, incarnation }` in the record's `result`,
+  plus an *open lease*. The lease keeps the session observed until a stream
+  subscribes to that owner, or until a grace period (default 30 s) expires.
+- **Retry:** a retry with the same key returns the same owner and never
+  materializes again.
+- **Failures:** load failure, retry and backoff appear as `history.phase`,
+  `history.error` and `operation`, as they do today.
 
-**Open versus resume.** A session scope is subscribed in one of two forms:
+**Subscribe.** A session scope is always written with its full owner:
 
-| Form | Meaning | If the bridge doesn't hold that session |
-| --- | --- | --- |
-| `session/<id>` with no `Last-Event-ID` in the current epoch | **open**: an explicit user action | materializes it, as above |
-| `session/<id>@<incarnation>`, or any session scope with a current-epoch `Last-Event-ID` | **resume** an observation the replica already had | sends `end` and never materializes |
+```text
+scope=session/<sessionId>@<epoch>:<incarnation>
+```
 
-A transport reconnect (EventSource retry) always resumes. A replica that recreates
-its stream for a session it already shows must use the `@<incarnation>` form. Only
-an open can materialize. So when page A loses its connection and page B closes the
-session, A's reconnect ends with `end`, and the session doesn't load again. This keeps
+The stream holds an observation lease on exactly that owner. If the bridge doesn't
+hold that owner, the scope gets `end` at once and nothing is loaded:
+
+- `closed`, `deleted` or `unobserved`: the incarnation was retired, per a bounded
+  per-epoch table of retired incarnations that outlives log compaction;
+- `replaced`: the session is held under a different incarnation, or the tag names
+  an older epoch;
+- `gone`: neither applies, for example after the incarnation aged out of the table.
+
+**Reconnects.** The subscription URL already carries the owner, so an EventSource
+retry is the same request as the original subscription, whether or not it carries
+`Last-Event-ID`. It can only resume. When page A disconnects before its first event,
+and page B then closes the session, A's retry gets `end: closed`. The session doesn't
+load again. An observer from an old epoch carries that epoch in its tag and gets
+`replaced`; it can't attach to the new epoch's same-numbered incarnation. This keeps
 the guarantee tested by
-`view_refresh_and_sse_resume_return_the_retired_owner_without_fresh_open`.
+`view_refresh_and_sse_resume_return_the_retired_owner_without_fresh_open`. To show
+the session again after `end`, the replica sends a new open.
 
-`end.reason` comes from a bounded per-epoch table of retired incarnations (`closed`,
-`deleted`, `unobserved`). The table outlives log compaction. Once an incarnation has
-aged out of that table too, the reason is `gone`. A resume naming a different
-incarnation than the held one gets `end` with `replaced`. The replica may then open
-the current incarnation, which `global.sessions` lists.
+Subscribing to `global` never observes a session.
 
 ## 5. Commands
 
@@ -460,8 +511,10 @@ No event correlation and no extra fetch are needed.
 
 ### 5.2 Intents and retries
 
-The commands that create something take an `Idempotency-Key: <clientIntentId>`
-header. It is required on turn start, `POST /sessions` and fork. Within one epoch:
+Every operation command (§3.1) and turn start requires an
+`Idempotency-Key: <clientIntentId>` header. The client chooses it before sending, so
+it can find its own submission among those of other clients. Control actions take no
+key. Within one epoch:
 
 - the intent fingerprint is `(method, target sessionId, owner tag, body digest)`. A
   fork of A and a fork of B, or the same prompt sent to two sessions, are different
@@ -469,9 +522,10 @@ header. It is required on turn start, `POST /sessions` and fork. Within one epoc
 - the same key with the same fingerprint returns the original result with
   `disposition: "duplicate"`, and creates nothing new;
 - the same key with a different fingerprint fails with `intent_conflict`;
-- the request record carries `clientIntentId`. A replica whose HTTP response was lost
-  finds its result in `global.requests` (or `outcomes` for a turn) by its own intent
-  ID, without retrying.
+- the record carries `clientIntentId`. A replica whose HTTP response was lost finds
+  its result in `global.requests` (or `outcomes` for a turn) by its own intent ID. If
+  there is no such record, the command was never accepted, and resending it with the
+  same key is safe.
 
 Exactly-once doesn't cross epochs. A new Agent connection forgets intents, in line
 with H07 and H15.
@@ -494,30 +548,36 @@ Delete is the only cold-session command. Everything else needs a held session.
 
 ### 5.4 Global commands
 
+All operation commands below take `Idempotency-Key` and return `disposition` with
+their `requestId`. Rows marked *control* take no key and create no record.
+
 | Command | Body | Result |
 | --- | --- | --- |
 | `POST /api/v2/agent/authenticate` | `{ methodId }` | `{ requestId }` |
 | `POST /api/v2/agent/logout` | `{}` | `{ requestId }` |
 | `POST /api/v2/agent/auth-terminals` | `{ methodId, cols, rows }` | `{ requestId }` (the record keeps `methodId` from start to end) |
-| `POST /api/v2/agent/auth-terminals/{requestId}/input` | `{ data }` | `{}` |
-| `POST /api/v2/agent/auth-terminals/{requestId}/resize` | `{ cols, rows }` | `{}` |
-| `POST /api/v2/agent/auth-terminals/{requestId}/cancel` | `{}` | `{}` |
-| `POST /api/v2/sessions` (`Idempotency-Key`) | `{ cwd }` | `{ requestId, disposition }` |
-| `DELETE /api/v2/requests/{requestId}` | — | `{}`: acknowledge a finished request |
-| `DELETE /api/v2/url-flows/{interactionId}` | — | `{}`: acknowledge a finished global URL flow |
+| `POST /api/v2/agent/auth-terminals/{requestId}/input` | `{ data }` | `{}` (*control*) |
+| `POST /api/v2/agent/auth-terminals/{requestId}/resize` | `{ cols, rows }` | `{}` (*control*) |
+| `POST /api/v2/agent/auth-terminals/{requestId}/cancel` | `{}` | `{}` (*control*: the record ends `cancelled`) |
+| `POST /api/v2/sessions` | `{ cwd }` | `{ requestId }` |
+| `DELETE /api/v2/requests/{requestId}` | — | `{}` (*control*: acknowledge a finished request) |
+| `DELETE /api/v2/url-flows/{interactionId}` | — | `{}` (*control*: acknowledge a finished global URL flow) |
 
 ### 5.5 Session commands
 
 | Command | Body | Result |
 | --- | --- | --- |
-| `POST /api/v2/sessions/{id}/turns` (`Idempotency-Key`) | `{ prompt: ContentBlock[] }` | `{ operationId, disposition }` |
-| `POST /api/v2/sessions/{id}/turns/{operationId}/cancel` | `{}` | `{}` |
+| Command | Body | Result |
+| --- | --- | --- |
+| `POST /api/v2/sessions/{id}/open` | `{ cwd }` | `{ requestId }`; no `If-Match` (§4.2) |
+| `POST /api/v2/sessions/{id}/turns` | `{ prompt: ContentBlock[] }` | `{ operationId, disposition }` |
+| `POST /api/v2/sessions/{id}/turns/{operationId}/cancel` | `{}` | `{}` (*control*) |
 | `PUT /api/v2/sessions/{id}/mode` | `{ modeId }` | `{ requestId }` |
 | `PUT /api/v2/sessions/{id}/config/{configId}` | `{ value }` | `{ requestId }` |
-| `POST /api/v2/sessions/{id}/fork` (`Idempotency-Key`) | `{}` (held source) | `{ requestId, disposition }` |
+| `POST /api/v2/sessions/{id}/fork` | `{}` (held source) | `{ requestId }` |
 | `POST /api/v2/sessions/{id}/close` | `{}` | `{ requestId }` |
 | `DELETE /api/v2/sessions/{id}` | — | `{ requestId }` (held or cold) |
-| `DELETE /api/v2/sessions/{id}/url-flows/{interactionId}` | — | `{}`: acknowledge a finished URL flow |
+| `DELETE /api/v2/sessions/{id}/url-flows/{interactionId}` | — | `{}` (*control*: acknowledge a finished URL flow) |
 
 ### 5.6 Interactions
 
@@ -530,6 +590,9 @@ If-Match: "<epoch>" | "<epoch>:<incarnation>"
 | --- | --- |
 | permission | `{ outcome: RequestPermissionOutcome }` |
 | elicitation | `{ response: CreateElicitationResponse }` |
+
+This is an operation command. It takes `Idempotency-Key` and returns
+`{ requestId, disposition }`. Its record reports delivery, not just removal (§3.1).
 
 Interaction IDs are bridge-allocated and unique within an epoch, so one endpoint
 serves both scopes. Accepting a URL elicitation removes the interaction and creates
@@ -570,13 +633,15 @@ type ErrorCode =
   | "owner_mismatch"        // 409: If-Match epoch/incarnation is not current
   | "history_mismatch"      // 412: If-Match history revision is not current
   | "precondition_required" // 428: missing If-Match or Idempotency-Key
-  | "conflict"              // 409: refused by admission (operation in progress, wrong phase)
+  | "conflict"              // 409: refused by admission (operation in progress, wrong phase,
+                            //      interaction already resolved)
   | "intent_conflict"       // 409: Idempotency-Key reused with a different body
   | "catalog_changed"       // 409: stale catalog revision
   | "unsupported"           // 501: the Agent did not advertise the capability
   | "gone"                  // 410: immutable resource no longer retained
   | "agent_error"           // 502: the Agent returned an error
-  | "unavailable";          // 503: no Agent connection in this epoch
+  | "unavailable"           // 503: no Agent connection in this epoch
+  | "interaction_ended";    // record only: the interaction ended before delivery
 ```
 
 The body of every non-2xx response is `{ error: ProtocolError }`. Stream-level
@@ -593,7 +658,7 @@ failures end the stream; the replica reconnects with `Last-Event-ID`.
 | `acp/authenticated`, `acp/logged_out`, `bridge/auth_terminal_*` | `global.requests`, `/agent/authenticatedMethodId` |
 | connection-level `request_elicitations` / `request_url_flows` | `global.interactions` / `global.urlFlows` with `requestId` |
 | mode, config, close, delete, fork results in the HTTP response only | `global.requests` records |
-| `expectedEpoch`/`expectedIncarnation` on the session event stream | `session/<id>@<incarnation>` resume form (§4.2) |
+| `expectedEpoch`/`expectedIncarnation` on the session event stream | owner-qualified scope `session/<id>@<epoch>:<incarnation>` (§4.2) |
 | `bridge/session_reset` | `reset` |
 | `bridge/session_delta` (every kind) | `ops` |
 | `bridge/session_retired` | `end` |
@@ -602,7 +667,7 @@ failures end the stream; the replica reconnects with `Last-Event-ID`.
 | `view.workspace.session` (`modes`, `configOptions`) | `controls.modes`, `controls.configOptions` |
 | `viewRevision`, `fromRevision` | `at.seq`, `prev` |
 | `expectedEpoch` / `expectedIncarnation` query, `If-Match: <historyRevision>` | `If-Match` tags (§5.3) |
-| `GET …/sessions/{id}?cwd=` loading a cold session | stream observation with `cwd` (§4.2) |
+| `GET …/sessions/{id}?cwd=` or an observing stream loading a cold session | `POST /api/v2/sessions/{id}/open` (§4.2) |
 | `POST /api/v1/sessions`, `…/fork` returning the view | request records with `clientIntentId` and a typed `result` |
 | `presentation=full\|compact` | compact only; process through immutable pages |
 | `includeProcessFrom`, `excludeProcessFor` | removed (§9) |

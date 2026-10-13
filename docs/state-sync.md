@@ -144,10 +144,23 @@ progress and the final result arrive only through replication.
 **Request records.** A `Request` in `global.requests` is created in the same actor
 turn that accepts the command or sends the ACP request:
 
-- every accepted command except turn start and interaction responses: authenticate,
-  logout, the auth terminal, create, fork, set_mode, set_config, close and delete;
-- every ACP request outside a held session, including the `session/list` behind a
-  catalog read.
+- every accepted operation command: open, create, fork, set_mode, set_config,
+  close, delete, authenticate, logout, auth terminal start, and interaction
+  responses;
+- every ACP request the bridge sends on its own outside a held session, including
+  the `session/list` behind a catalog read.
+
+Control actions update their parent and create nothing: acknowledgements, turn
+cancel, and auth terminal input, resize and cancel. Acknowledging a record therefore
+never creates another record.
+
+An interaction response record follows delivery, not removal. It ends `succeeded`
+only after `ensure_interaction_delivered` (`src/bridge.rs:5548`) succeeds.
+Otherwise it ends `failed` with `interaction_ended`, which keeps
+`failed_interaction_delivery_is_never_reported_as_resolved`. `params` keeps the
+distinguishing non-secret parameters (`modeId`, `configId`/`value`, `optionId`,
+elicitation `action`), so two clients' submissions differ even when an earlier
+response was lost.
 
 A session `operation` started by a command points to its record (`requestId`), and
 the record's final status and error stay after the operation clears. Synchronous
@@ -169,12 +182,13 @@ existing `url_flow_in_use` check keeps that unique. Acknowledgement uses the
 `interactionId`, so a late acknowledgement of flow A cannot remove a later flow B
 that reused A's `elicitationId`.
 
-**Intents.** Create, fork and turn start keep one intent table per epoch, keyed by
-`clientIntentId`. Each entry stores a fingerprint, `(method, target sessionId, owner
+**Intents.** Every operation command and turn start goes through one intent table per
+epoch, keyed by `clientIntentId`. Each entry stores a fingerprint, `(method, target sessionId, owner
 tag, body digest)`, and the record or operation ID it produced. Equal bodies sent to
 different targets therefore conflict instead of aliasing. Turns already keep an
 intent table (H07), which gains the target fields. Create and fork gain the table, so
-a retry or a lost response resolves to the existing record.
+a retry or a lost response resolves to the existing record. The same holds for every
+other operation command.
 
 **Cold delete.** `If-Match: "<epoch>:0"` is checked against the registry in the same
 actor turn that starts the request, so there is no window in which the session
@@ -184,17 +198,21 @@ becomes held unseen. It keeps the path tested by
 `cwd` from live state (`src/bridge.rs:4271`), and `ForkSessionRequest` requires a
 `cwd`.
 
-**Materialization.** Only an *open* observation starts `load`/`resume` (protocol
-§4.2). `GET /api/v2/sessions/{id}` answers from the held session or returns
-`not_found`, so the GET loses its loading side effect. The browser's
-observe-then-fetch order is kept.
+**Materialization.** Only the open command starts `load`/`resume` (protocol §4.2).
+It calls `start_attachment`, which allocates the incarnation synchronously
+(`src/runtime_state.rs:542`), so open can return the full owner in its record. Open
+grants a lease with a grace period, so the session isn't retired before the
+client's stream attaches. `GET /api/v2/sessions/{id}` answers from the held session
+or returns `not_found`, so the GET loses its loading side effect.
 
-**Resume never reopens.** The Hub classifies each session subscription as open or
-resume (protocol §4.2) before asking the bridge for a lease. A resume carries the
-expected owner, and the bridge applies today's rule from
-`prepare_session_view_request_for_owner` (`src/bridge.rs:1309`): a retired or
-foreign owner yields `end` and never a fresh load. Retired incarnations go into a
-bounded per-epoch table, so `end.reason` stays accurate after log compaction.
+**Subscriptions never materialize.** Every session subscription names
+`(epoch, incarnation)`, so a transport retry is byte-for-byte the original request.
+The bridge applies today's owner rule from `prepare_session_view_request_for_owner`
+(`src/bridge.rs:1309`): a retired, foreign-epoch or foreign-incarnation owner gets
+`end`, never a fresh load. Retired incarnations go into a bounded per-epoch table, so
+`end.reason` stays accurate after log compaction. Incarnation numbers restart with
+each registry (`src/session_registry.rs:415`), so the epoch in the tag is what
+separates `S@1` in epoch E1 from `S@1` in E2.
 
 ### 2.5 Rejected alternative
 
@@ -270,7 +288,13 @@ discards the replica at the critical point and rebuilds it from public state:
 | --- | --- |
 | Global URL authentication: refresh after accept, then `elicitation/complete`, and separately cancellation | global `urlFlows` and their lifetime |
 | URL flow A completes, the Agent reuses its `elicitationId` for flow B, and a late acknowledgement of A arrives | flow identity by `interactionId` |
-| Page A disconnects, page B closes the session, A reconnects (with and without the close still in the log) | resume never reopens; `end` reasons |
+| Page A disconnects, page B closes the session, A reconnects (with and without the close still in the log), including a disconnect before A's first event | subscriptions never materialize; `end` reasons |
+| An old-epoch page re-subscribing `S@1` after the new epoch also holds `S@1` | the epoch in the owner tag |
+| A new stream for `global` + `session/S`: `global` snapshot first, S's snapshot later, with a command on S committed in between | every scope starts pending |
+| An HTTP snapshot at 20 overtakes SSE entries 11–20 for the same scope | covered entries are ignored, no second reset |
+| Permission and form responses whose HTTP response is lost: delivered, answered by another client first, cancelled by the Agent before delivery | interaction response records |
+| Two clients set different modes on one session; one is refused, and one response is lost | `clientIntentId` and `params` on command records |
+| Acknowledging a finished request | control actions create no records |
 | `set_mode` / `set_config` refused by the Agent, and close of a held session, each with the HTTP response dropped | session command records in `global.requests` |
 | Auth terminal running, then failed, with two advertised methods, rebuilt from public state | `methodId` on the record |
 | Terminal login succeeds and the Agent restarts | `agent.predecessor` and the epoch boundary |
@@ -298,8 +322,8 @@ working throughout. Each step is one PR, validated in CI.
 | --- | --- | --- |
 | 1 | v2 chain columns in the coverage ledger. Protocol DTOs with generated TypeScript. `project_global` and `project_session` with unit tests, including control reduction. | #5 |
 | 2 | Commit step, log and identity-based diff; in-process convergence harness | — |
-| 3 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}` and `GET /api/v2/stream`: Hub cut, `prev`, coalescing, resume, `position`; open versus resume, and only an open materializes; retired-incarnation table | — |
-| 4 | Session commands with `at`/`scopes`, `If-Match` tags and `ProtocolError`; turn and fork intents; the interaction endpoint; the reads | — |
+| 3 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}` and `GET /api/v2/stream`: Hub cut, `prev`, coalescing, resume, `position`; owner-qualified session subscriptions that never materialize; every scope pending until installed; covered-entry filtering; retired-incarnation table | — |
+| 4 | Session commands with `at`/`scopes`, `If-Match` tags and `ProtocolError`; the open command and its lease; intents for every operation command; interaction response records; the reads | — |
 | 5 | Request records for every accepted command and out-of-session ACP request; global interactions and URL flows keyed by interaction; auth flows and the auth terminal; create and fork intents; cold delete; `agent.predecessor` | — |
 | 6 | Web UI on v2, with a generic replica engine (JSON Pointer patcher plus validation, with received and applied positions) outside React; sidebar markers from `global.sessions` | #16, #17 (visible fix) |
 | 7 | Remove v1: routes, business events, `advance_session_delta`, `touch`, `cachedSessions` and compensating browser state, and the journal replica if it has no other consumer | #18 |
