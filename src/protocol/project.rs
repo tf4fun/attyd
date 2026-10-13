@@ -40,8 +40,7 @@ pub(crate) fn project_global(
             .iter()
             .filter_map(|(session_id, entry)| Some((session_id.clone(), summary(entry)?)))
             .collect(),
-        // Request records arrive with migration step 5.
-        requests: BTreeMap::new(),
+        requests: registry.commands.requests().clone(),
         interactions: registry
             .request_elicitations
             .values()
@@ -318,13 +317,18 @@ impl<'a> SessionSource<'a> {
                 operation_id: operation.operation_id.clone(),
                 kind: operation_kind(operation.kind),
                 stage: operation.stage.clone(),
-                // Command request records arrive with migration step 4.
-                request_id: None,
+                // A command's operation carries its record's ID.
+                request_id: self
+                    .registry
+                    .commands
+                    .request(&operation.operation_id)
+                    .map(|request| request.request_id.clone()),
             }),
             interactions,
             url_flows: live
                 .url_flows
                 .values()
+                .chain(&live.settled_url_flows)
                 .map(|flow| (flow.registration_id.clone(), url_flow(flow)))
                 .collect(),
             terminals,

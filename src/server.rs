@@ -2662,7 +2662,7 @@ async fn get_attachment(
         &session_id,
         query.expected_incarnation,
     );
-    let mut view = match state
+    let view = match state
         .bridge
         .session_view_for_owner(session_id, None, Some(owner))
         .await
@@ -2670,7 +2670,12 @@ async fn get_attachment(
         Ok(view) => view,
         Err(error) => return session_view_error(error),
     };
-    let Some(file) = crate::attachments::find(&mut view, &attachment_id)
+    attachment_response(view, &attachment_id)
+}
+
+/// The attachment's bytes from a session view, served inert.
+fn attachment_response(mut view: serde_json::Value, attachment_id: &str) -> Response {
+    let Some(file) = crate::attachments::find(&mut view, attachment_id)
         .and_then(|block| crate::attachments::file(&block))
     else {
         return (

@@ -59,6 +59,9 @@ use crate::terminal::{TerminalManager, TerminalSnapshot};
 
 mod agent_dispatch;
 #[cfg(test)]
+mod command_tests;
+pub(crate) mod commands;
+#[cfg(test)]
 mod convergence_tests;
 mod coordinator;
 #[cfg(test)]
@@ -283,11 +286,14 @@ struct BridgeState {
     agent: AgentState,
     /// The protocol v2 commit step: published documents and the log.
     replication: Replication,
+    /// First-subscription leases on owners that commands returned.
+    first_leases: commands::FirstLeases,
 }
 
 impl BridgeState {
     /// The protocol v2 commit step for every scope (plan §2.2).
     fn commit(&mut self) {
+        commands::settle_turn_intents(self);
         self.replication
             .commit(&self.agent, self.catalog_revision, &self.sessions);
     }
@@ -471,6 +477,7 @@ impl ReplicationSource {
             let lease = ObservationLease::new();
             if resources.observers.observe(observer_id, lease.clone()) {
                 leases.push((session_id.clone(), lease));
+                commands::take_over_first_subscription_leases(state, session_id, *incarnation);
             }
         }
         refresh_observer_timers(state);
@@ -2667,7 +2674,10 @@ where
                         _ = connection.incoming_closed() => break None,
                         input = observer_rx.recv() => {
                             if let Some(input) = input {
-                                let _ = ingress.try_browser(input, crate::session_dispatch::TrafficClass::Reserved);
+                                // Observation inputs are reserved; v2 commands
+                                // share the class their v1 form has.
+                                let class = browser_traffic_class(&input);
+                                let _ = ingress.try_browser(input, class);
                             }
                         }
                         input = commands.recv() => {
@@ -2838,6 +2848,7 @@ where
                         {
                             resources.observers.unobserve(observer_id, &lease);
                         }
+                        commands::forget_first_subscription_lease(&mut state, observer_id);
                         refresh_observer_timers(&mut state);
                         continue;
                     }
@@ -4878,6 +4889,7 @@ async fn handle_command_inner(
             advance_catalog_revision(&mut state, &sink);
             flush_runtime(&mut state, &sink);
             creation_finish.committed(incarnation)?;
+            commands::fork_target_held(&mut state, &request_id, &session_id, incarnation);
             drop(state);
             let target_owner =
                 rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);

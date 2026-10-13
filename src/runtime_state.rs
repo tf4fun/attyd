@@ -66,6 +66,9 @@ pub(crate) struct SessionLiveState {
     pub permissions: BTreeMap<String, PendingInteraction>,
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
+    /// Finished URL flows, oldest first, kept for protocol v2 until they are
+    /// acknowledged or retained out (protocol §3.4). v1 views never show them.
+    pub settled_url_flows: VecDeque<UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
     // Mirror view headers captured at the last commit so a journal snapshot or
     // hub reset only ever exposes the published view, never uncommitted state.
@@ -276,6 +279,18 @@ pub(crate) enum UrlFlowResolution {
     Applied,
     AlreadyTerminal,
     StaleRegistration,
+}
+
+/// Finished session URL flows kept for acknowledgement (protocol §3.4).
+pub(crate) const SETTLED_URL_FLOWS: usize = 16;
+
+/// Why a URL flow acknowledgement was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UrlFlowAcknowledgement {
+    /// The flow is still waiting for `elicitation/complete`.
+    Waiting,
+    /// No such flow, or it already left.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,6 +604,7 @@ impl SessionRegistry {
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
+                settled_url_flows: VecDeque::new(),
                 terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
@@ -904,6 +920,7 @@ impl SessionRegistry {
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
+                settled_url_flows: VecDeque::new(),
                 terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
@@ -1608,7 +1625,7 @@ impl SessionRegistry {
                 {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
-                let flow = session
+                let mut flow = session
                     .url_flows
                     .remove(elicitation_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
@@ -1616,6 +1633,11 @@ impl SessionRegistry {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
                 remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
+                flow.status = status;
+                session.settled_url_flows.push_back(flow);
+                if session.settled_url_flows.len() > SETTLED_URL_FLOWS {
+                    session.settled_url_flows.pop_front();
+                }
                 self.commit_session(session_id);
             }
             None => {
@@ -1638,6 +1660,39 @@ impl SessionRegistry {
             }
         }
         Ok(UrlFlowResolution::Applied)
+    }
+
+    /// Removes a finished session URL flow by the `interactionId` of the
+    /// elicitation that started it; a later flow reusing its `elicitationId`
+    /// is never touched.
+    pub(crate) fn acknowledge_url_flow(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        interaction_id: &str,
+    ) -> Result<(), UrlFlowAcknowledgement> {
+        self.require_epoch(expected_epoch)
+            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
+        let session = self
+            .require_live_mut(session_id, incarnation)
+            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
+        if session
+            .url_flows
+            .values()
+            .any(|flow| flow.registration_id == interaction_id)
+        {
+            return Err(UrlFlowAcknowledgement::Waiting);
+        }
+        let before = session.settled_url_flows.len();
+        session
+            .settled_url_flows
+            .retain(|flow| flow.registration_id != interaction_id);
+        if session.settled_url_flows.len() == before {
+            return Err(UrlFlowAcknowledgement::Unknown);
+        }
+        self.commit_session(session_id);
+        Ok(())
     }
 
     pub(crate) fn upsert_terminal(
