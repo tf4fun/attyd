@@ -166,6 +166,39 @@ is gone (§5, step 7).
 Observation stays a bridge input. A stream that includes `session/<id>` holds an
 observation lease (H09, H13). The bridge sees only the lease, never the stream.
 
+Step 3 implements the Hub in `src/protocol/hub.rs`, and the routes in
+`src/server/v2.rs`:
+
+- **Cut.** `ReplicationSource::subscribe` (`src/bridge.rs`) takes the bridge lock,
+  attaches an observation lease to each held owner the stream names, and registers
+  the stream with the Hub at the log's current position. The commit step ends by
+  handing the Hub its new suffix (`Hub::deliver`), under the same lock, so no entry
+  falls between the cut and the stream.
+- **Start of a scope.** `global` starts with an inline `snapshot`, a held owner with
+  a `reset`, and any other owner with `end`. A `Last-Event-ID` in the current epoch
+  whose suffix the log still holds resumes each scope from it, unless the suffix
+  ends or creates the scope's document; that scope starts over.
+- **`end` reasons.** The transition that retires an incarnation notes `closed`,
+  `deleted` or `unobserved` (`retire_session_observation`), and its scope's `End`
+  carries the reason; an incarnation that ends without one is `replaced` when the
+  session is held again, else `gone`. Ended incarnations stay in a table of the
+  last 1,024 per epoch (`RETIRED_OWNERS`), so a subscription gets its reason after
+  the log compacted the `End`. An owner from another epoch is `replaced`.
+- **Coalescing.** Each stream's queue is accounted by serialized bytes. Past
+  `DEFAULT_SUBSCRIBER_BUDGET` (1 MiB), its queued data for each scope collapses into
+  one `reset` (sessions) or `snapshot` (`global`) at the current position; queued
+  `end` entries stay. A suffix compacted within the commit that appended it starts
+  every scope over the same way.
+- **Heartbeats.** After each commit, a stream whose last message is behind the log
+  gets one `position`; a queued `position` is replaced, not stacked.
+- **Epoch end.** The connection commits its terminal `agent` state, then ends every
+  stream. Its final `global` document stays readable with `GET /api/v2/global`
+  until the next connection starts.
+
+Reads never materialize a session: `GET /api/v2/sessions/{id}` projects a held
+session or returns `not_found`, and a stream only attaches leases to owners the
+bridge already holds.
+
 ### 2.4 Commands
 
 Command handlers run in the bridge actor as today. After the command's own
@@ -335,6 +368,19 @@ retained log or starting over from snapshots when compaction dropped its positio
   another client, a permission, a background `tool_call_update`, close, delete and
   unobserved retirement.
 
+Step 3 runs the same gate over SSE. `src/protocol/stream_replica.rs` is a replica of
+the stream protocol that follows protocol §4 and §4.1 strictly: every scope starts
+pending, a `reset` waits for a fetched snapshot, covered entries are ignored before
+`prev` is checked, and nothing follows `end`. The Hub scenarios
+(`src/protocol/hub_tests.rs`) cover the cut, per-scope `prev`, heartbeats,
+coalescing, resume, compaction and `end` reasons. Through the real routes
+(`src/bridge/stream_tests.rs`, `src/bridge/stream_client.rs`), SSE replicas join
+the coordinator scenario above and are compared at every step, and the step 3
+acceptance scenarios run end to end: a page that reconnects after another page
+closed the session (before its first event, with the close in the log, and after
+compaction), an old-epoch owner, an HTTP snapshot that overtakes its SSE entries, a
+coalesced slow subscriber, and `global` subscribers that never observe a session.
+
 Both places mutate state without committing and assert that the harness reports
 it. A replica that meets a continuity break or an op that does not apply fails the
 gate; snapshots replace entries only at the first cut, a coalesced queue, a
@@ -425,6 +471,8 @@ targeted v1 fix is possible, but that work would be thrown away in step 7.
 - **Pointer-diff cost.** Step 2 measures it (§2.2): streaming never projects the
   history again, and a chunk publishes only its growth. Switch to
   transition-recorded change lists only if profiling shows the pointer pass.
-- **Log retention budget.** Step 2 uses 8 MiB per epoch. How it interacts with the
-  existing subscriber budgets and the protocol §3.4 minimums is decided with the
-  Hub in step 3.
+- **Log retention budget.** Resolved in step 3. The log keeps 8 MiB per epoch; it
+  bounds how far back a stream can resume. Each stream's queue coalesces past
+  1 MiB, so a slow subscriber costs at most that plus one resync per scope, and
+  never holds the log back. `end` reasons outlive the log in the retired-incarnation
+  table. The protocol §3.4 minimums apply to records, which arrive in steps 4 and 5.

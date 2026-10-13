@@ -1,6 +1,8 @@
 # attyd protocol v2
 
-Status: draft, 2026-10-12. Nothing here is implemented yet. This document defines
+Status: draft, 2026-10-12. The state documents (§3), the replication stream (§4)
+and the snapshot reads of §6 are implemented (migration steps 1–3); commands and
+the other reads are not yet. This document defines
 the client-facing protocol that replaces today's `/api/v1` business API. The
 [implementation plan](state-sync.md) describes how the bridge produces it. The
 [runtime contract](active-turn-runtime.md) still governs ACP semantics: history
@@ -386,10 +388,14 @@ Applying entries is generic. A replica needs a JSON Pointer patcher and validati
 the result against the schema, not a reducer for each kind of change.
 
 **Continuity.** `prev` is the `seq` of the previous entry delivered for the same
-scope, which may be a `snapshot` or the `at` of a fetched snapshot. A replica
-applies `ops` only when `prev` equals the last `seq` it applied to that scope.
-Otherwise it treats the scope as reset. This is Raft's `prevLogIndex` check, per
-scope.
+scope on this stream: an `ops` entry, or the `at` of a `snapshot` or `reset`. On a
+resumed stream (`Last-Event-ID`), a scope's first entry carries the `seq` of the
+scope's previous log entry instead. A replica applies `ops` only when `prev` equals
+the last `seq` it applied to that scope. Right after it installs a snapshot at `a`,
+it also accepts any `prev <= a`: a fetched snapshot can be later than every entry
+the stream delivered for the scope, and the snapshot already covers that earlier
+position. Otherwise it treats the scope as reset. This is Raft's `prevLogIndex`
+check, per scope.
 
 **Start of a scope.** The first entry for each subscribed scope is a `snapshot` or a
 `reset`:
