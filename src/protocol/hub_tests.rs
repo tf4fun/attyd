@@ -685,3 +685,53 @@ fn partial_coalesced_cut_reconnect_preserves_eventsource_cursor() {
 
     client.sync(&bench);
 }
+
+#[test]
+fn a_partly_received_end_batch_can_resume_the_retired_owner() {
+    let mut bench = Bench::new();
+    let a = bench.open("a", json!({ "sessionId": "a" }), Vec::new());
+    let b = bench.open("b", json!({ "sessionId": "b" }), Vec::new());
+    bench.step();
+    let mut client = Client::subscribe(
+        &mut bench,
+        &[ScopeRequest::Global, owner("a", a), owner("b", b)],
+    );
+    client.sync(&bench);
+    bench.replication.set_subscriber_budget(EPOCH, 128);
+
+    bench.replication.note_retirement("a", a, EndReason::Closed);
+    bench.registry.sessions.remove("a");
+    bench.control(
+        "b",
+        b,
+        json!({ "sessionUpdate": "session_info_update", "title": "Changed" }),
+    );
+    bench.step();
+
+    // The collapsed batch starts with a's End, followed by the live scopes'
+    // resyncs. Stop at the End, preserving EventSource's last nonempty id.
+    loop {
+        let Message { id, data } = client.queue.try_next().expect("the scope must end");
+        let entry: Value = serde_json::from_str(&data).unwrap();
+        client.replica.receive(&id, &data).unwrap();
+        if !id.is_empty() {
+            client.last_id = Some(id);
+        }
+        if entry["type"] == "end" && entry["scope"] == "session/a" {
+            assert!(
+                client.replica.receive("", &data).is_err(),
+                "a second End is still invalid before reconnecting"
+            );
+            break;
+        }
+    }
+    assert_eq!(client.replica.ended("session/a"), Some(EndReason::Closed));
+
+    // A new stream must tell an already retired owner that it ended, even
+    // when this replica received that End before the disconnect. This is
+    // distinct from a forbidden second End within the same stream.
+    client.reconnect(&mut bench);
+    bench.step();
+    client.sync(&bench);
+    assert_eq!(client.replica.ended("session/a"), Some(EndReason::Closed));
+}

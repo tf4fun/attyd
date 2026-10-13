@@ -396,4 +396,125 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn an_overtaken_reset_does_not_make_an_installed_scope_pending_again() {
+        let scope = "session/s";
+        let mut replica = StreamReplica::new([scope]);
+        send(
+            &mut replica,
+            json!({ "type": "reset", "scope": scope, "at": at(10) }),
+        )
+        .unwrap();
+        replica.install(scope, &at(20), json!({ "n": 20 })).unwrap();
+
+        // Coalescing queued this reset while the HTTP snapshot was in flight;
+        // the response already covers it, just as it covers queued ops.
+        send(
+            &mut replica,
+            json!({ "type": "reset", "scope": scope, "at": at(15) }),
+        )
+        .unwrap();
+        assert!(
+            replica.fetches().is_empty(),
+            "a covered reset must not request the same snapshot again"
+        );
+        assert_eq!(replica.documents()[scope], json!({ "n": 20 }));
+
+        // A genuinely newer reset must still suspend application.
+        send(
+            &mut replica,
+            json!({ "type": "reset", "scope": scope, "at": at(21) }),
+        )
+        .unwrap();
+        assert_eq!(replica.fetches(), [scope]);
+        assert_eq!(replica.applied(), 20);
+    }
+
+    #[test]
+    fn an_overtaken_inline_snapshot_does_not_rewind_the_installed_document() {
+        let mut replica = StreamReplica::new(["global"]);
+        send(
+            &mut replica,
+            json!({ "type": "snapshot", "scope": "global", "at": at(10), "state": { "n": 10 } }),
+        )
+        .unwrap();
+        replica
+            .install("global", &at(20), json!({ "n": 20 }))
+            .unwrap();
+        send(
+            &mut replica,
+            json!({ "type": "snapshot", "scope": "global", "at": at(15), "state": { "n": 15 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            replica.documents()["global"],
+            json!({ "n": 20 }),
+            "an inline snapshot covered by a newer HTTP snapshot is ignored"
+        );
+
+        send(
+            &mut replica,
+            json!({ "type": "snapshot", "scope": "global", "at": at(21), "state": { "n": 21 } }),
+        )
+        .unwrap();
+        assert_eq!(replica.documents()["global"], json!({ "n": 21 }));
+    }
+
+    #[test]
+    fn an_epoch_change_requires_a_new_stream_and_discards_old_pending_state() {
+        fn initial_replica() -> StreamReplica {
+            let mut replica = StreamReplica::new(["global", "session/s"]);
+            send(
+                &mut replica,
+                json!({ "type": "snapshot", "scope": "global", "at": at(10), "state": { "epoch": "old" } }),
+            )
+            .unwrap();
+            send(
+                &mut replica,
+                json!({ "type": "reset", "scope": "session/s", "at": at(10) }),
+            )
+            .unwrap();
+            send(
+                &mut replica,
+                json!({ "type": "ops", "scope": "session/s", "at": at(11), "prev": 10, "ops": set(11) }),
+            )
+            .unwrap();
+            replica
+        }
+
+        let next_epoch = json!({
+            "type": "snapshot", "scope": "global",
+            "at": { "epoch": "next", "seq": 1 }, "state": { "epoch": "next" },
+        })
+        .to_string();
+        let mut same_stream = initial_replica();
+        assert!(
+            same_stream.receive("", &next_epoch).is_err(),
+            "an epoch cannot change inside one stream"
+        );
+
+        let mut reconnected = initial_replica();
+        reconnected.reconnect(Some("e:11"));
+        // The following End at this position carries the batch's SSE id.
+        reconnected.receive("", &next_epoch).unwrap();
+        assert!(
+            reconnected.fetches().is_empty(),
+            "the old epoch's reset and buffered ops must not survive"
+        );
+        reconnected
+            .receive(
+                "next:1",
+                &json!({
+                    "type": "end", "scope": "session/s",
+                    "at": { "epoch": "next", "seq": 1 }, "reason": "replaced",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(reconnected.documents().len(), 1);
+        assert_eq!(reconnected.documents()["global"], json!({ "epoch": "next" }));
+        assert_eq!(reconnected.ended("session/s"), Some(EndReason::Replaced));
+        assert_eq!(reconnected.applied(), 1);
+    }
 }
