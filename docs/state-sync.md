@@ -189,8 +189,8 @@ Step 3 implements the Hub in `src/protocol/hub.rs`, and the routes in
 - **Coalescing.** Each stream's queue is accounted by serialized bytes. Past
   `DEFAULT_SUBSCRIBER_BUDGET` (1 MiB), its queued data for each scope collapses into
   one `reset` (sessions) or `snapshot` (`global`) at the current position; queued
-  `end` entries stay. A suffix compacted within the commit that appended it starts
-  every scope over the same way.
+  `end` entries are kept, re-issued at that position. A suffix compacted within the
+  commit that appended it starts every scope over the same way (see "Collapse").
 - **Heartbeats.** After each commit, a stream whose last message is behind the log
   gets one `position`; a queued `position` is replaced, not stacked.
 - **Atomic batches.** Each commit's messages, coalescing and heartbeat enter a
