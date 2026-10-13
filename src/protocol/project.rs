@@ -445,6 +445,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projected_mode_reflects_successful_control_response_without_notification() {
+        let mut registry = SessionRegistry::new("epoch");
+        let incarnation = registry
+            .open_new_with_replay(
+                "epoch",
+                "s",
+                "/s",
+                json!({ "sessionId": "s", "modes": {
+                    "currentModeId": "ask",
+                    "availableModes": [{ "id": "ask", "name": "Ask" }, { "id": "code", "name": "Code" }],
+                } }),
+                vec![],
+            )
+            .unwrap();
+        registry.register_new("s", incarnation);
+        registry
+            .start_operation(
+                "epoch",
+                "s",
+                incarnation,
+                "set-mode",
+                SessionOperationKind::SetMode,
+                "setting",
+            )
+            .unwrap();
+        // Follow the bridge's successful session/set_mode response path.
+        // The Agent does not have to send a separate control notification.
+        registry
+            .complete_control_operation(
+                "epoch",
+                "s",
+                incarnation,
+                "set-mode",
+                SessionOperationKind::SetMode,
+                "current_mode_update",
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
+                json!({}),
+            )
+            .unwrap();
+
+        let session = project_session(&registry, "s").unwrap();
+        assert!(session.operation.is_none(), "the control command completed");
+        assert_eq!(session.controls.modes.unwrap().current_mode_id, "code");
+    }
+
+    #[test]
+    fn projected_config_reflects_successful_control_response_without_notification() {
+        let mut registry = SessionRegistry::new("epoch");
+        let initial_options = json!([{
+            "id": "mode", "name": "Mode", "type": "select", "currentValue": "ask",
+            "options": [{ "value": "ask", "name": "Ask" }, { "value": "code", "name": "Code" }],
+        }]);
+        let mut returned_options = initial_options.clone();
+        returned_options[0]["currentValue"] = json!("code");
+        let incarnation = registry
+            .open_new_with_replay(
+                "epoch",
+                "s",
+                "/s",
+                json!({ "sessionId": "s", "configOptions": initial_options }),
+                vec![],
+            )
+            .unwrap();
+        registry.register_new("s", incarnation);
+        registry
+            .start_operation(
+                "epoch",
+                "s",
+                incarnation,
+                "set-config",
+                SessionOperationKind::SetConfig,
+                "setting",
+            )
+            .unwrap();
+        // The response carries the complete current config options. Project
+        // that result even if no config_option_update notification arrives.
+        registry
+            .complete_control_operation(
+                "epoch", "s", incarnation, "set-config", SessionOperationKind::SetConfig,
+                "config_option_update",
+                json!({ "sessionUpdate": "config_option_update", "configOptions": returned_options }),
+                json!({ "configOptions": returned_options }),
+            )
+            .unwrap();
+
+        let session = project_session(&registry, "s").unwrap();
+        assert!(session.operation.is_none(), "the control command completed");
+        assert_eq!(json!(session.controls.config_options), returned_options);
+    }
+
     fn admit_projected_turn(registry: &mut SessionRegistry, incarnation: u64) -> String {
         let revision = registry
             .state("s")
