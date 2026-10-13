@@ -539,6 +539,64 @@ fn published_documents_and_the_log_release_turn_content() {
 }
 
 #[test]
+fn completed_process_content_is_released_from_the_retained_log() {
+    const PROCESS_BODY: &str = "completed-process-body-must-leave-the-log";
+
+    fn retained_ops(replication: &Replication) -> String {
+        let log = replication.log();
+        // Permit release to compact the prefix. Inspect every surviving entry,
+        // rather than requiring an obsolete cursor to remain replayable.
+        let before_retained = log.seq() - log.len() as u64;
+        let ops = log
+            .after(before_retained)
+            .expect("the retained suffix is continuous")
+            .flat_map(|entry| entry.change_ops())
+            .collect::<Vec<_>>();
+        serde_json::to_string(&ops).unwrap()
+    }
+
+    let mut bench = Bench::new();
+    let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    bench.step();
+    let operation = bench.start_turn("s", s, "release-intent");
+    bench.update(
+        "s",
+        s,
+        &operation,
+        json!({
+            "sessionUpdate": "tool_call", "toolCallId": "read-tool", "title": "Read",
+            "status": "completed", "content": [{ "type": "content", "content": {
+                "type": "text", "text": PROCESS_BODY,
+            } }],
+        }),
+    );
+    bench.step();
+    assert!(
+        retained_ops(&bench.replication).contains(PROCESS_BODY),
+        "the log must deliver the process body while its turn is active"
+    );
+
+    bench.update("s", s, &operation, chunk("Done"));
+    bench.finish_turn("s", s, "release-intent", &operation);
+    bench.step();
+    bench.registry.release_published_runtime(u64::MAX);
+    let documents = fresh(&bench.agent, 0, &bench.registry);
+    let session = &documents[&session_scope("s")];
+    assert!(session["turn"].is_null());
+    assert!(session["history"]["timeline"].to_string().contains("Done"));
+    assert!(
+        !serde_json::to_string(&documents)
+            .unwrap()
+            .contains(PROCESS_BODY)
+    );
+    assert!(
+        !retained_ops(&bench.replication).contains(PROCESS_BODY),
+        "released process bytes must leave log-owned Op values too, without waiting for later traffic to exhaust the budget"
+    );
+    bench.settle();
+}
+
+#[test]
 fn identity_diff_cost_on_long_timelines() {
     const UPDATES: usize = 2_000;
     let mut bench = Bench::new();
@@ -597,4 +655,77 @@ impl super::log::LogEntry {
             Change::End => Vec::new(),
         }
     }
+}
+
+#[test]
+fn unchanged_session_prompt_does_not_scale_other_session_commit_allocations() {
+    fn commit_allocations(prompt_bytes: usize) -> crate::test_allocations::AllocationStats {
+        let mut bench = Bench::new();
+        let quiet = bench.open("quiet", json!({ "sessionId": "quiet" }), Vec::new());
+        let streaming = bench.open("streaming", json!({ "sessionId": "streaming" }), Vec::new());
+        let revision = bench
+            .registry
+            .state("quiet")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
+        let admission = bench
+            .registry
+            .admit_session_turn(
+                EPOCH,
+                "quiet",
+                quiet,
+                &revision,
+                "quiet-intent",
+                vec![json!({ "type": "text", "text": "q".repeat(prompt_bytes) })],
+            )
+            .unwrap();
+        assert!(matches!(admission, TurnAdmission::Accepted { .. }));
+        let operation = bench.start_turn("streaming", streaming, "streaming-intent");
+        bench.step();
+
+        // Publish once before measuring, so the next commit changes an
+        // existing update in one session while the other session is untouched.
+        bench.update("streaming", streaming, &operation, chunk("first"));
+        bench.step();
+        let before = bench.replication.log().seq();
+        let quiet_seq = bench.replication.scope_seq("session/quiet");
+        bench.update("streaming", streaming, &operation, chunk(" next"));
+
+        // Input construction, the authoritative fold and fresh-projection
+        // checks are outside the allocation measurement.
+        let (_, allocations) = crate::test_allocations::measure_allocations(|| {
+            bench.replication.commit(&bench.agent, 0, &bench.registry);
+        });
+
+        assert_eq!(bench.replication.scope_seq("session/quiet"), quiet_seq);
+        assert!(
+            bench
+                .replication
+                .log()
+                .after(before)
+                .unwrap()
+                .any(|entry| entry.scope == session_scope("streaming")),
+            "the measured commit must publish the other session's update"
+        );
+        bench.check().unwrap();
+        allocations
+    }
+
+    const SMALL_PROMPT: usize = 64 * 1024;
+    const LARGE_PROMPT: usize = 1024 * 1024;
+    let small = commit_allocations(SMALL_PROMPT);
+    let large = commit_allocations(LARGE_PROMPT);
+    let extra = large.requested_bytes.saturating_sub(small.requested_bytes);
+    let prompt_growth = LARGE_PROMPT - SMALL_PROMPT;
+    // Allow metadata/bookkeeping variation without allowing even one full
+    // copy of the additional, unchanged prompt content. This counts requested
+    // allocation bytes, not elapsed time, live memory, or allocator RSS.
+    let allowance = 64 * 1024 + prompt_growth / 16;
+    assert!(
+        extra <= allowance,
+        "an untouched prompt must not be copied for another session's update: \
+         small={small:?}, large={large:?}, extra={extra}, allowance={allowance}"
+    );
 }

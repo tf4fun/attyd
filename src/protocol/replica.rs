@@ -283,3 +283,74 @@ impl Convergence {
         Err("a lagging replica never caught up".into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{AgentPhase, Op};
+
+    fn initialized_gate() -> (AgentState, SessionRegistry, Replication, Convergence) {
+        let agent = AgentState::default();
+        let registry = SessionRegistry::new("replica-regression");
+        let mut replication = Replication::default();
+        replication.commit(&agent, 0, &registry);
+        let mut convergence = Convergence::new(0x5eed);
+        convergence
+            .check(&replication, &fresh(&agent, 0, &registry))
+            .unwrap();
+        (agent, registry, replication, convergence)
+    }
+
+    #[test]
+    fn follow_rejects_an_invalid_op_instead_of_repairing_from_fresh() {
+        let (mut agent, registry, mut replication, mut convergence) = initialized_gate();
+        agent.phase = AgentPhase::Initializing;
+        let prev = replication.scope_seq(GLOBAL).unwrap();
+        // The authoritative state changed, but the producer emitted a patch
+        // whose parent does not exist. S2 must reject this log suffix even
+        // though an independently fetched snapshot could repair the document.
+        replication.log_mut_for_test().append(
+            GLOBAL,
+            prev,
+            Change::Ops(
+                vec![Op::Set {
+                    path: "/missing/phase".into(),
+                    value: json!("initializing"),
+                }]
+                .into(),
+            ),
+        );
+
+        let result = convergence.check(&replication, &fresh(&agent, 0, &registry));
+        assert!(
+            result.is_err(),
+            "Follow must fail on an invalid producer op instead of passing by installing the comparison snapshot"
+        );
+    }
+
+    #[test]
+    fn follow_rejects_a_wrong_prev_instead_of_repairing_from_fresh() {
+        let (mut agent, registry, mut replication, mut convergence) = initialized_gate();
+        agent.phase = AgentPhase::Initializing;
+        let prev = replication.scope_seq(GLOBAL).unwrap();
+        // Delivery is ordered and the log has not compacted. A broken prev is
+        // a producer error, not one of the gate's deliberate reconnect cuts.
+        replication.log_mut_for_test().append(
+            GLOBAL,
+            prev + 1,
+            Change::Ops(
+                vec![Op::Set {
+                    path: "/agent/phase".into(),
+                    value: json!("initializing"),
+                }]
+                .into(),
+            ),
+        );
+
+        let result = convergence.check(&replication, &fresh(&agent, 0, &registry));
+        assert!(
+            result.is_err(),
+            "Follow must fail on an unexpected continuity break instead of passing by installing the comparison snapshot"
+        );
+    }
+}

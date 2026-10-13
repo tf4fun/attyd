@@ -90,6 +90,13 @@ impl Replication {
         &self.log
     }
 
+    /// Allows convergence tests to inject malformed delivery without changing
+    /// the production commit path.
+    #[cfg(test)]
+    pub(crate) fn log_mut_for_test(&mut self) -> &mut Log {
+        &mut self.log
+    }
+
     /// The `seq` of the scope's last entry, or `None` when the scope has no
     /// published document.
     pub(crate) fn scope_seq(&self, scope: &str) -> Option<u64> {

@@ -27,7 +27,7 @@ struct Peer {
 }
 
 impl Peer {
-    async fn start(timeout_seconds: i64, capabilities: Value) -> Self {
+    async fn connect(timeout_seconds: i64) -> Self {
         let (outgoing, requests) = futures::channel::mpsc::channel::<String>(64);
         let (responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(64);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -48,7 +48,7 @@ impl Peer {
             EventSink { tx: events.into() },
             cancellation.clone(),
         ));
-        let mut peer = Self {
+        Self {
             commands,
             requests,
             responses,
@@ -58,7 +58,11 @@ impl Peer {
             task: Some(task),
             state: probe.await.unwrap(),
             convergence: Convergence::new(0xc0ffee),
-        };
+        }
+    }
+
+    async fn start(timeout_seconds: i64, capabilities: Value) -> Self {
+        let mut peer = Self::connect(timeout_seconds).await;
         let initialize = peer.next_request().await;
         assert_eq!(initialize["method"], "initialize");
         peer.reply(
@@ -485,4 +489,91 @@ async fn a_bridge_transition_without_a_commit_is_caught() {
         .map(|message| *message)
         .unwrap_or_default();
     assert!(message.contains("Uncommitted"), "{message}");
+}
+
+#[tokio::test]
+async fn cancellation_commits_agent_stopped() {
+    let mut peer = Peer::start(-1, json!({})).await;
+    // Keep the epoch's authority alive to inspect its final cut after teardown.
+    let retained = peer.state.upgrade().expect("ready connection owns state");
+    peer.cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(3), peer.task.take().unwrap())
+        .await
+        .expect("bridge did not stop")
+        .expect("bridge task panicked")
+        .expect("ordinary cancellation is a clean stop");
+
+    {
+        let state = retained.lock_without_commit().await;
+        assert_eq!(
+            state.agent.phase,
+            AgentPhase::Stopped,
+            "the connection ended but the v2 authority still advertises readiness"
+        );
+        assert!(state.agent.error.is_none());
+    }
+    // The existing ready replica must reach stopped through the log.
+    let documents = peer.check().await;
+    assert_eq!(
+        documents[crate::protocol::GLOBAL]["agent"]["phase"],
+        "stopped"
+    );
+}
+
+#[tokio::test]
+async fn initialize_refusal_commits_agent_error() {
+    let mut peer = Peer::connect(-1).await;
+    let initialize = peer.next_request().await;
+    assert_eq!(initialize["method"], "initialize");
+    let retained = peer
+        .state
+        .upgrade()
+        .expect("initializing connection owns state");
+    // Install the initializing cut before rejecting the RPC: the final check
+    // must follow a log entry, not bootstrap from the final snapshot.
+    let initial = peer.check().await;
+    assert_eq!(
+        initial[crate::protocol::GLOBAL]["agent"]["phase"],
+        "initializing"
+    );
+    peer.send(json!({
+        "jsonrpc": "2.0", "id": initialize["id"],
+        "error": {
+            "code": -32603,
+            "message": "initialization refused",
+            "data": {"cause": "fixture"},
+        },
+    }))
+    .await;
+    let error = tokio::time::timeout(Duration::from_secs(3), peer.task.take().unwrap())
+        .await
+        .expect("bridge did not settle after initialization was refused")
+        .expect("bridge task panicked")
+        .expect_err("the ACP initialize error must fail this connection");
+    assert_eq!(error.message, "initialization refused");
+
+    {
+        let state = retained.lock_without_commit().await;
+        assert_eq!(
+            state.agent.phase,
+            AgentPhase::Error,
+            "the failed connection leaves the v2 authority stuck initializing"
+        );
+        let published_error = state
+            .agent
+            .error
+            .as_ref()
+            .expect("v2 keeps the connection error");
+        assert_eq!(published_error.code, crate::protocol::ErrorCode::AgentError);
+        assert_eq!(published_error.message, "initialization refused");
+        assert_eq!(
+            published_error.data,
+            Some(serde_json::to_value(&error).unwrap())
+        );
+    }
+    let documents = peer.check().await;
+    assert_eq!(
+        documents[crate::protocol::GLOBAL]["agent"]["phase"],
+        "error"
+    );
 }
