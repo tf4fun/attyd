@@ -29,6 +29,7 @@ fn setup() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
             owner: None,
             dispatch_owner: rpc_owner(&epoch, None, "coordinator-test", None),
             url_registration: None,
+            request_parent: None,
             request_lease: None,
         },
         scheduling,

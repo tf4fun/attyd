@@ -22,11 +22,14 @@ use serde_json::json;
 
 use super::BridgeHub;
 use crate::bridge::ReplicationSource;
-use crate::bridge::commands::{HeldCommand, Outcome, OwnerTag, valid_intent_key};
+use crate::bridge::commands::{
+    GlobalCommand, HeldCommand, Outcome, OwnerTag, TerminalControl, valid_intent_key,
+};
 use crate::protocol::hub::{ScopeRequest, parse_event_id};
 use crate::protocol::{
-    EmptyBody, ErrorBody, ErrorCode, InteractionResponseBody, ProtocolError, SessionCwdBody,
-    SetConfigBody, SetModeBody, TurnBody,
+    AuthTerminalInputBody, AuthTerminalStartBody, AuthenticateBody, EmptyBody, ErrorBody,
+    ErrorCode, InteractionResponseBody, ProtocolError, SessionCwdBody, SetConfigBody, SetModeBody,
+    TerminalSizeBody, TurnBody,
 };
 
 #[derive(Clone)]
@@ -74,6 +77,19 @@ impl V2State {
 pub(crate) fn router(state: V2State) -> Router {
     Router::new()
         .route("/api/v2/global", get(global))
+        .route("/api/v2/catalog", get(catalog))
+        .route("/api/v2/agent/authenticate", post(authenticate))
+        .route("/api/v2/agent/logout", post(logout))
+        .route("/api/v2/agent/auth-terminals", post(start_auth_terminal))
+        .route(
+            "/api/v2/agent/auth-terminals/{request_id}/{control}",
+            post(auth_terminal_control),
+        )
+        .route("/api/v2/sessions", post(create_session))
+        .route(
+            "/api/v2/url-flows/{interaction_id}",
+            delete(acknowledge_global_url_flow),
+        )
         .route(
             "/api/v2/sessions/{session_id}",
             get(session).delete(delete_session),
@@ -281,13 +297,153 @@ async fn delete_session(
     run(async move {
         let tag = owner_tag(&headers)?;
         if tag.incarnation == Some(0) {
-            // Cold delete (`"<epoch>:0"`) arrives with migration step 5.
-            return Err(ProtocolError::new(
-                ErrorCode::Unsupported,
-                "deleting a session the bridge does not hold is not available yet",
-            ));
+            // `"<epoch>:0"`: the bridge holds no incarnation (protocol §5.3).
+            identifier(&session_id, "session ID")?;
+            let key = intent_key(&headers)?;
+            let source = live(&state).await?;
+            return Ok(answered(source.cold_delete(key, session_id, tag).await));
         }
         held(state, session_id, headers, HeldCommand::Delete).await
+    })
+    .await
+}
+
+/// A global operation command: no owner tag (protocol §5.3).
+async fn global_command(
+    state: V2State,
+    headers: HeaderMap,
+    command: GlobalCommand,
+) -> Result<Response, ProtocolError> {
+    let key = intent_key(&headers)?;
+    let source = live(&state).await?;
+    Ok(answered(source.global_command(key, command).await))
+}
+
+async fn authenticate(State(state): State<V2State>, headers: HeaderMap, bytes: Bytes) -> Response {
+    run(async move {
+        let AuthenticateBody { method_id } = body(&bytes)?;
+        identifier(&method_id, "method ID")?;
+        global_command(state, headers, GlobalCommand::Authenticate { method_id }).await
+    })
+    .await
+}
+
+async fn logout(State(state): State<V2State>, headers: HeaderMap, bytes: Bytes) -> Response {
+    run(async move {
+        let EmptyBody {} = body(&bytes)?;
+        global_command(state, headers, GlobalCommand::Logout).await
+    })
+    .await
+}
+
+async fn start_auth_terminal(
+    State(state): State<V2State>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    run(async move {
+        let AuthTerminalStartBody {
+            method_id,
+            cols,
+            rows,
+        } = body(&bytes)?;
+        identifier(&method_id, "method ID")?;
+        global_command(
+            state,
+            headers,
+            GlobalCommand::AuthTerminal {
+                method_id,
+                cols,
+                rows,
+            },
+        )
+        .await
+    })
+    .await
+}
+
+async fn auth_terminal_control(
+    State(state): State<V2State>,
+    Path((request_id, control)): Path<(String, String)>,
+    bytes: Bytes,
+) -> Response {
+    run(async move {
+        identifier(&request_id, "request ID")?;
+        let control = match control.as_str() {
+            "input" => {
+                let AuthTerminalInputBody { data } = body(&bytes)?;
+                TerminalControl::Input { data }
+            }
+            "resize" => {
+                let TerminalSizeBody { cols, rows } = body(&bytes)?;
+                TerminalControl::Resize { cols, rows }
+            }
+            "cancel" => {
+                let EmptyBody {} = body(&bytes)?;
+                TerminalControl::Cancel
+            }
+            _ => {
+                return Err(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!("unknown auth terminal control: {control}"),
+                ));
+            }
+        };
+        let source = live(&state).await?;
+        Ok(answered(
+            source.auth_terminal_control(request_id, control).await,
+        ))
+    })
+    .await
+}
+
+async fn create_session(
+    State(state): State<V2State>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    run(async move {
+        let SessionCwdBody { cwd } = body(&bytes)?;
+        identifier(&cwd, "cwd")?;
+        global_command(state, headers, GlobalCommand::Create { cwd }).await
+    })
+    .await
+}
+
+async fn acknowledge_global_url_flow(
+    State(state): State<V2State>,
+    Path(interaction_id): Path<String>,
+) -> Response {
+    run(async move {
+        identifier(&interaction_id, "interaction ID")?;
+        let source = live(&state).await?;
+        Ok(answered(
+            source.acknowledge_global_url_flow(interaction_id).await,
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogQuery {
+    cursor: Option<String>,
+    revision: Option<String>,
+}
+
+/// `GET /api/v2/catalog?cursor=&revision=`: the Agent's paged
+/// `session/list`; `revision` is `global.catalog.revision` (protocol §6).
+async fn catalog(
+    State(state): State<V2State>,
+    query: Result<Query<CatalogQuery>, QueryRejection>,
+) -> Response {
+    run(async move {
+        let Query(CatalogQuery { cursor, revision }) =
+            query.map_err(|error| invalid(format!("invalid query: {error}")))?;
+        let cursor = cursor.filter(|cursor| !cursor.is_empty());
+        let revision = revision.filter(|revision| !revision.is_empty());
+        let source = live(&state).await?;
+        Ok(axum::Json(source.catalog(cursor, revision).await?).into_response())
     })
     .await
 }

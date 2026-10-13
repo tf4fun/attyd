@@ -352,6 +352,10 @@ pub(crate) struct CompletionRegistration {
 }
 
 impl CompletionRegistration {
+    pub(crate) fn owner(&self) -> &RequestOwner {
+        &self.owner
+    }
+
     /// Bind immediately after `send_registered` returns, without intervening I/O.
     /// An old pre-bind response is released while this registration keeps waiting
     /// for the exact SDK request ID supplied here.

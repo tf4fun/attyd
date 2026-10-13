@@ -344,6 +344,20 @@ impl BridgeBootstrap {
     }
 }
 
+/// Why the generation that just ended stopped, for the next one's
+/// `agent.predecessor`: the hub's own reason, else the Agent's final phase.
+fn predecessor(state: &mut BridgeHubState) -> Option<crate::protocol::EpochPredecessor> {
+    let reason = state.restart_reason.take();
+    let (epoch, phase) = state.replication.as_ref()?.ended_agent()?;
+    Some(crate::protocol::EpochPredecessor {
+        epoch,
+        reason: reason.unwrap_or(match phase {
+            crate::protocol::AgentPhase::Error => crate::protocol::EpochEndReason::AgentError,
+            _ => crate::protocol::EpochEndReason::AgentExit,
+        }),
+    })
+}
+
 fn terminal_auth_succeeded(event: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(event)
         .ok()
@@ -565,6 +579,8 @@ struct BridgeHubState {
     /// The current generation's protocol v2 state; after the generation
     /// ends, its final `global` document.
     replication: Option<bridge::ReplicationSource>,
+    /// Why the hub itself ended the current generation, when it did.
+    restart_reason: Option<crate::protocol::EpochEndReason>,
 }
 
 struct BridgeHub {
@@ -1027,7 +1043,7 @@ impl BridgeHub {
                 let (input_tx, input) = mpsc::unbounded_channel();
                 let cancellation = CancellationToken::new();
                 let (event_tx, events) = event_queue::channel(cancellation.clone());
-                let replication = bridge::ReplicationSource::default();
+                let replication = bridge::ReplicationSource::succeeding(predecessor(&mut state));
                 state.input = Some(input_tx);
                 state.cancellation = Some(cancellation.clone());
                 state.replication = Some(replication.clone());
@@ -1382,7 +1398,11 @@ impl BridgeHub {
                     }
                     state.bootstrap.update(&event);
                     publish_to_global_subscribers(&mut state, &event);
-                    restart.then(|| state.cancellation.clone()).flatten()
+                    let cancellation = restart.then(|| state.cancellation.clone()).flatten();
+                    if cancellation.is_some() {
+                        state.restart_reason = Some(crate::protocol::EpochEndReason::AuthRestart);
+                    }
+                    cancellation
                 };
                 if let Some(cancellation) = restart_input {
                     cancellation.cancel();
@@ -1550,6 +1570,7 @@ impl BridgeHub {
         let cancellation = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
+            state.restart_reason = Some(crate::protocol::EpochEndReason::Shutdown);
             // Event streams must finish before HTTP graceful draining can
             // complete, including when no Agent runtime is currently active.
             state.global_subscribers.clear();

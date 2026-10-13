@@ -76,6 +76,16 @@ pub(super) fn find(documents: &Documents, intent: &str) -> Option<Value> {
         .cloned()
 }
 
+/// Command records; the setup's v1 `session/new` has an `agent_request`
+/// record of its own.
+fn commands(documents: &Documents) -> impl Iterator<Item = &Value> {
+    documents[GLOBAL]["requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|request| request["operation"] != "agent_request")
+}
+
 pub(super) async fn finished(peer: &mut Peer, intent: &str) -> Value {
     let documents = peer
         .until(&format!("the record of {intent} finishes"), |documents| {
@@ -463,7 +473,7 @@ async fn a_lost_response_recovers_from_public_state_or_gets_result_expired() {
     let documents = peer.check().await;
     assert!(find(&documents, "acknowledged").is_none());
     assert_eq!(
-        documents[GLOBAL]["requests"].as_object().unwrap().len(),
+        commands(&documents).count(),
         0,
         "an acknowledgement creates no record"
     );
@@ -1114,8 +1124,8 @@ async fn a_turn_cancel_is_a_control_on_the_running_turn() {
         })
         .await;
     assert_eq!(
-        documents[GLOBAL]["requests"],
-        json!({}),
+        commands(&documents).count(),
+        0,
         "a control action creates no record"
     );
     peer.reply(&prompt, json!({"stopReason": "cancelled"}))

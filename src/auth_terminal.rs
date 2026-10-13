@@ -17,6 +17,8 @@ const AUTH_TERMINAL_READ_CHUNK_BYTES: usize = 32_768;
 pub struct AuthTerminalManager {
     active: Arc<Mutex<Option<Arc<ActiveAuthTerminal>>>>,
     events: EventSender,
+    /// The bridge's protocol v2 view of the same events, in order.
+    observer: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
 }
 
 struct AuthTerminalCleanup<'a>(&'a AuthTerminalManager);
@@ -46,7 +48,18 @@ impl AuthTerminalManager {
         Self {
             active: Arc::new(Mutex::new(None)),
             events: events.into(),
+            observer: None,
         }
+    }
+
+    /// Also delivers every lifecycle event to `observer`, in publication
+    /// order.
+    pub(crate) fn observed_by(
+        mut self,
+        observer: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub fn start(
@@ -269,6 +282,9 @@ impl AuthTerminalManager {
     }
 
     fn send(&self, event: serde_json::Value) {
+        if let Some(observer) = &self.observer {
+            let _ = observer.send(event.clone());
+        }
         let _ = self.events.send_value(event);
     }
 }

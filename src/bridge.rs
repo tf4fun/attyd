@@ -31,9 +31,9 @@ use crate::options::{Options, Transport};
 use crate::ordered_ingress::{RequestClass, RequestOwner};
 use crate::protocol::hub::{ScopeRequest, StreamQueue};
 use crate::protocol::{
-    AgentLaunch, AgentPhase, AgentState, AgentTransport, EndReason, ErrorCode as ProtocolErrorCode,
-    GlobalState, McpServerKind, McpServerSummary, Position, ProtocolError, Replication,
-    SessionState, Snapshot,
+    AgentLaunch, AgentPhase, AgentState, AgentTransport, EndReason, EpochPredecessor,
+    ErrorCode as ProtocolErrorCode, GlobalState, McpServerKind, McpServerSummary, Position,
+    ProtocolError, Replication, SessionState, Snapshot,
 };
 use crate::runtime_state::{
     RuntimeEffect, SessionLifecycle, SessionOperationKind as RuntimeSessionOperationKind,
@@ -293,6 +293,9 @@ struct BridgeState {
     /// Terminal values as the first process page read of each held session's
     /// current history revision saw them; process pages are immutable.
     process_terminals: HashMap<String, (u64, String, serde_json::Map<String, Value>)>,
+    /// `agent_request` records of out-of-session ACP requests that no v2
+    /// command started, by the v1 operation ID that sends them.
+    agent_requests: HashMap<String, String>,
 }
 
 impl BridgeState {
@@ -376,6 +379,9 @@ pub(crate) struct ReplicationSource(Arc<std::sync::Mutex<SourceState>>);
 struct SourceState {
     state: Weak<BridgeLock>,
     ended: Option<Snapshot<GlobalState>>,
+    /// Why the previous epoch ended; the connection publishes it as
+    /// `agent.predecessor`.
+    predecessor: Option<EpochPredecessor>,
 }
 
 /// A stream's queue and the observation leases it holds on its owners.
@@ -407,6 +413,22 @@ impl ReplicationSource {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The source of the connection that follows the epoch `predecessor`
+    /// names.
+    pub(crate) fn succeeding(predecessor: Option<EpochPredecessor>) -> Self {
+        let source = Self::default();
+        source.source().predecessor = predecessor;
+        source
+    }
+
+    /// The epoch and final agent phase of an ended connection.
+    pub(crate) fn ended_agent(&self) -> Option<(String, AgentPhase)> {
+        self.source()
+            .ended
+            .as_ref()
+            .map(|ended| (ended.at.epoch.clone(), ended.state.agent.phase))
     }
 
     fn attach(&self, state: &Arc<BridgeLock>) {
@@ -2548,6 +2570,7 @@ where
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
         state.agent = AgentState::starting(agent_launch(&options));
+        state.agent.predecessor = replication.source().predecessor.clone();
     }
     sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(
         state.lock().await.sessions.snapshot(),
@@ -2589,7 +2612,18 @@ where
         });
     }
     let mcp = McpManager::new(options.cwd.clone(), options.acp_mcp_providers.clone());
-    let auth_terminal = AuthTerminalManager::new(sink.tx.clone());
+    let (auth_terminal_events, mut auth_terminal_rx) = mpsc::unbounded_channel();
+    let auth_terminal = AuthTerminalManager::new(sink.tx.clone()).observed_by(auth_terminal_events);
+    {
+        // Auth terminal records follow the terminal's events in order.
+        let state = Arc::downgrade(&state);
+        tokio::spawn(async move {
+            while let Some(event) = auth_terminal_rx.recv().await {
+                let Some(state) = state.upgrade() else { break };
+                commands::auth_terminal_event(&mut *state.lock().await, &event);
+            }
+        });
+    }
     let prompt_lifecycle = Arc::new(PromptLifecycle::default());
 
     let agent_services = agent_dispatch::AgentContext {
@@ -2608,6 +2642,7 @@ where
             attempt_id: None,
         },
         url_registration: None,
+        request_parent: None,
         request_lease: None,
     };
     let builder = Client.builder().on_receive_dispatch(
@@ -3974,6 +4009,18 @@ async fn handle_command(
         &mut execution,
     )
     .await;
+    // An out-of-session request's record and request-scoped elicitations end
+    // with it (plan §2.4).
+    if matches!(
+        command.get("type").and_then(Value::as_str),
+        Some(
+            "auth/authenticate" | "auth/logout" | "session/new" | "session/list" | "session/delete"
+        )
+    ) && let Some(request_id) = command.get("requestId").and_then(Value::as_str)
+    {
+        let mut state = context.state.lock().await;
+        commands::out_of_session_request_ended(&mut state, request_id, &result);
+    }
     // A registered history flow ends inside the same boundary as its business
     // outcome: the response publishes first, then the flow releases and the
     // idle interval restarts — even when the ordered epilogue was skipped.
@@ -4086,6 +4133,12 @@ async fn handle_command_inner(
                 return Err(Error::invalid_request()
                     .data("terminal authentication methods must use auth/terminal_start"));
             }
+            commands::out_of_session_request(
+                &mut *state.lock().await,
+                request_id,
+                "authenticate",
+                None,
+            );
             let response = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -4096,6 +4149,7 @@ async fn handle_command_inner(
             )
             .await??;
             relay_bytes(&response)?;
+            state.lock().await.agent.authenticated_method_id = Some(method_id.to_string());
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -4109,6 +4163,12 @@ async fn handle_command_inner(
         "auth/logout" => {
             let request_id = string_field(&command, "requestId")?;
             require_agent_method("auth/logout", &state).await?;
+            commands::out_of_session_request(
+                &mut *state.lock().await,
+                request_id,
+                "auth/logout",
+                None,
+            );
             let response = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -4119,6 +4179,7 @@ async fn handle_command_inner(
             )
             .await??;
             relay_bytes(&response)?;
+            state.lock().await.agent.authenticated_method_id = None;
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -4134,6 +4195,7 @@ async fn handle_command_inner(
             {
                 let mut state = state.lock().await;
                 state.pending_creations += 1;
+                commands::out_of_session_request(&mut state, &request_id, "session/new", None);
             }
             let request = NewSessionRequest::new(&cwd)
                 .additional_directories(local_additional_directories(&options))
@@ -4217,6 +4279,12 @@ async fn handle_command_inner(
                     }
 
                     session_mirror(&mut state).register_new(session_id.clone(), incarnation);
+                    commands::returned_owner_held(
+                        &mut state,
+                        &request_id,
+                        &session_id,
+                        incarnation,
+                    );
                     advance_catalog_revision(&mut state, &sink);
                     flush_runtime(&mut state, &sink);
                     let mirror_view = session_view_value(&mut state, &session_id, incarnation)?;
@@ -4269,10 +4337,11 @@ async fn handle_command_inner(
             // Keep the Agent's cursor opaque. Business pagination separately binds
             // the whole chain to the directory revision of its first page.
             let catalog_revision = {
-                let state = state.lock().await;
+                let mut state = state.lock().await;
                 if let Some(expected) = expected_revision {
                     require_catalog_revision(&state, expected)?;
                 }
+                commands::out_of_session_request(&mut state, &request_id, "session/list", None);
                 session_catalog_revision(&state)
             };
             // Startup cwd is the new-session default, not a discovery filter.
@@ -4900,7 +4969,7 @@ async fn handle_command_inner(
             advance_catalog_revision(&mut state, &sink);
             flush_runtime(&mut state, &sink);
             creation_finish.committed(incarnation)?;
-            commands::fork_target_held(&mut state, &request_id, &session_id, incarnation);
+            commands::returned_owner_held(&mut state, &request_id, &session_id, incarnation);
             drop(state);
             let target_owner =
                 rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
@@ -5209,6 +5278,15 @@ async fn handle_command_inner(
             let DeletionReservation::Session(incarnation) = deletion else {
                 // An unopened history row is a catalog operation. Keep only the
                 // ID reservation; its RPC and completion use the global lane.
+                commands::out_of_session_request(
+                    &mut *state.lock().await,
+                    &request_id,
+                    "session/delete",
+                    Some(crate::protocol::RequestTarget {
+                        session_id: session_id.clone(),
+                        incarnation: None,
+                    }),
+                );
                 let result = send_ordered(
                     &connection,
                     ingress.as_ref(),

@@ -25,6 +25,7 @@ pub(super) struct AgentContext {
     pub(super) owner: Option<SessionResourceOwner>,
     pub(super) dispatch_owner: RequestOwner,
     pub(super) url_registration: Option<UrlRegistration>,
+    pub(super) request_parent: Option<RequestOwner>,
     pub(super) request_lease: Option<InboundRequestLease>,
 }
 
@@ -523,6 +524,26 @@ async fn elicitation(
             .as_deref()
             .map(|id| context.require_owner(&state, id))
             .transpose()?;
+        // A request-scoped elicitation belongs to the out-of-session request
+        // it names; once that request ended, nothing can answer it.
+        let parent = match context
+            .request_parent
+            .as_ref()
+            .filter(|parent| owner.is_none() && parent.session_id.is_none())
+        {
+            Some(parent) => match commands::running_parent(&state, &parent.operation_id) {
+                Some(request_id) => Some(request_id),
+                None => {
+                    drop(state);
+                    drop(turn);
+                    return respond(
+                        responder,
+                        Ok(CreateElicitationResponse::new(ElicitationAction::Cancel)),
+                    );
+                }
+            },
+            None => None,
+        };
         {
             if let Some(url_elicitation_id) = &url_elicitation_id {
                 if url_elicitation_id.is_empty() {
@@ -563,6 +584,11 @@ async fn elicitation(
                 state
                     .request_elicitations
                     .insert(elicitation_id.clone(), pending);
+                if let Some(request_id) = parent {
+                    state
+                        .sessions
+                        .set_request_parent(&elicitation_id, request_id);
+                }
             }
             let delta = owner.as_ref().map(|owner| advance_session_delta(
                 &mut state, &owner.session_id, owner.incarnation,
@@ -895,6 +921,7 @@ mod tests {
                     attempt_id: Some("allocation".to_owned()),
                 },
                 url_registration: None,
+                request_parent: None,
                 request_lease: None,
             },
             scheduling,
@@ -936,6 +963,7 @@ mod tests {
                 owner: owner.clone(),
                 dispatch_owner: context.dispatch_owner.clone(),
                 url_registration: None,
+                request_parent: None,
             };
             route.dispatch_owner.session_id = owner.as_ref().map(|owner| owner.session_id.clone());
             route.dispatch_owner.incarnation = owner.as_ref().map(|owner| owner.incarnation);
@@ -1198,6 +1226,7 @@ mod tests {
                     owner: None,
                     dispatch_owner: context.dispatch_owner.clone(),
                     url_registration: None,
+                    request_parent: None,
                 };
                 route.dispatch_owner.attempt_id = Some(format!("allocation-{index}"));
                 let lease = inbound

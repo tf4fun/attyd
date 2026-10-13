@@ -12,7 +12,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ProtocolError, Request, RequestResult, RequestStatus, RequestTarget, TurnOutcomeStatus,
+    AuthTerminalState, ProtocolError, Request, RequestResult, RequestStatus, RequestTarget,
+    TurnOutcomeStatus,
 };
 
 /// The default intent table budget per epoch. Tombstones of about a hundred
@@ -352,6 +353,22 @@ impl CommandBook {
             .filter(|request| request.status == RequestStatus::Running)
         {
             request.target = Some(target);
+        }
+    }
+
+    /// Changes a running auth terminal record's terminal state.
+    pub(crate) fn update_terminal(
+        &mut self,
+        request_id: &str,
+        update: impl FnOnce(&mut AuthTerminalState),
+    ) {
+        if let Some(terminal) = self
+            .requests
+            .get_mut(request_id)
+            .filter(|request| request.status == RequestStatus::Running)
+            .and_then(|request| request.terminal.as_mut())
+        {
+            update(terminal);
         }
     }
 
