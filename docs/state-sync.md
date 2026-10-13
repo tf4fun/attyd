@@ -183,12 +183,30 @@ existing `url_flow_in_use` check keeps that unique. Acknowledgement uses the
 that reused A's `elicitationId`.
 
 **Intents.** Every operation command and turn start goes through one intent table per
-epoch, keyed by `clientIntentId`. Each entry stores a fingerprint, `(method, target sessionId, owner
-tag, body digest)`, and the record or operation ID it produced. Equal bodies sent to
-different targets therefore conflict instead of aliasing. Turns already keep an
-intent table (H07), which gains the target fields. Create and fork gain the table, so
-a retry or a lost response resolves to the existing record. The same holds for every
-other operation command.
+epoch, keyed by `clientIntentId`. Each entry stores:
+
+- the fingerprint `(operation, target, owner tag, body digest)`, where `target`
+  includes every path parameter (`sessionId`, `configId`, `interactionId`,
+  `operationId`, `requestId`);
+- the record or operation ID it produced;
+- that record's final status.
+
+Equal bodies sent to different targets therefore conflict instead of aliasing:
+config A versus config B, or two interactions given the same answer. Turns already
+keep an intent table (H07), which gains the target fields. The table is independent
+of public records, and outlives acknowledgement, retention and scope end, so a resend
+after a lost response never runs twice. When the record is gone, the resend answers
+`duplicate` with `resultExpired` (protocol §5.2). Only the memory budget bounds the
+table.
+
+**First-subscription lease.** Open, create and fork grant a lease on the owner they
+return, through the existing `ObservationLease` machinery. A stream subscription to
+that owner takes the lease over; otherwise it expires after a grace period. The grace
+period is independent of `--session-unobserved-timeout` (`src/options.rs:80`).
+Without the lease, an unobserved timeout of `0` lets `SessionObservers` start
+retirement as soon as a new session is Active and idle
+(`src/session_observers.rs:161`), before its creator can subscribe. That race exists
+in v1 today.
 
 **Cold delete.** `If-Match: "<epoch>:0"` is checked against the registry in the same
 actor turn that starts the request, so there is no window in which the session
@@ -294,6 +312,9 @@ discards the replica at the critical point and rebuilds it from public state:
 | An HTTP snapshot at 20 overtakes SSE entries 11–20 for the same scope | covered entries are ignored, no second reset |
 | Permission and form responses whose HTTP response is lost: delivered, answered by another client first, cancelled by the Agent before delivery | interaction response records |
 | Two clients set different modes on one session; one is refused, and one response is lost | `clientIntentId` and `params` on command records |
+| One key reused for `config/A` and `config/B` with the same `value`, and for two interactions given the same answer | `target` in the fingerprint |
+| Lost response where the record was acknowledged by another page, retained out, or ended with its scope; and a lost response for a turn that is still running | recovery order and `resultExpired`; no second execution |
+| Create and fork with `--session-unobserved-timeout 0`, subscribing after a delay shorter than the grace period, with an Agent without `load`/`resume` | first-subscription lease |
 | Acknowledging a finished request | control actions create no records |
 | `set_mode` / `set_config` refused by the Agent, and close of a held session, each with the HTTP response dropped | session command records in `global.requests` |
 | Auth terminal running, then failed, with two advertised methods, rebuilt from public state | `methodId` on the record |
@@ -323,7 +344,7 @@ working throughout. Each step is one PR, validated in CI.
 | 1 | v2 chain columns in the coverage ledger. Protocol DTOs with generated TypeScript. `project_global` and `project_session` with unit tests, including control reduction. | #5 |
 | 2 | Commit step, log and identity-based diff; in-process convergence harness | — |
 | 3 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}` and `GET /api/v2/stream`: Hub cut, `prev`, coalescing, resume, `position`; owner-qualified session subscriptions that never materialize; every scope pending until installed; covered-entry filtering; retired-incarnation table | — |
-| 4 | Session commands with `at`/`scopes`, `If-Match` tags and `ProtocolError`; the open command and its lease; intents for every operation command; interaction response records; the reads | — |
+| 4 | Session commands with `at`/`scopes`, `If-Match` tags and `ProtocolError`; the open command and the first-subscription lease for open, create and fork; intents for every operation command; interaction response records; the reads | — |
 | 5 | Request records for every accepted command and out-of-session ACP request; global interactions and URL flows keyed by interaction; auth flows and the auth terminal; create and fork intents; cold delete; `agent.predecessor` | — |
 | 6 | Web UI on v2, with a generic replica engine (JSON Pointer patcher plus validation, with received and applied positions) outside React; sidebar markers from `global.sessions` | #16, #17 (visible fix) |
 | 7 | Remove v1: routes, business events, `advance_session_delta`, `touch`, `cachedSessions` and compensating browser state, and the journal replica if it has no other consumer | #18 |

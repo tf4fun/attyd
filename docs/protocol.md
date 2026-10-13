@@ -125,6 +125,11 @@ interface SessionSummary {
 
 interface Request {
   requestId: string;                         // bridge-allocated, unique in the epoch
+  operation: string;                         // protocol operation: "open", "create", "fork",
+                                             // "set_mode", "set_config", "close", "delete",
+                                             // "authenticate", "logout", "auth_terminal",
+                                             // "interaction_response", or "agent_request"
+                                             // for ACP requests the bridge starts itself
   method: string;                            // ACP method ("authenticate", "logout",
                                              // "session/new", "session/fork",
                                              // "session/set_mode", "session/close",
@@ -405,8 +410,11 @@ Any other epoch starts every scope fresh. Resuming never reopens a session (§4.
 **`position`.** This entry advances the stream without data. The server sends it,
 coalesced, when the log moves through scopes the stream doesn't carry.
 
-**`end`.** The document no longer exists for this subscription. For a new
-incarnation, the old document ends with `replaced`, and a new `reset` follows.
+**`end`.** The document no longer exists for this subscription, and the scope stays
+ended for the rest of the stream. A subscription is bound to one owner (§4.2), so
+nothing follows `end` for that scope. If the session is held under a new
+incarnation, `end` says `replaced`, and the replica opens the session again to get
+the new owner.
 
 ### 4.1 Received and applied position
 
@@ -450,12 +458,20 @@ It has two halves:
   starts `load` or `resume` as its `operation`. Today's capability rules and the
   given `cwd` apply.
 - **Result:** in both cases, `{ sessionId, incarnation }` in the record's `result`,
-  plus an *open lease*. The lease keeps the session observed until a stream
-  subscribes to that owner, or until a grace period (default 30 s) expires.
+  plus a *first-subscription lease*.
 - **Retry:** a retry with the same key returns the same owner and never
   materializes again.
 - **Failures:** load failure, retry and backoff appear as `history.phase`,
   `history.error` and `operation`, as they do today.
+
+**First-subscription lease.** Every command whose result names a session owner the
+client hasn't subscribed to yet grants a lease on that owner: open, create, and fork
+(on the new target). The lease counts as an observation (H13). It ends when a stream
+subscribes to that owner, or when a grace period expires (default 30 s, independent
+of `--session-unobserved-timeout`). Even with an unobserved timeout of `0`, a session
+that was just created or forked isn't retired before its creator can subscribe. This
+matters most for Agents without `load`/`resume`, where a retired session couldn't be
+opened again. A retried command grants a fresh lease on the same owner.
 
 **Subscribe.** A session scope is always written with its full owner:
 
@@ -516,23 +532,50 @@ Every operation command (§3.1) and turn start requires an
 it can find its own submission among those of other clients. Control actions take no
 key. Within one epoch:
 
-- the intent fingerprint is `(method, target sessionId, owner tag, body digest)`. A
-  fork of A and a fork of B, or the same prompt sent to two sessions, are different
-  intents even though their bodies are equal;
+- the intent fingerprint is `(operation, target, owner tag, body digest)`:
+  - `operation` is the protocol operation, for example `set_config` or
+    `interaction_response`, not the ACP method;
+  - `target` is the complete addressed resource: every path parameter (`sessionId`,
+    `configId`, `interactionId`, `operationId`, `requestId`) and the scope it
+    belongs to.
+
+  Forks of A and B, the same prompt sent to two sessions, `value: "on"` sent to
+  config A and to config B, or the same answer to two interactions are therefore all
+  different intents, even when their bodies are equal;
 - the same key with the same fingerprint returns the original result with
   `disposition: "duplicate"`, and creates nothing new;
 - the same key with a different fingerprint fails with `intent_conflict`;
-- the record carries `clientIntentId`. A replica whose HTTP response was lost finds
-  its result in `global.requests` (or `outcomes` for a turn) by its own intent ID. If
-  there is no such record, the command was never accepted, and resending it with the
-  same key is safe.
+- the bridge keeps the intent table for the whole epoch, separately from the public
+  records. It is bounded only by a memory budget that is far larger than record
+  retention; an evicted intent is the one documented gap. The table outlives
+  acknowledgement, record retention and the end of the target scope.
+
+**Recovery after a lost response.** A replica looks for its `clientIntentId` in this
+order:
+
+1. `turn.clientIntentId` of the subscribed session (a turn that is still running);
+2. that session's `outcomes`;
+3. `global.requests`.
+
+A match is the answer. **No match proves nothing.** The command may never have been
+accepted, or its record may have been acknowledged, retained out, or ended with its
+scope. The replica resolves this by resending the same command with the same key:
+
+| Intent table says | Response |
+| --- | --- |
+| unknown key | the command runs now, as a first submission |
+| known, same fingerprint, result still public | `disposition: "duplicate"` with the original `requestId` or `operationId` |
+| known, same fingerprint, result no longer public | `disposition: "duplicate"`, `resultExpired: true`, the original ID and its final `status`; nothing runs again |
+| known, different fingerprint | `intent_conflict` |
 
 Exactly-once doesn't cross epochs. A new Agent connection forgets intents, in line
 with H07 and H15.
 
 ### 5.3 Preconditions
 
-Every session-addressed command names the state it expects in `If-Match`:
+Every session-addressed command names the state it expects in `If-Match`, with these
+exceptions. Open (§4.2) and `POST /sessions` take no owner tag, because they exist to
+learn one. Global commands (§5.4) take no tag either.
 
 | Tag | Meaning | Used by |
 | --- | --- | --- |
@@ -544,7 +587,8 @@ Interactions use `"<epoch>"` (global) or `"<epoch>:<incarnation>"` (session). Co
 delete never loads the session. It follows the existing cold-deletion path, without
 `new`/`load`/`resume`/`close`. If the session became held in the meantime, the tag
 fails with `owner_mismatch`, and the current incarnation is in `global.sessions`.
-Delete is the only cold-session command. Everything else needs a held session.
+Apart from open, delete is the only command that works on a session the bridge
+doesn't hold. Everything else needs a held session.
 
 ### 5.4 Global commands
 
@@ -565,8 +609,6 @@ their `requestId`. Rows marked *control* take no key and create no record.
 
 ### 5.5 Session commands
 
-| Command | Body | Result |
-| --- | --- | --- |
 | Command | Body | Result |
 | --- | --- | --- |
 | `POST /api/v2/sessions/{id}/open` | `{ cwd }` | `{ requestId }`; no `If-Match` (§4.2) |
