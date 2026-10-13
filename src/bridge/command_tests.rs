@@ -15,7 +15,7 @@ mod review_process_lifetime;
 mod review_replication;
 mod review_turns;
 
-async fn epoch(peer: &Peer) -> String {
+pub(super) async fn epoch(peer: &Peer) -> String {
     let (status, global) = get(&peer.router, "/api/v2/global").await;
     assert_eq!(status, StatusCode::OK);
     global["at"]["epoch"].as_str().unwrap().to_string()
@@ -48,7 +48,7 @@ async fn owner(peer: &mut Peer, session_id: &str) -> String {
     )
 }
 
-async fn command(
+pub(super) async fn command(
     peer: &Peer,
     method: &str,
     path: &str,
@@ -68,7 +68,7 @@ async fn command(
 
 /// A replica's recovery by intent: the record whose `clientIntentId` it
 /// chose (protocol §5.2).
-fn find(documents: &Documents, intent: &str) -> Option<Value> {
+pub(super) fn find(documents: &Documents, intent: &str) -> Option<Value> {
     documents[GLOBAL]["requests"]
         .as_object()?
         .values()
@@ -76,7 +76,7 @@ fn find(documents: &Documents, intent: &str) -> Option<Value> {
         .cloned()
 }
 
-async fn finished(peer: &mut Peer, intent: &str) -> Value {
+pub(super) async fn finished(peer: &mut Peer, intent: &str) -> Value {
     let documents = peer
         .until(&format!("the record of {intent} finishes"), |documents| {
             find(documents, intent).is_some_and(|request| request["status"] != "running")

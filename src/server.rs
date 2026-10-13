@@ -4413,6 +4413,78 @@ mod tests {
         (hub, observer)
     }
 
+    /// A v2 request through the production routes of `hub`.
+    async fn v2_request(
+        hub: &Arc<BridgeHub>,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = axum::http::Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let body = body.map_or_else(Body::empty, |body| Body::from(body.to_string()));
+        let response = v2::router(v2::V2State::hub(hub.clone()))
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_login_restart_names_auth_restart_as_the_predecessor() {
+        let (hub, observer) = capability_fixture(&["--terminal-auth"]).await;
+        let (status, first) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let first_epoch = first["at"]["epoch"].as_str().unwrap().to_string();
+        assert_eq!(
+            first["state"]["agent"]["predecessor"],
+            serde_json::Value::Null
+        );
+        let (status, accepted) = v2_request(
+            &hub,
+            "POST",
+            "/api/v2/agent/auth-terminals",
+            &[("idempotency-key", "terminal-login")],
+            Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        hub.unsubscribe(observer.id, observer.generation).await;
+
+        // The login exits successfully and the hub restarts the Agent; the
+        // next epoch says why the previous one ended.
+        let next = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                hub.ensure_runtime().await;
+                let (_, global) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+                if global["at"]["epoch"]
+                    .as_str()
+                    .is_some_and(|epoch| epoch != first_epoch)
+                    && global["state"]["agent"]["phase"] == "ready"
+                {
+                    return global;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the Agent never restarted after the terminal login");
+        hub.shutdown().await;
+        assert_eq!(
+            next["state"]["agent"]["predecessor"],
+            json!({"epoch": first_epoch, "reason": "auth_restart"}),
+            "{next}"
+        );
+    }
+
     #[tokio::test]
     async fn cold_session_deletion_uses_global_management_without_loading() {
         let (hub, observer) = capability_fixture(&["--delete", "--close"]).await;

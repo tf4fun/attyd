@@ -66,6 +66,8 @@ mod convergence_tests;
 mod coordinator;
 #[cfg(test)]
 mod coordinator_tests;
+#[cfg(test)]
+mod global_tests;
 mod inbound_requests;
 #[cfg(test)]
 mod memory_efficiency_tests;

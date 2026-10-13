@@ -33,6 +33,15 @@ pub(super) struct Peer {
 
 impl Peer {
     pub(super) async fn connect(timeout_seconds: i64) -> Self {
+        Self::connect_with(timeout_seconds, |_| {}).await
+    }
+
+    /// A bridge whose options the test adjusts, such as the Agent command an
+    /// auth terminal runs.
+    pub(super) async fn connect_with(
+        timeout_seconds: i64,
+        configure: impl FnOnce(&mut Options),
+    ) -> Self {
         let (outgoing, requests) = futures::channel::mpsc::channel::<String>(64);
         let (responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(64);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -42,6 +51,7 @@ impl Peer {
                 .normalized()
                 .unwrap();
         options.session_unobserved_timeout = timeout_seconds;
+        configure(&mut options);
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
@@ -71,12 +81,25 @@ impl Peer {
     }
 
     pub(super) async fn start(timeout_seconds: i64, capabilities: Value) -> Self {
-        let mut peer = Self::connect(timeout_seconds).await;
+        Self::start_with(timeout_seconds, capabilities, json!([]), |_| {}).await
+    }
+
+    /// A ready bridge whose Agent advertises `auth_methods`.
+    pub(super) async fn start_with(
+        timeout_seconds: i64,
+        capabilities: Value,
+        auth_methods: Value,
+        configure: impl FnOnce(&mut Options),
+    ) -> Self {
+        let mut peer = Self::connect_with(timeout_seconds, configure).await;
         let initialize = peer.next_request().await;
         assert_eq!(initialize["method"], "initialize");
         peer.reply(
             &initialize,
-            json!({"protocolVersion": 1, "agentCapabilities": capabilities, "authMethods": []}),
+            json!({
+                "protocolVersion": 1, "agentCapabilities": capabilities,
+                "authMethods": auth_methods,
+            }),
         )
         .await;
         peer.until("the agent is ready", |documents| {
