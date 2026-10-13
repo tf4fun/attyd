@@ -260,6 +260,9 @@ impl HttpStream {
                 _ => return false,
             }
         }
+        if self.replica.ahead_of(seq) {
+            return false; // a fetched snapshot is newer than this cut
+        }
         if let Some(divergence) = self.replica.diverges(fresh) {
             panic!("{divergence}");
         }

@@ -241,6 +241,11 @@ impl StreamReplica {
             .fold(self.received, u64::min)
     }
 
+    /// Some scope holds a snapshot later than `seq`.
+    pub(crate) fn ahead_of(&self, seq: u64) -> bool {
+        self.scopes.values().any(|replica| replica.installed > seq)
+    }
+
     pub(crate) fn ended(&self, scope: &str) -> Option<EndReason> {
         self.scopes.get(scope).and_then(|replica| replica.ended)
     }

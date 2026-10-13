@@ -154,6 +154,9 @@ async fn sse_resume_returns_the_retired_owner_without_fresh_open() {
         state.replication.log_mut_for_test().compact_through(seq);
     }
     compacted.reconnect(&peer.router).await;
+    while compacted.replica.ended(&session_scope(SESSION)).is_none() {
+        compacted.next().await;
+    }
     let (seq, documents) = peer.cut().await;
     assert!(compacted.check(&peer.router, seq, &documents).await);
     assert_eq!(
@@ -260,8 +263,9 @@ async fn coalescing_a_slow_subscriber_gives_the_same_final_replica() {
     let (seq, documents) = peer.cut().await;
     assert!(slow.check(&peer.router, seq, &documents).await);
     assert!(
-        slow.replica.resets >= 2,
-        "the slow subscriber was coalesced into a reset"
+        slow.entries.len() < 60,
+        "the slow subscriber's queue was coalesced: {} entries for 120 chunks",
+        slow.entries.len()
     );
     assert_eq!(
         slow.replica.documents(),
