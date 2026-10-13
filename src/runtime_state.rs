@@ -1906,6 +1906,8 @@ impl SessionRegistry {
         }) {
             return Err(RuntimeStateError::OperationMismatch);
         }
+        // The acknowledged control is the latest state, after any response.
+        session.controls.fold_update(&control_update);
         session
             .control_state
             .insert(control_key.into(), control_update);
