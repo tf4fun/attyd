@@ -30,8 +30,8 @@ use crate::mcp_config::{server_name, server_type};
 use crate::options::{Options, Transport};
 use crate::ordered_ingress::{RequestClass, RequestOwner};
 use crate::protocol::{
-    AgentLaunch, AgentPhase, AgentState, AgentTransport, McpServerKind, McpServerSummary,
-    Replication,
+    AgentLaunch, AgentPhase, AgentState, AgentTransport, ErrorCode as ProtocolErrorCode,
+    McpServerKind, McpServerSummary, ProtocolError, Replication,
 };
 use crate::runtime_state::{
     RuntimeEffect, SessionLifecycle, SessionOperationKind as RuntimeSessionOperationKind,
@@ -2403,7 +2403,8 @@ where
         agent_client_protocol::on_receive_dispatch!(),
     );
 
-    builder
+    let authority = state.clone();
+    let result = builder
         .connect_with(transport, async move |connection| {
             let _auth_terminal_cleanup = auth_terminal.close_on_drop();
             state.lock().await.agent.phase = AgentPhase::Initializing;
@@ -2874,7 +2875,32 @@ where
             }
             Ok(())
         })
-        .await
+        .await;
+    // The epoch's last commit: replicas learn how the connection ended.
+    {
+        let mut state = authority.lock().await;
+        match &result {
+            Ok(()) => {
+                state.agent.phase = AgentPhase::Stopped;
+                state.agent.error = None;
+            }
+            Err(error) => {
+                state.agent.phase = AgentPhase::Error;
+                state.agent.error = Some(agent_error(error));
+            }
+        }
+    }
+    result
+}
+
+/// An ACP error as a v2 `agent_error` (protocol §7): `data` keeps the ACP
+/// error `{ code, message, data }`.
+fn agent_error(error: &Error) -> ProtocolError {
+    ProtocolError {
+        code: ProtocolErrorCode::AgentError,
+        message: error.message.clone(),
+        data: serde_json::to_value(error).ok(),
+    }
 }
 
 fn error_message(error: Error) -> String {

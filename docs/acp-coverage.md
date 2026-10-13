@@ -99,7 +99,7 @@ their user-visible effects are projected.
 
 | ACP surface | Bridge authority | Projection / command | Finished result | Recovery | Lifecycle end | Test |
 | --- | --- | --- | --- | --- | --- | --- |
-| `initialize` | connection task | G `/agent/initialize`, `/agent/phase` | `/agent/phase = ready`, or `/agent/error` | `GET /api/v2/global` | epoch end; next epoch's `/agent/predecessor` | `summaries_report_work_and_pending_counts` (agent copy); step 5 (predecessor) |
+| `initialize` | connection task | G `/agent/initialize`, `/agent/phase` | `/agent/phase = ready`, or `/agent/error` | `GET /api/v2/global` | epoch end; next epoch's `/agent/predecessor` | `summaries_report_work_and_pending_counts` (agent copy), `cancellation_commits_agent_stopped`, `initialize_refusal_commits_agent_error`; step 5 (predecessor) |
 | Agent transport | launch options | G `/agent/launch/transport` | static per epoch | global snapshot | epoch end | step 3 |
 | `session/new` | creation staging | `POST /api/v2/sessions` → G `/requests/<id>` (`create`) | record `result.kind = session`; first-subscription lease | `global.requests` by `clientIntentId` | record acknowledged or retained out | step 5 |
 | `session/prompt` | turn admission (`SessionState`) | `POST …/turns` → S `/turn` | S `/outcomes/<operationId>` | `turn`, then `outcomes` (protocol §5.2) | outcome retained out; session `end` | `completed_turns_release_process_content_and_attachment_bytes` (projection); step 4 |
