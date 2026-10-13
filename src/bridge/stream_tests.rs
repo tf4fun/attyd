@@ -361,7 +361,7 @@ async fn an_owner_subscription_observes_its_session_until_the_stream_drops() {
 
 #[tokio::test]
 async fn the_connection_end_closes_streams_and_keeps_the_final_global_readable() {
-    let mut peer = Peer::start(-1, json!({})).await;
+    let peer = Peer::start(-1, json!({})).await;
     let router = peer.router.clone();
     let mut stream = HttpStream::open(&router, &[GLOBAL.to_string()]).await;
     let (seq, documents) = peer.cut().await;

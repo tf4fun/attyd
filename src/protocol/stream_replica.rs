@@ -246,7 +246,6 @@ impl StreamReplica {
             self.covered += 1;
             return Ok(());
         }
-        self.snapshots += 1;
         if let Some(reset) = replica.reset_at
             && at.seq < reset
         {
@@ -265,6 +264,7 @@ impl StreamReplica {
             replica.apply(scope, seq, prev, &ops)?;
         }
         self.covered += covered;
+        self.snapshots += 1;
         Ok(())
     }
 
