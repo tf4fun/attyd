@@ -140,7 +140,9 @@ The log is a bounded in-memory suffix per epoch, accounted by bytes (8 MiB by
 default, `DEFAULT_LOG_BUDGET` in `src/protocol/log.rs`). Compaction drops the oldest
 entries but always keeps the newest. When a turn ends, its process content leaves
 the documents (S6), so the log also drops every entry up to the session's previous
-one: those entries carried that content, and a replica behind them resets. A replica asking to resume from before the
+one: those entries carried that content, and a replica behind them resets. A
+session scope that ends while its turn is active (close or retirement during a
+turn) releases the same way. A replica asking to resume from before the
 retained suffix gets a `reset` (protocol §4). An entry whose session was retired or
 replaced by a new incarnation ends the scope; the next incarnation's first entry
 has `prev = 0` and creates its document.
@@ -337,7 +339,8 @@ Both places mutate state without committing and assert that the harness reports
 it. A replica that meets a continuity break or an op that does not apply fails the
 gate; snapshots replace entries only at the first cut, a coalesced queue, a
 reconnect, or a compacted position. The connection's end commits `agent.phase`
-`stopped`, or `error` with the ACP error as `agent_error`. S7 needs command positions, so its check arrives with the commands in step 4.
+`stopped`, or `error` with the ACP error as `agent_error`, for every exit after the
+epoch exists, including workspace setup failures. S7 needs command positions, so its check arrives with the commands in step 4.
 
 Convergence can't detect a projection that is missing something. If both the
 snapshot and the ops leave out global URL flows, they still agree. That is what the

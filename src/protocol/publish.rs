@@ -128,6 +128,11 @@ impl Replication {
             let published = self.sessions.remove(&session_id).expect("listed above");
             self.log
                 .append(&session_scope(&session_id), published.seq, Change::End);
+            // A scope that ends during a turn releases that turn's process
+            // content, as a turn that ends does.
+            if published.turn.is_some() {
+                self.log.compact_through(published.seq);
+            }
         }
         for session_id in registry.sessions.keys() {
             if let Some(source) = SessionSource::new(registry, session_id) {

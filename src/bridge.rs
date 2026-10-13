@@ -2321,6 +2321,10 @@ where
     let state = Arc::new(BridgeLock::new(BridgeState::default()));
     #[cfg(test)]
     memory_retention_tests::capture_coordinator_state(&state);
+    let authority = state.clone();
+    // Every exit after the epoch exists, setup failures included, ends with
+    // the agent's terminal state below.
+    let result: Result<(), Error> = async move {
     let epoch = state.lock().await.sessions.epoch().to_string();
     let (mut scheduling, ingress) =
         scheduling::Scheduling::new(epoch.clone(), sink.clone(), cancellation.clone())?;
@@ -2403,8 +2407,7 @@ where
         agent_client_protocol::on_receive_dispatch!(),
     );
 
-    let authority = state.clone();
-    let result = builder
+    builder
         .connect_with(transport, async move |connection| {
             let _auth_terminal_cleanup = auth_terminal.close_on_drop();
             state.lock().await.agent.phase = AgentPhase::Initializing;
@@ -2875,7 +2878,9 @@ where
             }
             Ok(())
         })
-        .await;
+        .await
+    }
+    .await;
     // The epoch's last commit: replicas learn how the connection ended.
     {
         let mut state = authority.lock().await;
