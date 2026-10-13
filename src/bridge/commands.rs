@@ -6,6 +6,7 @@
 //! response. The command then runs through the same bridge input as v1, and
 //! its result reaches the record when it finishes. A synchronous rejection
 //! commits nothing. Reads never materialize a session.
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::*;
