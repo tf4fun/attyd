@@ -123,7 +123,8 @@ impl StreamReplica {
         let at: Position =
             serde_json::from_value(field("at")?).map_err(|error| format!("{data}: {error}"))?;
         self.entries += 1;
-        if id != format!("{}:{}", at.epoch, at.seq) {
+        // An entry without an id shares its position with the next one.
+        if !id.is_empty() && id != format!("{}:{}", at.epoch, at.seq) {
             return Err(format!("SSE id {id} for an entry at {at:?}"));
         }
         self.position(&at)?;

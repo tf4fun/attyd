@@ -63,7 +63,10 @@ impl Client {
         let mut entries = Vec::new();
         while let Some(Message { id, data }) = self.queue.try_next() {
             self.replica.receive(&id, &data).unwrap();
-            self.last_id = Some(id);
+            // As EventSource does, only a message with an id moves it.
+            if !id.is_empty() {
+                self.last_id = Some(id);
+            }
             entries.push(serde_json::from_str(&data).unwrap());
         }
         entries

@@ -86,7 +86,8 @@ struct Queued {
     data: String,
 }
 
-/// One SSE message: its `id` and JSON `data`.
+/// One SSE message: its JSON `data`, and its `id`, empty when a later
+/// message shares its position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Message {
     pub id: String,
@@ -143,8 +144,17 @@ impl StreamQueue {
         let mut state = self.lock();
         let item = state.items.pop_front()?;
         state.bytes -= item.data.len();
+        // Entries that share a position carry the SSE id only on the last of
+        // them, so `Last-Event-ID` passes a position once all of it arrived.
+        // A commit's batch enters the queue atomically, so the rest of a
+        // position is queued whenever its first entry is.
+        let id = if state.items.front().is_some_and(|next| next.seq == item.seq) {
+            String::new()
+        } else {
+            format!("{}:{}", self.epoch, item.seq)
+        };
         Some(Message {
-            id: format!("{}:{}", self.epoch, item.seq),
+            id,
             data: item.data,
         })
     }
@@ -156,12 +166,6 @@ impl StreamQueue {
 
     pub(crate) fn queued_bytes(&self) -> usize {
         self.lock().bytes
-    }
-
-    fn push(&self, item: Queued) {
-        let mut state = self.lock();
-        state.bytes += item.data.len();
-        state.items.push_back(item);
     }
 }
 
@@ -190,6 +194,7 @@ pub(crate) struct Hub {
     budget: usize,
     next_id: u64,
     subscribers: BTreeMap<u64, Subscriber>,
+    finished: bool,
 }
 
 impl Hub {
@@ -204,6 +209,7 @@ impl Hub {
             budget,
             next_id: 0,
             subscribers: BTreeMap::new(),
+            finished: false,
         }
     }
 
@@ -231,7 +237,8 @@ impl Hub {
     /// each held session owner as a `reset`, every other owner as `end`. A
     /// `Last-Event-ID` in this epoch whose suffix the log still holds resumes
     /// from it instead. The caller holds the bridge lock, so the cut and the
-    /// log position agree.
+    /// log position agree. After the epoch finished, the cut is the stream's
+    /// last batch.
     pub(crate) fn subscribe(
         &mut self,
         log: &Log,
@@ -262,7 +269,7 @@ impl Hub {
         let resume = last_event
             .filter(|position| position.epoch == self.epoch && position.seq <= now)
             .and_then(|position| log.after(position.seq).map(Iterator::collect::<Vec<_>>));
-        let mut items = Vec::new();
+        let mut batch = Vec::new();
         let mut global = None;
         for (scope, cursor) in &mut subscriber.scopes {
             let suffix = resume.as_ref().map(|entries| {
@@ -284,26 +291,34 @@ impl Hub {
             match resumed {
                 Some(suffix) => {
                     for entry in suffix {
-                        items.push(self.entry(cursor, entry));
+                        batch.push(self.entry(cursor, entry));
                     }
                 }
-                None => items.push(self.resync(cursor, documents, now, &mut global)),
+                None => batch.push(self.resync(cursor, documents, now, &mut global)),
             }
         }
-        items.sort_by_key(|item| item.seq);
-        for item in items {
-            push(&mut subscriber, item);
+        batch.sort_by_key(|item| item.seq);
+        {
+            let mut state = queue.lock();
+            for item in batch {
+                enqueue(&mut state, &mut subscriber.sent, item);
+            }
+            self.heartbeat(&mut state, &mut subscriber.sent, now);
+            state.finished = self.finished;
         }
-        self.heartbeat(&mut subscriber, now);
         queue.ready.notify_one();
-        self.next_id += 1;
-        self.subscribers.insert(self.next_id, subscriber);
+        if !self.finished {
+            self.next_id += 1;
+            self.subscribers.insert(self.next_id, subscriber);
+        }
         queue
     }
 
     /// Delivers every entry the log gained since the last pass. Runs at the
-    /// end of each commit step.
-    pub(crate) fn deliver(&mut self, log: &Log, documents: &impl Documents) {
+    /// end of each commit step. `released` names the scopes whose process
+    /// content this commit released (S6): their undelivered entries leave
+    /// every queue, and the scope starts over unless it ends.
+    pub(crate) fn deliver(&mut self, log: &Log, documents: &impl Documents, released: &[String]) {
         let now = log.seq();
         if now == self.cursor && self.subscribers.is_empty() {
             return;
@@ -315,34 +330,84 @@ impl Hub {
         let mut subscribers = std::mem::take(&mut self.subscribers);
         let mut global = None;
         for subscriber in subscribers.values_mut() {
+            let Subscriber {
+                queue,
+                scopes,
+                sent,
+            } = subscriber;
+            let mut state = queue.lock();
+            // Scopes that start over at `now` instead of taking this batch.
+            let mut restart = std::collections::BTreeSet::new();
+            for scope in released {
+                if !scopes.get(scope).is_some_and(|cursor| !cursor.ended) {
+                    continue;
+                }
+                let before = state.items.len();
+                state.items.retain(|item| {
+                    item.kind != Kind::Data || item.scope.as_deref() != Some(scope.as_str())
+                });
+                let ends = entries.as_ref().is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        &entry.scope == scope && matches!(entry.change, Change::End(_))
+                    })
+                });
+                if state.items.len() != before && !ends {
+                    restart.insert(scope.clone());
+                }
+            }
             match &entries {
                 Some(entries) => {
                     for entry in entries {
-                        let Some(cursor) = subscriber.scopes.get_mut(&entry.scope) else {
+                        if restart.contains(&entry.scope) {
+                            continue;
+                        }
+                        let Some(cursor) = scopes.get_mut(&entry.scope) else {
                             continue;
                         };
                         if cursor.ended {
                             continue;
                         }
                         let item = self.entry(cursor, entry);
-                        push(subscriber, item);
+                        enqueue(&mut state, sent, item);
                     }
                 }
                 // The suffix was compacted in the commit that appended it:
                 // every scope starts over at the current position.
-                None => self.coalesce(subscriber, documents, now, &mut global, true),
+                None => restart.extend(scopes.keys().cloned()),
             }
-            if subscriber.queue.queued_bytes() > self.budget {
-                self.coalesce(subscriber, documents, now, &mut global, false);
+            if state.bytes > self.budget {
+                // A lagging subscriber: its queued data collapses into one
+                // resync per scope. `end` entries stay.
+                let mut kept = VecDeque::new();
+                for item in std::mem::take(&mut state.items) {
+                    match item.kind {
+                        Kind::End => kept.push_back(item),
+                        Kind::Data => {
+                            restart.insert(item.scope.clone().expect("data has a scope"));
+                        }
+                        Kind::Position => {}
+                    }
+                }
+                state.items = kept;
             }
-            self.heartbeat(subscriber, now);
-            subscriber.queue.ready.notify_one();
+            for (scope, cursor) in scopes.iter_mut() {
+                if restart.contains(scope) && !cursor.ended {
+                    let item = self.resync(cursor, documents, now, &mut global);
+                    enqueue(&mut state, sent, item);
+                }
+            }
+            state.bytes = state.items.iter().map(|item| item.data.len()).sum();
+            self.heartbeat(&mut state, sent, now);
+            drop(state);
+            queue.ready.notify_one();
         }
         self.subscribers = subscribers;
     }
 
-    /// The epoch ended: every stream drains its queue and closes.
+    /// The epoch ended: every stream drains its queue and closes, and a
+    /// later subscription gets only its cut.
     pub(crate) fn finish(&mut self) {
+        self.finished = true;
         for subscriber in std::mem::take(&mut self.subscribers).into_values() {
             subscriber.queue.lock().finished = true;
             subscriber.queue.ready.notify_one();
@@ -429,45 +494,18 @@ impl Hub {
         queued(Some(scope), now, kind, &entry)
     }
 
-    /// Replaces a lagging subscriber's queued data with one resync per scope
-    /// at `now`. `end` entries stay. With `all`, every live scope resyncs,
-    /// queued or not.
-    fn coalesce(
-        &self,
-        subscriber: &mut Subscriber,
-        documents: &impl Documents,
-        now: u64,
-        global: &mut Option<GlobalState>,
-        all: bool,
-    ) {
-        let mut state = subscriber.queue.lock();
-        let mut dropped = std::collections::BTreeSet::new();
-        let mut kept = VecDeque::new();
-        for item in std::mem::take(&mut state.items) {
-            match item.kind {
-                Kind::End => kept.push_back(item),
-                Kind::Data => {
-                    dropped.insert(item.scope.clone().expect("data has a scope"));
-                }
-                Kind::Position => {}
-            }
-        }
-        state.items = kept;
-        state.bytes = state.items.iter().map(|item| item.data.len()).sum();
-        drop(state);
-        for (scope, cursor) in &mut subscriber.scopes {
-            if !cursor.ended && (all || dropped.contains(scope)) {
-                let item = self.resync(cursor, documents, now, global);
-                subscriber.queue.push(item);
-            }
-        }
-        subscriber.sent = subscriber.sent.max(now);
-    }
-
     /// A coalesced `position` when the log moved past the last message.
-    fn heartbeat(&self, subscriber: &mut Subscriber, now: u64) {
-        if subscriber.sent >= now {
+    fn heartbeat(&self, state: &mut QueueState, sent: &mut u64, now: u64) {
+        if *sent >= now {
             return;
+        }
+        if state
+            .items
+            .back()
+            .is_some_and(|last| last.kind == Kind::Position)
+        {
+            let last = state.items.pop_back().expect("checked above");
+            state.bytes -= last.data.len();
         }
         let item = queued(
             None,
@@ -475,22 +513,14 @@ impl Hub {
             Kind::Position,
             &Entry::Position { at: self.at(now) },
         );
-        let mut state = subscriber.queue.lock();
-        if let Some(last) = state.items.back()
-            && last.kind == Kind::Position
-        {
-            let last = state.items.pop_back().expect("checked above");
-            state.bytes -= last.data.len();
-        }
-        state.bytes += item.data.len();
-        state.items.push_back(item);
-        subscriber.sent = now;
+        enqueue(state, sent, item);
     }
 }
 
-fn push(subscriber: &mut Subscriber, item: Queued) {
-    subscriber.sent = subscriber.sent.max(item.seq);
-    subscriber.queue.push(item);
+fn enqueue(state: &mut QueueState, sent: &mut u64, item: Queued) {
+    *sent = (*sent).max(item.seq);
+    state.bytes += item.data.len();
+    state.items.push_back(item);
 }
 
 fn queued(scope: Option<String>, seq: u64, kind: Kind, entry: &Entry) -> Queued {

@@ -180,8 +180,10 @@ Step 3 implements the Hub in `src/protocol/hub.rs`, and the routes in
   ends or creates the scope's document; that scope starts over.
 - **`end` reasons.** The transition that retires an incarnation notes `closed`,
   `deleted` or `unobserved` (`retire_session_observation`), and its scope's `End`
-  carries the reason; an incarnation that ends without one is `replaced` when the
-  session is held again, else `gone`. Ended incarnations stay in a table of the
+  carries the reason. Without a note, the session's last published operation
+  decides (`delete` is `deleted`, `close` is `closed`), so a delete that ends the
+  scope before its retirement is noted still says `deleted`; otherwise the
+  incarnation is `replaced` when the session is held again, else `gone`. Ended incarnations stay in a table of the
   last 1,024 per epoch (`RETIRED_OWNERS`), so a subscription gets its reason after
   the log compacted the `End`. An owner from another epoch is `replaced`.
 - **Coalescing.** Each stream's queue is accounted by serialized bytes. Past
@@ -191,9 +193,17 @@ Step 3 implements the Hub in `src/protocol/hub.rs`, and the routes in
   every scope over the same way.
 - **Heartbeats.** After each commit, a stream whose last message is behind the log
   gets one `position`; a queued `position` is replaced, not stacked.
+- **Atomic batches.** Each commit's messages, coalescing and heartbeat enter a
+  stream's queue in one critical section. Messages that share a position carry the
+  SSE `id` only on the last of them, so a reconnect between them resumes from the
+  previous position and receives the whole position again.
+- **Release.** When a commit releases a turn's process content (S6), its scope's
+  undelivered entries leave every queue as they leave the log, and the scope starts
+  over with a `reset`, unless the commit ends it.
 - **Epoch end.** The connection commits its terminal `agent` state, then ends every
-  stream. Its final `global` document stays readable with `GET /api/v2/global`
-  until the next connection starts.
+  stream; a subscription that was waiting for the bridge lock gets only its cut, then
+  ends. Its final `global` document stays readable with `GET /api/v2/global` until
+  the next connection starts. v2 reads never start a connection.
 
 Reads never materialize a session: `GET /api/v2/sessions/{id}` projects a held
 session or returns `not_found`, and a stream only attaches leases to owners the

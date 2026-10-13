@@ -130,9 +130,10 @@ impl HttpStream {
                             data.push_str(value.strip_prefix(' ').unwrap_or(value));
                         }
                     }
-                    // Keep-alive comments carry no id.
-                    if let Some(id) = id
-                        && sender.send((id, data)).is_err()
+                    // Keep-alive comments carry no data; an entry without
+                    // an id shares its position with the next one.
+                    if (id.is_some() || !data.is_empty())
+                        && sender.send((id.unwrap_or_default(), data)).is_err()
                     {
                         return;
                     }
@@ -162,7 +163,9 @@ impl HttpStream {
             panic!("{error}");
         }
         self.entries.push(serde_json::from_str(&data).unwrap());
-        self.last_id = Some(id);
+        if !id.is_empty() {
+            self.last_id = Some(id);
+        }
     }
 
     /// Reads until the replica received `seq`; `false` once the stream ended.

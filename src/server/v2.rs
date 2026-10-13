@@ -41,14 +41,11 @@ impl V2State {
         Self(Sources::Fixed(source, Arc::new(AtomicU64::new(1))))
     }
 
-    /// Reads, like the v1 global stream, start the Agent connection when
-    /// none is running.
+    /// The current generation, or the last one after it ended. Reads never
+    /// start a connection: an ended epoch's final `global` stays readable.
     async fn source(&self) -> Option<ReplicationSource> {
         match &self.0 {
-            Sources::Hub(hub) => {
-                hub.ensure_runtime().await;
-                hub.state.lock().await.replication.clone()
-            }
+            Sources::Hub(hub) => hub.state.lock().await.replication.clone(),
             #[cfg(test)]
             Sources::Fixed(source, _) => Some(source.clone()),
         }
@@ -167,10 +164,11 @@ async fn stream(
     };
     let stream = futures::stream::unfold(subscription, |subscription| async move {
         let message = subscription.queue.next().await?;
-        Some((
-            Ok::<_, Infallible>(SseEvent::default().id(message.id).data(message.data)),
-            subscription,
-        ))
+        let mut event = SseEvent::default().data(message.data);
+        if !message.id.is_empty() {
+            event = event.id(message.id);
+        }
+        Some((Ok::<_, Infallible>(event), subscription))
     });
     Sse::new(stream)
         .keep_alive(KeepAlive::default())

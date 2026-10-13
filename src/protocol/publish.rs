@@ -47,6 +47,8 @@ pub(crate) struct Replication {
     retiring: HashMap<(String, u64), EndReason>,
     retired: VecDeque<(String, u64, EndReason)>,
     hub: Option<Hub>,
+    /// The epoch ended; a Hub created later starts finished.
+    finished: bool,
     #[cfg(test)]
     pub(super) history_projections: usize,
 }
@@ -236,6 +238,9 @@ impl Replication {
         last_event: Option<&Position>,
     ) -> Arc<StreamQueue> {
         let hub = self.hub.get_or_insert_with(|| Hub::new(registry.epoch()));
+        if self.finished {
+            hub.finish();
+        }
         let published = Published {
             sessions: &self.sessions,
             retired: &self.retired,
@@ -248,6 +253,7 @@ impl Replication {
 
     /// The epoch ended: every stream drains and closes.
     pub(crate) fn finish(&mut self) {
+        self.finished = true;
         if let Some(hub) = &mut self.hub {
             hub.finish();
         }
@@ -284,17 +290,20 @@ impl Replication {
             })
             .map(|(session_id, _)| session_id.clone())
             .collect::<Vec<_>>();
+        let mut released = Vec::new();
         for session_id in ended {
             let published = self.sessions.remove(&session_id).expect("listed above");
+            // A noted retirement wins; otherwise the operation the session
+            // last published says why it left.
+            let operation = published.body["operation"]["kind"].as_str();
             let reason = self
                 .retiring
                 .remove(&(session_id.clone(), published.incarnation))
-                .unwrap_or_else(|| {
-                    if registry.sessions.contains_key(&session_id) {
-                        EndReason::Replaced
-                    } else {
-                        EndReason::Gone
-                    }
+                .unwrap_or_else(|| match operation {
+                    Some("delete") => EndReason::Deleted,
+                    Some("close") => EndReason::Closed,
+                    _ if registry.sessions.contains_key(&session_id) => EndReason::Replaced,
+                    _ => EndReason::Gone,
                 });
             self.log.append(
                 &session_scope(&session_id),
@@ -310,11 +319,14 @@ impl Replication {
             // content, as a turn that ends does.
             if published.turn.is_some() {
                 self.log.compact_through(published.seq);
+                released.push(session_scope(&session_id));
             }
         }
         for session_id in registry.sessions.keys() {
-            if let Some(source) = SessionSource::new(registry, session_id) {
-                self.commit_session(session_id, &source);
+            if let Some(source) = SessionSource::new(registry, session_id)
+                && self.commit_session(session_id, &source)
+            {
+                released.push(session_scope(session_id));
             }
         }
 
@@ -341,10 +353,12 @@ impl Replication {
             catalog_revision,
             registry,
         };
-        hub.deliver(&self.log, &published);
+        hub.deliver(&self.log, &published, &released);
     }
 
-    fn commit_session(&mut self, session_id: &str, source: &SessionSource) {
+    /// Commits one session; returns whether its ended turn released process
+    /// content.
+    fn commit_session(&mut self, session_id: &str, source: &SessionSource) -> bool {
         let mut previous = self.sessions.remove(session_id);
         let state = source.state;
         let mut history_ops = Vec::new();
@@ -528,6 +542,7 @@ impl Replication {
                 turn,
             },
         );
+        released_turn
     }
 }
 

@@ -354,7 +354,11 @@ Last-Event-ID: <epoch>:<seq>        (optional, set by EventSource on reconnect)
 
 One stream carries any set of scopes. To change the set, open a new stream.
 
-Each SSE message has `id: <epoch>:<seq>` and one JSON entry:
+Each SSE message carries one JSON entry and `id: <epoch>:<seq>` of its position.
+Several entries can share a position (a stream's first entries, a coalesced queue);
+only the last of them carries the `id`, so `Last-Event-ID` moves past a position
+only once every entry at it has arrived, and a reconnect in between starts that
+position again.
 
 ```ts
 type Entry =
