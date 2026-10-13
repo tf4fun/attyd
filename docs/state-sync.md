@@ -196,10 +196,14 @@ Step 3 implements the Hub in `src/protocol/hub.rs`, and the routes in
 - **Atomic batches.** Each commit's messages, coalescing and heartbeat enter a
   stream's queue in one critical section. Messages that share a position carry the
   SSE `id` only on the last of them, so a reconnect between them resumes from the
-  previous position and receives the whole position again.
-- **Release.** When a commit releases a turn's process content (S6), its scope's
-  undelivered entries leave every queue as they leave the log, and the scope starts
-  over with a `reset`, unless the commit ends it.
+  previous position and receives the whole position again; the replica ignores
+  replayed entries it already installed.
+- **Collapse.** A lagging queue, a queue holding undelivered entries of a scope
+  whose process content the commit released (S6), and a suffix compacted within its
+  own commit all collapse the queue the same way: every message in it is replaced
+  by messages at the current position, a resync for each scope that had queued
+  data and each queued `end` again. No SSE id in a collapsed queue can then pass
+  data it dropped.
 - **Epoch end.** The connection commits its terminal `agent` state, then ends every
   stream; a subscription that was waiting for the bridge lock gets only its cut, then
   ends. Its final `global` document stays readable with `GET /api/v2/global` until

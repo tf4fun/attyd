@@ -175,8 +175,13 @@ impl Replication {
         incarnation: u64,
         reason: EndReason,
     ) {
-        self.retiring
-            .insert((session_id.to_string(), incarnation), reason);
+        // An owner whose scope already ended keeps the reason its End
+        // published, in the bounded retired table; a note would never be
+        // consumed.
+        if self.held_incarnation(session_id) == Some(incarnation) {
+            self.retiring
+                .insert((session_id.to_string(), incarnation), reason);
+        }
     }
 
     /// Why an ended incarnation of this epoch ended, while the bounded table
@@ -725,12 +730,7 @@ mod retirement_tests {
             // Match complete_session_retirement's later transition: finish
             // cleanup, record why it retired, and remove the owner allocation.
             registry
-                .finish_session_cleanup(
-                    "session",
-                    incarnation,
-                    SessionAdmission::Delete,
-                    "delete",
-                )
+                .finish_session_cleanup("session", incarnation, SessionAdmission::Delete, "delete")
                 .unwrap();
             replication.note_retirement("session", incarnation, EndReason::Deleted);
             registry.remove("session", incarnation);

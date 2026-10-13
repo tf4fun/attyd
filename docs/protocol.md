@@ -416,7 +416,9 @@ arrives, then applies the rest.
 with `seq <= a`. It does this before checking `prev`, whether the entry was buffered
 or arrives over SSE after an HTTP snapshot that overtook it. Only entries with
 `seq > a` are checked against `prev`. A snapshot fetched ahead of the stream
-therefore never causes a second reset.
+therefore never causes a second reset. The same holds for entries the replica
+already applied: a scope ignores every entry with `seq` at or before the last one it
+installed, so a resumed stream may replay what the replica already has.
 
 **Lag.** For a subscriber that falls behind, the server may replace its queued
 entries for a scope with one `reset` or `snapshot` at the latest position. A replica
@@ -439,7 +441,9 @@ the new owner.
 
 A replica tracks two positions:
 
-- **received:** the `at.seq` of the last entry it read from the stream;
+- **received:** the `at.seq` of the last entry it read from the stream. A new
+  stream starts it again at the replica's `Last-Event-ID` (or `0` without one),
+  since the stream replays from there;
 - **applied:** `min(received, min over pending scopes of installed(scope))`, where:
   - `installed(scope)` is the last `seq` actually applied to that scope: a snapshot's
     `at.seq`, or the `seq` of the last applied `ops`. It is `0` while the scope has

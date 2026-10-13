@@ -73,8 +73,9 @@ pub(crate) trait Documents {
 enum Kind {
     /// `snapshot`, `reset` or `ops`: replaceable by a later resync.
     Data,
-    /// `end`: always delivered.
-    End,
+    /// `end`: always delivered, re-issued at the current position when its
+    /// queue collapses.
+    End(EndReason),
     Position,
 }
 
@@ -316,8 +317,8 @@ impl Hub {
 
     /// Delivers every entry the log gained since the last pass. Runs at the
     /// end of each commit step. `released` names the scopes whose process
-    /// content this commit released (S6): their undelivered entries leave
-    /// every queue, and the scope starts over unless it ends.
+    /// content this commit released (S6): a queue still holding their
+    /// undelivered entries collapses, as the log dropped them.
     pub(crate) fn deliver(&mut self, log: &Log, documents: &impl Documents, released: &[String]) {
         let now = log.seq();
         if now == self.cursor && self.subscribers.is_empty() {
@@ -326,6 +327,7 @@ impl Hub {
         self.subscribers
             .retain(|_, subscriber| !subscriber.queue.closed.load(Ordering::Acquire));
         let entries = log.after(self.cursor).map(Iterator::collect::<Vec<_>>);
+        let delivered = self.cursor;
         self.cursor = now;
         let mut subscribers = std::mem::take(&mut self.subscribers);
         let mut global = None;
@@ -336,72 +338,93 @@ impl Hub {
                 sent,
             } = subscriber;
             let mut state = queue.lock();
-            // Scopes that start over at `now` instead of taking this batch.
-            let mut restart = std::collections::BTreeSet::new();
-            for scope in released {
-                if !scopes.get(scope).is_some_and(|cursor| !cursor.ended) {
-                    continue;
-                }
-                let before = state.items.len();
-                state.items.retain(|item| {
-                    item.kind != Kind::Data || item.scope.as_deref() != Some(scope.as_str())
-                });
-                let ends = entries.as_ref().is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        &entry.scope == scope && matches!(entry.change, Change::End(_))
-                    })
-                });
-                if state.items.len() != before && !ends {
-                    restart.insert(scope.clone());
-                }
-            }
-            match &entries {
-                Some(entries) => {
-                    for entry in entries {
-                        if restart.contains(&entry.scope) {
-                            continue;
-                        }
-                        let Some(cursor) = scopes.get_mut(&entry.scope) else {
-                            continue;
-                        };
-                        if cursor.ended {
-                            continue;
-                        }
-                        let item = self.entry(cursor, entry);
-                        enqueue(&mut state, sent, item);
+            // Undelivered entries of a scope whose process content this
+            // commit released leave the queue, as they left the log.
+            let releases = state.items.iter().any(|item| {
+                item.kind == Kind::Data
+                    && item.seq <= delivered
+                    && item
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| released.contains(scope))
+            });
+            if let Some(entries) = &entries {
+                for entry in entries {
+                    let Some(cursor) = scopes.get_mut(&entry.scope) else {
+                        continue;
+                    };
+                    if cursor.ended {
+                        continue;
                     }
-                }
-                // The suffix was compacted in the commit that appended it:
-                // every scope starts over at the current position.
-                None => restart.extend(scopes.keys().cloned()),
-            }
-            if state.bytes > self.budget {
-                // A lagging subscriber: its queued data collapses into one
-                // resync per scope. `end` entries stay.
-                let mut kept = VecDeque::new();
-                for item in std::mem::take(&mut state.items) {
-                    match item.kind {
-                        Kind::End => kept.push_back(item),
-                        Kind::Data => {
-                            restart.insert(item.scope.clone().expect("data has a scope"));
-                        }
-                        Kind::Position => {}
-                    }
-                }
-                state.items = kept;
-            }
-            for (scope, cursor) in scopes.iter_mut() {
-                if restart.contains(scope) && !cursor.ended {
-                    let item = self.resync(cursor, documents, now, &mut global);
+                    let item = self.entry(cursor, entry);
                     enqueue(&mut state, sent, item);
                 }
             }
-            state.bytes = state.items.iter().map(|item| item.data.len()).sum();
+            // A collapsed queue holds only messages at `now`, so no SSE id
+            // in it can pass data it dropped.
+            if entries.is_none() || releases || state.bytes > self.budget {
+                self.collapse(
+                    &mut state,
+                    scopes,
+                    sent,
+                    documents,
+                    now,
+                    &mut global,
+                    entries.is_none(),
+                );
+            }
             self.heartbeat(&mut state, sent, now);
             drop(state);
             queue.ready.notify_one();
         }
         self.subscribers = subscribers;
+    }
+
+    /// Replaces a queue with one message per scope at `now`: a resync for
+    /// each scope that had queued data (every live scope with `all`), and
+    /// each queued `end` again at `now`.
+    #[allow(clippy::too_many_arguments)]
+    fn collapse(
+        &self,
+        state: &mut QueueState,
+        scopes: &mut BTreeMap<String, ScopeCursor>,
+        sent: &mut u64,
+        documents: &impl Documents,
+        now: u64,
+        global: &mut Option<GlobalState>,
+        all: bool,
+    ) {
+        let mut restart = std::collections::BTreeSet::new();
+        let mut ends = Vec::new();
+        for item in std::mem::take(&mut state.items) {
+            let scope = item.scope;
+            match item.kind {
+                Kind::Data => {
+                    restart.insert(scope.expect("data has a scope"));
+                }
+                Kind::End(reason) => ends.push((scope.expect("end has a scope"), reason)),
+                Kind::Position => {}
+            }
+        }
+        state.bytes = 0;
+        for (scope, reason) in ends {
+            let entry = Entry::End {
+                scope: scope.clone(),
+                at: self.at(now),
+                reason,
+            };
+            enqueue(
+                state,
+                sent,
+                queued(Some(scope), now, Kind::End(reason), &entry),
+            );
+        }
+        for (scope, cursor) in scopes.iter_mut() {
+            if !cursor.ended && (all || restart.contains(scope)) {
+                let item = self.resync(cursor, documents, now, global);
+                enqueue(state, sent, item);
+            }
+        }
     }
 
     /// The epoch ended: every stream drains its queue and closes, and a
@@ -432,9 +455,9 @@ impl Hub {
         cursor.last = Some(entry.seq);
         let kind = match entry.change {
             Change::Ops(_) => Kind::Data,
-            Change::End(_) => {
+            Change::End(reason) => {
                 cursor.ended = true;
-                Kind::End
+                Kind::End(reason)
             }
         };
         queued(
@@ -456,6 +479,7 @@ impl Hub {
     ) -> Queued {
         let scope = cursor.request.scope();
         cursor.last = Some(now);
+        let mut kind = Kind::Data;
         let entry = match &cursor.request {
             ScopeRequest::Global => Entry::Snapshot {
                 scope: scope.clone(),
@@ -483,6 +507,7 @@ impl Hub {
                     _ if documents.held_incarnation(session_id).is_some() => EndReason::Replaced,
                     retired => retired.unwrap_or(EndReason::Gone),
                 };
+                kind = Kind::End(reason);
                 Entry::End {
                     scope: scope.clone(),
                     at: self.at(now),
@@ -490,7 +515,6 @@ impl Hub {
                 }
             }
         };
-        let kind = if cursor.ended { Kind::End } else { Kind::Data };
         queued(Some(scope), now, kind, &entry)
     }
 

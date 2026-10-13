@@ -154,6 +154,7 @@ impl HttpStream {
     /// An EventSource retry: the same request, with `Last-Event-ID`.
     pub(super) async fn reconnect(&mut self, router: &Router) {
         self.disconnect();
+        self.replica.reconnect(self.last_id.as_deref());
         tokio::task::yield_now().await;
         self.connect(router).await;
     }

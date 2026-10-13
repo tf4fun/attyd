@@ -54,6 +54,7 @@ impl Client {
 
     /// The stream drops and the client resumes with its `Last-Event-ID`.
     fn reconnect(&mut self, bench: &mut Bench) {
+        self.replica.reconnect(self.last_id.as_deref());
         self.queue.close();
         self.queue = Self::open(bench, &self.scopes, self.last_id.as_deref());
     }

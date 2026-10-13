@@ -31,11 +31,13 @@ impl ScopeReplica {
     }
 
     fn apply(&mut self, scope: &str, seq: u64, prev: u64, ops: &[Op]) -> Result<(), String> {
-        if self.from_snapshot && seq <= self.installed {
-            return Ok(()); // covered by the installed snapshot
+        if seq <= self.installed {
+            // Covered by the installed snapshot, or replayed by a resumed
+            // stream after this replica applied it.
+            return Ok(());
         }
         let continuous = prev == self.installed || (self.from_snapshot && prev <= self.installed);
-        if !continuous || seq <= self.installed {
+        if !continuous {
             return Err(format!(
                 "{scope}: entry {seq} has prev {prev}, but the replica installed {}{}",
                 self.installed,
@@ -165,7 +167,7 @@ impl StreamReplica {
                     }
                     replica.buffer.push((at.seq, prev, ops));
                 } else {
-                    let covered = replica.from_snapshot && at.seq <= replica.installed;
+                    let covered = at.seq <= replica.installed;
                     replica.apply(&scope, at.seq, prev, &ops)?;
                     self.covered += usize::from(covered);
                 }
@@ -185,6 +187,15 @@ impl StreamReplica {
             other => return Err(format!("{data}: unknown entry type {other}")),
         }
         Ok(())
+    }
+
+    /// A new stream resumes from `last_id` (none: from scratch). Its entries
+    /// can repeat positions this replica already read (protocol §4.1).
+    pub(crate) fn reconnect(&mut self, last_id: Option<&str>) {
+        self.received = last_id
+            .and_then(super::hub::parse_event_id)
+            .filter(|position| self.epoch.as_ref() == Some(&position.epoch))
+            .map_or(0, |position| position.seq);
     }
 
     /// Installs a snapshot, inline or fetched over HTTP, then drains the
