@@ -135,11 +135,11 @@ async fn sse_resume_returns_the_retired_owner_without_fresh_open() {
 
     let read = in_log.entries.len();
     in_log.reconnect(&peer.router).await;
-    assert!(in_log.pump(seq).await);
     assert_eq!(
-        in_log.replica.ended(&session_scope(SESSION)),
-        Some(EndReason::Closed)
+        in_log.until_ended(&session_scope(SESSION)).await,
+        EndReason::Closed
     );
+    assert!(in_log.pump(seq).await);
     assert!(
         in_log.entries[read..]
             .iter()
@@ -154,9 +154,7 @@ async fn sse_resume_returns_the_retired_owner_without_fresh_open() {
         state.replication.log_mut_for_test().compact_through(seq);
     }
     compacted.reconnect(&peer.router).await;
-    while compacted.replica.ended(&session_scope(SESSION)).is_none() {
-        compacted.next().await;
-    }
+    compacted.until_ended(&session_scope(SESSION)).await;
     let (seq, documents) = peer.cut().await;
     assert!(compacted.check(&peer.router, seq, &documents).await);
     assert_eq!(
