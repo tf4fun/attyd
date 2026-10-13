@@ -6,12 +6,16 @@
 //! `serde_json::Value` in Rust and name their `@agentclientprotocol/sdk` type in
 //! TypeScript.
 //!
-//! Nothing is routed yet: the commit step (migration step 2) and the v2 routes
-//! (step 3) are the first consumers.
+//! The commit step (`publish`) keeps the per-epoch log (`log`) of JSON
+//! Pointer ops (`diff`) current; the v2 routes (migration step 3) are its
+//! first readers.
 #![allow(dead_code)]
 
 mod controls;
+pub(crate) mod diff;
+pub(crate) mod log;
 mod project;
+mod publish;
 #[cfg(test)]
 mod typescript;
 
@@ -21,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) use project::{project_global, project_session};
+pub(crate) use publish::{GLOBAL, Replication, session_scope};
 
 /// A log position (protocol §2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +64,26 @@ pub(crate) struct AgentState {
     pub predecessor: Option<EpochPredecessor>,
 }
 
+impl Default for AgentState {
+    fn default() -> Self {
+        Self::starting(AgentLaunch::default())
+    }
+}
+
+impl AgentState {
+    /// The agent before its connection initializes.
+    pub(crate) fn starting(launch: AgentLaunch) -> Self {
+        Self {
+            phase: AgentPhase::Starting,
+            error: None,
+            launch,
+            initialize: None,
+            authenticated_method_id: None,
+            predecessor: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -70,7 +95,7 @@ pub(crate) enum AgentPhase {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentLaunch {
@@ -82,10 +107,11 @@ pub(crate) struct AgentLaunch {
     pub mcp_servers: Vec<McpServerSummary>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AgentTransport {
+    #[default]
     Stdio,
     Http,
     Ws,
