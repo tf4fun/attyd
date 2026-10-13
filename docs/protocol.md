@@ -1,8 +1,9 @@
 # attyd protocol v2
 
-Status: draft, 2026-10-12. The state documents (§3), the replication stream (§4)
-and the snapshot reads of §6 are implemented (migration steps 1–3); commands and
-the other reads are not yet. This document defines
+Status: draft, 2026-10-13. The state documents (§3), the replication stream (§4),
+the session commands (§5.1–§5.3, §5.5, §5.6, request acknowledgement from §5.4)
+and the reads of §6 except the catalog are implemented (migration steps 1–4); the
+other global commands, cold delete and the catalog are not yet. This document defines
 the client-facing protocol that replaces today's `/api/v1` business API. The
 [implementation plan](state-sync.md) describes how the bridge produces it. The
 [runtime contract](active-turn-runtime.md) still governs ACP semantics: history
