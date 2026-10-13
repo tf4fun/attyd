@@ -694,7 +694,19 @@ async fn a_tiny_intent_budget_answers_an_open_from_its_tombstone() {
 
 #[tokio::test]
 async fn open_returns_the_owner_and_a_retry_never_materializes_again() {
-    let mut peer = Peer::start(-1, json!({"loadSession": true})).await;
+    for (capabilities, method) in [
+        (json!({"loadSession": true}), "session/load"),
+        (
+            json!({"sessionCapabilities": {"resume": {}}}),
+            "session/resume",
+        ),
+    ] {
+        open_once(capabilities, method).await;
+    }
+}
+
+async fn open_once(capabilities: Value, method: &str) {
+    let mut peer = Peer::start(-1, capabilities).await;
     let path = "/api/v2/sessions/cold/open";
     let (status, opened) = command(
         &peer,
@@ -716,7 +728,7 @@ async fn open_returns_the_owner_and_a_retry_never_materializes_again() {
         incarnation
     );
     let load = peer.next_request().await;
-    assert_eq!(load["method"], "session/load");
+    assert_eq!(load["method"], method);
     let (_, retried) = command(
         &peer,
         "POST",
@@ -864,7 +876,8 @@ async fn a_fork_target_survives_until_its_delayed_subscription() {
     let mut peer = Peer::start(-1, json!({"sessionCapabilities": {"fork": {}}})).await;
     create(&mut peer).await;
     let epoch = epoch(&peer).await;
-    let source = HttpStream::open(&peer.router, &[owner(&mut peer, SESSION).await]).await;
+    let source_owner = owner(&mut peer, SESSION).await;
+    let source = HttpStream::open(&peer.router, &[source_owner]).await;
     {
         let state = peer.state.upgrade().unwrap();
         let mut state = state.lock().await;
@@ -1024,5 +1037,164 @@ async fn applied_waits_for_every_scope_of_a_new_stream() {
     );
     let request = peer.next_request().await;
     peer.reply(&request, json!({})).await;
+    peer.stop().await;
+}
+
+#[tokio::test]
+async fn a_turn_cancel_is_a_control_on_the_running_turn() {
+    let mut peer = Peer::start(-1, json!({})).await;
+    create(&mut peer).await;
+    let tag = tag(&mut peer).await;
+    let (turn, prompt) = start_turn(&mut peer, "turn").await;
+    let operation_id = turn["result"]["operationId"].as_str().unwrap().to_string();
+    let (status, stale) = command(
+        &peer,
+        "POST",
+        &format!("/api/v2/sessions/{SESSION}/turns/other/cancel"),
+        None,
+        Some(&tag),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    let (status, cancelled) = command(
+        &peer,
+        "POST",
+        &format!("/api/v2/sessions/{SESSION}/turns/{operation_id}/cancel"),
+        None,
+        Some(&tag),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["scopes"], json!([session_scope(SESSION)]));
+    let cancel = peer.next_request().await;
+    assert_eq!(cancel["method"], "session/cancel");
+    let documents = peer
+        .until("the turn shows the cancel request", |documents| {
+            session(documents)["turn"]["cancelRequested"] == true
+        })
+        .await;
+    assert_eq!(
+        documents[GLOBAL]["requests"],
+        json!({}),
+        "a control action creates no record"
+    );
+    peer.reply(&prompt, json!({"stopReason": "cancelled"}))
+        .await;
+    peer.until("the cancelled turn ends", |documents| {
+        session(documents)["turn"].is_null()
+    })
+    .await;
+    peer.stop().await;
+}
+
+/// Plan §4.2: flow A completes, the Agent reuses its `elicitationId` for
+/// flow B, and a late acknowledgement of A must not touch B.
+#[tokio::test]
+async fn url_flows_are_acknowledged_by_interaction_never_by_elicitation_id() {
+    let mut peer = Peer::start(-1, json!({})).await;
+    create(&mut peer).await;
+    let tag = tag(&mut peer).await;
+    let (_, prompt) = start_turn(&mut peer, "turn").await;
+    let mut flows = Vec::new();
+    for (id, key) in [(910, "accept-a"), (911, "accept-b")] {
+        peer.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "elicitation/create",
+            "params": {
+                "sessionId": SESSION, "mode": "url", "elicitationId": "reused",
+                "url": "https://example.test/sign-in", "message": "Sign in",
+            },
+        }))
+        .await;
+        let documents = peer
+            .until("the URL elicitation is pending", |documents| {
+                !session(documents)["interactions"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty()
+            })
+            .await;
+        let interaction = session(&documents)["interactions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let (status, accepted) = command(
+            &peer,
+            "POST",
+            &format!("/api/v2/interactions/{interaction}"),
+            Some(key),
+            Some(&tag),
+            json!({"response": {"action": "accept"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        let delivered = peer.next_request().await;
+        assert_eq!(delivered["id"], id);
+        peer.until("the flow waits", |documents| {
+            session(documents)["urlFlows"][&interaction]["status"] == "waiting"
+        })
+        .await;
+        let acknowledge = format!("/api/v2/sessions/{SESSION}/url-flows/{interaction}");
+        let (status, waiting) = send(
+            &peer.router,
+            "DELETE",
+            &acknowledge,
+            &[("if-match", tag.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{waiting}");
+        peer.send(json!({
+            "jsonrpc": "2.0", "method": "elicitation/complete",
+            "params": {"elicitationId": "reused"},
+        }))
+        .await;
+        peer.until("the flow completes", |documents| {
+            session(documents)["urlFlows"][&interaction]["status"] == "completed"
+        })
+        .await;
+        flows.push((interaction, acknowledge));
+    }
+    let [(a, acknowledge_a), (b, acknowledge_b)] = <[_; 2]>::try_from(flows).unwrap();
+    let (status, _) = send(
+        &peer.router,
+        "DELETE",
+        &acknowledge_a,
+        &[("if-match", tag.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let documents = peer.check().await;
+    assert!(session(&documents)["urlFlows"].get(&a).is_none());
+    assert_eq!(session(&documents)["urlFlows"][&b]["status"], "completed");
+    // A late second acknowledgement of A leaves B alone.
+    let (status, late) = send(
+        &peer.router,
+        "DELETE",
+        &acknowledge_a,
+        &[("if-match", tag.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{late}");
+    assert_eq!(
+        session(&peer.check().await)["urlFlows"][&b]["status"],
+        "completed"
+    );
+    let (status, _) = send(
+        &peer.router,
+        "DELETE",
+        &acknowledge_b,
+        &[("if-match", tag.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
     peer.stop().await;
 }
