@@ -11,6 +11,7 @@
 //! `/api/v2/stream` subscribers.
 #![allow(dead_code)]
 
+pub(crate) mod commands;
 mod controls;
 pub(crate) mod diff;
 pub(crate) mod hub;

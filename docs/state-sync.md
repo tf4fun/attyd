@@ -295,6 +295,40 @@ retirement as soon as a new session is Active and idle
 (`src/session_observers.rs:161`), before its creator can subscribe. That race exists
 in v1 today.
 
+Step 4 implements the session commands in `src/bridge/commands.rs`, the record
+book and intent table in `src/protocol/commands.rs`, and the routes in
+`src/server/v2.rs`:
+
+- **Admission.** One critical section of the bridge lock looks the intent up,
+  checks the `If-Match` owner against the published owner, runs the command's own
+  admission (capability, active session, mode and config references, a running
+  record on the same target, `can_begin`), and commits the record or the turn's
+  intent. Only then does the command enter the bridge input, as v1 commands do; its
+  response finishes the record. A command refused after admission, for example by
+  a race with a v1 client, finishes its record `failed`.
+- **Records and intents.** The `CommandBook` lives in the session registry, so a
+  new registry (a new epoch) starts empty. A session `operation` started by a
+  command carries the record's ID as its operation ID, which is how
+  `operation.requestId` is projected. Turn intents settle in the commit step:
+  completed once the turn left an outcome, failed otherwise. Intents are accounted
+  as their key, subject ID and a fixed overhead (4 MiB per epoch by default).
+- **Open.** A held owner is returned at once in a succeeded record. Otherwise
+  `reserve_attachment_locked` allocates the incarnation in the admitting critical
+  section, the record's `target` names it while the load or resume runs, and the
+  command enters the bridge input as a prepared attachment.
+- **Leases.** `FirstLeases` (30 s) attaches an `ObservationLease` to the owner.
+  `ReplicationSource::subscribe` takes it over when a stream attaches its own
+  lease; otherwise its timer withdraws it through `UnobserveSession`. A fork grants
+  it in the transition that makes the target held (`fork_target_held`), before the
+  history workflow and the v1 response.
+- **Interaction responses** are refused synchronously (`conflict`) when the
+  interaction is gone or another response to it is running; otherwise the record
+  follows the v1 delivery and ends `failed` with `interaction_ended` if it was not
+  delivered.
+- **URL flows.** Settled session flows stay in their terminal status (the last 16
+  per session) until `DELETE …/url-flows/{interactionId}` removes the one with that
+  interaction ID. Global flows follow in step 5.
+
 **Cold delete.** `If-Match: "<epoch>:0"` is checked against the registry in the same
 actor turn that starts the request, so there is no window in which the session
 becomes held unseen. It keeps the path tested by
@@ -400,7 +434,10 @@ it. A replica that meets a continuity break or an op that does not apply fails t
 gate; snapshots replace entries only at the first cut, a coalesced queue, a
 reconnect, or a compacted position. The connection's end commits `agent.phase`
 `stopped`, or `error` with the ACP error as `agent_error`, for every exit after the
-epoch exists, including workspace setup failures. S7 needs command positions, so its check arrives with the commands in step 4.
+epoch exists, including workspace setup failures. Step 4 adds the S7 checks over
+SSE (`src/bridge/command_tests.rs`): a command that commits while its scope waits
+for a coalesced reset never advances `applied`, and a new stream's `applied` waits
+for every subscribed scope.
 
 Convergence can't detect a projection that is missing something. If both the
 snapshot and the ops leave out global URL flows, they still agree. That is what the

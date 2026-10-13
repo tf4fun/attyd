@@ -60,6 +60,8 @@ pub(crate) struct SessionRegistry {
     pub(crate) resolved_request_url_flows: VecDeque<String>,
     pub(crate) effects: VecDeque<RuntimeEffect>,
     pub(crate) journal: RuntimeJournal,
+    /// Protocol v2 command records and intents; they share the epoch.
+    pub(crate) commands: crate::protocol::commands::CommandBook,
 }
 
 impl SessionRegistry {
@@ -434,6 +436,7 @@ impl SessionRegistry {
             resolved_request_url_flows: VecDeque::new(),
             effects: VecDeque::new(),
             journal: RuntimeJournal::new(),
+            commands: Default::default(),
         }
     }
 }

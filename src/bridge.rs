@@ -59,6 +59,9 @@ use crate::terminal::{TerminalManager, TerminalSnapshot};
 
 mod agent_dispatch;
 #[cfg(test)]
+mod command_tests;
+pub(crate) mod commands;
+#[cfg(test)]
 mod convergence_tests;
 mod coordinator;
 #[cfg(test)]
@@ -283,11 +286,18 @@ struct BridgeState {
     agent: AgentState,
     /// The protocol v2 commit step: published documents and the log.
     replication: Replication,
+    /// First-subscription leases on owners that commands returned.
+    first_leases: commands::FirstLeases,
+    /// Terminal values as the first process page read of each held session's
+    /// current history revision saw them; process pages are immutable.
+    process_terminals: HashMap<String, (u64, String, serde_json::Map<String, Value>)>,
 }
 
 impl BridgeState {
     /// The protocol v2 commit step for every scope (plan §2.2).
     fn commit(&mut self) {
+        commands::settle_turn_intents(self);
+        commands::release_process_terminals(self);
         self.replication
             .commit(&self.agent, self.catalog_revision, &self.sessions);
     }
@@ -471,6 +481,7 @@ impl ReplicationSource {
             let lease = ObservationLease::new();
             if resources.observers.observe(observer_id, lease.clone()) {
                 leases.push((session_id.clone(), lease));
+                commands::take_over_first_subscription_leases(state, session_id, *incarnation);
             }
         }
         refresh_observer_timers(state);
@@ -2667,7 +2678,10 @@ where
                         _ = connection.incoming_closed() => break None,
                         input = observer_rx.recv() => {
                             if let Some(input) = input {
-                                let _ = ingress.try_browser(input, crate::session_dispatch::TrafficClass::Reserved);
+                                // Observation inputs are reserved; v2 commands
+                                // share the class their v1 form has.
+                                let class = browser_traffic_class(&input);
+                                let _ = ingress.try_browser(input, class);
                             }
                         }
                         input = commands.recv() => {
@@ -2838,6 +2852,7 @@ where
                         {
                             resources.observers.unobserve(observer_id, &lease);
                         }
+                        commands::forget_first_subscription_lease(&mut state, observer_id);
                         refresh_observer_timers(&mut state);
                         continue;
                     }
@@ -2993,6 +3008,10 @@ where
                     };
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
                         responder.error(error);
+                        // A turn refused before admission leaves no v2 intent.
+                        if let Some(key) = request_id.as_deref() {
+                            context.state.lock().await.sessions.commands.turn_refused(key);
+                        }
                     }
                     match (&business_responder, &result) {
                         (Some(responder), Ok(())) => {
@@ -4629,6 +4648,7 @@ async fn handle_command_inner(
             require_agent_method("session/fork", &state).await?;
             let (cwd, source_incarnation, source_baseline) = {
                 let mut state = state.lock().await;
+                commands::require_admitted_owner(&state, &command, &source_id)?;
                 let source = state.sessions.active_session(&source_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {source_id}"))
@@ -4878,6 +4898,7 @@ async fn handle_command_inner(
             advance_catalog_revision(&mut state, &sink);
             flush_runtime(&mut state, &sink);
             creation_finish.committed(incarnation)?;
+            commands::fork_target_held(&mut state, &request_id, &session_id, incarnation);
             drop(state);
             let target_owner =
                 rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
@@ -4916,6 +4937,7 @@ async fn handle_command_inner(
             require_agent_method("session/close", &state).await?;
             let incarnation = {
                 let mut state = state.lock().await;
+                commands::require_admitted_owner(&state, &command, &session_id)?;
                 if session_blocks_unobserved_retire(&state, &session_id)
                     && let Some(permit) = &auto_close
                 {
@@ -5177,7 +5199,11 @@ async fn handle_command_inner(
             let request_id = string_field(&command, "requestId")?.to_string();
             let session_id = string_field(&command, "sessionId")?.to_string();
             require_agent_method("session/delete", &state).await?;
-            let deletion = reserve_deletion(&mut *state.lock().await, &session_id, &request_id)?;
+            let deletion = {
+                let mut state = state.lock().await;
+                commands::require_admitted_owner(&state, &command, &session_id)?;
+                reserve_deletion(&mut state, &session_id, &request_id)?
+            };
             let DeletionReservation::Session(incarnation) = deletion else {
                 // An unopened history row is a catalog operation. Keep only the
                 // ID reservation; its RPC and completion use the global lane.
@@ -5408,6 +5434,10 @@ async fn handle_command_inner(
                     })? {
                     TurnAdmission::Accepted { operation_id } => operation_id,
                     TurnAdmission::Duplicate { operation_id } => {
+                        state
+                            .sessions
+                            .commands
+                            .turn_admitted(&client_intent_id, &operation_id);
                         turn_responder.success(json!({
                             "operationId": operation_id,
                             "disposition": "duplicate",
@@ -5415,6 +5445,12 @@ async fn handle_command_inner(
                         return Ok(());
                     }
                 };
+                // A v2 intent settles with the admission, whether or not
+                // its HTTP caller still waits.
+                state
+                    .sessions
+                    .commands
+                    .turn_admitted(&client_intent_id, &mirror_operation_id);
                 // The accepted turn owns the projection now: an optional
                 // history workflow still parked in backoff yields instead of
                 // retrying over this turn's outcome.
@@ -5516,6 +5552,7 @@ async fn handle_command_inner(
             let mode_id = string_field(&command, "modeId")?.to_string();
             let incarnation = {
                 let mut state = state.lock().await;
+                commands::require_admitted_owner(&state, &command, &session_id)?;
                 let session = state.sessions.active_session(&session_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {session_id}"))
@@ -5673,6 +5710,7 @@ async fn handle_command_inner(
             };
             let incarnation = {
                 let mut state = state.lock().await;
+                commands::require_admitted_owner(&state, &command, &session_id)?;
                 let session = state.sessions.active_session(&session_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {session_id}"))

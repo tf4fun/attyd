@@ -66,6 +66,10 @@ pub(crate) struct SessionLiveState {
     pub permissions: BTreeMap<String, PendingInteraction>,
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
+    /// Finished URL flows, oldest first, with their finish time, kept for
+    /// protocol v2 until they are acknowledged or retained out (protocol
+    /// §3.4). v1 views never show them.
+    pub settled_url_flows: VecDeque<(UrlFlow, std::time::Instant)>,
     pub terminals: BTreeMap<String, Value>,
     // Mirror view headers captured at the last commit so a journal snapshot or
     // hub reset only ever exposes the published view, never uncommitted state.
@@ -276,6 +280,22 @@ pub(crate) enum UrlFlowResolution {
     Applied,
     AlreadyTerminal,
     StaleRegistration,
+}
+
+/// Finished session URL flows kept for acknowledgement (protocol §3.4): a
+/// flow leaves only once it is older than `SETTLED_URL_FLOW_RETENTION` and
+/// the last `SETTLED_URL_FLOWS` stay.
+pub(crate) const SETTLED_URL_FLOWS: usize = 16;
+pub(crate) const SETTLED_URL_FLOW_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
+/// Why a URL flow acknowledgement was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UrlFlowAcknowledgement {
+    /// The flow is still waiting for `elicitation/complete`.
+    Waiting,
+    /// No such flow, or it already left.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,6 +609,7 @@ impl SessionRegistry {
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
+                settled_url_flows: VecDeque::new(),
                 terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
@@ -904,6 +925,7 @@ impl SessionRegistry {
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
+                settled_url_flows: VecDeque::new(),
                 terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
@@ -1608,7 +1630,7 @@ impl SessionRegistry {
                 {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
-                let flow = session
+                let mut flow = session
                     .url_flows
                     .remove(elicitation_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
@@ -1616,6 +1638,19 @@ impl SessionRegistry {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
                 remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
+                flow.status = status;
+                let now = std::time::Instant::now();
+                session.settled_url_flows.push_back((flow, now));
+                while session.settled_url_flows.len() > SETTLED_URL_FLOWS
+                    && session
+                        .settled_url_flows
+                        .front()
+                        .is_some_and(|(_, settled)| {
+                            now.saturating_duration_since(*settled) >= SETTLED_URL_FLOW_RETENTION
+                        })
+                {
+                    session.settled_url_flows.pop_front();
+                }
                 self.commit_session(session_id);
             }
             None => {
@@ -1638,6 +1673,39 @@ impl SessionRegistry {
             }
         }
         Ok(UrlFlowResolution::Applied)
+    }
+
+    /// Removes a finished session URL flow by the `interactionId` of the
+    /// elicitation that started it; a later flow reusing its `elicitationId`
+    /// is never touched.
+    pub(crate) fn acknowledge_url_flow(
+        &mut self,
+        expected_epoch: &str,
+        session_id: &str,
+        incarnation: u64,
+        interaction_id: &str,
+    ) -> Result<(), UrlFlowAcknowledgement> {
+        self.require_epoch(expected_epoch)
+            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
+        let session = self
+            .require_live_mut(session_id, incarnation)
+            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
+        if session
+            .url_flows
+            .values()
+            .any(|flow| flow.registration_id == interaction_id)
+        {
+            return Err(UrlFlowAcknowledgement::Waiting);
+        }
+        let before = session.settled_url_flows.len();
+        session
+            .settled_url_flows
+            .retain(|(flow, _)| flow.registration_id != interaction_id);
+        if session.settled_url_flows.len() == before {
+            return Err(UrlFlowAcknowledgement::Unknown);
+        }
+        self.commit_session(session_id);
+        Ok(())
     }
 
     pub(crate) fn upsert_terminal(
@@ -6705,6 +6773,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn seventeen_recent_url_flow_results_remain_projected_until_acknowledged() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let scope = Some(("session", incarnation));
+        for index in 0..17 {
+            let interaction = format!("recent-url-interaction-{index}");
+            let elicitation = format!("recent-url-flow-{index}");
+            state
+                .upsert_elicitation(
+                    "epoch",
+                    scope,
+                    &interaction,
+                    json!({"mode": "url", "message": "Continue", "url": "https://example.test/flow"}),
+                )
+                .unwrap();
+            state
+                .resolve_elicitation("epoch", scope, &interaction, Some(&elicitation))
+                .unwrap();
+            assert_eq!(
+                state
+                    .settle_url_registration(
+                        "epoch",
+                        scope,
+                        &elicitation,
+                        &interaction,
+                        UrlFlowStatus::Completed,
+                    )
+                    .unwrap(),
+                UrlFlowResolution::Applied
+            );
+        }
+
+        let projected = crate::protocol::project_session(&state, "session").unwrap();
+        assert_eq!(
+            projected.url_flows.len(),
+            17,
+            "protocol §3.4 promises ten minutes for every recent terminal URL flow, in addition to the last sixteen"
+        );
+        assert_eq!(
+            projected.url_flows["recent-url-interaction-0"].status,
+            crate::protocol::UrlFlowStatus::Completed
+        );
+        state
+            .acknowledge_url_flow("epoch", "session", incarnation, "recent-url-interaction-0")
+            .unwrap();
+        let projected = crate::protocol::project_session(&state, "session").unwrap();
+        assert_eq!(projected.url_flows.len(), 16);
+        assert!(!projected.url_flows.contains_key("recent-url-interaction-0"));
     }
 
     #[test]

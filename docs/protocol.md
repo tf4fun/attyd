@@ -1,8 +1,9 @@
 # attyd protocol v2
 
-Status: draft, 2026-10-12. The state documents (§3), the replication stream (§4)
-and the snapshot reads of §6 are implemented (migration steps 1–3); commands and
-the other reads are not yet. This document defines
+Status: draft, 2026-10-13. The state documents (§3), the replication stream (§4),
+the session commands (§5.1–§5.3, §5.5, §5.6, request acknowledgement from §5.4)
+and the reads of §6 except the catalog are implemented (migration steps 1–4); the
+other global commands, cold delete and the catalog are not yet. This document defines
 the client-facing protocol that replaces today's `/api/v1` business API. The
 [implementation plan](state-sync.md) describes how the bridge produces it. The
 [runtime contract](active-turn-runtime.md) still governs ACP semantics: history
@@ -441,12 +442,15 @@ the new owner.
 
 ### 4.1 Received and applied position
 
-A replica tracks two positions:
+A replica tracks three positions:
 
 - **received:** the `at.seq` of the last entry it read from the stream. A new
   stream starts it again at the replica's `Last-Event-ID` (or `0` without one),
   since the stream replays from there;
-- **applied:** `min(received, min over pending scopes of installed(scope))`, where:
+- **checkpoint:** the `at.seq` of the last entry that carried an SSE `id`, which is
+  the last position all of whose entries arrived. A new stream starts it at the
+  same value as `received`;
+- **applied:** `min(checkpoint, min over pending scopes of installed(scope))`, where:
   - `installed(scope)` is the last `seq` actually applied to that scope: a snapshot's
     `at.seq`, or the `seq` of the last applied `ops`. It is `0` while the scope has
     nothing installed;
@@ -462,6 +466,12 @@ A replica tracks two positions:
   A `reset` never advances `applied`. For example, a replica applied through 10, a
   command commits at 15, and a coalesced `reset@20` arrives: `applied` stays at 10
   until the snapshot (`at >= 20`) is installed.
+
+  The checkpoint matters when a coalesced queue puts several scopes at one
+  position. `global`'s `snapshot@20` can arrive before `session/S`'s `reset@20`;
+  until that reset arrives, S still looks installed at its older position, but the
+  checkpoint is still below 20, so a command on S committed at 15 is not yet
+  reported applied.
 
 Read-your-writes (§5.1) uses **applied**, never received.
 
