@@ -602,6 +602,81 @@ mod tests {
     }
 
     #[test]
+    fn returned_owners_fit_the_intent_budget_after_running_requests_finish() {
+        let mut book = CommandBook::default();
+        let budget = 550;
+        book.set_intent_budget(budget);
+        let mut accepted = Vec::new();
+        loop {
+            let index = accepted.len();
+            let key = format!("k{index}");
+            let source = format!("source-{index}");
+            let fingerprint = Fingerprint::of("fork", &[("sessionId", &source)], "e:1", &json!({}));
+            match book.lookup(&key, fingerprint) {
+                IntentLookup::Full => break,
+                IntentLookup::Unknown => {}
+                other => panic!("a fresh key must be admitted or refused for capacity: {other:?}"),
+            }
+            let request_id = book.allocate_request_id();
+            book.open(Request {
+                request_id: request_id.clone(),
+                operation: RequestOperation::Fork,
+                method: "session/fork".into(),
+                client_intent_id: Some(key.clone()),
+                target: Some(RequestTarget {
+                    session_id: source,
+                    incarnation: Some(1),
+                }),
+                interaction_id: None,
+                method_id: None,
+                params: BTreeMap::new(),
+                status: RequestStatus::Running,
+                result: None,
+                error: None,
+                terminal: None,
+            });
+            book.admit(&key, fingerprint, Subject::Request(request_id.clone()));
+            accepted.push((key, fingerprint, request_id));
+            assert!(
+                book.intent_bytes() <= budget,
+                "admission must respect the intent budget"
+            );
+        }
+        assert!(!accepted.is_empty(), "the budget has room for a command");
+
+        // All accepted commands are still running when capacity is reached.
+        // Their successful results must remain recoverable after ACK, without
+        // adding unreserved owner storage to the permanent intent table.
+        for (index, (_, _, request_id)) in accepted.iter().enumerate() {
+            assert!(book.finish(
+                request_id,
+                Ok(RequestResult::Session {
+                    session_id: format!("00000000-0000-0000-0000-{index:012}"),
+                    incarnation: index as u64 + 1,
+                }),
+                Instant::now(),
+            ));
+            book.acknowledge(request_id).unwrap();
+        }
+        assert!(book.requests().is_empty());
+        for (key, fingerprint, request_id) in &accepted {
+            let IntentLookup::Known(intent) = book.lookup(key, *fingerprint) else {
+                panic!("an accepted key must still answer after acknowledgement");
+            };
+            assert_eq!(intent.subject, Subject::Request(request_id.clone()));
+            assert_eq!(
+                intent.status,
+                Some(FinalStatus::Request(RequestStatus::Succeeded))
+            );
+        }
+        assert!(
+            book.intent_bytes() <= budget,
+            "finished owner results exceeded the {budget}-byte intent budget: {} bytes remain after ACK",
+            book.intent_bytes()
+        );
+    }
+
+    #[test]
     fn finished_records_stay_for_the_last_count_and_the_retention_window() {
         let mut book = CommandBook::default();
         book.set_retention(2, Duration::from_secs(60));
