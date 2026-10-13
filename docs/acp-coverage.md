@@ -79,6 +79,69 @@ Goose serve is an optional example, never a conformance gate or required backend
 | URL elicitation | Supported | HTTP(S)-only browser handoff; unique flow IDs, consent, accepted-only `elicitation/complete`, and session-lifecycle abortion are distinct states |
 | `mcp/connect`, request/notification `mcp/message`, `mcp/disconnect` | Supported (experimental) | Client-declared ACP transport; bidirectional inner MCP JSON-RPC, opaque connection IDs, connect/request cancellation, error preservation, process/message/request lifecycle tracking, and UI activity inspector |
 
+## Protocol v2 chain
+
+Each capability row above also needs its [protocol v2](protocol.md) chain
+([plan §4.2](state-sync.md#42-acp-semantic-coverage-gate-s8)):
+
+```text
+ACP capability → bridge authority → public projection / command → finished result
+               → recovery after a fresh replica → lifecycle end
+```
+
+Paths are JSON Pointers into the `global` (**G**) or `session/<id>` (**S**)
+document. **Test** names the test that proves the chain, or the migration step that
+adds it. A row is done when every link has a test. "Internal" marks requests the
+bridge fulfils itself as the ACP client: they have no client endpoint, and only
+their user-visible effects are projected.
+
+### Client → Agent
+
+| ACP surface | Bridge authority | Projection / command | Finished result | Recovery | Lifecycle end | Test |
+| --- | --- | --- | --- | --- | --- | --- |
+| `initialize` | connection task | G `/agent/initialize`, `/agent/phase` | `/agent/phase = ready`, or `/agent/error` | `GET /api/v2/global` | epoch end; next epoch's `/agent/predecessor` | `summaries_report_work_and_pending_counts` (agent copy); step 5 (predecessor) |
+| Agent transport | launch options | G `/agent/launch/transport` | static per epoch | global snapshot | epoch end | step 3 |
+| `session/new` | creation staging | `POST /api/v2/sessions` → G `/requests/<id>` (`create`) | record `result.kind = session`; first-subscription lease | `global.requests` by `clientIntentId` | record acknowledged or retained out | step 5 |
+| `session/prompt` | turn admission (`SessionState`) | `POST …/turns` → S `/turn` | S `/outcomes/<operationId>` | `turn`, then `outcomes` (protocol §5.2) | outcome retained out; session `end` | `completed_turns_release_process_content_and_attachment_bytes` (projection); step 4 |
+| `session/cancel` | turn execution | `POST …/turns/{operationId}/cancel` (control) → S `/turn/cancelRequested` | outcome with the Agent's stop reason | S `/turn` | turn end | step 4 |
+| `session/load` | attachment operation | `POST …/open` → S `/operation` (`load`), `/history/phase` | record `result.kind = session`; `history.phase = ready` | `global.requests`, session snapshot | session `end` | step 4 |
+| `session/list` | catalog gate | `GET /api/v2/catalog` (read); G `/requests/<id>` (`agent_request`) while in flight; G `/catalog/revision` | page returned to the reader | re-read when `catalog.revision` changes | Agent-owned, not replicated | step 4, step 5 |
+| `session/delete` | deletion reservation; cold catalog deletion | `DELETE /api/v2/sessions/{id}` with an owner tag or `"<epoch>:0"` → G `/requests/<id>` | record `done`; `end: deleted` | `global.requests` | record retained out; retired-incarnation table | step 5 |
+| `session/resume` | attachment operation | `POST …/open` → S `/operation` (`resume`), `/history/notice` | as load | as load | session `end` | step 4 |
+| `session/close` | close operation | `POST …/close` → G `/requests/<id>`; S `/operation` (`close`) | record `done`; `end: closed` | `global.requests` | record retained out; retired-incarnation table | step 4 |
+| `session/set_mode` | control transaction | `PUT …/mode` → G `/requests/<id>`; S `/operation` (`set_mode`) | S `/controls/modes`; record `done` or the ACP error | `global.requests` (`params.modeId`) | record retained out | `response_overrides_only_its_fields_between_early_and_later_updates`; step 4 |
+| `session/set_config_option` | control transaction | `PUT …/config/{configId}` → G `/requests/<id>` | S `/controls/configOptions`; record | `global.requests` (`params.configId`, `value`) | record retained out | `config_options_distinguish_never_provided_from_provided_empty`, `projected_config_preserves_response_clear_and_later_updates`; step 4 |
+| Text and resource-link prompts | content validation | turn body `prompt` | S `/history/timeline`, `/outcomes` | session snapshot | history revision | step 4 |
+| Image, audio, embedded-resource prompts | content validation; attachment projection | turn body `prompt`; documents carry `resource_link` references, bytes via `GET …/attachments/{id}` | as text | session snapshot | session `end` | `completed_turns_release_process_content_and_attachment_bytes` |
+| `authenticate` | auth method validation | `POST /api/v2/agent/authenticate` → G `/requests/<id>` (`methodId`) | record; G `/agent/authenticatedMethodId` | global snapshot | record retained out; epoch end | step 5 |
+| Terminal authentication | auth terminal manager | `POST /api/v2/agent/auth-terminals` → G `/requests/<id>/terminal`; input, resize and cancel are controls | record status; `predecessor.reason = auth_restart` when the Agent restarts | global snapshot | record retained out; epoch end | step 5 |
+| `logout` | logout gate | `POST /api/v2/agent/logout` → G `/requests/<id>` | record; G `/agent/authenticatedMethodId = null` | global snapshot | record retained out | step 5 |
+| MCP server configuration on session setup | launch options | G `/agent/launch/mcpServers` (name and type only) | static per epoch | global snapshot | epoch end | step 3 |
+| `additionalDirectories` | launch options | G `/agent/launch/additionalDirectories` | static per epoch | global snapshot | epoch end | step 3 |
+| `session/fork` | fork operation on a held source | `POST …/fork` → G `/requests/<id>`; source S `/operation` (`fork`) | record `result.kind = session`; lease on the new owner | `global.requests` | record retained out | step 5 |
+| Provider configuration | Product exclusion | not projected | — | — | — | — |
+| `nes/*` | Product exclusion | not projected | — | — | — | — |
+| `document/*` | Product exclusion | not projected | — | — | — | — |
+
+### Agent → Client
+
+| ACP surface | Bridge authority | Projection / command | Finished result | Recovery | Lifecycle end | Test |
+| --- | --- | --- | --- | --- | --- | --- |
+| `session/update` message chunks | update ingest; history cache | S `/turn/updates` while running; `/history/timeline` once committed | `history.revision` advances | session snapshot | session `end`; process pages `410` after the revision | `completed_turns_release_process_content_and_attachment_bytes`; step 2 |
+| Tool calls and sparse updates | update fold (`fold_history_update`) | S `/turn/updates`; completed bodies on process pages (protocol §6) | collapsed into `history.collapsedTurns` | session snapshot; process page | as above | `completed_turns_release_process_content_and_attachment_bytes`; step 2 (index `set`) |
+| Legacy plans | update fold | S `/turn/updates`, `/history/timeline` | as above | session snapshot | as above | step 2 |
+| ID-addressed plan update/removal | update fold | as legacy plans | as above | session snapshot | as above | step 2 |
+| Available commands | control state | S `/controls/commands` | — | session snapshot | session `end` | `response_overrides_only_its_fields_between_early_and_later_updates` |
+| Mode/config/session-info/usage updates | control state | S `/controls/*`; G `/sessions/<id>/title` | — | session snapshot | session `end` | `sparse_session_info_keeps_absent_fields_clears_null_and_sets_values`, `usage_without_cost_keeps_the_last_known_cost`, `settling_lets_the_response_override_only_its_fields`, `projected_modes_follow_early_updates_response_and_later_updates` |
+| Compaction update/summary chunks | update fold | S `/turn/updates`, `/history/timeline` | as message chunks | session snapshot | as above | `projected_compaction_attachments_are_references_resolvable_from_authority`; step 2 |
+| `session/request_permission` | permission responders | S `/interactions/<id>` (`permission`); G `/sessions/<id>/pending`; `POST /api/v2/interactions/{id}` → G `/requests/<id>` | record `succeeded` on delivery, or `failed` with `interaction_ended` | session snapshot, then `global.requests` | removed on answer, Agent cancel or session end | `summaries_report_work_and_pending_counts`, `projected_permission_references_the_public_turn_operation`; step 4 |
+| `fs/read_text_file` | Internal (workspace filesystem) | effects only, through tool calls | — | — | — | not applicable |
+| `fs/write_text_file` | Internal (workspace filesystem) | effects only, through tool calls | — | — | — | not applicable |
+| Terminal lifecycle | Internal (terminal manager); output projected | S `/terminals/<id>` (`output` by `trim` + `append`) | `exitStatus`, `released` | session snapshot | removed once released and unreferenced | `controls_operations_and_live_terminals_are_projected`; step 2 (trim diff) |
+| Form elicitation | elicitation responders | S `/interactions/<id>`, or G `/interactions/<id>` with `requestId`; `POST /api/v2/interactions/{id}` | record on delivery | snapshots, then `global.requests` | removed on answer, cancel, or end of its session or request | `summaries_report_work_and_pending_counts`, `request_scoped_interactions_and_url_flows_are_global_and_keyed_by_interaction`; step 4, step 5 |
+| URL elicitation | URL flow registry | S or G `/urlFlows/<interactionId>`; acknowledge with `DELETE …/url-flows/{interactionId}` | `status = completed` on `elicitation/complete`; `cancelled` on Agent cancel or session end | snapshots | acknowledged or retained out | `request_scoped_interactions_and_url_flows_are_global_and_keyed_by_interaction`; step 5 |
+| `mcp/connect`, `mcp/message`, `mcp/disconnect` | Internal (ACP-transport MCP) | not projected | — | — | — | not applicable |
+
 ## Cross-cutting invariants
 
 - Optional methods are rejected server-side unless the Agent advertised the matching capability.

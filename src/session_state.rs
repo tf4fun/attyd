@@ -47,6 +47,9 @@ pub(crate) struct CompletedTurnOutcome {
     pub operation_id: String,
     pub after_update: usize,
     pub response: Value,
+    /// Kept for protocol v2 recovery; v1 views do not carry it.
+    #[serde(skip)]
+    pub client_intent_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -468,6 +471,7 @@ impl SessionState {
                 operation_id: turn.operation_id.clone(),
                 after_update,
                 response: response.clone(),
+                client_intent_id: turn.client_intent_id.clone(),
             });
         }
         if let Some(turn) = self.active_turn.take()

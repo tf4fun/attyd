@@ -175,6 +175,11 @@ fn update_blocks(update: &mut Value, visit: &mut impl FnMut(&mut Value)) {
             }
         }
         Some("tool_call" | "tool_call_update") => tool_blocks(update, visit),
+        Some("compaction_update") => {
+            if let Some(summary) = update.get_mut("summary").and_then(Value::as_array_mut) {
+                summary.iter_mut().for_each(&mut *visit);
+            }
+        }
         _ => {}
     }
 }
