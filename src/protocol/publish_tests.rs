@@ -438,7 +438,13 @@ fn ended_and_replaced_sessions_end_their_scope() {
     let seq = bench.replication.scope_seq("session/s").unwrap();
     bench.registry.sessions.remove("s");
     bench.step();
-    let end = bench.replication.log().after(seq).unwrap().next().unwrap();
+    let end = bench
+        .replication
+        .log()
+        .after(seq)
+        .unwrap()
+        .find(|entry| entry.scope == session_scope("s"))
+        .unwrap();
     assert_eq!(
         (end.scope.as_str(), end.prev, &end.change),
         ("session/s", seq, &Change::End)
