@@ -681,3 +681,68 @@ fn diff_updates(
         });
     }
 }
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::session_state::SessionAdmission;
+
+    #[test]
+    fn direct_delete_cleanup_does_not_retain_ended_owner_notes() {
+        let mut registry = SessionRegistry::new("epoch");
+        let mut replication = Replication::default();
+        let agent = AgentState::default();
+        let mut pending_after_cleanup = Vec::new();
+
+        // Reuse one Agent session ID to distinguish retained incarnations
+        // from the registry's existing set of retired session IDs.
+        for _ in 0..4 {
+            let incarnation = registry
+                .open_new(
+                    "epoch",
+                    "session",
+                    "/workspace",
+                    json!({"sessionId": "session"}),
+                )
+                .unwrap();
+            replication.commit(&agent, 0, &registry);
+            registry
+                .start_direct_delete("epoch", "session", incarnation, "delete")
+                .unwrap();
+            replication.commit(&agent, 0, &registry);
+
+            // The Agent's successful response ends the published scope
+            // before external resource cleanup finishes in the bridge.
+            registry
+                .complete_delete("epoch", "session", incarnation, "delete")
+                .unwrap();
+            replication.commit(&agent, 0, &registry);
+            assert_eq!(
+                replication.retired("session", incarnation),
+                Some(EndReason::Deleted)
+            );
+
+            // Match complete_session_retirement's later transition: finish
+            // cleanup, record why it retired, and remove the owner allocation.
+            registry
+                .finish_session_cleanup(
+                    "session",
+                    incarnation,
+                    SessionAdmission::Delete,
+                    "delete",
+                )
+                .unwrap();
+            replication.note_retirement("session", incarnation, EndReason::Deleted);
+            registry.remove("session", incarnation);
+            replication.commit(&agent, 0, &registry);
+            assert!(registry.sessions.is_empty());
+            pending_after_cleanup.push(replication.retiring.len());
+        }
+
+        assert_eq!(
+            pending_after_cleanup,
+            vec![0; 4],
+            "completed retirements belong only to the bounded retired table; late notes must not accumulate"
+        );
+    }
+}

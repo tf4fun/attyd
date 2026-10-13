@@ -570,3 +570,117 @@ fn finished_turn_releases_slow_stream_process_bytes() {
     );
     client.sync(&bench);
 }
+
+fn assert_release_keeps_undelivered_data_resumable(include_global: bool) {
+    let mut bench = Bench::new();
+    let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    bench.step();
+    let mut scopes = vec![owner("s", s)];
+    if include_global {
+        scopes.push(ScopeRequest::Global);
+    }
+    let mut client = Client::subscribe(&mut bench, &scopes);
+    client.sync(&bench);
+
+    // Starting a turn queues session ops, followed by global ops or a
+    // position for the summary change. The client has read neither entry.
+    let operation = bench.start_turn("s", s, "checkpoint-intent");
+    bench.update(
+        "s",
+        s,
+        &operation,
+        json!({
+            "sessionUpdate": "tool_call", "toolCallId": "read-tool", "title": "Read",
+            "status": "completed", "content": [{ "type": "content", "content": {
+                "type": "text", "text": "released-tool-process",
+            } }],
+        }),
+    );
+    bench.step();
+
+    // Releasing the process content must also invalidate any queued
+    // checkpoint that depended on delivering those now-removed ops.
+    bench.update("s", s, &operation, chunk("Done"));
+    bench.finish_turn("s", s, "checkpoint-intent", &operation);
+    bench.step();
+    let Message { id, data } = client.queue.try_next().unwrap();
+    client.replica.receive(&id, &data).unwrap();
+    if !id.is_empty() {
+        client.last_id = Some(id);
+    }
+
+    // Disconnect after the first queued message, before any later reset.
+    // A resume must retain a path to the data that this client never saw.
+    client.reconnect(&mut bench);
+    bench.step();
+    client.sync(&bench);
+}
+
+#[test]
+fn release_does_not_checkpoint_past_undelivered_scope_data() {
+    assert_release_keeps_undelivered_data_resumable(false);
+}
+
+#[test]
+fn release_does_not_checkpoint_other_scopes_past_undelivered_data() {
+    assert_release_keeps_undelivered_data_resumable(true);
+}
+
+#[test]
+fn partial_coalesced_cut_reconnect_preserves_eventsource_cursor() {
+    let mut bench = Bench::new();
+    let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    let unobserved = bench.open("other", json!({ "sessionId": "other" }), Vec::new());
+    let operation = bench.start_turn("other", unobserved, "other-turn");
+    bench.step();
+    let mut client = Client::subscribe(&mut bench, &[ScopeRequest::Global, owner("s", s)]);
+    client.sync(&bench);
+    let checkpoint = client.last_id.clone();
+    bench.replication.set_subscriber_budget(EPOCH, 4_096);
+
+    // Interleaved traffic for an unsubscribed scope adds position entries to
+    // the live queue. Resume coalesces those positions, so the retained ops
+    // can fit the same budget even after this queue needed a resync.
+    let mut coalesced = false;
+    for index in 0..100 {
+        let before = client.queue.queued_bytes();
+        bench.control(
+            "s",
+            s,
+            json!({ "sessionUpdate": "session_info_update", "title": format!("Title {index}") }),
+        );
+        bench.step();
+        if client.queue.queued_bytes() < before {
+            coalesced = true;
+            break;
+        }
+        let before = client.queue.queued_bytes();
+        bench.update("other", unobserved, &operation, chunk("background"));
+        bench.step();
+        if client.queue.queued_bytes() < before {
+            coalesced = true;
+            break;
+        }
+    }
+    assert!(coalesced, "the live queue must exceed its fixed budget");
+    let Message { id, data } = client.queue.try_next().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&data).unwrap()["type"],
+        "snapshot"
+    );
+    assert!(
+        id.is_empty(),
+        "the following session reset completes this cut"
+    );
+    client.replica.receive(&id, &data).unwrap();
+    // EventSource retains its previous nonempty Last-Event-ID for this event.
+    // In particular it must not overwrite it with Some("").
+    if !id.is_empty() {
+        client.last_id = Some(id);
+    }
+    assert_eq!(client.last_id, checkpoint);
+    client.reconnect(&mut bench);
+    bench.step(); // the production subscription commits when its guard drops
+
+    client.sync(&bench);
+}
