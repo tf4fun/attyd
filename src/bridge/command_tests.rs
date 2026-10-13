@@ -1195,3 +1195,81 @@ async fn url_flows_are_acknowledged_by_interaction_never_by_elicitation_id() {
     peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
     peer.stop().await;
 }
+
+#[tokio::test]
+async fn reads_answer_from_the_held_owner_and_never_load() {
+    let mut peer = Peer::start(-1, json!({"loadSession": true})).await;
+    let router = peer.router.clone();
+    let get_status = |path: String| {
+        let router = router.clone();
+        async move { get(&router, &path).await }
+    };
+    // Nothing is held yet: every read is refused without a load.
+    let (status, _) = get_status(format!(
+        "/api/v2/sessions/{SESSION}/history/rev/turns/turn/process"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+    peer.no_request().await;
+
+    create(&mut peer).await;
+    let tag = tag(&mut peer).await;
+    let (_, prompt) = start_turn(&mut peer, "turn").await;
+    peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+    let documents = peer
+        .until("the turn is committed", |documents| {
+            session(documents)["turn"].is_null()
+                && session(documents)["history"]["phase"] == "ready"
+        })
+        .await;
+    let revision = session(&documents)["history"]["revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let process = |revision: &str, turn: &str| {
+        format!("/api/v2/sessions/{SESSION}/history/{revision}/turns/{turn}/process")
+    };
+    let (status, missing) = get_status(process(&revision, "no-such-turn")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    let (status, stale) = get_status(process("stale-revision", "no-such-turn")).await;
+    assert_eq!(status, StatusCode::GONE, "{stale}");
+    assert_eq!(stale["error"]["code"], "gone");
+    if let Some(turn) = session(&documents)["history"]["collapsedTurns"]
+        .as_array()
+        .and_then(|turns| turns.first())
+    {
+        let (status, page) = get_status(process(&revision, turn["turnId"].as_str().unwrap())).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+    }
+
+    let attachment = format!("/api/v2/sessions/{SESSION}/attachments/{}", "0".repeat(64));
+    let (status, _) = send(&peer.router, "GET", &attachment, &[], None).await;
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+    let (status, _) = send(
+        &peer.router,
+        "GET",
+        &attachment,
+        &[("if-match", tag.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        &peer.router,
+        "GET",
+        &format!("/api/v2/sessions/{SESSION}/attachments/short"),
+        &[("if-match", tag.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Workspace files need the host filesystem, which remote transports lack.
+    let (status, files) = get_status(format!("/api/v2/sessions/{SESSION}/files?query=src")).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{files}");
+    assert_eq!(files["error"]["code"], "unsupported");
+    let (status, _) = get_status(format!("/api/v2/sessions/{SESSION}/files/content")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    peer.no_request().await;
+    peer.stop().await;
+}
