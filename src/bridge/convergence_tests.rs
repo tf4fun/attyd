@@ -577,3 +577,135 @@ async fn initialize_refusal_commits_agent_error() {
         "error"
     );
 }
+
+#[tokio::test]
+async fn workspace_setup_failure_commits_agent_error() {
+    struct Capture {
+        probe: std::sync::Mutex<Option<oneshot::Receiver<Weak<BridgeLock>>>>,
+        retained: std::sync::Mutex<Option<Arc<BridgeLock>>>,
+    }
+
+    impl futures::task::ArcWake for Capture {
+        fn wake_by_ref(this: &Arc<Self>) {
+            let mut probe = this.probe.lock().unwrap();
+            let Some(receiver) = probe.as_mut() else {
+                return;
+            };
+            match receiver.try_recv() {
+                Ok(weak) => {
+                    *this.retained.lock().unwrap() = weak.upgrade();
+                    *probe = None;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => *probe = None,
+            }
+        }
+    }
+
+    // Setup can return before yielding after it publishes the weak probe.
+    // Retain the state synchronously, without delaying or changing production
+    // execution, so the final epoch cut remains inspectable after teardown.
+    let capture = Arc::new(Capture {
+        probe: std::sync::Mutex::new(Some(
+            super::memory_retention_tests::probe_coordinator_state(),
+        )),
+        retained: std::sync::Mutex::new(None),
+    });
+    let waker = futures::task::waker(capture.clone());
+    {
+        let mut probe = capture.probe.lock().unwrap();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            std::future::Future::poll(std::pin::Pin::new(probe.as_mut().unwrap()), &mut cx,)
+                .is_pending()
+        );
+    }
+    // A spurious wake must leave the pending receiver available.
+    waker.wake_by_ref();
+
+    let workspace = tempfile::tempdir().unwrap();
+    let missing = workspace.path().join("missing-additional-root");
+    let options = Options::try_parse_from([
+        std::ffi::OsString::from("attyd"),
+        "--cwd".into(),
+        workspace.path().as_os_str().to_owned(),
+        "--add-dir".into(),
+        missing.as_os_str().to_owned(),
+        "--".into(),
+        "unused-agent-before-filesystem-setup".into(),
+    ])
+    .unwrap()
+    .normalized()
+    .unwrap();
+    let (_commands, command_rx) = mpsc::unbounded_channel();
+    let (events, mut events_rx) = mpsc::unbounded_channel();
+    run_with_cancellation(
+        Arc::new(options),
+        command_rx,
+        events.into(),
+        CancellationToken::new(),
+    )
+    .await;
+    // Repeated wakes after capture must not consume the probe a second time.
+    waker.wake_by_ref();
+
+    let events = std::iter::from_fn(|| events_rx.try_recv().ok())
+        .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "bridge/phase" && event["phase"] == "error" })
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "bridge/error"
+                && event["data"].as_str().is_some_and(|message| {
+                    message.contains("workspace root cannot be resolved")
+                        && message.contains(missing.to_string_lossy().as_ref())
+                })
+        }),
+        "setup must fail on the additional root before trying to spawn the placeholder Agent: {events:?}"
+    );
+
+    let retained = capture
+        .retained
+        .lock()
+        .unwrap()
+        .take()
+        .expect("captured authority before setup returned");
+    let state = retained.lock_without_commit().await;
+    assert_eq!(state.agent.phase, AgentPhase::Error);
+    assert!(state.agent.error.is_some());
+
+    // Rebuild from the actual retained operations, rather than installing a
+    // fresh final snapshot that could conceal an authority-only repair.
+    let mut global = json!({});
+    let mut applied = 0;
+    for entry in state
+        .replication
+        .log()
+        .after(0)
+        .expect("the small setup log retains its initial entry")
+        .filter(|entry| entry.scope == crate::protocol::GLOBAL)
+    {
+        assert_eq!(entry.prev, applied);
+        let crate::protocol::log::Change::Ops(ops) = &entry.change else {
+            panic!("global remains present until the epoch ends");
+        };
+        for op in ops.iter() {
+            crate::protocol::diff::apply(&mut global, op).unwrap();
+        }
+        applied = entry.seq;
+    }
+    assert_eq!(global["agent"]["phase"], "error");
+    assert!(!global["agent"]["error"].is_null());
+    assert_eq!(
+        global,
+        json!(crate::protocol::project_global(
+            &state.agent,
+            state.catalog_revision,
+            &state.sessions,
+        ))
+    );
+}

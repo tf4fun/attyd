@@ -143,6 +143,19 @@ fn paths(ops: &[(String, Vec<Op>)], scope: &str) -> Vec<String> {
         .collect()
 }
 
+fn retained_ops(replication: &Replication) -> String {
+    let log = replication.log();
+    // Permit release to compact the prefix. Inspect every surviving entry,
+    // rather than requiring an obsolete cursor to remain replayable.
+    let before_retained = log.seq() - log.len() as u64;
+    let ops = log
+        .after(before_retained)
+        .expect("the retained suffix is continuous")
+        .flat_map(|entry| entry.change_ops())
+        .collect::<Vec<_>>();
+    serde_json::to_string(&ops).unwrap()
+}
+
 #[test]
 fn agent_control_updates_converge_in_arrival_order() {
     let mut bench = Bench::new();
@@ -542,19 +555,6 @@ fn published_documents_and_the_log_release_turn_content() {
 fn completed_process_content_is_released_from_the_retained_log() {
     const PROCESS_BODY: &str = "completed-process-body-must-leave-the-log";
 
-    fn retained_ops(replication: &Replication) -> String {
-        let log = replication.log();
-        // Permit release to compact the prefix. Inspect every surviving entry,
-        // rather than requiring an obsolete cursor to remain replayable.
-        let before_retained = log.seq() - log.len() as u64;
-        let ops = log
-            .after(before_retained)
-            .expect("the retained suffix is continuous")
-            .flat_map(|entry| entry.change_ops())
-            .collect::<Vec<_>>();
-        serde_json::to_string(&ops).unwrap()
-    }
-
     let mut bench = Bench::new();
     let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
     bench.step();
@@ -594,6 +594,89 @@ fn completed_process_content_is_released_from_the_retained_log() {
         "released process bytes must leave log-owned Op values too, without waiting for later traffic to exhaust the budget"
     );
     bench.settle();
+}
+
+#[test]
+fn closed_active_turn_releases_process_content_from_log() {
+    use crate::runtime_state::SessionOperationKind;
+    use crate::session_state::SessionAdmission;
+
+    const PROCESS_BODY: &str = "closed-active-process-must-leave-the-log";
+    let mut bench = Bench::new();
+    let incarnation = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    let operation = bench.start_turn("s", incarnation, "close-intent");
+    bench.update(
+        "s",
+        incarnation,
+        &operation,
+        json!({
+            "sessionUpdate": "tool_call", "toolCallId": "read-tool", "title": "Read",
+            "content": [{ "type": "content", "content": {
+                "type": "text", "text": PROCESS_BODY,
+            } }],
+        }),
+    );
+    bench.step();
+    assert!(
+        retained_ops(&bench.replication).contains(PROCESS_BODY),
+        "the log delivers process content while the turn is active"
+    );
+
+    bench
+        .registry
+        .begin_exclusive("s", incarnation, SessionOperationKind::Close, "close")
+        .unwrap();
+    bench
+        .registry
+        .start_operation(
+            EPOCH,
+            "s",
+            incarnation,
+            "close",
+            SessionOperationKind::Close,
+            "closing",
+        )
+        .unwrap();
+    bench.step();
+    let before_close = bench.replication.log().seq();
+    let before_close_session_seq = bench.replication.scope_seq("session/s").unwrap();
+    bench
+        .registry
+        .close_session(EPOCH, "s", incarnation, "close")
+        .unwrap();
+    bench.step();
+
+    // No normal prompt completion is injected. Release may happen at close
+    // confirmation or cleanup, but it must be complete once the scope ends.
+    let previous_session_seq = bench
+        .replication
+        .scope_seq("session/s")
+        .unwrap_or(before_close_session_seq);
+
+    bench
+        .registry
+        .finish_session_cleanup("s", incarnation, SessionAdmission::Close, "close")
+        .unwrap();
+    bench.registry.remove("s", incarnation);
+    bench.step();
+    bench.registry.release_published_runtime(u64::MAX);
+    assert!(super::project_session(&bench.registry, "s").is_none());
+    assert_eq!(bench.replication.scope_seq("session/s"), None);
+    let log = bench.replication.log();
+    let before_retained = log.seq() - log.len() as u64;
+    let end = log
+        .after(before_retained)
+        .expect("retirement preserves a continuous retained suffix")
+        .find(|entry| entry.scope == session_scope("s") && entry.change == Change::End)
+        .expect("retiring the owner emits its scope's End");
+    assert_eq!(end.change, Change::End);
+    assert_eq!(end.prev, previous_session_seq);
+    assert!(end.seq > before_close);
+    bench.settle();
+    assert!(
+        !retained_ops(&bench.replication).contains(PROCESS_BODY),
+        "scope retirement releases process bytes from every retained Op without waiting for the log budget to fill"
+    );
 }
 
 #[test]
