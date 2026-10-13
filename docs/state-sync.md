@@ -72,12 +72,24 @@ touched:
 
 1. Project each touched scope.
 2. Diff the result against the document last published for that scope, and emit
-   `set`/`remove` ops for every changed path. Append-only fields
-   (`history.timeline`, `turn.updates`, terminal `output`) are not compared value by
-   value. A length cursor per field emits `append`, so large content is never
-   diffed or copied.
+   ops for every difference (protocol §4).
 3. If any ops exist, append one entry `{ scope, seq, prev, ops }` to the log, and
    store the new document as the published one.
+
+Length alone can't tell what changed in the large sequence fields, so diffing them
+uses identity:
+
+| Field | Changes | Diff |
+| --- | --- | --- |
+| `history.timeline`, `turn.updates` | growth; in-place folds (`tool_call_update` keeps its original slot, see `fold_history_update` in `src/history_cache.rs`; merged chunks); whole replacement at baseline commit | Elements are `Arc`-shared. Active turn updates already are (`SharedTurnUpdates`); history entries become so in step 2, because `fold_history_update` returns plain values today. Compare published and current element by pointer: equal pointers mean unchanged. A changed element is an index `set`, a new tail is `append`, and a new history revision is one `set` of the field. |
+| terminal `output` | growth, plus front trimming when the tail exceeds its bound (`src/terminal.rs`, reader loop) | The bridge keeps an absolute counter of trimmed and appended UTF-16 units per terminal. The difference against the published counters gives `trim` + `append`. |
+| maps (`interactions`, `urlFlows`, `terminals`, `outcomes`, `requests`, `sessions`) | upsert, remove | per key; values compared by pointer first, then by value |
+| scalars and small structs (`controls`, `operation`, headers) | any | compared by value |
+
+Comparing pointers is linear in the number of elements, with no content comparison.
+If profiling shows that is too costly for long timelines, a per-field change list
+recorded by the transition can replace it. The gate still compares against full
+projections, so neither strategy can hide a change.
 
 The commit step emits whatever differs from the last published document, so a call
 site can neither forget an event nor choose the wrong one. `advance_session_delta`,
@@ -85,9 +97,9 @@ site can neither forget an event nor choose the wrong one. `advance_session_delt
 and `live.revision` counters all go away. A scope's position is the `seq` of its last
 entry.
 
-The published documents keep only what diffing needs. Append-only fields are
-represented by their cursors, and other fields share `Arc` payloads with bridge
-state, so publishing doesn't duplicate conversation content. The
+The published documents keep only what diffing needs: `Arc` handles shared with
+bridge state, plus terminal counters. Publishing therefore doesn't duplicate
+conversation content. The
 [memory retention](runtime-memory-retention.md) tests extend to the published
 documents and the log.
 
@@ -123,17 +135,43 @@ observation lease (H09, H13). The bridge sees only the lease, never the stream.
 ### 2.4 Commands
 
 Command handlers run in the bridge actor as today. After the command's own
-transition and commit step, the handler records the log position at that moment and
-returns it as `at`. This holds even when the command commits no change, such as an
-idempotent duplicate. Long-running effects (turns, auth flows) commit their
-acceptance before the HTTP response. Later progress arrives only through
-replication.
+transition and commit step, the handler records the log position at that moment as
+`at`, and the touched scopes as `scopes`. This holds even when the command commits
+no change, such as an idempotent duplicate. Long-running effects (turns, auth
+flows, create, fork) commit their acceptance and their tracking record before the
+HTTP response. Later progress arrives only through replication.
 
-Global requests (`authenticate`, `logout`, `auth_terminal`, `create_session`) become
-entries in `GlobalState.requests`. Request-scoped ACP elicitations attach to the
-request whose JSON-RPC call is in flight. This replaces `request_elicitations` and
+**Request records.** Every ACP request the bridge sends outside a held session gets
+a `GlobalRequest` before it is sent. This includes:
+
+- `authenticate` and `logout`;
+- the auth terminal;
+- `session/new` and `session/fork`;
+- cold `session/delete`;
+- the `session/list` behind a catalog read.
+
+The record is keyed by the bridge's JSON-RPC request ID. A request-scoped elicitation
+names that ID (`ElicitationRequestScope.request_id`), so the bridge attaches it to
+the record directly. This replaces the connection-level `request_elicitations` and
 `request_url_flows`, and the `acp/authenticated`, `acp/logged_out` and
-`bridge/auth_terminal_*` events.
+`bridge/auth_terminal_*` events. A global URL flow keeps its `requestId` but outlives
+the request (protocol §3.4).
+
+**Intents.** Create, fork and turn start keep an intent table per epoch, keyed by
+`clientIntentId`, that stores the body digest and the request or operation ID. Turns
+already have this (H07). Create and fork gain it, so a retry or a lost response
+resolves to the existing record.
+
+**Cold-session commands.** `If-Match: "<epoch>:0"` is checked against the registry
+in the same actor turn that starts the global request, so there is no window in which
+the session becomes held unseen. Cold delete keeps the path tested by
+`cold_session_deletion_uses_global_management_without_loading`
+(`src/server.rs:4400`).
+
+**Materialization.** Only an observation lease starts `load`/`resume` (protocol
+§4.2). `GET /api/v2/sessions/{id}` answers from the held session or returns
+`not_found`. Today's observe-then-fetch behaviour of the browser is kept, and the GET
+loses its loading side effect.
 
 ### 2.5 Rejected alternative
 
@@ -151,7 +189,7 @@ Rust DTOs from the start. TypeScript in `shared/` is generated from them (`ts-rs
 verbatim are referenced from `@agentclientprotocol/sdk`, not regenerated. This
 absorbs #5 for v2. v1 shapes are never typed; they are deleted.
 
-## 4. Invariants and the convergence gate
+## 4. Invariants and gates
 
 - **S1 single write path:** only the commit step appends to the log.
 - **S2 convergence:** for every scope, `apply(snapshot@a, entries(a..b)) ==
@@ -160,64 +198,94 @@ absorbs #5 for v2. v1 shapes are never typed; they are deleted.
   no mix of epochs or incarnations (extends H10).
 - **S4 coalescing safety:** replacing any queued suffix with the latest snapshot gives
   the same final document.
-- **S5 observation independence:** `global` subscribers and snapshot reads never
-  affect session lifecycle (extends H09, H13).
+- **S5 observation independence:** `global` subscribers and reads never affect
+  session lifecycle (extends H09, H13).
 - **S6 privacy:** released process content and private payloads never enter a
   document, op or log entry.
-- **S7 read your writes:** once a replica's stream position reaches a command's `at`,
-  its documents reflect that command.
+- **S7 read your writes:** once a replica's *applied* position (protocol §4.1)
+  reaches a command's `at`, its subscribed documents in `scopes` reflect that
+  command, including while a reset is pending.
+- **S8 rebuildability:** a replica that discards everything and re-reads public state
+  recovers every answerable interaction, every running operation, and every finished
+  result within retention (protocol §1, §3.4).
 
-**Convergence gate.** A Rust harness drives the bridge with a scripted Agent. After
-every step, it applies the delivered entries to a replica and compares the result
-with fresh snapshots (S2). It repeats the scenario with forced coalescing (S4) and
-with reconnects at random cuts (S3). The scenarios cover:
+Two gates enforce these. Neither is enough alone.
 
-- control updates from the Agent;
-- URL flow completion and cancellation;
-- a background permission;
-- a turn started by another client;
-- a global request with a request-scoped elicitation;
-- retirement, close, delete, fork and reattach;
-- an epoch change;
-- early `session/new` updates, once #8 is fixed.
+### 4.1 Convergence gate (S2–S4, S7)
+
+A Rust harness drives the bridge with a scripted Agent. After every step, it applies
+the delivered entries to a replica and compares the result with fresh snapshots. It
+repeats the scenario with forced coalescing and with reconnects at random cuts. It
+also checks S7 by issuing commands while a scope is waiting for its reset snapshot.
 
 A missed commit step shows up as a divergence, whatever the field. The harness lands
 together with the commit step, in the same PR.
+
+Convergence can't detect a projection that is missing something. If both the
+snapshot and the ops leave out global URL flows, they still agree. That is what the
+second gate is for.
+
+### 4.2 ACP semantic coverage gate (S8)
+
+For every row of the [coverage ledger](acp-coverage.md), the ledger gains the v2
+chain:
+
+```text
+ACP capability → bridge authority → public projection / command → finished result
+               → recovery after a fresh replica → lifecycle end
+```
+
+Each link names the document path or endpoint and the test that proves it. A link
+that is "not applicable" says why: for example, filesystem requests are fulfilled
+inside the bridge, so only their user-visible effects are projected. A capability
+row is done when every link has a test.
+
+These acceptance scenarios come first and run against v2 end to end. Each one
+discards the replica at the critical point and rebuilds it from public state:
+
+| Scenario | Proves |
+| --- | --- |
+| Global URL authentication: refresh after accept, then `elicitation/complete`, and separately cancellation | global `urlFlows` and their lifetime |
+| `POST /sessions` and fork with the HTTP response dropped; two pages creating in one directory; retry with the same key | intents and typed request results |
+| Cold-session delete with an Agent that supports delete but not load or resume | the `"<epoch>:0"` precondition and the no-load path |
+| Sparse controls: title then `updatedAt` only; usage with cost, then usage without cost; `null` clears | control reduction (protocol §3.3) |
+| Terminal output that rolls past its bound | the `trim` + `append` diff |
+| A background `tool_call_update` folding into an earlier slot | index `set` on the timeline |
+| A command completing while its scope waits for a reset snapshot | received versus applied position |
+| A request-scoped elicitation during `session/new` and during a catalog read | request records as parents |
+| A background permission, and a turn started by another client | `global.sessions` summaries |
+| Retirement, close, delete, reattach, epoch change | `end`, incarnation and epoch handling |
+| Early `session/new` updates, once #8 is fixed | baseline seeding |
 
 Browser tests check only the browser's half: applying a valid entry stream gives the
 same replica as loading the final snapshot. These extend the existing fuzz tests.
 
 ## 5. Migration
 
-v2 is built next to v1 and the web UI moves to it in one step, so the product keeps
+v2 is built next to v1, and the web UI moves to it in one step, so the product keeps
 working throughout. Each step is one PR, validated in CI.
 
 | Step | Work | Absorbs |
 | --- | --- | --- |
-| 1 | Protocol DTOs with generated TypeScript; `project_global` / `project_session` with unit tests | #5 |
-| 2 | Commit step, log, diff and append cursors; convergence harness (in process, no HTTP) | — |
-| 3 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}`, `GET /api/v2/stream`: Hub cut, `prev`, coalescing, resume, `position` | — |
-| 4 | v2 commands with `at`, owner `If-Match` and `ProtocolError`; the interaction endpoint; reads (catalog, process pages, attachments, files) | — |
-| 5 | Global requests: auth flows, auth terminal and `create_session`, request-scoped elicitations | — |
-| 6 | Web UI on v2: a generic replica engine (JSON Pointer patcher and validation) outside React; sidebar busy and attention markers from `global.sessions` | #16, #17 (visible fix) |
+| 1 | v2 chain columns in the coverage ledger. Protocol DTOs with generated TypeScript. `project_global` and `project_session` with unit tests, including control reduction. | #5 |
+| 2 | Commit step, log and identity-based diff; in-process convergence harness | — |
+| 3 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}` and `GET /api/v2/stream`: Hub cut, `prev`, coalescing, resume, `position`; observation-only materialization | — |
+| 4 | Session commands with `at`/`scopes`, `If-Match` tags and `ProtocolError`; turn and fork intents; the interaction endpoint; the reads | — |
+| 5 | Request records for every out-of-session ACP request; global interactions and URL flows; auth flows and the auth terminal; create intents; cold delete and fork | — |
+| 6 | Web UI on v2, with a generic replica engine (JSON Pointer patcher plus validation, with received and applied positions) outside React; sidebar markers from `global.sessions` | #16, #17 (visible fix) |
 | 7 | Remove v1: routes, business events, `advance_session_delta`, `touch`, `cachedSessions` and compensating browser state, and the journal replica if it has no other consumer | #18 |
 | 8 | (optional) Path-subset profiles and an access-layer guide, when a second access layer is concrete | — |
 
-Dependencies: 1 → 2 → 3 → 4 → 5 → 6 → 7. Steps 4 and 5 can be developed in parallel
-once step 3 lands. #8 is independent and can land at any time, in v1 or v2.
+Dependencies: 1 → 2 → 3, then 4 and 5 in either order, then 6 → 7. Each step adds
+the acceptance scenarios from §4.2 that it makes reachable. #8 is independent and can
+land at any time, in v1 or v2.
 
 #16 and #17 stay visible until step 6. If either becomes urgent before then, a
 targeted v1 fix is possible, but that work would be thrown away in step 7.
 
 ## 6. Open questions
 
-- **Diff cost on large maps.** `controls`, `interactions` and `terminals` are small.
-  If profiling shows diffing a hot field is costly, the commit step may take a
-  "touched paths" hint from the transition, as long as the gate still compares
-  against a full projection.
+- **Pointer-diff cost.** Measure the pointer-compare diff on long timelines in step 2.
+  Switch to transition-recorded change lists only if it shows up.
 - **Log retention budget.** Choose the byte bound for the per-epoch log, and how it
-  interacts with the existing subscriber budgets.
-- **Snapshot cost for cold sessions.** `GET /api/v2/sessions/{id}` with `cwd` can
-  trigger a load. Decide whether a stream subscription should start the load and
-  answer the snapshot fetch from it (as observe-then-fetch does today), or the fetch
-  should start it.
+  interacts with the existing subscriber budgets and the protocol §3.4 minimums.

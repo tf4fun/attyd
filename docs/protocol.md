@@ -4,19 +4,22 @@ Status: draft, 2026-10-12. Nothing here is implemented yet. This document define
 the client-facing protocol that replaces today's `/api/v1` business API. The
 [implementation plan](state-sync.md) describes how the bridge produces it. The
 [runtime contract](active-turn-runtime.md) still governs ACP semantics: history
-authority, CAS, idempotency and epoch and incarnation isolation.
+authority, CAS, idempotency, and epoch and incarnation isolation. The
+[ACP coverage ledger](acp-coverage.md) lists the capabilities this protocol must
+carry.
 
 ## 1. Model
 
-attyd puts a stateless protocol layer on top of ACP. It works like single-leader log
-replication, as in MySQL primary/replica replication or Raft's log, without leader
-election or quorum.
+attyd puts a stateless access layer on top of ACP. It works like single-leader log
+replication: MySQL primary/replica replication, or Raft's log without election or
+quorum.
 
-- **The bridge is the leader and the only writer.** It alone speaks ACP, holds
-  state and decides every transition.
-- **Clients are replicas.** A client holds a copy of the state it subscribes to and
+- **The bridge is the leader and the only writer.** It alone speaks ACP, owns the
+  connection, the sessions, their resources and every in-flight operation, and
+  decides every transition.
+- **Clients are replicas.** A client holds a copy of the scopes it subscribes to and
   nothing authoritative. It may keep local UI state: drafts, unsent queued prompts,
-  expanded panels, scroll positions. Anything other clients would need to see is
+  expanded panels, scroll positions. Anything another client would need to see is
   bridge state.
 - **Writes are commands sent to the leader.** A client never changes its replica
   directly. It sends a command over HTTP, and the effect comes back through
@@ -25,17 +28,34 @@ election or quorum.
   operations (§4), not the ACP calls that caused them. Applying an entry needs no
   ACP knowledge.
 
+**Stateless means rebuildable.** A client can discard its replica at any moment,
+then re-read the public state and recover:
+
+- every interaction that can still be answered;
+- every operation that is still running;
+- the result of every operation that finished within the retention bounds (§3.4).
+
+Every later command needs only the request itself and public state. No result
+exists only in a single HTTP response.
+
+**Coverage.** The protocol carries ACP v1 as pinned in `Cargo.lock` (schema
+`1.7.0`), the unstable features attyd negotiates, and the product boundary in the
+[coverage ledger](acp-coverage.md). Provider configuration, NES and editor document
+integration are product exclusions. Filesystem, terminal and MCP requests from the
+Agent are fulfilled inside the bridge as the ACP client. They need no client
+endpoints, but every user-visible effect of them is projected.
+
 The protocol has three parts:
 
 | Part | Transport | Purpose |
 | --- | --- | --- |
 | State documents (§3) | `GET` snapshots | replicated state, one document per scope |
 | Replication stream (§4) | SSE | ordered operations on those documents |
-| Commands and resources (§5, §6) | HTTP | writes, plus immutable or Agent-owned reads |
+| Commands and reads (§5, §6) | HTTP | writes, plus immutable or Agent-owned reads |
 
 All paths are under `/api/v2`. JSON field names are camelCase. Embedded ACP types
 (`SessionUpdate`, `RequestPermissionRequest`, `InitializeResponse`, …) are carried
-verbatim, as defined by the ACP schema.
+verbatim, as the ACP schema defines them.
 
 ## 2. Positions
 
@@ -44,8 +64,8 @@ interface Position { epoch: string; seq: number }
 ```
 
 - `epoch` identifies one bridge connection to the Agent. A new Agent connection
-  starts a new epoch, and every replica discards all state from the old epoch (as a
-  replica does after a primary change).
+  starts a new epoch. Every replica then discards all state from the old epoch, as
+  a replica does after a primary change.
 - `seq` is the log position inside the epoch. It starts at 1 and increases by one
   for each committed entry, across all scopes.
 - Every snapshot reports the position it was taken at. Every command response
@@ -53,14 +73,15 @@ interface Position { epoch: string; seq: number }
 
 ## 3. State documents
 
-A **scope** is the unit of replication. There are two kinds:
+A **scope** is the unit of replication. There are exactly two kinds:
 
-- `global`: always exists in an epoch;
-- `session/<sessionId>`: exists while the bridge holds that session. A new
+- `global` always exists in an epoch.
+- `session/<sessionId>` exists while the bridge holds that session. A new
   incarnation of the same session ID is a new document.
 
-There is no third kind. Anything not tied to a session, including ACP requests made
-before a session exists, belongs to `global`.
+Anything outside a held session belongs to `global`. That includes ACP requests made
+before a session exists, requests on sessions the bridge does not hold, and the
+request-scoped interactions those requests trigger.
 
 ### 3.1 Global
 
@@ -81,41 +102,49 @@ interface GlobalState {
     authenticatedMethodId: string | null;
   };
   catalog: { revision: string };             // token for the Agent-owned session list (§6)
-  sessions: Record<string, SessionSummary>;  // sessions the bridge currently holds
-  requests: Record<string, GlobalRequest>;   // in-flight commands outside any session
-  interactions: Record<string, Interaction>; // user input requested outside any session
+  sessions: Record<string, SessionSummary>;  // sessions the bridge holds
+  requests: Record<string, GlobalRequest>;   // ACP requests outside any held session
+  interactions: Record<string, Interaction>; // request-scoped user input (requestId set)
+  urlFlows: Record<string, UrlFlow>;         // request-scoped URL flows (requestId set)
 }
 
 interface SessionSummary {
   sessionId: string;
   incarnation: number;
   cwd: string;
-  title: string | null;
-  lifecycle: "attaching" | "active" | "closing" | "closing_for_delete" | "deleting" | "closed" | "uncertain";
+  title: string | null;                      // controls.info.title
+  lifecycle: "attaching" | "active" | "closing" | "closing_for_delete"
+           | "deleting" | "closed" | "uncertain";
   phase: SessionPhase;
   work: "idle" | "running" | "awaiting_input";
   pending: { permissions: number; elicitations: number; urlFlows: number };
 }
 
 interface GlobalRequest {
-  requestId: string;
-  kind: "authenticate" | "logout" | "auth_terminal" | "create_session";
-  methodId?: string;
+  requestId: string;                         // bridge-allocated, unique in the epoch
+  method: string;                            // ACP method ("authenticate", "logout",
+                                             // "session/new", "session/fork",
+                                             // "session/delete", "session/list", …)
+                                             // or "attyd/auth_terminal"
+  clientIntentId: string | null;             // Idempotency-Key of the starting command
+  sessionId: string | null;                  // addressed session, if any (fork source, cold delete)
   status: "running" | "succeeded" | "failed" | "cancelled";
-  error?: ProtocolError;
-  terminal?: TerminalState;                  // auth_terminal only
+  result?: RequestResult;                    // succeeded
+  error?: ProtocolError;                     // failed
+  terminal?: TerminalState;                  // attyd/auth_terminal
 }
+
+type RequestResult =
+  | { kind: "session"; sessionId: string; incarnation: number }  // session/new, session/fork
+  | { kind: "authenticated"; methodId: string }                  // authenticate, auth terminal
+  | { kind: "done" };                                            // everything else
 ```
 
-Global interactions are ACP elicitations with request scope: the Agent asks for input
-while answering a global request, such as `authenticate` or a `session/new` that
-hasn't returned yet. Each one names the `requestId` it belongs to and is removed when
-answered or when that request ends. Session permissions are always session-scoped in
-ACP and never appear here.
-
-A finished request stays in `requests` until the client acknowledges it (§5.2), so a
-replica that reconnects still sees the outcome. The bridge may also drop finished
-requests after a bounded retention.
+**A request record exists for every ACP request the bridge sends outside a held
+session, while that request is in flight.** That includes requests a read starts:
+`GET /api/v2/catalog` sends `session/list`, so it gets a record. Every request-scoped
+elicitation therefore has a parent that a replica can see. Finished records are
+retained per §3.4.
 
 ### 3.2 Session
 
@@ -124,18 +153,17 @@ interface SessionState {
   sessionId: string;
   incarnation: number;
   cwd: string;
-  agent: Omit<NewSessionResponse, "sessionId"> | null;  // modes, models, configOptions as returned
-  controls: Record<string, SessionUpdate>;             // latest control update by kind
+  controls: SessionControls;                 // reduced state, §3.3
   history: {
-    revision: string | null;                // CAS token for turns (§5.3)
+    revision: string | null;                 // CAS token for turns (§5.3)
     phase: SessionPhase;
     error: string | null;
     notice: string | null;
-    timeline: SessionUpdate[];              // completed history, process bodies collapsed
-    collapsedTurns: CollapsedTurn[];        // references to process pages (§6)
+    timeline: SessionUpdate[];               // completed history; process bodies collapsed
+    collapsedTurns: CollapsedTurn[];         // references to process pages (§6)
   };
   turn: ActiveTurn | null;
-  outcomes: Record<string, TurnOutcome>;    // by operationId, bounded retention
+  outcomes: Record<string, TurnOutcome>;     // by operationId
   operation: { operationId: string; kind: OperationKind; stage: string } | null;
   interactions: Record<string, Interaction>;
   urlFlows: Record<string, UrlFlow>;
@@ -149,7 +177,7 @@ interface ActiveTurn {
   operationId: string;
   clientIntentId: string;
   prompt: ContentBlock[];
-  updates: SessionUpdate[];
+  updates: SessionUpdate[];                  // folded overlay; entries may change in place
   cancelRequested: boolean;
 }
 
@@ -157,37 +185,87 @@ interface TurnOutcome {
   operationId: string;
   clientIntentId: string;
   status: "completed" | "failed";
-  response?: PromptResponse;               // completed
-  error?: ProtocolError;                   // failed
-  prompt?: ContentBlock[];                 // failed: kept so the user can retry
-  afterUpdate: number;                     // timeline index the outcome follows
+  response?: PromptResponse;                 // completed: stop reason, usage
+  error?: ProtocolError;                     // failed
+  prompt?: ContentBlock[];                   // failed: kept for an exact retry
+  afterUpdate: number;                       // timeline index the outcome follows
 }
 
 type Interaction =
   | { interactionId: string; kind: "permission"; request: RequestPermissionRequest;
-      operationId: string | null; requestId?: never }
+      operationId: string | null }
   | { interactionId: string; kind: "elicitation"; request: CreateElicitationRequest;
-      operationId: string | null; requestId?: string };  // requestId: global scope only
+      operationId: string | null; requestId?: string };   // requestId: global scope only
 
 interface UrlFlow {
   elicitationId: string;
+  interactionId: string;                     // the accepted elicitation
+  requestId?: string;                        // global scope only
   request: CreateElicitationRequest;
   status: "waiting" | "completed" | "cancelled";
 }
 
 interface TerminalState {
   terminalId: string;
-  output: string;                          // bounded tail
+  output: string;                            // bounded tail, see `trim` in §4
   truncated: boolean;
   exitStatus: { exitCode: number | null; signal: string | null } | null;
   released: boolean;
 }
 ```
 
-The session document is the compact presentation used by the web UI today. Process
+The session document is the compact presentation the web UI uses today. Process
 bodies of completed turns are never inlined. They are immutable pages addressed by
-`(historyRevision, turnId)` (§6). This keeps snapshots bounded, and lets privacy
-release apply to one place.
+`(historyRevision, turnId)` (§6). This keeps snapshots bounded, and privacy release
+applies in one place.
+
+A fork is tracked as a global request (`session/fork` with `sessionId` = source),
+because its result is a new session and the source may be cold. While the request
+runs, a held source also shows `operation.kind = "fork"`, which excludes other
+mutations of the source. This is the current admission rule.
+
+### 3.3 Controls
+
+`controls` is the **reduced current state** of the session's controls. It is not a
+log of the latest notifications. The initial `session/new`, `load`, `resume` or `fork`
+response comes first, and every later update folds into it in arrival order:
+
+```ts
+interface SessionControls {
+  modes: { currentModeId: string; availableModes: SessionMode[] } | null;
+  configOptions: SessionConfigOption[];      // also carries model selection in schema 1.7.0
+  commands: AvailableCommand[];
+  info: { title: string | null; updatedAt: string | null; meta: unknown | null };
+  usage: { used: number; size: number; cost: Cost | null } | null;
+}
+```
+
+| ACP source | Reduction |
+| --- | --- |
+| response `modes` | sets `modes` |
+| `current_mode_update` | sets `modes.currentModeId` |
+| response `configOptions`, `config_option_update` | replace `configOptions` as a whole |
+| `available_commands_update` | replace `commands` as a whole |
+| `session_info_update` | patch per field: absent keeps the value, `null` clears it, a value sets it |
+| `usage_update` | sets `used` and `size`. `cost` absent or `null` keeps the last known cost. |
+
+These rules are what `fold_control_update` and `SessionLiveState::config_options`
+implement today (`src/runtime_state.rs`). The protocol makes them normative, so a
+snapshot after any sequence of sparse updates equals the fold of that sequence.
+
+### 3.4 Lifetimes
+
+| Entity | Created | Removed |
+| --- | --- | --- |
+| `Interaction` | the Agent sends `session/request_permission` or `elicitation/create` | answered, cancelled by the Agent, or its session or request ends |
+| `UrlFlow` | a URL elicitation is accepted. Accepting only consents to open the URL (ACP). | stays after its parent request ends. Becomes `completed` on `elicitation/complete` and `cancelled` on Agent cancellation or session end. Kept in a terminal status until acknowledged or retained out. |
+| `GlobalRequest` | the bridge sends the ACP request | when running: never. When finished: acknowledged (§5.2) or retained out. |
+| `TurnOutcome` | the turn ends | retained out |
+| `TerminalState` | the Agent creates the terminal | released and no longer referenced by the active turn or the timeline |
+
+"Retained out" means a bounded retention that the bridge enforces. It is at least
+the last 16 finished records per scope and at least 10 minutes. A replica that
+reconnects within those bounds sees every result.
 
 ## 4. Replication stream
 
@@ -196,10 +274,7 @@ GET /api/v2/stream?scope=global&scope=session/<id>[&cwd=<dir>]
 Last-Event-ID: <epoch>:<seq>        (optional, set by EventSource on reconnect)
 ```
 
-One stream carries any set of scopes. Subscribing to a `session/<id>` scope is an
-**observation**: it keeps the session materialized and stops unobserved retirement.
-`cwd` lets a cold session be found before it is listed. Subscribing to `global` never
-observes any session. To change the scope set, open a new stream.
+One stream carries any set of scopes. To change the set, open a new stream.
 
 Each SSE message has `id: <epoch>:<seq>` and one JSON entry:
 
@@ -212,59 +287,141 @@ type Entry =
   | { type: "position"; at: Position };
 
 type Op =
-  | { op: "set";    path: string; value: unknown }  // replace or create
-  | { op: "remove"; path: string }
-  | { op: "append"; path: string; values: unknown[] }  // array tail
-  | { op: "append"; path: string; text: string };      // string tail
+  | { op: "set";    path: string; value: unknown }   // create or replace; an array index modifies in place
+  | { op: "remove"; path: string }                   // map key or array index
+  | { op: "append"; path: string; values: unknown[] }// array tail
+  | { op: "append"; path: string; text: string }     // string tail
+  | { op: "trim";   path: string; count: number };   // drop the first `count` items or UTF-16 units
 ```
 
-- `path` is a JSON Pointer into the scope's document. `set` on a missing parent is a
-  protocol error. Any other op on a missing target is also a protocol error.
-- `prev` is the `seq` of the previous entry delivered for the same scope, which may be
-  a `snapshot`. A replica applies `ops` only when `prev` equals the last `seq` it
-  applied to that scope. Otherwise it treats the scope as `reset`. This is Raft's
-  `prevLogIndex` check, per scope.
-- **Start of a scope:** the first entry for each subscribed scope is a `snapshot` or a
-  `reset`. A small document (`global`) comes inline as a `snapshot`. A large one
-  (`session/*`) comes as a `reset`. After a `reset`, the replica fetches
-  `GET /api/v2/sessions/<id>` (§6). The fetched snapshot's `at` will be at or after
-  the reset position. The replica then drops buffered entries with `seq <= at.seq`
-  and applies the rest.
-- **Lag:** if a subscriber falls behind, the server may replace its queued entries for
-  a scope with one `reset` or `snapshot` at the latest position. A replica must not
-  depend on seeing every intermediate state.
-- **Resume:** with `Last-Event-ID` in the current epoch, the server resumes each scope
-  from its retained log, or sends a `reset` when the suffix has been compacted. With
-  any other epoch, every scope starts fresh.
-- **`position`:** advances the replica's stream position without data. The server
-  sends it, coalesced, when the log moves through scopes the stream doesn't carry.
-  A replica can therefore always tell when it has caught up to a command's commit
-  position (§5.1).
-- **`end`:** the document no longer exists for this subscription. A new incarnation
-  ends the old one (`replaced`), then a new snapshot or reset follows.
+**Ops.** `path` is a JSON Pointer into the scope's document. Any op on a missing
+target or parent is a protocol error. The server picks the op that matches the
+change:
 
-Applying entries is generic. A replica needs no per-kind reducer, only a JSON Pointer
-patcher plus validation of the resulting document against the schema.
+- growth uses `append`;
+- an entry folded in place (a `tool_call_update`, a merged chunk) uses `set` on its
+  index;
+- a bounded tail moving forward (terminal output) uses `trim` plus `append`;
+- anything else uses `set` on the smallest enclosing value.
+
+Applying entries is generic. A replica needs a JSON Pointer patcher and validation of
+the result against the schema, not a reducer for each kind of change.
+
+**Continuity.** `prev` is the `seq` of the previous entry delivered for the same
+scope, which may be a `snapshot` or the `at` of a fetched snapshot. A replica
+applies `ops` only when `prev` equals the last `seq` it applied to that scope.
+Otherwise it treats the scope as reset. This is Raft's `prevLogIndex` check, per
+scope.
+
+**Start of a scope.** The first entry for each subscribed scope is a `snapshot` or a
+`reset`:
+
+- `global` comes inline as a `snapshot`;
+- a `session/*` scope comes as a `reset`.
+
+After a `reset`, the replica fetches `GET /api/v2/sessions/<id>` (§6), whose `at` is
+at or after the reset position. It buffers entries for that scope until the snapshot
+arrives, drops buffered entries with `seq <= at.seq`, and applies the rest.
+
+**Lag.** For a subscriber that falls behind, the server may replace its queued
+entries for a scope with one `reset` or `snapshot` at the latest position. A replica
+must not depend on seeing every intermediate state.
+
+**Resume.** If `Last-Event-ID` is in the current epoch, the server resumes each
+scope from its retained log, or sends a `reset` if the suffix has been compacted.
+Any other epoch starts every scope fresh.
+
+**`position`.** This entry advances the stream without data. The server sends it,
+coalesced, when the log moves through scopes the stream doesn't carry.
+
+**`end`.** The document no longer exists for this subscription. For a new
+incarnation, the old document ends with `replaced`, and a new `reset` follows.
+
+### 4.1 Received and applied position
+
+A replica tracks two positions:
+
+- **received:** the `at.seq` of the last entry it read from the stream;
+- **applied:** the largest `p` such that every subscribed scope reflects the log
+  through `p`. A scope that is waiting for a snapshot holds `applied` at its reset
+  position until the snapshot is installed and its buffer is drained.
+
+Read-your-writes (§5.1) uses **applied**, never received.
+
+### 4.2 Observation and materialization
+
+Subscribing to `session/<id>` is an **observation**. It holds an observation lease
+that keeps the session materialized and stops unobserved retirement (H09, H13).
+Subscribing to `global` never observes a session.
+
+**Only observation starts materialization.** When a stream subscribes to a session
+the bridge doesn't hold, the bridge:
+
+1. creates the session document with `history.phase = "cold"`;
+2. starts `load` or `resume` as the session's `operation`, following today's
+   capability rules and the stream's `cwd`;
+3. sends the scope's `reset` once the document exists.
+
+Load failure, retry and backoff appear as `history.phase`, `history.error` and
+`operation`, as they do today. Reads never start materialization (§6).
 
 ## 5. Commands
 
-Every command is a `POST`/`PUT`/`DELETE` that returns:
+Every command is a `POST`, `PUT` or `DELETE` that returns:
 
 ```ts
-interface CommandResult<T = unknown> { at: Position; result: T }
+interface CommandResult<T = unknown> {
+  at: Position;           // the effect is committed at or before this position
+  scopes: string[];       // scopes the effect touched
+  result: T;
+}
 ```
 
-or an error (§7). A command that returns `at` has committed its effect at or before
-that position. A command whose effect continues asynchronously (a turn, an auth flow)
-commits the acceptance at `at`, and reports progress through replicated state.
+or an error (§7). A command whose effect continues asynchronously (a turn, an auth
+flow, a fork) commits its acceptance, and the request record or operation that
+tracks it, at `at`. Its progress and result arrive through replication.
 
 ### 5.1 Read your writes
 
-To show a command's effect, a replica waits until its stream position reaches the
-returned `at`. Its replica then reflects the command. No event correlation, intent
-matching or extra fetch is needed.
+A replica shows a command's effect once both of these hold:
 
-### 5.2 Global commands
+- its **applied** position (§4.1) is at least `at.seq`;
+- it subscribes to the scopes in `scopes` that it wants to show.
+
+No event correlation and no extra fetch are needed.
+
+### 5.2 Intents and retries
+
+The commands that create something take an `Idempotency-Key: <clientIntentId>`
+header. It is required on turn start, `POST /sessions` and fork. Within one epoch:
+
+- the same key with the same body returns the original result with
+  `disposition: "duplicate"`, and creates nothing new;
+- the same key with a different body fails with `intent_conflict`;
+- the request record carries `clientIntentId`. A replica whose HTTP response was lost
+  finds its result in `global.requests` (or `outcomes` for a turn) by its own intent
+  ID, without retrying.
+
+Exactly-once doesn't cross epochs. A new Agent connection forgets intents, in line
+with H07 and H15.
+
+### 5.3 Preconditions
+
+Every session-addressed command names the state it expects in `If-Match`:
+
+| Tag | Meaning | Used by |
+| --- | --- | --- |
+| `"<epoch>:<incarnation>"` | the bridge holds exactly this incarnation | every command on a held session |
+| `"<epoch>:<incarnation>:<historyRevision>"` | as above, plus the history CAS | turn start |
+| `"<epoch>:0"` | the bridge holds no incarnation of this session | commands on a cold session: delete, fork |
+
+Interactions use `"<epoch>"` (global) or `"<epoch>:<incarnation>"` (session). A
+cold-session command never loads the session. It runs as a global request, so for
+example `session/delete` follows the existing cold-deletion path without
+`new`/`load`/`resume`/`close`. If the session became held in the meantime, the tag
+fails with `owner_mismatch`. The current incarnation is then in `global.sessions`.
+
+### 5.4 Global commands
 
 | Command | Body | Result |
 | --- | --- | --- |
@@ -274,40 +431,28 @@ matching or extra fetch is needed.
 | `POST /api/v2/agent/auth-terminals/{requestId}/input` | `{ data }` | `{}` |
 | `POST /api/v2/agent/auth-terminals/{requestId}/resize` | `{ cols, rows }` | `{}` |
 | `POST /api/v2/agent/auth-terminals/{requestId}/cancel` | `{}` | `{}` |
+| `POST /api/v2/sessions` (`Idempotency-Key`) | `{ cwd }` | `{ requestId, disposition }` |
 | `DELETE /api/v2/requests/{requestId}` | — | `{}`: acknowledge a finished request |
-| `POST /api/v2/sessions` | `{ cwd }` | `{ sessionId, incarnation }` |
+| `DELETE /api/v2/url-flows/{elicitationId}` | — | `{}`: acknowledge a finished global URL flow |
 
-`POST /sessions` creates a `create_session` request first. Request-scoped
-elicitations that happen before the Agent returns the session ID attach to that
-request.
-
-### 5.3 Session commands
-
-Every session command carries the expected owner, so a stale replica cannot act on a
-new incarnation:
-
-```text
-If-Match: "<epoch>:<incarnation>"          (owner precondition, all session commands)
-If-Match: "<epoch>:<incarnation>:<historyRevision>"   (turn start only: adds history CAS)
-Idempotency-Key: <clientIntentId>          (turn start only)
-```
+### 5.5 Session commands
 
 | Command | Body | Result |
 | --- | --- | --- |
-| `POST /api/v2/sessions/{id}/turns` | `{ prompt: ContentBlock[] }` | `{ operationId, disposition: "accepted" \| "duplicate" }` |
+| `POST /api/v2/sessions/{id}/turns` (`Idempotency-Key`) | `{ prompt: ContentBlock[] }` | `{ operationId, disposition }` |
 | `POST /api/v2/sessions/{id}/turns/{operationId}/cancel` | `{}` | `{}` |
 | `PUT /api/v2/sessions/{id}/mode` | `{ modeId }` | `{}` |
 | `PUT /api/v2/sessions/{id}/config/{configId}` | `{ value }` | `{}` |
-| `POST /api/v2/sessions/{id}/fork` | `{}` | `{ sessionId, incarnation }` |
+| `POST /api/v2/sessions/{id}/fork` (`Idempotency-Key`) | `{}` | `{ requestId, disposition }` |
 | `POST /api/v2/sessions/{id}/close` | `{}` | `{}` |
-| `DELETE /api/v2/sessions/{id}` | — | `{}` |
+| `DELETE /api/v2/sessions/{id}` | — | `{}` held, or `{ requestId }` cold |
+| `DELETE /api/v2/sessions/{id}/url-flows/{elicitationId}` | — | `{}`: acknowledge a finished URL flow |
 
-### 5.4 Interactions
+### 5.6 Interactions
 
 ```text
 POST /api/v2/interactions/{interactionId}
-If-Match: "<epoch>"                         (global interaction)
-If-Match: "<epoch>:<incarnation>"           (session interaction)
+If-Match: "<epoch>" | "<epoch>:<incarnation>"
 ```
 
 | Kind | Body |
@@ -316,20 +461,22 @@ If-Match: "<epoch>:<incarnation>"           (session interaction)
 | elicitation | `{ response: CreateElicitationResponse }` |
 
 Interaction IDs are bridge-allocated and unique within an epoch, so one endpoint
-serves both scopes.
+serves both scopes. Accepting a URL elicitation removes the interaction and creates
+the `UrlFlow` in the same commit.
 
 ## 6. Reads
 
-Reads are snapshots of state documents, immutable resources, or data the bridge
-passes through without owning it. None of them change state.
+A read never changes a state document, and never starts materialization or another
+session operation. The only state a read can create is the request record of an ACP
+call it makes while that call is in flight (§3.1).
 
 | Read | Kind | Notes |
 | --- | --- | --- |
 | `GET /api/v2/global` | snapshot | `{ at, state: GlobalState }` |
-| `GET /api/v2/sessions/{id}?cwd=` | snapshot | `{ at, state: SessionState }`; `cwd` allows loading a cold session. Fetching is not an observation. |
+| `GET /api/v2/sessions/{id}` | snapshot | `{ at, state: SessionState }` for a held session, else `404 not_found` |
 | `GET /api/v2/sessions/{id}/history/{historyRevision}/turns/{turnId}/process?offset=` | immutable | process page; cacheable forever; `410` once the revision is gone |
 | `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | immutable | `If-Match` owner |
-| `GET /api/v2/catalog?cursor=&revision=` | Agent-owned | Agent's paged `session/list`; `409 catalog_changed` when `revision` is stale |
+| `GET /api/v2/catalog?cursor=&revision=` | Agent-owned | the Agent's paged `session/list`; `409 catalog_changed` when `revision` is stale |
 | `GET /api/v2/sessions/{id}/files?query=` | workspace | context search within the session's workspace |
 | `GET /api/v2/sessions/{id}/files/content?path=` | workspace | context read |
 
@@ -343,18 +490,19 @@ large. `global.catalog.revision` tells replicas when to re-read it, and
 interface ProtocolError {
   code: ErrorCode;
   message: string;
-  data?: unknown;           // for agent_error: the ACP error { code, message, data }
+  data?: unknown;           // agent_error: the ACP error { code, message, data }
 }
 
 type ErrorCode =
   | "invalid_request"       // 400: malformed body, query or identifier
-  | "not_found"             // 404: unknown session, turn, interaction or request
+  | "not_found"             // 404: unknown or unheld session, turn, interaction or request
   | "owner_mismatch"        // 409: If-Match epoch/incarnation is not current
   | "history_mismatch"      // 412: If-Match history revision is not current
   | "precondition_required" // 428: missing If-Match or Idempotency-Key
   | "conflict"              // 409: refused by admission (operation in progress, wrong phase)
-  | "intent_conflict"       // 409: Idempotency-Key reused with a different prompt
+  | "intent_conflict"       // 409: Idempotency-Key reused with a different body
   | "catalog_changed"       // 409: stale catalog revision
+  | "unsupported"           // 501: the Agent did not advertise the capability
   | "gone"                  // 410: immutable resource no longer retained
   | "agent_error"           // 502: the Agent returned an error
   | "unavailable";          // 503: no Agent connection in this epoch
@@ -371,15 +519,20 @@ failures end the stream; the replica reconnects with `Last-Event-ID`.
 | `GET /api/v1/events`, `GET /api/v1/sessions/{id}/events` | one `GET /api/v2/stream` with scopes |
 | `bridge/connection`, `bridge/connection_error` | `global` ops on `/agent/phase`, `/agent/error` |
 | `bridge/catalog_changed` | `global` op on `/catalog/revision` |
-| `acp/authenticated`, `acp/logged_out`, `bridge/auth_terminal_*` | `global` `requests` and `/agent/authenticatedMethodId` |
+| `acp/authenticated`, `acp/logged_out`, `bridge/auth_terminal_*` | `global.requests`, `/agent/authenticatedMethodId` |
+| connection-level `request_elicitations` / `request_url_flows` | `global.interactions` / `global.urlFlows` with `requestId` |
 | `bridge/session_reset` | `reset` |
 | `bridge/session_delta` (every kind) | `ops` |
 | `bridge/session_retired` | `end` |
-| `bridge/session_turn_complete` / `_failed` | ops on `/outcomes/<operationId>`, plus `/turn` cleared |
+| `bridge/session_turn_complete` / `_failed` | ops on `/outcomes/<operationId>`, with `/turn` cleared |
+| `view.controls` (latest notification by kind) | `controls` (reduced state, §3.3) |
+| `view.workspace.session` (`modes`, `configOptions`) | `controls.modes`, `controls.configOptions` |
 | `viewRevision`, `fromRevision` | `at.seq`, `prev` |
-| `expectedEpoch` / `expectedIncarnation` query, `If-Match: <historyRevision>` | `If-Match` owner tags (§5.3) |
-| `presentation=full\|compact` | compact only; process via immutable pages |
-| `includeProcessFrom`, `excludeProcessFor` | removed; see open questions |
+| `expectedEpoch` / `expectedIncarnation` query, `If-Match: <historyRevision>` | `If-Match` tags (§5.3) |
+| `GET …/sessions/{id}?cwd=` loading a cold session | stream observation with `cwd` (§4.2) |
+| `POST /api/v1/sessions`, `…/fork` returning the view | request records with `clientIntentId` and a typed `result` |
+| `presentation=full\|compact` | compact only; process through immutable pages |
+| `includeProcessFrom`, `excludeProcessFor` | removed (§9) |
 | `GET /api/v1/sessions` (list) | `GET /api/v2/catalog` |
 | `POST /api/v1/sessions/{id}/interactions/{iid}/response` | `POST /api/v2/interactions/{iid}` |
 | `GET /api/v1/context/search?sessionId=`, `POST …/context/read` | `GET /api/v2/sessions/{id}/files…` |
@@ -389,15 +542,15 @@ failures end the stream; the replica reconnects with `Last-Event-ID`.
 
 - **Inline process for the turn a client just watched.** v1's `includeProcessFrom`
   keeps the process of a turn the client watched inline across commit, so it doesn't
-  flicker. In v2, the client already holds those updates from `turn`. It can keep
-  them locally as a cache keyed by `(historyRevision, turnId)` until it fetches the
-  page. Recommended: client-side cache, with no per-client snapshot variants.
+  flicker. In v2 the client already holds those updates from `turn`, and can keep
+  them as a local cache keyed by `(historyRevision, turnId)` until it fetches the
+  page. Recommended: a client-side cache, with no per-client snapshot variants.
 - **Profiles for other access layers.** A subscription may later name a profile that
   is a fixed subset of document paths, for example a session profile without
   `history.timeline` for a chat bot. This is not part of v2.0. The op format already
-  allows the server to filter by path.
-- **Outcome and request retention.** Choose the bounds: last N outcomes per session,
-  and the time-to-live for finished global requests that are never acknowledged.
+  lets the server filter by path.
+- **Retention bounds.** §3.4 sets minimums. The real values follow the memory
+  retention budget.
 - **Multiple streams.** A client that changes its observed session opens a new
-  stream. If that proves costly, add a subscription-update command for an existing
-  stream (keyed by a stream ID) in a later minor version.
+  stream. If that proves costly, a later minor version could add a
+  subscription-update command for an existing stream, keyed by a stream ID.
