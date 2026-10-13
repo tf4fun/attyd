@@ -311,7 +311,7 @@ impl Replication {
                 Change::End(reason),
             );
             self.retired
-                .push_back((session_id, published.incarnation, reason));
+                .push_back((session_id.clone(), published.incarnation, reason));
             if self.retired.len() > RETIRED_OWNERS {
                 self.retired.pop_front();
             }
