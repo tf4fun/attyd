@@ -12,6 +12,9 @@ use super::stream_client::{HttpStream, get, owner_scope, send};
 use super::*;
 use crate::protocol::{GLOBAL, session_scope};
 
+mod review_auth;
+mod review_parents;
+
 const AUTHENTICATE: &str = "/api/v2/agent/authenticate";
 const LOGOUT: &str = "/api/v2/agent/logout";
 const AUTH_TERMINALS: &str = "/api/v2/agent/auth-terminals";

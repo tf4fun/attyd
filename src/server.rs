@@ -4506,6 +4506,54 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_terminal_login_restarts_without_a_v1_client_or_private_restart_call() {
+        let (hub, observer) = capability_fixture(&["--terminal-auth"]).await;
+        hub.unsubscribe(observer.id, observer.generation).await;
+        let (status, first) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let first_epoch = first["at"]["epoch"].as_str().unwrap().to_string();
+        let (status, accepted) = v2_request(
+            &hub,
+            "POST",
+            "/api/v2/agent/auth-terminals",
+            &[("idempotency-key", "v2-only-terminal-login")],
+            Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+
+        // A real v2 client can only read/reconnect through the public routes.
+        // Polling must not manufacture the restart with ensure_runtime().
+        let mut last = first;
+        let restarted = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (status, global) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{global}");
+                last = global;
+                if last["at"]["epoch"]
+                    .as_str()
+                    .is_some_and(|epoch| epoch != first_epoch)
+                    && last["state"]["agent"]["phase"] == "ready"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        hub.shutdown().await;
+        assert!(
+            restarted.is_ok(),
+            "successful v2 terminal login must restart the Agent without a v1 client; last state: {last}"
+        );
+        assert_eq!(
+            last["state"]["agent"]["predecessor"],
+            json!({"epoch": first_epoch, "reason": "auth_restart"})
+        );
+    }
+
     #[tokio::test]
     async fn cold_session_deletion_uses_global_management_without_loading() {
         let (hub, observer) = capability_fixture(&["--delete", "--close"]).await;
