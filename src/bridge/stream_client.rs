@@ -26,6 +26,37 @@ pub(super) async fn get(router: &Router, path: &str) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
 
+/// A command or read with headers and an optional JSON body.
+pub(super) async fn send(
+    router: &Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, value);
+    }
+    let body = match body {
+        Some(body) => {
+            request = request.header("content-type", "application/json");
+            Body::from(body.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = router
+        .clone()
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
 /// The scope parameter for an owner (protocol §4.2).
 pub(super) fn owner_scope(session_id: &str, epoch: &str, incarnation: u64) -> String {
     format!("session/{session_id}@{epoch}:{incarnation}")
@@ -82,6 +113,11 @@ impl HttpStream {
 
     pub(super) fn resume(&self) {
         self.reading.send_replace(true);
+    }
+
+    /// Stops reading the body; at most the chunk already awaited arrives.
+    pub(super) fn pause(&self) {
+        self.reading.send_replace(false);
     }
 
     async fn connect(&mut self, router: &Router) {
