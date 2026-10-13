@@ -4,9 +4,10 @@
 //! release lives here: completed process bodies are collapsed out of
 //! `history.timeline`, embedded attachment bytes become references, and
 //! released terminals leave once nothing references them.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::{
     ActiveTurn, AgentState, CatalogState, CollapsedTurn, GlobalState, Interaction, OperationKind,
@@ -14,10 +15,12 @@ use super::{
     SessionSummary, SessionWork, TerminalExitStatus, TerminalState, TurnOutcome, TurnOutcomeStatus,
     UrlFlow, UrlFlowStatus,
 };
-use crate::history_cache::SessionKey;
+use crate::history_cache::{HistorySnapshot, SessionKey};
 use crate::runtime_state::{self as rt, PendingInteraction, SessionOperationKind};
 use crate::session_observers::SessionWork as LiveWork;
+use crate::session_presentation::terminal_references;
 use crate::session_registry::{SessionEntry, SessionRegistry};
+use crate::session_resources::SessionResourceOwner;
 use crate::session_state::MirrorPhase;
 
 /// The `global` document. `agent` is owned by the connection task, not the
@@ -61,142 +64,272 @@ pub(crate) fn project_session(
     registry: &SessionRegistry,
     session_id: &str,
 ) -> Option<SessionState> {
-    let entry = registry.sessions.get(session_id)?;
-    let state = &entry.state;
-    let live = state.live.as_ref()?;
-    let key = SessionKey::new(session_id, state.incarnation);
-    let mut terminals = registry
-        .retained_terminals
-        .get(&key)
-        .cloned()
-        .unwrap_or_default();
-    terminals.extend(live.terminals.clone());
-    // Reuse the v1 compact presentation and attachment projection, so both
-    // protocols release the same content until v1 is removed.
-    let mut view = json!({
-        "bridgeEpoch": registry.epoch,
-        "sessionId": session_id,
-        "sessionIncarnation": state.incarnation,
-        "historyRevision": state.history_revision,
-        "timeline": registry.history.peek(&key).map(|snapshot| snapshot.updates()).unwrap_or(&[]),
-        "turnOutcomes": state.turn_outcomes,
-        "activeTurn": state.active_turn.as_ref().map(|turn| json!({
-            "prompt": &*turn.prompt,
-            "updates": &*turn.updates,
-        })),
-        "interactions": { "permissions": live.permissions },
-        "terminals": terminals,
+    let source = SessionSource::new(registry, session_id)?;
+    let mut history = source.history();
+    let mut refs = std::mem::take(&mut history.terminal_refs);
+    let turn = source.turn_head().map(|head| {
+        let updates = source.turn_updates().map_or_else(Vec::new, |updates| {
+            updates.iter().map(|update| source.update(update)).collect()
+        });
+        head.with_updates(updates)
     });
-    view = crate::session_presentation::compact_view(view, Some(&json!(live.terminals)));
-    crate::attachments::project(&mut view);
+    source.turn_references(&mut refs);
+    let timeline = std::mem::take(&mut history.timeline);
+    let mut state = source.assemble(history, turn, refs);
+    state.history.timeline = timeline;
+    Some(state)
+}
 
-    let intents = state
-        .turn_outcomes
-        .iter()
-        .map(|outcome| {
-            (
-                outcome.operation_id.as_str(),
-                outcome.client_intent_id.as_str(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let outcomes = take_array(&mut view["turnOutcomes"])
-        .into_iter()
-        .filter_map(|outcome| {
-            let operation_id = outcome["operationId"].as_str()?.to_string();
-            let projected = TurnOutcome {
-                client_intent_id: intents.get(operation_id.as_str())?.to_string(),
-                status: TurnOutcomeStatus::Completed,
-                response: Some(outcome["response"].clone()),
-                error: None,
-                prompt: None,
-                after_update: usize::try_from(outcome["afterUpdate"].as_u64()?).ok()?,
-                operation_id: operation_id.clone(),
-            };
-            Some((operation_id, projected))
-        })
-        .collect();
-    let turn = state.active_turn.as_ref().map(|turn| ActiveTurn {
-        operation_id: turn.operation_id.clone(),
-        client_intent_id: turn.client_intent_id.clone(),
-        prompt: take_array(&mut view["activeTurn"]["prompt"]),
-        updates: take_array(&mut view["activeTurn"]["updates"]),
-        cancel_requested: turn
-            .execution
-            .as_ref()
-            .is_some_and(|execution| execution.cancel_requested),
-    });
-    // Interactions record the turn's RPC operation, which is its client
-    // intent; replicas address the turn by its public operation ID.
-    let turn_operation = |internal: Option<&str>| {
-        let turn = state.active_turn.as_ref()?;
-        let rpc = turn
-            .execution
-            .as_ref()
-            .map_or(turn.client_intent_id.as_str(), |execution| {
-                execution.rpc_operation_id.as_str()
-            });
-        (internal? == rpc).then(|| turn.operation_id.clone())
-    };
-    let mut interactions = BTreeMap::new();
-    for (interaction_id, permission) in take_object(&mut view["interactions"]["permissions"]) {
-        let operation_id = turn_operation(permission["operationId"].as_str());
-        interactions.insert(
-            interaction_id.clone(),
-            Interaction::Permission {
-                interaction_id,
-                request: permission["request"].clone(),
-                operation_id,
-            },
-        );
+/// A held session's sources. The commit step projects a session from these
+/// parts, reusing the parts whose source identity did not change; the full
+/// projection above composes the same parts.
+pub(super) struct SessionSource<'a> {
+    registry: &'a SessionRegistry,
+    pub(super) state: &'a crate::session_state::SessionState,
+    pub(super) live: &'a rt::SessionLiveState,
+    key: SessionKey,
+    owner: SessionResourceOwner,
+}
+
+/// The projected history: completed process bodies collapsed and embedded
+/// attachment bytes replaced by references.
+#[derive(Debug, Clone, Default)]
+pub(super) struct HistorySection {
+    pub timeline: Vec<Value>,
+    pub collapsed_turns: Vec<CollapsedTurn>,
+    pub outcomes: BTreeMap<String, TurnOutcome>,
+    /// Terminals the projected timeline references.
+    pub terminal_refs: HashSet<String>,
+}
+
+/// The active turn without its updates.
+pub(super) struct TurnHead {
+    pub operation_id: String,
+    pub client_intent_id: String,
+    pub prompt: Vec<Value>,
+    pub cancel_requested: bool,
+}
+
+impl TurnHead {
+    pub(super) fn with_updates(self, updates: Vec<Value>) -> ActiveTurn {
+        ActiveTurn {
+            operation_id: self.operation_id,
+            client_intent_id: self.client_intent_id,
+            prompt: self.prompt,
+            updates,
+            cancel_requested: self.cancel_requested,
+        }
     }
-    for pending in live.elicitations.values() {
-        let operation_id = turn_operation(pending.operation_id.as_deref());
-        interactions.insert(
-            pending.interaction_id.clone(),
-            elicitation(pending, operation_id, None),
-        );
+}
+
+impl<'a> SessionSource<'a> {
+    pub(super) fn new(registry: &'a SessionRegistry, session_id: &str) -> Option<Self> {
+        let state = &registry.sessions.get(session_id)?.state;
+        let live = state.live.as_ref()?;
+        Some(Self {
+            registry,
+            state,
+            live,
+            key: SessionKey::new(session_id, state.incarnation),
+            owner: SessionResourceOwner::new(&registry.epoch, session_id, state.incarnation),
+        })
     }
 
-    Some(SessionState {
-        session_id: session_id.to_string(),
-        incarnation: state.incarnation,
-        cwd: live.cwd.to_string_lossy().into_owned(),
-        controls: live.controls.clone(),
-        history: SessionHistory {
-            revision: state.history_revision.clone(),
-            phase: phase(state.phase),
-            error: state.sync_error.clone(),
-            notice: state.history_notice.clone(),
-            collapsed_turns: serde_json::from_value::<Vec<CollapsedTurn>>(
-                view["collapsedTurns"].take(),
-            )
-            .unwrap_or_default(),
-            timeline: take_array(&mut view["timeline"]),
-        },
-        turn,
-        outcomes,
-        operation: state.operation.as_ref().map(|operation| SessionOperation {
-            operation_id: operation.operation_id.clone(),
-            kind: operation_kind(operation.kind),
-            stage: operation.stage.clone(),
-            // Command request records arrive with migration step 4.
-            request_id: None,
-        }),
-        interactions,
-        url_flows: live
-            .url_flows
-            .values()
-            .map(|flow| (flow.registration_id.clone(), url_flow(flow)))
-            .collect(),
-        terminals: take_object(&mut view["terminals"])
-            .into_iter()
-            .map(|(terminal_id, terminal)| {
-                let projected = terminal_state(&terminal_id, &terminal);
-                (terminal_id, projected)
+    /// The history baseline; with `turn_outcomes` and `history_revision` it
+    /// determines `history()`.
+    pub(super) fn history_snapshot(&self) -> Option<&'a Arc<HistorySnapshot>> {
+        self.registry.history.peek(&self.key)
+    }
+
+    pub(super) fn history(&self) -> HistorySection {
+        let view = json!({
+            "historyRevision": self.state.history_revision,
+            "timeline": self.history_snapshot().map(|snapshot| snapshot.updates()).unwrap_or(&[]),
+            "turnOutcomes": self.state.turn_outcomes,
+        });
+        let mut view = crate::session_presentation::compact_view(view, None);
+        let mut timeline = take_array(&mut view["timeline"]);
+        let mut terminal_refs = HashSet::new();
+        for update in &mut timeline {
+            terminal_references(update, &mut terminal_refs);
+            crate::attachments::project_update(update, &self.owner);
+        }
+        let intents = self
+            .state
+            .turn_outcomes
+            .iter()
+            .map(|outcome| {
+                (
+                    outcome.operation_id.as_str(),
+                    outcome.client_intent_id.as_str(),
+                )
             })
-            .collect(),
-    })
+            .collect::<HashMap<_, _>>();
+        let outcomes = take_array(&mut view["turnOutcomes"])
+            .into_iter()
+            .filter_map(|outcome| {
+                let operation_id = outcome["operationId"].as_str()?.to_string();
+                let projected = TurnOutcome {
+                    client_intent_id: intents.get(operation_id.as_str())?.to_string(),
+                    status: TurnOutcomeStatus::Completed,
+                    response: Some(outcome["response"].clone()),
+                    error: None,
+                    prompt: None,
+                    after_update: usize::try_from(outcome["afterUpdate"].as_u64()?).ok()?,
+                    operation_id: operation_id.clone(),
+                };
+                Some((operation_id, projected))
+            })
+            .collect();
+        HistorySection {
+            timeline,
+            collapsed_turns: serde_json::from_value(view["collapsedTurns"].take())
+                .unwrap_or_default(),
+            outcomes,
+            terminal_refs,
+        }
+    }
+
+    pub(super) fn turn_head(&self) -> Option<TurnHead> {
+        let prompt = self.prompt(&self.state.active_turn.as_ref()?.prompt);
+        self.turn_head_with(prompt)
+    }
+
+    /// The active turn's head with an already projected prompt.
+    pub(super) fn turn_head_with(&self, prompt: Vec<Value>) -> Option<TurnHead> {
+        let turn = self.state.active_turn.as_ref()?;
+        Some(TurnHead {
+            operation_id: turn.operation_id.clone(),
+            client_intent_id: turn.client_intent_id.clone(),
+            prompt,
+            cancel_requested: turn
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.cancel_requested),
+        })
+    }
+
+    pub(super) fn turn_updates(&self) -> Option<&'a rt::SharedTurnUpdates> {
+        Some(&self.state.active_turn.as_ref()?.updates)
+    }
+
+    /// Adds the terminals the active turn's prompt and updates reference.
+    pub(super) fn turn_references(&self, refs: &mut HashSet<String>) {
+        if let Some(turn) = &self.state.active_turn {
+            turn.prompt
+                .iter()
+                .chain(turn.updates.iter().map(|update| &**update))
+                .for_each(|value| terminal_references(value, refs));
+        }
+    }
+
+    /// One projected active-turn update; a pure function of the update.
+    pub(super) fn update(&self, update: &Value) -> Value {
+        let mut update = update.clone();
+        crate::attachments::project_update(&mut update, &self.owner);
+        update
+    }
+
+    pub(super) fn prompt(&self, prompt: &[Value]) -> Vec<Value> {
+        prompt
+            .iter()
+            .map(|block| {
+                let mut block = block.clone();
+                crate::attachments::project_content(&mut block, &self.owner);
+                block
+            })
+            .collect()
+    }
+
+    /// The document from its parts. `history.timeline` and `turn.updates` are
+    /// taken as given, so the commit step can leave them empty; `refs` are
+    /// the terminals the timeline and the active turn reference.
+    pub(super) fn assemble(
+        &self,
+        history: HistorySection,
+        turn: Option<ActiveTurn>,
+        mut refs: HashSet<String>,
+    ) -> SessionState {
+        let state = self.state;
+        let live = self.live;
+        // Interactions record the turn's RPC operation, which is its client
+        // intent; replicas address the turn by its public operation ID.
+        let turn_operation = |internal: Option<&str>| {
+            let turn = state.active_turn.as_ref()?;
+            let rpc = turn
+                .execution
+                .as_ref()
+                .map_or(turn.client_intent_id.as_str(), |execution| {
+                    execution.rpc_operation_id.as_str()
+                });
+            (internal? == rpc).then(|| turn.operation_id.clone())
+        };
+        let mut interactions = BTreeMap::new();
+        for (interaction_id, permission) in &live.permissions {
+            let mut request = permission.request.clone();
+            terminal_references(&request, &mut refs);
+            crate::attachments::project_permission_request(&mut request, &self.owner);
+            interactions.insert(
+                interaction_id.clone(),
+                Interaction::Permission {
+                    interaction_id: interaction_id.clone(),
+                    request,
+                    operation_id: turn_operation(permission.operation_id.as_deref()),
+                },
+            );
+        }
+        for pending in live.elicitations.values() {
+            let operation_id = turn_operation(pending.operation_id.as_deref());
+            interactions.insert(
+                pending.interaction_id.clone(),
+                elicitation(pending, operation_id, None),
+            );
+        }
+        // Released terminals leave once nothing references them.
+        refs.extend(live.terminals.keys().cloned());
+        let retained = self.registry.retained_terminals.get(&self.key);
+        let terminals = retained
+            .into_iter()
+            .flatten()
+            .filter(|(terminal_id, _)| !live.terminals.contains_key(*terminal_id))
+            .chain(&live.terminals)
+            .filter(|(terminal_id, _)| refs.contains(*terminal_id))
+            .map(|(terminal_id, terminal)| {
+                (terminal_id.clone(), terminal_state(terminal_id, terminal))
+            })
+            .collect();
+
+        SessionState {
+            session_id: state.session_id.clone(),
+            incarnation: state.incarnation,
+            cwd: live.cwd.to_string_lossy().into_owned(),
+            controls: live.controls.clone(),
+            history: SessionHistory {
+                revision: state.history_revision.clone(),
+                phase: phase(state.phase),
+                error: state.sync_error.clone(),
+                notice: state.history_notice.clone(),
+                collapsed_turns: history.collapsed_turns,
+                timeline: history.timeline,
+            },
+            turn,
+            outcomes: history.outcomes,
+            operation: state.operation.as_ref().map(|operation| SessionOperation {
+                operation_id: operation.operation_id.clone(),
+                kind: operation_kind(operation.kind),
+                stage: operation.stage.clone(),
+                // Command request records arrive with migration step 4.
+                request_id: None,
+            }),
+            interactions,
+            url_flows: live
+                .url_flows
+                .values()
+                .map(|flow| (flow.registration_id.clone(), url_flow(flow)))
+                .collect(),
+            terminals,
+        }
+    }
 }
 
 fn summary(entry: &SessionEntry) -> Option<SessionSummary> {
@@ -311,13 +444,6 @@ fn take_array(value: &mut Value) -> Vec<Value> {
     match value.take() {
         Value::Array(values) => values,
         _ => Vec::new(),
-    }
-}
-
-fn take_object(value: &mut Value) -> Map<String, Value> {
-    match value.take() {
-        Value::Object(fields) => fields,
-        _ => Map::new(),
     }
 }
 
