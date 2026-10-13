@@ -349,6 +349,228 @@ mod tests {
     }
 
     #[test]
+    fn projected_modes_follow_early_updates_response_and_later_updates() {
+        let mut registry = SessionRegistry::new("epoch");
+        let available = json!([
+            { "id": "ask", "name": "Ask" },
+            { "id": "code", "name": "Code" },
+        ]);
+        let incarnation = registry
+            .open_new_with_replay(
+                "epoch",
+                "s",
+                "/s",
+                json!({ "sessionId": "s", "modes": {
+                    "currentModeId": "ask", "availableModes": available,
+                } }),
+                vec![json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" })],
+            )
+            .unwrap();
+        registry.register_new("s", incarnation);
+        let after_response = project_session(&registry, "s").unwrap().controls.modes;
+        registry
+            .update_control_state(
+                "epoch",
+                "s",
+                incarnation,
+                "current_mode_update",
+                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
+            )
+            .unwrap();
+        let after_later_update = project_session(&registry, "s").unwrap().controls.modes;
+
+        // Capture both cuts before asserting: always applying the response last
+        // would fix the first cut but incorrectly overwrite the later update.
+        assert_eq!(
+            json!([after_response, after_later_update]),
+            json!([
+                { "currentModeId": "ask", "availableModes": available },
+                { "currentModeId": "code", "availableModes": available },
+            ]),
+        );
+    }
+
+    #[test]
+    fn projected_config_preserves_response_clear_and_later_updates() {
+        let mut registry = SessionRegistry::new("epoch");
+        let options = json!([{
+            "id": "mode", "name": "Mode", "type": "select", "currentValue": "code",
+            "options": [{ "value": "code", "name": "Code" }],
+        }]);
+        let update = json!({ "sessionUpdate": "config_option_update", "configOptions": options });
+        let incarnation = registry
+            .open_new_with_replay(
+                "epoch",
+                "s",
+                "/s",
+                json!({ "sessionId": "s", "configOptions": [] }),
+                vec![update.clone()],
+            )
+            .unwrap();
+        registry.register_new("s", incarnation);
+        let after_response = project_session(&registry, "s")
+            .unwrap()
+            .controls
+            .config_options;
+        registry
+            .update_control_state("epoch", "s", incarnation, "config_option_update", update)
+            .unwrap();
+        let after_later_update = project_session(&registry, "s")
+            .unwrap()
+            .controls
+            .config_options;
+
+        // An explicit response [] clears the early value, but a subsequent
+        // notification with that same value must still become current.
+        assert_eq!(
+            json!([after_response, after_later_update]),
+            json!([[], options])
+        );
+    }
+
+    fn admit_projected_turn(registry: &mut SessionRegistry, incarnation: u64) -> String {
+        let revision = registry
+            .state("s")
+            .unwrap()
+            .history_revision
+            .clone()
+            .unwrap();
+        let TurnAdmission::Accepted { operation_id } = registry
+            .admit_session_turn(
+                "epoch",
+                "s",
+                incarnation,
+                &revision,
+                "client-intent-X",
+                vec![text("Run it")],
+            )
+            .unwrap()
+        else {
+            panic!("new intent");
+        };
+        // The runtime-only start_prompt fixture makes these identities equal
+        // and would hide an incorrect interaction-to-turn projection.
+        assert_ne!(operation_id, "client-intent-X");
+        operation_id
+    }
+
+    #[test]
+    fn projected_permission_references_the_public_turn_operation() {
+        let mut registry = SessionRegistry::new("epoch");
+        let incarnation = open(&mut registry, "s");
+        let operation_id = admit_projected_turn(&mut registry, incarnation);
+        registry
+            .upsert_permission(
+                "epoch",
+                "s",
+                incarnation,
+                "permission",
+                json!({
+                    "sessionId": "s", "toolCall": { "toolCallId": "tool", "title": "Run" },
+                    "options": [{ "optionId": "yes", "name": "Allow", "kind": "allow_once" }],
+                }),
+            )
+            .unwrap();
+        let session = project_session(&registry, "s").unwrap();
+        assert_eq!(session.turn.as_ref().unwrap().operation_id, operation_id);
+        let Interaction::Permission {
+            operation_id: parent,
+            ..
+        } = &session.interactions["permission"]
+        else {
+            panic!("permission interaction");
+        };
+        assert_eq!(parent.as_deref(), Some(operation_id.as_str()));
+    }
+
+    #[test]
+    fn projected_elicitation_references_the_public_turn_operation() {
+        let mut registry = SessionRegistry::new("epoch");
+        let incarnation = open(&mut registry, "s");
+        let operation_id = admit_projected_turn(&mut registry, incarnation);
+        registry
+            .upsert_elicitation(
+                "epoch",
+                Some(("s", incarnation)),
+                "form",
+                json!({
+                    "sessionId": "s", "mode": "form", "message": "Name?",
+                    "requestedSchema": { "type": "object", "properties": {} },
+                }),
+            )
+            .unwrap();
+        let session = project_session(&registry, "s").unwrap();
+        assert_eq!(session.turn.as_ref().unwrap().operation_id, operation_id);
+        let Interaction::Elicitation {
+            operation_id: parent,
+            ..
+        } = &session.interactions["form"]
+        else {
+            panic!("elicitation interaction");
+        };
+        assert_eq!(parent.as_deref(), Some(operation_id.as_str()));
+    }
+
+    #[test]
+    fn projected_compaction_attachments_are_references_resolvable_from_authority() {
+        let mut registry = SessionRegistry::new("epoch");
+        let incarnation = open(&mut registry, "s");
+        let operation_id = admit_projected_turn(&mut registry, incarnation);
+        let update = json!({
+            "sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed",
+            "summary": [
+                { "type": "image", "mimeType": "image/png", "data": "UFJJVkFURS1QSVhFTFM=" },
+                { "type": "audio", "mimeType": "audio/wav", "data": "UFJJVkFURS1BVURJTw==" },
+                { "type": "resource", "resource": { "uri": "file:///note.txt", "text": "private-summary-text" } },
+                { "type": "resource", "resource": { "uri": "file:///data.bin", "blob": "UFJJVkFURS1CTE9C" } },
+            ],
+        });
+        // Exercise a valid ACP payload, including the SDK's normalization.
+        let typed: agent_client_protocol::schema::v1::SessionUpdate =
+            serde_json::from_value(update).unwrap();
+        let update = serde_json::to_value(typed).unwrap();
+        crate::semantic::validate_and_track_session_update(
+            &mut crate::semantic::SessionUpdateSemanticState::default(),
+            &update,
+        )
+        .unwrap();
+        let originals = update["summary"].as_array().unwrap().clone();
+        registry
+            .append_turn_update("s", incarnation, &operation_id, update)
+            .unwrap();
+
+        let session = project_session(&registry, "s").unwrap();
+        let turn = session.turn.as_ref().unwrap();
+        let summary = turn.updates[0]["summary"].as_array().unwrap();
+        assert_eq!(summary.len(), originals.len());
+        let mut authority = registry.view_value("s", incarnation).unwrap();
+        for (block, original) in summary.iter().zip(&originals) {
+            let reference = crate::attachments::reference(block)
+                .unwrap_or_else(|| panic!("summary attachment was not projected: {block}"));
+            assert_eq!(reference.bridge_epoch, "epoch");
+            assert_eq!(reference.session_id, "s");
+            assert_eq!(reference.session_incarnation, incarnation);
+            assert!(block.get("data").is_none() && block.get("resource").is_none());
+            assert_eq!(
+                crate::attachments::find(&mut authority, &reference.id).as_ref(),
+                Some(original)
+            );
+        }
+        let wire = serde_json::to_string(&session).unwrap();
+        for private in [
+            "UFJJVkFURS1QSVhFTFM=",
+            "UFJJVkFURS1BVURJTw==",
+            "private-summary-text",
+            "UFJJVkFURS1CTE9C",
+        ] {
+            assert!(
+                !wire.contains(private),
+                "attachment payload entered the projection"
+            );
+        }
+    }
+
+    #[test]
     fn summaries_report_work_and_pending_counts() {
         let mut registry = SessionRegistry::new("epoch");
         let idle = open(&mut registry, "idle");
