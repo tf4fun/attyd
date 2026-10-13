@@ -845,6 +845,13 @@ async fn interaction_responses_report_delivery() {
         "jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": 903},
     }))
     .await;
+    peer.until("the cancelled permission leaves", |documents| {
+        session(documents)["interactions"].get(&cancelled).is_none()
+    })
+    .await;
+    // A response the bridge already handed over counts as delivered; once
+    // the cancellation is processed, the response is refused and recorded
+    // nowhere, so it can never be reported as resolved.
     let (status, response) = command(
         &peer,
         "POST",
@@ -854,18 +861,8 @@ async fn interaction_responses_report_delivery() {
         allow(),
     )
     .await;
-    if status == StatusCode::OK {
-        let record = finished(&mut peer, "cancelled").await;
-        assert_eq!(record["status"], "failed", "{record}");
-        assert_eq!(record["error"]["code"], "interaction_ended");
-    } else {
-        assert_eq!(status, StatusCode::CONFLICT, "{response}");
-        assert!(find(&peer.check().await, "cancelled").is_none());
-    }
-    peer.until("the cancelled permission leaves", |documents| {
-        session(documents)["interactions"].get(&cancelled).is_none()
-    })
-    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert!(find(&peer.check().await, "cancelled").is_none());
     peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
     peer.stop().await;
 }
