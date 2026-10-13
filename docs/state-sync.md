@@ -58,8 +58,13 @@ ACP ──▶ bridge actor: transition ──▶ commit step ──▶ log (epoc
 
 Two pure functions define the documents of protocol §3:
 
-- `project_global(&BridgeState) -> GlobalState`
-- `project_session(&SessionEntry) -> SessionState`
+- `project_global(&AgentState, catalog_revision, &SessionRegistry) -> GlobalState`
+- `project_session(&SessionRegistry, session_id) -> Option<SessionState>`
+
+Both read the session registry rather than a single `SessionEntry`, because the
+history baseline and retained terminals live in registry-wide caches. `agent` is
+owned by the connection task, so the caller supplies it. They live in
+`src/protocol/project.rs`.
 
 They are the only definition of what clients see. Snapshots (`GET /api/v2/global`,
 `GET /api/v2/sessions/{id}`) call them directly. Privacy rules, such as releasing

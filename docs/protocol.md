@@ -220,6 +220,15 @@ interface SessionState {
 type SessionPhase = "cold" | "loading" | "ready" | "running" | "reconciling" | "blocked";
 type OperationKind = "load" | "resume" | "fork" | "close" | "delete" | "set_mode" | "set_config";
 
+interface CollapsedTurn {                   // one completed turn in `timeline`
+  turnId: string;                            // page address with history.revision (§6)
+  operationId: string | null;                // the turn operation, when known
+  beforeUpdate: number;                      // timeline range of the turn
+  afterUpdate: number;
+  processCount: number;                      // updates on the process page
+  visibleRanges: Array<{ start: number; end: number }>;  // prompt and final answer
+}
+
 interface ActiveTurn {
   operationId: string;
   clientIntentId: string;
