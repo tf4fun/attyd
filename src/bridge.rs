@@ -2913,6 +2913,9 @@ where
                         .get("requestId")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
+                    // Only this exact input may withdraw the v2 intent it
+                    // stands for when it is refused.
+                    let turn_input = (operation == "session/prompt").then(|| command.clone());
                     let intent_session_id = command
                         .get("sessionId")
                         .and_then(Value::as_str)
@@ -3009,10 +3012,8 @@ where
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
                         responder.error(error);
                         // A turn refused before admission leaves no v2 intent.
-                        if let (Some(key), Some(session_id)) =
-                            (request_id.as_deref(), intent_session_id.as_deref())
-                        {
-                            context.state.lock().await.sessions.commands.turn_refused(key, session_id);
+                        if let Some(input) = &turn_input {
+                            commands::settle_turn_input(&mut *context.state.lock().await, input, None);
                         }
                     }
                     match (&business_responder, &result) {
@@ -5436,11 +5437,7 @@ async fn handle_command_inner(
                     })? {
                     TurnAdmission::Accepted { operation_id } => operation_id,
                     TurnAdmission::Duplicate { operation_id } => {
-                        state.sessions.commands.turn_admitted(
-                            &client_intent_id,
-                            &session_id,
-                            &operation_id,
-                        );
+                        commands::settle_turn_input(&mut state, &command, Some(&operation_id));
                         turn_responder.success(json!({
                             "operationId": operation_id,
                             "disposition": "duplicate",
@@ -5450,11 +5447,7 @@ async fn handle_command_inner(
                 };
                 // A v2 intent settles with the admission, whether or not
                 // its HTTP caller still waits.
-                state.sessions.commands.turn_admitted(
-                    &client_intent_id,
-                    &session_id,
-                    &mirror_operation_id,
-                );
+                commands::settle_turn_input(&mut state, &command, Some(&mirror_operation_id));
                 // The accepted turn owns the projection now: an optional
                 // history workflow still parked in backoff yields instead of
                 // retrying over this turn's outcome.

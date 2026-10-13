@@ -632,6 +632,65 @@ pub(super) fn fork_target_held(
     }
 }
 
+/// A turn's intent fingerprint (protocol §5.2): the session, the owner tag
+/// with the history revision, and the prompt.
+fn turn_fingerprint(tag: &str, session_id: &str, prompt: &Value) -> Fingerprint {
+    Fingerprint::of(
+        "turn",
+        &[("sessionId", session_id)],
+        tag,
+        &json!({ "prompt": prompt }),
+    )
+}
+
+/// The bridge admitted (`Some(operation_id)`) or refused (`None`) the turn
+/// input `command`. It settles a pending v2 intent only when the input is
+/// that intent's own command: same key, session, owner, history revision and
+/// prompt, which is the protocol's definition of one intent. Any other input
+/// under the same key, v1 or v2, on this session or another, changes nothing.
+pub(super) fn settle_turn_input(
+    state: &mut BridgeState,
+    command: &Value,
+    operation_id: Option<&str>,
+) {
+    let (Some(key), Some(session_id), Some(revision)) = (
+        command.get("clientIntentId").and_then(Value::as_str),
+        command.get("sessionId").and_then(Value::as_str),
+        command.get("historyRevision").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let Some(intent) = state.sessions.commands.intent(key) else {
+        return;
+    };
+    let Subject::Turn {
+        session_id: owner,
+        incarnation,
+        operation_id: None,
+    } = &intent.subject
+    else {
+        return;
+    };
+    let tag = format!("{}:{incarnation}:{revision}", state.sessions.epoch());
+    if owner != session_id
+        || intent.fingerprint
+            != turn_fingerprint(
+                &tag,
+                session_id,
+                command.get("prompt").unwrap_or(&Value::Null),
+            )
+    {
+        return;
+    }
+    match operation_id {
+        Some(operation_id) => state
+            .sessions
+            .commands
+            .turn_admitted(key, session_id, operation_id),
+        None => state.sessions.commands.turn_refused(key, session_id),
+    }
+}
+
 /// Frozen process terminals live exactly as long as their owner's revision:
 /// a retired owner or a replaced revision releases them in the same commit.
 pub(super) fn release_process_terminals(state: &mut BridgeState) {
@@ -915,12 +974,7 @@ impl ReplicationSource {
         prompt: Vec<Value>,
     ) -> Outcome<TurnAccepted> {
         let lock = self.live().ok_or_else(unavailable)?;
-        let fingerprint = Fingerprint::of(
-            "turn",
-            &[("sessionId", session_id.as_str())],
-            &tag.text(),
-            &json!({ "prompt": prompt }),
-        );
+        let fingerprint = turn_fingerprint(&tag.text(), &session_id, &json!(prompt));
         let scopes = vec![session_scope(&session_id)];
         let response = {
             let mut state = lock.lock().await;
@@ -1005,6 +1059,8 @@ impl ReplicationSource {
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
+                // Only this caller's own admission answer reaches here; the
+                // bridge normally settled the intent already.
                 state
                     .sessions
                     .commands
