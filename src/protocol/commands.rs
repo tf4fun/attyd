@@ -577,6 +577,36 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_finished_requests_keeps_every_result_for_ten_minutes() {
+        let mut book = CommandBook::default();
+        let start = Instant::now();
+        let ids = (0..4097)
+            .map(|index| {
+                let key = format!("burst-{index}");
+                let id = record(&mut book, &key);
+                book.admit(&key, mode("code"), Subject::Request(id.clone()));
+                book.finish(&id, Ok(RequestResult::Done), start);
+                id
+            })
+            .collect::<Vec<_>>();
+
+        book.retain(start + Duration::from_secs(599));
+        assert_eq!(
+            book.requests().len(),
+            ids.len(),
+            "protocol §3.4 keeps every unacknowledged result for at least ten minutes, even during a burst"
+        );
+        assert!(book.request(&ids[0]).is_some());
+
+        book.retain(start + Duration::from_secs(600));
+        assert_eq!(
+            book.requests().keys().cloned().collect::<BTreeSet<_>>(),
+            ids[ids.len() - 16..].iter().cloned().collect(),
+            "after the time minimum, the last sixteen finished records remain"
+        );
+    }
+
+    #[test]
     fn turn_intents_settle_once_and_withdrawn_keys_are_unknown_again() {
         let mut book = CommandBook::default();
         let turn = Fingerprint::of("turn", &[("sessionId", "s")], "e:1:r", &json!({}));

@@ -6763,6 +6763,57 @@ mod tests {
     }
 
     #[test]
+    fn seventeen_recent_url_flow_results_remain_projected_until_acknowledged() {
+        let mut state = state();
+        let incarnation = open(&mut state, "session");
+        let scope = Some(("session", incarnation));
+        for index in 0..17 {
+            let interaction = format!("recent-url-interaction-{index}");
+            let elicitation = format!("recent-url-flow-{index}");
+            state
+                .upsert_elicitation(
+                    "epoch",
+                    scope,
+                    &interaction,
+                    json!({"mode": "url", "message": "Continue", "url": "https://example.test/flow"}),
+                )
+                .unwrap();
+            state
+                .resolve_elicitation("epoch", scope, &interaction, Some(&elicitation))
+                .unwrap();
+            assert_eq!(
+                state
+                    .settle_url_registration(
+                        "epoch",
+                        scope,
+                        &elicitation,
+                        &interaction,
+                        UrlFlowStatus::Completed,
+                    )
+                    .unwrap(),
+                UrlFlowResolution::Applied
+            );
+        }
+
+        let projected = crate::protocol::project_session(&state, "session").unwrap();
+        assert_eq!(
+            projected.url_flows.len(),
+            17,
+            "protocol §3.4 promises ten minutes for every recent terminal URL flow, in addition to the last sixteen"
+        );
+        assert_eq!(
+            projected.url_flows["recent-url-interaction-0"].status,
+            crate::protocol::UrlFlowStatus::Completed
+        );
+        state
+            .acknowledge_url_flow("epoch", "session", incarnation, "recent-url-interaction-0")
+            .unwrap();
+        let projected = crate::protocol::project_session(&state, "session").unwrap();
+        assert_eq!(projected.url_flows.len(), 16);
+        assert!(!projected.url_flows.contains_key("recent-url-interaction-0"));
+    }
+
+    #[test]
     fn url_registration_fences_reuse_without_exposing_internal_identity() {
         for request_scoped in [false, true] {
             let mut state = state();

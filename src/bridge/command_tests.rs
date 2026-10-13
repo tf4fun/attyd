@@ -9,6 +9,11 @@ use super::stream_client::{HttpStream, get, owner_scope, send};
 use super::*;
 use crate::protocol::{GLOBAL, session_scope};
 
+mod review_leases;
+mod review_owner;
+mod review_replication;
+mod review_turns;
+
 async fn epoch(peer: &Peer) -> String {
     let (status, global) = get(&peer.router, "/api/v2/global").await;
     assert_eq!(status, StatusCode::OK);
@@ -689,6 +694,41 @@ async fn a_tiny_intent_budget_answers_an_open_from_its_tombstone() {
         documents[&session_scope("cold")]["history"]["phase"],
         "ready"
     );
+    peer.stop().await;
+}
+
+#[tokio::test]
+async fn an_acknowledged_open_of_a_held_session_keeps_its_success_in_the_tombstone() {
+    let mut peer = Peer::start(-1, json!({"loadSession": true})).await;
+    create(&mut peer).await;
+    let path = format!("/api/v2/sessions/{SESSION}/open");
+    let body = json!({"cwd": "/workspace"});
+    let (status, opened) =
+        command(&peer, "POST", &path, Some("held-open"), None, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{opened}");
+    let record = finished(&mut peer, "held-open").await;
+    assert_eq!(record["status"], "succeeded");
+    let request_id = record["requestId"].as_str().unwrap();
+    let (status, acknowledged) = send(
+        &peer.router,
+        "DELETE",
+        &format!("/api/v2/requests/{request_id}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{acknowledged}");
+    assert!(find(&peer.check().await, "held-open").is_none());
+
+    let (status, retried) = command(&peer, "POST", &path, Some("held-open"), None, body).await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(
+        retried["result"],
+        json!({"requestId": request_id, "disposition": "duplicate",
+               "resultExpired": true, "status": "succeeded"}),
+        "acknowledgement cannot change a successful held-open result into a failure"
+    );
+    peer.no_request().await;
     peer.stop().await;
 }
 
