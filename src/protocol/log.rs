@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use super::{Entry, Op, Position};
+use super::{EndReason, Entry, Op, Position};
 
 /// The default retained bytes per epoch. A replica resuming from before the
 /// retained suffix gets a `reset` (protocol §4).
@@ -14,7 +14,7 @@ pub(crate) enum Change {
     Ops(Arc<[Op]>),
     /// The scope's document no longer exists: its session was retired or
     /// replaced by a new incarnation.
-    End,
+    End(EndReason),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,20 +29,30 @@ pub(crate) struct LogEntry {
 
 impl LogEntry {
     /// The stream entry for a subscriber whose previous delivered entry for
-    /// this scope is `prev`. `End` reasons come from the Hub (migration step 3).
-    pub(crate) fn ops_entry(&self, epoch: &str, prev: u64) -> Option<Entry> {
-        let Change::Ops(ops) = &self.change else {
-            return None;
+    /// this scope is `prev`.
+    pub(crate) fn stream_entry(&self, epoch: &str, prev: u64) -> Entry {
+        let at = Position {
+            epoch: epoch.to_string(),
+            seq: self.seq,
         };
-        Some(Entry::Ops {
-            scope: self.scope.clone(),
-            at: Position {
-                epoch: epoch.to_string(),
-                seq: self.seq,
+        match &self.change {
+            Change::Ops(ops) => Entry::Ops {
+                scope: self.scope.clone(),
+                at,
+                prev,
+                ops: ops.to_vec(),
             },
-            prev,
-            ops: ops.to_vec(),
-        })
+            Change::End(reason) => Entry::End {
+                scope: self.scope.clone(),
+                at,
+                reason: *reason,
+            },
+        }
+    }
+
+    /// The bytes this entry accounts for in the log budget.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -88,7 +98,7 @@ impl Log {
         let bytes = scope.len()
             + match &change {
                 Change::Ops(ops) => serde_json::to_vec(&**ops).map_or(0, |encoded| encoded.len()),
-                Change::End => 0,
+                Change::End(_) => 0,
             };
         self.entries.push_back(LogEntry {
             scope: scope.to_string(),
@@ -151,7 +161,10 @@ mod tests {
         assert_eq!(log.append("global", 0, set(1)), 1);
         assert_eq!(log.append("session/a", 0, set(1)), 2);
         assert_eq!(log.append("global", 1, set(1)), 3);
-        assert_eq!(log.append("session/a", 2, Change::End), 4);
+        assert_eq!(
+            log.append("session/a", 2, Change::End(EndReason::Closed)),
+            4
+        );
         let after = log
             .after(1)
             .unwrap()
@@ -162,19 +175,19 @@ mod tests {
         assert!(log.after(5).is_none(), "a position from the future");
         let entry = log.after(2).unwrap().next().unwrap();
         assert_eq!(
-            serde_json::to_value(entry.ops_entry("e", 1).unwrap()).unwrap(),
+            serde_json::to_value(entry.stream_entry("e", 1)).unwrap(),
             json!({
                 "type": "ops", "scope": "global", "at": { "epoch": "e", "seq": 3 },
                 "prev": 1, "ops": [{ "op": "set", "path": "/value", "value": "x" }],
             })
         );
-        assert!(
-            log.after(3)
-                .unwrap()
-                .next()
-                .unwrap()
-                .ops_entry("e", 2)
-                .is_none()
+        assert_eq!(
+            serde_json::to_value(log.after(3).unwrap().next().unwrap().stream_entry("e", 2))
+                .unwrap(),
+            json!({
+                "type": "end", "scope": "session/a", "at": { "epoch": "e", "seq": 4 },
+                "reason": "closed",
+            })
         );
     }
 

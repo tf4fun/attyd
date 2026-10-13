@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
@@ -29,9 +29,11 @@ use crate::mcp::McpManager;
 use crate::mcp_config::{server_name, server_type};
 use crate::options::{Options, Transport};
 use crate::ordered_ingress::{RequestClass, RequestOwner};
+use crate::protocol::hub::{ScopeRequest, StreamQueue};
 use crate::protocol::{
-    AgentLaunch, AgentPhase, AgentState, AgentTransport, ErrorCode as ProtocolErrorCode,
-    McpServerKind, McpServerSummary, ProtocolError, Replication,
+    AgentLaunch, AgentPhase, AgentState, AgentTransport, EndReason, ErrorCode as ProtocolErrorCode,
+    GlobalState, McpServerKind, McpServerSummary, Position, ProtocolError, Replication,
+    SessionState, Snapshot,
 };
 use crate::runtime_state::{
     RuntimeEffect, SessionLifecycle, SessionOperationKind as RuntimeSessionOperationKind,
@@ -67,6 +69,10 @@ mod memory_efficiency_tests;
 #[cfg(test)]
 mod memory_retention_tests;
 mod scheduling;
+#[cfg(test)]
+mod stream_client;
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod unobserved_tests;
 
@@ -344,6 +350,153 @@ impl Drop for BridgeGuard<'_> {
         if self.touched {
             self.state.commit();
         }
+    }
+}
+
+/// The server's handle on one generation's replicated state (protocol §4,
+/// §6). Reads and stream cuts take the bridge lock, so each sees a committed
+/// position. Once the connection ends, only its final `global` document
+/// remains readable.
+#[derive(Clone, Default)]
+pub(crate) struct ReplicationSource(Arc<std::sync::Mutex<SourceState>>);
+
+#[derive(Default)]
+struct SourceState {
+    state: Weak<BridgeLock>,
+    ended: Option<Snapshot<GlobalState>>,
+}
+
+/// A stream's queue and the observation leases it holds on its owners.
+pub(crate) struct StreamSubscription {
+    pub(crate) queue: Arc<StreamQueue>,
+    observer_id: u64,
+    leases: Vec<(String, ObservationLease)>,
+    observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
+}
+
+impl Drop for StreamSubscription {
+    fn drop(&mut self) {
+        self.queue.close();
+        for (session_id, lease) in self.leases.drain(..) {
+            lease.cancel();
+            if let Some(events) = &self.observer_events {
+                let _ = events.send(BridgeInput::UnobserveSession {
+                    session_id,
+                    observer_id: self.observer_id,
+                    lease,
+                });
+            }
+        }
+    }
+}
+
+impl ReplicationSource {
+    fn source(&self) -> std::sync::MutexGuard<'_, SourceState> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn attach(&self, state: &Arc<BridgeLock>) {
+        self.source().state = Arc::downgrade(state);
+    }
+
+    fn live(&self) -> Option<Arc<BridgeLock>> {
+        self.source().state.upgrade()
+    }
+
+    /// Keeps the connection's final `global` document readable after the
+    /// bridge state is gone.
+    fn freeze(&self, snapshot: Snapshot<GlobalState>) {
+        let mut source = self.source();
+        source.ended = Some(snapshot);
+        source.state = Weak::new();
+    }
+
+    /// `GET /api/v2/global`; `None` before the connection started.
+    pub(crate) async fn global(&self) -> Option<Snapshot<GlobalState>> {
+        let Some(state) = self.live() else {
+            return self.source().ended.clone();
+        };
+        let state = state.lock().await;
+        Some(state.replication.global_snapshot(
+            &state.agent,
+            state.catalog_revision,
+            &state.sessions,
+        ))
+    }
+
+    /// `GET /api/v2/sessions/{id}`: `Some(None)` when the session is not
+    /// held. Never materializes anything.
+    pub(crate) async fn session(&self, session_id: &str) -> Option<Option<Snapshot<SessionState>>> {
+        let state = self.live()?;
+        let state = state.lock().await;
+        Some(
+            state
+                .replication
+                .session_snapshot(&state.sessions, session_id),
+        )
+    }
+
+    /// Opens a stream at a cut atomic with the bridge actor. Each held owner
+    /// it names gets an observation lease; nothing is materialized.
+    pub(crate) async fn subscribe(
+        &self,
+        scopes: Vec<ScopeRequest>,
+        last_event: Option<Position>,
+        observer_id: u64,
+    ) -> Option<StreamSubscription> {
+        let state = self.live()?;
+        let mut state = state.lock().await;
+        let state = &mut *state;
+        let epoch = state.sessions.epoch().to_string();
+        let mut leases = Vec::new();
+        for scope in &scopes {
+            let ScopeRequest::Session {
+                session_id,
+                epoch: owner_epoch,
+                incarnation,
+            } = scope
+            else {
+                continue;
+            };
+            if *owner_epoch != epoch
+                || state.replication.held_incarnation(session_id) != Some(*incarnation)
+            {
+                continue;
+            }
+            let Ok(resources) = state.sessions.resources_mut(session_id, *incarnation) else {
+                continue;
+            };
+            let lease = ObservationLease::new();
+            if resources.observers.observe(observer_id, lease.clone()) {
+                leases.push((session_id.clone(), lease));
+            }
+        }
+        refresh_observer_timers(state);
+        let queue = state.replication.subscribe(
+            &state.agent,
+            state.catalog_revision,
+            &state.sessions,
+            scopes,
+            last_event.as_ref(),
+        );
+        Some(StreamSubscription {
+            queue,
+            observer_id,
+            leases,
+            observer_events: state.observer_events.clone(),
+        })
+    }
+}
+
+/// The `End` reason a retirement records for its scope.
+fn end_reason(reason: &str) -> EndReason {
+    match reason {
+        "closed" => EndReason::Closed,
+        "deleted" => EndReason::Deleted,
+        "unobserved" => EndReason::Unobserved,
+        _ => EndReason::Gone,
     }
 }
 
@@ -1315,6 +1468,9 @@ fn retire_session_observation(
     incarnation: u64,
     reason: &str,
 ) {
+    state
+        .replication
+        .note_retirement(session_id, incarnation, end_reason(reason));
     sink.send(json!({
         "type": "bridge/session_retired", "sessionId": session_id,
         "bridgeEpoch": state.sessions.epoch(), "sessionIncarnation": incarnation,
@@ -2201,6 +2357,24 @@ pub async fn run_with_cancellation(
     events: EventSender,
     cancellation: CancellationToken,
 ) {
+    run_with_replication(
+        options,
+        commands,
+        events,
+        cancellation,
+        ReplicationSource::default(),
+    )
+    .await;
+}
+
+/// Runs one generation, attaching its replicated state to `replication`.
+pub(crate) async fn run_with_replication(
+    options: Arc<Options>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
+    events: EventSender,
+    cancellation: CancellationToken,
+    replication: ReplicationSource,
+) {
     let sink = EventSink { tx: events };
     let mcp_servers = options
         .mcp_servers
@@ -2230,12 +2404,13 @@ pub async fn run_with_cancellation(
                 .on_fatal(move |error| {
                     let _ = fatal_tx.send(error);
                 });
-            let connection = run_connection(
+            let connection = run_connection_with(
                 agent,
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
+                replication.clone(),
             );
             tokio::pin!(connection);
             tokio::select! {
@@ -2260,23 +2435,25 @@ pub async fn run_with_cancellation(
             }
         }
         Transport::Ws => {
-            run_connection(
+            run_connection_with(
                 crate::websocket_agent::WebSocketAgent::new(options.command[0].clone()),
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
+                replication.clone(),
             )
             .await
         }
         Transport::Http => match remote_http_client(&options.command[0]) {
             Ok(client) => {
-                run_connection(
+                run_connection_with(
                     client,
                     options.clone(),
                     commands,
                     sink.clone(),
                     cancellation.clone(),
+                    replication.clone(),
                 )
                 .await
             }
@@ -2311,14 +2488,37 @@ fn remote_http_client(
 async fn run_connection<T>(
     transport: T,
     options: Arc<Options>,
-    mut commands: mpsc::UnboundedReceiver<BridgeInput>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
     sink: EventSink,
     cancellation: CancellationToken,
 ) -> Result<(), Error>
 where
     T: ConnectTo<Client>,
 {
+    run_connection_with(
+        transport,
+        options,
+        commands,
+        sink,
+        cancellation,
+        ReplicationSource::default(),
+    )
+    .await
+}
+
+async fn run_connection_with<T>(
+    transport: T,
+    options: Arc<Options>,
+    mut commands: mpsc::UnboundedReceiver<BridgeInput>,
+    sink: EventSink,
+    cancellation: CancellationToken,
+    replication: ReplicationSource,
+) -> Result<(), Error>
+where
+    T: ConnectTo<Client>,
+{
     let state = Arc::new(BridgeLock::new(BridgeState::default()));
+    replication.attach(&state);
     #[cfg(test)]
     memory_retention_tests::capture_coordinator_state(&state);
     let authority = state.clone();
@@ -2894,6 +3094,18 @@ where
                 state.agent.error = Some(agent_error(error));
             }
         }
+    }
+    // The terminal state above was delivered by its commit; now every stream
+    // of this epoch drains and closes, and only the final `global` remains.
+    {
+        let mut state = authority.lock().await;
+        let state = &mut *state;
+        state.replication.finish();
+        replication.freeze(state.replication.global_snapshot(
+            &state.agent,
+            state.catalog_revision,
+            &state.sessions,
+        ));
     }
     result
 }

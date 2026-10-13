@@ -562,6 +562,9 @@ struct BridgeHubState {
     canonical: CanonicalProjection,
     canonical_resync_pending: bool,
     shutting_down: bool,
+    /// The current generation's protocol v2 state; after the generation
+    /// ends, its final `global` document.
+    replication: Option<bridge::ReplicationSource>,
 }
 
 struct BridgeHub {
@@ -994,6 +997,7 @@ fn canonical_reset_event(
 
 struct BridgeRuntime {
     generation: u64,
+    replication: bridge::ReplicationSource,
     input: mpsc::UnboundedReceiver<bridge::BridgeInput>,
     events: EventReceiver,
     event_tx: EventSender,
@@ -1023,10 +1027,13 @@ impl BridgeHub {
                 let (input_tx, input) = mpsc::unbounded_channel();
                 let cancellation = CancellationToken::new();
                 let (event_tx, events) = event_queue::channel(cancellation.clone());
+                let replication = bridge::ReplicationSource::default();
                 state.input = Some(input_tx);
                 state.cancellation = Some(cancellation.clone());
+                state.replication = Some(replication.clone());
                 Some(BridgeRuntime {
                     generation: state.generation,
+                    replication,
                     input,
                     events,
                     event_tx,
@@ -1222,6 +1229,7 @@ impl BridgeHub {
     fn spawn_runtime(self: &Arc<Self>, runtime: BridgeRuntime) {
         let BridgeRuntime {
             generation,
+            replication,
             input,
             events,
             event_tx,
@@ -1230,7 +1238,7 @@ impl BridgeHub {
         let options = self.options.clone();
         let (runtime_done_tx, runtime_done_rx) = oneshot::channel();
         tokio::spawn(async move {
-            bridge::run_with_cancellation(options, input, event_tx, cancellation).await;
+            bridge::run_with_replication(options, input, event_tx, cancellation, replication).await;
             let _ = runtime_done_tx.send(());
         });
 
@@ -1736,6 +1744,10 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route("/api/v1/events", get(global_events))
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
+        .with_state(AppState {
+            bridge: bridge.clone(),
+        })
+        .merge(v2::router(v2::V2State::hub(bridge)))
         .layer(DefaultBodyLimit::disable())
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -1745,7 +1757,6 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
             },
             enforce_origin,
         ))
-        .with_state(AppState { bridge })
 }
 
 async fn shutdown_signal() {
@@ -2956,6 +2967,7 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod memory_retention_tests;
+pub(crate) mod v2;
 
 #[cfg(test)]
 mod attachment_tests;

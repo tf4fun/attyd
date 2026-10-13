@@ -9,25 +9,30 @@ use agent_client_protocol::Lines;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 
+use super::stream_client::HttpStream;
 use super::*;
 use crate::protocol::replica::{Convergence, fresh};
 
-type Documents = BTreeMap<String, Value>;
+pub(super) type Documents = BTreeMap<String, Value>;
 
-struct Peer {
-    commands: mpsc::UnboundedSender<BridgeInput>,
+pub(super) struct Peer {
+    pub(super) commands: mpsc::UnboundedSender<BridgeInput>,
     requests: futures::channel::mpsc::Receiver<String>,
     responses: futures::channel::mpsc::Sender<io::Result<String>>,
     buffered: VecDeque<Value>,
     _events: mpsc::UnboundedReceiver<String>,
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
-    state: Weak<BridgeLock>,
+    pub(super) state: Weak<BridgeLock>,
     convergence: Convergence,
+    /// The real `/api/v2` routes over this bridge.
+    pub(super) router: axum::Router,
+    /// SSE replicas checked with the log-fed ones at every step.
+    pub(super) streams: Vec<HttpStream>,
 }
 
 impl Peer {
-    async fn connect(timeout_seconds: i64) -> Self {
+    pub(super) async fn connect(timeout_seconds: i64) -> Self {
         let (outgoing, requests) = futures::channel::mpsc::channel::<String>(64);
         let (responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(64);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -41,12 +46,14 @@ impl Peer {
         let (events, event_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let probe = super::memory_retention_tests::probe_coordinator_state();
-        let task = tokio::spawn(run_connection(
+        let source = ReplicationSource::default();
+        let task = tokio::spawn(run_connection_with(
             transport,
             Arc::new(options),
             command_rx,
             EventSink { tx: events.into() },
             cancellation.clone(),
+            source.clone(),
         ));
         Self {
             commands,
@@ -58,10 +65,12 @@ impl Peer {
             task: Some(task),
             state: probe.await.unwrap(),
             convergence: Convergence::new(0xc0ffee),
+            router: crate::server::v2::router(crate::server::v2::V2State::fixed(source)),
+            streams: Vec::new(),
         }
     }
 
-    async fn start(timeout_seconds: i64, capabilities: Value) -> Self {
+    pub(super) async fn start(timeout_seconds: i64, capabilities: Value) -> Self {
         let mut peer = Self::connect(timeout_seconds).await;
         let initialize = peer.next_request().await;
         assert_eq!(initialize["method"], "initialize");
@@ -77,7 +86,7 @@ impl Peer {
         peer
     }
 
-    async fn next_request(&mut self) -> Value {
+    pub(super) async fn next_request(&mut self) -> Value {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Some(request) = self.buffered.pop_front() {
@@ -94,16 +103,28 @@ impl Peer {
         .expect("expected request did not reach the Agent")
     }
 
-    async fn send(&mut self, message: Value) {
+    /// No request reaches the Agent within a short wait.
+    pub(super) async fn no_request(&mut self) {
+        if let Some(request) = self.buffered.pop_front() {
+            panic!("unexpected Agent request {request}");
+        }
+        if let Ok(Some(raw)) =
+            tokio::time::timeout(Duration::from_millis(200), self.requests.next()).await
+        {
+            panic!("unexpected Agent request {raw}");
+        }
+    }
+
+    pub(super) async fn send(&mut self, message: Value) {
         self.responses.send(Ok(message.to_string())).await.unwrap();
     }
 
-    async fn reply(&mut self, request: &Value, result: Value) {
+    pub(super) async fn reply(&mut self, request: &Value, result: Value) {
         self.send(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
             .await;
     }
 
-    async fn update(&mut self, update: Value) {
+    pub(super) async fn update(&mut self, update: Value) {
         self.send(
             json!({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": SESSION, "update": update,
@@ -112,7 +133,10 @@ impl Peer {
         .await;
     }
 
-    fn submit(&self, command: Value) -> oneshot::Receiver<Result<Value, BridgeRequestError>> {
+    pub(super) fn submit(
+        &self,
+        command: Value,
+    ) -> oneshot::Receiver<Result<Value, BridgeRequestError>> {
         let (response, result) = oneshot::channel();
         self.commands
             .send(BridgeInput::BusinessRequest { command, response })
@@ -120,19 +144,40 @@ impl Peer {
         result
     }
 
-    /// One convergence check at the current cut.
-    async fn check(&mut self) -> Documents {
+    /// The current log position and fresh documents.
+    pub(super) async fn cut(&self) -> (u64, Documents) {
         let state = self.state.upgrade().expect("bridge state is alive");
         let state = state.lock_without_commit().await;
-        let documents = fresh(&state.agent, state.catalog_revision, &state.sessions);
-        if let Err(divergence) = self.convergence.check(&state.replication, &documents) {
-            panic!("{divergence}");
+        (
+            state.replication.log().seq(),
+            fresh(&state.agent, state.catalog_revision, &state.sessions),
+        )
+    }
+
+    /// One convergence check at the current cut, for the log-fed replicas
+    /// and for every SSE replica.
+    pub(super) async fn check(&mut self) -> Documents {
+        let (seq, documents) = {
+            let state = self.state.upgrade().expect("bridge state is alive");
+            let state = state.lock_without_commit().await;
+            let documents = fresh(&state.agent, state.catalog_revision, &state.sessions);
+            if let Err(divergence) = self.convergence.check(&state.replication, &documents) {
+                panic!("{divergence}");
+            }
+            (state.replication.log().seq(), documents)
+        };
+        for stream in &mut self.streams {
+            stream.check(&self.router, seq, &documents).await;
         }
         documents
     }
 
     /// Checks convergence at every poll until `done` holds.
-    async fn until(&mut self, what: &str, done: impl Fn(&Documents) -> bool) -> Documents {
+    pub(super) async fn until(
+        &mut self,
+        what: &str,
+        done: impl Fn(&Documents) -> bool,
+    ) -> Documents {
         for _ in 0..300 {
             let documents = self.check().await;
             if done(&documents) {
@@ -143,16 +188,37 @@ impl Peer {
         panic!("{what} never happened");
     }
 
-    async fn settle(&mut self) {
-        let state = self.state.upgrade().expect("bridge state is alive");
-        let state = state.lock_without_commit().await;
-        let documents = fresh(&state.agent, state.catalog_revision, &state.sessions);
-        if let Err(divergence) = self.convergence.settle(&state.replication, &documents) {
-            panic!("{divergence}");
+    pub(super) async fn settle(&mut self) {
+        {
+            let state = self.state.upgrade().expect("bridge state is alive");
+            let state = state.lock_without_commit().await;
+            let documents = fresh(&state.agent, state.catalog_revision, &state.sessions);
+            if let Err(divergence) = self.convergence.settle(&state.replication, &documents) {
+                panic!("{divergence}");
+            }
+        }
+        // Every SSE replica must compare equal at a quiet cut.
+        for index in 0..self.streams.len() {
+            let mut compared = false;
+            for _ in 0..50 {
+                let (seq, documents) = self.cut().await;
+                if self.streams[index]
+                    .check(&self.router, seq, &documents)
+                    .await
+                {
+                    compared = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                compared,
+                "SSE replica {index} never applied the current position"
+            );
         }
     }
 
-    async fn stop(mut self) {
+    pub(super) async fn stop(mut self) {
         self.cancellation.cancel();
         tokio::time::timeout(Duration::from_secs(3), self.task.take().unwrap())
             .await
@@ -171,22 +237,22 @@ impl Drop for Peer {
     }
 }
 
-const SESSION: &str = "convergence-session";
+pub(super) const SESSION: &str = "convergence-session";
 
-fn session(documents: &Documents) -> &Value {
+pub(super) fn session(documents: &Documents) -> &Value {
     &documents[&crate::protocol::session_scope(SESSION)]
 }
 
-fn held(documents: &Documents) -> bool {
+pub(super) fn held(documents: &Documents) -> bool {
     documents.contains_key(&crate::protocol::session_scope(SESSION))
 }
 
-async fn create(peer: &mut Peer) {
+pub(super) async fn create(peer: &mut Peer) {
     create_unobserved(peer).await;
     peer.until("the session is held", held).await;
 }
 
-async fn create_unobserved(peer: &mut Peer) {
+pub(super) async fn create_unobserved(peer: &mut Peer) {
     let created = peer.submit(json!({
         "type": "session/new", "requestId": "convergence-new", "cwd": "/workspace",
     }));
@@ -215,6 +281,16 @@ async fn controls_turns_permissions_close_and_delete_converge() {
     )
     .await;
     create(&mut peer).await;
+    // SSE replicas over the real routes: one follows `global`, one also
+    // the session's owner.
+    let owner = super::stream_tests::owner(&peer).await;
+    for scopes in [
+        vec![crate::protocol::GLOBAL.to_string()],
+        vec![crate::protocol::GLOBAL.to_string(), owner],
+    ] {
+        let stream = HttpStream::open(&peer.router, &scopes).await;
+        peer.streams.push(stream);
+    }
 
     // Agent control updates, including sparse info and usage without cost.
     for (update, done) in [
@@ -394,6 +470,13 @@ async fn controls_turns_permissions_close_and_delete_converge() {
         .unwrap();
     peer.until("the closed session leaves", |documents| !held(documents))
         .await;
+    assert_eq!(
+        peer.streams[1]
+            .replica
+            .ended(&crate::protocol::session_scope(SESSION)),
+        Some(crate::protocol::EndReason::Closed),
+        "the owner's stream ends with the close"
+    );
 
     // Delete of the closed session.
     let deleted = peer.submit(json!({
@@ -435,7 +518,10 @@ async fn unobserved_retirement_ends_the_session_scope() {
             .map(|entry| {
                 (
                     entry.prev,
-                    entry.change == crate::protocol::log::Change::End,
+                    entry.change
+                        == crate::protocol::log::Change::End(
+                            crate::protocol::EndReason::Unobserved,
+                        ),
                 )
             })
             .collect::<Vec<_>>()
