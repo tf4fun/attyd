@@ -8,6 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::protocol::SessionControls;
 use crate::session_mirror::TurnOverlay;
 use crate::session_registry::{SessionEntry, SessionRegistry};
 use crate::session_state::{MirrorError, SessionAdmission, SessionState, TurnAdmission};
@@ -57,6 +58,10 @@ pub(crate) struct SessionLiveState {
     pub cwd: PathBuf,
     pub session: Value,
     pub control_state: BTreeMap<String, Value>,
+    /// Protocol v2 controls, reduced in arrival order around the setup
+    /// response (protocol §3.3). `control_state` keeps only the latest update
+    /// of each kind, which loses the response boundary.
+    pub controls: SessionControls,
     pub lifecycle: SessionLifecycle,
     pub permissions: BTreeMap<String, PendingInteraction>,
     pub elicitations: BTreeMap<String, PendingInteraction>,
@@ -579,6 +584,7 @@ impl SessionRegistry {
                 cwd: cwd.into(),
                 session: Value::Null,
                 control_state: BTreeMap::new(),
+                controls: SessionControls::default(),
                 lifecycle: SessionLifecycle::Attaching,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
@@ -726,6 +732,7 @@ impl SessionRegistry {
         let candidate = std::mem::take(&mut session.attachment_candidate);
         session.attachment_candidate_bytes = 0;
         session.control_state = extract_control_state(candidate);
+        session.controls = SessionControls::settle(&session.control_state, &response);
         session.session = response;
         owner.operation = None;
 
@@ -790,6 +797,7 @@ impl SessionRegistry {
         let controls = extract_control_state(candidate);
         session.attachment_candidate_bytes = 0;
         session.control_state.extend(controls);
+        session.controls = SessionControls::settle(&session.control_state, &response);
         session.session = response;
         session.lifecycle = SessionLifecycle::Active;
         owner.operation = None;
@@ -882,6 +890,7 @@ impl SessionRegistry {
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
         let session = retain_session_metadata(&session_id, session);
+        let controls = SessionControls::settle(&control_state, &session);
         self.install_live(
             &session_id,
             incarnation,
@@ -890,6 +899,7 @@ impl SessionRegistry {
                 cwd,
                 session,
                 control_state,
+                controls,
                 lifecycle: SessionLifecycle::Active,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
@@ -1061,6 +1071,9 @@ impl SessionRegistry {
             return Err(RuntimeStateError::SessionNotActive);
         }
         let key = key.into();
+        // A later update folds even when it repeats the stored one: the
+        // response may have replaced its value since.
+        session.controls.fold_update(&update);
         let update = fold_control_update(session.control_state.get(&key), update);
         if session.control_state.get(&key) == Some(&update) {
             return Ok(());
@@ -1091,6 +1104,7 @@ impl SessionRegistry {
         {
             return Err(RuntimeStateError::BusySession);
         }
+        session.controls = SessionControls::settle(&controls, &response);
         session.session = response;
         session.control_state = controls;
         self.commit_session(session_id);

@@ -10,9 +10,9 @@ use serde_json::{Map, Value, json};
 
 use super::{
     ActiveTurn, AgentState, CatalogState, CollapsedTurn, GlobalState, Interaction, OperationKind,
-    PendingCounts, SessionControls, SessionHistory, SessionLifecycle, SessionOperation,
-    SessionPhase, SessionState, SessionSummary, SessionWork, TerminalExitStatus, TerminalState,
-    TurnOutcome, TurnOutcomeStatus, UrlFlow, UrlFlowStatus,
+    PendingCounts, SessionHistory, SessionLifecycle, SessionOperation, SessionPhase, SessionState,
+    SessionSummary, SessionWork, TerminalExitStatus, TerminalState, TurnOutcome, TurnOutcomeStatus,
+    UrlFlow, UrlFlowStatus,
 };
 use crate::history_cache::SessionKey;
 use crate::runtime_state::{self as rt, PendingInteraction, SessionOperationKind};
@@ -42,7 +42,10 @@ pub(crate) fn project_global(
         interactions: registry
             .request_elicitations
             .values()
-            .map(|pending| (pending.interaction_id.clone(), elicitation(pending, None)))
+            .map(|pending| {
+                let projected = elicitation(pending, None, None);
+                (pending.interaction_id.clone(), projected)
+            })
             .collect(),
         url_flows: registry
             .request_url_flows
@@ -123,9 +126,21 @@ pub(crate) fn project_session(
             .as_ref()
             .is_some_and(|execution| execution.cancel_requested),
     });
+    // Interactions record the turn's RPC operation, which is its client
+    // intent; replicas address the turn by its public operation ID.
+    let turn_operation = |internal: Option<&str>| {
+        let turn = state.active_turn.as_ref()?;
+        let rpc = turn
+            .execution
+            .as_ref()
+            .map_or(turn.client_intent_id.as_str(), |execution| {
+                execution.rpc_operation_id.as_str()
+            });
+        (internal? == rpc).then(|| turn.operation_id.clone())
+    };
     let mut interactions = BTreeMap::new();
     for (interaction_id, permission) in take_object(&mut view["interactions"]["permissions"]) {
-        let operation_id = permission["operationId"].as_str().map(str::to_owned);
+        let operation_id = turn_operation(permission["operationId"].as_str());
         interactions.insert(
             interaction_id.clone(),
             Interaction::Permission {
@@ -136,14 +151,18 @@ pub(crate) fn project_session(
         );
     }
     for pending in live.elicitations.values() {
-        interactions.insert(pending.interaction_id.clone(), elicitation(pending, None));
+        let operation_id = turn_operation(pending.operation_id.as_deref());
+        interactions.insert(
+            pending.interaction_id.clone(),
+            elicitation(pending, operation_id, None),
+        );
     }
 
     Some(SessionState {
         session_id: session_id.to_string(),
         incarnation: state.incarnation,
         cwd: live.cwd.to_string_lossy().into_owned(),
-        controls: SessionControls::from_live(&live.session, &live.control_state),
+        controls: live.controls.clone(),
         history: SessionHistory {
             revision: state.history_revision.clone(),
             phase: phase(state.phase),
@@ -187,13 +206,7 @@ fn summary(entry: &SessionEntry) -> Option<SessionSummary> {
         session_id: state.session_id.clone(),
         incarnation: state.incarnation,
         cwd: live.cwd.to_string_lossy().into_owned(),
-        // `controls.info.title`: only `session_info_update` carries it.
-        title: live
-            .control_state
-            .get("session_info_update")
-            .and_then(|update| update.get("title"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        title: live.controls.info.title.clone(),
         lifecycle: lifecycle(&live.lifecycle),
         phase: phase(state.phase),
         work: match LiveWork::of(entry) {
@@ -213,11 +226,15 @@ fn summary(entry: &SessionEntry) -> Option<SessionSummary> {
     })
 }
 
-fn elicitation(pending: &PendingInteraction, request_id: Option<String>) -> Interaction {
+fn elicitation(
+    pending: &PendingInteraction,
+    operation_id: Option<String>,
+    request_id: Option<String>,
+) -> Interaction {
     Interaction::Elicitation {
         interaction_id: pending.interaction_id.clone(),
         request: pending.request.clone(),
-        operation_id: pending.operation_id.clone(),
+        operation_id,
         request_id,
     }
 }

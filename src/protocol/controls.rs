@@ -3,6 +3,8 @@
 //! Sources fold in order: early updates, then the `session/new`, load, resume
 //! or fork response, then later updates. The response overrides exactly the
 //! fields it provides; every update kind owns disjoint fields.
+//! `SessionLiveState::controls` holds the result: `settle` at each response,
+//! then `fold_update` for every later update.
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -93,17 +95,15 @@ impl SessionControls {
         }
     }
 
-    /// The reduced state of today's live storage: the retained response, then
-    /// the latest notification of each kind. `fold_control_update` has already
-    /// merged sparse info and usage updates, and the kinds own disjoint fields,
-    /// so folding them after the response reproduces `SessionLiveState`'s
-    /// precedence.
-    pub(crate) fn from_live(response: &Value, control_state: &BTreeMap<String, Value>) -> Self {
+    /// The state at a setup response: `early` holds the control updates
+    /// that arrived before it, as the latest update of each kind. The kinds own
+    /// disjoint fields, so their arrival order does not matter.
+    pub(crate) fn settle(early: &BTreeMap<String, Value>, response: &Value) -> Self {
         let mut controls = Self::default();
-        controls.apply_response(response);
-        for update in control_state.values() {
+        for update in early.values() {
             controls.fold_update(update);
         }
+        controls.apply_response(response);
         controls
     }
 }
@@ -264,35 +264,32 @@ mod tests {
     }
 
     #[test]
-    fn live_storage_reduces_with_the_v1_precedence() {
+    fn settling_lets_the_response_override_only_its_fields() {
         let response = json!({
             "sessionId": "s",
             "modes": { "currentModeId": "ask", "availableModes": [{ "id": "ask" }, { "id": "code" }] },
-            "configOptions": [{ "id": "response" }],
+            "configOptions": [],
         });
-        let mut control_state = BTreeMap::new();
+        let mut early = BTreeMap::new();
         for update in [
             json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
-            json!({ "sessionUpdate": "config_option_update", "configOptions": [{ "id": "update" }] }),
+            json!({ "sessionUpdate": "config_option_update", "configOptions": [{ "id": "early" }] }),
             json!({ "sessionUpdate": "session_info_update", "title": "Title", "updatedAt": null }),
             json!({ "sessionUpdate": "usage_update", "used": 3, "size": 9,
                     "cost": { "amount": 2, "currency": "USD" } }),
         ] {
             let key = update["sessionUpdate"].as_str().unwrap().to_string();
-            let folded = crate::runtime_state::fold_control_update(control_state.get(&key), update);
-            control_state.insert(key, folded);
+            let folded = crate::runtime_state::fold_control_update(early.get(&key), update);
+            early.insert(key, folded);
         }
-        let controls = SessionControls::from_live(&response, &control_state);
-        assert_eq!(controls.modes.as_ref().unwrap().current_mode_id, "code");
+        let controls = SessionControls::settle(&early, &response);
+        assert_eq!(controls.modes.as_ref().unwrap().current_mode_id, "ask");
         assert_eq!(controls.modes.as_ref().unwrap().available_modes.len(), 2);
-        assert_eq!(
-            controls.config_options,
-            Some(vec![json!({ "id": "update" })])
-        );
+        assert_eq!(controls.config_options, Some(Vec::new()));
         assert_eq!(controls.info.title.as_deref(), Some("Title"));
         assert_eq!(controls.usage.as_ref().unwrap().size, 9);
         assert_eq!(
-            SessionControls::from_live(&json!({ "sessionId": "s" }), &BTreeMap::new()),
+            SessionControls::settle(&BTreeMap::new(), &json!({ "sessionId": "s" })),
             SessionControls::default()
         );
     }
