@@ -57,6 +57,8 @@ pub(crate) struct Replica {
     random: u64,
     pub(crate) snapshots: usize,
     pub(crate) applied_entries: usize,
+    /// Restarts because the log no longer held the replica's position.
+    pub(crate) compaction_resets: usize,
 }
 
 impl Replica {
@@ -68,6 +70,7 @@ impl Replica {
             random: seed | 1,
             snapshots: 0,
             applied_entries: 0,
+            compaction_resets: 0,
         }
     }
 
@@ -106,60 +109,79 @@ impl Replica {
         self.received = replication.log().seq();
     }
 
-    fn deliver(
-        &mut self,
-        entry: &LogEntry,
-        replication: &Replication,
-        fresh: &BTreeMap<String, Value>,
-    ) {
+    /// Applies one entry. A continuity break or an op that does not apply is
+    /// a producer error: the gate reports it instead of repairing the
+    /// document from the snapshot it is about to compare with.
+    fn deliver(&mut self, entry: &LogEntry) -> Result<(), String> {
         if self
             .documents
             .get(&entry.scope)
             .is_some_and(|document| entry.seq <= document.covered)
         {
-            return;
+            return Ok(());
         }
-        match &entry.change {
-            Change::End => {
-                self.documents.remove(&entry.scope);
+        let mut document = match self.documents.remove(&entry.scope) {
+            Some(document) if document.seq == entry.prev => document,
+            None if entry.prev == 0 => Document {
+                seq: 0,
+                covered: 0,
+                value: json!({}),
+            },
+            document => {
+                return Err(format!(
+                    "{:?} replica: entry {} for {} has prev {}, but the replica is at {:?}",
+                    self.delivery,
+                    entry.seq,
+                    entry.scope,
+                    entry.prev,
+                    document.map(|document| document.seq),
+                ));
             }
+        };
+        match &entry.change {
+            Change::End => {}
             Change::Ops(ops) => {
-                let mut document = match self.documents.remove(&entry.scope) {
-                    Some(document) if document.seq == entry.prev => document,
-                    None if entry.prev == 0 => Document {
-                        seq: 0,
-                        covered: 0,
-                        value: json!({}),
-                    },
-                    // A continuity break resets the scope (protocol §4).
-                    _ => return self.install(&entry.scope, replication, fresh),
-                };
-                if ops.iter().any(|op| apply(&mut document.value, op).is_err()) {
-                    return self.install(&entry.scope, replication, fresh);
+                for op in ops.iter() {
+                    apply(&mut document.value, op).map_err(|error| {
+                        format!(
+                            "{:?} replica: entry {} for {} does not apply: {error:?}",
+                            self.delivery, entry.seq, entry.scope
+                        )
+                    })?;
                 }
                 self.applied_entries += 1;
                 document.seq = entry.seq;
                 self.documents.insert(entry.scope.clone(), document);
             }
         }
+        Ok(())
     }
 
     /// Delivers whatever the replica's delivery mode takes from the log now.
-    pub(crate) fn sync(&mut self, replication: &Replication, fresh: &BTreeMap<String, Value>) {
+    /// Snapshots replace entries only at the allowed boundaries: the first
+    /// cut, a coalesced queue, a reconnect, and a position the log compacted.
+    pub(crate) fn sync(
+        &mut self,
+        replication: &Replication,
+        fresh: &BTreeMap<String, Value>,
+    ) -> Result<(), String> {
         if self.received == 0 && self.documents.is_empty() {
-            return self.restart(replication, fresh);
+            self.restart(replication, fresh);
+            return Ok(());
         }
         if self.delivery != Delivery::Follow && self.next() % 3 != 0 {
-            return; // lagging
+            return Ok(()); // lagging
         }
         let Some(entries) = replication.log().after(self.received) else {
-            return self.restart(replication, fresh);
+            self.compaction_resets += 1;
+            self.restart(replication, fresh);
+            return Ok(());
         };
         let entries = entries.collect::<Vec<_>>();
         match self.delivery {
             Delivery::Follow => {
                 for entry in entries {
-                    self.deliver(entry, replication, fresh);
+                    self.deliver(entry)?;
                 }
             }
             Delivery::Coalesce => {
@@ -172,7 +194,7 @@ impl Replica {
                     .collect::<BTreeSet<_>>();
                 for entry in entries {
                     if !coalesced.contains(&entry.scope) {
-                        self.deliver(entry, replication, fresh);
+                        self.deliver(entry)?;
                     }
                 }
                 for scope in coalesced {
@@ -181,14 +203,16 @@ impl Replica {
             }
             Delivery::Cuts => {
                 if self.next() % 4 == 0 {
-                    return self.restart(replication, fresh);
+                    self.restart(replication, fresh);
+                    return Ok(());
                 }
                 for entry in entries {
-                    self.deliver(entry, replication, fresh);
+                    self.deliver(entry)?;
                 }
             }
         }
         self.received = replication.log().seq();
+        Ok(())
     }
 
     pub(crate) fn is_current(&self, replication: &Replication) -> bool {
@@ -254,7 +278,9 @@ impl Convergence {
     ) -> Result<(), String> {
         self.steps += 1;
         for replica in &mut self.replicas {
-            replica.sync(replication, fresh);
+            replica
+                .sync(replication, fresh)
+                .map_err(|error| format!("step {}: {error}", self.steps))?;
             if replica.is_current(replication)
                 && let Some(divergence) = replica.diverges(fresh)
             {
