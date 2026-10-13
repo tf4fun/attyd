@@ -178,6 +178,11 @@ fn held(documents: &Documents) -> bool {
 }
 
 async fn create(peer: &mut Peer) {
+    create_unobserved(peer).await;
+    peer.until("the session is held", held).await;
+}
+
+async fn create_unobserved(peer: &mut Peer) {
     let created = peer.submit(json!({
         "type": "session/new", "requestId": "convergence-new", "cwd": "/workspace",
     }));
@@ -196,7 +201,6 @@ async fn create(peer: &mut Peer) {
         .unwrap()
         .unwrap()
         .unwrap();
-    peer.until("the session is held", held).await;
 }
 
 #[tokio::test]
@@ -407,11 +411,41 @@ async fn controls_turns_permissions_close_and_delete_converge() {
 #[tokio::test]
 async fn unobserved_retirement_ends_the_session_scope() {
     let mut peer = Peer::start(0, json!({})).await;
-    create(&mut peer).await;
+    // With a zero timeout the session may retire before any poll sees it
+    // held (the race the first-subscription lease closes in step 4), so the
+    // log is what proves it was published and then ended.
+    create_unobserved(&mut peer).await;
     peer.until("the unobserved session retires", |documents| {
         !held(documents)
     })
     .await;
+    let state = peer.state.upgrade().unwrap();
+    let changes = {
+        let state = state.lock_without_commit().await;
+        state
+            .replication
+            .log()
+            .after(0)
+            .unwrap()
+            .filter(|entry| entry.scope == crate::protocol::session_scope(SESSION))
+            .map(|entry| {
+                (
+                    entry.prev,
+                    entry.change == crate::protocol::log::Change::End,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        changes.first().map(|change| change.0),
+        Some(0),
+        "{changes:?}"
+    );
+    assert_eq!(
+        changes.last().map(|change| change.1),
+        Some(true),
+        "{changes:?}"
+    );
     peer.settle().await;
     peer.stop().await;
 }
