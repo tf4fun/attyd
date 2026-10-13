@@ -17,6 +17,10 @@ pub(crate) mod log;
 mod project;
 mod publish;
 #[cfg(test)]
+mod publish_tests;
+#[cfg(test)]
+pub(crate) mod replica;
+#[cfg(test)]
 mod typescript;
 
 use std::collections::BTreeMap;

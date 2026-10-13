@@ -56,6 +56,8 @@ use crate::session_state::SessionAdmission;
 use crate::terminal::{TerminalManager, TerminalSnapshot};
 
 mod agent_dispatch;
+#[cfg(test)]
+mod convergence_tests;
 mod coordinator;
 #[cfg(test)]
 mod coordinator_tests;
