@@ -137,41 +137,64 @@ observation lease (H09, H13). The bridge sees only the lease, never the stream.
 Command handlers run in the bridge actor as today. After the command's own
 transition and commit step, the handler records the log position at that moment as
 `at`, and the touched scopes as `scopes`. This holds even when the command commits
-no change, such as an idempotent duplicate. Long-running effects (turns, auth
-flows, create, fork) commit their acceptance and their tracking record before the
-HTTP response. Later progress arrives only through replication.
+no change, such as an idempotent duplicate. Every accepted command commits its
+`Request` record (or, for a turn, its operation) before the HTTP response. Later
+progress and the final result arrive only through replication.
 
-**Request records.** Every ACP request the bridge sends outside a held session gets
-a `GlobalRequest` before it is sent. This includes:
+**Request records.** A `Request` in `global.requests` is created in the same actor
+turn that accepts the command or sends the ACP request:
 
-- `authenticate` and `logout`;
-- the auth terminal;
-- `session/new` and `session/fork`;
-- cold `session/delete`;
-- the `session/list` behind a catalog read.
+- every accepted command except turn start and interaction responses: authenticate,
+  logout, the auth terminal, create, fork, set_mode, set_config, close and delete;
+- every ACP request outside a held session, including the `session/list` behind a
+  catalog read.
 
-The record is keyed by the bridge's JSON-RPC request ID. A request-scoped elicitation
+A session `operation` started by a command points to its record (`requestId`), and
+the record's final status and error stay after the operation clears. Synchronous
+rejections (4xx) create nothing. Auth records keep `methodId` for their whole life,
+which replaces today's browser-side `AuthTerminalState.methodId` (`web/src/lib/state.ts`).
+
+An out-of-session record is keyed by the bridge's JSON-RPC request ID. A request-scoped elicitation
 names that ID (`ElicitationRequestScope.request_id`), so the bridge attaches it to
 the record directly. This replaces the connection-level `request_elicitations` and
 `request_url_flows`, and the `acp/authenticated`, `acp/logged_out` and
 `bridge/auth_terminal_*` events. A global URL flow keeps its `requestId` but outlives
 the request (protocol §3.4).
 
-**Intents.** Create, fork and turn start keep an intent table per epoch, keyed by
-`clientIntentId`, that stores the body digest and the request or operation ID. Turns
-already have this (H07). Create and fork gain it, so a retry or a lost response
-resolves to the existing record.
+**URL flow identity.** URL flows are keyed by the `interactionId` of the accepted
+elicitation, not by the Agent's `elicitationId`. The Agent may legally reuse an
+`elicitationId` once a flow ends (regression at `src/runtime_state.rs:6672`).
+`elicitation/complete` resolves to the single *waiting* flow with that ID; the
+existing `url_flow_in_use` check keeps that unique. Acknowledgement uses the
+`interactionId`, so a late acknowledgement of flow A cannot remove a later flow B
+that reused A's `elicitationId`.
 
-**Cold-session commands.** `If-Match: "<epoch>:0"` is checked against the registry
-in the same actor turn that starts the global request, so there is no window in which
-the session becomes held unseen. Cold delete keeps the path tested by
+**Intents.** Create, fork and turn start keep one intent table per epoch, keyed by
+`clientIntentId`. Each entry stores a fingerprint, `(method, target sessionId, owner
+tag, body digest)`, and the record or operation ID it produced. Equal bodies sent to
+different targets therefore conflict instead of aliasing. Turns already keep an
+intent table (H07), which gains the target fields. Create and fork gain the table, so
+a retry or a lost response resolves to the existing record.
+
+**Cold delete.** `If-Match: "<epoch>:0"` is checked against the registry in the same
+actor turn that starts the request, so there is no window in which the session
+becomes held unseen. It keeps the path tested by
 `cold_session_deletion_uses_global_management_without_loading`
-(`src/server.rs:4400`).
+(`src/server.rs:4400`). Fork still requires a held source: it reads the source's
+`cwd` from live state (`src/bridge.rs:4271`), and `ForkSessionRequest` requires a
+`cwd`.
 
-**Materialization.** Only an observation lease starts `load`/`resume` (protocol
+**Materialization.** Only an *open* observation starts `load`/`resume` (protocol
 §4.2). `GET /api/v2/sessions/{id}` answers from the held session or returns
-`not_found`. Today's observe-then-fetch behaviour of the browser is kept, and the GET
-loses its loading side effect.
+`not_found`, so the GET loses its loading side effect. The browser's
+observe-then-fetch order is kept.
+
+**Resume never reopens.** The Hub classifies each session subscription as open or
+resume (protocol §4.2) before asking the bridge for a lease. A resume carries the
+expected owner, and the bridge applies today's rule from
+`prepare_session_view_request_for_owner` (`src/bridge.rs:1309`): a retired or
+foreign owner yields `end` and never a fresh load. Retired incarnations go into a
+bounded per-epoch table, so `end.reason` stays accurate after log compaction.
 
 ### 2.5 Rejected alternative
 
@@ -246,12 +269,18 @@ discards the replica at the critical point and rebuilds it from public state:
 | Scenario | Proves |
 | --- | --- |
 | Global URL authentication: refresh after accept, then `elicitation/complete`, and separately cancellation | global `urlFlows` and their lifetime |
-| `POST /sessions` and fork with the HTTP response dropped; two pages creating in one directory; retry with the same key | intents and typed request results |
+| URL flow A completes, the Agent reuses its `elicitationId` for flow B, and a late acknowledgement of A arrives | flow identity by `interactionId` |
+| Page A disconnects, page B closes the session, A reconnects (with and without the close still in the log) | resume never reopens; `end` reasons |
+| `set_mode` / `set_config` refused by the Agent, and close of a held session, each with the HTTP response dropped | session command records in `global.requests` |
+| Auth terminal running, then failed, with two advertised methods, rebuilt from public state | `methodId` on the record |
+| Terminal login succeeds and the Agent restarts | `agent.predecessor` and the epoch boundary |
+| `POST /sessions` and fork with the HTTP response dropped; two pages creating in one directory; retry with the same key; one key reused for forks of A and B | intents, fingerprints and typed request results |
 | Cold-session delete with an Agent that supports delete but not load or resume | the `"<epoch>:0"` precondition and the no-load path |
-| Sparse controls: title then `updatedAt` only; usage with cost, then usage without cost; `null` clears | control reduction (protocol §3.3) |
+| Sparse controls: title then `updatedAt` only; usage with cost, then usage without cost; `null` clears; early commands and title before a response that sets modes | control reduction and its order (protocol §3.3) |
+| An Agent that omits `configOptions` versus one that returns `[]` | `null` versus `[]` presence |
 | Terminal output that rolls past its bound | the `trim` + `append` diff |
 | A background `tool_call_update` folding into an earlier slot | index `set` on the timeline |
-| A command completing while its scope waits for a reset snapshot | received versus applied position |
+| A command completing while its scope waits for a coalesced reset snapshot (applied 10, commit 15, `reset@20`) | `applied` never advances on a reset |
 | A request-scoped elicitation during `session/new` and during a catalog read | request records as parents |
 | A background permission, and a turn started by another client | `global.sessions` summaries |
 | Retirement, close, delete, reattach, epoch change | `end`, incarnation and epoch handling |
@@ -269,9 +298,9 @@ working throughout. Each step is one PR, validated in CI.
 | --- | --- | --- |
 | 1 | v2 chain columns in the coverage ledger. Protocol DTOs with generated TypeScript. `project_global` and `project_session` with unit tests, including control reduction. | #5 |
 | 2 | Commit step, log and identity-based diff; in-process convergence harness | — |
-| 3 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}` and `GET /api/v2/stream`: Hub cut, `prev`, coalescing, resume, `position`; observation-only materialization | — |
+| 3 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}` and `GET /api/v2/stream`: Hub cut, `prev`, coalescing, resume, `position`; open versus resume, and only an open materializes; retired-incarnation table | — |
 | 4 | Session commands with `at`/`scopes`, `If-Match` tags and `ProtocolError`; turn and fork intents; the interaction endpoint; the reads | — |
-| 5 | Request records for every out-of-session ACP request; global interactions and URL flows; auth flows and the auth terminal; create intents; cold delete and fork | — |
+| 5 | Request records for every accepted command and out-of-session ACP request; global interactions and URL flows keyed by interaction; auth flows and the auth terminal; create and fork intents; cold delete; `agent.predecessor` | — |
 | 6 | Web UI on v2, with a generic replica engine (JSON Pointer patcher plus validation, with received and applied positions) outside React; sidebar markers from `global.sessions` | #16, #17 (visible fix) |
 | 7 | Remove v1: routes, business events, `advance_session_delta`, `touch`, `cachedSessions` and compensating browser state, and the journal replica if it has no other consumer | #18 |
 | 8 | (optional) Path-subset profiles and an access-layer guide, when a second access layer is concrete | — |
