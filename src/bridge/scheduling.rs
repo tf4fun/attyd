@@ -112,7 +112,7 @@ struct SenderInner {
     epoch: String,
     events: mpsc::UnboundedSender<IngressItem>,
     replays: SyncMutex<HashMap<String, (RequestId, ReplayCandidate)>>,
-    /// Out-of-session RPCs by their JSON-RPC ID, so a request-scoped
+    /// Outstanding RPCs by their JSON-RPC ID, so a request-scoped
     /// elicitation finds its parent (plan §2.4). An entry leaves once its
     /// completion has passed the coordinator, after every earlier event.
     outstanding: SyncMutex<HashMap<RequestId, RequestOwner>>,
@@ -709,8 +709,8 @@ impl IngressSender {
         })
     }
 
-    /// The owner of the out-of-session RPC with this JSON-RPC ID, while its
-    /// completion has not passed the coordinator.
+    /// The owner of the RPC with this JSON-RPC ID, while its completion has
+    /// not passed the coordinator.
     pub(super) fn outstanding_owner(&self, request_id: &RequestId) -> Option<RequestOwner> {
         self.inner.outstanding.lock().ok()?.get(request_id).cloned()
     }
@@ -781,20 +781,18 @@ impl PreparedRpc {
             .map_err(scheduling_error)?;
         // Still inside the receive gate: no event naming this ID can be
         // routed before the entry exists.
-        let outstanding = matches!(self.scope, ExecutionScope::Global(_)).then(|| {
-            self.sender
-                .inner
-                .outstanding
-                .lock()
-                .expect("outstanding RPC registry lock poisoned")
-                .insert(
-                    registered.request_id.clone(),
-                    self.registration.owner().clone(),
-                );
-            OutstandingRegistration {
-                sender: self.sender.clone(),
-                request_id: registered.request_id.clone(),
-            }
+        self.sender
+            .inner
+            .outstanding
+            .lock()
+            .expect("outstanding RPC registry lock poisoned")
+            .insert(
+                registered.request_id.clone(),
+                self.registration.owner().clone(),
+            );
+        let outstanding = Some(OutstandingRegistration {
+            sender: self.sender.clone(),
+            request_id: registered.request_id.clone(),
         });
         let replay_registration = session_id.zip(self.replay).map(|(session_id, replay)| {
             replays.insert(session_id.clone(), (registered.request_id.clone(), replay));

@@ -337,14 +337,17 @@ Step 5 adds the global commands and out-of-session records in the same files:
   its own record; any other one, a v1 client's included, gets an `agent_request`
   record that finishes with the handler. A read's record (`session/list`) leaves
   as soon as its call ends.
-- **Parents.** The ingress keeps every out-of-session RPC by its JSON-RPC ID until
-  its completion has passed the coordinator (`IngressSender::outstanding_owner`).
-  The coordinator resolves a request-scoped elicitation's `requestId` when it routes
-  the event, so the lookup follows wire order and a fast response can't race it.
-  The elicitation records its parent; when the parent's request ends, its pending
-  request-scoped elicitations are cancelled, and its URL flows stay. An elicitation
-  naming a request that already ended is answered `cancel`. A request scope that
-  names a session request (a prompt) keeps v1's behavior: global, without a parent.
+- **Parents.** The ingress keeps every RPC by its JSON-RPC ID until its completion
+  has passed the coordinator (`IngressSender::outstanding_owner`). The coordinator
+  resolves a request-scoped elicitation's `requestId` when it routes the event, so
+  the lookup follows wire order and a fast response can't race it. The record of
+  the named request parents the elicitation, out of session or a session command
+  such as `set_mode`. The transition that finishes that record cancels its pending
+  request-scoped elicitations, and the Agent gets `cancel`; their URL flows stay.
+  An elicitation naming a request that is no longer outstanding, or whose record
+  already finished, is answered `cancel` and never published. A running session
+  request without a record (a prompt) leaves the interaction global and
+  unparented, as does a `null` request scope.
 - **Global URL flows** keep their parent's `requestId`, stay terminal (the last 16)
   until `DELETE /api/v2/url-flows/{interactionId}`, and are keyed by interaction.
 - **Auth.** `POST /api/v2/agent/authenticate`, `…/logout` and `…/auth-terminals`
@@ -352,7 +355,7 @@ Step 5 adds the global commands and out-of-session records in the same files:
   auth terminal manager also delivers its events to the bridge in order
   (`auth_terminal_event`): output extends the record's bounded tail (64 KiB), and
   the exit finishes the record `succeeded`, `failed` or `cancelled`, keeping
-  `methodId`. Input, resize and cancel are controls on a running record.
+  `methodId`; a signalled exit reports `signal` with a `null` `exitCode`. Input, resize and cancel are controls on a running record.
   `agent.authenticatedMethodId` follows authenticate and logout.
 - **Create.** `POST /api/v2/sessions` is an operation command; the transition that
   makes the new session held finishes its record and grants the lease
@@ -363,7 +366,9 @@ Step 5 adds the global commands and out-of-session records in the same files:
 - **Predecessor.** The hub notes why it ended a generation (`auth_restart` after a
   successful terminal login, `shutdown`); otherwise the ended epoch's final agent
   phase decides (`agent_error` or `agent_exit`). The next connection's source
-  carries it into `agent.predecessor`.
+  carries it into `agent.predecessor`. An `auth_restart` starts the next
+  connection as soon as the old one finished, so a v2-only client sees the new
+  epoch; reading an ended epoch's `global` still never restarts the Agent.
 
 **Cold delete.** `If-Match: "<epoch>:0"` is checked against the registry in the same
 actor turn that starts the request, so there is no window in which the session

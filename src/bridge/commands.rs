@@ -684,6 +684,7 @@ fn finish_on_response(
             .sessions
             .commands
             .finish(&request_id, outcome(response), Instant::now());
+        end_request_children(state, &request_id);
     });
 }
 
@@ -985,11 +986,18 @@ pub(super) fn out_of_session_request_ended(
             let _ = state.sessions.commands.acknowledge(request_id);
         }
     }
+    end_request_children(state, &request_id);
+}
+
+/// A request ended: the request-scoped elicitations it parents end with it
+/// in the same transition, and the Agent gets `cancel` (protocol §3.4).
+/// Their URL flows stay.
+fn end_request_children(state: &mut BridgeState, request_id: &str) {
     let children = state
         .sessions
         .request_elicitations
         .values()
-        .filter(|pending| pending.request_id.as_deref() == Some(request_id.as_str()))
+        .filter(|pending| pending.request_id.as_deref() == Some(request_id))
         .map(|pending| pending.interaction_id.clone())
         .collect::<Vec<_>>();
     let epoch = state.sessions.epoch().to_string();
@@ -1050,6 +1058,10 @@ pub(super) fn auth_terminal_event(state: &mut BridgeState, event: &Value) {
                     .get("exitCode")
                     .and_then(Value::as_i64)
                     .and_then(|code| i32::try_from(code).ok());
+                terminal.signal = event
+                    .get("signal")
+                    .and_then(Value::as_i64)
+                    .and_then(|signal| i32::try_from(signal).ok());
                 terminal.message = message.clone();
             });
             let now = Instant::now();
@@ -1709,6 +1721,7 @@ impl ReplicationSource {
                 _ => done(response),
             };
             state.sessions.commands.finish(&id, outcome, Instant::now());
+            end_request_children(state, &id);
         });
         Ok(result(at, scopes, accepted(request_id)))
     }
@@ -1899,6 +1912,7 @@ impl ReplicationSource {
                 Instant::now(),
             );
             let _ = commands.acknowledge(&request_id);
+            end_request_children(state, &request_id);
             let _ = answer.send(response);
         });
         let response = answered.await.map_err(|_| unavailable())?;

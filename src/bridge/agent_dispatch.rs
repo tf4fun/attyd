@@ -524,16 +524,22 @@ async fn elicitation(
             .as_deref()
             .map(|id| context.require_owner(&state, id))
             .transpose()?;
-        // A request-scoped elicitation belongs to the out-of-session request
-        // it names; once that request ended, nothing can answer it.
-        let parent = match context
-            .request_parent
-            .as_ref()
-            .filter(|parent| owner.is_none() && parent.session_id.is_none())
-        {
-            Some(parent) => match commands::running_parent(&state, &parent.operation_id) {
-                Some(request_id) => Some(request_id),
-                None => {
+        // A request-scoped elicitation belongs to the request it names (plan
+        // §2.4): that request's record parents it, and once the request ended
+        // nothing can answer it. A running session request without a record
+        // (a prompt) leaves the interaction global and unparented.
+        let named = owner.is_none()
+            && matches!(
+                request.scope(),
+                ElicitationScope::Request(scope)
+                    if !matches!(scope.request_id, agent_client_protocol::schema::v1::RequestId::Null)
+            );
+        let parent = if named {
+            let parent = context.request_parent.as_ref();
+            match parent.map(|parent| commands::running_parent(&state, &parent.operation_id)) {
+                Some(Some(request_id)) => Some(request_id),
+                Some(None) if parent.is_some_and(|parent| parent.session_id.is_some()) => None,
+                _ => {
                     drop(state);
                     drop(turn);
                     return respond(
@@ -541,8 +547,9 @@ async fn elicitation(
                         Ok(CreateElicitationResponse::new(ElicitationAction::Cancel)),
                     );
                 }
-            },
-            None => None,
+            }
+        } else {
+            None
         };
         {
             if let Some(url_elicitation_id) = &url_elicitation_id {

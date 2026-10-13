@@ -1630,6 +1630,16 @@ async fn forward_generation_events(
     }
     if let Some(hub) = hub.upgrade() {
         hub.finish_generation(generation).await;
+        // A successful terminal login ends the epoch to restart the Agent:
+        // the restart is part of that lifecycle, whoever is connected.
+        let restart = {
+            let state = hub.state.lock().await;
+            !state.shutting_down
+                && state.restart_reason == Some(crate::protocol::EpochEndReason::AuthRestart)
+        };
+        if restart {
+            hub.ensure_runtime().await;
+        }
     }
 }
 
