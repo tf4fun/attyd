@@ -194,6 +194,16 @@ impl HttpStream {
         self.entries.last().unwrap().clone()
     }
 
+    /// Reads until `scope` ended; returns its reason.
+    pub(super) async fn until_ended(&mut self, scope: &str) -> crate::protocol::EndReason {
+        loop {
+            if let Some(reason) = self.replica.ended(scope) {
+                return reason;
+            }
+            self.next().await;
+        }
+    }
+
     /// `true` once the server ended the stream.
     pub(super) async fn ended(&mut self) -> bool {
         let Some(messages) = self.messages.as_mut() else {
