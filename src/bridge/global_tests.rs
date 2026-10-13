@@ -13,6 +13,7 @@ use super::*;
 use crate::protocol::{GLOBAL, session_scope};
 
 mod review_auth;
+mod review_parent_completion;
 mod review_parents;
 
 const AUTHENTICATE: &str = "/api/v2/agent/authenticate";
