@@ -546,9 +546,15 @@ key. Within one epoch:
   `disposition: "duplicate"`, and creates nothing new;
 - the same key with a different fingerprint fails with `intent_conflict`;
 - the bridge keeps the intent table for the whole epoch, separately from the public
-  records. It is bounded only by a memory budget that is far larger than record
-  retention; an evicted intent is the one documented gap. The table outlives
-  acknowledgement, record retention and the end of the target scope.
+  records. **An intent is never evicted within its epoch.** After its record goes
+  away, the intent shrinks to a fixed-size tombstone: key, fingerprint hash, original
+  ID and final status. The table outlives acknowledgement, record retention and the
+  end of the target scope;
+- the table has a memory budget. When the budget is full, the bridge **refuses new
+  intents** with `intent_capacity` (503) and commits nothing. A known key is still
+  answered from its tombstone. Capacity is recovered only by a new epoch. An unknown
+  key therefore always means the command was never accepted in this epoch, and
+  running it is a true first submission.
 
 **Recovery after a lost response.** A replica looks for its `clientIntentId` in this
 order:
@@ -563,7 +569,8 @@ scope. The replica resolves this by resending the same command with the same key
 
 | Intent table says | Response |
 | --- | --- |
-| unknown key | the command runs now, as a first submission |
+| unknown key | the command runs now, as a first submission. Within the epoch this is safe, because intents are never evicted. |
+| unknown key, table full | `intent_capacity`; nothing runs |
 | known, same fingerprint, result still public | `disposition: "duplicate"` with the original `requestId` or `operationId` |
 | known, same fingerprint, result no longer public | `disposition: "duplicate"`, `resultExpired: true`, the original ID and its final `status`; nothing runs again |
 | known, different fingerprint | `intent_conflict` |
@@ -683,6 +690,7 @@ type ErrorCode =
   | "gone"                  // 410: immutable resource no longer retained
   | "agent_error"           // 502: the Agent returned an error
   | "unavailable"           // 503: no Agent connection in this epoch
+  | "intent_capacity"       // 503: intent table full for this epoch; known keys still answer
   | "interaction_ended";    // record only: the interaction ended before delivery
 ```
 

@@ -194,10 +194,16 @@ epoch, keyed by `clientIntentId`. Each entry stores:
 Equal bodies sent to different targets therefore conflict instead of aliasing:
 config A versus config B, or two interactions given the same answer. Turns already
 keep an intent table (H07), which gains the target fields. The table is independent
-of public records, and outlives acknowledgement, retention and scope end, so a resend
-after a lost response never runs twice. When the record is gone, the resend answers
-`duplicate` with `resultExpired` (protocol §5.2). Only the memory budget bounds the
-table.
+of public records, and outlives acknowledgement, retention and scope end. Entries are
+never evicted within an epoch. Once its record is gone, an entry shrinks to a
+fixed-size tombstone (key, 32-byte fingerprint hash, ID, final status), and the
+resend answers `duplicate` with `resultExpired` (protocol §5.2). When the table's
+byte budget is full, new intents are refused with `intent_capacity`, and known keys
+are still answered. A resend after a lost response therefore never runs twice within
+an epoch, which keeps H07 and H14 intact. Tombstones of roughly 100 bytes make a
+budget of a few MiB cover tens of thousands of operations. Exhausting it means an
+epoch has had an unusual number of commands, and failing closed is the intended
+answer.
 
 **First-subscription lease.** Open, create and fork grant a lease on the owner they
 return, through the existing `ObservationLease` machinery. A stream subscription to
@@ -314,6 +320,7 @@ discards the replica at the critical point and rebuilds it from public state:
 | Two clients set different modes on one session; one is refused, and one response is lost | `clientIntentId` and `params` on command records |
 | One key reused for `config/A` and `config/B` with the same `value`, and for two interactions given the same answer | `target` in the fingerprint |
 | Lost response where the record was acknowledged by another page, retained out, or ended with its scope; and a lost response for a turn that is still running | recovery order and `resultExpired`; no second execution |
+| A tiny intent budget: an operation succeeds, its response is lost, the record is acknowledged or retained out, the table reaches its budget, then the same key is resent; for create, fork and open | no second ACP dispatch; `resultExpired` from the tombstone; new keys refused with `intent_capacity` and visible as such |
 | Create and fork with `--session-unobserved-timeout 0`, subscribing after a delay shorter than the grace period, with an Agent without `load`/`resume` | first-subscription lease |
 | Acknowledging a finished request | control actions create no records |
 | `set_mode` / `set_config` refused by the Agent, and close of a held session, each with the HTTP response dropped | session command records in `global.requests` |
