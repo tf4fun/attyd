@@ -442,12 +442,15 @@ the new owner.
 
 ### 4.1 Received and applied position
 
-A replica tracks two positions:
+A replica tracks three positions:
 
 - **received:** the `at.seq` of the last entry it read from the stream. A new
   stream starts it again at the replica's `Last-Event-ID` (or `0` without one),
   since the stream replays from there;
-- **applied:** `min(received, min over pending scopes of installed(scope))`, where:
+- **checkpoint:** the `at.seq` of the last entry that carried an SSE `id`, which is
+  the last position all of whose entries arrived. A new stream starts it at the
+  same value as `received`;
+- **applied:** `min(checkpoint, min over pending scopes of installed(scope))`, where:
   - `installed(scope)` is the last `seq` actually applied to that scope: a snapshot's
     `at.seq`, or the `seq` of the last applied `ops`. It is `0` while the scope has
     nothing installed;
@@ -463,6 +466,12 @@ A replica tracks two positions:
   A `reset` never advances `applied`. For example, a replica applied through 10, a
   command commits at 15, and a coalesced `reset@20` arrives: `applied` stays at 10
   until the snapshot (`at >= 20`) is installed.
+
+  The checkpoint matters when a coalesced queue puts several scopes at one
+  position. `global`'s `snapshot@20` can arrive before `session/S`'s `reset@20`;
+  until that reset arrives, S still looks installed at its older position, but the
+  checkpoint is still below 20, so a command on S committed at 15 is not yet
+  reported applied.
 
 Read-your-writes (§5.1) uses **applied**, never received.
 

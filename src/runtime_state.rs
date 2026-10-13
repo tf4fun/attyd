@@ -66,9 +66,10 @@ pub(crate) struct SessionLiveState {
     pub permissions: BTreeMap<String, PendingInteraction>,
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
-    /// Finished URL flows, oldest first, kept for protocol v2 until they are
-    /// acknowledged or retained out (protocol §3.4). v1 views never show them.
-    pub settled_url_flows: VecDeque<UrlFlow>,
+    /// Finished URL flows, oldest first, with their finish time, kept for
+    /// protocol v2 until they are acknowledged or retained out (protocol
+    /// §3.4). v1 views never show them.
+    pub settled_url_flows: VecDeque<(UrlFlow, std::time::Instant)>,
     pub terminals: BTreeMap<String, Value>,
     // Mirror view headers captured at the last commit so a journal snapshot or
     // hub reset only ever exposes the published view, never uncommitted state.
@@ -281,8 +282,12 @@ pub(crate) enum UrlFlowResolution {
     StaleRegistration,
 }
 
-/// Finished session URL flows kept for acknowledgement (protocol §3.4).
+/// Finished session URL flows kept for acknowledgement (protocol §3.4): a
+/// flow leaves only once it is older than `SETTLED_URL_FLOW_RETENTION` and
+/// the last `SETTLED_URL_FLOWS` stay.
 pub(crate) const SETTLED_URL_FLOWS: usize = 16;
+pub(crate) const SETTLED_URL_FLOW_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(600);
 
 /// Why a URL flow acknowledgement was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1634,8 +1639,16 @@ impl SessionRegistry {
                 }
                 remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
                 flow.status = status;
-                session.settled_url_flows.push_back(flow);
-                if session.settled_url_flows.len() > SETTLED_URL_FLOWS {
+                let now = std::time::Instant::now();
+                session.settled_url_flows.push_back((flow, now));
+                while session.settled_url_flows.len() > SETTLED_URL_FLOWS
+                    && session
+                        .settled_url_flows
+                        .front()
+                        .is_some_and(|(_, settled)| {
+                            now.saturating_duration_since(*settled) >= SETTLED_URL_FLOW_RETENTION
+                        })
+                {
                     session.settled_url_flows.pop_front();
                 }
                 self.commit_session(session_id);
@@ -1687,7 +1700,7 @@ impl SessionRegistry {
         let before = session.settled_url_flows.len();
         session
             .settled_url_flows
-            .retain(|flow| flow.registration_id != interaction_id);
+            .retain(|(flow, _)| flow.registration_id != interaction_id);
         if session.settled_url_flows.len() == before {
             return Err(UrlFlowAcknowledgement::Unknown);
         }

@@ -173,9 +173,12 @@ impl HeldCommand {
         }
     }
 
-    fn command(&self, request_id: &str, session_id: &str) -> Value {
+    /// The v1 command, bound to the owner admission checked: the handler
+    /// refuses it if that owner was replaced in the meantime.
+    fn command(&self, request_id: &str, session_id: &str, incarnation: u64) -> Value {
         let mut command = json!({
             "type": self.method(), "requestId": request_id, "sessionId": session_id,
+            "expectedOwnerIncarnation": incarnation,
         });
         match self {
             Self::SetMode { mode_id } => command["modeId"] = json!(mode_id),
@@ -479,6 +482,55 @@ fn done(response: Result<Value, BridgeRequestError>) -> Result<RequestResult, Pr
         .map_err(|error| record_error(&error))
 }
 
+/// A resend of a command that returned an owner (open, fork) renews that
+/// owner's lease (protocol §4.2), from the tombstone once the record is gone.
+fn renew_returned_owner(state: &mut BridgeState, key: &str) {
+    let owner = state.sessions.commands.intent(key).and_then(|intent| {
+        intent.owner.clone().or_else(|| {
+            // An open still running names its owner in the record's target.
+            let Subject::Request(request_id) = &intent.subject else {
+                return None;
+            };
+            let request = state.sessions.commands.request(request_id)?;
+            let target = request
+                .target
+                .as_ref()
+                .filter(|_| request.operation == RequestOperation::Open)?;
+            Some((target.session_id.clone(), target.incarnation?))
+        })
+    });
+    if let Some((session_id, incarnation)) = owner
+        && state.replication.held_incarnation(&session_id) == Some(incarnation)
+    {
+        grant_first_subscription_lease(state, &session_id, incarnation);
+    }
+}
+
+/// The owner a v2 command was admitted for must still be the session's
+/// owner when the handler runs; otherwise the command would act on a
+/// replacement (a v1 close and a new session with the same ID).
+pub(super) fn require_admitted_owner(
+    state: &BridgeState,
+    command: &Value,
+    session_id: &str,
+) -> Result<(), Error> {
+    let Some(expected) = command
+        .get("expectedOwnerIncarnation")
+        .and_then(Value::as_u64)
+    else {
+        return Ok(());
+    };
+    if state
+        .sessions
+        .state(session_id)
+        .is_some_and(|session| session.incarnation == expected)
+    {
+        Ok(())
+    } else {
+        Err(Error::invalid_params().data("the admitted session owner was replaced"))
+    }
+}
+
 /// Grants a first-subscription lease on an owner a command returned
 /// (protocol §4.2). A stream that subscribes to the owner takes it over;
 /// otherwise it lapses after the grace period.
@@ -627,13 +679,16 @@ impl ReplicationSource {
         let fingerprint = Fingerprint::of(command.name(), &target, &tag.text(), &command.body());
         let scopes = vec![GLOBAL.to_string(), session_scope(&session_id)];
         if let Some(duplicate) = known_request(&state, &key, fingerprint)? {
-            return Ok(result(position(&state), scopes, duplicate));
+            renew_returned_owner(&mut state, &key);
+            return Ok(result(committed(&mut state), scopes, duplicate));
         }
         let incarnation = held_owner(&state, &session_id, &tag)?;
         admit_held(&state, &session_id, incarnation, &command)?;
         let request_id = state.sessions.commands.allocate_request_id();
-        let Some(response) = dispatch(&state, business(command.command(&request_id, &session_id)))
-        else {
+        let Some(response) = dispatch(
+            &state,
+            business(command.command(&request_id, &session_id, incarnation)),
+        ) else {
             return Err(unavailable());
         };
         state.sessions.commands.open(record(
@@ -702,23 +757,7 @@ impl ReplicationSource {
         let fingerprint = Fingerprint::of("open", &[("sessionId", session_id.as_str())], "", &body);
         let scopes = vec![GLOBAL.to_string(), session_scope(&session_id)];
         if let Some(duplicate) = known_request(&state, &key, fingerprint)? {
-            // A retried open grants a fresh lease on the same owner.
-            if let Some(Request {
-                target:
-                    Some(RequestTarget {
-                        incarnation: Some(incarnation),
-                        ..
-                    }),
-                ..
-            }) = state
-                .sessions
-                .commands
-                .request(&duplicate.request_id)
-                .cloned()
-                && state.replication.held_incarnation(&session_id) == Some(incarnation)
-            {
-                grant_first_subscription_lease(&mut state, &session_id, incarnation);
-            }
+            renew_returned_owner(&mut state, &key);
             return Ok(result(committed(&mut state), scopes, duplicate));
         }
         let params = BTreeMap::from([("cwd".to_string(), json!(cwd))]);
@@ -745,6 +784,11 @@ impl ReplicationSource {
                 Some(target),
                 params,
             ));
+            // Admitted before it finishes, so the tombstone keeps its status.
+            state
+                .sessions
+                .commands
+                .admit(&key, fingerprint, Subject::Request(request_id.clone()));
             state.sessions.commands.finish(
                 &request_id,
                 Ok(RequestResult::Session {
@@ -753,10 +797,6 @@ impl ReplicationSource {
                 }),
                 Instant::now(),
             );
-            state
-                .sessions
-                .commands
-                .admit(&key, fingerprint, Subject::Request(request_id.clone()));
             grant_first_subscription_lease(&mut state, &session_id, incarnation);
             return Ok(result(committed(&mut state), scopes, accepted(request_id)));
         }
@@ -913,7 +953,7 @@ impl ReplicationSource {
                     response,
                 })
                 .map_err(|_| unavailable())?;
-            state.sessions.commands.admit(
+            let attempt = state.sessions.commands.admit(
                 &key,
                 fingerprint,
                 Subject::Turn {
@@ -922,8 +962,11 @@ impl ReplicationSource {
                     operation_id: None,
                 },
             );
-            received
+            (received, attempt)
         };
+        // The bridge settles the intent when it admits or refuses the turn;
+        // this caller may disconnect at any point from here on.
+        let (response, attempt) = response;
         let response = response
             .await
             .unwrap_or_else(|_| Err("bridge stopped before admitting the turn".to_string()));
@@ -952,7 +995,9 @@ impl ReplicationSource {
                 ))
             }
             Err(message) => {
-                state.sessions.commands.withdraw(&key);
+                // The turn never reached the handler (refused at ingress) or
+                // the handler already withdrew it.
+                state.sessions.commands.withdraw_attempt(&key, attempt);
                 Err(turn_rejection(message))
             }
         }
@@ -1229,6 +1274,42 @@ impl ReplicationSource {
         };
         session_view_value(&mut state, session_id, incarnation)
             .map_err(|error| admission_error(&error))
+    }
+
+    /// The terminals a process page of `revision` shows: frozen at the first
+    /// read of that revision, so an immutable page never follows later output.
+    pub(crate) async fn process_terminals(
+        &self,
+        session_id: &str,
+        revision: &str,
+        current: Value,
+    ) -> Result<Value, ProtocolError> {
+        let lock = self.live().ok_or_else(unavailable)?;
+        let mut state = lock.lock().await;
+        let state = &mut *state;
+        let Some(incarnation) = state.replication.held_incarnation(session_id) else {
+            return Err(rejection(
+                ErrorCode::Gone,
+                "the history revision is no longer retained",
+            ));
+        };
+        let replication = &state.replication;
+        state
+            .process_terminals
+            .retain(|id, (held, _, _)| replication.held_incarnation(id) == Some(*held));
+        let frozen = state
+            .process_terminals
+            .entry(session_id.to_string())
+            .or_insert_with(|| (incarnation, revision.to_string(), Default::default()));
+        if frozen.0 != incarnation || frozen.1 != revision {
+            *frozen = (incarnation, revision.to_string(), Default::default());
+        }
+        if let Value::Object(current) = current {
+            for (terminal_id, terminal) in current {
+                frozen.2.entry(terminal_id).or_insert(terminal);
+            }
+        }
+        Ok(Value::Object(frozen.2.clone()))
     }
 
     /// A v1 business read through the bridge input (workspace files).

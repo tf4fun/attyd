@@ -67,6 +67,9 @@ pub(crate) struct StreamReplica {
     epoch: Option<String>,
     /// The `at.seq` of the last entry read (protocol §4.1).
     pub(crate) received: u64,
+    /// The last position whose entries all arrived: the `at.seq` of the
+    /// last entry that carried an SSE id (protocol §4.1).
+    checkpoint: u64,
     scopes: BTreeMap<String, ScopeReplica>,
     pub(crate) resets: usize,
     pub(crate) snapshots: usize,
@@ -84,6 +87,7 @@ impl StreamReplica {
         Self {
             epoch: None,
             received: 0,
+            checkpoint: 0,
             scopes: scopes
                 .into_iter()
                 .map(|scope| (scope.to_string(), ScopeReplica::default()))
@@ -113,6 +117,7 @@ impl StreamReplica {
                 // (protocol §2), pending resets and buffers included.
                 self.epoch = Some(at.epoch.clone());
                 self.received = 0;
+                self.checkpoint = 0;
                 for replica in self.scopes.values_mut() {
                     *replica = ScopeReplica::default();
                 }
@@ -146,6 +151,9 @@ impl StreamReplica {
             return Err(format!("SSE id {id} for an entry at {at:?}"));
         }
         self.position(&at)?;
+        if !id.is_empty() {
+            self.checkpoint = at.seq;
+        }
         let kind = entry["type"].as_str().unwrap_or_default();
         if kind == "position" {
             return Ok(());
@@ -224,6 +232,7 @@ impl StreamReplica {
             .and_then(super::hub::parse_event_id)
             .filter(|position| self.epoch.as_ref() == Some(&position.epoch))
             .map_or(0, |position| position.seq);
+        self.checkpoint = self.received;
     }
 
     /// Installs a snapshot, inline or fetched over HTTP, then drains the
@@ -277,13 +286,16 @@ impl StreamReplica {
             .collect()
     }
 
-    /// `min(received, installed of every pending scope)` (protocol §4.1).
+    /// `min(checkpoint, installed of every pending scope)` (protocol §4.1).
+    /// Until a position's last entry arrives, a scope whose entry at that
+    /// position is still in flight may look installed, so the bound is the
+    /// last complete position, not the last entry read.
     pub(crate) fn applied(&self) -> u64 {
         self.scopes
             .values()
             .filter(|replica| replica.pending())
             .map(|replica| replica.installed)
-            .fold(self.received, u64::min)
+            .fold(self.checkpoint, u64::min)
     }
 
     /// Some scope holds a snapshot later than `seq`.

@@ -27,10 +27,6 @@ pub(crate) const INTENT_KEY_LIMIT: usize = 200;
 pub(crate) const RETAINED_RECORDS: usize = 16;
 pub(crate) const RECORD_RETENTION: Duration = Duration::from_secs(600);
 
-/// Finished records past this count leave even inside the retention window,
-/// so a burst cannot grow `global` without bound.
-const RECORD_CEILING: usize = 4096;
-
 /// The fixed part of an intent's accounted bytes: the fingerprint hash, the
 /// final status and the table's own overhead.
 const INTENT_OVERHEAD: usize = 96;
@@ -127,6 +123,12 @@ pub(crate) struct Intent {
     pub subject: Subject,
     /// `None` while the subject runs.
     pub status: Option<FinalStatus>,
+    /// The session owner a finished request returned (open, fork), kept so a
+    /// resend can renew its lease after the record is gone.
+    pub owner: Option<(String, u64)>,
+    /// Which admission produced this intent; a stale caller cannot withdraw
+    /// a later one.
+    attempt: u64,
     bytes: usize,
 }
 
@@ -161,6 +163,7 @@ pub(crate) struct CommandBook {
     retained_records: usize,
     record_retention: Duration,
     next_request: u64,
+    next_attempt: u64,
 }
 
 impl Default for CommandBook {
@@ -175,6 +178,7 @@ impl Default for CommandBook {
             retained_records: RETAINED_RECORDS,
             record_retention: RECORD_RETENTION,
             next_request: 0,
+            next_attempt: 0,
         }
     }
 }
@@ -233,12 +237,14 @@ impl CommandBook {
     }
 
     /// Records a first submission. The caller checked `lookup` under the
-    /// same lock, so the key is new and the table has room.
-    pub(crate) fn admit(&mut self, key: &str, fingerprint: Fingerprint, subject: Subject) {
+    /// same lock, so the key is new and the table has room. Returns the
+    /// admission's attempt, which `withdraw_attempt` needs.
+    pub(crate) fn admit(&mut self, key: &str, fingerprint: Fingerprint, subject: Subject) -> u64 {
         let bytes = intent_bytes(key, Some(&subject));
         if matches!(subject, Subject::Turn { .. }) {
             self.running_turns.insert(key.to_string());
         }
+        self.next_attempt += 1;
         self.intent_bytes += bytes;
         self.intents.insert(
             key.to_string(),
@@ -246,9 +252,44 @@ impl CommandBook {
                 fingerprint,
                 subject,
                 status: None,
+                owner: None,
+                attempt: self.next_attempt,
                 bytes,
             },
         );
+        self.next_attempt
+    }
+
+    /// Withdraws a turn intent the bridge never admitted, if it is still the
+    /// admission `attempt` made. An admitted turn keeps its intent.
+    pub(crate) fn withdraw_attempt(&mut self, key: &str, attempt: u64) {
+        if self.intents.get(key).is_some_and(|intent| {
+            intent.attempt == attempt
+                && matches!(
+                    intent.subject,
+                    Subject::Turn {
+                        operation_id: None,
+                        ..
+                    }
+                )
+        }) {
+            self.withdraw(key);
+        }
+    }
+
+    /// The bridge refused the turn of `key` before admitting it.
+    pub(crate) fn turn_refused(&mut self, key: &str) {
+        if self.intents.get(key).is_some_and(|intent| {
+            matches!(
+                intent.subject,
+                Subject::Turn {
+                    operation_id: None,
+                    ..
+                }
+            )
+        }) {
+            self.withdraw(key);
+        }
     }
 
     /// Withdraws an intent whose command was rejected after all: a rejected
@@ -367,6 +408,16 @@ impl CommandBook {
             .and_then(|key| self.intents.get_mut(key))
         {
             intent.status = Some(FinalStatus::Request(status));
+            if let Some(RequestResult::Session {
+                session_id,
+                incarnation,
+            }) = &request.result
+            {
+                // The owner joins the tombstone: its bytes count like its key.
+                intent.owner = Some((session_id.clone(), *incarnation));
+                intent.bytes += session_id.len() + 8;
+                self.intent_bytes += session_id.len() + 8;
+            }
         }
         self.finished.push_back((request_id.to_string(), now));
         self.retain(now);
@@ -389,12 +440,14 @@ impl CommandBook {
         }
     }
 
-    /// Drops finished records outside both retention minimums.
+    /// Drops finished records outside both retention minimums: a record
+    /// leaves only once it is older than the window and the last
+    /// `retained_records` stay.
     pub(crate) fn retain(&mut self, now: Instant) {
         while let Some((request_id, finished_at)) = self.finished.front() {
             let over = self.finished.len() > self.retained_records;
             let expired = now.saturating_duration_since(*finished_at) >= self.record_retention;
-            if !(over && expired) && self.finished.len() <= RECORD_CEILING {
+            if !(over && expired) {
                 break;
             }
             self.requests.remove(request_id);

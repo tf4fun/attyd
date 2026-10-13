@@ -328,7 +328,7 @@ impl<'a> SessionSource<'a> {
             url_flows: live
                 .url_flows
                 .values()
-                .chain(&live.settled_url_flows)
+                .chain(live.settled_url_flows.iter().map(|(flow, _)| flow))
                 .map(|flow| (flow.registration_id.clone(), url_flow(flow)))
                 .collect(),
             terminals,

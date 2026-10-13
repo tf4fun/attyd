@@ -424,8 +424,14 @@ async fn process_page(
                 ErrorCode::NotFound => ProtocolError::new(ErrorCode::Gone, error.message),
                 _ => error,
             })?;
-        let view =
+        let mut view =
             super::business_session_view(&raw).ok_or_else(|| invalid("the session has no view"))?;
+        if view["historyRevision"] == history_revision.as_str() {
+            let current = view["terminals"].take();
+            view["terminals"] = source
+                .process_terminals(&session_id, &history_revision, current)
+                .await?;
+        }
         use crate::session_presentation::PageError;
         let mut page =
             crate::session_presentation::process_page(&view, &turn_id, &history_revision, offset)
@@ -465,7 +471,14 @@ async fn attachment(
         let tag = owner_tag(&headers)?;
         let source = live(&state).await?;
         let view = source.owner_view(&session_id, Some(&tag)).await?;
-        Ok(super::attachment_response(view, &attachment_id))
+        let response = super::attachment_response(view, &attachment_id);
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                "the attachment is no longer available",
+            ));
+        }
+        Ok(response)
     })
     .await
 }
