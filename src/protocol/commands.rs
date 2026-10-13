@@ -278,15 +278,10 @@ impl CommandBook {
         }
     }
 
-    /// The bridge refused a turn of `key` on `session_id` before admitting
-    /// it. Only a still-unadmitted v2 intent for that session is withdrawn: a
-    /// v1 turn may reuse the key on another session.
-    pub(crate) fn turn_refused(&mut self, key: &str, session_id: &str) {
-        if self
-            .intents
-            .get(key)
-            .is_some_and(|intent| pending_turn_on(intent, session_id))
-        {
+    /// The bridge refused the turn of `key` before admitting it; an
+    /// admitted turn keeps its intent.
+    pub(crate) fn turn_refused(&mut self, key: &str) {
+        if self.intents.get(key).is_some_and(pending_turn) {
             self.withdraw(key);
         }
     }
@@ -300,14 +295,13 @@ impl CommandBook {
         self.running_turns.remove(key);
     }
 
-    /// The bridge admitted a turn of `key` on `session_id` as
-    /// `operation_id`. It settles only a still-unadmitted v2 intent for that
-    /// session; another session's turn under the same key changes nothing.
-    pub(crate) fn turn_admitted(&mut self, key: &str, session_id: &str, operation_id: &str) {
+    /// The bridge admitted the turn of `key` as `operation_id`. Only a
+    /// still-unadmitted intent settles, once.
+    pub(crate) fn turn_admitted(&mut self, key: &str, operation_id: &str) {
         if let Some(intent) = self
             .intents
             .get_mut(key)
-            .filter(|intent| pending_turn_on(intent, session_id))
+            .filter(|intent| pending_turn(intent))
             && let Subject::Turn {
                 operation_id: admitted,
                 ..
@@ -450,14 +444,13 @@ impl CommandBook {
     }
 }
 
-fn pending_turn_on(intent: &Intent, session: &str) -> bool {
+fn pending_turn(intent: &Intent) -> bool {
     matches!(
-        &intent.subject,
+        intent.subject,
         Subject::Turn {
-            session_id,
             operation_id: None,
             ..
-        } if session_id == session
+        }
     )
 }
 
@@ -752,9 +745,8 @@ mod tests {
                 operation_id: None,
             },
         );
-        book.turn_admitted("t", "other", "op");
-        book.turn_admitted("t", "s", "op");
-        book.turn_admitted("t", "s", "later");
+        book.turn_admitted("t", "op");
+        book.turn_admitted("t", "later");
         assert_eq!(
             book.running_turns().collect::<Vec<_>>(),
             vec![("t", "s", 1, Some("op"))]

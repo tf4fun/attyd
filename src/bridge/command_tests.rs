@@ -9,9 +9,6 @@ use super::stream_client::{HttpStream, get, owner_scope, send};
 use super::*;
 use crate::protocol::{GLOBAL, session_scope};
 
-mod review_intent_attempts;
-mod review_intent_ownership;
-mod review_intent_retry_identity;
 mod review_leases;
 mod review_owner;
 mod review_process_lifetime;
