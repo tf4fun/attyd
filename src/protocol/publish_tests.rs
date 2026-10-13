@@ -278,6 +278,56 @@ fn a_turn_streams_appends_and_folds_tool_calls_into_their_slot() {
 }
 
 #[test]
+fn plans_and_compactions_fold_in_place_and_removals_shrink_the_turn() {
+    let mut bench = Bench::new();
+    let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());
+    bench.step();
+    let operation = bench.start_turn("s", s, "intent");
+    bench.step();
+    let mut published = Vec::new();
+    for update in [
+        json!({ "sessionUpdate": "plan",
+                "entries": [{ "content": "a", "priority": "high", "status": "pending" }] }),
+        json!({ "sessionUpdate": "plan",
+                "entries": [{ "content": "a", "priority": "high", "status": "completed" }] }),
+        json!({ "sessionUpdate": "plan_update",
+                "plan": { "planId": "p", "type": "items", "entries": [] } }),
+        json!({ "sessionUpdate": "plan_update", "plan": { "planId": "p", "type": "items",
+                "entries": [{ "content": "b", "priority": "low", "status": "pending" }] } }),
+        json!({ "sessionUpdate": "compaction_update", "compactionId": "c", "status": "in_progress" }),
+        json!({ "sessionUpdate": "compaction_summary_chunk", "compactionId": "c",
+                "content": { "type": "text", "text": "Summary" } }),
+        json!({ "sessionUpdate": "plan_removed", "planId": "p" }),
+    ] {
+        bench.update("s", s, &operation, update);
+        published.push(paths(&bench.step(), "session/s"));
+    }
+    assert_eq!(
+        published[1],
+        [json!({ "op": "set", "path": "/turn/updates/0/entries/0/status", "value": "completed" })
+            .to_string()],
+        "a replaced legacy plan keeps its slot"
+    );
+    assert!(
+        published[3]
+            .iter()
+            .all(|op| op.contains("/turn/updates/1/")),
+        "an identified plan update keeps its slot: {:?}",
+        published[3]
+    );
+    assert!(
+        published[6]
+            .iter()
+            .any(|op| op.starts_with(r#"{"op":"set","path":"/turn/updates","#)),
+        "a removal shrinks the updates: {:?}",
+        published[6]
+    );
+    bench.finish_turn("s", s, "intent", &operation);
+    bench.step();
+    bench.settle();
+}
+
+#[test]
 fn a_terminal_rolling_past_its_bound_trims_and_appends() {
     let mut bench = Bench::new();
     let s = bench.open("s", json!({ "sessionId": "s" }), Vec::new());

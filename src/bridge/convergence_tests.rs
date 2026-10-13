@@ -442,7 +442,9 @@ async fn a_bridge_transition_without_a_commit_is_caught() {
         peer
     })
     .await;
-    let panic = caught.expect_err("the harness must catch the omitted commit");
+    let Err(panic) = caught else {
+        panic!("the harness must catch the omitted commit");
+    };
     let message = panic
         .into_panic()
         .downcast::<String>()
