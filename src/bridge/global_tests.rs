@@ -517,7 +517,7 @@ async fn acknowledging_a_finished_request_creates_no_record() {
     let (status, logout) = command(&peer, "POST", LOGOUT, Some("logout"), None, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{logout}");
     let request = peer.next_request().await;
-    assert_eq!(request["method"], "auth/logout");
+    assert_eq!(request["method"], "logout");
     peer.reply(&request, json!({})).await;
     let record = finished(&mut peer, "logout").await;
     assert_eq!(record["operation"], "logout");

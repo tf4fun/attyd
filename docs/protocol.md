@@ -133,7 +133,7 @@ interface Request {
                                              // "authenticate", "logout", "auth_terminal",
                                              // "interaction_response", or "agent_request"
                                              // for ACP requests the bridge starts itself
-  method: string;                            // ACP method ("authenticate", "auth/logout",
+  method: string;                            // ACP method ("authenticate", "logout",
                                              // "session/new", "session/fork",
                                              // "session/set_mode", "session/close",
                                              // "session/delete", "session/list", …)

@@ -4164,12 +4164,7 @@ async fn handle_command_inner(
         "auth/logout" => {
             let request_id = string_field(&command, "requestId")?;
             require_agent_method("auth/logout", &state).await?;
-            commands::out_of_session_request(
-                &mut *state.lock().await,
-                request_id,
-                "auth/logout",
-                None,
-            );
+            commands::out_of_session_request(&mut *state.lock().await, request_id, "logout", None);
             let response = send_ordered(
                 &connection,
                 ingress.as_ref(),

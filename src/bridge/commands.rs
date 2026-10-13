@@ -231,7 +231,7 @@ impl GlobalCommand {
     fn method(&self) -> &'static str {
         match self {
             Self::Authenticate { .. } => "authenticate",
-            Self::Logout => "auth/logout",
+            Self::Logout => "logout",
             Self::AuthTerminal { .. } => "attyd/auth_terminal",
             Self::Create { .. } => "session/new",
         }
