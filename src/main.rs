@@ -15,6 +15,7 @@ mod mcp;
 mod mcp_config;
 mod options;
 mod ordered_ingress;
+mod protocol;
 mod runtime_state;
 mod semantic;
 mod server;
