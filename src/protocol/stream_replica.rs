@@ -72,6 +72,10 @@ pub(crate) struct StreamReplica {
     pub(crate) snapshots: usize,
     pub(crate) covered: usize,
     pub(crate) entries: usize,
+    /// No entry of the current stream was read yet: it may start a new epoch.
+    fresh_stream: bool,
+    /// Scopes that received `end` on the current stream.
+    stream_ended: std::collections::BTreeSet<String>,
 }
 
 impl StreamReplica {
@@ -88,6 +92,8 @@ impl StreamReplica {
             snapshots: 0,
             covered: 0,
             entries: 0,
+            fresh_stream: true,
+            stream_ended: std::collections::BTreeSet::new(),
         }
     }
 
@@ -99,12 +105,22 @@ impl StreamReplica {
 
     fn position(&mut self, at: &Position) -> Result<(), String> {
         match &self.epoch {
-            Some(epoch) if *epoch != at.epoch => {
+            Some(epoch) if *epoch != at.epoch && !self.fresh_stream => {
                 return Err(format!("entry from epoch {} in epoch {epoch}", at.epoch));
+            }
+            Some(epoch) if *epoch != at.epoch => {
+                // A new stream in a new epoch: nothing of the old one stays
+                // (protocol §2), pending resets and buffers included.
+                self.epoch = Some(at.epoch.clone());
+                self.received = 0;
+                for replica in self.scopes.values_mut() {
+                    *replica = ScopeReplica::default();
+                }
             }
             Some(_) => {}
             None => self.epoch = Some(at.epoch.clone()),
         }
+        self.fresh_stream = false;
         if at.seq < self.received {
             return Err(format!("entry at {} after {}", at.seq, self.received));
         }
@@ -141,13 +157,21 @@ impl StreamReplica {
         match kind {
             "snapshot" => self.install(&scope, &at, field("state")?)?,
             "reset" => {
-                self.resets += 1;
                 let replica = self.scope(&scope)?;
                 if replica.ended.is_some() {
                     return Err(format!("{scope}: reset after end"));
                 }
+                if replica.document.is_some() && at.seq <= replica.installed {
+                    // Covered by the installed snapshot.
+                    self.covered += 1;
+                    return Ok(());
+                }
+                if replica.reset_at.is_some_and(|reset| reset >= at.seq) {
+                    return Ok(());
+                }
                 replica.reset_at = Some(at.seq);
                 replica.buffer.clear();
+                self.resets += 1;
             }
             "ops" => {
                 let prev = entry["prev"]
@@ -175,10 +199,12 @@ impl StreamReplica {
             "end" => {
                 let reason: EndReason = serde_json::from_value(field("reason")?)
                     .map_err(|error| format!("{data}: {error}"))?;
-                let replica = self.scope(&scope)?;
-                if replica.ended.is_some() {
+                // A new stream tells a retired owner again that it ended;
+                // within one stream, nothing follows `end`.
+                if !self.stream_ended.insert(scope.clone()) {
                     return Err(format!("{scope}: a second end"));
                 }
+                let replica = self.scope(&scope)?;
                 *replica = ScopeReplica {
                     ended: Some(reason),
                     ..ScopeReplica::default()
@@ -192,6 +218,8 @@ impl StreamReplica {
     /// A new stream resumes from `last_id` (none: from scratch). Its entries
     /// can repeat positions this replica already read (protocol §4.1).
     pub(crate) fn reconnect(&mut self, last_id: Option<&str>) {
+        self.fresh_stream = true;
+        self.stream_ended.clear();
         self.received = last_id
             .and_then(super::hub::parse_event_id)
             .filter(|position| self.epoch.as_ref() == Some(&position.epoch))
@@ -209,11 +237,16 @@ impl StreamReplica {
         if self.epoch.as_ref().is_some_and(|epoch| *epoch != at.epoch) {
             return Err(format!("{scope}: snapshot from epoch {}", at.epoch));
         }
-        self.snapshots += 1;
         let replica = self.scope(scope)?;
         if replica.ended.is_some() {
             return Err(format!("{scope}: snapshot after end"));
         }
+        if replica.document.is_some() && replica.reset_at.is_none() && at.seq <= replica.installed {
+            // An older snapshot never rewinds a newer one.
+            self.covered += 1;
+            return Ok(());
+        }
+        self.snapshots += 1;
         if let Some(reset) = replica.reset_at
             && at.seq < reset
         {
@@ -513,7 +546,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reconnected.documents().len(), 1);
-        assert_eq!(reconnected.documents()["global"], json!({ "epoch": "next" }));
+        assert_eq!(
+            reconnected.documents()["global"],
+            json!({ "epoch": "next" })
+        );
         assert_eq!(reconnected.ended("session/s"), Some(EndReason::Replaced));
         assert_eq!(reconnected.applied(), 1);
     }

@@ -418,7 +418,8 @@ or arrives over SSE after an HTTP snapshot that overtook it. Only entries with
 `seq > a` are checked against `prev`. A snapshot fetched ahead of the stream
 therefore never causes a second reset. The same holds for entries the replica
 already applied: a scope ignores every entry with `seq` at or before the last one it
-installed, so a resumed stream may replay what the replica already has.
+installed, `reset` and `snapshot` included, so a resumed stream may replay what the
+replica already has and an older snapshot never replaces a newer one.
 
 **Lag.** For a subscriber that falls behind, the server may replace its queued
 entries for a scope with one `reset` or `snapshot` at the latest position. A replica
@@ -432,7 +433,8 @@ Any other epoch starts every scope fresh. Resuming never reopens a session (§4.
 coalesced, when the log moves through scopes the stream doesn't carry.
 
 **`end`.** The document no longer exists for this subscription, and the scope stays
-ended for the rest of the stream. A subscription is bound to one owner (§4.2), so
+ended for the rest of the stream. A new stream for the same owner starts with `end`
+again, even when the replica already received it. A subscription is bound to one owner (§4.2), so
 nothing follows `end` for that scope. If the session is held under a new
 incarnation, `end` says `replaced`, and the replica opens the session again to get
 the new owner.
