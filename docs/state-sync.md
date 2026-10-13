@@ -342,12 +342,15 @@ Step 5 adds the global commands and out-of-session records in the same files:
   resolves a request-scoped elicitation's `requestId` when it routes the event, so
   the lookup follows wire order and a fast response can't race it. The record of
   the named request parents the elicitation, out of session or a session command
-  such as `set_mode`. The transition that finishes that record cancels its pending
-  request-scoped elicitations, and the Agent gets `cancel`; their URL flows stay.
-  An elicitation naming a request that is no longer outstanding, or whose record
-  already finished, is answered `cancel` and never published. A running session
-  request without a record (a prompt) leaves the interaction global and
-  unparented, as does a `null` request scope.
+  such as `set_mode`. A named request-scoped elicitation lives while the RPC it
+  names is outstanding, whether or not that request has a record: the first commit
+  after the RPC's completion passed the coordinator cancels it, and the Agent gets
+  `cancel` (`end_finished_request_children`). That is before anything the handler
+  does after the response, such as a fork's optional history load. URL flows it
+  started stay. An elicitation naming a request that is no longer outstanding, or
+  whose record already finished, is answered `cancel` and never published. A
+  running session request without a record (a prompt) shows the interaction in
+  `global` without a parent; a `null` request scope is global and unparented.
 - **Global URL flows** keep their parent's `requestId`, stay terminal (the last 16)
   until `DELETE /api/v2/url-flows/{interactionId}`, and are keyed by interaction.
 - **Auth.** `POST /api/v2/agent/authenticate`, `…/logout` and `…/auth-terminals`

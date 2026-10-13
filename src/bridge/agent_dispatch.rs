@@ -528,13 +528,19 @@ async fn elicitation(
         // §2.4): that request's record parents it, and once the request ended
         // nothing can answer it. A running session request without a record
         // (a prompt) leaves the interaction global and unparented.
-        let named = owner.is_none()
-            && matches!(
-                request.scope(),
-                ElicitationScope::Request(scope)
-                    if !matches!(scope.request_id, agent_client_protocol::schema::v1::RequestId::Null)
-            );
-        let parent = if named {
+        let named = match request.scope() {
+            ElicitationScope::Request(scope)
+                if owner.is_none()
+                    && !matches!(
+                        scope.request_id,
+                        agent_client_protocol::schema::v1::RequestId::Null
+                    ) =>
+            {
+                Some(scope.request_id.clone())
+            }
+            _ => None,
+        };
+        let parent = if named.is_some() {
             let parent = context.request_parent.as_ref();
             match parent.map(|parent| commands::running_parent(&state, &parent.operation_id)) {
                 Some(Some(request_id)) => Some(request_id),
@@ -595,6 +601,9 @@ async fn elicitation(
                     state
                         .sessions
                         .set_request_parent(&elicitation_id, request_id);
+                }
+                if let Some(rpc) = named {
+                    state.request_children.insert(elicitation_id.clone(), rpc);
                 }
             }
             let delta = owner.as_ref().map(|owner| advance_session_delta(

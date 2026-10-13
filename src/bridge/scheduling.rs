@@ -115,7 +115,7 @@ struct SenderInner {
     /// Outstanding RPCs by their JSON-RPC ID, so a request-scoped
     /// elicitation finds its parent (plan §2.4). An entry leaves once its
     /// completion has passed the coordinator, after every earlier event.
-    outstanding: SyncMutex<HashMap<RequestId, RequestOwner>>,
+    outstanding: OutstandingRpcs,
     ordered: OrderedIngress<IngressItem>,
     handoff: CompletionHandoff,
     wake: Arc<Notify>,
@@ -124,6 +124,10 @@ struct SenderInner {
     closed: CancellationToken,
     fault: FaultReporter,
 }
+
+/// Outstanding RPCs by JSON-RPC ID; bridge state holds the same table, never
+/// the sender itself.
+pub(super) type OutstandingRpcs = Arc<SyncMutex<HashMap<RequestId, RequestOwner>>>;
 
 #[derive(Clone)]
 pub(super) struct IngressSender {
@@ -244,7 +248,7 @@ impl Scheduling {
                 epoch,
                 events,
                 replays: SyncMutex::new(HashMap::new()),
-                outstanding: SyncMutex::new(HashMap::new()),
+                outstanding: OutstandingRpcs::default(),
                 ordered,
                 handoff,
                 wake: wake.clone(),
@@ -711,6 +715,10 @@ impl IngressSender {
 
     /// The owner of the RPC with this JSON-RPC ID, while its completion has
     /// not passed the coordinator.
+    pub(super) fn outstanding_rpcs(&self) -> OutstandingRpcs {
+        self.inner.outstanding.clone()
+    }
+
     pub(super) fn outstanding_owner(&self, request_id: &RequestId) -> Option<RequestOwner> {
         self.inner.outstanding.lock().ok()?.get(request_id).cloned()
     }

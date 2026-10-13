@@ -684,7 +684,6 @@ fn finish_on_response(
             .sessions
             .commands
             .finish(&request_id, outcome(response), Instant::now());
-        end_request_children(state, &request_id);
     });
 }
 
@@ -955,20 +954,14 @@ pub(super) fn running_parent(state: &BridgeState, operation_id: &str) -> Option<
         .map(|request| request.request_id.clone())
 }
 
-/// An out-of-session request ended. Its `agent_request` record finishes
-/// with it, a read's record leaves at once (protocol §6), and the
-/// request-scoped elicitations it parents end (protocol §3.4). Their URL
-/// flows stay.
+/// An out-of-session request ended: its `agent_request` record finishes with
+/// it, and a read's record leaves at once (protocol §6).
 pub(super) fn out_of_session_request_ended(
     state: &mut BridgeState,
     operation_id: &str,
     result: &Result<(), Error>,
 ) {
-    let agent_request = state.agent_requests.remove(operation_id);
-    let request_id = agent_request
-        .clone()
-        .unwrap_or_else(|| operation_id.to_string());
-    if let Some(request_id) = &agent_request {
+    if let Some(request_id) = &state.agent_requests.remove(operation_id) {
         let outcome = result
             .as_ref()
             .map(|_| RequestResult::Done)
@@ -986,22 +979,33 @@ pub(super) fn out_of_session_request_ended(
             let _ = state.sessions.commands.acknowledge(request_id);
         }
     }
-    end_request_children(state, &request_id);
 }
 
-/// A request ended: the request-scoped elicitations it parents end with it
-/// in the same transition, and the Agent gets `cancel` (protocol §3.4).
-/// Their URL flows stay.
-fn end_request_children(state: &mut BridgeState, request_id: &str) {
-    let children = state
-        .sessions
-        .request_elicitations
-        .values()
-        .filter(|pending| pending.request_id.as_deref() == Some(request_id))
-        .map(|pending| pending.interaction_id.clone())
-        .collect::<Vec<_>>();
+/// A named request-scoped elicitation lives while the RPC it names is
+/// outstanding (protocol §3.4): once that request ended, whether or not it
+/// has a record, the commit that sees it cancels the interaction and the
+/// Agent gets `cancel`. URL flows it started stay.
+pub(super) fn end_finished_request_children(state: &mut BridgeState) {
+    if state.request_children.is_empty() {
+        return;
+    }
+    let Some(outstanding) = state.outstanding_rpcs.clone() else {
+        return;
+    };
+    let ended = {
+        let outstanding = outstanding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .request_children
+            .iter()
+            .filter(|(_, request_id)| !outstanding.contains_key(request_id))
+            .map(|(interaction_id, _)| interaction_id.clone())
+            .collect::<Vec<_>>()
+    };
     let epoch = state.sessions.epoch().to_string();
-    for interaction_id in children {
+    for interaction_id in ended {
+        state.request_children.remove(&interaction_id);
         if let Some(pending) = state.request_elicitations.remove(&interaction_id) {
             let _ = state
                 .sessions
@@ -1011,6 +1015,11 @@ fn end_request_children(state: &mut BridgeState, request_id: &str) {
                 .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     }
+    // Answered or cancelled children leave the table with their interaction.
+    let pending = &state.request_elicitations;
+    state
+        .request_children
+        .retain(|interaction_id, _| pending.contains_key(interaction_id));
 }
 
 /// The bounded tail of an auth terminal record's output, in bytes.
@@ -1721,7 +1730,6 @@ impl ReplicationSource {
                 _ => done(response),
             };
             state.sessions.commands.finish(&id, outcome, Instant::now());
-            end_request_children(state, &id);
         });
         Ok(result(at, scopes, accepted(request_id)))
     }
@@ -1912,7 +1920,6 @@ impl ReplicationSource {
                 Instant::now(),
             );
             let _ = commands.acknowledge(&request_id);
-            end_request_children(state, &request_id);
             let _ = answer.send(response);
         });
         let response = answered.await.map_err(|_| unavailable())?;

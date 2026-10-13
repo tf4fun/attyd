@@ -296,6 +296,11 @@ struct BridgeState {
     /// `agent_request` records of out-of-session ACP requests that no v2
     /// command started, by the v1 operation ID that sends them.
     agent_requests: HashMap<String, String>,
+    /// The JSON-RPC request each named request-scoped elicitation belongs
+    /// to; it lives while that RPC is outstanding (protocol §3.4).
+    request_children: HashMap<String, agent_client_protocol::schema::v1::RequestId>,
+    /// The ingress's outstanding RPC table.
+    outstanding_rpcs: Option<scheduling::OutstandingRpcs>,
 }
 
 impl BridgeState {
@@ -303,6 +308,7 @@ impl BridgeState {
     fn commit(&mut self) {
         commands::settle_turn_intents(self);
         commands::release_process_terminals(self);
+        commands::end_finished_request_children(self);
         self.replication
             .commit(&self.agent, self.catalog_revision, &self.sessions);
     }
@@ -2570,6 +2576,7 @@ where
         let mut state = state.lock().await;
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
+        state.outstanding_rpcs = Some(ingress.outstanding_rpcs());
         state.agent = AgentState::starting(agent_launch(&options));
         state.agent.predecessor = predecessor;
     }
