@@ -680,7 +680,7 @@ fn closed_active_turn_releases_process_content_from_log() {
         .expect("retirement preserves a continuous retained suffix")
         .find(|entry| entry.scope == session_scope("s") && matches!(entry.change, Change::End(_)))
         .expect("retiring the owner emits its scope's End");
-    assert_eq!(end.change, Change::End(EndReason::Gone));
+    assert_eq!(end.change, Change::End(EndReason::Closed));
     assert_eq!(end.prev, previous_session_seq);
     assert!(end.seq > before_close);
     bench.settle();
