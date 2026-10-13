@@ -107,6 +107,15 @@ impl Log {
         self.seq
     }
 
+    /// Drops every entry at or before `seq`, so no replay can deliver what
+    /// they carried; a replica behind `seq` resets.
+    pub(crate) fn compact_through(&mut self, seq: u64) {
+        while self.entries.front().is_some_and(|entry| entry.seq <= seq) {
+            let dropped = self.entries.pop_front().expect("nonempty log");
+            self.bytes -= dropped.bytes;
+        }
+    }
+
     /// Every entry after `seq`, or `None` when compaction dropped some of
     /// them and the replica must reset.
     pub(crate) fn after(&self, seq: u64) -> Option<impl Iterator<Item = &LogEntry>> {

@@ -119,10 +119,16 @@ duplicate conversation content:
 - one 16-byte digest per projected timeline element;
 - the small fields, including terminal tails, collapsed-turn descriptors and outcomes.
 
-`published_documents_and_the_log_release_turn_content` extends the
+The active turn's prompt stays out of the per-commit body as its updates do, so a
+session whose turn did not change costs no content copies when another session
+commits.
+
+`published_documents_and_the_log_release_turn_content` and
+`completed_process_content_is_released_from_the_retained_log` extend the
 [memory retention](runtime-memory-retention.md) gates: once a turn ends and its
 baseline is replaced, neither the published documents nor the log keep its
-updates, prompt or old baseline alive, and the log stays within its byte budget.
+updates, prompt, process content or old baseline alive, and the log stays within
+its byte budget.
 
 Global summaries are part of `global`. When a session transition changes its
 summary, the commit step therefore touches both `session/<id>` and `global`. They
@@ -132,7 +138,9 @@ get consecutive `seq`s in one actor turn.
 
 The log is a bounded in-memory suffix per epoch, accounted by bytes (8 MiB by
 default, `DEFAULT_LOG_BUDGET` in `src/protocol/log.rs`). Compaction drops the oldest
-entries but always keeps the newest. A replica asking to resume from before the
+entries but always keeps the newest. When a turn ends, its process content leaves
+the documents (S6), so the log also drops every entry up to the session's previous
+one: those entries carried that content, and a replica behind them resets. A replica asking to resume from before the
 retained suffix gets a `reset` (protocol §4). An entry whose session was retired or
 replaced by a new incarnation ends the scope; the next incarnation's first entry
 has `prev = 0` and creates its document.
@@ -326,7 +334,10 @@ retained log or starting over from snapshots when compaction dropped its positio
   unobserved retirement.
 
 Both places mutate state without committing and assert that the harness reports
-it. S7 needs command positions, so its check arrives with the commands in step 4.
+it. A replica that meets a continuity break or an op that does not apply fails the
+gate; snapshots replace entries only at the first cut, a coalesced queue, a
+reconnect, or a compacted position. The connection's end commits `agent.phase`
+`stopped`, or `error` with the ACP error as `agent_error`. S7 needs command positions, so its check arrives with the commands in step 4.
 
 Convergence can't detect a projection that is missing something. If both the
 snapshot and the ops leave out global URL flows, they still agree. That is what the

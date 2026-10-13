@@ -200,24 +200,42 @@ impl Replication {
             }
         };
 
-        // Active turn: prompt by identity, updates element by element.
-        let previous_turn = previous
+        // Active turn: prompt by identity, updates element by element. Both
+        // stay out of the body, so an unchanged turn copies no content.
+        let mut previous_turn = previous.as_mut().and_then(|previous| previous.turn.take());
+        let had_turn = previous_turn.is_some();
+        let continued = state
+            .active_turn
             .as_ref()
-            .and_then(|previous| previous.turn.as_ref());
+            .zip(previous_turn.as_ref())
+            .is_some_and(|(active, turn)| active.operation_id == turn.operation_id);
         let mut turn_ops = Vec::new();
         let mut head = None;
-        let turn = source.state.active_turn.as_ref().map(|active| {
-            let same = previous_turn.filter(|turn| turn.operation_id == active.operation_id);
-            let (projected_prompt, prompt_refs) = match same
-                .filter(|turn| Weak::as_ptr(&turn.prompt) == Arc::as_ptr(&active.prompt))
-            {
-                Some(turn) => (turn.projected_prompt.clone(), turn.prompt_refs.clone()),
+        let turn = state.active_turn.as_ref().map(|active| {
+            let mut same = previous_turn.take().filter(|_| continued);
+            let prompt_kept = same
+                .as_ref()
+                .is_some_and(|turn| Weak::as_ptr(&turn.prompt) == Arc::as_ptr(&active.prompt));
+            let (projected_prompt, prompt_refs) = match same.as_mut().filter(|_| prompt_kept) {
+                Some(turn) => (
+                    std::mem::take(&mut turn.projected_prompt),
+                    std::mem::take(&mut turn.prompt_refs),
+                ),
                 None => {
                     let mut refs = HashSet::new();
                     for block in active.prompt.iter() {
                         terminal_references(block, &mut refs);
                     }
-                    (source.prompt(&active.prompt), refs)
+                    let projected = source.prompt(&active.prompt);
+                    // A new turn's body has an empty prompt; a replaced one
+                    // still holds the previous turn's.
+                    if had_turn || !projected.is_empty() {
+                        turn_ops.push(Op::Set {
+                            path: "/turn/prompt".into(),
+                            value: Value::Array(projected.clone()),
+                        });
+                    }
+                    (projected, refs)
                 }
             };
             let updates = &active.updates;
@@ -225,20 +243,21 @@ impl Replication {
                 .iter()
                 .enumerate()
                 .map(|(index, update)| {
-                    same.and_then(|turn| {
-                        turn.updates
-                            .get(index)
-                            .filter(|old| Arc::ptr_eq(old, update))
-                            .map(|_| turn.update_refs[index].clone())
-                    })
-                    .unwrap_or_else(|| {
-                        let mut refs = HashSet::new();
-                        terminal_references(update, &mut refs);
-                        refs.into_iter().collect()
-                    })
+                    same.as_ref()
+                        .and_then(|turn| {
+                            turn.updates
+                                .get(index)
+                                .filter(|old| Arc::ptr_eq(old, update))
+                                .map(|_| turn.update_refs[index].clone())
+                        })
+                        .unwrap_or_else(|| {
+                            let mut refs = HashSet::new();
+                            terminal_references(update, &mut refs);
+                            refs.into_iter().collect()
+                        })
                 })
                 .collect::<Vec<_>>();
-            match same {
+            match same.as_ref() {
                 Some(turn) if Arc::ptr_eq(&turn.updates, updates) => {}
                 Some(turn) => diff_updates(source, &turn.updates, updates, &mut turn_ops),
                 None => {
@@ -246,7 +265,7 @@ impl Replication {
                         .iter()
                         .map(|update| source.update(update))
                         .collect::<Vec<_>>();
-                    if previous_turn.is_some() {
+                    if had_turn {
                         // The body diff keeps the previous turn's updates.
                         turn_ops.push(Op::Set {
                             path: "/turn/updates".into(),
@@ -260,7 +279,7 @@ impl Replication {
                     }
                 }
             }
-            head = source.turn_head_with(projected_prompt.clone());
+            head = source.turn_head_with(Vec::new());
             PublishedTurn {
                 operation_id: active.operation_id.clone(),
                 prompt: Arc::downgrade(&active.prompt),
@@ -270,6 +289,9 @@ impl Replication {
                 update_refs,
             }
         });
+        // An ended turn releases its process content (S6): earlier entries
+        // carried it, so the log drops them and lagging replicas reset.
+        let released_turn = had_turn && !continued;
 
         let mut refs = history.section.terminal_refs.clone();
         if let Some(turn) = &turn {
@@ -300,6 +322,9 @@ impl Replication {
             self.log
                 .append(&session_scope(session_id), prev, Change::Ops(ops.into()))
         };
+        if released_turn {
+            self.log.compact_through(prev);
+        }
         self.sessions.insert(
             session_id.to_string(),
             PublishedSession {
