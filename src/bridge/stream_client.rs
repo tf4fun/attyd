@@ -241,9 +241,24 @@ impl HttpStream {
         if !self.pump(seq).await {
             return false;
         }
-        self.fetch(router).await;
-        if self.replica.applied() != seq {
-            return false;
+        loop {
+            self.fetch(router).await;
+            if self.replica.applied() == seq {
+                break;
+            }
+            if self.replica.received > seq {
+                return false; // the bridge moved on; a later check compares
+            }
+            // Several entries share a position (a cut's snapshot and resets):
+            // read the rest of them.
+            let Some(messages) = self.messages.as_mut() else {
+                return false;
+            };
+            match tokio::time::timeout(std::time::Duration::from_millis(500), messages.recv()).await
+            {
+                Ok(Some((id, data))) => self.receive(id, data),
+                _ => return false,
+            }
         }
         if let Some(divergence) = self.replica.diverges(fresh) {
             panic!("{divergence}");
