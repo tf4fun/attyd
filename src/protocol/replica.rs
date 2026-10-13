@@ -139,7 +139,7 @@ impl Replica {
             }
         };
         match &entry.change {
-            Change::End => {}
+            Change::End(_) => {}
             Change::Ops(ops) => {
                 for op in ops.iter() {
                     apply(&mut document.value, op).map_err(|error| {

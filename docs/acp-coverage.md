@@ -100,7 +100,7 @@ their user-visible effects are projected.
 | ACP surface | Bridge authority | Projection / command | Finished result | Recovery | Lifecycle end | Test |
 | --- | --- | --- | --- | --- | --- | --- |
 | `initialize` | connection task | G `/agent/initialize`, `/agent/phase` | `/agent/phase = ready`, or `/agent/error` | `GET /api/v2/global` | epoch end; next epoch's `/agent/predecessor` | `summaries_report_work_and_pending_counts` (agent copy), `cancellation_commits_agent_stopped`, `initialize_refusal_commits_agent_error`; step 5 (predecessor) |
-| Agent transport | launch options | G `/agent/launch/transport` | static per epoch | global snapshot | epoch end | step 3 |
+| Agent transport | launch options | G `/agent/launch/transport` | static per epoch | global snapshot | epoch end | `snapshot_reads_serve_held_sessions_and_never_load`, `the_connection_end_closes_streams_and_keeps_the_final_global_readable` |
 | `session/new` | creation staging | `POST /api/v2/sessions` → G `/requests/<id>` (`create`) | record `result.kind = session`; first-subscription lease | `global.requests` by `clientIntentId` | record acknowledged or retained out | step 5 |
 | `session/prompt` | turn admission (`SessionState`) | `POST …/turns` → S `/turn` | S `/outcomes/<operationId>` | `turn`, then `outcomes` (protocol §5.2) | outcome retained out; session `end` | `completed_turns_release_process_content_and_attachment_bytes` (projection); step 4 |
 | `session/cancel` | turn execution | `POST …/turns/{operationId}/cancel` (control) → S `/turn/cancelRequested` | outcome with the Agent's stop reason | S `/turn` | turn end | step 4 |
@@ -108,7 +108,7 @@ their user-visible effects are projected.
 | `session/list` | catalog gate | `GET /api/v2/catalog` (read); G `/requests/<id>` (`agent_request`) while in flight; G `/catalog/revision` | page returned to the reader | re-read when `catalog.revision` changes | Agent-owned, not replicated | step 4, step 5 |
 | `session/delete` | deletion reservation; cold catalog deletion | `DELETE /api/v2/sessions/{id}` with an owner tag or `"<epoch>:0"` → G `/requests/<id>` | record `done`; `end: deleted` | `global.requests` | record retained out; retired-incarnation table | step 5 |
 | `session/resume` | attachment operation | `POST …/open` → S `/operation` (`resume`), `/history/notice` | as load | as load | session `end` | step 4 |
-| `session/close` | close operation | `POST …/close` → G `/requests/<id>`; S `/operation` (`close`) | record `done`; `end: closed` | `global.requests` | record retained out; retired-incarnation table | step 4 |
+| `session/close` | close operation | `POST …/close` → G `/requests/<id>`; S `/operation` (`close`) | record `done`; `end: closed` | `global.requests` | record retained out; retired-incarnation table | `sse_resume_returns_the_retired_owner_without_fresh_open` (`end: closed`, retired table); step 4 |
 | `session/set_mode` | control transaction | `PUT …/mode` → G `/requests/<id>`; S `/operation` (`set_mode`) | S `/controls/modes`; record `done` or the ACP error | `global.requests` (`params.modeId`) | record retained out | `response_overrides_only_its_fields_between_early_and_later_updates`; step 4 |
 | `session/set_config_option` | control transaction | `PUT …/config/{configId}` → G `/requests/<id>` | S `/controls/configOptions`; record | `global.requests` (`params.configId`, `value`) | record retained out | `config_options_distinguish_never_provided_from_provided_empty`, `projected_config_preserves_response_clear_and_later_updates`; step 4 |
 | Text and resource-link prompts | content validation | turn body `prompt` | S `/history/timeline`, `/outcomes` | session snapshot | history revision | step 4 |
@@ -116,8 +116,8 @@ their user-visible effects are projected.
 | `authenticate` | auth method validation | `POST /api/v2/agent/authenticate` → G `/requests/<id>` (`methodId`) | record; G `/agent/authenticatedMethodId` | global snapshot | record retained out; epoch end | step 5 |
 | Terminal authentication | auth terminal manager | `POST /api/v2/agent/auth-terminals` → G `/requests/<id>/terminal`; input, resize and cancel are controls | record status; `predecessor.reason = auth_restart` when the Agent restarts | global snapshot | record retained out; epoch end | step 5 |
 | `logout` | logout gate | `POST /api/v2/agent/logout` → G `/requests/<id>` | record; G `/agent/authenticatedMethodId = null` | global snapshot | record retained out | step 5 |
-| MCP server configuration on session setup | launch options | G `/agent/launch/mcpServers` (name and type only) | static per epoch | global snapshot | epoch end | step 3 |
-| `additionalDirectories` | launch options | G `/agent/launch/additionalDirectories` | static per epoch | global snapshot | epoch end | step 3 |
+| MCP server configuration on session setup | launch options | G `/agent/launch/mcpServers` (name and type only) | static per epoch | global snapshot | epoch end | `snapshot_reads_serve_held_sessions_and_never_load`, `the_connection_end_closes_streams_and_keeps_the_final_global_readable` |
+| `additionalDirectories` | launch options | G `/agent/launch/additionalDirectories` | static per epoch | global snapshot | epoch end | `snapshot_reads_serve_held_sessions_and_never_load`, `the_connection_end_closes_streams_and_keeps_the_final_global_readable` |
 | `session/fork` | fork operation on a held source | `POST …/fork` → G `/requests/<id>`; source S `/operation` (`fork`) | record `result.kind = session`; lease on the new owner | `global.requests` | record retained out | step 5 |
 | Provider configuration | Product exclusion | not projected | — | — | — | — |
 | `nes/*` | Product exclusion | not projected | — | — | — | — |

@@ -7,26 +7,26 @@ use serde_json::{Value, json};
 
 use super::log::Change;
 use super::replica::{Convergence, fresh};
-use super::{AgentState, GLOBAL, Op, Replication, session_scope};
+use super::{AgentState, EndReason, GLOBAL, Op, Replication, session_scope};
 use crate::runtime_state::UrlFlowStatus;
 use crate::session_registry::SessionRegistry;
 use crate::session_state::TurnAdmission;
 
-const EPOCH: &str = "epoch";
+pub(super) const EPOCH: &str = "epoch";
 
-struct Bench {
-    registry: SessionRegistry,
-    replication: Replication,
+pub(super) struct Bench {
+    pub(super) registry: SessionRegistry,
+    pub(super) replication: Replication,
     convergence: Convergence,
-    agent: AgentState,
+    pub(super) agent: AgentState,
 }
 
 impl Bench {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with(Replication::default())
     }
 
-    fn with(replication: Replication) -> Self {
+    pub(super) fn with(replication: Replication) -> Self {
         let mut bench = Self {
             registry: SessionRegistry::new(EPOCH),
             replication,
@@ -39,7 +39,7 @@ impl Bench {
 
     /// Ends a transition: one commit, then the convergence gate. Returns the
     /// ops this commit appended, by scope.
-    fn step(&mut self) -> Vec<(String, Vec<Op>)> {
+    pub(super) fn step(&mut self) -> Vec<(String, Vec<Op>)> {
         let before = self.replication.log().seq();
         self.replication.commit(&self.agent, 0, &self.registry);
         self.check().unwrap();
@@ -49,22 +49,22 @@ impl Bench {
             .unwrap()
             .filter_map(|entry| match &entry.change {
                 Change::Ops(ops) => Some((entry.scope.clone(), ops.to_vec())),
-                Change::End => None,
+                Change::End(_) => None,
             })
             .collect()
     }
 
-    fn check(&mut self) -> Result<(), String> {
+    pub(super) fn check(&mut self) -> Result<(), String> {
         let fresh = fresh(&self.agent, 0, &self.registry);
         self.convergence.check(&self.replication, &fresh)
     }
 
-    fn settle(&mut self) {
+    pub(super) fn settle(&mut self) {
         let fresh = fresh(&self.agent, 0, &self.registry);
         self.convergence.settle(&self.replication, &fresh).unwrap();
     }
 
-    fn open(&mut self, session_id: &str, response: Value, early: Vec<Value>) -> u64 {
+    pub(super) fn open(&mut self, session_id: &str, response: Value, early: Vec<Value>) -> u64 {
         let incarnation = self
             .registry
             .open_new_with_replay(EPOCH, session_id, format!("/{session_id}"), response, early)
@@ -73,7 +73,12 @@ impl Bench {
         incarnation
     }
 
-    fn start_turn(&mut self, session_id: &str, incarnation: u64, intent: &str) -> String {
+    pub(super) fn start_turn(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        intent: &str,
+    ) -> String {
         let revision = self
             .registry
             .state(session_id)
@@ -97,13 +102,19 @@ impl Bench {
         operation_id
     }
 
-    fn update(&mut self, session_id: &str, incarnation: u64, operation_id: &str, update: Value) {
+    pub(super) fn update(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        operation_id: &str,
+        update: Value,
+    ) {
         self.registry
             .append_turn_update(session_id, incarnation, operation_id, update)
             .unwrap();
     }
 
-    fn finish_turn(
+    pub(super) fn finish_turn(
         &mut self,
         session_id: &str,
         incarnation: u64,
@@ -122,7 +133,7 @@ impl Bench {
             .unwrap();
     }
 
-    fn control(&mut self, session_id: &str, incarnation: u64, update: Value) {
+    pub(super) fn control(&mut self, session_id: &str, incarnation: u64, update: Value) {
         let kind = update["sessionUpdate"].as_str().unwrap().to_string();
         self.registry
             .update_control_state(EPOCH, session_id, incarnation, &kind, update)
@@ -130,7 +141,7 @@ impl Bench {
     }
 }
 
-fn chunk(text: &str) -> Value {
+pub(super) fn chunk(text: &str) -> Value {
     json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m",
             "content": { "type": "text", "text": text } })
 }
@@ -460,7 +471,7 @@ fn ended_and_replaced_sessions_end_their_scope() {
         .unwrap();
     assert_eq!(
         (end.scope.as_str(), end.prev, &end.change),
-        ("session/s", seq, &Change::End)
+        ("session/s", seq, &Change::End(EndReason::Gone))
     );
     assert_eq!(bench.replication.scope_seq("session/s"), None);
 
@@ -667,9 +678,9 @@ fn closed_active_turn_releases_process_content_from_log() {
     let end = log
         .after(before_retained)
         .expect("retirement preserves a continuous retained suffix")
-        .find(|entry| entry.scope == session_scope("s") && entry.change == Change::End)
+        .find(|entry| entry.scope == session_scope("s") && matches!(entry.change, Change::End(_)))
         .expect("retiring the owner emits its scope's End");
-    assert_eq!(end.change, Change::End);
+    assert_eq!(end.change, Change::End(EndReason::Closed));
     assert_eq!(end.prev, previous_session_seq);
     assert!(end.seq > before_close);
     bench.settle();
@@ -735,7 +746,7 @@ impl super::log::LogEntry {
     fn change_ops(&self) -> Vec<Op> {
         match &self.change {
             Change::Ops(ops) => ops.to_vec(),
-            Change::End => Vec::new(),
+            Change::End(_) => Vec::new(),
         }
     }
 }

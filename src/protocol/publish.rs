@@ -5,16 +5,20 @@
 //! compared by identity: the history baseline by its `Arc`, active-turn
 //! updates element by element by pointer, and the projected timeline by
 //! per-element digests, since collapsing completed turns renumbers it.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::diff::{self, Text};
+use super::hub::{Documents, Hub, ScopeRequest, StreamQueue};
 use super::log::{Change, Log};
 use super::project::{HistorySection, SessionSource};
-use super::{AgentState, AppendTail, Op, project_global};
+use super::{
+    AgentState, AppendTail, EndReason, GlobalState, Op, Position, SessionState, Snapshot,
+    project_global, project_session,
+};
 use crate::history_cache::HistorySnapshot;
 use crate::runtime_state::SharedTurnUpdates;
 use crate::session_presentation::terminal_references;
@@ -27,14 +31,63 @@ pub(crate) fn session_scope(session_id: &str) -> String {
     format!("session/{session_id}")
 }
 
-/// The commit step's state: the log and the last published documents.
+/// Ended incarnations kept per epoch, so a subscription to one gets its
+/// `end` reason after the log compacted its `End` (protocol §4.2).
+pub(crate) const RETIRED_OWNERS: usize = 1024;
+
+/// The commit step's state: the log, the last published documents, and the
+/// Hub that delivers the log to streams.
 #[derive(Debug, Default)]
 pub(crate) struct Replication {
     log: Log,
     global: Option<PublishedGlobal>,
     sessions: BTreeMap<String, PublishedSession>,
+    /// Why an incarnation is retiring, noted by the transition that retires
+    /// it and consumed by its scope's `End`.
+    retiring: HashMap<(String, u64), EndReason>,
+    retired: VecDeque<(String, u64, EndReason)>,
+    hub: Option<Hub>,
+    /// The epoch ended; a Hub created later starts finished.
+    finished: bool,
     #[cfg(test)]
     pub(super) history_projections: usize,
+}
+
+/// The Hub's view of the published state at the current position.
+struct Published<'a> {
+    sessions: &'a BTreeMap<String, PublishedSession>,
+    retired: &'a VecDeque<(String, u64, EndReason)>,
+    agent: &'a AgentState,
+    catalog_revision: u64,
+    registry: &'a SessionRegistry,
+}
+
+impl Documents for Published<'_> {
+    fn held_incarnation(&self, session_id: &str) -> Option<u64> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.incarnation)
+    }
+
+    fn retired(&self, session_id: &str, incarnation: u64) -> Option<EndReason> {
+        retired_reason(self.retired, session_id, incarnation)
+    }
+
+    fn global(&self) -> GlobalState {
+        project_global(self.agent, self.catalog_revision, self.registry)
+    }
+}
+
+fn retired_reason(
+    retired: &VecDeque<(String, u64, EndReason)>,
+    session_id: &str,
+    incarnation: u64,
+) -> Option<EndReason> {
+    retired
+        .iter()
+        .rev()
+        .find(|(id, retired, _)| id == session_id && *retired == incarnation)
+        .map(|(_, _, reason)| *reason)
 }
 
 #[derive(Debug)]
@@ -97,6 +150,124 @@ impl Replication {
         &mut self.log
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_budgets(log: usize, epoch: &str, subscriber: usize) -> Self {
+        Self {
+            log: Log::with_budget(log),
+            hub: Some(Hub::with_budget(epoch, subscriber)),
+            ..Self::default()
+        }
+    }
+
+    /// Shrinks the Hub's per-subscriber budget so a test can make a stream lag.
+    #[cfg(test)]
+    pub(crate) fn set_subscriber_budget(&mut self, epoch: &str, budget: usize) {
+        self.hub
+            .get_or_insert_with(|| Hub::new(epoch))
+            .set_budget(budget);
+    }
+
+    /// Records why `incarnation` is retiring; its scope's `End` carries it.
+    /// A later note for the same incarnation replaces it.
+    pub(crate) fn note_retirement(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        reason: EndReason,
+    ) {
+        // An owner whose scope already ended keeps the reason its End
+        // published, in the bounded retired table; a note would never be
+        // consumed.
+        if self.held_incarnation(session_id) == Some(incarnation) {
+            self.retiring
+                .insert((session_id.to_string(), incarnation), reason);
+        }
+    }
+
+    /// Why an ended incarnation of this epoch ended, while the bounded table
+    /// still holds it.
+    pub(crate) fn retired(&self, session_id: &str, incarnation: u64) -> Option<EndReason> {
+        retired_reason(&self.retired, session_id, incarnation)
+    }
+
+    /// The incarnation of the held session's published document.
+    pub(crate) fn held_incarnation(&self, session_id: &str) -> Option<u64> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.incarnation)
+    }
+
+    /// `GET /api/v2/global`: the document at the current position.
+    pub(crate) fn global_snapshot(
+        &self,
+        agent: &AgentState,
+        catalog_revision: u64,
+        registry: &SessionRegistry,
+    ) -> Snapshot<GlobalState> {
+        Snapshot {
+            at: self.position(registry),
+            state: project_global(agent, catalog_revision, registry),
+        }
+    }
+
+    /// `GET /api/v2/sessions/{id}`: a held session's document at the current
+    /// position. Never loads anything.
+    pub(crate) fn session_snapshot(
+        &self,
+        registry: &SessionRegistry,
+        session_id: &str,
+    ) -> Option<Snapshot<SessionState>> {
+        if !self.sessions.contains_key(session_id) {
+            return None;
+        }
+        Some(Snapshot {
+            at: self.position(registry),
+            state: project_session(registry, session_id)?,
+        })
+    }
+
+    fn position(&self, registry: &SessionRegistry) -> Position {
+        Position {
+            epoch: registry.epoch().to_string(),
+            seq: self.log.seq(),
+        }
+    }
+
+    /// Opens a stream at the current position (plan §2.3, "Cut").
+    pub(crate) fn subscribe(
+        &mut self,
+        agent: &AgentState,
+        catalog_revision: u64,
+        registry: &SessionRegistry,
+        scopes: Vec<ScopeRequest>,
+        last_event: Option<&Position>,
+    ) -> Arc<StreamQueue> {
+        let hub = self.hub.get_or_insert_with(|| Hub::new(registry.epoch()));
+        if self.finished {
+            hub.finish();
+        }
+        let published = Published {
+            sessions: &self.sessions,
+            retired: &self.retired,
+            agent,
+            catalog_revision,
+            registry,
+        };
+        hub.subscribe(&self.log, &published, scopes, last_event)
+    }
+
+    /// The epoch ended: every stream drains and closes.
+    pub(crate) fn finish(&mut self) {
+        self.finished = true;
+        if let Some(hub) = &mut self.hub {
+            hub.finish();
+        }
+    }
+
+    pub(crate) fn subscribers(&self) -> usize {
+        self.hub.as_ref().map_or(0, Hub::subscribers)
+    }
+
     /// The `seq` of the scope's last entry, or `None` when the scope has no
     /// published document.
     pub(crate) fn scope_seq(&self, scope: &str) -> Option<u64> {
@@ -124,19 +295,43 @@ impl Replication {
             })
             .map(|(session_id, _)| session_id.clone())
             .collect::<Vec<_>>();
+        let mut released = Vec::new();
         for session_id in ended {
             let published = self.sessions.remove(&session_id).expect("listed above");
-            self.log
-                .append(&session_scope(&session_id), published.seq, Change::End);
+            // A noted retirement wins; otherwise the operation the session
+            // last published says why it left.
+            let operation = published.body["operation"]["kind"].as_str();
+            let reason = self
+                .retiring
+                .remove(&(session_id.clone(), published.incarnation))
+                .unwrap_or_else(|| match operation {
+                    Some("delete") => EndReason::Deleted,
+                    Some("close") => EndReason::Closed,
+                    _ if registry.sessions.contains_key(&session_id) => EndReason::Replaced,
+                    _ => EndReason::Gone,
+                });
+            self.log.append(
+                &session_scope(&session_id),
+                published.seq,
+                Change::End(reason),
+            );
+            self.retired
+                .push_back((session_id.clone(), published.incarnation, reason));
+            if self.retired.len() > RETIRED_OWNERS {
+                self.retired.pop_front();
+            }
             // A scope that ends during a turn releases that turn's process
             // content, as a turn that ends does.
             if published.turn.is_some() {
                 self.log.compact_through(published.seq);
+                released.push(session_scope(&session_id));
             }
         }
         for session_id in registry.sessions.keys() {
-            if let Some(source) = SessionSource::new(registry, session_id) {
-                self.commit_session(session_id, &source);
+            if let Some(source) = SessionSource::new(registry, session_id)
+                && self.commit_session(session_id, &source)
+            {
+                released.push(session_scope(session_id));
             }
         }
 
@@ -154,9 +349,21 @@ impl Replication {
             let seq = self.log.append(GLOBAL, prev, Change::Ops(ops.into()));
             self.global = Some(PublishedGlobal { seq, document });
         }
+
+        let hub = self.hub.get_or_insert_with(|| Hub::new(registry.epoch()));
+        let published = Published {
+            sessions: &self.sessions,
+            retired: &self.retired,
+            agent,
+            catalog_revision,
+            registry,
+        };
+        hub.deliver(&self.log, &published, &released);
     }
 
-    fn commit_session(&mut self, session_id: &str, source: &SessionSource) {
+    /// Commits one session; returns whether its ended turn released process
+    /// content.
+    fn commit_session(&mut self, session_id: &str, source: &SessionSource) -> bool {
         let mut previous = self.sessions.remove(session_id);
         let state = source.state;
         let mut history_ops = Vec::new();
@@ -340,6 +547,7 @@ impl Replication {
                 turn,
             },
         );
+        released_turn
     }
 }
 
@@ -476,5 +684,65 @@ fn diff_updates(
                     .collect(),
             },
         });
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::session_state::SessionAdmission;
+
+    #[test]
+    fn direct_delete_cleanup_does_not_retain_ended_owner_notes() {
+        let mut registry = SessionRegistry::new("epoch");
+        let mut replication = Replication::default();
+        let agent = AgentState::default();
+        let mut pending_after_cleanup = Vec::new();
+
+        // Reuse one Agent session ID to distinguish retained incarnations
+        // from the registry's existing set of retired session IDs.
+        for _ in 0..4 {
+            let incarnation = registry
+                .open_new(
+                    "epoch",
+                    "session",
+                    "/workspace",
+                    json!({"sessionId": "session"}),
+                )
+                .unwrap();
+            replication.commit(&agent, 0, &registry);
+            registry
+                .start_direct_delete("epoch", "session", incarnation, "delete")
+                .unwrap();
+            replication.commit(&agent, 0, &registry);
+
+            // The Agent's successful response ends the published scope
+            // before external resource cleanup finishes in the bridge.
+            registry
+                .complete_delete("epoch", "session", incarnation, "delete")
+                .unwrap();
+            replication.commit(&agent, 0, &registry);
+            assert_eq!(
+                replication.retired("session", incarnation),
+                Some(EndReason::Deleted)
+            );
+
+            // Match complete_session_retirement's later transition: finish
+            // cleanup, record why it retired, and remove the owner allocation.
+            registry
+                .finish_session_cleanup("session", incarnation, SessionAdmission::Delete, "delete")
+                .unwrap();
+            replication.note_retirement("session", incarnation, EndReason::Deleted);
+            registry.remove("session", incarnation);
+            replication.commit(&agent, 0, &registry);
+            assert!(registry.sessions.is_empty());
+            pending_after_cleanup.push(replication.retiring.len());
+        }
+
+        assert_eq!(
+            pending_after_cleanup,
+            vec![0; 4],
+            "completed retirements belong only to the bounded retired table; late notes must not accumulate"
+        );
     }
 }

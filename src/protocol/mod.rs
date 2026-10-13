@@ -7,12 +7,15 @@
 //! TypeScript.
 //!
 //! The commit step (`publish`) keeps the per-epoch log (`log`) of JSON
-//! Pointer ops (`diff`) current; the v2 routes (migration step 3) are its
-//! first readers.
+//! Pointer ops (`diff`) current, and the Hub (`hub`) delivers it to the
+//! `/api/v2/stream` subscribers.
 #![allow(dead_code)]
 
 mod controls;
 pub(crate) mod diff;
+pub(crate) mod hub;
+#[cfg(test)]
+mod hub_tests;
 pub(crate) mod log;
 mod project;
 mod publish;
@@ -20,6 +23,8 @@ mod publish;
 mod publish_tests;
 #[cfg(test)]
 pub(crate) mod replica;
+#[cfg(test)]
+pub(crate) mod stream_replica;
 #[cfg(test)]
 mod typescript;
 
@@ -29,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) use project::{project_global, project_session};
-pub(crate) use publish::{GLOBAL, Replication, session_scope};
+pub(crate) use publish::{GLOBAL, RETIRED_OWNERS, Replication, session_scope};
 
 /// A log position (protocol §2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
