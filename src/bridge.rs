@@ -2559,6 +2559,7 @@ where
     let authority = state.clone();
     // Every exit after the epoch exists, setup failures included, ends with
     // the agent's terminal state below.
+    let predecessor = replication.source().predecessor.clone();
     let result: Result<(), Error> = async move {
     let epoch = state.lock().await.sessions.epoch().to_string();
     let (mut scheduling, ingress) =
@@ -2570,7 +2571,7 @@ where
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
         state.agent = AgentState::starting(agent_launch(&options));
-        state.agent.predecessor = replication.source().predecessor.clone();
+        state.agent.predecessor = predecessor;
     }
     sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(
         state.lock().await.sessions.snapshot(),

@@ -133,7 +133,7 @@ interface Request {
                                              // "authenticate", "logout", "auth_terminal",
                                              // "interaction_response", or "agent_request"
                                              // for ACP requests the bridge starts itself
-  method: string;                            // ACP method ("authenticate", "logout",
+  method: string;                            // ACP method ("authenticate", "auth/logout",
                                              // "session/new", "session/fork",
                                              // "session/set_mode", "session/close",
                                              // "session/delete", "session/list", …)
@@ -694,7 +694,7 @@ call it makes while that call is in flight (§3.1).
 | `GET /api/v2/sessions/{id}` | snapshot | `{ at, state: SessionState }` for a held session, else `404 not_found` |
 | `GET /api/v2/sessions/{id}/history/{historyRevision}/turns/{turnId}/process?offset=` | immutable | process page; cacheable forever; `410` once the revision is gone |
 | `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | immutable | `If-Match` owner |
-| `GET /api/v2/catalog?cursor=&revision=` | Agent-owned | the Agent's paged `session/list`; `409 catalog_changed` when `revision` is stale |
+| `GET /api/v2/catalog?cursor=&revision=` | Agent-owned | `{ revision, sessions, nextCursor }`: the Agent's paged `session/list` (`sessions` are ACP `SessionInfo`); `409 catalog_changed` when `revision` is stale |
 | `GET /api/v2/sessions/{id}/files?query=` | workspace | context search within the session's workspace |
 | `GET /api/v2/sessions/{id}/files/content?path=` | workspace | context read |
 
