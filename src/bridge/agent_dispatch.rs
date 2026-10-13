@@ -14,7 +14,7 @@ use agent_client_protocol::{
 
 #[derive(Clone)]
 pub(super) struct AgentContext {
-    pub(super) state: Arc<Mutex<BridgeState>>,
+    pub(super) state: Arc<BridgeLock>,
     pub(super) sink: EventSink,
     pub(super) terminals: Option<TerminalManager>,
     pub(super) filesystem: Option<Arc<WorkspaceFileSystem>>,
@@ -872,7 +872,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn context() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (events, receiver) = mpsc::unbounded_channel();
         let sink = EventSink { tx: events.into() };
         let epoch = state.try_lock().unwrap().sessions.epoch().to_owned();

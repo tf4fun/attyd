@@ -247,6 +247,23 @@ pub(crate) fn project(value: &mut Value) {
     blocks(value, &mut |block| project_block(block, &owner));
 }
 
+/// Projects one session update, as `project` does for each update of a view.
+pub(crate) fn project_update(update: &mut Value, owner: &SessionResourceOwner) {
+    update_blocks(update, &mut |block| project_block(block, owner));
+}
+
+/// Projects one prompt content block.
+pub(crate) fn project_content(block: &mut Value, owner: &SessionResourceOwner) {
+    project_block(block, owner);
+}
+
+/// Projects the tool call carried by a permission request.
+pub(crate) fn project_permission_request(request: &mut Value, owner: &SessionResourceOwner) {
+    if let Some(call) = request.get_mut("toolCall") {
+        tool_blocks(call, &mut |block| project_block(block, owner));
+    }
+}
+
 pub(crate) fn find(view: &mut Value, attachment_id: &str) -> Option<Value> {
     let mut found = None;
     blocks(view, &mut |block| {

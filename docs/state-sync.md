@@ -72,41 +72,63 @@ finished process content and keeping private payloads out, live inside them.
 
 ### 2.2 Commit step
 
-Every transition in the bridge actor ends with one commit step for the scopes it
-touched:
+Every transition in the bridge actor ends with one commit step:
 
-1. Project each touched scope.
+1. Project each scope.
 2. Diff the result against the document last published for that scope, and emit
    ops for every difference (protocol §4).
 3. If any ops exist, append one entry `{ scope, seq, prev, ops }` to the log, and
    store the new document as the published one.
+
+The commit step runs when the bridge state lock's guard is released after mutable
+access (`BridgeLock` in `src/bridge.rs`). A transition is one critical section, so
+it commits exactly once, and no call site can skip the step (S1). The step visits
+every held scope instead of a touched list; unchanged parts are skipped by
+identity, so an untouched session costs a comparison of its small fields.
 
 Length alone can't tell what changed in the large sequence fields, so diffing them
 uses identity:
 
 | Field | Changes | Diff |
 | --- | --- | --- |
-| `history.timeline`, `turn.updates` | growth; in-place folds (`tool_call_update` keeps its original slot, see `fold_history_update` in `src/history_cache.rs`; merged chunks); whole replacement at baseline commit | Elements are `Arc`-shared. Active turn updates already are (`SharedTurnUpdates`); history entries become so in step 2, because `fold_history_update` returns plain values today. Compare published and current element by pointer: equal pointers mean unchanged. A changed element is an index `set`, a new tail is `append`, and a new history revision is one `set` of the field. |
-| terminal `output` | growth, plus front trimming when the tail exceeds its bound (`src/terminal.rs`, reader loop) | The bridge keeps an absolute counter of trimmed and appended UTF-16 units per terminal. The difference against the published counters gives `trim` + `append`. |
-| maps (`interactions`, `urlFlows`, `terminals`, `outcomes`, `requests`, `sessions`) | upsert, remove | per key; values compared by pointer first, then by value |
+| `turn.updates` | growth; in-place folds (`tool_call_update` keeps its original slot; merged chunks; replaced plans); removal (`plan_removed`) | Elements are `Arc`-shared (`SharedTurnUpdates`), and a fold gives the changed element a new pointer. Compare published and current element by pointer: equal pointers mean unchanged. A changed element is diffed against its previous value, so a merged chunk is a text `append` and a fold is a `set` inside its index; a new tail is `append`; a shorter list is one `set` of the field. |
+| `history.timeline` | a new baseline (turn commit, background update, reload) | The projection collapses completed turns, which renumbers the timeline, so source element identity does not carry over to its indices. The baseline's `Arc<HistorySnapshot>` (with the revision and the turn outcomes) says whether the history changed at all; only then is it projected again. Per-element digests of the projected timeline then find the changed indices: each is an index `set`, a new tail is `append`, and a shorter or mostly changed timeline is one `set` of the field. |
+| terminal `output` | growth, plus front trimming when the tail exceeds its bound (`src/terminal.rs`, reader loop) | The published document keeps the output tail the replicas hold. The longest suffix of the published tail that prefixes the new one (found in linear time) gives `trim` + `append`. No counter is added to bridge state; where repeated output makes the cut ambiguous, every choice yields the same document. |
+| maps (`interactions`, `urlFlows`, `terminals`, `outcomes`, `requests`, `sessions`) | upsert, remove | per key, by value |
 | scalars and small structs (`controls`, `operation`, headers) | any | compared by value |
 
 Comparing pointers is linear in the number of elements, with no content comparison.
-If profiling shows that is too costly for long timelines, a per-field change list
-recorded by the transition can replace it. The gate still compares against full
-projections, so neither strategy can hide a change.
+`identity_diff_cost_on_long_timelines` streams into a turn of 2,000 updates on top
+of a 2,000-entry history and checks that streaming never projects the history again
+and that a chunk publishes only its growth. If profiling shows the pointer pass is
+too costly, a per-field change list recorded by the transition can replace it. The
+gate still compares against full projections, so neither strategy can hide a change.
 
 The commit step emits whatever differs from the last published document, so a call
-site can neither forget an event nor choose the wrong one. `advance_session_delta`,
-`touch`, the hand-built `bridge/session_view` values, and the paired `view_revision`
-and `live.revision` counters all go away. A scope's position is the `seq` of its last
-entry.
+site can neither forget an event nor choose the wrong one. Mirror and live-state
+transitions share the step and the log position. v1 delivery stays unchanged until
+step 7, when `advance_session_delta`, `touch`, the hand-built `bridge/session_view`
+values, and the paired `view_revision` and `live.revision` counters go away. A
+scope's position is the `seq` of its last entry.
 
-The published documents keep only what diffing needs: `Arc` handles shared with
-bridge state, plus terminal counters. Publishing therefore doesn't duplicate
-conversation content. The
-[memory retention](runtime-memory-retention.md) tests extend to the published
-documents and the log.
+The published documents keep only what diffing needs, so publishing doesn't
+duplicate conversation content:
+
+- a `Weak` handle to the history baseline and to the active turn's prompt;
+- the active turn's `SharedTurnUpdates`, shared with bridge state;
+- one 16-byte digest per projected timeline element;
+- the small fields, including terminal tails, collapsed-turn descriptors and outcomes.
+
+The active turn's prompt stays out of the per-commit body as its updates do, so a
+session whose turn did not change costs no content copies when another session
+commits.
+
+`published_documents_and_the_log_release_turn_content` and
+`completed_process_content_is_released_from_the_retained_log` extend the
+[memory retention](runtime-memory-retention.md) gates: once a turn ends and its
+baseline is replaced, neither the published documents nor the log keep its
+updates, prompt, process content or old baseline alive, and the log stays within
+its byte budget.
 
 Global summaries are part of `global`. When a session transition changes its
 summary, the commit step therefore touches both `session/<id>` and `global`. They
@@ -114,9 +136,16 @@ get consecutive `seq`s in one actor turn.
 
 ### 2.3 Log and Hub
 
-The log is a bounded in-memory suffix per epoch, accounted by bytes. Compaction
-drops the oldest entries. A replica asking to resume from before the retained suffix
-gets a `reset` (protocol §4).
+The log is a bounded in-memory suffix per epoch, accounted by bytes (8 MiB by
+default, `DEFAULT_LOG_BUDGET` in `src/protocol/log.rs`). Compaction drops the oldest
+entries but always keeps the newest. When a turn ends, its process content leaves
+the documents (S6), so the log also drops every entry up to the session's previous
+one: those entries carried that content, and a replica behind them resets. A
+session scope that ends while its turn is active (close or retirement during a
+turn) releases the same way. A replica asking to resume from before the
+retained suffix gets a `reset` (protocol §4). An entry whose session was retired or
+replaced by a new incarnation ends the scope; the next incarnation's first entry
+has `prev = 0` and creates its document.
 
 The Hub owns delivery only:
 
@@ -291,6 +320,28 @@ also checks S7 by issuing commands while a scope is waiting for its reset snapsh
 A missed commit step shows up as a divergence, whatever the field. The harness lands
 together with the commit step, in the same PR.
 
+Step 2 implements it in `src/protocol/replica.rs`. Three replicas run side by side:
+one follows every entry, one lags and replaces a random subset of each scope's
+queue with the latest snapshot (S4), and one lags and reconnects, resuming from the
+retained log or starting over from snapshots when compaction dropped its position
+(S3). Scenarios run in two places:
+
+- on the session registry (`src/protocol/publish_tests.rs`), for control updates,
+  streamed and folded turn updates, plans and compactions, URL flow completion and
+  cancellation in both scopes, a terminal rolling past its bound, and ended or
+  replaced sessions;
+- through the real coordinator and ACP transport with a scripted Agent
+  (`src/bridge/convergence_tests.rs`), for control updates, a turn started by
+  another client, a permission, a background `tool_call_update`, close, delete and
+  unobserved retirement.
+
+Both places mutate state without committing and assert that the harness reports
+it. A replica that meets a continuity break or an op that does not apply fails the
+gate; snapshots replace entries only at the first cut, a coalesced queue, a
+reconnect, or a compacted position. The connection's end commits `agent.phase`
+`stopped`, or `error` with the ACP error as `agent_error`, for every exit after the
+epoch exists, including workspace setup failures. S7 needs command positions, so its check arrives with the commands in step 4.
+
 Convergence can't detect a projection that is missing something. If both the
 snapshot and the ops leave out global URL flows, they still agree. That is what the
 second gate is for.
@@ -371,7 +422,9 @@ targeted v1 fix is possible, but that work would be thrown away in step 7.
 
 ## 6. Open questions
 
-- **Pointer-diff cost.** Measure the pointer-compare diff on long timelines in step 2.
-  Switch to transition-recorded change lists only if it shows up.
-- **Log retention budget.** Choose the byte bound for the per-epoch log, and how it
-  interacts with the existing subscriber budgets and the protocol §3.4 minimums.
+- **Pointer-diff cost.** Step 2 measures it (§2.2): streaming never projects the
+  history again, and a chunk publishes only its growth. Switch to
+  transition-recorded change lists only if profiling shows the pointer pass.
+- **Log retention budget.** Step 2 uses 8 MiB per epoch. How it interacts with the
+  existing subscriber budgets and the protocol §3.4 minimums is decided with the
+  Hub in step 3.

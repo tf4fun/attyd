@@ -117,7 +117,7 @@ impl Coordinator {
         item: IngressItem,
         scheduling: &Scheduling,
         ingress: &IngressSender,
-        state: &Arc<Mutex<BridgeState>>,
+        state: &Arc<BridgeLock>,
         sink: &EventSink,
     ) -> Result<(), Error> {
         let mut ready = VecDeque::from([item]);
