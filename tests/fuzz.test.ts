@@ -6,6 +6,8 @@ import {
   type GlobalBusinessEvent,
   type SessionBusinessEvent,
 } from "../shared/business-api";
+import type { Entry, Op, SessionState } from "../shared/protocol";
+import { Replica, sessionSubscription } from "../shared/replica";
 import { appReducer, initialState, type AppAction } from "../web/src/lib/state";
 
 const eventTypes = new Set<GlobalBusinessEvent["type"] | SessionBusinessEvent["type"]>([
@@ -66,6 +68,148 @@ describe("deterministic adversarial generation", () => {
     expect(state.timeline.length).toBeGreaterThan(0);
   }, 30_000);
 });
+
+describe("replica convergence (browser half of the convergence gate)", () => {
+  const subscription = sessionSubscription("S", "e1", 1);
+  const scope = "session/S";
+
+  for (const delivery of ["follow", "reset", "reconnect"] as const) {
+    it(`applying a valid entry stream equals loading the final snapshot (${delivery})`, () => {
+      const random = prng(delivery === "follow" ? 0x5eed_0001 : delivery === "reset" ? 0x5eed_0002 : 0x5eed_0003);
+      for (let round = 0; round < 60; round += 1) {
+        const { states, entries } = generatedStream(random, 40);
+        const replica = new Replica();
+        replica.subscribe([subscription]);
+        const last = states.length - 1;
+        const send = (entry: Entry) => replica.receive(JSON.stringify(entry), `e1:${entry.at.seq}`);
+        send({ type: "snapshot", scope, at: { epoch: "e1", seq: 1 }, state: states[1] });
+        if (delivery === "follow") {
+          for (const entry of entries) send(entry);
+        } else if (delivery === "reset") {
+          // A coalesced reset at k, an HTTP snapshot at m overtaking or
+          // trailing the buffered entries, then the rest of the stream.
+          const k = 2 + Math.floor(random() * (last - 1));
+          const j = Math.min(last, k + Math.floor(random() * 8));
+          const m = Math.min(last, k + Math.floor(random() * 12));
+          for (const entry of entries.filter(({ at }) => at.seq < k)) send(entry);
+          send({ type: "reset", scope, at: { epoch: "e1", seq: k } });
+          const after = entries.filter(({ at }) => at.seq > k).map((entry) =>
+            entry.type === "ops" && entry.at.seq === k + 1 ? { ...entry, prev: k } : entry);
+          for (const entry of after.filter(({ at }) => at.seq <= j)) send(entry);
+          expect(replica.install(subscription, { at: { epoch: "e1", seq: m }, state: states[m] })).toBe(true);
+          for (const entry of after.filter(({ at }) => at.seq > j)) send(entry);
+        } else {
+          const k = 2 + Math.floor(random() * (last - 1));
+          const p = 1 + Math.floor(random() * k);
+          for (const entry of entries.filter(({ at }) => at.seq <= k)) send(entry);
+          replica.reconnect(`e1:${p}`);
+          for (const entry of entries.filter(({ at }) => at.seq > p)) send(entry);
+        }
+        expect(replica.fetches()).toEqual([]);
+        expect(replica.applied()).toBe(last);
+        expect(replica.document(scope)).toEqual(states[last]);
+      }
+    });
+  }
+});
+
+/** A random sequence of session documents and the `ops` entries between them. */
+function generatedStream(random: () => number, length: number): { states: SessionState[]; entries: Entry[] } {
+  let current: SessionState = {
+    sessionId: "S", incarnation: 1, cwd: "/work",
+    controls: { modes: null, configOptions: null, commands: [], info: { title: null, updatedAt: null, meta: null }, usage: null },
+    history: { revision: "r0", phase: "ready", error: null, notice: null, timeline: [], collapsedTurns: [] },
+    turn: null, outcomes: {}, operation: null, interactions: {}, urlFlows: {}, terminals: {},
+  };
+  const states: SessionState[] = [current, current];
+  const entries: Entry[] = [];
+  for (let seq = 2; seq <= length; seq += 1) {
+    const next = structuredClone(current);
+    const ops: Op[] = [];
+    const turn = next.turn;
+    switch (Math.floor(random() * 7)) {
+      case 0: {
+        const update = { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `t${seq}` } } as const;
+        next.history.timeline.push(update);
+        ops.push({ op: "append", path: "/history/timeline", values: [update] });
+        break;
+      }
+      case 1: {
+        const title = random() < 0.3 ? null : `title ${seq}`;
+        next.controls.info.title = title;
+        ops.push({ op: "set", path: "/controls/info/title", value: title });
+        break;
+      }
+      case 2: {
+        const id = `i/${seq % 5}`;
+        const interaction = {
+          interactionId: id, kind: "permission" as const, operationId: null,
+          request: { sessionId: "S", toolCall: { toolCallId: `c${seq}` }, options: [] },
+        };
+        next.interactions[id] = interaction;
+        ops.push({ op: "set", path: `/interactions/${id.replace("/", "~1")}`, value: interaction });
+        break;
+      }
+      case 3: {
+        const id = Object.keys(next.interactions)[0];
+        if (id == null) break;
+        delete next.interactions[id];
+        ops.push({ op: "remove", path: `/interactions/${id.replace("/", "~1")}` });
+        break;
+      }
+      case 4: {
+        const terminal = next.terminals.T;
+        if (terminal == null) {
+          next.terminals.T = { terminalId: "T", output: "", truncated: false, exitStatus: null, released: false };
+          ops.push({ op: "set", path: "/terminals/T", value: next.terminals.T });
+          break;
+        }
+        terminal.output += `out${seq};`;
+        ops.push({ op: "append", path: "/terminals/T/output", text: `out${seq};` });
+        if (terminal.output.length > 20) {
+          const count = terminal.output.length - 20;
+          terminal.output = terminal.output.slice(count);
+          terminal.truncated = true;
+          ops.push({ op: "trim", path: "/terminals/T/output", count }, { op: "set", path: "/terminals/T/truncated", value: true });
+        }
+        break;
+      }
+      case 5: {
+        if (turn == null) {
+          next.turn = { operationId: `op${seq}`, clientIntentId: `k${seq}`, prompt: [], updates: [], cancelRequested: false };
+          ops.push({ op: "set", path: "/turn", value: next.turn });
+          break;
+        }
+        const lastUpdate = turn.updates.at(-1);
+        if (lastUpdate?.sessionUpdate === "agent_message_chunk" && lastUpdate.content.type === "text" && random() < 0.6) {
+          lastUpdate.content.text += `+${seq}`;
+          ops.push({ op: "append", path: `/turn/updates/${turn.updates.length - 1}/content/text`, text: `+${seq}` });
+        } else {
+          const update = { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `c${seq}` } } as const;
+          turn.updates.push(update);
+          ops.push({ op: "append", path: "/turn/updates", values: [update] });
+        }
+        break;
+      }
+      default: {
+        if (turn == null) break;
+        next.outcomes[turn.operationId] = {
+          operationId: turn.operationId, clientIntentId: turn.clientIntentId, status: "completed",
+          response: { stopReason: "end_turn" }, afterUpdate: next.history.timeline.length,
+        };
+        next.turn = null;
+        ops.push(
+          { op: "set", path: `/outcomes/${turn.operationId}`, value: next.outcomes[turn.operationId] },
+          { op: "set", path: "/turn", value: null },
+        );
+      }
+    }
+    entries.push({ type: "ops", scope: "session/S", at: { epoch: "e1", seq }, prev: seq - 1, ops });
+    current = next;
+    states.push(current);
+  }
+  return { states, entries };
+}
 
 function generatedSessionAction(random: () => number, index: number): AppAction {
   const crossSession = random() < 0.22;
