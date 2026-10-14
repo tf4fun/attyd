@@ -1105,7 +1105,7 @@ async fn attachments_follow_the_documents_that_reference_them() {
         json!({
             "sessionUpdate": "tool_call", "toolCallId": "shot", "title": "screenshot",
             "status": "completed",
-            "content": [{"type": "content", "content": image("dG9vbA")}],
+            "content": [{"type": "content", "content": image("dG9vbA==")}],
         }),
     )
     .await;
@@ -1119,7 +1119,7 @@ async fn attachments_follow_the_documents_that_reference_them() {
         .to_string();
     assert_eq!(
         peer.attachment(CREATED, &tool_attachment).await.unwrap()["data"],
-        "dG9vbA"
+        "dG9vbA=="
     );
     peer.update(CREATED, chunk("answer", text("seen"))).await;
     peer.reply(&request, json!({"stopReason": "end_turn"}))
