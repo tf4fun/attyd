@@ -307,6 +307,17 @@ impl World {
             .complete_delete(EPOCH, session_id, incarnation, "del")
             .unwrap();
         self.commit();
+        // The real bridge completes external cleanup before the same ID
+        // can be opened again. Keep that lifecycle step in this driver too.
+        self.registry
+            .finish_session_cleanup(
+                session_id,
+                incarnation,
+                crate::session_state::SessionAdmission::Delete,
+                "del",
+            )
+            .unwrap();
+        self.commit();
     }
 }
 

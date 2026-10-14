@@ -201,6 +201,8 @@ impl Hub {
             queue: Mutex::new(queue),
             ready: Notify::new(),
             closes: self.closes.clone(),
+            #[cfg(test)]
+            after_empty: Mutex::new(None),
         });
         shared.ready.notify_one();
         self.subscriptions.push(shared.clone());
@@ -412,6 +414,9 @@ struct Shared {
     queue: Mutex<Queue>,
     ready: Notify,
     closes: Arc<watch::Sender<u64>>,
+    // A one-shot pause owned by this subscription only, never a global hook.
+    #[cfg(test)]
+    after_empty: Mutex<Option<close_race_tests::Pause>>,
 }
 
 impl Shared {
@@ -577,6 +582,17 @@ impl Subscription {
             if let Some(event) = self.try_next() {
                 return Some(event);
             }
+            #[cfg(test)]
+            {
+                // No queue lock is held while the test commits and closes.
+                let pause = self.shared.after_empty.lock().unwrap().take();
+                if let Some((reached, resume)) = pause {
+                    let _ = reached.send(());
+                    resume
+                        .await
+                        .expect("the close-race test releases its pause");
+                }
+            }
             if self.shared.queue().finished {
                 return None;
             }
@@ -645,5 +661,76 @@ pub(crate) struct Publication(Arc<Mutex<Published>>);
 impl Publication {
     pub(crate) fn lock(&self) -> MutexGuard<'_, Published> {
         self.0.lock().expect("publication poisoned")
+    }
+}
+
+#[cfg(test)]
+mod close_race_tests {
+    use super::*;
+    use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase};
+    use crate::session_registry::SessionRegistry;
+    use tokio::sync::oneshot;
+
+    pub(super) type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    #[tokio::test]
+    async fn review_next_delivers_the_last_commit_when_close_races_its_empty_check() {
+        let mut registry = SessionRegistry::new("close-race");
+        let mut publisher = Publisher::default();
+        let mut agent = AgentInfo {
+            phase: AgentPhase::Ready,
+            error: None,
+            launch: AgentLaunch::default(),
+            initialize: None,
+            authenticated_method_id: None,
+        };
+        publisher.commit(&mut registry, &agent, 0);
+        let mut hub = Hub::default();
+        let subscription = hub.subscribe(
+            &publisher,
+            &[Subscribed {
+                scope: Scope::Global,
+                have: Head::zero(),
+                cwd: None,
+            }],
+        );
+        subscription.next().await.expect("the initial alignment");
+        assert_eq!(subscription.queued_bytes(), 0);
+
+        let (reached_tx, reached) = oneshot::channel();
+        let (resume, resume_rx) = oneshot::channel();
+        *subscription.shared.after_empty.lock().unwrap() = Some((reached_tx, resume_rx));
+        let consumer = tokio::spawn(async move {
+            let last = subscription
+                .next()
+                .await
+                .expect("the last commit must be delivered before EOF");
+            assert!(
+                subscription.next().await.is_none(),
+                "EOF follows the final event"
+            );
+            last
+        });
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .expect("next reaches its empty check")
+            .unwrap();
+
+        // next has seen an empty queue, but has not checked finished. Queue
+        // a real published terminal change and close before it continues.
+        agent.phase = AgentPhase::Stopped;
+        let events = publisher.commit(&mut registry, &agent, 0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].scope(), "global");
+        let expected = serde_json::to_value(&events[0]).unwrap();
+        hub.dispatch(&publisher, &events);
+        hub.close();
+        resume.send(()).unwrap();
+
+        let last = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("the closed stream drains without waiting for another notification")
+            .expect("the stream did not return EOF before the final event");
+        assert_eq!(serde_json::to_value(last).unwrap(), expected);
     }
 }
