@@ -224,11 +224,11 @@ impl AuthTerminalManager {
             *current = None;
         }
         let (exit_code, signal, wait_error) = match result {
-            Ok(status) => (
-                Some(status.exit_code()),
-                status.signal().map(ToOwned::to_owned),
-                None,
-            ),
+            // A signalled child has no exit status of its own.
+            Ok(status) => match status.signal() {
+                Some(signal) => (None, Some(signal.to_owned()), None),
+                None => (Some(status.exit_code()), None, None),
+            },
             Err(error) => (None, None, Some(error.to_string())),
         };
         let failure = active
@@ -252,13 +252,12 @@ impl AuthTerminalManager {
             "status": status,
             "exitCode": exit_code,
         });
-        if let Some(signal) = signal {
+        if let Some(failure) = failure {
+            event["message"] = json!(failure);
+        } else if let Some(signal) = &signal {
             event["message"] = json!(format!(
                 "terminal authentication was terminated by {signal}"
             ));
-        }
-        if let Some(failure) = failure {
-            event["message"] = json!(failure);
         } else if status == "failed" {
             event["message"] = json!(match exit_code {
                 Some(code) => format!("terminal authentication exited with status {code}"),
