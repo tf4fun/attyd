@@ -561,6 +561,53 @@ mod tests {
         );
     }
 
+    // RFC 8785 appendix B (finite values), and a valid `annotations.priority`
+    // where the shortest digits end on a tie.
+    #[test]
+    fn canonical_numbers_follow_ecmascript() {
+        let vectors = [
+            (0x0000000000000000, "0"),
+            (0x8000000000000000, "0"),
+            (0x0000000000000001, "5e-324"),
+            (0x8000000000000001, "-5e-324"),
+            (0x7fefffffffffffff, "1.7976931348623157e+308"),
+            (0xffefffffffffffff, "-1.7976931348623157e+308"),
+            (0x4340000000000000, "9007199254740992"),
+            (0xc340000000000000, "-9007199254740992"),
+            (0x4430000000000000, "295147905179352830000"),
+            (0x44b52d02c7e14af5, "9.999999999999997e+22"),
+            (0x44b52d02c7e14af6, "1e+23"),
+            (0x44b52d02c7e14af7, "1.0000000000000001e+23"),
+            (0x444b1ae4d6e2ef4e, "999999999999999700000"),
+            (0x444b1ae4d6e2ef4f, "999999999999999900000"),
+            (0x444b1ae4d6e2ef50, "1e+21"),
+            (0x3eb0c6f7a0b5ed8c, "9.999999999999997e-7"),
+            (0x3eb0c6f7a0b5ed8d, "0.000001"),
+            (0x41b3de4355555553, "333333333.3333332"),
+            (0x41b3de4355555554, "333333333.33333325"),
+            (0x41b3de4355555555, "333333333.3333333"),
+            (0x41b3de4355555556, "333333333.3333334"),
+            (0x41b3de4355555557, "333333333.33333343"),
+            (0xbecbf647612f3696, "-0.0000033333333333333333"),
+            (0x43143ff3c1cb0959, "1424953923781206.2"),
+        ];
+        for (bits, expected) in vectors {
+            let value = json!(f64::from_bits(bits));
+            assert_eq!(
+                String::from_utf8(canonical_json(&value)).unwrap(),
+                expected,
+                "{bits:#018x}"
+            );
+        }
+        assert_eq!(
+            String::from_utf8(canonical_json(&json!({
+                "annotations": { "priority": f64::from_bits(0x3e60000000000000) }
+            })))
+            .unwrap(),
+            "{\"annotations\":{\"priority\":2.9802322387695312e-8}}"
+        );
+    }
+
     #[test]
     fn hash_chain_starts_at_zero_and_uses_short_base64url() {
         let mut log = TurnLog::default();
@@ -659,7 +706,7 @@ mod tests {
         });
         let blocks = [
             with_meta(json!({ "type": "text", "text": "a", "annotations": { "priority": 1 } })),
-            text("b"),
+            json!({ "type": "text", "text": "b", "annotations": { "priority": 1 } }),
             with_meta(image()),
             with_meta(json!({ "type": "resource_link", "uri": "file:///y", "name": "y" })),
             resource,
@@ -692,6 +739,45 @@ mod tests {
                 "resource": { "uri": "file:///x.txt", "mimeType": "text/plain", "text": "t" },
             }))
         );
+    }
+
+    #[test]
+    fn adjacent_text_merges_only_when_its_other_fields_agree() {
+        let annotated = |text: &str, audience: &str| json!({ "type": "text", "text": text, "annotations": { "audience": [audience] } });
+        let mut attachments = Attachments::default();
+        assert_eq!(
+            serde_json::to_value(normalize(
+                &[
+                    annotated("a", "user"),
+                    annotated("b", "assistant"),
+                    text("c")
+                ],
+                &mut attachments,
+            ))
+            .unwrap(),
+            json!([
+                annotated("a", "user"),
+                annotated("b", "assistant"),
+                text("c")
+            ])
+        );
+
+        let reply = |second: &str| {
+            TurnLog::from_replay(&[
+                user(text("q")),
+                agent(annotated("a", "user")),
+                agent(annotated("b", second)),
+            ])
+        };
+        assert_ne!(reply("assistant").head(), reply("user").head());
+
+        let chunked = TurnLog::from_replay(&[
+            user(text("q")),
+            agent(annotated("hel", "user")),
+            agent(with_meta(annotated("lo", "user"))),
+        ]);
+        let whole = TurnLog::from_replay(&[user(text("q")), agent(annotated("hello", "user"))]);
+        assert_eq!(chunked, whole);
     }
 
     // Acceptance 1: the same messages give the same entry and hash however they
