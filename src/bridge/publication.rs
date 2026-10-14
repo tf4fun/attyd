@@ -200,17 +200,20 @@ impl BridgeState {
             &self.protocol.agent,
             self.catalog_revision,
         );
+        // The events enter every queue in the critical section that produced
+        // them (S3); the tap sees the same commit under the same lock. A
+        // commit without events may still have released a session.
+        let published = &mut *published;
+        published.hub.dispatch(&published.publisher, &events);
         #[cfg(test)]
         if !events.is_empty()
             && let Some(tap) = &self.protocol.tap
         {
             let _ = tap.send(PublishedCommit {
-                events: events.clone(),
+                events,
                 documents: documents(&published.publisher),
             });
         }
-        #[cfg(not(test))]
-        let _ = (events, published);
     }
 
     /// Whether a commit now would publish anything (the gate's check, §4.1).

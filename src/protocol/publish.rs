@@ -398,6 +398,14 @@ impl Publisher {
         }
     }
 
+    /// The log of each published session, by session ID: `None` while it is
+    /// unknown.
+    pub(crate) fn session_logs(&self) -> impl Iterator<Item = (&str, Option<&[Arc<LogEntry>]>)> {
+        self.sessions
+            .iter()
+            .map(|(session_id, published)| (session_id.as_str(), entries(&published.log)))
+    }
+
     /// The published scopes.
     pub(crate) fn scopes(&self) -> Vec<String> {
         let mut scopes = Vec::new();
