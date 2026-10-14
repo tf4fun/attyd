@@ -315,3 +315,109 @@ async fn review_filesystem_setup_failure_publishes_final_agent_error() {
         "{agent}"
     );
 }
+
+async fn assert_prompt_cancel_preserves_accepted_url_flow(request_scoped: bool) {
+    let label = if request_scoped {
+        "request scope"
+    } else {
+        "session scope"
+    };
+    let mut peer = Peer::start(json!({})).await;
+    let revision = peer.create(CREATED, json!({})).await;
+    let scope = format!("session/{CREATED}");
+    let prompt = vec![text("hi")];
+    let op = peer.install_prompt(CREATED, &prompt).await;
+    let request = peer.turn(CREATED, &revision, prompt).await;
+    let elicitation_scope = if request_scoped {
+        json!({"requestId": request["id"]})
+    } else {
+        json!({"sessionId": CREATED})
+    };
+    peer.agent_request(
+        "sign-in",
+        "elicitation/create",
+        url_elicitation(elicitation_scope, "flow"),
+    )
+    .await;
+    peer.until("the URL elicitation joins the prompt", |peer| {
+        interaction_ids(&peer.live(&scope)).len() == 1
+    })
+    .await;
+    let interaction = interaction_ids(&peer.live(&scope)).remove(0);
+    let answered = peer.submit(json!({
+        "type": "elicitation/respond", "requestId": "answer",
+        "elicitationId": interaction, "response": {"action": "accept"},
+    }));
+    Peer::result(answered).await.unwrap();
+    assert_eq!(
+        peer.response("sign-in").await["result"]["action"],
+        "accept",
+        "{label}"
+    );
+    peer.until("the accepted flow is published", |peer| {
+        peer.live(&scope)["urlFlows"].get(&interaction).is_some()
+            && interaction_ids(&peer.live(&scope)).is_empty()
+    })
+    .await;
+    let accepted = peer.live(&scope)["urlFlows"][&interaction].clone();
+
+    let cancelled = peer.submit(json!({
+        "type": "session/cancel", "requestId": "cancel", "sessionId": CREATED,
+    }));
+    Peer::result(cancelled).await.unwrap();
+    let cancellation = peer.request("session/cancel").await;
+    assert_eq!(cancellation["params"]["sessionId"], CREATED);
+    peer.until("the cancel intent is published", |peer| {
+        peer.live(&scope)["op"]["cancelRequested"] == true
+    })
+    .await;
+    let live = peer.live(&scope);
+    assert_eq!(live["op"]["id"], op, "{label}");
+    assert_eq!(live["op"]["status"], "running", "{label}");
+    assert_eq!(
+        live["urlFlows"][&interaction], accepted,
+        "{label}: cancelling an operation must not terminate an accepted resource"
+    );
+
+    peer.reply(&request, json!({"stopReason": "cancelled"}))
+        .await;
+    peer.until("the cancelled prompt completes", |peer| {
+        peer.live(&scope)["op"]["status"] == "completed"
+    })
+    .await;
+    assert_eq!(
+        peer.live(&scope)["urlFlows"][&interaction],
+        accepted,
+        "{label}: the operation ending must not terminate an accepted resource"
+    );
+    assert_eq!(
+        peer.live("global")["sessions"][CREATED]["pending"]["urlFlows"],
+        1
+    );
+    peer.settled().await;
+
+    peer.send(json!({
+        "jsonrpc": "2.0", "method": "elicitation/complete",
+        "params": {"elicitationId": "flow"},
+    }))
+    .await;
+    peer.until("the Agent completes its flow", |peer| {
+        peer.live(&scope)["urlFlows"].get(&interaction).is_none()
+    })
+    .await;
+    assert_eq!(
+        peer.live("global")["sessions"][CREATED]["pending"]["urlFlows"],
+        0
+    );
+    peer.settled().await;
+}
+
+#[tokio::test]
+async fn review_prompt_cancel_preserves_accepted_request_scoped_url_flow() {
+    assert_prompt_cancel_preserves_accepted_url_flow(true).await;
+}
+
+#[tokio::test]
+async fn review_prompt_cancel_preserves_accepted_session_scoped_url_flow() {
+    assert_prompt_cancel_preserves_accepted_url_flow(false).await;
+}
