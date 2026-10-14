@@ -153,9 +153,15 @@ impl JournalTurn {
 // connection. It neither changes scheduling nor owns the registry after teardown.
 thread_local! {
     static COORDINATOR_PROBE: std::cell::RefCell<Option<oneshot::Sender<Weak<BridgeLock>>>> = const { std::cell::RefCell::new(None) };
+    static RETAINED_COORDINATOR_PROBE: std::cell::RefCell<Option<oneshot::Sender<Arc<BridgeLock>>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(super) fn capture_coordinator_state(state: &Arc<BridgeLock>) {
+    RETAINED_COORDINATOR_PROBE.with(|probe| {
+        if let Some(response) = probe.borrow_mut().take() {
+            let _ = response.send(Arc::clone(state));
+        }
+    });
     COORDINATOR_PROBE.with(|probe| {
         if let Some(response) = probe.borrow_mut().take() {
             let _ = response.send(Arc::downgrade(state));
@@ -167,6 +173,16 @@ pub(super) fn capture_coordinator_state(state: &Arc<BridgeLock>) {
 pub(super) fn probe_coordinator_state() -> oneshot::Receiver<Weak<BridgeLock>> {
     let (response, probe) = oneshot::channel();
     COORDINATOR_PROBE.with(|slot| {
+        assert!(slot.borrow_mut().replace(response).is_none());
+    });
+    probe
+}
+
+// Opt-in only: setup-error tests need to inspect the last published document
+// after the connection has returned. Retention tests keep using the Weak probe.
+pub(super) fn probe_retained_coordinator_state() -> oneshot::Receiver<Arc<BridgeLock>> {
+    let (response, probe) = oneshot::channel();
+    RETAINED_COORDINATOR_PROBE.with(|slot| {
         assert!(slot.borrow_mut().replace(response).is_none());
     });
     probe

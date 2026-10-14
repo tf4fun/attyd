@@ -1910,3 +1910,5 @@ async fn the_same_history_gives_the_same_log_after_a_restart() {
     assert_eq!(first.len(), 1);
     assert_eq!(first, load(&replay).await, "a restart keeps the same log");
 }
+
+mod review_lifecycle;
