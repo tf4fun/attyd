@@ -85,12 +85,17 @@ impl Agents {
         }
     }
 
-    /// The next connection, initialized with `capabilities`.
-    async fn accept(&mut self, capabilities: Value) -> Link {
-        let mut link = tokio::time::timeout(WAIT, self.links.recv())
+    /// The next connection, before its `initialize` is answered.
+    async fn connect(&mut self) -> Link {
+        tokio::time::timeout(WAIT, self.links.recv())
             .await
             .expect("the bridge did not connect to the Agent")
-            .unwrap();
+            .unwrap()
+    }
+
+    /// The next connection, initialized with `capabilities`.
+    async fn accept(&mut self, capabilities: Value) -> Link {
+        let mut link = self.connect().await;
         let initialize = link.request("initialize").await;
         link.reply(
             &initialize,
@@ -204,7 +209,14 @@ struct Server {
 
 impl Server {
     async fn start(capabilities: Value) -> (Self, Link) {
-        let mut agents = Agents::listen().await;
+        let mut server = Self::launch().await;
+        let link = server.agents.accept(capabilities).await;
+        (server, link)
+    }
+
+    /// A server whose first Agent connection is not accepted yet.
+    async fn launch() -> Self {
+        let agents = Agents::listen().await;
         let options = Options::try_parse_from(["attyd", "--transport", "ws", "--", &agents.url])
             .unwrap()
             .normalized()
@@ -218,15 +230,11 @@ impl Server {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let link = agents.accept(capabilities).await;
-        (
-            Self {
-                address,
-                hub,
-                agents,
-            },
-            link,
-        )
+        Self {
+            address,
+            hub,
+            agents,
+        }
     }
 
     async fn send(&self, path: &str) -> Response<hyper::body::Incoming> {
@@ -992,5 +1000,376 @@ async fn a_successful_terminal_login_starts_the_next_connection_for_a_global_onl
     stream.assert_document("global", &read);
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(launched(), (2, 1), "the next connection is started once");
+    hub.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Subscribing while the Agent initializes, and the recovery's boundaries
+// (protocol §5.1, §5.4; Q2)
+
+/// Longer than the recovery's backoff after the failed attempts these tests
+/// make: no attempt they rule out can still be waiting to start.
+const RETRY_WINDOW: Duration = Duration::from_secs(3);
+
+/// How long the server takes to read the EOF of a dropped HTTP stream.
+const DROP_SETTLE: Duration = Duration::from_millis(500);
+
+fn initialized(capabilities: Value) -> Value {
+    json!({"protocolVersion": 1, "agentCapabilities": capabilities, "authMethods": []})
+}
+
+/// Events until `global` shows the Agent `phase`.
+async fn until_phase(stream: &mut Sse, phases: &[&str]) {
+    stream
+        .until("global", |event| {
+            phases.iter().any(|phase| mentions(event, phase))
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_new_global_stream_aligns_while_initialize_is_unanswered() {
+    let mut server = Server::launch().await;
+    let mut link = server.agents.connect().await;
+    let initialize = link.request("initialize").await;
+
+    let mut stream = server.stream("scope=global").await;
+    let aligned = stream.event().await;
+    assert_eq!(aligned["scope"], "global", "{aligned}");
+    let agent = &aligned["live"]["replace"]["agent"];
+    assert_eq!(agent["phase"], "initializing", "{aligned}");
+    assert!(agent["initialize"].is_null(), "{aligned}");
+
+    link.reply(&initialize, initialized(json!({}))).await;
+    while stream.replica("global").live["agent"]["phase"] != "ready" {
+        stream.event().await;
+    }
+    let (status, global) = server.read("global").await;
+    assert_eq!(status, StatusCode::OK);
+    stream.assert_document("global", &global);
+}
+
+#[tokio::test]
+async fn a_known_session_aligns_on_a_new_stream_while_the_next_initialize_is_unanswered() {
+    let replay = turns(&[("one", "1"), ("two", "2")]);
+    let (mut server, link, mut first) = loaded(&replay).await;
+    let (_, before) = server.read("session/saved").await;
+    link.close().await;
+    first
+        .until("session/saved", |event| mentions(event, "running"))
+        .await;
+
+    let mut next = server.agents.connect().await;
+    let initialize = next.request("initialize").await;
+    // A held session needs no cwd; its known log aligns at once.
+    let mut second = server.stream("scope=session%2Fsaved").await;
+    let aligned = second.event().await;
+    assert_eq!(aligned["scope"], "session/saved", "{aligned}");
+    assert_eq!(
+        json!(second.replica("session/saved").log),
+        before["log"],
+        "{aligned}"
+    );
+    assert_eq!(aligned["live"]["replace"]["op"]["kind"], "load");
+    assert_eq!(aligned["live"]["replace"]["op"]["status"], "running");
+
+    next.reply(&initialize, initialized(json!({"loadSession": true})))
+        .await;
+    next.serve_load("saved", &replay).await;
+    second
+        .until("session/saved", |event| mentions(event, "completed"))
+        .await;
+    let (_, after) = server.read("session/saved").await;
+    second.assert_document("session/saved", &after);
+    first
+        .until("session/saved", |event| mentions(event, "completed"))
+        .await;
+    first.assert_document("session/saved", &after);
+    assert_eq!(after["log"], before["log"]);
+    assert_eq!(server.agents.accepted(), 2);
+}
+
+#[tokio::test]
+async fn an_initialization_failure_keeps_recovering_while_a_session_stream_needs_it() {
+    let replay = turns(&[("one", "1")]);
+    let (mut server, link, mut stream) = loaded(&replay).await;
+    let (_, before) = server.read("session/saved").await;
+    link.close().await;
+    stream
+        .until("session/saved", |event| mentions(event, "running"))
+        .await;
+
+    // The next connection ends before it answers initialize.
+    let mut failed = server.agents.connect().await;
+    failed.request("initialize").await;
+    failed.close().await;
+
+    let mut next = server.agents.accept(json!({"loadSession": true})).await;
+    next.serve_load("saved", &replay).await;
+    loop {
+        let event = stream.event().await;
+        assert!(
+            event.get("end").is_none(),
+            "the stream keeps the session: {event}"
+        );
+        let replica = stream.replica("session/saved");
+        assert_eq!(json!(replica.log), before["log"], "{event}");
+        if replica.live["op"]["kind"] == "load" && replica.live["op"]["status"] == "completed" {
+            break;
+        }
+    }
+    let (_, after) = server.read("session/saved").await;
+    stream.assert_document("session/saved", &after);
+    assert_eq!(server.agents.accepted(), 3);
+}
+
+#[tokio::test]
+async fn recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_leaves() {
+    let replay = turns(&[("one", "1")]);
+    let (mut server, link, first) = loaded(&replay).await;
+    let mut second = server.stream("scope=session%2Fsaved").await;
+    second.event().await;
+    // A global stream only watches the attempts; it needs no connection.
+    let mut watcher = server.stream("scope=global").await;
+    watcher.event().await;
+
+    link.close().await;
+    until_phase(&mut watcher, &["stopped", "error"]).await;
+    drop(first);
+    tokio::time::sleep(DROP_SETTLE).await;
+
+    // One subscriber left: a failed attempt is followed by another.
+    let mut failed = server.agents.connect().await;
+    failed.request("initialize").await;
+    until_phase(&mut watcher, &["initializing"]).await;
+    failed.close().await;
+    until_phase(&mut watcher, &["stopped", "error"]).await;
+    let mut pending = server.agents.connect().await;
+    pending.request("initialize").await;
+    until_phase(&mut watcher, &["initializing"]).await;
+
+    // The last subscriber leaves while that attempt runs; once it ends, no
+    // further attempt starts.
+    drop(second);
+    tokio::time::sleep(DROP_SETTLE).await;
+    pending.close().await;
+    until_phase(&mut watcher, &["stopped", "error"]).await;
+    tokio::time::sleep(RETRY_WINDOW).await;
+    assert_eq!(
+        server.agents.accepted(),
+        3,
+        "no attempt after the last subscriber"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_load_cut_by_an_eof_keeps_the_cache_and_converges_on_the_next_connection() {
+    let replay = turns(&[("one", "1"), ("two", "2"), ("three", "3")]);
+    let cached = log_values(TurnLog::from_replay(&replay[..2]).entries());
+    let (mut server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("scope", "session/saved")
+        .append_pair(
+            "have",
+            &format!("session/saved:1:{}", cached[0]["hash"].as_str().unwrap()),
+        )
+        .append_pair("cwd", &format!("session/saved:{CWD}"))
+        .finish();
+    let mut stream = server.stream(&query).await;
+    stream.cache_log("session/saved", cached.clone());
+
+    // The first load replays part of the history, then the Agent goes away.
+    let load = link.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "saved");
+    for update in &replay[..2] {
+        link.update("saved", update.clone()).await;
+    }
+    link.close().await;
+
+    let mut next = server.agents.accept(json!({"loadSession": true})).await;
+    let load = next.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "saved");
+    assert_eq!(load["params"]["cwd"], CWD);
+    for update in &replay {
+        next.update("saved", update.clone()).await;
+    }
+    next.reply(&load, json!({})).await;
+
+    let expected = json!(log_values(TurnLog::from_replay(&replay).entries()));
+    loop {
+        let event = stream.event().await;
+        assert!(
+            event.get("end").is_none(),
+            "the stream keeps the session: {event}"
+        );
+        let replica = stream.replica("session/saved");
+        let completed =
+            replica.live["op"]["kind"] == "load" && replica.live["op"]["status"] == "completed";
+        if completed {
+            assert_eq!(json!(replica.log), expected, "{event}");
+            break;
+        }
+        assert_eq!(
+            json!(replica.log),
+            json!(cached),
+            "no partial replay replaces the client's cache: {event}"
+        );
+    }
+    let (_, after) = server.read("session/saved").await;
+    stream.assert_document("session/saved", &after);
+    assert_eq!(server.agents.accepted(), 2);
+}
+
+#[tokio::test]
+async fn a_session_ended_with_load_failed_is_no_recovery_need_behind_a_global_stream() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let mut stream = server
+        .stream(&format!(
+            "scope=global&scope=session%2Fsaved&cwd={}",
+            query_scope(&format!("session/saved:{CWD}"))
+        ))
+        .await;
+    let load = link.request("session/load").await;
+    link.send(json!({
+        "jsonrpc": "2.0", "id": load["id"],
+        "error": {"code": -32002, "message": "no such session"},
+    }))
+    .await;
+    let end = stream
+        .until("session/saved", |event| event.get("end").is_some())
+        .await
+        .pop()
+        .unwrap();
+    assert_eq!(end["end"]["reason"], "load_failed", "{end}");
+
+    link.close().await;
+    until_phase(&mut stream, &["stopped", "error"]).await;
+    tokio::time::sleep(RETRY_WINDOW).await;
+    assert_eq!(
+        server.agents.accepted(),
+        1,
+        "an ended session scope needs no connection"
+    );
+}
+
+/// Q2: the login authorizes one next connection. When that connection ends
+/// with an ordinary EOF, a global-only stream starts no third.
+#[tokio::test]
+async fn a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("authenticated");
+    let launches = root.path().join("launches");
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let fixture = std::path::Path::new(manifest).join("tests/fixtures/fake-agent.ts");
+    // Each launch records its process ID (kept by exec) and arguments.
+    let script = format!(
+        "export ATTYD_FAKE_AUTH_FILE='{}'; echo \"$$ $*\" >> '{}'; exec node --import tsx '{}' \"$@\"",
+        auth.display(),
+        launches.display(),
+        fixture.display(),
+    );
+    let options = Options::try_parse_from([
+        "attyd",
+        "--cwd",
+        manifest,
+        "--",
+        "sh",
+        "-c",
+        &script,
+        "agent",
+        "--terminal-auth-required",
+    ])
+    .unwrap()
+    .normalized()
+    .unwrap();
+    let options = Arc::new(options);
+    let hub = BridgeHub::new(options.clone());
+    hub.ensure_runtime().await;
+    let app = app_router(&options, hub.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let agents = || {
+        std::fs::read_to_string(&launches)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.contains("--terminal-login"))
+            .map(|line| line.split(' ').next().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let response = send(address, Method::GET, "/api/v2/stream?scope=global", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = Sse {
+        body: Body::new(response.into_body()).into_data_stream(),
+        buffer: String::new(),
+        replicas: BTreeMap::new(),
+        aligned: BTreeSet::new(),
+        ended: BTreeSet::new(),
+    };
+    let phase = |stream: &Sse| stream.replica("global").live["agent"]["phase"].clone();
+    assert_eq!(stream.event().await["scope"], "global");
+    while phase(&stream) != "ready" {
+        stream.event().await;
+    }
+
+    let started = send(
+        address,
+        Method::POST,
+        "/api/v1/auth/terminal",
+        Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+    )
+    .await;
+    assert_eq!(started.status(), StatusCode::ACCEPTED);
+    let started: Value = serde_json::from_slice(
+        &axum::body::to_bytes(Body::new(started.into_body()), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let request_id = started["requestId"].as_str().unwrap();
+    while !stream.replica("global").live["terminals"]
+        .to_string()
+        .contains("Enter access code")
+    {
+        stream.event().await;
+    }
+    let input = send(
+        address,
+        Method::POST,
+        &format!("/api/v1/auth/terminal/{request_id}/input"),
+        Some(json!({"data": "open-sesame\r"})),
+    )
+    .await;
+    assert!(input.status().is_success(), "{}", input.status());
+    let mut ended = false;
+    loop {
+        stream.event().await;
+        let phase = phase(&stream);
+        ended |= phase != "ready";
+        if ended && phase == "ready" {
+            break;
+        }
+    }
+    let launched = agents();
+    assert_eq!(launched.len(), 2, "the login's one next connection");
+
+    // The next connection's Agent exits: an ordinary EOF.
+    let killed = std::process::Command::new("kill")
+        .arg(&launched[1])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    while !matches!(phase(&stream).as_str(), Some("stopped" | "error")) {
+        stream.event().await;
+    }
+    tokio::time::sleep(RETRY_WINDOW).await;
+    assert_eq!(
+        agents().len(),
+        2,
+        "the login authorized one connection only"
+    );
     hub.shutdown().await;
 }
