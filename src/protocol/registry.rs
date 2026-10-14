@@ -755,6 +755,30 @@ impl SessionRegistry {
         }
     }
 
+    /// A resume or the bridge's cache gave the session's context, which is no
+    /// replay: it is the log only of a session whose history is unknown, and a
+    /// known log stays (protocol S1).
+    pub(crate) fn adopt_session_log(&mut self, session_id: &str, updates: &[Value]) {
+        if let Some(entry) = self.sessions.get_mut(session_id)
+            && matches!(entry.state.log, SessionLog::Unknown)
+        {
+            entry.state.log = SessionLog::Known(Arc::new(TurnLog::from_replay(updates)));
+        }
+    }
+
+    /// Whether the held session shows the `load` the previous connection left
+    /// it waiting with, and nothing runs it yet (protocol S6, §5.4).
+    pub(crate) fn waits_for_load(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|entry| {
+            entry.state.operation.is_none()
+                && entry
+                    .state
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.op.is_running_kind(OperationKind::Load))
+        })
+    }
+
     /// A setup response arrived: controls settle from the earlier updates and
     /// the response (protocol §4.5).
     pub(crate) fn settle_session_controls(&mut self, session_id: &str) {

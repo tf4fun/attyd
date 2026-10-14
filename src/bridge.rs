@@ -6845,17 +6845,16 @@ fn reserve_attachment_locked(
         .map(|session| (session.live.cwd.clone(), session.state.incarnation));
     let reservation = match tracked {
         Some((cwd, incarnation)) => {
-            if kind != RuntimeSessionOperationKind::Load {
+            // A session the previous connection left waiting may also come
+            // back with a resume, which replays nothing (protocol §5.4).
+            if kind != RuntimeSessionOperationKind::Load
+                && !state.sessions.waits_for_load(session_id)
+            {
                 return Err(Error::invalid_request()
                     .data("an active tracked session can only be reloaded with session/load"));
             }
             session_mirror(state)
-                .begin_exclusive(
-                    session_id,
-                    incarnation,
-                    RuntimeSessionOperationKind::Load,
-                    operation_id,
-                )
+                .begin_exclusive(session_id, incarnation, kind, operation_id)
                 .map_err(mirror_error)?;
             if let Err(error) =
                 state

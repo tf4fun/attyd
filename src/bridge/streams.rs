@@ -46,19 +46,15 @@ pub(super) fn serve(state: &mut BridgeState, sink: &EventSink) -> Option<Value> 
         else {
             continue;
         };
-        if !state
-            .agent_capabilities
-            .as_ref()
-            .is_some_and(|capabilities| capabilities.load_session)
-        {
+        let Some(method) = reattach_method(state.agent_capabilities.as_ref()) else {
             state.sessions.end_unloadable(&session_id);
             continue;
-        }
+        };
         if !state.stream_reloads.is_empty() {
             wake(state);
         }
         return Some(json!({
-            "type": "session/load", "requestId": format!("bridge-reload-{}", Uuid::new_v4()),
+            "type": method, "requestId": format!("bridge-reload-{}", Uuid::new_v4()),
             "sessionId": session_id, "cwd": cwd,
         }));
     }
@@ -165,15 +161,24 @@ pub(super) fn finish_load(
     end_waiting(state, session_id, EndReason::LoadFailed, Some(error));
 }
 
+/// How the Agent brings a held session back, if it can: `session/load`
+/// replays its history; `session/resume` replays none, and the session keeps
+/// the log it has (§5.4).
+fn reattach_method(capabilities: Option<&AgentCapabilities>) -> Option<&'static str> {
+    let capabilities = capabilities?;
+    if capabilities.load_session {
+        Some("session/load")
+    } else if capabilities.session_capabilities.resume.is_some() {
+        Some("session/resume")
+    } else {
+        None
+    }
+}
+
 /// Whether the Agent can bring a released session back: only such a session
 /// is released (S6).
 pub(super) fn releasable(state: &BridgeState) -> bool {
-    state
-        .agent_capabilities
-        .as_ref()
-        .is_some_and(|capabilities| {
-            capabilities.load_session || capabilities.session_capabilities.resume.is_some()
-        })
+    reattach_method(state.agent_capabilities.as_ref()).is_some()
 }
 
 /// The sessions some subscription follows.
@@ -216,10 +221,7 @@ impl BridgeState {
     /// (S6, §5.4). Every other held session is released by the next
     /// connection's first commit.
     pub(super) fn hold_for_next_connection(&mut self) {
-        let reloadable = self
-            .agent_capabilities
-            .as_ref()
-            .is_none_or(|capabilities| capabilities.load_session);
+        let reloadable = self.agent_capabilities.is_none() || releasable(self);
         let followed = followed(self);
         let held: Vec<String> = crate::protocol::project::held_sessions(&self.sessions)
             .into_iter()

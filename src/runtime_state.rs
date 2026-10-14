@@ -664,7 +664,10 @@ impl SessionRegistry {
         kind: SessionOperationKind,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        if kind != SessionOperationKind::Load {
+        if !matches!(
+            kind,
+            SessionOperationKind::Load | SessionOperationKind::Resume
+        ) {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let operation_id = operation_id.into();
@@ -733,7 +736,11 @@ impl SessionRegistry {
             });
         let collecting_reload = session.lifecycle == SessionLifecycle::Active
             && owner.operation.as_ref().is_some_and(|operation| {
-                operation.stage == "reloading" && operation.kind == SessionOperationKind::Load
+                operation.stage == "reloading"
+                    && matches!(
+                        operation.kind,
+                        SessionOperationKind::Load | SessionOperationKind::Resume
+                    )
             });
         if !collecting_attachment && !collecting_reload {
             return Err(RuntimeStateError::OperationMismatch);
@@ -763,7 +770,10 @@ impl SessionRegistry {
         if session.lifecycle != SessionLifecycle::Active
             || owner.operation.as_ref().is_none_or(|operation| {
                 operation.operation_id != operation_id
-                    || operation.kind != SessionOperationKind::Load
+                    || !matches!(
+                        operation.kind,
+                        SessionOperationKind::Load | SessionOperationKind::Resume
+                    )
                     || operation.stage != "reloading"
             })
         {
@@ -795,7 +805,10 @@ impl SessionRegistry {
         if session.lifecycle != SessionLifecycle::Active
             || owner.operation.as_ref().is_none_or(|operation| {
                 operation.operation_id != operation_id
-                    || operation.kind != SessionOperationKind::Load
+                    || !matches!(
+                        operation.kind,
+                        SessionOperationKind::Load | SessionOperationKind::Resume
+                    )
                     || operation.stage != "reloading"
             })
         {
