@@ -1927,7 +1927,7 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
     peer.stop().await.unwrap();
     let global = peer.live("global");
     assert_eq!(global["agent"]["phase"], "stopped");
-    for scope in ["global", "catalog", scope.as_str()] {
+    for scope in ["global", "catalog"] {
         let live = peer.live(scope);
         assert_eq!(live["op"]["status"], "failed", "{scope}: {live}");
         assert_eq!(live["op"]["error"]["code"], "unavailable", "{scope}");
@@ -1937,7 +1937,14 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
             "{scope} keeps no URL flow"
         );
     }
-    assert_eq!(global["sessions"][CREATED]["op"]["status"], "failed");
+    // No subscription follows the session: with its operation, interactions
+    // and URL flow gone, nothing needs it, and the connection's end releases
+    // it from the final documents (S6).
+    let published = peer.publication.lock();
+    assert!(published.publisher.document(&scope).is_none());
+    let summary = &published.publisher.document("global").unwrap().live;
+    assert!(summary["sessions"].get(CREATED).is_none(), "{summary}");
+    assert!(global["sessions"].get(CREATED).is_none(), "{global}");
 }
 
 #[tokio::test]
