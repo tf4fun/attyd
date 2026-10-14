@@ -162,7 +162,7 @@ fn tool_blocks(call: &mut Value, visit: &mut impl FnMut(&mut Value)) {
     }
 }
 
-fn update_blocks(update: &mut Value, visit: &mut impl FnMut(&mut Value)) {
+pub(crate) fn update_blocks(update: &mut Value, visit: &mut impl FnMut(&mut Value)) {
     match update["sessionUpdate"].as_str() {
         Some(
             "user_message_chunk"

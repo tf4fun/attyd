@@ -51,9 +51,10 @@ ACP ──▶ bridge actor: transition ──▶ commit step ──────�
 ### 2.1 Bridge state added
 
 - **Operation slots.** Every scope has an `OpSlot { id, kind, status, input,
-  interactions, result, error, cancel_requested }` in bridge state. A held session
-  keeps it in its registry entry; `global` and `catalog` keep theirs next to the
-  agent state.
+  cancel_requested, result, error }` in bridge state. A held session keeps it in
+  its registry entry; `global` and `catalog` keep theirs in the registry. The
+  operation's pending interactions are the scope's pending Agent requests, which
+  the bridge keeps as today; the projection reads them from there.
 - **Occupation.** An `occupied: HashMap<Scope, OpId>` records scopes an operation
   occupies besides its own (delete occupies `session/<id>`). A held occupied scope
   shows the occupying operation as its `op`.
@@ -270,14 +271,15 @@ product keeps working throughout. Each step is one PR, validated in CI.
 | 1 | The redesign settled, the protocol and this plan (docs only) | — |
 | 2 | Remove the earlier v2 draft: `src/server/v2.rs` and its routes, the records and intent table, the replication log and Hub, the commit step, owner-qualified subscriptions, the projections and their tests, and the generated `shared/protocol.ts` types; `controls.rs`, `diff.rs` and `typescript.rs` stay (§1); v1 unchanged | v1 suites still pass |
 | 3 | `canon.rs`: message reduction, turns, normalization, prompt resolution, hash chain; `TurnLog` built from live commits and from replays | 1 |
-| 4 | DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`; the per-event convergence gate | 2, 5, 13, 18 |
+| 4a | DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`, driven by the session registry's transitions; the per-event convergence gate on the session registry | 2, 5, 13, 18 |
+| 4b | The commit step in the bridge actor, run when the bridge lock's mutable guard is released; the bridge's remaining transitions (global and catalog operations, login terminals, the Agent connection); the gate through the real coordinator and ACP transport | — |
 | 5 | `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}`: Hub cut, alignment, coalescing, `end`; hold by subscription and need, `load` on subscription, release of loadable sessions only | 3, 4, 12 |
 | 6 | `POST /api/v2/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16, 17 (bridge) |
 | 7 | Web UI on v2: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection. PR #34, built on the earlier draft, is not landed; `shared/replica.ts` and `shared/protocol-validate.ts` are carried over where they fit | 3, 4, 9, 15, 16 (client) |
 | 8 | Remove v1: routes, business events, browser compensating state; Markdown export and attachment links on v2 | — |
 | 9 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | — |
 
-Dependencies: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8, and 9 after 8. #16 and #17 are fixed
+Dependencies: 1 → 2 → 3 → 4a → 4b → 5 → 6 → 7 → 8, and 9 after 8. #16 and #17 are fixed
 visibly in step 7.
 
 ## 6. Open questions
