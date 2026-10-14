@@ -678,6 +678,11 @@ pub(crate) struct Published {
     /// The held sessions an ended connection left for the next one to load
     /// again, because a subscription follows them (S6, §5.4).
     pub waiting: Vec<super::registry::WaitingSession>,
+    /// A test's tap for the next generation, which takes it before its first
+    /// commit.
+    #[cfg(test)]
+    pub next_tap:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::bridge::publication::PublishedCommit>>,
 }
 
 #[derive(Clone, Default)]

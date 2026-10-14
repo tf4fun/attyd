@@ -86,7 +86,7 @@ impl Drop for BridgeGuard<'_> {
 /// One commit as the test tap receives it: its events and every document
 /// published after it.
 #[cfg(test)]
-pub(super) struct PublishedCommit {
+pub(crate) struct PublishedCommit {
     pub events: Vec<crate::protocol::documents::Event>,
     pub documents: BTreeMap<String, crate::protocol::publish::Document>,
 }
@@ -127,11 +127,16 @@ impl ProtocolState {
         self.tap = Some(tap);
         documents(&self.publication.lock().publisher)
     }
+
+    #[cfg(test)]
+    pub(super) fn set_tap(&mut self, tap: mpsc::UnboundedSender<PublishedCommit>) {
+        self.tap = Some(tap);
+    }
 }
 
 /// Every published document.
 #[cfg(test)]
-pub(super) fn documents(
+pub(crate) fn documents(
     publisher: &Publisher,
 ) -> BTreeMap<String, crate::protocol::publish::Document> {
     publisher

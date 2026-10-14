@@ -323,8 +323,11 @@ async fn idle_retirement_workflow_cold_observers_share_outer_retries_until_deliv
 
 #[tokio::test(start_paused = true)]
 async fn idle_retirement_workflow_fork_without_load_falls_back_and_retires() {
-    let mut agent =
-        TestAgent::start(2, json!({"sessionCapabilities":{"fork":{}, "close":{}}})).await;
+    let mut agent = TestAgent::start(
+        2,
+        json!({"sessionCapabilities":{"fork":{}, "resume":{}, "close":{}}}),
+    )
+    .await;
     let _source_lease = create_observed_source(&mut agent).await;
     let completion = agent
         .submit(json!({"type":"session/fork", "requestId":"no-load-fork", "sessionId":SOURCE}));
@@ -440,8 +443,11 @@ async fn idle_retirement_workflow_invalid_replay_fallback_does_not_leak_work() {
 
 #[tokio::test(start_paused = true)]
 async fn idle_retirement_workflow_rejected_fork_target_does_not_strand_source() {
-    let mut agent =
-        TestAgent::start(2, json!({"sessionCapabilities":{"fork":{}, "close":{}}})).await;
+    let mut agent = TestAgent::start(
+        2,
+        json!({"sessionCapabilities":{"fork":{}, "resume":{}, "close":{}}}),
+    )
+    .await;
     let source_lease = create_observed_source(&mut agent).await;
     let completion = agent
         .submit(json!({"type":"session/fork", "requestId":"invalid-fork", "sessionId":SOURCE}));

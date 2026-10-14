@@ -304,6 +304,15 @@ impl Peer {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
+        // The next generation is tapped from its first commit on, after the
+        // documents the previous one left: a stream that crosses the two
+        // sees every commit the timeline holds.
+        let (tap, commits) = mpsc::unbounded_channel();
+        let next_cut = (!timeline.is_empty()).then(|| {
+            let mut published = publication.lock();
+            published.next_tap = Some(tap.clone());
+            super::publication::documents(&published.publisher)
+        });
         let probe = super::memory_retention_tests::probe_coordinator_state();
         let task = tokio::spawn(run_generation(
             transport,
@@ -314,13 +323,18 @@ impl Peer {
             publication.clone(),
         ));
         let state = probe.await.unwrap();
-        let (tap, commits) = mpsc::unbounded_channel();
         // The tap and the cut are taken under one guard, so no commit falls
         // between the aligned replicas and the first tapped event.
-        let cut = {
-            let lock = state.upgrade().unwrap();
-            let mut guard = lock.lock().await;
-            guard.protocol.tap(tap)
+        let cut = match next_cut {
+            Some(cut) => {
+                drop(tap);
+                cut
+            }
+            None => {
+                let lock = state.upgrade().unwrap();
+                let mut guard = lock.lock().await;
+                guard.protocol.tap(tap)
+            }
         };
         timeline.push(cut.clone());
         Self {

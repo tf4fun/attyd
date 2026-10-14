@@ -66,7 +66,7 @@ mod memory_efficiency_tests;
 mod memory_retention_tests;
 #[cfg(test)]
 mod protocol_gate_tests;
-mod publication;
+pub(crate) mod publication;
 mod scheduling;
 mod streams;
 #[cfg(test)]
@@ -2271,6 +2271,14 @@ where
     let mut state = BridgeState::default();
     state.protocol.publication = publication;
     state.seed_from_previous_connection();
+    // A test's tap for this generation, set before its first commit.
+    #[cfg(test)]
+    {
+        let tap = state.protocol.publication.lock().next_tap.take();
+        if let Some(tap) = tap {
+            state.protocol.set_tap(tap);
+        }
+    }
     let state = Arc::new(BridgeLock::new(state));
     state.lock().await.protocol.agent.launch = agent_launch(&options);
     #[cfg(test)]
@@ -10912,6 +10920,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn owner_cancelled_observe_restarts_absence_and_fences_an_old_timer() {
         let mut state = BridgeState::default();
+        // Only a session the Agent can load again is released (S6).
+        state.agent_capabilities = Some(AgentCapabilities::new().load_session(true));
         let incarnation = register_test_session(&mut state, "session", "/workspace");
         let (input, mut commands) = mpsc::unbounded_channel();
         state.observer_events = Some(input);
