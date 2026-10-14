@@ -8,7 +8,6 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::protocol::SessionControls;
 use crate::session_mirror::TurnOverlay;
 use crate::session_registry::{SessionEntry, SessionRegistry};
 use crate::session_state::{MirrorError, SessionAdmission, SessionState, TurnAdmission};
@@ -58,18 +57,10 @@ pub(crate) struct SessionLiveState {
     pub cwd: PathBuf,
     pub session: Value,
     pub control_state: BTreeMap<String, Value>,
-    /// Protocol v2 controls, reduced in arrival order around the setup
-    /// response (protocol §3.3). `control_state` keeps only the latest update
-    /// of each kind, which loses the response boundary.
-    pub controls: SessionControls,
     pub lifecycle: SessionLifecycle,
     pub permissions: BTreeMap<String, PendingInteraction>,
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
-    /// Finished URL flows, oldest first, with their finish time, kept for
-    /// protocol v2 until they are acknowledged or retained out (protocol
-    /// §3.4). v1 views never show them.
-    pub settled_url_flows: VecDeque<(UrlFlow, std::time::Instant)>,
     pub terminals: BTreeMap<String, Value>,
     // Mirror view headers captured at the last commit so a journal snapshot or
     // hub reset only ever exposes the published view, never uncommitted state.
@@ -194,10 +185,6 @@ pub(crate) struct PendingInteraction {
     pub request: Value,
     pub operation_id: Option<String>,
     pub responding_operation_id: Option<String>,
-    /// Protocol v2: the record of the out-of-session request a
-    /// request-scoped elicitation belongs to. v1 views never show it.
-    #[serde(skip)]
-    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -208,10 +195,6 @@ pub(crate) struct UrlFlow {
     pub(crate) registration_id: String,
     pub request: Value,
     pub status: UrlFlowStatus,
-    /// Protocol v2: the parent record of a global flow, kept after the
-    /// request ends.
-    #[serde(skip)]
-    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,36 +271,6 @@ pub(crate) enum UrlFlowResolution {
     Applied,
     AlreadyTerminal,
     StaleRegistration,
-}
-
-/// Finished session URL flows kept for acknowledgement (protocol §3.4): a
-/// flow leaves only once it is older than `SETTLED_URL_FLOW_RETENTION` and
-/// the last `SETTLED_URL_FLOWS` stay.
-pub(crate) const SETTLED_URL_FLOWS: usize = 16;
-pub(crate) const SETTLED_URL_FLOW_RETENTION: std::time::Duration =
-    std::time::Duration::from_secs(600);
-
-/// Keeps a finished URL flow; the oldest leave once both retention minimums
-/// have passed.
-fn settle(settled: &mut VecDeque<(UrlFlow, std::time::Instant)>, flow: UrlFlow) {
-    let now = std::time::Instant::now();
-    settled.push_back((flow, now));
-    while settled.len() > SETTLED_URL_FLOWS
-        && settled.front().is_some_and(|(_, finished)| {
-            now.saturating_duration_since(*finished) >= SETTLED_URL_FLOW_RETENTION
-        })
-    {
-        settled.pop_front();
-    }
-}
-
-/// Why a URL flow acknowledgement was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UrlFlowAcknowledgement {
-    /// The flow is still waiting for `elicitation/complete`.
-    Waiting,
-    /// No such flow, or it already left.
-    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,12 +579,10 @@ impl SessionRegistry {
                 cwd: cwd.into(),
                 session: Value::Null,
                 control_state: BTreeMap::new(),
-                controls: SessionControls::default(),
                 lifecycle: SessionLifecycle::Attaching,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
-                settled_url_flows: VecDeque::new(),
                 terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
@@ -775,7 +726,6 @@ impl SessionRegistry {
         let candidate = std::mem::take(&mut session.attachment_candidate);
         session.attachment_candidate_bytes = 0;
         session.control_state = extract_control_state(candidate);
-        session.controls = SessionControls::settle(&session.control_state, &response);
         session.session = response;
         owner.operation = None;
 
@@ -840,7 +790,6 @@ impl SessionRegistry {
         let controls = extract_control_state(candidate);
         session.attachment_candidate_bytes = 0;
         session.control_state.extend(controls);
-        session.controls = SessionControls::settle(&session.control_state, &response);
         session.session = response;
         session.lifecycle = SessionLifecycle::Active;
         owner.operation = None;
@@ -933,7 +882,6 @@ impl SessionRegistry {
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
         let session = retain_session_metadata(&session_id, session);
-        let controls = SessionControls::settle(&control_state, &session);
         self.install_live(
             &session_id,
             incarnation,
@@ -942,12 +890,10 @@ impl SessionRegistry {
                 cwd,
                 session,
                 control_state,
-                controls,
                 lifecycle: SessionLifecycle::Active,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
-                settled_url_flows: VecDeque::new(),
                 terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
@@ -1115,9 +1061,6 @@ impl SessionRegistry {
             return Err(RuntimeStateError::SessionNotActive);
         }
         let key = key.into();
-        // A later update folds even when it repeats the stored one: the
-        // response may have replaced its value since.
-        session.controls.fold_update(&update);
         let update = fold_control_update(session.control_state.get(&key), update);
         if session.control_state.get(&key) == Some(&update) {
             return Ok(());
@@ -1148,7 +1091,6 @@ impl SessionRegistry {
         {
             return Err(RuntimeStateError::BusySession);
         }
-        session.controls = SessionControls::settle(&controls, &response);
         session.session = response;
         session.control_state = controls;
         self.commit_session(session_id);
@@ -1389,7 +1331,6 @@ impl SessionRegistry {
                         request,
                         operation_id: active_operation,
                         responding_operation_id: None,
-                        request_id: None,
                     },
                 );
                 self.commit_session(session_id);
@@ -1416,21 +1357,12 @@ impl SessionRegistry {
                         request,
                         operation_id: None,
                         responding_operation_id: None,
-                        request_id: None,
                     },
                 );
                 self.commit_connection();
             }
         }
         Ok(InteractionUpsert::Inserted)
-    }
-
-    /// Protocol v2: names the record a request-scoped elicitation belongs
-    /// to. v1 views never show it, so nothing is journaled.
-    pub(crate) fn set_request_parent(&mut self, interaction_id: &str, request_id: String) {
-        if let Some(pending) = self.request_elicitations.get_mut(interaction_id) {
-            pending.request_id = Some(request_id);
-        }
     }
 
     pub(crate) fn resolve_elicitation(
@@ -1474,7 +1406,6 @@ impl SessionRegistry {
                             registration_id: interaction_id.to_string(),
                             request,
                             status: UrlFlowStatus::Waiting,
-                            request_id: None,
                         },
                     );
                 }
@@ -1497,11 +1428,7 @@ impl SessionRegistry {
                     .request_elicitations
                     .remove(interaction_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
-                let PendingInteraction {
-                    request,
-                    request_id,
-                    ..
-                } = pending;
+                let PendingInteraction { request, .. } = pending;
                 remember_resolved_interaction(
                     &mut self.resolved_request_elicitations,
                     interaction_id,
@@ -1516,7 +1443,6 @@ impl SessionRegistry {
                             registration_id: interaction_id.to_string(),
                             request,
                             status: UrlFlowStatus::Waiting,
-                            request_id,
                         },
                     );
                 }
@@ -1668,7 +1594,7 @@ impl SessionRegistry {
                 {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
-                let mut flow = session
+                let flow = session
                     .url_flows
                     .remove(elicitation_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
@@ -1676,8 +1602,6 @@ impl SessionRegistry {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
                 remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
-                flow.status = status;
-                settle(&mut session.settled_url_flows, flow);
                 self.commit_session(session_id);
             }
             None => {
@@ -1688,7 +1612,7 @@ impl SessionRegistry {
                 {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
-                let mut flow = self
+                let flow = self
                     .request_url_flows
                     .remove(elicitation_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
@@ -1696,71 +1620,10 @@ impl SessionRegistry {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
                 remember_resolved_interaction(&mut self.resolved_request_url_flows, elicitation_id);
-                flow.status = status;
-                settle(&mut self.settled_request_url_flows, flow);
                 self.commit_connection();
             }
         }
         Ok(UrlFlowResolution::Applied)
-    }
-
-    /// Removes a finished session URL flow by the `interactionId` of the
-    /// elicitation that started it; a later flow reusing its `elicitationId`
-    /// is never touched.
-    pub(crate) fn acknowledge_url_flow(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        interaction_id: &str,
-    ) -> Result<(), UrlFlowAcknowledgement> {
-        self.require_epoch(expected_epoch)
-            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
-        let session = self
-            .require_live_mut(session_id, incarnation)
-            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
-        if session
-            .url_flows
-            .values()
-            .any(|flow| flow.registration_id == interaction_id)
-        {
-            return Err(UrlFlowAcknowledgement::Waiting);
-        }
-        let before = session.settled_url_flows.len();
-        session
-            .settled_url_flows
-            .retain(|(flow, _)| flow.registration_id != interaction_id);
-        if session.settled_url_flows.len() == before {
-            return Err(UrlFlowAcknowledgement::Unknown);
-        }
-        self.commit_session(session_id);
-        Ok(())
-    }
-
-    /// `DELETE /api/v2/url-flows/{interactionId}`: removes a finished global
-    /// URL flow by its interaction ID, never by its `elicitationId`.
-    pub(crate) fn acknowledge_request_url_flow(
-        &mut self,
-        expected_epoch: &str,
-        interaction_id: &str,
-    ) -> Result<(), UrlFlowAcknowledgement> {
-        self.require_epoch(expected_epoch)
-            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
-        if self
-            .request_url_flows
-            .values()
-            .any(|flow| flow.registration_id == interaction_id)
-        {
-            return Err(UrlFlowAcknowledgement::Waiting);
-        }
-        let before = self.settled_request_url_flows.len();
-        self.settled_request_url_flows
-            .retain(|(flow, _)| flow.registration_id != interaction_id);
-        if self.settled_request_url_flows.len() == before {
-            return Err(UrlFlowAcknowledgement::Unknown);
-        }
-        self.commit_connection();
-        Ok(())
     }
 
     pub(crate) fn upsert_terminal(
@@ -2029,8 +1892,6 @@ impl SessionRegistry {
         }) {
             return Err(RuntimeStateError::OperationMismatch);
         }
-        // The acknowledged control is the latest state, after any response.
-        session.controls.fold_update(&control_update);
         session
             .control_state
             .insert(control_key.into(), control_update);
@@ -2577,7 +2438,6 @@ mod session_live {
                 request,
                 operation_id: active_operation,
                 responding_operation_id: None,
-                request_id: None,
             },
         );
         Ok(InteractionUpsert::Inserted)
@@ -6829,57 +6689,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn seventeen_recent_url_flow_results_remain_projected_until_acknowledged() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-        let scope = Some(("session", incarnation));
-        for index in 0..17 {
-            let interaction = format!("recent-url-interaction-{index}");
-            let elicitation = format!("recent-url-flow-{index}");
-            state
-                .upsert_elicitation(
-                    "epoch",
-                    scope,
-                    &interaction,
-                    json!({"mode": "url", "message": "Continue", "url": "https://example.test/flow"}),
-                )
-                .unwrap();
-            state
-                .resolve_elicitation("epoch", scope, &interaction, Some(&elicitation))
-                .unwrap();
-            assert_eq!(
-                state
-                    .settle_url_registration(
-                        "epoch",
-                        scope,
-                        &elicitation,
-                        &interaction,
-                        UrlFlowStatus::Completed,
-                    )
-                    .unwrap(),
-                UrlFlowResolution::Applied
-            );
-        }
-
-        let projected = crate::protocol::project_session(&state, "session").unwrap();
-        assert_eq!(
-            projected.url_flows.len(),
-            17,
-            "protocol §3.4 promises ten minutes for every recent terminal URL flow, in addition to the last sixteen"
-        );
-        assert_eq!(
-            projected.url_flows["recent-url-interaction-0"].status,
-            crate::protocol::UrlFlowStatus::Completed
-        );
-        state
-            .acknowledge_url_flow("epoch", "session", incarnation, "recent-url-interaction-0")
-            .unwrap();
-        let projected = crate::protocol::project_session(&state, "session").unwrap();
-        assert_eq!(projected.url_flows.len(), 16);
-        assert!(!projected.url_flows.contains_key("recent-url-interaction-0"));
     }
 
     #[test]

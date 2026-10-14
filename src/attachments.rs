@@ -247,23 +247,6 @@ pub(crate) fn project(value: &mut Value) {
     blocks(value, &mut |block| project_block(block, &owner));
 }
 
-/// Projects one session update, as `project` does for each update of a view.
-pub(crate) fn project_update(update: &mut Value, owner: &SessionResourceOwner) {
-    update_blocks(update, &mut |block| project_block(block, owner));
-}
-
-/// Projects one prompt content block.
-pub(crate) fn project_content(block: &mut Value, owner: &SessionResourceOwner) {
-    project_block(block, owner);
-}
-
-/// Projects the tool call carried by a permission request.
-pub(crate) fn project_permission_request(request: &mut Value, owner: &SessionResourceOwner) {
-    if let Some(call) = request.get_mut("toolCall") {
-        tool_blocks(call, &mut |block| project_block(block, owner));
-    }
-}
-
 pub(crate) fn find(view: &mut Value, attachment_id: &str) -> Option<Value> {
     let mut found = None;
     blocks(view, &mut |block| {
@@ -382,6 +365,20 @@ mod tests {
         project(&mut event);
         assert_eq!(event["change"]["update"]["rawInput"], block);
         assert_eq!(event["change"]["update"]["rawOutput"], block);
+    }
+
+    #[test]
+    fn completed_compaction_summaries_project_and_resolve_their_attachments() {
+        let image = json!({"type":"image","mimeType":"image/png","data":"AQID"});
+        let mut original = json!({"bridgeEpoch":"epoch","sessionId":"session","sessionIncarnation":1,
+            "timeline":[{"sessionUpdate":"compaction_update","status":"completed","summary":[image]}]});
+        let mut projected = original.clone();
+        project(&mut projected);
+        assert!(!projected.to_string().contains("AQID"));
+        let block = &projected["timeline"][0]["summary"][0];
+        assert_eq!(block["type"], "resource_link");
+        let reference = reference(block).expect("host-owned reference");
+        assert_eq!(find(&mut original, &reference.id), Some(image));
     }
 
     #[test]

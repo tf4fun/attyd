@@ -203,7 +203,6 @@ mod tests {
                 attempt_id: Some(allocation.to_owned()),
             },
             url_registration: None,
-            request_parent: None,
         }
     }
 

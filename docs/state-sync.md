@@ -11,8 +11,9 @@ projections.
 
 ## 1. Starting point
 
-An earlier v2 draft is implemented on `main` (its migration steps 1–5). It was never
-completed: no client uses it, and the web UI still runs on `/api/v1`. It is also
+An earlier v2 draft was implemented on `main` (its migration steps 1–5, last at
+`11d04d0`) until step 2 removed it. It was never completed: no client used it, and
+the web UI still runs on `/api/v1`. It was also
 over-designed for the settled model (incarnation owner tags, epochs and log
 positions, a retained log with resume, request records, intent tables, process
 pages). It is therefore **removed first** (§5, step 2), not kept beside the new

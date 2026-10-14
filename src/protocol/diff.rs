@@ -1,4 +1,4 @@
-//! JSON Pointer ops (protocol §4): the generic diff the commit step uses for
+//! JSON Pointer ops (protocol §5.3): the generic diff the bridge uses for
 //! small values, and the patcher every replica applies.
 use serde_json::{Map, Value};
 
@@ -160,7 +160,7 @@ pub(crate) struct ApplyError {
 }
 
 /// Applies one op. A violation is a protocol error; the replica resets the
-/// scope (protocol §4).
+/// scope (protocol §5.3).
 pub(crate) fn apply(document: &mut Value, op: &Op) -> Result<(), ApplyError> {
     let path = match op {
         Op::Set { path, .. }

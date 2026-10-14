@@ -62,9 +62,6 @@ pub(super) struct CapturedRoute {
     pub owner: Option<SessionResourceOwner>,
     pub dispatch_owner: RequestOwner,
     pub url_registration: Option<UrlRegistration>,
-    /// The out-of-session RPC a request-scoped elicitation names, captured
-    /// in wire order (plan §2.4).
-    pub request_parent: Option<RequestOwner>,
 }
 
 /// One accepted event retains its wire order until its local transition finishes.
@@ -112,10 +109,6 @@ struct SenderInner {
     epoch: String,
     events: mpsc::UnboundedSender<IngressItem>,
     replays: SyncMutex<HashMap<String, (RequestId, ReplayCandidate)>>,
-    /// Outstanding RPCs by their JSON-RPC ID, so a request-scoped
-    /// elicitation finds its parent (plan §2.4). An entry leaves once its
-    /// completion has passed the coordinator, after every earlier event.
-    outstanding: OutstandingRpcs,
     ordered: OrderedIngress<IngressItem>,
     handoff: CompletionHandoff,
     wake: Arc<Notify>,
@@ -124,10 +117,6 @@ struct SenderInner {
     closed: CancellationToken,
     fault: FaultReporter,
 }
-
-/// Outstanding RPCs by JSON-RPC ID; bridge state holds the same table, never
-/// the sender itself.
-pub(super) type OutstandingRpcs = Arc<SyncMutex<HashMap<RequestId, RequestOwner>>>;
 
 #[derive(Clone)]
 pub(super) struct IngressSender {
@@ -248,7 +237,6 @@ impl Scheduling {
                 epoch,
                 events,
                 replays: SyncMutex::new(HashMap::new()),
-                outstanding: OutstandingRpcs::default(),
                 ordered,
                 handoff,
                 wake: wake.clone(),
@@ -713,16 +701,6 @@ impl IngressSender {
         })
     }
 
-    /// The owner of the RPC with this JSON-RPC ID, while its completion has
-    /// not passed the coordinator.
-    pub(super) fn outstanding_rpcs(&self) -> OutstandingRpcs {
-        self.inner.outstanding.clone()
-    }
-
-    pub(super) fn outstanding_owner(&self, request_id: &RequestId) -> Option<RequestOwner> {
-        self.inner.outstanding.lock().ok()?.get(request_id).cloned()
-    }
-
     /// Drop the previous execution turn before awaiting a continuation. This
     /// inserts new work in FIFO order and never holds a ticket while waiting.
     pub(super) async fn continue_owner(&self, owner: RequestOwner) -> Result<ExecutionTurn, Error> {
@@ -787,21 +765,6 @@ impl PreparedRpc {
             .ordered
             .send_registered(connection, request, self.reservation)
             .map_err(scheduling_error)?;
-        // Still inside the receive gate: no event naming this ID can be
-        // routed before the entry exists.
-        self.sender
-            .inner
-            .outstanding
-            .lock()
-            .expect("outstanding RPC registry lock poisoned")
-            .insert(
-                registered.request_id.clone(),
-                self.registration.owner().clone(),
-            );
-        let outstanding = Some(OutstandingRegistration {
-            sender: self.sender.clone(),
-            request_id: registered.request_id.clone(),
-        });
         let replay_registration = session_id.zip(self.replay).map(|(session_id, replay)| {
             replays.insert(session_id.clone(), (registered.request_id.clone(), replay));
             ReplayRegistration {
@@ -823,21 +786,7 @@ impl PreparedRpc {
             request_id: registered.request_id,
             sent: registered.sent,
             replay_registration,
-            _outstanding: outstanding,
         })
-    }
-}
-
-struct OutstandingRegistration {
-    sender: IngressSender,
-    request_id: RequestId,
-}
-
-impl Drop for OutstandingRegistration {
-    fn drop(&mut self) {
-        if let Ok(mut outstanding) = self.sender.inner.outstanding.lock() {
-            outstanding.remove(&self.request_id);
-        }
     }
 }
 
@@ -873,8 +822,6 @@ pub(super) struct PendingRpc<Response> {
     pub request_id: agent_client_protocol::schema::v1::RequestId,
     sent: SentRequest<Response>,
     replay_registration: Option<ReplayRegistration>,
-    /// Dropped after the completion passed the coordinator.
-    _outstanding: Option<OutstandingRegistration>,
 }
 
 impl<Response> PendingRpc<Response> {
@@ -1776,7 +1723,6 @@ mod tests {
                 owner: Some(captured),
                 registration_id: "registration-1".into(),
             }),
-            request_parent: None,
         });
         scheduling
             .route_global(item)

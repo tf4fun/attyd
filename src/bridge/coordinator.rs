@@ -84,7 +84,6 @@ pub(super) async fn dispatch_ready(
                 owner: route.owner,
                 dispatch_owner: route.dispatch_owner,
                 url_registration: route.url_registration,
-                request_parent: route.request_parent,
                 request_lease,
                 ..services.clone()
             };
@@ -118,7 +117,7 @@ impl Coordinator {
         item: IngressItem,
         scheduling: &Scheduling,
         ingress: &IngressSender,
-        state: &Arc<BridgeLock>,
+        state: &Arc<Mutex<BridgeState>>,
         sink: &EventSink,
     ) -> Result<(), Error> {
         let mut ready = VecDeque::from([item]);
@@ -378,25 +377,11 @@ impl Coordinator {
                     }
                     _ => None,
                 };
-                let request_parent = match &item.event {
-                    BridgeIngress::Acp(Dispatch::Request(message, _))
-                        if CreateElicitationRequest::matches_method(message.method()) =>
-                    {
-                        message
-                            .params()
-                            .get("requestId")
-                            .cloned()
-                            .and_then(|id| serde_json::from_value(id).ok())
-                            .and_then(|id| ingress.outstanding_owner(&id))
-                    }
-                    _ => None,
-                };
                 (
                     CapturedRoute {
                         owner,
                         dispatch_owner,
                         url_registration,
-                        request_parent,
                     },
                     incarnation,
                 )

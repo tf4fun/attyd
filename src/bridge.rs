@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
@@ -29,12 +29,6 @@ use crate::mcp::McpManager;
 use crate::mcp_config::{server_name, server_type};
 use crate::options::{Options, Transport};
 use crate::ordered_ingress::{RequestClass, RequestOwner};
-use crate::protocol::hub::{ScopeRequest, StreamQueue};
-use crate::protocol::{
-    AgentLaunch, AgentPhase, AgentState, AgentTransport, EndReason, EpochPredecessor,
-    ErrorCode as ProtocolErrorCode, GlobalState, McpServerKind, McpServerSummary, Position,
-    ProtocolError, Replication, SessionState, Snapshot,
-};
 use crate::runtime_state::{
     RuntimeEffect, SessionLifecycle, SessionOperationKind as RuntimeSessionOperationKind,
     SessionTurnError, UrlFlowResolution, UrlFlowStatus,
@@ -58,26 +52,15 @@ use crate::session_state::SessionAdmission;
 use crate::terminal::{TerminalManager, TerminalSnapshot};
 
 mod agent_dispatch;
-#[cfg(test)]
-mod command_tests;
-pub(crate) mod commands;
-#[cfg(test)]
-mod convergence_tests;
 mod coordinator;
 #[cfg(test)]
 mod coordinator_tests;
-#[cfg(test)]
-mod global_tests;
 mod inbound_requests;
 #[cfg(test)]
 mod memory_efficiency_tests;
 #[cfg(test)]
 mod memory_retention_tests;
 mod scheduling;
-#[cfg(test)]
-mod stream_client;
-#[cfg(test)]
-mod stream_tests;
 #[cfg(test)]
 mod unobserved_tests;
 
@@ -284,298 +267,6 @@ struct BridgeState {
     observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
     observer_timeout: Option<i64>,
     observers_stopped: bool,
-    /// The protocol v2 `agent` document, owned by the connection task.
-    agent: AgentState,
-    /// The protocol v2 commit step: published documents and the log.
-    replication: Replication,
-    /// First-subscription leases on owners that commands returned.
-    first_leases: commands::FirstLeases,
-    /// Terminal values as the first process page read of each held session's
-    /// current history revision saw them; process pages are immutable.
-    process_terminals: HashMap<String, (u64, String, serde_json::Map<String, Value>)>,
-    /// `agent_request` records of out-of-session ACP requests that no v2
-    /// command started, by the v1 operation ID that sends them.
-    agent_requests: HashMap<String, String>,
-    /// The JSON-RPC request each named request-scoped elicitation belongs
-    /// to; it lives while that RPC is outstanding (protocol §3.4).
-    request_children: HashMap<String, agent_client_protocol::schema::v1::RequestId>,
-    /// The ingress's outstanding RPC table.
-    outstanding_rpcs: Option<scheduling::OutstandingRpcs>,
-}
-
-impl BridgeState {
-    /// The protocol v2 commit step for every scope (plan §2.2).
-    fn commit(&mut self) {
-        commands::settle_turn_intents(self);
-        commands::release_process_terminals(self);
-        commands::end_finished_request_children(self);
-        self.replication
-            .commit(&self.agent, self.catalog_revision, &self.sessions);
-    }
-}
-
-/// The bridge actor's state. A guard that took mutable access ends its
-/// transition with the commit step when it is released, so no transition can
-/// change what replicas see without committing it (S1).
-struct BridgeLock(Mutex<BridgeState>);
-
-struct BridgeGuard<'a> {
-    state: tokio::sync::MutexGuard<'a, BridgeState>,
-    touched: bool,
-}
-
-impl BridgeLock {
-    fn new(state: BridgeState) -> Self {
-        Self(Mutex::new(state))
-    }
-
-    async fn lock(&self) -> BridgeGuard<'_> {
-        BridgeGuard {
-            state: self.0.lock().await,
-            touched: false,
-        }
-    }
-
-    fn try_lock(&self) -> Result<BridgeGuard<'_>, tokio::sync::TryLockError> {
-        Ok(BridgeGuard {
-            state: self.0.try_lock()?,
-            touched: false,
-        })
-    }
-
-    /// Mutable access that skips the commit step, so the convergence harness
-    /// can prove it catches a transition without one.
-    #[cfg(test)]
-    async fn lock_without_commit(&self) -> tokio::sync::MutexGuard<'_, BridgeState> {
-        self.0.lock().await
-    }
-}
-
-impl std::ops::Deref for BridgeGuard<'_> {
-    type Target = BridgeState;
-
-    fn deref(&self) -> &BridgeState {
-        &self.state
-    }
-}
-
-impl std::ops::DerefMut for BridgeGuard<'_> {
-    fn deref_mut(&mut self) -> &mut BridgeState {
-        self.touched = true;
-        &mut self.state
-    }
-}
-
-impl Drop for BridgeGuard<'_> {
-    fn drop(&mut self) {
-        if self.touched {
-            self.state.commit();
-        }
-    }
-}
-
-/// The server's handle on one generation's replicated state (protocol §4,
-/// §6). Reads and stream cuts take the bridge lock, so each sees a committed
-/// position. Once the connection ends, only its final `global` document
-/// remains readable.
-#[derive(Clone, Default)]
-pub(crate) struct ReplicationSource(Arc<std::sync::Mutex<SourceState>>);
-
-#[derive(Default)]
-struct SourceState {
-    state: Weak<BridgeLock>,
-    ended: Option<Snapshot<GlobalState>>,
-    /// Why the previous epoch ended; the connection publishes it as
-    /// `agent.predecessor`.
-    predecessor: Option<EpochPredecessor>,
-}
-
-/// A stream's queue and the observation leases it holds on its owners.
-pub(crate) struct StreamSubscription {
-    pub(crate) queue: Arc<StreamQueue>,
-    observer_id: u64,
-    leases: Vec<(String, ObservationLease)>,
-    observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
-}
-
-impl Drop for StreamSubscription {
-    fn drop(&mut self) {
-        self.queue.close();
-        for (session_id, lease) in self.leases.drain(..) {
-            lease.cancel();
-            if let Some(events) = &self.observer_events {
-                let _ = events.send(BridgeInput::UnobserveSession {
-                    session_id,
-                    observer_id: self.observer_id,
-                    lease,
-                });
-            }
-        }
-    }
-}
-
-impl ReplicationSource {
-    fn source(&self) -> std::sync::MutexGuard<'_, SourceState> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// The source of the connection that follows the epoch `predecessor`
-    /// names.
-    pub(crate) fn succeeding(predecessor: Option<EpochPredecessor>) -> Self {
-        let source = Self::default();
-        source.source().predecessor = predecessor;
-        source
-    }
-
-    /// The epoch and final agent phase of an ended connection.
-    pub(crate) fn ended_agent(&self) -> Option<(String, AgentPhase)> {
-        self.source()
-            .ended
-            .as_ref()
-            .map(|ended| (ended.at.epoch.clone(), ended.state.agent.phase))
-    }
-
-    fn attach(&self, state: &Arc<BridgeLock>) {
-        self.source().state = Arc::downgrade(state);
-    }
-
-    fn live(&self) -> Option<Arc<BridgeLock>> {
-        self.source().state.upgrade()
-    }
-
-    /// Keeps the connection's final `global` document readable after the
-    /// bridge state is gone.
-    fn freeze(&self, snapshot: Snapshot<GlobalState>) {
-        let mut source = self.source();
-        source.ended = Some(snapshot);
-        source.state = Weak::new();
-    }
-
-    /// `GET /api/v2/global`; `None` before the connection started.
-    pub(crate) async fn global(&self) -> Option<Snapshot<GlobalState>> {
-        let Some(state) = self.live() else {
-            return self.source().ended.clone();
-        };
-        let state = state.lock().await;
-        Some(state.replication.global_snapshot(
-            &state.agent,
-            state.catalog_revision,
-            &state.sessions,
-        ))
-    }
-
-    /// `GET /api/v2/sessions/{id}`: `Some(None)` when the session is not
-    /// held. Never materializes anything.
-    pub(crate) async fn session(&self, session_id: &str) -> Option<Option<Snapshot<SessionState>>> {
-        let state = self.live()?;
-        let state = state.lock().await;
-        Some(
-            state
-                .replication
-                .session_snapshot(&state.sessions, session_id),
-        )
-    }
-
-    /// Opens a stream at a cut atomic with the bridge actor. Each held owner
-    /// it names gets an observation lease; nothing is materialized.
-    pub(crate) async fn subscribe(
-        &self,
-        scopes: Vec<ScopeRequest>,
-        last_event: Option<Position>,
-        observer_id: u64,
-    ) -> Option<StreamSubscription> {
-        let state = self.live()?;
-        let mut state = state.lock().await;
-        let state = &mut *state;
-        let epoch = state.sessions.epoch().to_string();
-        let mut leases = Vec::new();
-        for scope in &scopes {
-            let ScopeRequest::Session {
-                session_id,
-                epoch: owner_epoch,
-                incarnation,
-            } = scope
-            else {
-                continue;
-            };
-            if *owner_epoch != epoch
-                || state.replication.held_incarnation(session_id) != Some(*incarnation)
-            {
-                continue;
-            }
-            let Ok(resources) = state.sessions.resources_mut(session_id, *incarnation) else {
-                continue;
-            };
-            let lease = ObservationLease::new();
-            if resources.observers.observe(observer_id, lease.clone()) {
-                leases.push((session_id.clone(), lease));
-                commands::take_over_first_subscription_leases(state, session_id, *incarnation);
-            }
-        }
-        refresh_observer_timers(state);
-        let queue = state.replication.subscribe(
-            &state.agent,
-            state.catalog_revision,
-            &state.sessions,
-            scopes,
-            last_event.as_ref(),
-        );
-        Some(StreamSubscription {
-            queue,
-            observer_id,
-            leases,
-            observer_events: state.observer_events.clone(),
-        })
-    }
-}
-
-/// The `End` reason a retirement records for its scope.
-fn end_reason(reason: &str) -> EndReason {
-    match reason {
-        "closed" => EndReason::Closed,
-        "deleted" => EndReason::Deleted,
-        "unobserved" => EndReason::Unobserved,
-        _ => EndReason::Gone,
-    }
-}
-
-/// The launch metadata the `agent` document shows; environment values and
-/// MCP server commands stay host-private.
-fn agent_launch(options: &Options) -> AgentLaunch {
-    AgentLaunch {
-        transport: match options.transport {
-            Transport::Stdio => AgentTransport::Stdio,
-            Transport::Http => AgentTransport::Http,
-            Transport::Ws => AgentTransport::Ws,
-        },
-        command: options.command.clone(),
-        cwd: options.cwd.to_string_lossy().into_owned(),
-        read_only: options.read_only,
-        additional_directories: options
-            .additional_directories
-            .iter()
-            .map(|directory| directory.to_string_lossy().into_owned())
-            .collect(),
-        mcp_servers: options
-            .mcp_servers
-            .iter()
-            .filter_map(|server| {
-                let kind = match server {
-                    McpServer::Stdio(_) => McpServerKind::Stdio,
-                    McpServer::Http(_) => McpServerKind::Http,
-                    McpServer::Sse(_) => McpServerKind::Sse,
-                    McpServer::Acp(_) => McpServerKind::Acp,
-                    _ => return None,
-                };
-                Some(McpServerSummary {
-                    name: server_name(server).to_string(),
-                    kind,
-                })
-            })
-            .collect(),
-    }
 }
 
 fn session_ingest<'a>(state: &'a BridgeState, session_id: &str) -> Option<&'a SessionResources> {
@@ -1509,9 +1200,6 @@ fn retire_session_observation(
     incarnation: u64,
     reason: &str,
 ) {
-    state
-        .replication
-        .note_retirement(session_id, incarnation, end_reason(reason));
     sink.send(json!({
         "type": "bridge/session_retired", "sessionId": session_id,
         "bridgeEpoch": state.sessions.epoch(), "sessionIncarnation": incarnation,
@@ -2011,7 +1699,7 @@ struct CommandContext {
     prepared_attachment: Option<PreparedAttachment>,
     ingress: Option<scheduling::IngressSender>,
     options: Arc<Options>,
-    state: Arc<BridgeLock>,
+    state: Arc<Mutex<BridgeState>>,
     sink: EventSink,
     terminals: Option<TerminalManager>,
     filesystem: Option<Arc<WorkspaceFileSystem>>,
@@ -2398,24 +2086,6 @@ pub async fn run_with_cancellation(
     events: EventSender,
     cancellation: CancellationToken,
 ) {
-    run_with_replication(
-        options,
-        commands,
-        events,
-        cancellation,
-        ReplicationSource::default(),
-    )
-    .await;
-}
-
-/// Runs one generation, attaching its replicated state to `replication`.
-pub(crate) async fn run_with_replication(
-    options: Arc<Options>,
-    commands: mpsc::UnboundedReceiver<BridgeInput>,
-    events: EventSender,
-    cancellation: CancellationToken,
-    replication: ReplicationSource,
-) {
     let sink = EventSink { tx: events };
     let mcp_servers = options
         .mcp_servers
@@ -2445,13 +2115,12 @@ pub(crate) async fn run_with_replication(
                 .on_fatal(move |error| {
                     let _ = fatal_tx.send(error);
                 });
-            let connection = run_connection_with(
+            let connection = run_connection(
                 agent,
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
-                replication.clone(),
             );
             tokio::pin!(connection);
             tokio::select! {
@@ -2476,25 +2145,23 @@ pub(crate) async fn run_with_replication(
             }
         }
         Transport::Ws => {
-            run_connection_with(
+            run_connection(
                 crate::websocket_agent::WebSocketAgent::new(options.command[0].clone()),
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
-                replication.clone(),
             )
             .await
         }
         Transport::Http => match remote_http_client(&options.command[0]) {
             Ok(client) => {
-                run_connection_with(
+                run_connection(
                     client,
                     options.clone(),
                     commands,
                     sink.clone(),
                     cancellation.clone(),
-                    replication.clone(),
                 )
                 .await
             }
@@ -2529,44 +2196,16 @@ fn remote_http_client(
 async fn run_connection<T>(
     transport: T,
     options: Arc<Options>,
-    commands: mpsc::UnboundedReceiver<BridgeInput>,
-    sink: EventSink,
-    cancellation: CancellationToken,
-) -> Result<(), Error>
-where
-    T: ConnectTo<Client>,
-{
-    run_connection_with(
-        transport,
-        options,
-        commands,
-        sink,
-        cancellation,
-        ReplicationSource::default(),
-    )
-    .await
-}
-
-async fn run_connection_with<T>(
-    transport: T,
-    options: Arc<Options>,
     mut commands: mpsc::UnboundedReceiver<BridgeInput>,
     sink: EventSink,
     cancellation: CancellationToken,
-    replication: ReplicationSource,
 ) -> Result<(), Error>
 where
     T: ConnectTo<Client>,
 {
-    let state = Arc::new(BridgeLock::new(BridgeState::default()));
-    replication.attach(&state);
+    let state = Arc::new(Mutex::new(BridgeState::default()));
     #[cfg(test)]
     memory_retention_tests::capture_coordinator_state(&state);
-    let authority = state.clone();
-    // Every exit after the epoch exists, setup failures included, ends with
-    // the agent's terminal state below.
-    let predecessor = replication.source().predecessor.clone();
-    let result: Result<(), Error> = async move {
     let epoch = state.lock().await.sessions.epoch().to_string();
     let (mut scheduling, ingress) =
         scheduling::Scheduling::new(epoch.clone(), sink.clone(), cancellation.clone())?;
@@ -2576,9 +2215,6 @@ where
         let mut state = state.lock().await;
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
-        state.outstanding_rpcs = Some(ingress.outstanding_rpcs());
-        state.agent = AgentState::starting(agent_launch(&options));
-        state.agent.predecessor = predecessor;
     }
     sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(
         state.lock().await.sessions.snapshot(),
@@ -2620,18 +2256,7 @@ where
         });
     }
     let mcp = McpManager::new(options.cwd.clone(), options.acp_mcp_providers.clone());
-    let (auth_terminal_events, mut auth_terminal_rx) = mpsc::unbounded_channel();
-    let auth_terminal = AuthTerminalManager::new(sink.tx.clone()).observed_by(auth_terminal_events);
-    {
-        // Auth terminal records follow the terminal's events in order.
-        let state = Arc::downgrade(&state);
-        tokio::spawn(async move {
-            while let Some(event) = auth_terminal_rx.recv().await {
-                let Some(state) = state.upgrade() else { break };
-                commands::auth_terminal_event(&mut *state.lock().await, &event);
-            }
-        });
-    }
+    let auth_terminal = AuthTerminalManager::new(sink.tx.clone());
     let prompt_lifecycle = Arc::new(PromptLifecycle::default());
 
     let agent_services = agent_dispatch::AgentContext {
@@ -2650,7 +2275,6 @@ where
             attempt_id: None,
         },
         url_registration: None,
-        request_parent: None,
         request_lease: None,
     };
     let builder = Client.builder().on_receive_dispatch(
@@ -2666,7 +2290,6 @@ where
     builder
         .connect_with(transport, async move |connection| {
             let _auth_terminal_cleanup = auth_terminal.close_on_drop();
-            state.lock().await.agent.phase = AgentPhase::Initializing;
             sink.send(json!({ "type": "bridge/phase", "phase": "initializing" }));
             let initialize = InitializeRequest::new(ProtocolVersion::V1)
                 .client_capabilities(client_capabilities(&options))
@@ -2694,8 +2317,6 @@ where
                     .iter()
                     .map(|method| (method.id().0.to_string(), method.clone()))
                     .collect();
-                state.agent.phase = AgentPhase::Ready;
-                state.agent.initialize = serde_json::to_value(&response).ok();
             }
             sink.typed("acp/initialized", &response);
             sink.send(json!({ "type": "bridge/phase", "phase": "ready" }));
@@ -2723,10 +2344,7 @@ where
                         _ = connection.incoming_closed() => break None,
                         input = observer_rx.recv() => {
                             if let Some(input) = input {
-                                // Observation inputs are reserved; v2 commands
-                                // share the class their v1 form has.
-                                let class = browser_traffic_class(&input);
-                                let _ = ingress.try_browser(input, class);
+                                let _ = ingress.try_browser(input, crate::session_dispatch::TrafficClass::Reserved);
                             }
                         }
                         input = commands.recv() => {
@@ -2897,7 +2515,6 @@ where
                         {
                             resources.observers.unobserve(observer_id, &lease);
                         }
-                        commands::forget_first_subscription_lease(&mut state, observer_id);
                         refresh_observer_timers(&mut state);
                         continue;
                     }
@@ -3053,10 +2670,6 @@ where
                     };
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
                         responder.error(error);
-                        // A turn refused before admission leaves no v2 intent.
-                        if let Some(key) = request_id.as_deref() {
-                            context.state.lock().await.sessions.commands.turn_refused(key);
-                        }
                     }
                     match (&business_responder, &result) {
                         (Some(responder), Ok(())) => {
@@ -3143,45 +2756,6 @@ where
             Ok(())
         })
         .await
-    }
-    .await;
-    // The epoch's last commit: replicas learn how the connection ended.
-    {
-        let mut state = authority.lock().await;
-        match &result {
-            Ok(()) => {
-                state.agent.phase = AgentPhase::Stopped;
-                state.agent.error = None;
-            }
-            Err(error) => {
-                state.agent.phase = AgentPhase::Error;
-                state.agent.error = Some(agent_error(error));
-            }
-        }
-    }
-    // The terminal state above was delivered by its commit; now every stream
-    // of this epoch drains and closes, and only the final `global` remains.
-    {
-        let mut state = authority.lock().await;
-        let state = &mut *state;
-        state.replication.finish();
-        replication.freeze(state.replication.global_snapshot(
-            &state.agent,
-            state.catalog_revision,
-            &state.sessions,
-        ));
-    }
-    result
-}
-
-/// An ACP error as a v2 `agent_error` (protocol §7): `data` keeps the ACP
-/// error `{ code, message, data }`.
-fn agent_error(error: &Error) -> ProtocolError {
-    ProtocolError {
-        code: ProtocolErrorCode::AgentError,
-        message: error.message.clone(),
-        data: serde_json::to_value(error).ok(),
-    }
 }
 
 fn error_message(error: Error) -> String {
@@ -3190,7 +2764,7 @@ fn error_message(error: Error) -> String {
 
 #[cfg(test)]
 async fn resolve_session_view_waiters(
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
     session_id: &str,
     materialization_id: &str,
@@ -3327,7 +2901,10 @@ fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-async fn apply_runtime_effects(state: &Arc<BridgeLock>, terminals: Option<&TerminalManager>) {
+async fn apply_runtime_effects(
+    state: &Arc<Mutex<BridgeState>>,
+    terminals: Option<&TerminalManager>,
+) {
     let terminal_releases = {
         let mut locked = state.lock().await;
         drain_runtime_effects(&mut locked)
@@ -3367,7 +2944,7 @@ fn client_capabilities(options: &Options) -> ClientCapabilities {
 
 async fn handle_session_update(
     notification: SessionNotification,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
     _terminals: Option<&TerminalManager>,
 ) {
@@ -3701,7 +3278,7 @@ async fn handle_session_update(
 
 async fn cancel_prompts_on_shutdown(
     connection: &ConnectionTo<Agent>,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
     lifecycle: &PromptLifecycle,
 ) {
@@ -3885,7 +3462,7 @@ async fn send_history<Req: JsonRpcRequest>(
     connection: &ConnectionTo<Agent>,
     ingress: Option<&IngressSender>,
     execution: &mut Option<ExecutionTurn>,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     owner: RequestOwner,
     request: Req,
 ) -> Result<Result<Req::Response, Error>, Error> {
@@ -4017,18 +3594,6 @@ async fn handle_command(
         &mut execution,
     )
     .await;
-    // An out-of-session request's record and request-scoped elicitations end
-    // with it (plan §2.4).
-    if matches!(
-        command.get("type").and_then(Value::as_str),
-        Some(
-            "auth/authenticate" | "auth/logout" | "session/new" | "session/list" | "session/delete"
-        )
-    ) && let Some(request_id) = command.get("requestId").and_then(Value::as_str)
-    {
-        let mut state = context.state.lock().await;
-        commands::out_of_session_request_ended(&mut state, request_id, &result);
-    }
     // A registered history flow ends inside the same boundary as its business
     // outcome: the response publishes first, then the flow releases and the
     // idle interval restarts — even when the ordered epilogue was skipped.
@@ -4141,12 +3706,6 @@ async fn handle_command_inner(
                 return Err(Error::invalid_request()
                     .data("terminal authentication methods must use auth/terminal_start"));
             }
-            commands::out_of_session_request(
-                &mut *state.lock().await,
-                request_id,
-                "authenticate",
-                None,
-            );
             let response = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -4157,7 +3716,6 @@ async fn handle_command_inner(
             )
             .await??;
             relay_bytes(&response)?;
-            state.lock().await.agent.authenticated_method_id = Some(method_id.to_string());
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -4171,7 +3729,6 @@ async fn handle_command_inner(
         "auth/logout" => {
             let request_id = string_field(&command, "requestId")?;
             require_agent_method("auth/logout", &state).await?;
-            commands::out_of_session_request(&mut *state.lock().await, request_id, "logout", None);
             let response = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -4182,7 +3739,6 @@ async fn handle_command_inner(
             )
             .await??;
             relay_bytes(&response)?;
-            state.lock().await.agent.authenticated_method_id = None;
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -4198,7 +3754,6 @@ async fn handle_command_inner(
             {
                 let mut state = state.lock().await;
                 state.pending_creations += 1;
-                commands::out_of_session_request(&mut state, &request_id, "session/new", None);
             }
             let request = NewSessionRequest::new(&cwd)
                 .additional_directories(local_additional_directories(&options))
@@ -4282,12 +3837,6 @@ async fn handle_command_inner(
                     }
 
                     session_mirror(&mut state).register_new(session_id.clone(), incarnation);
-                    commands::returned_owner_held(
-                        &mut state,
-                        &request_id,
-                        &session_id,
-                        incarnation,
-                    );
                     advance_catalog_revision(&mut state, &sink);
                     flush_runtime(&mut state, &sink);
                     let mirror_view = session_view_value(&mut state, &session_id, incarnation)?;
@@ -4340,11 +3889,10 @@ async fn handle_command_inner(
             // Keep the Agent's cursor opaque. Business pagination separately binds
             // the whole chain to the directory revision of its first page.
             let catalog_revision = {
-                let mut state = state.lock().await;
+                let state = state.lock().await;
                 if let Some(expected) = expected_revision {
                     require_catalog_revision(&state, expected)?;
                 }
-                commands::out_of_session_request(&mut state, &request_id, "session/list", None);
                 session_catalog_revision(&state)
             };
             // Startup cwd is the new-session default, not a discovery filter.
@@ -4722,7 +4270,6 @@ async fn handle_command_inner(
             require_agent_method("session/fork", &state).await?;
             let (cwd, source_incarnation, source_baseline) = {
                 let mut state = state.lock().await;
-                commands::require_admitted_owner(&state, &command, &source_id)?;
                 let source = state.sessions.active_session(&source_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {source_id}"))
@@ -4972,7 +4519,6 @@ async fn handle_command_inner(
             advance_catalog_revision(&mut state, &sink);
             flush_runtime(&mut state, &sink);
             creation_finish.committed(incarnation)?;
-            commands::returned_owner_held(&mut state, &request_id, &session_id, incarnation);
             drop(state);
             let target_owner =
                 rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
@@ -5011,7 +4557,6 @@ async fn handle_command_inner(
             require_agent_method("session/close", &state).await?;
             let incarnation = {
                 let mut state = state.lock().await;
-                commands::require_admitted_owner(&state, &command, &session_id)?;
                 if session_blocks_unobserved_retire(&state, &session_id)
                     && let Some(permit) = &auto_close
                 {
@@ -5273,23 +4818,10 @@ async fn handle_command_inner(
             let request_id = string_field(&command, "requestId")?.to_string();
             let session_id = string_field(&command, "sessionId")?.to_string();
             require_agent_method("session/delete", &state).await?;
-            let deletion = {
-                let mut state = state.lock().await;
-                commands::require_admitted_owner(&state, &command, &session_id)?;
-                reserve_deletion(&mut state, &session_id, &request_id)?
-            };
+            let deletion = reserve_deletion(&mut *state.lock().await, &session_id, &request_id)?;
             let DeletionReservation::Session(incarnation) = deletion else {
                 // An unopened history row is a catalog operation. Keep only the
                 // ID reservation; its RPC and completion use the global lane.
-                commands::out_of_session_request(
-                    &mut *state.lock().await,
-                    &request_id,
-                    "session/delete",
-                    Some(crate::protocol::RequestTarget {
-                        session_id: session_id.clone(),
-                        incarnation: None,
-                    }),
-                );
                 let result = send_ordered(
                     &connection,
                     ingress.as_ref(),
@@ -5517,10 +5049,6 @@ async fn handle_command_inner(
                     })? {
                     TurnAdmission::Accepted { operation_id } => operation_id,
                     TurnAdmission::Duplicate { operation_id } => {
-                        state
-                            .sessions
-                            .commands
-                            .turn_admitted(&client_intent_id, &operation_id);
                         turn_responder.success(json!({
                             "operationId": operation_id,
                             "disposition": "duplicate",
@@ -5528,12 +5056,6 @@ async fn handle_command_inner(
                         return Ok(());
                     }
                 };
-                // A v2 intent settles with the admission, whether or not
-                // its HTTP caller still waits.
-                state
-                    .sessions
-                    .commands
-                    .turn_admitted(&client_intent_id, &mirror_operation_id);
                 // The accepted turn owns the projection now: an optional
                 // history workflow still parked in backoff yields instead of
                 // retrying over this turn's outcome.
@@ -5635,7 +5157,6 @@ async fn handle_command_inner(
             let mode_id = string_field(&command, "modeId")?.to_string();
             let incarnation = {
                 let mut state = state.lock().await;
-                commands::require_admitted_owner(&state, &command, &session_id)?;
                 let session = state.sessions.active_session(&session_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {session_id}"))
@@ -5793,7 +5314,6 @@ async fn handle_command_inner(
             };
             let incarnation = {
                 let mut state = state.lock().await;
-                commands::require_admitted_owner(&state, &command, &session_id)?;
                 let session = state.sessions.active_session(&session_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {session_id}"))
@@ -6400,7 +5920,7 @@ enum HistorySyncOutcome {
 async fn synchronize_attached_history(
     connection: &ConnectionTo<Agent>,
     options: &Options,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
     cancellation: &CancellationToken,
     session_id: &str,
@@ -6530,7 +6050,7 @@ async fn synchronize_attached_history(
 async fn synchronize_authoritative_history(
     connection: &ConnectionTo<Agent>,
     options: &Options,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
     cancellation: &CancellationToken,
     session_id: &str,
@@ -7004,7 +6524,7 @@ fn local_additional_directories(options: &Options) -> Vec<PathBuf> {
 async fn reserve_attachment(
     session_id: &str,
     kind: RuntimeSessionOperationKind,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
 ) -> Result<AttachmentReservation, Error> {
     reserve_attachment_with_cwd(session_id, kind, None, "test-attachment", None, state).await
 }
@@ -7015,7 +6535,7 @@ async fn reserve_attachment_with_cwd(
     requested_cwd: Option<&str>,
     operation_id: &str,
     materialization_id: Option<&str>,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
 ) -> Result<AttachmentReservation, Error> {
     let mut state = state.lock().await;
     reserve_attachment_locked(
@@ -7432,7 +6952,7 @@ fn commit_runtime_delete_close_success(
 
 async fn require_live_session_incarnation(
     session_id: &str,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
 ) -> Result<u64, Error> {
     let state = state.lock().await;
     live_session_incarnation(&state, session_id).ok_or_else(|| {
@@ -7442,7 +6962,7 @@ async fn require_live_session_incarnation(
 
 async fn require_session_workspace(
     session_id: &str,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     filesystem: &WorkspaceFileSystem,
 ) -> Result<(u64, WorkspaceFileSystem), Error> {
     let (incarnation, cwd) = {
@@ -7458,7 +6978,7 @@ async fn require_session_workspace(
 async fn cancel_interactions(
     session_id: &str,
     incarnation: u64,
-    state: &Arc<BridgeLock>,
+    state: &Arc<Mutex<BridgeState>>,
     sink: &EventSink,
 ) {
     let mut state = state.lock().await;
@@ -7637,7 +7157,10 @@ fn validate_auth_methods(methods: &[AuthMethod], terminal_supported: bool) -> Re
     Ok(())
 }
 
-async fn require_agent_method(operation: &str, state: &Arc<BridgeLock>) -> Result<(), Error> {
+async fn require_agent_method(
+    operation: &str,
+    state: &Arc<Mutex<BridgeState>>,
+) -> Result<(), Error> {
     let capabilities = state
         .lock()
         .await
@@ -7665,41 +7188,6 @@ async fn require_agent_method(operation: &str, state: &Arc<BridgeLock>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn subscription_waiting_on_final_cut_cannot_survive_epoch_finish() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
-        let source = ReplicationSource::default();
-        source.attach(&state);
-        {
-            let mut state = state.lock().await;
-            state.agent.phase = AgentPhase::Stopped;
-        }
-        // Match the final finish/freeze transition, while another request
-        // has upgraded the source's Weak and is waiting for this lock.
-        let mut finishing = state.lock().await;
-        let mut subscribing = Box::pin(source.subscribe(vec![ScopeRequest::Global], None, 1));
-        assert!(futures::poll!(subscribing.as_mut()).is_pending());
-        {
-            let finishing = &mut *finishing;
-            finishing.replication.finish();
-            source.freeze(finishing.replication.global_snapshot(
-                &finishing.agent,
-                finishing.catalog_revision,
-                &finishing.sessions,
-            ));
-        }
-        drop(finishing);
-        if let Some(subscription) = subscribing.await {
-            // It may reject the stale source, or return a finite final cut;
-            // it must not keep an ended epoch's SSE connection open forever.
-            tokio::time::timeout(Duration::from_millis(100), async {
-                while subscription.queue.next().await.is_some() {}
-            })
-            .await
-            .expect("a subscription racing epoch finish must close after draining");
-        }
-    }
     const FORMER_BRIDGE_MESSAGE_BYTES: usize = 5 * 1024 * 1024;
     const FORMER_BRIDGE_IDENTIFIER_LENGTH: usize = 1_024;
     const FORMER_BRIDGE_PATH_LENGTH: usize = 16_384;
@@ -8210,7 +7698,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_completion_publishes_old_outcome_before_waiting_next_turn_can_admit() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         let (tx, mut events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let mut locked = state.lock().await;
@@ -9655,7 +9143,7 @@ mod tests {
     async fn buffers_pre_response_updates_and_drops_late_unknown_sessions() {
         // Zed's ACP regression suite requires load replay notifications arriving before
         // the RPC response to survive. New/fork need the same ordering guarantee here.
-        let state = Arc::new(BridgeLock::new(BridgeState {
+        let state = Arc::new(Mutex::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));
@@ -9730,7 +9218,7 @@ mod tests {
         register_test_session(&mut bridge, "session", "/workspace");
         start_test_turn(&mut bridge, "session", "prompt").unwrap();
         bridge.published_runtime_seq = bridge.sessions.seq();
-        let state = Arc::new(BridgeLock::new(bridge));
+        let state = Arc::new(Mutex::new(bridge));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let invalid: SessionNotification = serde_json::from_value(json!({
@@ -9795,7 +9283,7 @@ mod tests {
             .unwrap()
             .session["modes"] = json!({ "currentModeId": "build" });
         bridge_state.published_runtime_seq = bridge_state.sessions.seq();
-        let state = Arc::new(BridgeLock::new(bridge_state));
+        let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let answer: SessionNotification = serde_json::from_value(json!({
@@ -9891,7 +9379,7 @@ mod tests {
             .revision()
             .to_string();
         let before = bridge_state.sessions.snapshot();
-        let state = Arc::new(BridgeLock::new(bridge_state));
+        let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let late: SessionNotification = serde_json::from_value(json!({
@@ -9946,7 +9434,7 @@ mod tests {
                 register_created_terminal_locked(&mut bridge, &sink, &owner, "terminal").unwrap();
             }
             while rx.try_recv().is_ok() {}
-            let state = Arc::new(BridgeLock::new(bridge));
+            let state = Arc::new(Mutex::new(bridge));
             let notification = serde_json::from_value(json!({
                 "sessionId": "session",
                 "update": {
@@ -10062,7 +9550,7 @@ mod tests {
         let validation =
             ensure_session_validation(&mut bridge_state, "session", incarnation).unwrap();
         validate_and_track_session_update(validation, &json!({ "sessionUpdate": "compaction_update", "compactionId": "original", "status": "in_progress" })).unwrap();
-        let state = Arc::new(BridgeLock::new(bridge_state));
+        let state = Arc::new(Mutex::new(bridge_state));
         reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
             .await
             .unwrap();
@@ -10119,7 +9607,7 @@ mod tests {
             .is_err()
         );
         assert!(reserve_deletion(&mut state, "session", "delete").is_err());
-        let state = Arc::new(BridgeLock::new(state));
+        let state = Arc::new(Mutex::new(state));
         assert!(
             reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
                 .await
@@ -10283,7 +9771,7 @@ mod tests {
             waiters: Vec::new(),
             cancellation: cancellation.clone(),
         });
-        let state = Arc::new(BridgeLock::new(bridge));
+        let state = Arc::new(Mutex::new(bridge));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         for session_id in ["cold", "another-cold"] {
@@ -10360,7 +9848,7 @@ mod tests {
             incarnation: None,
             allocation: staging.validation.allocation.clone(),
         };
-        let state = Arc::new(BridgeLock::new(bridge));
+        let state = Arc::new(Mutex::new(bridge));
         let reservation = reserve_attachment_with_cwd(
             "session",
             RuntimeSessionOperationKind::Load,
@@ -10464,7 +9952,7 @@ mod tests {
             .begin_load("session", incarnation, "load")
             .unwrap();
         clear_attachment_delivery(&mut bridge_state, "session", incarnation);
-        let state = Arc::new(BridgeLock::new(bridge_state));
+        let state = Arc::new(Mutex::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let replay: SessionNotification = serde_json::from_value(json!({
@@ -10543,7 +10031,7 @@ mod tests {
     async fn invalid_same_session_reload_update_is_private_and_poisoned_for_rollback() {
         let mut bridge_state = BridgeState::default();
         let incarnation = register_test_session(&mut bridge_state, "session", "/workspace");
-        let state = Arc::new(BridgeLock::new(bridge_state));
+        let state = Arc::new(Mutex::new(bridge_state));
         reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
             .await
             .unwrap();
@@ -10593,7 +10081,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_early_updates_prevent_session_commit_and_clear_cleanly() {
-        let state = Arc::new(BridgeLock::new(BridgeState {
+        let state = Arc::new(Mutex::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));
@@ -10754,7 +10242,7 @@ mod tests {
                 RuntimeSessionOperationKind::Load,
             )
             .unwrap();
-        let state = Arc::new(BridgeLock::new(bridge));
+        let state = Arc::new(Mutex::new(bridge));
         let (owner, filesystem) = require_session_workspace("session", &state, &filesystem)
             .await
             .unwrap();
@@ -10887,7 +10375,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserves_listed_sessions_once_and_rejects_busy_attachments() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         state.lock().await.listed_sessions.insert(
             "saved".to_string(),
             session_info("saved", "/agent/workspace"),
@@ -10944,7 +10432,7 @@ mod tests {
     async fn reserves_an_idle_tracked_session_for_best_effort_authoritative_reload() {
         let mut bridge = BridgeState::default();
         let incarnation = register_test_session(&mut bridge, "session", "/agent/workspace");
-        let state = Arc::new(BridgeLock::new(bridge));
+        let state = Arc::new(Mutex::new(bridge));
         let reservation = reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
             .await
             .expect("an idle tracked session must reach the Agent's session/load implementation");
@@ -11204,7 +10692,7 @@ mod tests {
             .unwrap()
             .cancellation
             .clone();
-        let state = Arc::new(BridgeLock::new(bridge));
+        let state = Arc::new(Mutex::new(bridge));
         assert!(
             reserve_attachment_with_cwd(
                 "saved",
@@ -11292,7 +10780,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_owner_can_settle_materialization_waiters() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         let (events, _events_rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: events.into() };
         let (sender, mut receiver) = oneshot::channel();
@@ -11574,7 +11062,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_completion_releases_exclusion_before_notifying_shutdown() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         let (_incarnation, operation) = {
             let mut state = state.lock().await;
             let incarnation = register_test_session(&mut state, "session", "/workspace");
@@ -11677,7 +11165,7 @@ mod tests {
 
     #[tokio::test]
     async fn capability_gates_optional_methods_and_configured_features() {
-        let state = Arc::new(BridgeLock::new(BridgeState {
+        let state = Arc::new(Mutex::new(BridgeState {
             agent_capabilities: Some(AgentCapabilities::new()),
             ..BridgeState::default()
         }));
@@ -11949,7 +11437,7 @@ mod tests {
                 .unwrap();
             (permission, elicitation)
         }
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         let (tx, _events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let mut locked = state.lock().await;
@@ -12017,7 +11505,7 @@ mod tests {
 
     #[tokio::test]
     async fn retired_incarnation_effects_cannot_cancel_reused_interaction_or_url_routes() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         let (old_permission_sender, old_permission) = oneshot::channel();
         let (old_elicitation_sender, old_elicitation) = oneshot::channel();
         let (new_permission_sender, mut new_permission) = oneshot::channel();
@@ -12205,7 +11693,7 @@ mod tests {
     async fn prompt_terminal_effects_cancel_owned_responders_in_the_adapter() {
         let (permission_sender, permission_receiver) = oneshot::channel();
         let (elicitation_sender, elicitation_receiver) = oneshot::channel();
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         {
             let mut state = state.lock().await;
             let epoch = state.sessions.epoch().to_string();
@@ -12372,7 +11860,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_cleanup_tombstone_blocks_same_id_reattachment() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         let (tx, _events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let incarnation = {
@@ -12691,7 +12179,7 @@ mod tests {
         let (permission_sender, permission_receiver) = oneshot::channel();
         let (session_sender, session_receiver) = oneshot::channel();
         let (request_sender, _request_receiver) = oneshot::channel();
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
+        let state = Arc::new(Mutex::new(BridgeState::default()));
         {
             let mut state = state.lock().await;
             let epoch = state.sessions.epoch().to_string();
@@ -12877,7 +12365,7 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_early_update_bursts_until_creation_completes() {
-        let state = Arc::new(BridgeLock::new(BridgeState {
+        let state = Arc::new(Mutex::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));

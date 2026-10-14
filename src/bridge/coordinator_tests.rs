@@ -12,7 +12,7 @@ const SESSION: &str = "ordered-interaction";
 const AGENT_REQUEST_ID: u64 = 17;
 
 fn setup() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
-    let state = Arc::new(BridgeLock::new(BridgeState::default()));
+    let state = Arc::new(Mutex::new(BridgeState::default()));
     let (events, receiver) = mpsc::unbounded_channel();
     let sink = EventSink { tx: events.into() };
     let epoch = state.try_lock().unwrap().sessions.epoch().to_owned();
@@ -29,7 +29,6 @@ fn setup() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
             owner: None,
             dispatch_owner: rpc_owner(&epoch, None, "coordinator-test", None),
             url_registration: None,
-            request_parent: None,
             request_lease: None,
         },
         scheduling,
