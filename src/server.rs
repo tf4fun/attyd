@@ -607,9 +607,22 @@ struct BridgeHub {
     // Per-host test barrier for a subscription crossing Agent generations.
     #[cfg(test)]
     after_subscribe_input: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    // Per-host test barrier for the next `create`, `fork` or `list` response.
+    #[cfg(test)]
+    before_op_response: std::sync::Mutex<Option<ResponseHold>>,
     state: Mutex<BridgeHubState>,
     next_subscriber_id: AtomicU64,
     stopped: Notify,
+}
+
+/// The next `create`, `fork` or `list` write, once admitted, tells its op ID
+/// through `admitted` and waits for `resume` before its response takes the
+/// operation's result.
+#[cfg(test)]
+#[allow(dead_code)] // Taken by the ops route (migration step 6).
+struct ResponseHold {
+    admitted: oneshot::Sender<String>,
+    resume: oneshot::Receiver<()>,
 }
 
 struct BridgeSubscription {
@@ -1046,6 +1059,8 @@ impl BridgeHub {
             publication: Publication::default(),
             #[cfg(test)]
             after_subscribe_input: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_op_response: std::sync::Mutex::new(None),
             state: Mutex::new(BridgeHubState::default()),
             next_subscriber_id: AtomicU64::new(1),
             stopped: Notify::new(),
