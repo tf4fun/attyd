@@ -792,7 +792,14 @@ function applySessionLive(
   };
   for (const update of turnUpdates) notify(update);
   for (const [kind, update] of Object.entries(view.controls)) {
-    if (previous.controls[kind] !== update) notify(update);
+    const before = previous.controls[kind];
+    if (before === update) continue;
+    if (JSON.stringify(before) === JSON.stringify(update)) continue;
+    // A title the Agent cleared is absent from the projected update.
+    notify(update.sessionUpdate === "session_info_update" && before?.sessionUpdate === "session_info_update" &&
+      before.title != null && update.title === undefined
+      ? { ...update, title: null }
+      : update);
   }
   const session = view.workspace.session ?? {};
   const previousSession = previous.workspace.session ?? {};

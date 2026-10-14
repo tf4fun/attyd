@@ -360,5 +360,15 @@ describe("useAcp on protocol v2", () => {
     expect(acp.state.authTerminal).toMatchObject({ status: "failed", exitCode: 2, message: "bad code" });
     expect(acp.state.pendingAuth).toBeUndefined();
   });
-});
 
+  it("reconnects by resyncing its stream only, after the Agent connection ended", async () => {
+    await mount("/");
+    await act(async () => bridge.commit("global", [{ op: "set", path: "/agent/phase", value: "stopped" }]));
+    expect(acp.state.phase).toBe("stopped");
+    const streams = bridge.streams.length;
+    await act(async () => acp.reconnect());
+    await settle();
+    expect(bridge.streams.length).toBe(streams + 1);
+    expect(bridge.requests.filter(({ path }) => path.startsWith("/api/v2/agent/"))).toEqual([]);
+  });
+});

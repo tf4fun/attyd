@@ -6337,6 +6337,27 @@ fn commit_completed_turn_history(
         flush_runtime(state, sink);
         let view = session_view_value(state, session_id, incarnation)?;
         let failure = error.as_ref().or(sync_error.as_ref());
+        if let Some(error) = failure {
+            let after_update = state
+                .sessions
+                .history
+                .peek(&crate::history_cache::SessionKey::new(
+                    session_id,
+                    incarnation,
+                ))
+                .map_or(0, |snapshot| snapshot.updates().len());
+            session_mirror(state).record_failed_turn(
+                session_id,
+                incarnation,
+                crate::session_state::FailedTurnOutcome {
+                    operation_id: operation_id.to_string(),
+                    client_intent_id: client_intent_id.to_string(),
+                    error: agent_error_value(error),
+                    prompt: prompt.as_array().cloned().unwrap_or_default(),
+                    after_update,
+                },
+            );
+        }
         let outcome = session_turn_outcome_value(
             state,
             if failure.is_some() {

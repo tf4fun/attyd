@@ -23,12 +23,12 @@ test("transmits the final answer first and fetches execution details only in req
   page.on("request", (request) => {
     if (isProcessUrl(request.url())) processRequests.push(request.url());
   });
-  const initialResponse = page.waitForResponse((response) => {
-    const url = new URL(response.url());
-    return url.pathname === SESSION_PATH && response.request().method() === "GET" && response.ok();
-  });
   await page.goto("/sessions/lazy-process-session");
-  const response = await initialResponse;
+  const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
+  await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
+  // The loaded document is compact: the final answer, never the process.
+  const response = await page.request.get(SESSION_PATH);
+  expect(response.ok()).toBe(true);
   const raw = await response.text();
   expect(raw).toContain(FINAL_ANSWER);
   expect(raw).not.toContain("HIDDEN_PROCESS_PAYLOAD_");
@@ -36,8 +36,6 @@ test("transmits the final answer first and fetches execution details only in req
   const snapshot = JSON.parse(raw).state;
   expect(snapshot.history.collapsedTurns).toHaveLength(1);
   expect(snapshot.history.collapsedTurns[0].processCount).toBe(25);
-  const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
-  await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
   await expect(turn.locator(".turn-process-count")).toHaveText("25 items");
   expect(processRequests).toEqual([]);
   await expect(turn.locator(".tool-card")).toHaveCount(0);

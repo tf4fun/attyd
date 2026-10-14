@@ -112,6 +112,7 @@ struct PublishedHistory {
     snapshot: Option<Weak<HistorySnapshot>>,
     revision: Option<String>,
     outcomes: Vec<CompletedTurnOutcome>,
+    failed: Vec<crate::session_state::FailedTurnOutcome>,
     /// One digest per projected timeline element.
     timeline: Vec<[u8; 16]>,
     collapsed_turns: Value,
@@ -377,7 +378,8 @@ impl Replication {
             Some(history)
                 if history.snapshot.as_ref().map(Weak::as_ptr) == snapshot.map(Arc::as_ptr)
                     && history.revision == state.history_revision
-                    && history.outcomes == state.turn_outcomes =>
+                    && history.outcomes == state.turn_outcomes
+                    && history.failed == state.failed_outcomes =>
             {
                 history
             }
@@ -563,6 +565,7 @@ impl PublishedHistory {
             snapshot: snapshot.map(Arc::downgrade),
             revision: source.state.history_revision.clone(),
             outcomes: source.state.turn_outcomes.clone(),
+            failed: source.state.failed_outcomes.clone(),
             timeline: timeline.iter().map(digest).collect(),
             collapsed_turns: json!(std::mem::take(&mut section.collapsed_turns)),
             projected_outcomes: json!(std::mem::take(&mut section.outcomes)),
@@ -580,6 +583,7 @@ impl Default for PublishedHistory {
             snapshot: None,
             revision: None,
             outcomes: Vec::new(),
+            failed: Vec::new(),
             timeline: Vec::new(),
             collapsed_turns: json!([]),
             projected_outcomes: json!({}),

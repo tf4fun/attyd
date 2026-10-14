@@ -207,8 +207,15 @@ export function useAcp(options: UseAcpOptions = {}) {
     const ended = replica.ended(scope);
     if (ended != null) {
       const view = store.getState().sessionView;
+      const loaded = previousSessionRef.current?.state.history.revision != null;
       subscribe(undefined);
       pendingTurnRef.current = undefined;
+      if (!loaded && ended !== "replaced" && ended !== "deleted") {
+        // The open's load or resume failed before any history: keep the
+        // route. Its record reports why, and a later open may succeed.
+        routeRestoreRef.current = undefined;
+        return;
+      }
       if (ended === "replaced") {
         // The session is held under another owner: open it again.
         if (view != null) dispatch({ type: "bridge/connection_replaced" });
@@ -306,6 +313,13 @@ export function useAcp(options: UseAcpOptions = {}) {
       }
     }
     dispatch({ type: "v2/global", global, previous });
+    const signedIn = global.agent.authenticatedMethodId != null &&
+      previous?.agent.authenticatedMethodId !== global.agent.authenticatedMethodId;
+    if (signedIn && subscribedRef.current == null) {
+      // A session the Agent refused before sign-in can open now.
+      routeRestoreRef.current = undefined;
+      restoreRouteRef.current();
+    }
     if (global.agent.phase === "ready" && previous?.agent.phase !== "ready") {
       if (store.getState().authTerminal?.status === "succeeded") dispatch({ type: "auth/dismiss_terminal" });
       restoreRouteRef.current();
@@ -498,7 +512,15 @@ export function useAcp(options: UseAcpOptions = {}) {
     activeSessionIdRef.current = routeSessionId;
     if (store.getState().sessionView == null) setSessionOpening({ sessionId: routeSessionId });
     void (async () => {
-      let cwd: string | undefined = global.sessions[routeSessionId]?.cwd ?? routeProjectCwd;
+      let cwd: string | undefined = global.sessions[routeSessionId]?.cwd;
+      // The Agent's catalog names the session's workspace; a route's project
+      // may be wrong, so it is only the fallback.
+      if (cwd == null && sessionListSupported()) {
+        const discovered = await discovery;
+        if (!stillCurrent()) return;
+        if (discovered.ok) cwd = discovered.selected?.cwd ?? undefined;
+      }
+      cwd ??= routeProjectCwd;
       if (cwd == null) {
         const discovered = await discovery;
         if (!stillCurrent()) return;
@@ -548,7 +570,10 @@ export function useAcp(options: UseAcpOptions = {}) {
     void refreshSessionList().catch(reportError);
   }, [refreshSessionList, reportError, resetSession, returnHome]);
 
+  /** Resyncs the stream; the bridge starts a new Agent connection if needed. */
   const reconnect = useCallback(() => client().connect(subscriptions()), []);
+  const reconnectRef = useRef(reconnect);
+  reconnectRef.current = reconnect;
 
   useEffect(() => {
     const current = client();
@@ -570,7 +595,7 @@ export function useAcp(options: UseAcpOptions = {}) {
     };
     const recoverClosedStream = () => {
       if (current.closed() || store.getState().phase === "stopped" || store.getState().phase === "error") {
-        current.connect(subscriptions());
+        reconnectRef.current();
       }
     };
     window.addEventListener("online", recoverClosedStream);

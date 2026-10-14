@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::BridgeHub;
 use crate::bridge::ReplicationSource;
@@ -475,13 +475,53 @@ async fn start_turn(
         identifier(&session_id, "session ID")?;
         let key = intent_key(&headers)?;
         let tag = owner_tag(&headers)?;
-        let TurnBody { prompt } = body(&bytes)?;
+        let TurnBody { mut prompt } = body(&bytes)?;
         let source = live(&state).await?;
+        resolve_attachments(&source, &session_id, &tag, &mut prompt).await?;
         Ok(answered(
             source.start_turn(key, session_id, tag, prompt).await,
         ))
     })
     .await
+}
+
+/// Browser history carries attachment references. A resent prompt gets the
+/// original blocks back from the owner it names before admission, as v1 does.
+async fn resolve_attachments(
+    source: &ReplicationSource,
+    session_id: &str,
+    tag: &OwnerTag,
+    prompt: &mut [Value],
+) -> Result<(), ProtocolError> {
+    let mut view = None;
+    for block in prompt.iter_mut() {
+        if block
+            .get("_meta")
+            .and_then(|meta| meta.get(crate::attachments::REFERENCE_KEY))
+            .is_none()
+        {
+            continue;
+        }
+        let reference = crate::attachments::reference(block)
+            .ok_or_else(|| invalid("invalid attachment reference"))?;
+        let owner = reference.owner();
+        if owner.session_id != session_id
+            || owner.epoch != tag.epoch
+            || Some(owner.incarnation) != tag.incarnation
+        {
+            return Err(invalid(
+                "attachment reference belongs to another session owner",
+            ));
+        }
+        if view.is_none() {
+            view = Some(source.owner_view(session_id, Some(tag)).await?);
+        }
+        *block = crate::attachments::find(view.as_mut().expect("read above"), &reference.id)
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::NotFound, "the attachment is no longer available")
+            })?;
+    }
+    Ok(())
 }
 
 async fn cancel_turn(
@@ -770,6 +810,12 @@ async fn stream(
         Err(message) => return error(ErrorCode::InvalidRequest, message),
     };
     // A malformed or foreign Last-Event-ID starts every scope fresh.
+    // The bridge manages its Agent connection: once an epoch has ended, the
+    // next subscriber gets a new one, as v1's global stream does. Reads never
+    // start one.
+    if let Sources::Hub(hub) = &state.0 {
+        hub.ensure_runtime().await;
+    }
     let last_event = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -857,6 +903,54 @@ mod tests {
         );
         assert_eq!(status, StatusCode::OK);
         assert_eq!(document, serde_json::to_value(final_snapshot).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_stream_after_the_epoch_ended_starts_the_next_connection() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use clap::Parser;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing_agent = directory.path().join("agent-that-does-not-exist");
+        let options = crate::options::Options::try_parse_from([
+            "attyd",
+            "--cwd",
+            directory.path().to_str().unwrap(),
+            "--",
+            missing_agent.to_str().unwrap(),
+        ])
+        .unwrap();
+        let hub = BridgeHub::new(Arc::new(options));
+        let ended = || async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while hub.state.lock().await.input.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the unavailable Agent must finish its generation");
+        };
+        hub.ensure_runtime().await;
+        ended().await;
+        let generation = hub.state.lock().await.generation;
+        // The bridge owns the Agent connection: a client only resumes its
+        // stream, and the hub starts the next epoch for it.
+        let response = router(V2State::hub(hub.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v2/stream?scope=global")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The new Agent may already have failed again; the restart is the point.
+        assert_eq!(hub.state.lock().await.generation, generation + 1);
+        drop(response);
+        ended().await;
+        hub.shutdown().await;
     }
 
     #[test]

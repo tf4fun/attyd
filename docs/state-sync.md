@@ -373,6 +373,46 @@ Step 5 adds the global commands and out-of-session records in the same files:
   connection as soon as the old one finished, so a v2-only client sees the new
   epoch; reading an ended epoch's `global` still never restarts the Agent.
 
+Step 6 moves the web UI to v2:
+
+- **Replica engine.** `shared/replica.ts` knows nothing about ACP or React. It holds
+  one document per subscribed scope and applies entries with an immutable JSON
+  Pointer patcher, so untouched subtrees keep their identity. It follows protocol
+  §4 and §4.1 as `src/protocol/stream_replica.rs` does, except that it repairs what
+  the gate reports: a `prev` gap, an op that does not apply, or a document that
+  fails validation (`shared/protocol-validate.ts`, mirroring the generated types)
+  resets only that scope, which keeps showing its last document until the fetched
+  snapshot is installed. `whenApplied(at)` is read-your-writes on `applied`, and
+  `findIntent` looks for a `clientIntentId` in the turn, the outcomes and then
+  `global.requests`.
+- **Client.** `web/src/lib/v2-client.ts` opens one stream for `global` and the open
+  session's owner, fetches snapshots for reset scopes (one read in flight per
+  scope), and resolves every command only once its `at` is applied. A lost
+  response (timeout or network error) is resent with the same `Idempotency-Key`.
+- **Projection.** `web/src/lib/v2-session-view.ts` maps the session document to the
+  reducer's view. History or turn boundaries rebuild the presentation; anything
+  else is applied in place, and a running turn feeds the reducer the raw updates
+  between two folded overlays (`turnUpdateDelta`), so streamed items keep their
+  identity. The processes of turns this client watched stay inline from a cache
+  keyed by `(historyRevision, turnId)`, carried to the next revision while the
+  turn is still there, until the UI releases them; other turns load their
+  immutable pages. This replaces `includeProcessFrom`.
+- **Global.** Auth status, the auth terminal, request-scoped interactions and URL
+  flows come from `global`. A record this client started carries its key, which is
+  the pending operation's ID in the reducer. The sidebar's "working" and "Input
+  needed" markers read `global.sessions` (`work`, `pending`), so a background
+  session or a turn another client started shows too.
+- **Agent connection.** The bridge owns it; the web UI only resyncs its stream.
+  After an epoch ended, the hub starts the next connection for the next stream
+  subscriber (as v1's global stream does); `GET /api/v2/global` still never does.
+- **Backend gaps closed here.** Failed turns are kept per session (the last 16) and
+  published as `outcomes` with `status: "failed"`, the ACP error and the exact
+  prompt, so a fresh replica can show and retry them. `POST …/turns` resolves
+  attachment references in a resent prompt against the owner it names, as v1 does.
+- **Not yet v2.** Attachment links and the Markdown export still read v1: a link
+  cannot send `If-Match`, and v2 has no complete, attachment-inclusive read. Step 7
+  needs a v2 answer for both before it removes v1.
+
 **Cold delete.** `If-Match: "<epoch>:0"` is checked against the registry in the same
 actor turn that starts the request, so there is no window in which the session
 becomes held unseen. It keeps the path tested by
@@ -536,7 +576,10 @@ discards the replica at the critical point and rebuilds it from public state:
 | Early `session/new` updates, once #8 is fixed | baseline seeding |
 
 Browser tests check only the browser's half: applying a valid entry stream gives the
-same replica as loading the final snapshot. These extend the existing fuzz tests.
+same replica as loading the final snapshot. These extend the existing fuzz tests
+(`tests/fuzz.test.ts`): the stream is followed, cut by a coalesced reset with an HTTP
+snapshot overtaking or trailing its buffered entries, or resumed from an earlier
+position.
 
 ## 5. Migration
 

@@ -1137,6 +1137,40 @@ async fn a_turn_cancel_is_a_control_on_the_running_turn() {
     peer.stop().await;
 }
 
+/// Protocol §3.2: a failed turn's outcome keeps its error and the exact
+/// prompt, so a fresh replica can show the failure and retry it.
+#[tokio::test]
+async fn a_failed_turn_keeps_its_error_and_prompt_in_the_outcomes() {
+    let mut peer = Peer::start(-1, json!({})).await;
+    create(&mut peer).await;
+    let (turn, prompt) = start_turn(&mut peer, "failing").await;
+    let operation_id = turn["result"]["operationId"].as_str().unwrap().to_string();
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": prompt["id"],
+        "error": {"code": -32603, "message": "Synthetic failure", "data": {"retry": true}},
+    }))
+    .await;
+    let documents = peer
+        .until("the failed outcome is published", |documents| {
+            session(documents)["outcomes"][&operation_id]["status"] == "failed"
+        })
+        .await;
+    let outcome = &session(&documents)["outcomes"][&operation_id];
+    assert_eq!(outcome["clientIntentId"], "failing", "{outcome}");
+    assert_eq!(outcome["error"]["code"], "agent_error", "{outcome}");
+    assert_eq!(outcome["error"]["data"]["code"], -32603, "{outcome}");
+    assert_eq!(outcome["error"]["data"]["message"], "Synthetic failure");
+    assert_eq!(outcome["error"]["data"]["data"], json!({"retry": true}));
+    assert_eq!(
+        outcome["prompt"],
+        json!([{"type": "text", "text": "Run it"}]),
+        "{outcome}"
+    );
+    assert!(session(&documents)["turn"].is_null());
+    peer.stop().await;
+}
+
 /// Plan §4.2: flow A completes, the Agent reuses its `elicitationId` for
 /// flow B, and a late acknowledgement of A must not touch B.
 #[tokio::test]

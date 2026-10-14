@@ -581,6 +581,33 @@ impl SessionRegistry {
         self.sessions.get(session_id).map(|entry| &entry.state)
     }
 
+    /// Keeps a failed turn's outcome for v2 recovery, the latest
+    /// `FAILED_OUTCOMES_KEPT` of them per incarnation.
+    pub(crate) fn record_failed_turn(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        outcome: crate::session_state::FailedTurnOutcome,
+    ) {
+        let Some(state) = self
+            .sessions
+            .get_mut(session_id)
+            .map(|entry| &mut entry.state)
+            .filter(|state| state.incarnation == incarnation)
+        else {
+            return;
+        };
+        state
+            .failed_outcomes
+            .retain(|kept| kept.operation_id != outcome.operation_id);
+        state.failed_outcomes.push(outcome);
+        let excess = state
+            .failed_outcomes
+            .len()
+            .saturating_sub(crate::session_state::FAILED_OUTCOMES_KEPT);
+        state.failed_outcomes.drain(..excess);
+    }
+
     pub(crate) fn iter_states(&self) -> impl Iterator<Item = &MirrorSessionState> {
         self.sessions.values().map(|entry| &entry.state)
     }

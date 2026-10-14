@@ -52,6 +52,22 @@ pub(crate) struct CompletedTurnOutcome {
     pub client_intent_id: String,
 }
 
+/// A turn that ended with an error (protocol §3.2). Only v2 publishes it; v1
+/// reports failures as events.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FailedTurnOutcome {
+    pub operation_id: String,
+    pub client_intent_id: String,
+    /// The ACP error: `{ code, message, data }`.
+    pub error: Value,
+    /// The exact prompt, kept for a retry.
+    pub prompt: Vec<Value>,
+    pub after_update: usize,
+}
+
+/// Failed outcomes kept per session (protocol §3.4 minimum).
+pub(crate) const FAILED_OUTCOMES_KEPT: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionState {
@@ -64,6 +80,8 @@ pub(crate) struct SessionState {
     pub phase: MirrorPhase,
     pub active_turn: Option<TurnOverlay>,
     pub turn_outcomes: Vec<CompletedTurnOutcome>,
+    #[serde(skip)]
+    pub failed_outcomes: Vec<FailedTurnOutcome>,
     pub sync_error: Option<String>,
     #[serde(default)]
     pub history_notice: Option<String>,
@@ -159,6 +177,7 @@ impl SessionState {
             phase: MirrorPhase::Cold,
             active_turn: None,
             turn_outcomes: Vec::new(),
+            failed_outcomes: Vec::new(),
             sync_error: None,
             history_notice: None,
             operation: None,

@@ -1,9 +1,8 @@
 # attyd protocol v2
 
 Status: draft, 2026-10-13. The state documents (§3), the replication stream (§4),
-the session commands (§5.1–§5.3, §5.5, §5.6, request acknowledgement from §5.4)
-and the reads of §6 except the catalog are implemented (migration steps 1–4); the
-other global commands, cold delete and the catalog are not yet. This document defines
+the commands (§5) and the reads (§6) are implemented (migration steps 1–5), and
+the web UI runs on them (step 6). This document defines
 the client-facing protocol that replaces today's `/api/v1` business API. The
 [implementation plan](state-sync.md) describes how the bridge produces it. The
 [runtime contract](active-turn-runtime.md) still governs ACP semantics: history
@@ -534,6 +533,12 @@ the guarantee tested by
 the session again after `end`, the replica sends a new open.
 
 Subscribing to `global` never observes a session.
+
+**Agent connection.** The bridge owns its connection to the Agent; clients only keep
+their stream in sync. Once an epoch has ended (`agent.phase` `stopped` or `error`),
+the next stream subscription, a reconnect included, starts a new connection, whose
+epoch arrives on that stream. Reads such as `GET /api/v2/global` never start one, so
+an ended epoch's final `global` stays readable.
 
 ## 5. Commands
 

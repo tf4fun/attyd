@@ -1,7 +1,7 @@
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
 import type { TerminalSnapshot } from "../../../shared/bridge";
 import type { BridgeSessionView, BridgeTurnOutcome, CollapsedTurn } from "../../../shared/business-api";
-import type { CollapsedTurn as V2CollapsedTurn, SessionState } from "../../../shared/protocol";
+import type { CollapsedTurn as V2CollapsedTurn, SessionState, TerminalState as TerminalStateV2 } from "../../../shared/protocol";
 
 /**
  * Processes of turns this client watched live, keyed by
@@ -12,9 +12,15 @@ import type { CollapsedTurn as V2CollapsedTurn, SessionState } from "../../../sh
 export class ObservedProcesses {
   private entries = new Map<string, { revision: string; turnId: string; operationId: string; updates: SessionUpdate[] }>();
   private revision: string | null = null;
+  /**
+   * The last state of every terminal this client saw. A watched turn's
+   * inline process still shows a terminal the document released.
+   */
+  readonly terminals = new Map<string, TerminalStateV2>();
 
   /** Records the transition from `previous` to `next` of one session owner. */
   observe(previous: SessionState | undefined, next: SessionState): void {
+    for (const terminal of Object.values(next.terminals)) this.terminals.set(terminal.terminalId, terminal);
     const revision = next.history.revision;
     if (revision !== this.revision) {
       // A later commit keeps every watched turn that is still in the history.
@@ -48,6 +54,7 @@ export class ObservedProcesses {
 
   clear(): void {
     this.entries.clear();
+    this.terminals.clear();
     this.revision = null;
   }
 }
@@ -121,16 +128,24 @@ export function bridgeSessionView(
     };
   }
   const terminals: Record<string, TerminalSnapshot> = {};
+  if (expanded) {
+    // Released terminals an inline process still references.
+    for (const terminal of processes?.terminals.values() ?? []) {
+      terminals[terminal.terminalId] = { ...terminal, released: true, sessionId: state.sessionId };
+    }
+  }
   for (const terminal of Object.values(state.terminals)) {
     terminals[terminal.terminalId] = { ...terminal, sessionId: state.sessionId };
   }
 
   const controlUpdates: Record<string, SessionUpdate> = {
     available_commands_update: { sessionUpdate: "available_commands_update", availableCommands: controls.commands },
+    // `null` means the Agent never named it (protocol §3.3); the catalog's
+    // title stays until it does.
     session_info_update: {
       sessionUpdate: "session_info_update",
-      title: controls.info.title,
-      updatedAt: controls.info.updatedAt,
+      ...(controls.info.title == null ? {} : { title: controls.info.title }),
+      ...(controls.info.updatedAt == null ? {} : { updatedAt: controls.info.updatedAt }),
       ...(controls.info.meta == null ? {} : { _meta: controls.info.meta as Record<string, unknown> }),
     },
   };

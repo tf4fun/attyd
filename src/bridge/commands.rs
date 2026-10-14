@@ -2125,6 +2125,10 @@ fn known_turn(
                     .turn_outcomes
                     .iter()
                     .any(|outcome| &outcome.operation_id == operation_id)
+                || session
+                    .failed_outcomes
+                    .iter()
+                    .any(|outcome| &outcome.operation_id == operation_id)
         });
     Ok(TurnAccepted {
         operation_id: operation_id.clone(),

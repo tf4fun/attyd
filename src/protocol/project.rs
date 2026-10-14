@@ -10,10 +10,10 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::{
-    ActiveTurn, AgentState, CatalogState, CollapsedTurn, GlobalState, Interaction, OperationKind,
-    PendingCounts, SessionHistory, SessionLifecycle, SessionOperation, SessionPhase, SessionState,
-    SessionSummary, SessionWork, TerminalExitStatus, TerminalState, TurnOutcome, TurnOutcomeStatus,
-    UrlFlow, UrlFlowStatus,
+    ActiveTurn, AgentState, CatalogState, CollapsedTurn, ErrorCode, GlobalState, Interaction,
+    OperationKind, PendingCounts, ProtocolError, SessionHistory, SessionLifecycle,
+    SessionOperation, SessionPhase, SessionState, SessionSummary, SessionWork, TerminalExitStatus,
+    TerminalState, TurnOutcome, TurnOutcomeStatus, UrlFlow, UrlFlowStatus,
 };
 use crate::history_cache::{HistorySnapshot, SessionKey};
 use crate::runtime_state::{self as rt, PendingInteraction, SessionOperationKind};
@@ -185,7 +185,30 @@ impl<'a> SessionSource<'a> {
                 };
                 Some((operation_id, projected))
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        let mut outcomes = outcomes;
+        for failed in &self.state.failed_outcomes {
+            let message = failed.error["message"]
+                .as_str()
+                .unwrap_or("the turn failed")
+                .to_string();
+            outcomes.insert(
+                failed.operation_id.clone(),
+                TurnOutcome {
+                    operation_id: failed.operation_id.clone(),
+                    client_intent_id: failed.client_intent_id.clone(),
+                    status: TurnOutcomeStatus::Failed,
+                    response: None,
+                    error: Some(ProtocolError {
+                        code: ErrorCode::AgentError,
+                        message,
+                        data: Some(failed.error.clone()),
+                    }),
+                    prompt: Some(self.prompt(&failed.prompt)),
+                    after_update: failed.after_update,
+                },
+            );
+        }
         HistorySection {
             timeline,
             collapsed_turns: serde_json::from_value(view["collapsedTurns"].take())

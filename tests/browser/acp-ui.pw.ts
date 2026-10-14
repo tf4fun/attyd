@@ -3489,7 +3489,8 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
       "--terminal-auth-required",
     ],
   });
-  const browserErrors = collectBrowserErrors(page, [409]);
+  // Listing the catalog before sign-in is refused by the Agent.
+  const browserErrors = collectBrowserErrors(page, [{ status: 502, pathname: "/api/v2/catalog" }]);
   let releaseFirstInput!: () => void;
   const firstInputGate = new Promise<void>((resolve) => { releaseFirstInput = resolve; });
   const inputChunks: string[] = [];
