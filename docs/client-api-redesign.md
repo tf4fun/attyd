@@ -174,7 +174,7 @@ type Block =               // normalized content: protocol §3.1
    message are its reply, concatenated in order. Process updates are not part of
    the entry.
 3. **Content.** `prompt` and `reply` are normalized by the same rules:
-   - adjacent text blocks are merged;
+   - adjacent text blocks are merged when they differ only in `text`;
    - image, audio and resource blocks are replaced by an attachment reference
      `{ type: "attachment", id, … }`, where `id` is the SHA-256 of the canonical
      block. This is the bridge's own type, not an ACP `ContentBlock`; a prompt

@@ -153,7 +153,8 @@ from a `session/load` or `session/resume` replay apply the same steps.
    reply, concatenated in order. Agent messages before the first user message form
    a turn with an empty prompt. Process updates are not part of any entry.
 3. **Content.** `prompt` and `reply` are normalized by the same rules:
-   - adjacent text blocks are merged into one;
+   - adjacent text blocks are merged into one when, `_meta` dropped, they differ
+     only in `text`; blocks with different annotations keep their boundary;
    - image, audio and embedded resource blocks are replaced by an `AttachmentRef`
      (§3.1), whose `id` is the lowercase hex SHA-256 of the block's canonical JSON
      with `_meta` dropped; resource links stay as they are;

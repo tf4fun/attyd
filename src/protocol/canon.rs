@@ -207,7 +207,7 @@ pub(crate) fn normalize(blocks: &[Value], attachments: &mut Attachments) -> Vec<
         let kind = match block_type.as_str() {
             "text" => {
                 if let Some(Block::Content(previous)) = normalized.last_mut()
-                    && previous["type"] == "text"
+                    && same_but_text(previous, &block)
                     && let Some(Value::String(text)) = previous.get_mut("text")
                 {
                     text.push_str(block["text"].as_str().unwrap_or_default());
@@ -252,6 +252,18 @@ pub(crate) fn normalize(blocks: &[Value], attachments: &mut Attachments) -> Vec<
         }));
     }
     normalized
+}
+
+/// Whether two blocks differ at most in `text`, so they may merge.
+fn same_but_text(left: &Value, right: &Value) -> bool {
+    let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
+        return false;
+    };
+    left.len() == right.len()
+        && left.contains_key("text") == right.contains_key("text")
+        && left
+            .iter()
+            .all(|(key, value)| key == "text" || right.get(key) == Some(value))
 }
 
 /// Drops `_meta` at every level.
@@ -360,12 +372,9 @@ fn canonical_number(number: &serde_json::Number) -> String {
         return "0".into();
     }
     let sign = if value < 0.0 { "-" } else { "" };
-    // The shortest digits that round-trip, as `d.ddde<exponent>`.
-    let scientific = format!("{:e}", value.abs());
-    let (mantissa, exponent) = scientific.split_once('e').expect("exponent form");
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let (digits, exponent) = ecmascript_digits(value.abs());
     let k = digits.len() as i32;
-    let n = exponent.parse::<i32>().expect("exponent") + 1;
+    let n = exponent + 1;
     let body = if k <= n && n <= 21 {
         format!("{digits}{}", "0".repeat((n - k) as usize))
     } else if 0 < n && n <= 21 {
@@ -385,6 +394,54 @@ fn canonical_number(number: &serde_json::Number) -> String {
         format!("{first}{fraction}e{exponent_sign}{}", exponent.abs())
     };
     format!("{sign}{body}")
+}
+
+/// ECMAScript's digits for a positive double, with the exponent of the first:
+/// the fewest that round-trip and, among those, the closest to the exact value,
+/// an exact tie going to the even digit.
+fn ecmascript_digits(value: f64) -> (String, i32) {
+    // Rust's shortest digits round-trip, but on a tie may not be the closest.
+    let shortest = scientific_digits(&format!("{value:e}"));
+    // The exact expansion; a double has at most 767 significant digits.
+    let (exact, exponent) = scientific_digits(&format!("{value:.800e}"));
+    let closest = round_half_even(&exact, exponent, shortest.0.len());
+    let round_trips = format!("0.{}e{}", closest.0, closest.1 + 1).parse::<f64>() == Ok(value);
+    if round_trips { closest } else { shortest }
+}
+
+/// Splits `d.ddde<exponent>` into its digits and exponent.
+fn scientific_digits(scientific: &str) -> (String, i32) {
+    let (mantissa, exponent) = scientific.split_once('e').expect("exponent form");
+    let digits = mantissa.chars().filter(|c| *c != '.').collect();
+    (digits, exponent.parse().expect("exponent"))
+}
+
+/// Rounds a digit string to `count` digits, half to even.
+fn round_half_even(digits: &str, exponent: i32, count: usize) -> (String, i32) {
+    let (head, tail) = digits.split_at(count.min(digits.len()));
+    let mut head = head.as_bytes().to_vec();
+    let tail = tail.trim_end_matches('0').as_bytes();
+    let round_up = match tail {
+        [] => false,
+        [b'5'] => head.last().is_some_and(|digit| (digit - b'0') % 2 == 1),
+        [first, ..] => *first >= b'5',
+    };
+    let mut exponent = exponent;
+    if round_up {
+        match head.iter().rposition(|digit| *digit != b'9') {
+            Some(index) => {
+                head[index] += 1;
+                head[index + 1..].fill(b'0');
+            }
+            None => {
+                // 99…9 becomes 10…0 with one more integer digit.
+                head.fill(b'0');
+                head[0] = b'1';
+                exponent += 1;
+            }
+        }
+    }
+    (String::from_utf8(head).expect("ASCII digits"), exponent)
 }
 
 // ---------------------------------------------------------------------------
