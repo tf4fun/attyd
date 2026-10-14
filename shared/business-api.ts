@@ -102,6 +102,8 @@ export interface BridgeSessionView extends SessionOwner {
     permissions: Record<string, PendingInteraction<RequestPermissionRequest>>;
     elicitations: Record<string, PendingInteraction<CreateElicitationRequest>>;
     urlFlows: Record<string, {
+      /** v2: the accepted elicitation that identifies the flow. */
+      interactionId?: string;
       elicitationId: string;
       request: CreateElicitationRequest;
       status: "waiting" | "completed" | "cancelled";
