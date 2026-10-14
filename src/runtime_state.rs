@@ -6643,7 +6643,7 @@ mod tests {
                 "session",
                 incarnation,
                 "reload",
-                SessionOperationKind::Resume,
+                SessionOperationKind::Fork,
             ),
             Err(RuntimeStateError::OperationMismatch)
         );
