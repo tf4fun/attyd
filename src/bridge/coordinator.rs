@@ -85,6 +85,7 @@ pub(super) async fn dispatch_ready(
                 dispatch_owner: route.dispatch_owner,
                 url_registration: route.url_registration,
                 request_lease,
+                request_scope: route.request_scope,
                 ..services.clone()
             };
             let task_connection = connection.clone();
@@ -117,7 +118,7 @@ impl Coordinator {
         item: IngressItem,
         scheduling: &Scheduling,
         ingress: &IngressSender,
-        state: &Arc<Mutex<BridgeState>>,
+        state: &Arc<BridgeLock>,
         sink: &EventSink,
     ) -> Result<(), Error> {
         let mut ready = VecDeque::from([item]);
@@ -319,7 +320,13 @@ impl Coordinator {
                 (route, incarnation)
             } else {
                 let locked = state.lock().await;
-                let requested_id = event_session_id(&item.event, &locked);
+                // A request-scoped elicitation of a session's request runs in
+                // that session's order, before the request's response.
+                let requested_id =
+                    event_session_id(&item.event, &locked).or_else(|| match &item.request_scope {
+                        Some(OpScope::Session(session_id)) => Some(session_id.clone()),
+                        _ => None,
+                    });
                 let incarnation = requested_id
                     .as_deref()
                     .and_then(|id| locked.sessions.state(id))
@@ -382,6 +389,7 @@ impl Coordinator {
                         owner,
                         dispatch_owner,
                         url_registration,
+                        request_scope: item.request_scope.clone(),
                     },
                     incarnation,
                 )

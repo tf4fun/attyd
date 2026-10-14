@@ -13,6 +13,21 @@ use crate::event_queue::EventSender;
 
 const AUTH_TERMINAL_READ_CHUNK_BYTES: usize = 32_768;
 
+/// What a login terminal reports to its owner besides the browser events.
+#[derive(Debug, Clone)]
+pub(crate) enum AuthTerminalEvent {
+    Output(String),
+    Exited {
+        exit_code: Option<i64>,
+        signal: Option<String>,
+        cancelled: bool,
+        failure: Option<String>,
+    },
+}
+
+/// Called from the terminal's blocking reader and waiter threads.
+pub(crate) type AuthTerminalObserver = Arc<dyn Fn(AuthTerminalEvent) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AuthTerminalManager {
     active: Arc<Mutex<Option<Arc<ActiveAuthTerminal>>>>,
@@ -36,6 +51,7 @@ struct ActiveAuthTerminal {
     cancelled: AtomicBool,
     settled: AtomicBool,
     failure: Mutex<Option<String>>,
+    observer: Option<AuthTerminalObserver>,
 }
 
 impl AuthTerminalManager {
@@ -57,6 +73,21 @@ impl AuthTerminalManager {
         cwd: &std::path::Path,
         cols: u16,
         rows: u16,
+    ) -> Result<(), Error> {
+        self.start_observed(request_id, method, agent_command, cwd, cols, rows, None)
+    }
+
+    /// Starts a login whose output and exit `observer` also receives.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_observed(
+        &self,
+        request_id: String,
+        method: AuthMethodTerminal,
+        agent_command: &[String],
+        cwd: &std::path::Path,
+        cols: u16,
+        rows: u16,
+        observer: Option<AuthTerminalObserver>,
     ) -> Result<(), Error> {
         validate_method(&method)?;
         validate_size(cols, rows)?;
@@ -95,6 +126,7 @@ impl AuthTerminalManager {
             cancelled: AtomicBool::new(false),
             settled: AtomicBool::new(false),
             failure: Mutex::new(None),
+            observer,
         });
         *self.active.lock().map_err(lock_error)? = Some(active.clone());
         // Publish the lifecycle boundary before either blocking worker can
@@ -104,8 +136,9 @@ impl AuthTerminalManager {
             "requestId": request_id,
             "methodId": method.id,
         }));
-        self.spawn_reader(active.clone(), reader);
-        self.spawn_waiter(active, child);
+        let (drained, reader_done) = std::sync::mpsc::channel();
+        self.spawn_reader(active.clone(), reader, drained);
+        self.spawn_waiter(active, child, reader_done);
         Ok(())
     }
 
@@ -178,20 +211,31 @@ impl AuthTerminalManager {
         Ok(active)
     }
 
-    fn spawn_reader(&self, active: Arc<ActiveAuthTerminal>, mut reader: Box<dyn Read + Send>) {
+    fn spawn_reader(
+        &self,
+        active: Arc<ActiveAuthTerminal>,
+        mut reader: Box<dyn Read + Send>,
+        drained: std::sync::mpsc::Sender<()>,
+    ) {
         let manager = self.clone();
         tokio::task::spawn_blocking(move || {
+            // Dropped when the output ends, so the exit follows the output.
+            let _drained = drained;
             let mut buffer = [0_u8; AUTH_TERMINAL_READ_CHUNK_BYTES];
             loop {
                 let count = match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => count,
                 };
+                let data = String::from_utf8_lossy(&buffer[..count]);
                 manager.send(json!({
                     "type": "bridge/auth_terminal_output",
                     "requestId": active.request_id,
-                    "data": String::from_utf8_lossy(&buffer[..count]),
+                    "data": data,
                 }));
+                if let Some(observer) = &active.observer {
+                    observer(AuthTerminalEvent::Output(data.into_owned()));
+                }
             }
         });
     }
@@ -200,10 +244,14 @@ impl AuthTerminalManager {
         &self,
         active: Arc<ActiveAuthTerminal>,
         mut child: Box<dyn portable_pty::Child + Send + Sync>,
+        reader_done: std::sync::mpsc::Receiver<()>,
     ) {
         let manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let result = child.wait();
+            // Report the exit after the output the process wrote; a
+            // descendant that keeps the terminal open does not delay it long.
+            let _ = reader_done.recv_timeout(std::time::Duration::from_secs(1));
             manager.finish(active, result);
         });
     }
@@ -238,6 +286,14 @@ impl AuthTerminalManager {
             .and_then(|failure| failure.clone())
             .or(wait_error);
         let cancelled = active.cancelled.load(Ordering::Acquire);
+        if let Some(observer) = &active.observer {
+            observer(AuthTerminalEvent::Exited {
+                exit_code: exit_code.map(i64::from),
+                signal: signal.clone(),
+                cancelled,
+                failure: failure.clone(),
+            });
+        }
         let status = if cancelled {
             "cancelled"
         } else if exit_code == Some(0) && failure.is_none() {

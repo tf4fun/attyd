@@ -152,15 +152,40 @@ impl JournalTurn {
 // The coordinator hook exposes only a weak reference and is opt-in for one
 // connection. It neither changes scheduling nor owns the registry after teardown.
 thread_local! {
-    static COORDINATOR_PROBE: std::cell::RefCell<Option<oneshot::Sender<Weak<Mutex<BridgeState>>>>> = const { std::cell::RefCell::new(None) };
+    static COORDINATOR_PROBE: std::cell::RefCell<Option<oneshot::Sender<Weak<BridgeLock>>>> = const { std::cell::RefCell::new(None) };
+    static RETAINED_COORDINATOR_PROBE: std::cell::RefCell<Option<oneshot::Sender<Arc<BridgeLock>>>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(super) fn capture_coordinator_state(state: &Arc<Mutex<BridgeState>>) {
+pub(super) fn capture_coordinator_state(state: &Arc<BridgeLock>) {
+    RETAINED_COORDINATOR_PROBE.with(|probe| {
+        if let Some(response) = probe.borrow_mut().take() {
+            let _ = response.send(Arc::clone(state));
+        }
+    });
     COORDINATOR_PROBE.with(|probe| {
         if let Some(response) = probe.borrow_mut().take() {
             let _ = response.send(Arc::downgrade(state));
         }
     });
+}
+
+/// The next connection's bridge state, for gates that drive it in process.
+pub(super) fn probe_coordinator_state() -> oneshot::Receiver<Weak<BridgeLock>> {
+    let (response, probe) = oneshot::channel();
+    COORDINATOR_PROBE.with(|slot| {
+        assert!(slot.borrow_mut().replace(response).is_none());
+    });
+    probe
+}
+
+// Opt-in only: setup-error tests need to inspect the last published document
+// after the connection has returned. Retention tests keep using the Weak probe.
+pub(super) fn probe_retained_coordinator_state() -> oneshot::Receiver<Arc<BridgeLock>> {
+    let (response, probe) = oneshot::channel();
+    RETAINED_COORDINATOR_PROBE.with(|slot| {
+        assert!(slot.borrow_mut().replace(response).is_none());
+    });
+    probe
 }
 
 fn append_unpublished_update(
@@ -620,7 +645,7 @@ impl Drop for PublicationPeer {
     }
 }
 
-async fn live_publication_peer() -> (PublicationPeer, Weak<Mutex<BridgeState>>, Value) {
+async fn live_publication_peer() -> (PublicationPeer, Weak<BridgeLock>, Value) {
     let (probe_response, probe) = oneshot::channel();
     COORDINATOR_PROBE.with(|slot| {
         assert!(slot.borrow_mut().replace(probe_response).is_none());
@@ -665,7 +690,7 @@ async fn live_publication_peer() -> (PublicationPeer, Weak<Mutex<BridgeState>>, 
 }
 
 async fn unpublished_overlay_versions(
-    state_probe: &Weak<Mutex<BridgeState>>,
+    state_probe: &Weak<BridgeLock>,
 ) -> (Weak<Vec<Arc<Value>>>, Weak<Vec<Arc<Value>>>) {
     // Establish unflushed changes at the real coordinator's publication boundary.
     // This hook calls the same registry transitions as the live reducers; it does
