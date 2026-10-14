@@ -1205,6 +1205,7 @@ async fn a_create_completes_with_its_session_and_advances_the_catalog() {
     assert!(global["sessions"].get(CREATED).is_some());
     let scope = format!("session/{CREATED}");
     let appeared = peer
+        .gate
         .history
         .iter()
         .position(|events| events.iter().any(|event| event["scope"] == scope))
