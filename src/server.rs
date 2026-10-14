@@ -604,6 +604,9 @@ struct BridgeHub {
     /// The published documents and the v2 streams, shared by the
     /// generations (protocol §5.4).
     publication: Publication,
+    // Per-host test barrier for a subscription crossing Agent generations.
+    #[cfg(test)]
+    after_subscribe_input: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     state: Mutex<BridgeHubState>,
     next_subscriber_id: AtomicU64,
     stopped: Notify,
@@ -1041,6 +1044,8 @@ impl BridgeHub {
         Arc::new(Self {
             options,
             publication: Publication::default(),
+            #[cfg(test)]
+            after_subscribe_input: std::sync::Mutex::new(None),
             state: Mutex::new(BridgeHubState::default()),
             next_subscriber_id: AtomicU64::new(1),
             stopped: Notify::new(),
@@ -1124,6 +1129,16 @@ impl BridgeHub {
             }
             state.input.clone()
         };
+        #[cfg(test)]
+        {
+            let pause = self.after_subscribe_input.lock().unwrap().take();
+            if let Some((reached, resume)) = pause {
+                let _ = reached.send(());
+                resume
+                    .await
+                    .expect("the generation-race test releases its pause");
+            }
+        }
         if let Some(input) = input {
             let (reply, subscribed) = oneshot::channel();
             if input

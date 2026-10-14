@@ -1043,12 +1043,37 @@ async fn a_successful_terminal_login_starts_the_next_connection_for_a_global_onl
 // Subscribing while the Agent initializes, and the recovery's boundaries
 // (protocol §5.1, §5.4; Q2)
 
-/// Longer than the recovery's backoff after the failed attempts these tests
-/// make: no attempt they rule out can still be waiting to start.
-const RETRY_WINDOW: Duration = Duration::from_secs(3);
+/// A dropped body has actually left the Hub, not merely had time to do so.
+async fn wait_subscribers(hub: &BridgeHub, session_id: &str, expected: usize) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if hub.publication.lock().hub.subscribers(session_id) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the HTTP subscriber count did not settle");
+}
 
-/// How long the server takes to read the EOF of a dropped HTTP stream.
-const DROP_SETTLE: Duration = Duration::from_millis(500);
+/// Start the negative observation only after the old runtime really stopped,
+/// then cross its actual next-attempt backoff, with a scheduling margin.
+async fn cross_recovery_window(hub: &BridgeHub) {
+    let backoff = tokio::time::timeout(WAIT, async {
+        loop {
+            let state = hub.state.lock().await;
+            if state.input.is_none() {
+                return state.recovery_backoff;
+            }
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the old Agent runtime did not finish");
+    tokio::time::sleep(backoff + Duration::from_secs(1)).await;
+}
 
 fn initialized(capabilities: Value) -> Value {
     json!({"protocolVersion": 1, "agentCapabilities": capabilities, "authMethods": []})
@@ -1056,11 +1081,16 @@ fn initialized(capabilities: Value) -> Value {
 
 /// Events until `global` shows the Agent `phase`.
 async fn until_phase(stream: &mut Sse, phases: &[&str]) {
-    stream
-        .until("global", |event| {
-            phases.iter().any(|phase| mentions(event, phase))
-        })
-        .await;
+    loop {
+        let event = stream.event().await;
+        if event["scope"] == "global"
+            && stream.replica("global").live["agent"]["phase"]
+                .as_str()
+                .is_some_and(|phase| phases.contains(&phase))
+        {
+            return;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1172,7 +1202,7 @@ async fn recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_
     link.close().await;
     until_phase(&mut watcher, &["stopped", "error"]).await;
     drop(first);
-    tokio::time::sleep(DROP_SETTLE).await;
+    wait_subscribers(&server.hub, "saved", 1).await;
 
     // One subscriber left: a failed attempt is followed by another.
     let mut failed = server.agents.connect().await;
@@ -1187,10 +1217,10 @@ async fn recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_
     // The last subscriber leaves while that attempt runs; once it ends, no
     // further attempt starts.
     drop(second);
-    tokio::time::sleep(DROP_SETTLE).await;
+    wait_subscribers(&server.hub, "saved", 0).await;
     pending.close().await;
     until_phase(&mut watcher, &["stopped", "error"]).await;
-    tokio::time::sleep(RETRY_WINDOW).await;
+    cross_recovery_window(&server.hub).await;
     assert_eq!(
         server.agents.accepted(),
         3,
@@ -1201,25 +1231,75 @@ async fn recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_
 #[tokio::test]
 async fn a_cold_load_cut_by_an_eof_keeps_the_cache_and_converges_on_the_next_connection() {
     let replay = turns(&[("one", "1"), ("two", "2"), ("three", "3")]);
-    let cached = log_values(TurnLog::from_replay(&replay[..2]).entries());
+    let cached = log_values(TurnLog::from_replay(&replay[..4]).entries());
     let (mut server, mut link) = Server::start(json!({"loadSession": true})).await;
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("scope", "session/saved")
         .append_pair(
             "have",
-            &format!("session/saved:1:{}", cached[0]["hash"].as_str().unwrap()),
+            &format!("session/saved:2:{}", cached[1]["hash"].as_str().unwrap()),
         )
         .append_pair("cwd", &format!("session/saved:{CWD}"))
         .finish();
     let mut stream = server.stream(&query).await;
     stream.cache_log("session/saved", cached.clone());
 
-    // The first load replays part of the history, then the Agent goes away.
+    // The client has two turns, but the interrupted load only replays one.
+    // Publishing that incomplete history would visibly truncate its cache.
     let load = link.request("session/load").await;
     assert_eq!(load["params"]["sessionId"], "saved");
+    let aligned = stream.event().await;
+    assert_eq!(aligned["scope"], "session/saved", "{aligned}");
+    assert!(aligned.get("log").is_none(), "{aligned}");
+    let replica = stream.replica("session/saved");
+    assert_eq!(json!(replica.log), json!(cached), "{aligned}");
+    assert_eq!(replica.live["op"]["kind"], "load", "{aligned}");
+    assert_eq!(replica.live["op"]["status"], "running", "{aligned}");
     for update in &replay[..2] {
         link.update("saved", update.clone()).await;
     }
+    // This real Agent request follows the partial replay in ordered ingress.
+    // Seeing it in the same SSE proves the coordinator processed that replay;
+    // neither a delay nor a GET establishes that ordering.
+    let barrier = "cold-load-partial-replay-barrier";
+    link.send(json!({
+        "jsonrpc": "2.0", "id": barrier, "method": "elicitation/create",
+        "params": {
+            "sessionId": "saved", "mode": "form", "message": barrier,
+            "requestedSchema": {"type": "object", "properties": {}},
+        },
+    }))
+    .await;
+    loop {
+        let event = stream.event().await;
+        assert!(event.get("end").is_none(), "{event}");
+        let replica = stream.replica("session/saved");
+        assert_eq!(
+            json!(replica.log),
+            json!(cached),
+            "an unfinished replay must not replace the cache: {event}"
+        );
+        assert_eq!(replica.live["op"]["kind"], "load", "{event}");
+        assert_eq!(replica.live["op"]["status"], "running", "{event}");
+        if replica.live["op"]["interactions"]
+            .as_object()
+            .expect("the running load has an interaction map")
+            .values()
+            .any(|interaction| interaction["request"]["message"] == barrier)
+        {
+            break;
+        }
+    }
+    // Comparison only, after the wire barrier: an unchanged client cache must
+    // not hide the bridge prematurely changing Unknown into Known.
+    let (status, loading) = server.read("session/saved").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !loading.as_object().unwrap().contains_key("log"),
+        "the unfinished first load still has an unknown log: {loading}"
+    );
+    stream.assert_document("session/saved", &loading);
+    // Leave the elicitation unanswered. EOF cancels it with the first load.
     link.close().await;
 
     let mut next = server.agents.accept(json!({"loadSession": true})).await;
@@ -1277,10 +1357,11 @@ async fn a_session_ended_with_load_failed_is_no_recovery_need_behind_a_global_st
         .pop()
         .unwrap();
     assert_eq!(end["end"]["reason"], "load_failed", "{end}");
+    wait_subscribers(&server.hub, "saved", 0).await;
 
     link.close().await;
     until_phase(&mut stream, &["stopped", "error"]).await;
-    tokio::time::sleep(RETRY_WINDOW).await;
+    cross_recovery_window(&server.hub).await;
     assert_eq!(
         server.agents.accepted(),
         1,
@@ -1373,11 +1454,223 @@ async fn a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing() 
     while !matches!(phase(&stream).as_str(), Some("stopped" | "error")) {
         stream.event().await;
     }
-    tokio::time::sleep(RETRY_WINDOW).await;
+    cross_recovery_window(&hub).await;
     assert_eq!(
         agents().len(),
         2,
         "the login authorized one connection only"
     );
     hub.shutdown().await;
+}
+
+/// A stream request can retain the old generation's sender while that
+/// generation ends and a new one becomes ready. Its fallback must still
+/// schedule the new cold scope on the current actor.
+#[tokio::test]
+async fn review_a_subscription_crossing_generations_loads_on_the_current_agent() {
+    let replay = turns(&[("one", "1")]);
+    let (mut server, old, mut keeper) = loaded(&replay).await;
+    let old_generation = server.hub.state.lock().await.generation;
+    let (reached, captured) = oneshot::channel();
+    let (resume, paused) = oneshot::channel();
+    *server.hub.after_subscribe_input.lock().unwrap() = Some((reached, paused));
+    let address = server.address;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("scope", "session/new-cold")
+        .append_pair("cwd", &format!("session/new-cold:{CWD}"))
+        .finish();
+    let opening = tokio::spawn(async move {
+        send(
+            address,
+            Method::GET,
+            &format!("/api/v2/stream?{query}"),
+            None,
+        )
+        .await
+    });
+    tokio::time::timeout(WAIT, captured)
+        .await
+        .expect("the HTTP request captures the old input")
+        .unwrap();
+
+    // The paused request has registered no scope yet. The existing real
+    // HTTP stream alone drives recovery and the next generation's reload.
+    assert_eq!(server.hub.publication.lock().hub.subscribers("new-cold"), 0);
+    old.close().await;
+    let mut next = server.agents.accept(json!({"loadSession": true})).await;
+    next.serve_load("saved", &replay).await;
+    keeper
+        .until("session/saved", |event| mentions(event, "completed"))
+        .await;
+    assert!(server.hub.state.lock().await.generation > old_generation);
+    assert!(server.hub.state.lock().await.input.is_some());
+    assert_eq!(
+        keeper.replica("session/saved").live["op"]["status"],
+        "completed"
+    );
+
+    // Readiness's ServeStreams has already dispatched and completed the
+    // sole reload. No unrelated stream or command wakes the actor afterward.
+    resume.send(()).unwrap();
+    let response = tokio::time::timeout(WAIT, opening)
+        .await
+        .expect("the request opens a stream on the current generation")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut newcomer = Sse {
+        body: Body::new(response.into_body()).into_data_stream(),
+        buffer: String::new(),
+        replicas: BTreeMap::new(),
+        aligned: BTreeSet::new(),
+        ended: BTreeSet::new(),
+    };
+    assert_eq!(server.hub.publication.lock().hub.subscribers("new-cold"), 1);
+    let load = next.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "new-cold");
+    assert_eq!(load["params"]["cwd"], CWD);
+    next.reply(&load, json!({})).await;
+    newcomer
+        .until("session/new-cold", |event| mentions(event, "completed"))
+        .await;
+    let (status, document) = server.read("session/new-cold").await;
+    assert_eq!(status, StatusCode::OK);
+    newcomer.assert_document("session/new-cold", &document);
+    assert_eq!(server.agents.accepted(), 2, "no extra connection is needed");
+    server.hub.shutdown().await;
+}
+/// A peer that never answers initialize must not leave the published Agent
+/// running after shutdown has drained and closed the protocol streams.
+#[tokio::test]
+async fn review_shutdown_during_initialize_publishes_a_final_agent_before_closing_streams() {
+    let mut server = Server::launch().await;
+    let mut link = server.agents.connect().await;
+    link.request("initialize").await;
+    let mut stream = server.stream("scope=global").await;
+    let aligned = stream.event().await;
+    assert_eq!(aligned["live"]["replace"]["agent"]["phase"], "initializing");
+
+    tokio::time::timeout(WAIT, server.hub.shutdown())
+        .await
+        .expect("shutdown must finish even when initialize is unanswered");
+    // Observe the actual HTTP body ending, not a quiet timeout. Keep every
+    // queued event: publishing a final cut after closing the stream cannot
+    // substitute for delivering that cut before EOF.
+    let mut delivered = std::mem::take(&mut stream.buffer).into_bytes();
+    tokio::time::timeout(WAIT, async {
+        while let Some(chunk) = stream.body.next().await {
+            delivered.extend_from_slice(&chunk.unwrap());
+        }
+    })
+    .await
+    .expect("shutdown must drain and close the SSE body");
+    let (status, document) = server.read("global").await;
+    let runtime_remains = server.hub.state.lock().await.input.is_some();
+    // Release the scripted peer before asserting, including on the old code.
+    link.close().await;
+    let delivered = String::from_utf8(delivered).unwrap();
+    for message in delivered.split("\n\n") {
+        let data: Vec<_> = message
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        if data.is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(&data.join("\n")).unwrap();
+        assert_eq!(event["scope"], "global", "{event}");
+        assert!(event.get("end").is_none(), "{event}");
+        stream
+            .replicas
+            .get_mut("global")
+            .unwrap()
+            .apply(&event)
+            .unwrap();
+    }
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        matches!(
+            document["live"]["agent"]["phase"].as_str(),
+            Some("stopped" | "error")
+        ),
+        "the final published cut must precede SSE EOF: {document}"
+    );
+    stream.assert_document("global", &document);
+    assert!(
+        !runtime_remains,
+        "shutdown left initialize running after closing SSE"
+    );
+}
+
+/// Options' URI parser accepts this authority, but the HTTP transport's URL
+/// parser rejects its port before it has a connection. That startup failure
+/// still belongs in the always-existing global/catalog documents.
+#[tokio::test]
+async fn review_an_http_transport_construction_error_is_published_to_v2() {
+    let options = Options::try_parse_from([
+        "attyd",
+        "--transport",
+        "http",
+        "--",
+        "http://127.0.0.1:99999/acp",
+    ])
+    .unwrap()
+    .normalized()
+    .expect("the configured endpoint passes the current CLI validation");
+    let options = Arc::new(options);
+    let hub = BridgeHub::new(options.clone());
+    hub.ensure_runtime().await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let stopped = hub.stopped.notified();
+            if hub.state.lock().await.input.is_none() {
+                break;
+            }
+            stopped.await;
+        }
+    })
+    .await
+    .expect("the rejected transport construction ends the generation");
+
+    let app = app_router(&options, hub.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut reads = Vec::new();
+    for scope in ["global", "catalog"] {
+        let response = send(
+            address,
+            Method::GET,
+            &format!("/api/v2/scopes/{scope}"),
+            None,
+        )
+        .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
+            .await
+            .unwrap();
+        reads.push((
+            scope,
+            status,
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+        ));
+    }
+    hub.shutdown().await;
+    server.abort();
+    for (scope, status, document) in &reads {
+        assert_eq!(
+            *status,
+            StatusCode::OK,
+            "{scope} must exist after startup failed: {document}"
+        );
+        assert_eq!(document["log"], json!([]));
+    }
+    let global = &reads[0].2;
+    assert_eq!(global["live"]["agent"]["phase"], "error", "{global}");
+    assert!(
+        !global["live"]["agent"]["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+    );
 }
