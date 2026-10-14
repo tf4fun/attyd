@@ -6,6 +6,7 @@
 //! connection the test answers. Requests go through a hyper client.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use axum::http::Method;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use hyper_util::rt::TokioIo;
