@@ -175,11 +175,6 @@ fn update_blocks(update: &mut Value, visit: &mut impl FnMut(&mut Value)) {
             }
         }
         Some("tool_call" | "tool_call_update") => tool_blocks(update, visit),
-        Some("compaction_update") => {
-            if let Some(summary) = update.get_mut("summary").and_then(Value::as_array_mut) {
-                summary.iter_mut().for_each(&mut *visit);
-            }
-        }
         _ => {}
     }
 }
@@ -245,23 +240,6 @@ pub(crate) fn project(value: &mut Value) {
     };
     let owner = SessionResourceOwner::new(epoch, session, incarnation);
     blocks(value, &mut |block| project_block(block, &owner));
-}
-
-/// Projects one session update, as `project` does for each update of a view.
-pub(crate) fn project_update(update: &mut Value, owner: &SessionResourceOwner) {
-    update_blocks(update, &mut |block| project_block(block, owner));
-}
-
-/// Projects one prompt content block.
-pub(crate) fn project_content(block: &mut Value, owner: &SessionResourceOwner) {
-    project_block(block, owner);
-}
-
-/// Projects the tool call carried by a permission request.
-pub(crate) fn project_permission_request(request: &mut Value, owner: &SessionResourceOwner) {
-    if let Some(call) = request.get_mut("toolCall") {
-        tool_blocks(call, &mut |block| project_block(block, owner));
-    }
 }
 
 pub(crate) fn find(view: &mut Value, attachment_id: &str) -> Option<Value> {

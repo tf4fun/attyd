@@ -58,13 +58,8 @@ pub(crate) struct SessionRegistry {
     pub(crate) request_url_flows: BTreeMap<String, UrlFlow>,
     pub(crate) resolved_request_elicitations: VecDeque<String>,
     pub(crate) resolved_request_url_flows: VecDeque<String>,
-    /// Finished global URL flows, oldest first, kept for protocol v2 until
-    /// they are acknowledged or retained out (protocol §3.4).
-    pub(crate) settled_request_url_flows: VecDeque<(UrlFlow, std::time::Instant)>,
     pub(crate) effects: VecDeque<RuntimeEffect>,
     pub(crate) journal: RuntimeJournal,
-    /// Protocol v2 command records and intents; they share the epoch.
-    pub(crate) commands: crate::protocol::commands::CommandBook,
 }
 
 impl SessionRegistry {
@@ -437,10 +432,8 @@ impl SessionRegistry {
             request_url_flows: BTreeMap::new(),
             resolved_request_elicitations: VecDeque::new(),
             resolved_request_url_flows: VecDeque::new(),
-            settled_request_url_flows: VecDeque::new(),
             effects: VecDeque::new(),
             journal: RuntimeJournal::new(),
-            commands: Default::default(),
         }
     }
 }

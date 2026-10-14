@@ -85,8 +85,9 @@ Each capability row above also needs its protocol chain (the earlier coverage ga
 [plan at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/state-sync.md#42-acp-semantic-coverage-gate-s8)).
 The chains below describe the earlier v2 draft, and their "protocol §" references
 are to [that draft at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md).
-The draft is being removed; the [current protocol](protocol.md) replaces these
-chains with its own as its steps land ([plan §4.2](state-sync.md#42-acceptance)):
+Migration step 2 removed the draft, so the tests named below exist only at that
+commit; the [current protocol](protocol.md) replaces these chains with its own as
+its steps land ([plan §4.2](state-sync.md#42-acceptance)):
 
 ```text
 ACP capability → bridge authority → public projection / command → finished result

@@ -1,10 +1,9 @@
-//! The reduced control state of a session (protocol §3.3).
+//! The reduced control state of a session (protocol §4.5).
 //!
 //! Sources fold in order: early updates, then the `session/new`, load, resume
 //! or fork response, then later updates. The response overrides exactly the
-//! fields it provides; every update kind owns disjoint fields.
-//! `SessionLiveState::controls` holds the result: `settle` at each response,
-//! then `fold_update` for every later update.
+//! fields it provides; every update kind owns disjoint fields. A holder calls
+//! `settle` at each response, then `fold_update` for every later update.
 use std::collections::BTreeMap;
 
 use serde_json::Value;

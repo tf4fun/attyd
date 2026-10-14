@@ -333,7 +333,7 @@ fn turn_operation<'a>(turn: &Turn<'a>) -> Option<&'a str> {
         })
 }
 
-pub(crate) fn terminal_references(value: &Value, ids: &mut HashSet<String>) {
+fn terminal_references(value: &Value, ids: &mut HashSet<String>) {
     match value {
         Value::Array(values) => values
             .iter()
