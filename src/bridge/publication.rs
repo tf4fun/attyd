@@ -220,22 +220,72 @@ impl BridgeState {
         )
     }
 
-    /// A request-scoped interaction whose operation ended is answered with its
-    /// cancel outcome: an operation's end clears its pending interactions (S7).
+    /// An interaction whose operation ended is answered with its cancel
+    /// outcome: an operation's end clears its pending interactions (S7).
     fn retire_orphaned_interactions(&mut self) {
-        for interaction_id in self.sessions.orphaned_interactions() {
-            let Some(pending) = self.request_elicitations.remove(&interaction_id) else {
-                self.sessions.scopes.joined.remove(&interaction_id);
-                continue;
-            };
+        use crate::protocol::registry::Pending;
+        for (interaction_id, pending) in self.sessions.orphaned_interactions() {
             let epoch = self.sessions.epoch().to_owned();
-            let _ = self
-                .sessions
-                .resolve_elicitation(&epoch, None, &interaction_id, None);
+            match pending {
+                Pending::Request => {
+                    let responder = self.request_elicitations.remove(&interaction_id);
+                    let _ = self
+                        .sessions
+                        .resolve_elicitation(&epoch, None, &interaction_id, None);
+                    if let Some(responder) = responder {
+                        let _ = responder
+                            .sender
+                            .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
+                    }
+                }
+                Pending::Permission(session_id) => {
+                    let owner = self
+                        .sessions
+                        .permission_owners
+                        .get(&interaction_id)
+                        .cloned();
+                    let responder = owner
+                        .as_ref()
+                        .and_then(|owner| self.sessions.take_permission(&interaction_id, owner));
+                    if let Some(owner) = &owner {
+                        let _ = self.sessions.resolve_permission(
+                            &epoch,
+                            &session_id,
+                            owner.incarnation,
+                            &interaction_id,
+                        );
+                    }
+                    if let Some(responder) = responder {
+                        let _ = responder.sender.send(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ));
+                    }
+                }
+                Pending::Elicitation(session_id) => {
+                    let owner = self
+                        .sessions
+                        .elicitation_owners
+                        .get(&interaction_id)
+                        .cloned();
+                    let responder = owner
+                        .as_ref()
+                        .and_then(|owner| self.sessions.take_elicitation(&interaction_id, owner));
+                    if let Some(owner) = &owner {
+                        let _ = self.sessions.resolve_elicitation(
+                            &epoch,
+                            Some((session_id.as_str(), owner.incarnation)),
+                            &interaction_id,
+                            None,
+                        );
+                    }
+                    if let Some(responder) = responder {
+                        let _ = responder
+                            .sender
+                            .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
+                    }
+                }
+            }
             self.sessions.scopes.joined.remove(&interaction_id);
-            let _ = pending
-                .sender
-                .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
         self.sessions.prune_joined();
     }

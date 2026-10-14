@@ -112,10 +112,8 @@ pub(crate) fn unanswered<'a>(
         .filter(|interaction| interaction.responding_operation_id.is_none())
 }
 
-fn has_unanswered(live: &SessionLiveState) -> bool {
-    unanswered(live.permissions.values().chain(live.elicitations.values()))
-        .next()
-        .is_some()
+fn held(live: &SessionLiveState) -> bool {
+    live.lifecycle != crate::runtime_state::SessionLifecycle::Closed
 }
 
 /// The ACP method of a request names the scope it belongs to: a list is the
@@ -128,12 +126,13 @@ pub(crate) fn request_scope(session_id: Option<&str>, method: &str) -> Scope {
     }
 }
 
-/// Starts an `agent_request` for interactions no operation runs for, and
-/// completes one whose interactions are gone (protocol §6.2).
-fn settle_agent_request(slot: &mut OpSlot, pending: bool) {
-    if pending && !slot.is_running() {
+/// Starts an `agent_request` for interactions that joined no operation, and
+/// completes one whose interactions are gone (protocol §6.2). An interaction
+/// that joined an operation which ended is cancelled, not re-homed.
+fn settle_agent_request(slot: &mut OpSlot, unjoined: bool, joined: bool) {
+    if unjoined && !slot.is_running() {
         *slot = OpSlot::running(OperationKind::AgentRequest, json!({}));
-    } else if !pending && slot.is_running_kind(OperationKind::AgentRequest) {
+    } else if !unjoined && !joined && slot.is_running_kind(OperationKind::AgentRequest) {
         slot.complete(json!({}));
     }
 }
@@ -237,14 +236,45 @@ impl SessionRegistry {
     // -----------------------------------------------------------------------
     // Transitions, called by the registry's v1 transitions.
 
-    /// Whether an unanswered request-scoped interaction joined `op`.
+    /// Every unanswered interaction: request-scoped ones, and each held
+    /// session's, with the session they wait in.
+    fn pending_interactions(&self) -> impl Iterator<Item = (&PendingInteraction, Pending)> {
+        let requests = unanswered(self.request_elicitations.values())
+            .map(|pending| (pending, Pending::Request));
+        let sessions = self.sessions.iter().flat_map(|(session_id, entry)| {
+            entry
+                .state
+                .live
+                .iter()
+                .filter(|live| held(live))
+                .flat_map(move |live| {
+                    unanswered(live.permissions.values())
+                        .map(move |pending| (pending, Pending::Permission(session_id.clone())))
+                        .chain(unanswered(live.elicitations.values()).map(move |pending| {
+                            (pending, Pending::Elicitation(session_id.clone()))
+                        }))
+                })
+        });
+        requests.chain(sessions)
+    }
+
+    /// Whether an unanswered interaction joined `op`.
     fn has_joined(&self, op: &str) -> bool {
-        unanswered(self.request_elicitations.values()).any(|pending| {
+        self.pending_interactions().any(|(pending, _)| {
             self.scopes
                 .joined
                 .get(&pending.interaction_id)
                 .is_some_and(|joined| joined.op == op)
         })
+    }
+
+    /// Whether `interaction` belongs to `op`: it joined it, or it predates
+    /// joining and waits in the scope `op` is shown in.
+    pub(crate) fn belongs_to(&self, interaction: &str, op: &str) -> bool {
+        self.scopes
+            .joined
+            .get(interaction)
+            .is_none_or(|joined| joined.op == op)
     }
 
     /// A transition of `session_id` ended: settle its `agent_request`.
@@ -255,21 +285,24 @@ impl SessionRegistry {
         let Some(live) = self.held_live(session_id) else {
             return;
         };
-        let pending = has_unanswered(live) || self.has_joined(&live.op.id);
+        let op = &live.op.id;
+        let own = unanswered(live.permissions.values().chain(live.elicitations.values()))
+            .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id));
+        let joined = self.has_joined(op);
         let live = self.held_live_mut(session_id).expect("held session");
-        settle_agent_request(&mut live.op, pending);
+        settle_agent_request(&mut live.op, own, joined);
     }
 
     /// A connection-level transition ended: settle the `agent_request` of
     /// `global` (its own interactions are those that joined no operation) and
     /// of every scope a request-scoped interaction joined.
     pub(crate) fn settle_global_ops(&mut self) {
-        let pending = unanswered(self.request_elicitations.values())
-            .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id))
-            || self.has_joined(&self.scopes.global.id);
-        settle_agent_request(&mut self.scopes.global, pending);
-        let pending = self.has_joined(&self.scopes.catalog.id);
-        settle_agent_request(&mut self.scopes.catalog, pending);
+        let unjoined = unanswered(self.request_elicitations.values())
+            .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id));
+        let joined = self.has_joined(&self.scopes.global.id);
+        settle_agent_request(&mut self.scopes.global, unjoined, joined);
+        let joined = self.has_joined(&self.scopes.catalog.id);
+        settle_agent_request(&mut self.scopes.catalog, false, joined);
         let sessions: Vec<String> = self
             .scopes
             .joined
@@ -281,6 +314,14 @@ impl SessionRegistry {
             .collect();
         for session_id in sessions {
             self.settle_session_ops(&session_id);
+        }
+    }
+
+    /// An interaction arrived in `scope`: it joins the operation shown there
+    /// unless it already joined one.
+    pub(crate) fn bind_interaction(&mut self, interaction_id: &str, scope: Scope) {
+        if !self.scopes.joined.contains_key(interaction_id) {
+            self.join_interaction(interaction_id, scope);
         }
     }
 
@@ -321,10 +362,11 @@ impl SessionRegistry {
         }
     }
 
-    /// Unanswered request-scoped interactions whose operation ended.
-    pub(crate) fn orphaned_interactions(&self) -> Vec<String> {
-        unanswered(self.request_elicitations.values())
-            .filter(|pending| {
+    /// Unanswered interactions whose operation ended: an operation's end
+    /// clears its pending interactions (S7).
+    pub(crate) fn orphaned_interactions(&self) -> Vec<(String, Pending)> {
+        self.pending_interactions()
+            .filter(|(pending, _)| {
                 self.scopes
                     .joined
                     .get(&pending.interaction_id)
@@ -333,16 +375,31 @@ impl SessionRegistry {
                             .is_none_or(|slot| slot.id != joined.op || !slot.is_running())
                     })
             })
-            .map(|pending| pending.interaction_id.clone())
+            .map(|(pending, kind)| (pending.interaction_id.clone(), kind))
             .collect()
     }
 
     /// Forgets joins and flow scopes whose interaction or flow is gone.
     pub(crate) fn prune_joined(&mut self) {
-        let interactions = &self.request_elicitations;
+        let pending: std::collections::BTreeSet<String> = self
+            .request_elicitations
+            .keys()
+            .cloned()
+            .chain(
+                self.sessions
+                    .values()
+                    .filter_map(|entry| entry.state.live.as_ref())
+                    .flat_map(|live| {
+                        live.permissions
+                            .keys()
+                            .chain(live.elicitations.keys())
+                            .cloned()
+                    }),
+            )
+            .collect();
         self.scopes
             .joined
-            .retain(|interaction_id, _| interactions.contains_key(interaction_id));
+            .retain(|interaction_id, _| pending.contains(interaction_id));
         let flows: std::collections::BTreeSet<&str> = self
             .request_url_flows
             .values()
@@ -665,6 +722,17 @@ impl SessionRegistry {
             live.controls.fold_update(update);
         }
     }
+}
+
+/// Where an unanswered interaction waits.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Pending {
+    /// A request-scoped elicitation, kept by the connection.
+    Request,
+    /// A permission of this session.
+    Permission(String),
+    /// A session-scoped elicitation of this session.
+    Elicitation(String),
 }
 
 /// How a login terminal's process ended.

@@ -399,6 +399,9 @@ async fn permission(
             }
             state
                 .sessions
+                .bind_interaction(&permission_id, OpScope::Session(session_id.clone()));
+            state
+                .sessions
                 .upsert_permission(
                     &owner.epoch,
                     &session_id,
@@ -540,14 +543,14 @@ async fn elicitation(
                 }
             }
             let epoch = state.sessions.epoch().to_owned();
-            // Joined before it is pending, so no scope settles without it.
-            if owner.is_none()
-                && let Some(scope) = &context.request_scope
-            {
-                state
-                    .sessions
-                    .join_interaction(&elicitation_id, scope.clone());
-            }
+            // Joined before it is pending, so no scope settles without it: a
+            // session's to the session, a request-scoped one to the scope of
+            // the request it names, and one naming none to global.
+            let scope = match &owner {
+                Some(owner) => OpScope::Session(owner.session_id.clone()),
+                None => context.request_scope.clone().unwrap_or(OpScope::Global),
+            };
+            state.sessions.bind_interaction(&elicitation_id, scope);
             state
                 .sessions
                 .upsert_elicitation(

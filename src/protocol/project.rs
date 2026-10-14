@@ -71,9 +71,24 @@ fn interaction(pending: &PendingInteraction, permission: bool) -> (String, Inter
     (interaction_id, interaction)
 }
 
-fn session_interactions(live: &SessionLiveState, into: &mut BTreeMap<String, Interaction>) {
-    into.extend(unanswered(live.permissions.values()).map(|pending| interaction(pending, true)));
-    into.extend(unanswered(live.elicitations.values()).map(|pending| interaction(pending, false)));
+/// A session's pending interactions that belong to `op`.
+fn session_interactions(
+    registry: &SessionRegistry,
+    live: &SessionLiveState,
+    op: &str,
+    into: &mut BTreeMap<String, Interaction>,
+) {
+    let belongs = |pending: &&PendingInteraction| registry.belongs_to(&pending.interaction_id, op);
+    into.extend(
+        unanswered(live.permissions.values())
+            .filter(belongs)
+            .map(|pending| interaction(pending, true)),
+    );
+    into.extend(
+        unanswered(live.elicitations.values())
+            .filter(belongs)
+            .map(|pending| interaction(pending, false)),
+    );
 }
 
 /// The pending interactions of the operation `op` in `owner`'s slot: its own
@@ -101,7 +116,7 @@ fn interactions(
         Scope::Catalog => {}
         Scope::Session(session_id) => {
             if let Some(live) = held_live(registry, session_id) {
-                session_interactions(live, &mut interactions);
+                session_interactions(registry, live, op, &mut interactions);
             }
         }
     }
@@ -109,7 +124,7 @@ fn interactions(
         if occupier == owner
             && let Some(live) = held_live(registry, session_id)
         {
-            session_interactions(live, &mut interactions);
+            session_interactions(registry, live, op, &mut interactions);
         }
     }
     interactions

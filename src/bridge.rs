@@ -2208,7 +2208,7 @@ fn remote_http_client(
 async fn run_connection<T>(
     transport: T,
     options: Arc<Options>,
-    mut commands: mpsc::UnboundedReceiver<BridgeInput>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
     sink: EventSink,
     cancellation: CancellationToken,
 ) -> Result<(), Error>
@@ -2219,7 +2219,32 @@ where
     state.lock().await.protocol.agent.launch = agent_launch(&options);
     #[cfg(test)]
     memory_retention_tests::capture_coordinator_state(&state);
-    let final_state = state.clone();
+    let result = run_connection_with(
+        state.clone(),
+        transport,
+        options,
+        commands,
+        sink,
+        cancellation,
+    )
+    .await;
+    // The last commit, on every return once the state exists: running
+    // operations fail and the final agent shows.
+    state.lock().await.end_connection(result.as_ref().err());
+    result
+}
+
+async fn run_connection_with<T>(
+    state: Arc<BridgeLock>,
+    transport: T,
+    options: Arc<Options>,
+    mut commands: mpsc::UnboundedReceiver<BridgeInput>,
+    sink: EventSink,
+    cancellation: CancellationToken,
+) -> Result<(), Error>
+where
+    T: ConnectTo<Client>,
+{
     let epoch = state.lock().await.sessions.epoch().to_string();
     let (mut scheduling, ingress) =
         scheduling::Scheduling::new(epoch.clone(), sink.clone(), cancellation.clone())?;
@@ -2306,7 +2331,7 @@ where
         agent_client_protocol::on_receive_dispatch!(),
     );
 
-    let result = builder
+    builder
         .connect_with(transport, async move |connection| {
             let _auth_terminal_cleanup = auth_terminal.close_on_drop();
             sink.send(json!({ "type": "bridge/phase", "phase": "initializing" }));
@@ -2697,7 +2722,10 @@ where
                             &operation,
                             intent_session_id.as_deref(),
                             error,
-                            context.cancellation.is_cancelled(),
+                            // The Agent connection ending, by a cancel or by
+                            // the transport closing, is not the Agent's error.
+                            context.cancellation.is_cancelled()
+                                || is_incoming_transport_closed(error),
                         );
                     }
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
@@ -2787,13 +2815,7 @@ where
             }
             Ok(())
         })
-        .await;
-    // The last commit: running operations fail and the final agent shows.
-    final_state
-        .lock()
         .await
-        .end_connection(result.as_ref().err());
-    result
 }
 
 /// A v1 command failed: the protocol operation it ran for fails with it.
@@ -7221,6 +7243,47 @@ fn cancel_interactions_locked(
         state
             .sessions
             .take_url_route(&elicitation_id, &registration);
+    }
+    // A request-scoped URL flow accepted in this session ends with its scope
+    // too (protocol §4.6), and frees the Agent's elicitation ID.
+    let scope = OpScope::Session(session_id.to_string());
+    let request_flows = state
+        .sessions
+        .url_owners
+        .iter()
+        .filter(|(_, route)| {
+            route.owner.is_none()
+                && state
+                    .sessions
+                    .scopes
+                    .flow_scopes
+                    .get(&route.registration_id)
+                    == Some(&scope)
+        })
+        .map(|(id, route)| (id.clone(), route.clone()))
+        .collect::<Vec<_>>();
+    for (elicitation_id, registration) in request_flows {
+        match state.sessions.settle_url_registration(
+            &owner.epoch,
+            None,
+            &elicitation_id,
+            &registration.registration_id,
+            UrlFlowStatus::Cancelled,
+        ) {
+            Ok(UrlFlowResolution::StaleRegistration) => continue,
+            Ok(_) => {}
+            Err(error) => {
+                sink.acp_error(runtime_state_error(error), None, Some("elicitation/abort"));
+            }
+        }
+        state
+            .sessions
+            .take_url_route(&elicitation_id, &registration);
+        state
+            .sessions
+            .scopes
+            .flow_scopes
+            .remove(&registration.registration_id);
     }
     flush_runtime(state, sink);
 }
