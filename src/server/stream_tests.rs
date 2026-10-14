@@ -836,6 +836,8 @@ async fn a_successful_terminal_login_starts_the_next_connection_for_a_global_onl
         ended: BTreeSet::new(),
     };
     let phase = |stream: &Sse| stream.replica("global").live["agent"]["phase"].clone();
+    // The alignment comes first; only then is there a replica to inspect.
+    assert_eq!(stream.event().await["scope"], "global");
     while phase(&stream) != "ready" {
         stream.event().await;
     }
