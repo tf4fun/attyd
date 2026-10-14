@@ -1217,7 +1217,8 @@ fn every_event_round_trips_its_documented_wire_shape() {
         )
         .unwrap();
     for event in gate.commit() {
-        let keys: Vec<_> = event.as_object().unwrap().keys().cloned().collect();
+        let mut keys: Vec<_> = event.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
         assert!(
             [
                 vec!["live", "log", "scope"],

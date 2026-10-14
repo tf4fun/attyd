@@ -1,6 +1,12 @@
 // Checks documents and events against the generated types, in the shapes the
 // gate in src/protocol/convergence_tests.rs publishes.
-import type { CatalogLive, Event, GlobalLive, SessionLive } from "../../shared/protocol";
+import type {
+  CatalogLive,
+  Event,
+  GlobalLive,
+  Operation,
+  SessionLive,
+} from "../../shared/protocol";
 
 const op = {
   id: "AAAAAAAAAAAAAAAAAAAAAA",
@@ -20,7 +26,7 @@ const op = {
     },
   },
   process: [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hel" } }],
-} as const;
+} satisfies Operation;
 
 export const session = {
   op,
