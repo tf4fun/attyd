@@ -44,6 +44,14 @@ export class ObservedProcesses {
     });
   }
 
+  /**
+   * Seeds a turn this client started but never saw running, from its fetched
+   * process page, so it stays inline as a watched one does.
+   */
+  seed(revision: string, turnId: string, operationId: string, updates: SessionUpdate[]): void {
+    if (revision === this.revision) this.entries.set(key(revision, turnId), { revision, turnId, operationId, updates });
+  }
+
   get(revision: string | null, turnId: string): SessionUpdate[] | undefined {
     return revision == null ? undefined : this.entries.get(key(revision, turnId))?.updates;
   }

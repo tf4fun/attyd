@@ -384,5 +384,37 @@ describe("useAcp on protocol v2", () => {
     expect(acp.state.sessionView).toMatchObject({ bridgeEpoch: "e2", sessionIncarnation: 1 });
     expect(bridge.stream.subscriptions).toEqual(["global", "session/alpha@e2:1"]);
   });
+
+  it("keeps its own turn inline when the turn ended before the replica showed it running", async () => {
+    await openAlpha();
+    bridge.overrides.push((request) => {
+      if (!request.path.endsWith("/turns")) return undefined;
+      const tool = { sessionUpdate: "tool_call", toolCallId: "fast-tool", title: "Fast tool", status: "completed" } as const;
+      bridge.processes.set("turn-fast", [tool]);
+      bridge.commit("session/alpha", [
+        { op: "append", path: "/history/timeline", values: [
+          { sessionUpdate: "user_message_chunk", content: { type: "text", text: "fast" } },
+          { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Fast answer." } },
+        ] },
+        { op: "append", path: "/history/collapsedTurns", values: [{
+          turnId: "turn-fast", operationId: "op-fast", beforeUpdate: 0, afterUpdate: 2, processCount: 1,
+          visibleRanges: [{ start: 0, end: 1 }, { start: 1, end: 2 }],
+        }] },
+        { op: "set", path: "/history/revision", value: "r2" },
+        { op: "set", path: "/outcomes/op-fast", value: {
+          operationId: "op-fast", clientIntentId: request.headers["idempotency-key"], status: "completed",
+          response: { stopReason: "end_turn" }, afterUpdate: 2,
+        } },
+      ]);
+      return json({ at: { epoch: bridge.epoch, seq: bridge.seq }, scopes: ["session/alpha"],
+        result: { operationId: "op-fast", disposition: "accepted" } });
+    });
+    await act(async () => { acp.prompt([{ type: "text", text: "fast" }]); });
+    await settle();
+    expect(bridge.requests.filter(({ path }) => path.includes("/turns/turn-fast/process"))).toHaveLength(1);
+    expect(acp.state.timeline.some((item) => item.type === "tool" && item.call.toolCallId === "fast-tool")).toBe(true);
+    expect(JSON.stringify(acp.state.timeline)).toContain("Fast answer.");
+    expect(acp.state.timeline.find((item) => item.retainedProcess != null)?.retainedProcess).toMatchObject({ turnId: "turn-fast" });
+  });
 });
 

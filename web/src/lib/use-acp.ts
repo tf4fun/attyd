@@ -71,6 +71,8 @@ export function useAcp(options: UseAcpOptions = {}) {
   const previousSessionRef = useRef<{ state: SessionState; view: BridgeSessionView } | undefined>(undefined);
   const processesRef = useRef(new ObservedProcesses());
   const shownFailuresRef = useRef(new Set<string>());
+  /** Keys of turns this client started, until their outcome is seen. */
+  const startedTurnsRef = useRef(new Set<string>());
   /** A submitted prompt the replica does not show yet. */
   const pendingTurnRef = useRef<{ key: string; sessionId: string } | undefined>(undefined);
   const navigationRef = useRef(0);
@@ -252,6 +254,21 @@ export function useAcp(options: UseAcpOptions = {}) {
         navigateSession(document.sessionId, document.cwd, true);
         setSessionOpening((opening) => opening?.sessionId === document.sessionId ? undefined : opening);
       }
+    }
+    for (const outcome of Object.values(document.outcomes)) {
+      if (!startedTurnsRef.current.delete(outcome.clientIntentId)) continue;
+      // A turn this client started stays inline even when it ended before the
+      // replica showed it running: its process page seeds the cache.
+      const turn = document.history.collapsedTurns.find(({ operationId }) => operationId === outcome.operationId);
+      const revision = document.history.revision;
+      if (turn == null || revision == null || turn.processCount === 0 ||
+        processesRef.current.get(revision, turn.turnId) != null) continue;
+      void readProcess(owner, revision, turn.turnId).then((updates) => {
+        if (subscribedRef.current !== owner || client().session(owner.sessionId)?.history.revision !== revision) return;
+        processesRef.current.seed(revision, turn.turnId, outcome.operationId, updates);
+        previousSessionRef.current = undefined;
+        syncSessionRef.current();
+      }, () => undefined);
     }
     for (const outcome of Object.values(document.outcomes)) {
       if (outcome.status !== "failed" || shownFailuresRef.current.has(outcome.operationId)) continue;
@@ -663,6 +680,7 @@ export function useAcp(options: UseAcpOptions = {}) {
     const sessionId = owner.sessionId;
     const navigation = navigationRef.current;
     pendingTurnRef.current = { key, sessionId };
+    startedTurnsRef.current.add(key);
     dispatch({ type: "user/prompt", requestId: key, sessionId, blocks });
     void client().command<TurnAccepted>(`/api/v2/sessions/${encodeURIComponent(sessionId)}/turns`, {
       key,
@@ -1025,6 +1043,20 @@ export function useAcp(options: UseAcpOptions = {}) {
     releaseTurnProcess,
     readThreadForExport,
   };
+}
+
+/** Every page of a completed turn's process, in order. */
+async function readProcess(owner: Owner, revision: string, turnId: string) {
+  const updates: BridgeTurnProcessPage["items"][number] = [];
+  for (let offset: number | null = 0; offset != null;) {
+    const page: BridgeTurnProcessPage = await requestJson<BridgeTurnProcessPage>(
+      `/api/v2/sessions/${encodeURIComponent(owner.sessionId)}/history/${encodeURIComponent(revision)}` +
+        `/turns/${encodeURIComponent(turnId)}/process?${new URLSearchParams({ offset: String(offset) })}`,
+    );
+    updates.push(...page.items.flat());
+    offset = page.nextOffset;
+  }
+  return updates;
 }
 
 function sessionIdentity(owner: SessionOwner): SessionOwner {
