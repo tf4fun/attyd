@@ -5,11 +5,12 @@
 //! embedded ACP values stay `serde_json::Value` in Rust and name their
 //! `@agentclientprotocol/sdk` type in TypeScript.
 //!
-//! Only the generic parts the protocol keeps are here so far: the control
-//! reduction (`controls`) and the JSON Pointer ops (`diff`). The bridge uses
-//! them from migration step 4 on (docs/state-sync.md §5).
+//! So far: the control reduction (`controls`), the JSON Pointer ops (`diff`), and
+//! `canon` with the hash chain and the turn log (`canon`). The bridge uses them
+//! from migration step 4 on (docs/state-sync.md §5).
 #![allow(dead_code)]
 
+pub(crate) mod canon;
 mod controls;
 pub(crate) mod diff;
 #[cfg(test)]

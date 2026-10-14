@@ -145,14 +145,16 @@ from a `session/load` or `session/resume` replay apply the same steps.
 1. **Messages.** `user_message_chunk` and `agent_message_chunk` updates are reduced
    to logical messages. Chunks of the same kind belong to one message when they
    carry the same `messageId`. Without `messageId`, they belong to one message when
-   they are consecutive, with only process updates (thoughts, tool calls, tool call
-   updates, plans) between them.
+   they are consecutive, with no other message chunk between them: process updates
+   (thoughts, tool calls, tool call updates, plans) and control updates do not
+   separate them.
 2. **Turns.** A user message starts a turn; for a live turn, the prompt is the
    operation's input. The Agent messages up to the next user message are its
    reply, concatenated in order. Agent messages before the first user message form
    a turn with an empty prompt. Process updates are not part of any entry.
 3. **Content.** `prompt` and `reply` are normalized by the same rules:
-   - adjacent text blocks are merged into one;
+   - adjacent text blocks are merged into one when, `_meta` dropped, they differ
+     only in `text`; blocks with different annotations keep their boundary;
    - image, audio and embedded resource blocks are replaced by an `AttachmentRef`
      (§3.1), whose `id` is the lowercase hex SHA-256 of the block's canonical JSON
      with `_meta` dropped; resource links stay as they are;

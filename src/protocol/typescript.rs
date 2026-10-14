@@ -4,6 +4,7 @@ use std::path::Path;
 
 use ts_rs::{Config, TS};
 
+use super::canon::*;
 use super::*;
 
 const OUTPUT: &str = "shared/protocol.ts";
@@ -11,6 +12,7 @@ const OUTPUT: &str = "shared/protocol.ts";
 /// ACP types embedded verbatim; they come from the SDK and are not regenerated.
 const ACP_TYPES: &[&str] = &[
     "AvailableCommand",
+    "ContentBlock",
     "Cost",
     "SessionConfigOption",
     "SessionMode",
@@ -27,6 +29,12 @@ fn declarations(cfg: &Config) -> Vec<String> {
         SessionUsage,
         Op,
         AppendTail,
+        Turn,
+        Block,
+        PromptBlock,
+        AttachmentRef,
+        AttachmentKind,
+        LogEntry,
     ]
 }
 
