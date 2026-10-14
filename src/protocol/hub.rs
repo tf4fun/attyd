@@ -593,8 +593,16 @@ impl Subscription {
                         .expect("the close-race test releases its pause");
                 }
             }
-            if self.shared.queue().finished {
-                return None;
+            {
+                // One critical section decides: a stream ends only once it is
+                // closed with nothing left to deliver.
+                let queue = self.shared.queue();
+                if !queue.items.is_empty() {
+                    continue;
+                }
+                if queue.finished {
+                    return None;
+                }
             }
             ready.await;
         }
