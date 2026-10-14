@@ -594,14 +594,24 @@ impl Peer {
         self.gate.check(&documents);
     }
 
-    /// Sends one JSON-RPC batch while the bridge lock is held, so the batch is
-    /// received in wire order before the coordinator can handle any of it: a
-    /// response in it clears its pending request first.
-    async fn send_held_batch(&mut self, batch: Vec<Value>) {
+    /// Sends one JSON-RPC batch ending with the response to `parent` while the
+    /// bridge lock is held, and releases the lock only once that response was
+    /// received and removed its pending request. The coordinator, which needs
+    /// the lock, handles nothing of the batch before then.
+    async fn send_held_batch(&mut self, batch: Vec<Value>, parent: &Value) {
+        let parent: agent_client_protocol::schema::v1::RequestId =
+            serde_json::from_value(parent["id"].clone()).unwrap();
         let lock = self.lock();
         let guard = lock.lock().await;
         self.send(Value::Array(batch)).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ingress = guard.ingress.clone().expect("the connection's ingress");
+        tokio::time::timeout(WAIT, async {
+            while ingress.is_pending(&parent) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the parent's response was not received");
         drop(guard);
     }
 
@@ -1490,10 +1500,13 @@ async fn a_request_scoped_elicitation_followed_by_its_response_joins_the_catalog
     let request = peer.request("session/list").await;
     // The parent's response clears its pending request before the
     // coordinator handles the interaction that names it.
-    peer.send_held_batch(vec![
-        agent_request("list-question", form(json!({"requestId": request["id"]}))),
-        result(&request, json!({"sessions": [], "nextCursor": null})),
-    ])
+    peer.send_held_batch(
+        vec![
+            agent_request("list-question", form(json!({"requestId": request["id"]}))),
+            result(&request, json!({"sessions": [], "nextCursor": null})),
+        ],
+        &request,
+    )
     .await;
     Peer::result(listed).await.unwrap();
     peer.until("the list completes", |peer| {
@@ -1610,10 +1623,13 @@ async fn request_scoped_interactions_of_a_prompt_join_its_session() {
     );
 
     // A second interaction arrives right before the prompt's response.
-    peer.send_held_batch(vec![
-        agent_request("question", form(json!({"requestId": request["id"]}))),
-        result(&request, json!({"stopReason": "end_turn"})),
-    ])
+    peer.send_held_batch(
+        vec![
+            agent_request("question", form(json!({"requestId": request["id"]}))),
+            result(&request, json!({"stopReason": "end_turn"})),
+        ],
+        &request,
+    )
     .await;
     peer.until("the prompt completes", |peer| {
         peer.live(&scope)["op"]["status"] == "completed"
