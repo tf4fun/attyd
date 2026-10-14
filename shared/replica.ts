@@ -70,8 +70,8 @@ function arrayIndex(token: string, length: number, path: string): number {
   return index;
 }
 
-function isContainer(value: Json): value is Record<string, Json> | Json[] {
-  return typeof value === "object" && value !== null;
+function isContainer(value: Json): value is Record<string, Json> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function child(container: Json, token: string, path: string): Json {
