@@ -80,22 +80,22 @@ export function bridgeSessionView(
     cursor = turn.afterUpdate;
     const beforeUpdate = timeline.length;
     const compact = history.timeline.slice(turn.beforeUpdate, turn.afterUpdate);
-    const watched = processes?.get(history.revision, turn.turnId);
-    // The watched overlay supplies the process; the committed history stays
-    // the authority for the prompt and the final answer, which the last
-    // overlay this client saw may not have held yet.
-    const process = watched?.slice(leadingPrompt(watched).length).slice(0, turn.processCount);
-    const observed = process != null && process.length === turn.processCount ? process : undefined;
+    const observed = processes?.get(history.revision, turn.turnId);
     let visibleRanges = shift(turn, beforeUpdate - turn.beforeUpdate);
     if (observed == null) {
       timeline.push(...compact);
     } else {
       expanded = true;
-      const prompt = leadingPrompt(compact);
-      const output = compact.slice(prompt.length);
-      timeline.push(...prompt, ...observed, ...output);
+      const echoed = observed[0]?.sessionUpdate === "user_message_chunk";
+      const prompt = echoed ? [] : leadingPrompt(compact);
+      const output = compact.slice(leadingPrompt(compact).length);
+      // The last overlay this client saw can miss the final answer when it
+      // arrived with the commit; history then supplies it.
+      const missing = !agentText(observed).endsWith(agentText(output));
+      timeline.push(...prompt, ...observed, ...(missing ? output : []));
+      const promptLength = echoed ? leadingPrompt(observed).length : prompt.length;
       visibleRanges = [
-        ...(prompt.length > 0 ? [{ start: beforeUpdate, end: beforeUpdate + prompt.length }] : []),
+        ...(promptLength > 0 ? [{ start: beforeUpdate, end: beforeUpdate + promptLength }] : []),
         ...(output.length > 0 ? [{ start: timeline.length - output.length, end: timeline.length }] : []),
       ];
     }
@@ -197,6 +197,11 @@ export function bridgeSessionView(
 
 function shift(turn: V2CollapsedTurn, offset: number): Array<{ start: number; end: number }> {
   return turn.visibleRanges.map(({ start, end }) => ({ start: start + offset, end: end + offset }));
+}
+
+function agentText(updates: SessionUpdate[]): string {
+  return updates.map((update) => update.sessionUpdate === "agent_message_chunk" && update.content.type === "text"
+    ? update.content.text : "").join("");
 }
 
 function leadingPrompt(updates: SessionUpdate[]): SessionUpdate[] {
