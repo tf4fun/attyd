@@ -1,6 +1,6 @@
 # Client API redesign
 
-Status: proposal for review, 2026-10-14 (third version). It replaces the client
+Status: proposal for review, 2026-10-14 (fourth version). It replaces the client
 protocol of [protocol.md](protocol.md) (v2) and the replication rules of
 [state-sync.md](state-sync.md). Nothing here is implemented yet. The review that
 led here is recorded in [protocol-v2-review.md](protocol-v2-review.md) and in the
@@ -134,7 +134,7 @@ operation's input, and its reply is the turn's Agent messages.
 
 A turn enters the log when the Agent answered its prompt, with any stop reason,
 `cancelled` included. A turn whose prompt failed with an error does not; its
-prompt and error stay on its operation (§4.3).
+prompt and error stay on its operation (§4.4).
 
 Identity serves synchronization only. Admission never compares hashes (S5). Where
 the Agent's replay lacks information the live turn had (two prompts without a reply
@@ -144,36 +144,58 @@ log. That costs a redrawn history, never a wrong write.
 ### 4.2 Live state
 
 ```ts
-interface SessionLive {
-  cwd: string;
-  controls: Controls;            // modes, configOptions, commands, info, usage (reduced)
+interface ScopeLive {            // what every scope's live has
   op: Operation;
-  terminals: Record<string, Terminal>;   // terminals the Agent has not released
   urlFlows: Record<string, UrlFlow>;     // accepted URL elicitations, by interaction
 }
 
-interface GlobalLive {
-  agent: AgentState;             // connection phase, launch, initialize, authentication
-  sessions: Record<string, SessionSummary>;  // sessions the bridge holds
-  op: Operation;
-  terminals: Record<string, Terminal>;   // terminal login
-  urlFlows: Record<string, UrlFlow>;
+interface SessionLive extends ScopeLive {
+  cwd: string;
+  controls: Controls;            // modes, configOptions, commands, info, usage (reduced)
+  terminals: Record<string, Terminal>;   // terminals the Agent has not released
 }
 
-interface CatalogLive {
+interface GlobalLive extends ScopeLive {
+  agent: AgentState;             // connection phase, launch, initialize, authentication
+  sessions: Record<string, SessionSummary>;  // sessions the bridge holds
+  terminals: Record<string, Terminal>;   // terminal login
+}
+
+interface CatalogLive extends ScopeLive {
   revision: string;              // changes when the Agent's session list may have changed
-  op: Operation;
 }
 ```
 
 - `live` contains only what the bridge holds now. Nothing is retained for clients
   that come later.
-- **URL flows** belong to the `live` of their scope, `global` included. A URL flow
-  starts when a client accepts a URL elicitation; it leaves the pending
-  interactions and stays in `urlFlows` until the Agent completes it or the work it
-  belongs to ends. Then it is removed; no completion record is kept.
+- **Every scope has `op` and `urlFlows`.** Any scope with operations can receive
+  interactions, so any scope can hold URL flows. A new scope gets both without
+  special handling.
 
-### 4.3 Operations
+### 4.3 Resources
+
+Terminals and URL flows are **resources**: they live in their scope's `live` by
+their own lifecycle, not by the lifecycle of the operation that created them.
+
+- **An operation's end** clears its pending interactions. It does not end the
+  resources it created.
+- **A URL flow** starts when a client accepts a URL elicitation: the interaction
+  leaves the pending set and the flow enters `urlFlows`. Accepting only consents;
+  the external flow starts then. The flow is removed when one of these happens:
+  - the Agent sends its completion notification;
+  - a client dismisses it (§6.1), because ACP makes the completion notification
+    optional and the user must be able to give up waiting;
+  - its scope ends, or the Agent connection that started it ends.
+
+  No completion record is kept.
+- **A terminal** is removed when the Agent releases it, or when its scope or the
+  Agent connection ends. A terminal login is removed when it exits and a client
+  dismisses it.
+- **Holding.** A live resource keeps its session needed (S6). When the last
+  resource of an unsubscribed, unoccupied session is removed, the session may be
+  released.
+
+### 4.4 Operations
 
 ```ts
 interface Operation {
@@ -245,8 +267,9 @@ Every synchronization is one alignment event (S3). In particular:
   fails the head match. The bridge sends its whole log, and the client replaces
   its own. If the bridge's log is shorter, the same happens.
 - **A slow subscriber** is treated as if it had subscribed again: the bridge drops
-  its queued events for the scope and sends one alignment event, from the last log
-  position it sent to that subscriber.
+  its queued events for the scope. For a scope that still exists, it sends one
+  alignment event, from the last log position it sent to that subscriber. For a
+  scope that ended, it keeps the `end` event and sends nothing after it.
 - **Changing the set of scopes** opens a new stream. A client ignores events from
   a stream it replaced.
 
@@ -285,8 +308,17 @@ only on the user's request.
 - **The catalog** is its own scope, so that listing does not contend with global
   writes. `list` runs the Agent's `session/list`. An elicitation the Agent sends
   during it is an interaction of the `list` operation, answered like any other.
-- **Terminal input and resize** are not writes. They go to a terminal the bridge
-  runs and change no document state the client decides on.
+- **Resource actions are not operations.** Terminal input, resize, and dismissing
+  a URL flow or an exited terminal login address a resource by its ID and take no
+  `expect`:
+
+  ```text
+  POST /api/v2/scopes/{scope}/resources/{id}/{action}
+  ```
+
+  They never wait for a client and are idempotent by resource ID: dismissing a
+  flow twice, or one that already completed, leaves the same state. A missing
+  resource gives `404`.
 
 ### 6.2 Request and response
 
@@ -428,6 +460,8 @@ read. There is no process to fetch and no export endpoint.
 - Atomic alignment by log head, and one `log` event for alignment and commit.
 - The operation slot, `expect`, occupation across scopes, and one write endpoint.
 - The `catalog` scope and `agent_request` operations.
+- `urlFlows` on every scope; resource lifecycles independent of operations;
+  resource actions, including dismissing a URL flow.
 - Hold by subscription and need, release only of loadable sessions; delete as a
   global operation.
 
@@ -463,9 +497,11 @@ consistency is checked after **every** event, not only once synchronization ends
    - a resent cancel is harmless.
 7. **Group answers (S5).** An answer is refused after an interaction arrives or is
    cancelled.
-8. **Interactions everywhere (§4.3).** Interactions of `load`, `fork`, `create`,
+8. **Interactions everywhere (§4.4).** Interactions of `load`, `fork`, `create`,
    `set_config`, `list` and `agent_request` are shown, answered through the same
-   path as a turn's, and cleared when their operation ends.
+   path as a turn's, and cleared when their operation ends. A URL flow accepted in
+   an `agent_request` stays visible after that operation ends and after the next
+   operation replaces `op`.
 9. **Responses (§6.2).**
    - An answer's HTTP success arriving before the stream shows the change, and an
      operation B replaced by C before a slow subscriber sees B, both leave the
@@ -476,9 +512,11 @@ consistency is checked after **every** event, not only once synchronization ends
     - A prompt on a held session racing its delete is refused.
     - A subscription to an unheld session during its delete gets `end: deleted`,
       or its load after a failed delete.
-11. **URL flows (§4.2).** A URL flow of `global` (authenticate) and of a session
-    survives a reload of the client between accept and completion, and is removed
-    on completion.
+11. **URL flows (§4.3).**
+    - A URL flow of `global` (authenticate), of `catalog` (`list`) and of a
+      session survives a reload of the client between accept and completion.
+    - It is removed on the Agent's completion, on a client's dismissal (also when
+      dismissed twice), and when its scope or the Agent connection ends.
 12. **Holding (S6, §7).**
     - A session released before its first subscription is loaded by that
       subscription and continues its log.
@@ -486,6 +524,8 @@ consistency is checked after **every** event, not only once synchronization ends
       never released while the connection lasts, and a late first subscription
       finds it.
     - A one-off read holds nothing.
+    - A session kept only by a URL flow or terminal is released (if it can be
+      loaded again) once that resource is removed, and is not released before.
 13. **Attachments (§8).** Attachments are readable while referenced by `log` or
     `live`, and stop being readable once only a released process referenced them.
 14. **Delete (§6.1).** Delete of a held session ends its scope with `deleted`; a
