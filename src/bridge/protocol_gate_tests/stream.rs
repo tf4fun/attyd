@@ -1165,6 +1165,68 @@ async fn a_new_subscription_or_an_occupation_cancels_the_release_timer() {
 }
 
 #[tokio::test]
+async fn review_a_sessions_own_admitted_operation_keeps_it_held_before_dispatch() {
+    let (mut peer, mut stream) = followed(loadable()).await;
+    let scope = session(CREATED);
+    let op = peer
+        .install(
+            &scope,
+            OperationKind::Prompt,
+            json!({"prompt": [text("waiting")]}),
+        )
+        .await;
+    stream
+        .until(&mut peer, "the admitted operation", |reader| {
+            reader.live(&session(CREATED))["op"]["id"] == op
+        })
+        .await;
+    // The operation owns this session before its ACP task starts. Dropping
+    // the last observer must not let a retirement timer close its target.
+    stream.close();
+    peer.until_subscribers(CREATED, 0).await;
+    peer.quiet(BEYOND_TIMER).await;
+    peer.settled().await;
+    assert!(
+        !peer.released(&scope),
+        "the session's own operation holds it"
+    );
+    assert_eq!(peer.live(&scope)["op"]["id"], op);
+}
+
+#[tokio::test]
+async fn review_a_subscription_waits_from_delete_admission_before_its_rpc_starts() {
+    let caps = json!({"loadSession": true, "sessionCapabilities": {"delete": {}}});
+    let mut peer = Peer::start(caps).await;
+    let scope = session(SAVED);
+    peer.install("global", OperationKind::Delete, json!({"sessionId": SAVED}))
+        .await;
+
+    // Occupation begins at admission, before the ACP request is dispatched.
+    // A subscription must not steal that interval to start a load.
+    let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
+    peer.quiet(Duration::from_millis(200)).await;
+    assert!(
+        stream.take_all(&mut peer).is_empty(),
+        "the occupied scope waits"
+    );
+
+    let deleted = peer.submit(json!({
+        "type": "session/delete", "requestId": "delete", "sessionId": SAVED,
+    }));
+    let delete = peer.request("session/delete").await;
+    peer.reply(&delete, json!({})).await;
+    Peer::result(deleted).await.unwrap();
+    stream
+        .until(&mut peer, "the admitted delete ends", |reader| {
+            reader.ended.contains_key(&session(SAVED))
+        })
+        .await;
+    assert_eq!(stream.reader.received.len(), 1, "End is the first event");
+    assert_eq!(stream.reader.ended[&scope]["reason"], "deleted");
+    peer.quiet(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
 async fn a_subscription_waits_for_a_cold_delete_and_ends_with_deleted() {
     let caps = json!({"loadSession": true, "sessionCapabilities": {"delete": {}}});
     let mut peer = Peer::start(caps).await;
@@ -1301,6 +1363,39 @@ async fn the_next_connection_s_diverging_replay_rebuilds_from_the_common_prefix(
     assert_eq!(hash_of(&stream.log(&scope)[0]), hash_of(&cached[0]));
     assert_ne!(hash_of(&stream.log(&scope)[1]), hash_of(&cached[1]));
     peer.settled().await;
+    stream.converged(&peer);
+}
+
+#[tokio::test]
+async fn review_an_unfollowed_session_is_released_when_the_agent_connection_ends() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create(CREATED, json!({})).await;
+    let scope = session(CREATED);
+    let mut stream = Stream::open(&peer, &["global"], None).await;
+    stream
+        .until(&mut peer, "the global alignment", |reader| {
+            reader.live("global")["sessions"].get(CREATED).is_some()
+        })
+        .await;
+    assert_eq!(peer.subscribers(CREATED).await, 0);
+    assert!(peer.publication.lock().publisher.document(&scope).is_some());
+
+    // EOF completes the final commit; this test starts no next generation.
+    peer.eof().await.unwrap();
+    stream.take_all(&mut peer);
+    assert_eq!(stream.live("global")["agent"]["phase"], "stopped");
+    let published = peer.publication.lock();
+    assert!(
+        published.publisher.document(&scope).is_none(),
+        "an unneeded session must leave the publisher at EOF, without waiting for another connection"
+    );
+    let global = published.publisher.document("global").unwrap();
+    assert!(
+        global.live["sessions"].get(CREATED).is_none(),
+        "the final global document must no longer list the released session"
+    );
+    assert!(stream.live("global")["sessions"].get(CREATED).is_none());
+    drop(published);
     stream.converged(&peer);
 }
 
@@ -1463,4 +1558,93 @@ async fn four_consumers_converge_one_by_one_lagging_reconnecting_and_paused() {
     assert_eq!(follower.reader.replicas, reconnector.reader.replicas);
     assert_eq!(follower.reader.replicas, pauser.reader.replicas);
     assert_eq!(follower.log(&scope).len(), 4);
+}
+
+// Resume is a valid way to attach after a connection ends, but ACP does not
+// promise that it replays history. The bridge must keep the log it already owns.
+async fn review_resume_on_next_connection_keeps_known_log(
+    old: &mut Peer,
+    stream: &mut Stream,
+    session_id: &str,
+    cached: &[Value],
+) {
+    let scope = session(session_id);
+    let caps = json!({"sessionCapabilities": {"resume": {}}});
+    let mut peer = next_generation(old, caps).await;
+    stream.take_all(&mut peer);
+    assert!(
+        !stream.reader.ended.contains_key(&scope),
+        "resume support keeps the original subscription alive across connections"
+    );
+    assert_eq!(stream.log(&scope), cached);
+    let resume = peer.request("session/resume").await;
+    assert_eq!(resume["params"]["sessionId"], session_id);
+    assert_eq!(resume["params"]["cwd"], CWD);
+    // A conforming resume response sends no historical message notifications.
+    peer.reply(&resume, json!({})).await;
+    stream
+        .until(
+            &mut peer,
+            "the resume completes on the original stream",
+            |reader| reader.live(&session(session_id))["op"]["status"] == "completed",
+        )
+        .await;
+    peer.settled().await;
+    stream.take_all(&mut peer);
+    assert!(stream.reader.ended.is_empty());
+    assert_eq!(
+        stream.log(&scope),
+        cached,
+        "no resume replay is not evidence of an empty history"
+    );
+    stream.converged(&peer);
+    peer.quiet(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn review_resume_only_session_waits_across_eof_and_preserves_its_known_log() {
+    let caps = json!({"sessionCapabilities": {"resume": {}}});
+    let mut old = Peer::start(caps).await;
+    old.create_in(CREATED, CWD, json!({})).await;
+    let scope = session(CREATED);
+    let mut stream = Stream::open(&old, &[scope.as_str()], None).await;
+    old.whole_turn(CREATED, "keep this prompt", "keep this answer")
+        .await;
+    stream
+        .until(&mut old, "the nonempty history", |reader| {
+            reader.log(&session(CREATED)).len() == 1
+        })
+        .await;
+    let cached = stream.log(&scope);
+    old.eof().await.unwrap();
+    stream.take_all(&mut old);
+    assert!(
+        !stream.reader.ended.contains_key(&scope),
+        "an Agent that supports resume can attach this session again"
+    );
+    assert_eq!(stream.live(&scope)["op"]["kind"], "load");
+    assert_eq!(stream.live(&scope)["op"]["status"], "running");
+    assert_eq!(stream.log(&scope), cached);
+    review_resume_on_next_connection_keeps_known_log(&mut old, &mut stream, CREATED, &cached).await;
+}
+
+#[tokio::test]
+async fn review_waiting_session_uses_the_new_connections_resume_capability() {
+    let mut old = Peer::start(json!({"loadSession": true})).await;
+    let scope = session(SAVED);
+    let mut stream = Stream::open(&old, &[scope.as_str()], Some(CWD)).await;
+    old.serve_load(SAVED, &turns(&[("one", "1"), ("two", "2")]))
+        .await;
+    stream
+        .until(&mut old, "the initial load completes", |reader| {
+            reader.live(&session(SAVED))["op"]["status"] == "completed"
+        })
+        .await;
+    let cached = stream.log(&scope);
+    assert_eq!(cached.len(), 2);
+    old.eof().await.unwrap();
+    stream.take_all(&mut old);
+    assert_eq!(stream.live(&scope)["op"]["kind"], "load");
+    assert_eq!(stream.live(&scope)["op"]["status"], "running");
+    review_resume_on_next_connection_keeps_known_log(&mut old, &mut stream, SAVED, &cached).await;
 }
