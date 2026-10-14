@@ -31,17 +31,20 @@ document specifies their fields, endpoints and behavior.
 - **S1 Document.** Every scope is one document with two parts: `log`, an
   append-only sequence of entries, and `live`, one JSON value. Each log entry has a
   chain hash `h_i = H(h_{i-1} ‖ canon(entry_i))`, with `h_0` fixed. A session
-  scope's log is its turn history; every other scope's log is always empty.
+  scope's log is its turn history; every other scope's log is always empty. A
+  session's log is known once the bridge holds its history (from creation, or
+  once its first load completed); until then it is unknown, not empty.
 - **S2 Commit.** Only a completed turn enters the log. Appending its entry, removing
   its process from `live` and moving its operation to a final status are one event.
   Every other change happens in `live` only.
-- **S3 Alignment.** A client subscribes with the head of its log, `(n, h_n)`. The
-  bridge takes one cut of the scope and sends it as one event: its log from `n` if
-  it has hash `h_n` at index `n`, otherwise from `0`, together with the whole of
-  `live`. Taking the cut and continuing with the changes after it is one serial
-  step, so the changes follow the cut exactly. Every later log change names the
-  position `(index, hash)` it follows; a client that cannot match it subscribes
-  again.
+- **S3 Alignment.** A client subscribes with the head of the log it holds,
+  `(n, h_n)`, the subscription's baseline. The bridge sends one cut as one event:
+  the whole of `live` and, once the log is known, its log from the baseline if it
+  has hash `h_n` at index `n`, otherwise from `0`; while the log is unknown, the
+  client keeps its own, unconfirmed. Taking the cut and continuing is one serial
+  step. The baseline advances only with log changes handed to the subscriber's
+  output stream; every log change is computed from it and names the position it
+  follows. A client that cannot apply one subscribes again with the head it holds.
 - **S4 Operation.** All bridge work that may wait for a client is an operation of a
   scope. Every scope's `live` holds exactly one operation `op`, whose `id` is random
   and never reused. The ID identifies the operation and is what writes are admitted
@@ -50,9 +53,10 @@ document specifies their fields, endpoints and behavior.
   writes and loads one at a time. A write that starts an operation needs
   `expect == op.id`, `op` ended, and every other scope it acts on free; the new
   operation replaces `op` in the same step. A write that acts on the running
-  operation (cancel, answer) needs `expect == op.id` and `op` running; an answer
-  must cover exactly the pending interactions. An admitted operation occupies every
-  scope it acts on until it ends: it is the `op` of each held one and holds back the
+  operation (cancel, answer) needs `expect == op.id`, `op` running and a kind that
+  accepts it; an answer must cover exactly the pending interactions. An admitted
+  operation occupies every scope it acts on until it actually ends, a requested
+  cancel included: it is the `op` of each held one and holds back the
   load of each unheld one. Anything else is refused.
 - **S6 Holding.** The bridge holds a session while it is needed: subscribed,
   occupied, or with a live terminal or URL flow. It releases a session that is not
@@ -77,7 +81,8 @@ document specifies their fields, endpoints and behavior.
 **Conventions.** All paths are under `/api/v2`. JSON field names are camelCase.
 Embedded ACP types (`ContentBlock`, `SessionUpdate`, `RequestPermissionRequest`,
 `InitializeResponse`, …) are carried verbatim, as the ACP schema pinned in
-`Cargo.lock` defines them.
+`Cargo.lock` defines them. Types the bridge defines itself, such as
+`AttachmentRef` (§3.1), are never presented as ACP types.
 
 | Part | Transport | Section |
 | --- | --- | --- |
@@ -104,9 +109,23 @@ continues the same scope name; S3 decides what a client keeps.
 
 ```ts
 interface Turn {
-  prompt: ContentBlock[];   // the user's message, normalized (§3.2)
-  reply: ContentBlock[];    // the Agent's message content, in order, normalized
+  prompt: Block[];          // the user's message, normalized (§3.2)
+  reply: Block[];           // the Agent's message content, in order, normalized
 }
+
+type Block =                // normalized content
+  | Extract<ContentBlock, { type: "text" | "resource_link" }>   // ACP, verbatim
+  | AttachmentRef;
+
+interface AttachmentRef {   // the bridge's own type, not an ACP ContentBlock
+  type: "attachment";
+  id: string;               // lowercase hex SHA-256 of the block's canonical JSON
+  block: "image" | "audio" | "resource";   // the type of the block it stands for
+  mimeType?: string;        // from the block, when it has one
+  uri?: string;             // a resource's URI
+}
+
+type PromptBlock = ContentBlock | AttachmentRef;   // what a prompt may contain (§6.2)
 
 interface LogEntry {
   turn: Turn;
@@ -134,9 +153,9 @@ from a `session/load` or `session/resume` replay apply the same steps.
    a turn with an empty prompt. Process updates are not part of any entry.
 3. **Content.** `prompt` and `reply` are normalized by the same rules:
    - adjacent text blocks are merged into one;
-   - image, audio and embedded resource blocks are replaced by
-     `{ type: "attachment", id }`, where `id` is the lowercase hex SHA-256 of the
-     block's canonical JSON; resource links stay as they are;
+   - image, audio and embedded resource blocks are replaced by an `AttachmentRef`
+     (§3.1), whose `id` is the lowercase hex SHA-256 of the block's canonical JSON
+     with `_meta` dropped; resource links stay as they are;
    - `_meta` fields are dropped at every level;
    - the result is serialized as canonical JSON (RFC 8785, JCS).
 
@@ -192,7 +211,11 @@ interface GlobalLive extends ScopeLive {
     authenticatedMethodId: string | null;
   };
   sessions: Record<string, SessionSummary>; // sessions the bridge holds
-  terminals: Record<string, Terminal>;      // terminal logins, by operation ID
+  terminals: Record<string, LoginTerminal>; // terminal logins, by operation ID
+}
+
+interface LoginTerminal extends Terminal {
+  methodId: string;                         // the authentication method it runs
 }
 
 interface SessionSummary {
@@ -217,7 +240,8 @@ interface Operation {
   id: string;                               // random, never reused (§6.5)
   kind: OperationKind;
   status: OperationStatus;
-  input: unknown;                           // the write's `args`, or the load's cwd
+  input: unknown;                           // the write's `args` (a prompt as normalized
+                                            // `Block[]`), or the load's cwd
   cancelRequested: boolean;
   interactions: Record<string, Interaction>;  // pending, by interactionId
   process?: SessionUpdate[];                // prompt while running: its updates, folded
@@ -259,7 +283,10 @@ three sources in this order:
    `load`, `resume` or `fork` response, in arrival order.
 2. **The response**, which overrides exactly the fields it provides (`modes`,
    `configOptions`). Fields it does not provide keep their early value.
-3. **Later updates**, in arrival order.
+3. **Later updates and acknowledgements**, in arrival order. A successful
+   `set_mode` or `set_config` operation folds its acknowledgement when its response
+   arrives, after every notification that arrived before it, whether or not the
+   Agent also sent a notification. A failed one folds nothing.
 
 ```ts
 interface SessionControls {
@@ -281,6 +308,8 @@ interface SessionControls {
 | `available_commands_update` | replaces `commands` as a whole |
 | `session_info_update` | per field: absent keeps the value, `null` clears it, a value sets it |
 | `usage_update` | sets `used` and `size`; `cost` absent or `null` keeps the last known cost |
+| successful `set_mode` | sets `modes.currentModeId` to the requested `modeId` |
+| successful `set_config` | replaces `configOptions` with the response's `configOptions` |
 
 ### 4.6 Resources
 
@@ -303,7 +332,7 @@ interface Terminal {
 | --- | --- | --- |
 | URL flow | a client accepts a URL elicitation; the interaction leaves `interactions` in the same step. Accepting only consents. | the Agent's `elicitation/complete` for its `elicitationId` (the one flow with that ID); a client's dismissal (§7); its scope ending; the Agent connection ending |
 | session terminal | the Agent's `terminal/create` | the Agent's `terminal/release`; its scope ending; the Agent connection ending |
-| terminal login | a `terminal_login` operation starts | it has exited and a client dismisses it (§7); the Agent connection ending |
+| terminal login | a `terminal_login` operation starts; it keeps its `methodId` for its whole life, whatever operation follows | it has exited and a client dismisses it (§7); the Agent connection ending |
 
 No completion record is kept. A live resource keeps its session needed (S6).
 
@@ -318,7 +347,7 @@ GET /api/v2/stream?scope=global&scope=session/S&have=session/S:12:<hash>&cwd=ses
 | Parameter | Meaning |
 | --- | --- |
 | `scope` | a scope to follow; repeatable |
-| `have` | `<scope>:<n>:<h_n>`, the client's log head for a session scope; without it the head is `(0, h_0)` |
+| `have` | `<scope>:<n>:<h_n>`, the head of the log the client holds now for a session scope; without it the head is `(0, h_0)`. It is the subscription's baseline (S3). |
 | `cwd` | `<scope>:<path>`, the working directory to load an unheld session with (S6); ignored for a held session |
 
 One stream carries any set of scopes. To change the set, a client opens a new
@@ -326,10 +355,13 @@ stream and ignores every event of the one it replaced.
 
 Subscribing to a session scope:
 
-- **held:** the scope is aligned at once;
-- **not held, free:** the bridge starts holding it with a running `load` and aligns
-  the scope with an empty log and that `live`. A missing `cwd` ends the scope with
-  `load_failed` (`invalid_request`);
+- **held:** the scope is aligned at once, log and `live`;
+- **not held, free:** the bridge starts holding it with a running `load`. Its log is
+  unknown, so the alignment carries `live` only: the client keeps its log,
+  unconfirmed, and shows and answers the load's interactions. When the load ends,
+  one event carries the log from the baseline (the suffix if the baseline matches,
+  else the whole log) with the patch that ends the load. A missing `cwd` ends the
+  scope with `load_failed` (`invalid_request`);
 - **not held, occupied** (a delete runs on it, §6.3): the subscription waits until
   the occupying operation ends, then gets `end: deleted` or starts the load.
 
@@ -358,18 +390,21 @@ type LiveChange = { replace: unknown } | { patch: Op[] };
 A client applies an event to its document for `scope`:
 
 1. **`log`.** If `from` exceeds its log length, or its hash at `from` is not `prev`,
-   the client subscribes again (S3). Otherwise it truncates to `from` entries and
-   appends `entries`.
+   the client closes the stream and subscribes again with the head it holds (S3).
+   Otherwise it truncates to `from` entries and appends `entries`; its log is then
+   confirmed.
 2. **`live`.** `replace` installs the value; `patch` applies the ops in order.
 3. **`end`.** The client drops the document. Nothing follows `end` for that scope
    on this stream.
 
 Both parts of one event are applied together. After every event the client's
-document equals a document the bridge held at some moment.
+`live` equals a `live` the bridge held at some moment, and its log equals the
+bridge's log at that moment, or, while that log is unknown, the client's own.
 
 | Event | When |
 | --- | --- |
-| `{ log, live: { replace } }` | **alignment**: the first event of every subscribed scope, and every resync (§5.4). `from` is the matched index, or `0`. |
+| `{ log, live: { replace } }` | **alignment**: the first event of every subscribed scope, and every resync (§5.4). `from` is the matched index, or `0`. While the log is unknown, the alignment is `{ live: { replace } }`. |
+| `{ log, live: { patch } }` at a first load's end | the log from the baseline, with the patch that ends the load |
 | `{ log, live: { patch } }` | **commit** (S2): `from` is the previous length; the patch ends the operation and removes its process. Also a rebuilt log after a reload (`from` is the longest common prefix with the log last sent). |
 | `{ live: { patch } }` | every other change |
 | `{ end }` | the session was deleted, or its load failed |
@@ -399,9 +434,10 @@ in place uses `set` on its index, a bounded tail moving forward uses `trim` plus
 | --- | --- |
 | first open, reconnect after a break, bridge restart | the client subscribes with the head it holds; one alignment event |
 | the Agent's replay after a reload differs from the client's log | the head does not match; the alignment sends the whole log and the client replaces its own |
-| a slow subscriber | the bridge drops the subscriber's queued events of each scope that still exists and queues one alignment from the last log position it sent; an ended scope keeps its `end` |
+| a slow subscriber | the bridge drops the subscriber's queued events of each scope that still exists and queues one alignment from the baseline, the last log position handed to the output stream (a change still in the queue never advances it); an ended scope keeps its `end` |
+| a cold reopen | the client's log stays, unconfirmed, while the session loads; the load's end confirms it with the suffix, or replaces it when the history changed |
 | the Agent connection ends | each subscribed session's `op` becomes a running `load` waiting for the connection; `global.agent` shows why; a session the Agent cannot load again ends with `load_failed` |
-| `EventSource` retries the original URL | correct, since the original `have` still aligns; a client may instead reopen the stream with its current head |
+| the stream breaks | the client subscribes again with the head it holds then. It does not let `EventSource` retry the original URL, whose `have` may no longer be what it holds. |
 
 The bridge sends an SSE comment at least every 15 seconds on an idle stream.
 
@@ -420,7 +456,7 @@ POST /api/v2/scopes/{scope}/ops
 
 | Scope | Kind | `args` | Occupies | Allowed while | Result |
 | --- | --- | --- | --- | --- | --- |
-| session | `prompt` | `{ prompt: ContentBlock[] }` | the session | `op` ended | `{ stopReason, usage? }` |
+| session | `prompt` | `{ prompt: PromptBlock[] }` | the session | `op` ended | `{ stopReason, usage? }` |
 | session | `set_mode` | `{ modeId }` | the session | `op` ended | `{}` |
 | session | `set_config` | `{ configId, value }` | the session | `op` ended | `{}` |
 | session | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source | `op` ended | `{ sessionId }` |
@@ -430,7 +466,7 @@ POST /api/v2/scopes/{scope}/ops
 | global | `logout` | `{}` | `global` | `op` ended | `{}` |
 | global | `terminal_login` | `{ methodId, cols, rows }` | `global` | `op` ended | `{ exitCode, signal }` |
 | catalog | `list` | `{ cursor?, revision? }` | `catalog` | `op` ended | `{ revision, sessions: SessionInfo[], nextCursor }` |
-| any | `cancel` | `{}` | — | `op` running, of a kind that can be cancelled | — |
+| any | `cancel` | `{}` | — | `op` running, of kind `prompt`, `terminal_login` or `agent_request` | — |
 | any | `answer` | `{ answers: Record<interactionId, Answer> }` | — | `op` running, keys equal to `op.interactions` | — |
 
 ```ts
@@ -442,12 +478,15 @@ type Answer =
 - **Bridge-started kinds.** `load` (a subscription, §5.1), `open` (the first
   operation of a created session), `none` (the first operation of `global` and
   `catalog`) and `agent_request` (below) are never written by clients.
-- **Prompt content.** A prompt may reference an attachment of the session as
-  `{ type: "attachment", id }`; the bridge resolves it to the block it names.
+- **Prompt content.** A prompt may contain `AttachmentRef`s to attachments of the
+  session. The bridge resolves each to the ACP block it names before it calls
+  `session/prompt`; an unknown ID is refused with `invalid_request`. The
+  operation's `input.prompt` is the normalized `Block[]`.
 - **Cancel** applies to `prompt` (`session/cancel`), `terminal_login` (the login
   process is stopped) and `agent_request` (every pending interaction is answered
   with its cancel outcome). Other kinds refuse it with `not_allowed`. A cancel sets
-  `cancelRequested`; repeating it changes nothing.
+  `cancelRequested`; repeating it changes nothing. Requesting a cancel does not end
+  the operation: it keeps its scopes occupied until it actually ends.
 - **Answer** delivers each answer as the response to its Agent request. Accepting a
   URL elicitation moves it to `urlFlows` (§4.6).
 - **Fork** creates a session the bridge holds, starting with a completed `open`.
@@ -456,13 +495,14 @@ type Answer =
   Agent's delete capability. It works on sessions the bridge does not hold.
 - **List** runs the Agent's `session/list`. A `revision` that is not
   `catalog.live.revision` is refused with `catalog_changed`.
-- **Agent requests outside an operation.** An Agent request (permission or
-  elicitation) that arrives while its scope's `op` has ended starts an
-  `agent_request` operation holding it; one that arrives while an operation runs
-  joins that operation's `interactions`. A request-scoped elicitation belongs to
-  the scope of the operation whose ACP request it names. If its scope is occupied
-  by another scope's operation, the bridge answers it with its cancel outcome. An
-  `agent_request` completes when its interactions are gone.
+- **Agent requests.** An Agent request (permission or elicitation) joins the
+  running operation of its scope: the scope's own, or the operation that occupies
+  it. A delete's `session/close` may ask for input in the session it occupies; that
+  interaction joins the delete and is answered like any other. If no operation
+  runs, the request starts an `agent_request` operation in its scope. An occupied
+  held scope always shows its occupying operation, so there is no other case. A
+  request-scoped elicitation belongs to the scope of the operation whose ACP
+  request it names. An `agent_request` completes when its interactions are gone.
 
 ### 6.3 Response
 
@@ -486,13 +526,13 @@ The bridge handles operation writes and loads one at a time:
 | Write | Admitted when | Otherwise |
 | --- | --- | --- |
 | starts an operation | `expect == op.id`, `op` ended, every other scope in "Occupies" free | `stale` if `expect` differs; `not_allowed` otherwise |
-| `cancel`, `answer` | `expect == op.id`, `op` running, and for `answer` the keys equal `op.interactions` | `stale` if `expect` differs; `not_allowed` otherwise |
+| `cancel`, `answer` | `expect == op.id`, `op` running, its kind accepts the write (§6.2), and for `answer` the keys equal `op.interactions` | `stale` if `expect` differs; `not_allowed` otherwise |
 
 Capability, argument and Agent checks follow: `unsupported`, `invalid_request`,
 `unavailable`. A refused write changes nothing.
 
 An admitted operation is the `op` of every held scope it occupies, with the same
-`id`, until it ends; an unheld occupied session cannot be loaded meanwhile. A scope
+`id`, until it actually ends; an unheld occupied session cannot be loaded meanwhile. A scope
 is free when its `op` has ended and no operation occupies it.
 
 ### 6.5 Operation IDs

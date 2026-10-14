@@ -94,7 +94,11 @@ lock's mutable guard is released (as in the earlier draft):
 
 - `reduce_messages(&[SessionUpdate]) -> Vec<Message>` applies protocol §3.2 step 1;
 - `turns(messages) -> Vec<Turn>` applies step 2;
-- `normalize(&[ContentBlock]) -> Vec<ContentBlock>` applies step 3;
+- `normalize(&[ContentBlock]) -> Vec<Block>` applies step 3, where `Block` is the
+  protocol's normalized content (text, resource links and `AttachmentRef`), a
+  bridge DTO rather than an ACP type;
+- `resolve(&[PromptBlock]) -> Vec<ContentBlock>` turns a prompt's references back
+  into the ACP blocks they name, before `session/prompt`;
 - `chain(prev, &Turn) -> Hash` hashes the JCS serialization.
 
 A live commit builds the turn from the operation's prompt and the turn's Agent
@@ -114,11 +118,15 @@ The Hub owns delivery only:
   client's head if `have` matches, else from `0`, with `live: { replace }`. Events
   of later commits enter the subscriber's queue in the same critical section that
   produced them, so nothing falls between the cut and the stream (protocol S3).
-- **Per-subscriber position.** For each scope the Hub remembers the log length and
-  head it last queued to the subscriber, which is all a resync needs.
-- **Coalescing.** A queue past its byte budget (1 MiB, as in the earlier draft) is collapsed per
-  scope: queued events of a scope that still exists are replaced by one alignment
-  from the remembered position; a queued `end` is kept, and nothing of its scope
+- **Baseline.** For each session scope the Hub keeps the subscription's baseline:
+  the head the client declared, advanced only when a log change is taken from the
+  replaceable queue and handed to the stream's ordered output. Every log change for
+  that subscriber is computed from the baseline, and a resync starts from it. A
+  change still in the queue never advances it, since coalescing may drop it. No
+  client acknowledgement, sequence number or retained log is needed.
+- **Coalescing.** A queue past its byte budget (1 MiB, as in the earlier draft) is
+  collapsed per scope: queued events of a scope that still exists are replaced by
+  one alignment from the baseline; a queued `end` is kept, and nothing of its scope
   follows it.
 - **Heartbeats.** An SSE comment on a stream idle for 15 seconds.
 - **Holding.** A subscription to a session scope counts as one subscriber of that
@@ -148,14 +156,28 @@ that the ending transition fulfils. A dropped connection only drops the channel.
 
 **Agent requests.** The coordinator routes each Agent request to a scope as today:
 by session, or for a request-scoped elicitation by the JSON-RPC ID it names
-(`ElicitationRequestScope.request_id`), resolved in wire order. The request joins a
-running operation of that scope, starts an `agent_request` operation if the scope is
-free, or is answered with its cancel outcome otherwise.
+(`ElicitationRequestScope.request_id`), resolved in wire order. The request joins
+the scope's running operation, its own or the one occupying it, or starts an
+`agent_request` operation when none runs.
+
+**Cancel.** A cancel is admitted only for `prompt`, `terminal_login` and
+`agent_request`. It sets `cancel_requested` and starts the kind's cancellation;
+the operation keeps its occupation until the transition that actually ends it.
+
+**Controls.** A successful `set_mode` or `set_config` folds its acknowledgement
+into `controls` in the transition that ends the operation, as the bridge does today
+(`complete_control_operation`): the requested mode, or the response's
+`configOptions`. A failure folds nothing.
 
 **Loads.** A subscription to an unheld session is admitted like a write without
 `expect`: it waits while the session is occupied, then installs a running `load`
-with the given `cwd`. A load reuses the existing `session/load` / `session/resume`
-attachment path and ends by rebuilding the `TurnLog` from the replay.
+with the given `cwd`. Until the first load completes, the session's `TurnLog` is
+`Unknown`, distinct from empty: alignments carry `live` only and leave each
+subscriber's baseline where the client declared it. The load reuses the existing
+`session/load` / `session/resume` attachment path and ends by building the
+`TurnLog` from the replay; the transition publishes, per subscriber, the log from
+its baseline together with the patch that ends the load. A reload of a held session
+(after an Agent restart) keeps its known log until the replay replaces it.
 
 **Release.** A session whose need ends starts the existing retirement timer
 (`--session-unobserved-timeout`), now only a performance setting. When it fires and
@@ -165,7 +187,8 @@ the session is still not needed, the bridge closes it only if the Agent advertis
 ### 2.6 Resources
 
 Session terminals and URL flows keep their current bridge representation, keyed by
-terminal ID and interaction ID. They leave `live` as protocol §4.6 states;
+terminal ID and interaction ID. A login terminal keeps its `methodId` with the
+terminal itself, not on the operation that started it. They leave `live` as protocol §4.6 states;
 acknowledgement records and terminal statuses go. The terminal login keeps the auth
 terminal manager and its ordered events; its operation ends with the process exit,
 and its terminal stays until dismissed. Terminal input is written as received, in
@@ -183,7 +206,7 @@ fails when the generated output is stale. ACP types are referenced from
 | Invariant | Statement |
 | --- | --- |
 | I1 single write path | only the commit step publishes documents and events |
-| I2 per-event consistency | after every event, a replica's document equals a document the bridge published |
+| I2 per-event consistency | after every event, a replica's `live` equals a published `live`, and its log equals the published log, or its own unconfirmed log while the bridge's is unknown |
 | I3 exact cut | an alignment plus the events after it reproduce the published documents, with no gap and no duplicate |
 | I4 coalescing safety | replacing any queued suffix by an alignment gives the same final document; `end` survives |
 | I5 identity | the same messages give the same entries and hashes, live or replayed, however chunked |
@@ -199,7 +222,9 @@ published documents:
 
 - one follows every event;
 - one lags and has random suffixes of its queue coalesced (I4);
-- one disconnects at random cuts and subscribes again with its head (I3).
+- one disconnects at random cuts and subscribes again with its head (I3);
+- one pauses consumption, has a queued but unsent log change coalesced, and
+  resumes; it must apply the alignment directly, without subscribing again.
 
 Scenarios run on the session registry (control updates, streamed and folded turns,
 commits, reloads with equal and diverging replays, terminals rolling past their
@@ -211,7 +236,7 @@ divergence.
 ### 4.2 Acceptance
 
 The acceptance cases of
-[client-api-redesign.md §11](client-api-redesign.md#11-acceptance) (1–16) are the
+[client-api-redesign.md §11](client-api-redesign.md#11-acceptance) (1–18) are the
 acceptance suite. Each lands, as a bridge test, in the step that makes it
 reachable (§5), and again in the client engine where it has a client half (3, 4, 9,
 15, 16). The [coverage ledger](acp-coverage.md) replaces the earlier draft's chains with one per
@@ -231,10 +256,10 @@ product keeps working throughout. Each step is one PR, validated in CI.
 | --- | --- | --- |
 | 1 | The redesign settled, the protocol and this plan (docs only) | — |
 | 2 | Remove the earlier v2 draft: `src/server/v2.rs` and its routes, the records and intent table, the replication log and Hub, the commit step, owner-qualified subscriptions, the projections and their tests, and the generated `shared/protocol.ts` types; `controls.rs`, `diff.rs` and `typescript.rs` stay (§1); v1 unchanged | v1 suites still pass |
-| 3 | `canon.rs`: message reduction, turns, normalization, hash chain; `TurnLog` built from live commits and from replays | 1 |
-| 4 | DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`; the per-event convergence gate | 2, 5, 13 |
+| 3 | `canon.rs`: message reduction, turns, normalization, prompt resolution, hash chain; `TurnLog` built from live commits and from replays | 1 |
+| 4 | DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`; the per-event convergence gate | 2, 5, 13, 18 |
 | 5 | `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}`: Hub cut, alignment, coalescing, `end`; hold by subscription and need, `load` on subscription, release of loadable sessions only | 3, 4, 12 |
-| 6 | `POST /api/v2/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16 (bridge) |
+| 6 | `POST /api/v2/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16, 17 (bridge) |
 | 7 | Web UI on v2: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection. PR #34, built on the earlier draft, is not landed; `shared/replica.ts` and `shared/protocol-validate.ts` are carried over where they fit | 3, 4, 9, 15, 16 (client) |
 | 8 | Remove v1: routes, business events, browser compensating state; Markdown export and attachment links on v2 | — |
 | 9 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | — |
