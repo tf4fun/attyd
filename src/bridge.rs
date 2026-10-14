@@ -7147,22 +7147,42 @@ fn commit_session_cancel(
         .request_cancel(&epoch, session_id, incarnation)
         .map_err(runtime_state_error)?;
     // Select and retire this turn's current interactions before completion can
-    // admit a new turn in the same incarnation.
-    cancel_interactions_locked(session_id, incarnation, state, sink);
+    // admit a new turn in the same incarnation. Accepted URL flows belong to
+    // the session scope and survive the cancel (S7).
+    if let Some(owner) = owned_resources(state, session_id, incarnation) {
+        cancel_pending_interactions(&owner, state, sink);
+        flush_runtime(state, sink);
+    }
     Ok(())
 }
 
+fn owned_resources(
+    state: &BridgeState,
+    session_id: &str,
+    incarnation: u64,
+) -> Option<SessionResourceOwner> {
+    let owner = SessionResourceOwner::new(state.sessions.epoch(), session_id, incarnation);
+    state.sessions.owns_resources(&owner).then_some(owner)
+}
+
+/// Cancels the session's pending interactions and releases its scope's
+/// resources: the session ended or the connection is ending.
 fn cancel_interactions_locked(
     session_id: &str,
     incarnation: u64,
     state: &mut BridgeState,
     sink: &EventSink,
 ) {
-    let owner = SessionResourceOwner::new(state.sessions.epoch(), session_id, incarnation);
-    if !state.sessions.owns_resources(&owner) {
+    let Some(owner) = owned_resources(state, session_id, incarnation) else {
         return;
-    }
-    let resolve_canonical = state.sessions.live(session_id).is_some_and(|live| {
+    };
+    cancel_pending_interactions(&owner, state, sink);
+    release_url_flows(&owner, state, sink);
+    flush_runtime(state, sink);
+}
+
+fn resolves_canonically(state: &BridgeState, session_id: &str) -> bool {
+    state.sessions.live(session_id).is_some_and(|live| {
         matches!(
             live.lifecycle,
             SessionLifecycle::Active
@@ -7170,16 +7190,27 @@ fn cancel_interactions_locked(
                 | SessionLifecycle::Closing
                 | SessionLifecycle::ClosingForDelete
         )
-    });
+    })
+}
+
+/// Answers the session's pending permissions and elicitations with cancel.
+fn cancel_pending_interactions(
+    owner: &SessionResourceOwner,
+    state: &mut BridgeState,
+    sink: &EventSink,
+) {
+    let session_id = owner.session_id.as_str();
+    let incarnation = owner.incarnation;
+    let resolve_canonical = resolves_canonically(state, session_id);
     let permission_ids = state
         .sessions
         .permission_owners
         .iter()
-        .filter(|(_, route)| *route == &owner)
+        .filter(|(_, route)| *route == owner)
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     for id in permission_ids {
-        if let Some(pending) = state.sessions.take_permission(&id, &owner) {
+        if let Some(pending) = state.sessions.take_permission(&id, owner) {
             if resolve_canonical
                 && let Err(error) =
                     state
@@ -7197,11 +7228,11 @@ fn cancel_interactions_locked(
         .sessions
         .elicitation_owners
         .iter()
-        .filter(|(_, route)| *route == &owner)
+        .filter(|(_, route)| *route == owner)
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     for id in elicitation_ids {
-        if let Some(pending) = state.sessions.take_elicitation(&id, &owner) {
+        if let Some(pending) = state.sessions.take_elicitation(&id, owner) {
             if resolve_canonical
                 && let Err(error) = state.sessions.resolve_elicitation(
                     &owner.epoch,
@@ -7217,11 +7248,19 @@ fn cancel_interactions_locked(
                 .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
     }
+}
+
+/// Settles the URL flows accepted in the session as cancelled: its scope
+/// ended (protocol §4.6), which also frees the Agent's elicitation IDs.
+fn release_url_flows(owner: &SessionResourceOwner, state: &mut BridgeState, sink: &EventSink) {
+    let session_id = owner.session_id.as_str();
+    let incarnation = owner.incarnation;
+    let resolve_canonical = resolves_canonically(state, session_id);
     let url_ids = state
         .sessions
         .url_owners
         .iter()
-        .filter(|(_, route)| route.owner.as_ref() == Some(&owner))
+        .filter(|(_, route)| route.owner.as_ref() == Some(owner))
         .map(|(id, route)| (id.clone(), route.clone()))
         .collect::<Vec<_>>();
     for (elicitation_id, registration) in url_ids {
@@ -7244,8 +7283,7 @@ fn cancel_interactions_locked(
             .sessions
             .take_url_route(&elicitation_id, &registration);
     }
-    // A request-scoped URL flow accepted in this session ends with its scope
-    // too (protocol §4.6), and frees the Agent's elicitation ID.
+    // A request-scoped URL flow accepted in this session ends with it too.
     let scope = OpScope::Session(session_id.to_string());
     let request_flows = state
         .sessions
@@ -7285,7 +7323,6 @@ fn cancel_interactions_locked(
             .flow_scopes
             .remove(&registration.registration_id);
     }
-    flush_runtime(state, sink);
 }
 
 fn validate_configured_capabilities(
@@ -11636,7 +11673,7 @@ mod tests {
             .resource_owner("session", incarnation)
             .unwrap();
         let (mut old_permission, mut old_elicitation) = pending(&mut locked, &owner, "old");
-        register_test_url(&mut locked, Some(owner.clone()), "old-url");
+        let old_url = register_test_url(&mut locked, Some(owner.clone()), "old-url");
         let competing_state = state.clone();
         let next_owner = owner.clone();
         let (queued, ready) = oneshot::channel();
@@ -11658,15 +11695,31 @@ mod tests {
             old_elicitation.try_recv().unwrap().action,
             ElicitationAction::Cancel
         ));
-        assert!(locked.sessions.url_owners.is_empty());
-        assert!(
-            locked
-                .sessions
-                .live("session")
-                .unwrap()
-                .url_flows
-                .is_empty()
+        // The accepted flow belongs to the session scope, not to the turn, so
+        // the cancel keeps it (S7). Only its completion frees the ID.
+        assert_eq!(
+            locked.sessions.url_owners.get("reusable-url"),
+            Some(&old_url)
         );
+        assert_eq!(
+            locked.sessions.live("session").unwrap().url_flows["reusable-url"].registration_id,
+            "old-url"
+        );
+        let epoch = locked.sessions.epoch().to_string();
+        locked
+            .sessions
+            .settle_url_registration(
+                &epoch,
+                Some(("session", incarnation)),
+                "reusable-url",
+                &old_url.registration_id,
+                UrlFlowStatus::Completed,
+            )
+            .unwrap();
+        locked
+            .sessions
+            .take_url_route("reusable-url", &old_url)
+            .unwrap();
         complete_test_turn(&mut locked, "session", &operation);
         drop(locked);
         let ((mut permission, mut elicitation), registration) = next.await.unwrap();
