@@ -758,7 +758,9 @@ fn a_coalesce_keeps_a_queued_end_and_nothing_of_its_scope_follows() {
 #[test]
 fn a_turn_completion_and_a_reload_coalesce_to_the_same_cut_a_follower_reaches() {
     let mut world = World::new();
-    let incarnation = world.load("s", &replay(&[("one", "1")]));
+    // The registry admits a reload only on a settled turn, as the bridge's
+    // history sync leaves it; the committed turn is the flood's prompt below.
+    let incarnation = world.load("s", &replay(&[("one", "1"), ("two", "2")]));
     let mut follower = Reader::new(&["global", "session/s"]);
     let following = world.subscribe(&mut follower);
     let mut lagging = Reader::new(&["global", "session/s"]);
@@ -766,8 +768,6 @@ fn a_turn_completion_and_a_reload_coalesce_to_the_same_cut_a_follower_reaches() 
     world.drain(&mut follower, &following);
     world.drain(&mut lagging, &lagged);
 
-    world.turn("s", incarnation, "two", "2");
-    world.drain(&mut follower, &following);
     world.reload("s", incarnation, &replay(&[("one", "1"), ("other", "3")]));
     world.drain(&mut follower, &following);
     // The follower takes every commit as it comes; the lagger stays paused.
