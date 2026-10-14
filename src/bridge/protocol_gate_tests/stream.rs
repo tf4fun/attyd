@@ -585,12 +585,32 @@ async fn reconnecting_before_during_and_after_a_load_keeps_one_load_and_converge
     // During the replay.
     peer.update(SAVED, replay[0].clone()).await;
     peer.update(SAVED, replay[1].clone()).await;
+    // A barrier: the Agent's next request shows only once the bridge has
+    // handled the replay before it.
+    peer.agent_request(
+        "barrier",
+        "elicitation/create",
+        form(json!({"sessionId": SAVED})),
+    )
+    .await;
+    stream
+        .until(&mut peer, "the barrier", |reader| {
+            interaction_ids(&reader.live(&session(SAVED))).len() == 1
+        })
+        .await;
     stream.reopen(&peer, Some(CWD)).await;
     stream
         .until(&mut peer, "the third alignment", |reader| {
             reader.events_of(&session(SAVED)).len() == 3
         })
         .await;
+    let barrier = interaction_ids(&stream.live(&scope)).remove(0);
+    let answered = peer.submit(json!({
+        "type": "elicitation/respond", "requestId": "answer", "sessionId": SAVED,
+        "elicitationId": barrier, "response": {"action": "accept", "content": {}},
+    }));
+    Peer::result(answered).await.unwrap();
+    peer.response("barrier").await;
     for update in &replay[2..] {
         peer.update(SAVED, update.clone()).await;
     }
@@ -640,9 +660,18 @@ async fn an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed
         "the end is the scope's only event"
     );
     peer.quiet(Duration::from_millis(200)).await;
+    let before = missing.events_of("global").len();
+    let op = peer
+        .install("global", OperationKind::Logout, json!({}))
+        .await;
+    missing
+        .until(&mut peer, "a later global change", |reader| {
+            reader.live("global")["op"]["id"] == op
+        })
+        .await;
     assert!(
-        missing.reader.replicas.contains_key("global"),
-        "other scopes go on"
+        missing.events_of("global").len() > before,
+        "the stream goes on for its other scopes"
     );
 
     let mut failing = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
@@ -813,6 +842,49 @@ async fn subscribers_hold_a_loadable_session_and_the_last_one_leaving_releases_i
 }
 
 #[tokio::test]
+async fn a_loadable_session_without_close_is_released_locally() {
+    let replay = turns(&[("one", "1")]);
+    let mut peer = Peer::start_with(json!({"loadSession": true}), json!([]), |options| {
+        options.session_unobserved_timeout = 0;
+    })
+    .await;
+    let scope = session(SAVED);
+    let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
+    peer.serve_load(SAVED, &replay).await;
+    stream
+        .until(&mut peer, "the load ends", |reader| {
+            reader.live(&session(SAVED))["op"]["status"] == "completed"
+        })
+        .await;
+    let cached = stream.log(&scope);
+    stream.close();
+    peer.until("the session is released", |peer| {
+        peer.released(&session(SAVED))
+    })
+    .await;
+    peer.quiet(Duration::from_millis(200)).await;
+    assert!(
+        peer.events_of(&scope)
+            .iter()
+            .all(|event| event.get("end").is_none()),
+        "a release sends no end"
+    );
+    assert!(peer.publication.lock().publisher.document(&scope).is_none());
+
+    stream.reopen(&peer, Some(CWD)).await;
+    peer.serve_load(SAVED, &replay).await;
+    stream
+        .until(&mut peer, "the reload ends", |reader| {
+            reader.live(&session(SAVED))["op"]["status"] == "completed"
+                && reader.events_of(&session(SAVED)).len() > 2
+        })
+        .await;
+    assert_eq!(stream.log(&scope), cached);
+    peer.settled().await;
+    stream.converged(&peer);
+}
+
+#[tokio::test]
 async fn a_session_released_before_its_first_subscription_is_loaded_by_it() {
     let mut peer = Peer::start_with(loadable(), json!([]), |options| {
         options.session_unobserved_timeout = 0;
@@ -961,6 +1033,7 @@ async fn an_accepted_url_flow_alone_keeps_the_session_needed() {
         stream.close();
         peer.until_subscribers(CREATED, 0).await;
         peer.quiet(BEYOND_TIMER).await;
+        peer.settled().await;
         assert!(!peer.released(&scope), "request_scoped={request_scoped}");
 
         peer.send(json!({
@@ -979,8 +1052,25 @@ async fn an_accepted_url_flow_alone_keeps_the_session_needed() {
 
 #[tokio::test]
 async fn an_exited_terminal_not_yet_released_keeps_the_session_needed() {
-    let (mut peer, mut stream) = followed(loadable()).await;
+    // The bridge runs Agent terminals for a stdio Agent only, in a real
+    // workspace.
+    let workspace = tempfile::tempdir().unwrap();
+    let cwd = workspace.path().to_string_lossy().into_owned();
+    let mut peer = Peer::start_with(loadable(), json!([]), |options| {
+        options.transport = Transport::Stdio;
+        options.command = vec!["/bin/sh".into()];
+        options.cwd = workspace.path().to_path_buf();
+        options.session_unobserved_timeout = 1;
+    })
+    .await;
+    peer.create_in(CREATED, &cwd, json!({})).await;
     let scope = session(CREATED);
+    let mut stream = Stream::open(&peer, &[scope.as_str()], None).await;
+    stream
+        .until(&mut peer, "the alignment", |reader| {
+            reader.replicas.contains_key(&session(CREATED))
+        })
+        .await;
     let revision = peer.revision(CREATED).await;
     let prompt = vec![text("run")];
     peer.install_prompt(CREATED, &prompt).await;
@@ -1017,6 +1107,7 @@ async fn an_exited_terminal_not_yet_released_keeps_the_session_needed() {
     stream.close();
     peer.until_subscribers(CREATED, 0).await;
     peer.quiet(BEYOND_TIMER).await;
+    peer.settled().await;
     assert!(
         !peer.released(&scope),
         "an unreleased terminal keeps the need"
@@ -1045,6 +1136,7 @@ async fn a_new_subscription_or_an_occupation_cancels_the_release_timer() {
     peer.until_subscribers(CREATED, 0).await;
     stream.reopen(&peer, None).await;
     peer.quiet(BEYOND_TIMER).await;
+    peer.settled().await;
     assert!(
         !peer.released(&scope),
         "a new subscription cancels the timer"

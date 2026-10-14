@@ -494,8 +494,13 @@ impl Peer {
     /// Creates `session_id` through `session/new` and returns its history
     /// revision.
     async fn create(&mut self, session_id: &str, response: Value) -> String {
+        self.create_in(session_id, "/workspace", response).await
+    }
+
+    /// Creates `session_id` in `cwd`.
+    async fn create_in(&mut self, session_id: &str, cwd: &str, response: Value) -> String {
         let created = self.submit(json!({
-            "type": "session/new", "requestId": format!("new-{session_id}"), "cwd": "/workspace",
+            "type": "session/new", "requestId": format!("new-{session_id}"), "cwd": cwd,
         }));
         let new = self.request("session/new").await;
         let mut response = response;
