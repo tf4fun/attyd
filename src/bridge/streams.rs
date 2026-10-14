@@ -215,20 +215,28 @@ pub(super) fn needed(
 }
 
 impl BridgeState {
-    /// At the connection's end, after its operations failed: a held session a
-    /// subscription follows waits for the next connection to load it again,
-    /// with its log; one the Agent cannot load again ends with `load_failed`
-    /// (S6, §5.4). Every other held session is released by the next
-    /// connection's first commit.
+    /// At the connection's end, after its operations failed and its resources
+    /// went: a held session a subscription follows waits for the next
+    /// connection to load it again, with its log; one the Agent cannot load
+    /// again ends with `load_failed` (S6, §5.4). Nothing else needs any other
+    /// held session, which is released now, before the final commit.
     pub(super) fn hold_for_next_connection(&mut self) {
         let reloadable = self.agent_capabilities.is_none() || releasable(self);
         let followed = followed(self);
-        let held: Vec<String> = crate::protocol::project::held_sessions(&self.sessions)
-            .into_iter()
-            .filter(|session_id| followed.contains(session_id))
-            .collect();
-        for session_id in held {
-            if !reloadable {
+        for session_id in crate::protocol::project::held_sessions(&self.sessions) {
+            if !followed.contains(&session_id) {
+                if let Some(incarnation) = self
+                    .sessions
+                    .state(&session_id)
+                    .map(|session| session.incarnation)
+                {
+                    self.sessions.retire_entry(
+                        &session_id,
+                        incarnation,
+                        "the Agent connection ended",
+                    );
+                }
+            } else if !reloadable {
                 self.sessions.end_unloadable(&session_id);
             } else if let Some(waiting) = self.sessions.wait_for_next_connection(&session_id) {
                 self.protocol.publication.lock().waiting.push(waiting);
