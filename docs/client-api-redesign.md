@@ -87,28 +87,37 @@ mechanism, and the reload is the fallback.
 A client is a read-only replica of the bridge's memory, like a MySQL replica. Its
 only goal is to hold the same data as the leader for the scopes it shows.
 
-- **Log.** Every state change commits one entry at a position `seq` that increases
-  by one per entry. There is no `epoch`: clients care only about being in sync with
-  the bridge, not about which run of the bridge or which ACP connection produced the
-  state.
+**What a replica needs.** The client needs only the history and the current state:
+
+- **history**: completed turns, consolidated (the compact history of protocol
+  §3.2, with process bodies on immutable pages);
+- **current state**: the session's state-machine state and checkpoint, the turn in
+  flight (folded), pending interactions, controls, terminals, URL flows.
+
+**Compaction to `idle`.** Everything between one `idle` and the next is
+intermediate: the `running` → `awaiting_input` → `running` transitions and every
+chunk, tool call update and terminal step of the turn. When the session returns to
+`idle`, all of it collapses into one consolidated history entry, and the
+intermediate stream disappears. Nothing replays it later.
+
 - **Scopes.** `global`, and `session/<sessionId>` for a held session. Scopes are
   addressed by session ID only; there is no owner or incarnation.
-- **Stream.** `GET /api/v2/stream?scope=global&scope=session/<id>` delivers, for
-  each scope, a `snapshot` first and then `ops`, in log order, on one stream.
-  Snapshots are sent inside the stream; there is no separate `reset` plus HTTP
-  fetch.
-- **Continuity.** A stream carries a fixed set of scopes. Changing the set opens a
-  new stream, which starts every scope with a snapshot. Continuity is checked on
-  the stream's `seq` alone; no per-scope `prev`.
-- **Resume.** The SSE `id` is an opaque cursor that the bridge issued. `Last-Event-ID`
-  resumes the stream's suffix when the bridge still holds that log position;
-  otherwise every scope starts with a snapshot. The cursor is valid only for the log
-  that issued it, so a restarted bridge never mistakes an old cursor for one of its
-  own; clients never parse it.
-- **Compaction.** Like MySQL log compaction, the bridge may drop the intermediate
-  entries of a slow subscriber's queue (chunks, folded tool call updates, terminal
-  output steps) and send the consolidated data instead: one snapshot of the scope at
-  the latest position. Replicas never depend on seeing intermediate states.
+- **Stream.** `GET /api/v2/stream?scope=global&scope=session/<id>`. For each scope
+  the bridge first sends the **current state**: the history up to the last `idle`,
+  plus the turn in flight consolidated so far, plus the state and its checkpoint.
+  It then sends live changes: appends to the turn in flight, state transitions, and
+  at `idle` the consolidation of the turn into history.
+- **Resynchronization.** A broken stream is not resumed. The client subscribes
+  again, and the bridge sends the current state again: synchronized to the last
+  checkpoint, with whatever the current turn has accumulated, then live changes.
+  Whether the stream broke on a checkpoint or in the middle of a turn, the client
+  holds complete data as soon as the next checkpoint arrives. There is no log
+  position, no `seq`, no resume cursor and no `Last-Event-ID`; a restarted bridge
+  needs no detection either.
+- **Slow subscribers** get the same treatment: the bridge drops their queued
+  intermediate changes and sends the current state of the scope.
+- **Ordering.** Within one stream the transport keeps order; there is no `prev`.
+  Changing the set of scopes opens a new stream.
 - **End.** When the bridge stops holding a session (or never held it), the scope
   gets `end`. The entry may carry an informational reason (`closed`, `deleted`,
   `retired`, `not_held`) for presentation; the replica's behavior does not depend
@@ -117,9 +126,8 @@ only goal is to hold the same data as the leader for the scopes it shows.
 ### 3.2 Opening and reconnecting
 
 For the replica, opening a session and reconnecting are the same operation: get
-the scopes it shows consistent with the bridge's memory. A replica without a
-continuous position takes snapshots; one with a continuous position resumes. It
-never distinguishes a first sync from a resync.
+the scopes it shows consistent with the bridge's memory, by subscribing and
+receiving their current state. It never distinguishes a first sync from a resync.
 
 Opening a session in the UI is a write (hold the session, §4.4) followed by this
 read. The read never loads a session: subscribing to a session the bridge does not
@@ -212,7 +220,7 @@ logout, start a terminal login) name `global.checkpoint`.
   fork end in a held session or in a failure the client cannot get past, so their
   response waits for that end:
   - **Open** (`{ checkpoint, sessionId, cwd }`): asks the bridge to hold a session.
-    It answers with the held session at `idle` (`{ sessionId, checkpoint, at }`), or
+    It answers with the held session at `idle` (`{ sessionId, checkpoint }`), or
     with the load error. A load failure is the bridge's problem: the bridge cannot go
     on, so neither can the client, and the error is returned explicitly rather than
     kept as state. A session that is already held needs no write: the client
@@ -234,7 +242,8 @@ POST /api/v2/…   { "checkpoint": 42, …body }
 
 - The checkpoint goes in the request body. `If-Match` is not used: this is
   attyd's own API, with no reason to borrow HTTP precondition headers.
-- **Accepted:** `{ at }`. The effect shows once the replica received `at` (read your
+- **Accepted:** `{ checkpoint }`, the checkpoint the write moved its state machine
+  to. The effect shows once the replica's scope reached that checkpoint (read your
   writes). Open, create and fork answer with the session they produced (§4.4).
 - **Refused:** `{ error: { code, message } }` with `stale` (the checkpoint is not
   current), `invalid_request`, `not_allowed` (the state does not allow this write),
@@ -277,16 +286,18 @@ Agent returns, and nothing else outlives the state it belongs to.
   state (protocol §3.4).
 - `epoch` in positions and scopes, `agent.predecessor`, and epoch handling in
   clients.
-- Per-scope `prev`, `reset` plus HTTP snapshot fetch, covered-entry filtering, and
-  the `applied` position with pending scopes: one stream with inline snapshots needs
-  only the received position.
+- The log position: `seq`, `Position`, `at` in command results, `Last-Event-ID`
+  resume, the retained log, per-scope `prev`, `reset` plus HTTP snapshot fetch,
+  covered-entry filtering, `position` entries, and the received, checkpoint and
+  applied positions. A stream starts from the current state and read-your-writes
+  compares checkpoints.
 - In the client: owner handling, intent recovery, `end: replaced` reopening, request
   record waits, the auth-request projection, and the v1 compensating state.
 
 ### 5.2 Kept
 
-- The log, snapshots and JSON Pointer ops; the generic replica engine's patcher and
-  validation.
+- Snapshots and JSON Pointer ops for live changes; the generic replica engine's
+  patcher and validation.
 - `global` and session documents, control reduction (protocol §3.3), compact
   history with immutable process pages, terminals, URL flows keyed by interaction.
 - The client cache of watched turns' processes keyed by `(historyRevision, turnId)`.
@@ -299,8 +310,10 @@ Agent returns, and nothing else outlives the state it belongs to.
 - Group answers for interactions.
 - Idle-only close for every path (request, delete, retirement), with cancel and
   wait for a running turn.
-- Inline snapshots on the stream, compaction of slow queues into consolidated
-  snapshots, and an opaque resume cursor; `end` with an informational reason.
+- Streams that start from the current state (history up to the last `idle`, the
+  consolidated turn in flight, the state and its checkpoint); compaction of
+  everything between two `idle`s into one history entry; resynchronization by
+  subscribing again; `end` with an informational reason.
 - Attachment reads without a version.
 
 ## 6. Decisions from review
@@ -308,15 +321,16 @@ Agent returns, and nothing else outlives the state it belongs to.
 1. **Create and fork results.** Create answers with the new session at its `idle`
    checkpoint. Fork is an input on the source session, like a prompt, and answers
    the same way with the new session (§4.4).
-2. **Slow subscribers.** Coalescing is log compaction: drop intermediate entries
-   (chunks and other steps) and send the consolidated data (§3.1).
+2. **Slow subscribers.** Coalescing is compaction: drop intermediate changes and
+   send the consolidated current state. Everything between two `idle`s collapses
+   into one history entry (§3.1).
 3. **Load failure.** A bridge-level failure the client cannot get past; the open
    answers with the error explicitly (§4.4).
 4. **Retained results.** Almost none: nothing is persisted, so the bridge's state
    matches what the Agent returns on `load` (§4.6).
-5. **Epoch.** No meaning for clients, which care only about being in sync with the
-   bridge; removed. The resume cursor is opaque and bound to the log that issued it
-   (§3.1).
+5. **Epoch and resume.** No meaning for clients, which care only about being in sync
+   with the bridge; removed. Resynchronization is subscribing again from the current
+   state, so there is no resume cursor either (§3.1).
 
 ## 7. Migration
 
