@@ -1800,6 +1800,13 @@ pub(crate) enum BridgeInput {
         reservation: PreparedAttachment,
         response: Option<oneshot::Sender<Result<Value, BridgeRequestError>>>,
     },
+    /// A v2 stream (protocol §5.1): registers the subscription, holds and
+    /// loads its unheld sessions, and joins distribution under one bridge
+    /// guard.
+    Subscribe {
+        scopes: Vec<crate::protocol::hub::Subscribed>,
+        reply: oneshot::Sender<crate::protocol::hub::Subscription>,
+    },
 }
 
 impl BridgeInput {
@@ -1807,7 +1814,7 @@ impl BridgeInput {
     /// session ID is validated by the reducer, never used to redirect a reply.
     fn session_id<'a>(&'a self, state: &'a BridgeState) -> Option<&'a str> {
         match self {
-            Self::RuntimeSnapshotRequest => None,
+            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } => None,
             Self::SessionViewRequest { session_id, .. }
             | Self::ObserveSession { session_id, .. }
             | Self::UnobserveSession { session_id, .. }
@@ -1846,6 +1853,7 @@ impl BridgeInput {
     fn payload_bytes(&self) -> usize {
         let payload = match self {
             Self::RuntimeSnapshotRequest => 0,
+            Self::Subscribe { scopes, .. } => scopes.len().saturating_mul(256),
             Self::SessionViewRequest {
                 session_id,
                 cwd,
@@ -1888,7 +1896,7 @@ impl BridgeInput {
     /// and withdraw its observation lease; dropping a sender alone loses the cause.
     fn reject(self, error: Error) {
         match self {
-            Self::RuntimeSnapshotRequest => {}
+            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } => {}
             Self::SessionViewRequest { response, .. } => {
                 let _ = response.send(Err(SessionViewError::from(error)));
             }
@@ -2215,7 +2223,33 @@ async fn run_connection<T>(
 where
     T: ConnectTo<Client>,
 {
-    let state = Arc::new(BridgeLock::new(BridgeState::default()));
+    run_generation(
+        transport,
+        options,
+        commands,
+        sink,
+        cancellation,
+        crate::protocol::hub::Publication::default(),
+    )
+    .await
+}
+
+/// One generation of the bridge actor: one Agent connection, publishing into
+/// `publication`, which the generations before and after it share.
+async fn run_generation<T>(
+    transport: T,
+    options: Arc<Options>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
+    sink: EventSink,
+    cancellation: CancellationToken,
+    publication: crate::protocol::hub::Publication,
+) -> Result<(), Error>
+where
+    T: ConnectTo<Client>,
+{
+    let mut state = BridgeState::default();
+    state.protocol.publication = publication;
+    let state = Arc::new(BridgeLock::new(state));
     state.lock().await.protocol.agent.launch = agent_launch(&options);
     #[cfg(test)]
     memory_retention_tests::capture_coordinator_state(&state);
@@ -2418,6 +2452,10 @@ where
                             state.sessions.release_published_runtime(through);
                         }
                         continue;
+                    }
+                    Some(BridgeInput::Subscribe { scopes, reply }) => {
+                        let _ = (scopes, reply);
+                        todo!("subscribe a v2 stream")
                     }
                     Some(BridgeInput::FinishHistorySync { owner }) => {
                         // A dropped task may not release its flow through the

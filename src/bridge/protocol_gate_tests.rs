@@ -20,6 +20,7 @@ use crate::protocol::Op;
 use crate::protocol::canon::ChainHash;
 use crate::protocol::diff;
 use crate::protocol::documents::{OperationKind, Scope};
+use crate::protocol::hub::{Publication, Subscribed, Subscription};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -266,6 +267,12 @@ struct Peer {
     state: Weak<BridgeLock>,
     commits: mpsc::UnboundedReceiver<PublishedCommit>,
     gate: Gate,
+    /// The published documents and the Hub, shared with the generations
+    /// before and after this connection.
+    publication: Publication,
+    /// The published documents after every commit, from the first
+    /// generation's cut on: what streams are checked against.
+    timeline: Vec<Documents>,
 }
 
 fn options(configure: impl FnOnce(&mut Options)) -> Options {
@@ -281,6 +288,16 @@ fn options(configure: impl FnOnce(&mut Options)) -> Options {
 impl Peer {
     /// A connection whose `initialize` the test has not answered yet.
     async fn connect(configure: impl FnOnce(&mut Options)) -> Self {
+        Self::connect_on(Publication::default(), Vec::new(), configure).await
+    }
+
+    /// The next generation's connection, publishing into `publication` after
+    /// the documents `timeline` recorded.
+    async fn connect_on(
+        publication: Publication,
+        mut timeline: Vec<Documents>,
+        configure: impl FnOnce(&mut Options),
+    ) -> Self {
         let (outgoing, requests) = futures::channel::mpsc::channel::<String>(64);
         let (responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(64);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -288,12 +305,13 @@ impl Peer {
         let (events, event_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let probe = super::memory_retention_tests::probe_coordinator_state();
-        let task = tokio::spawn(run_connection(
+        let task = tokio::spawn(run_generation(
             transport,
             Arc::new(options(configure)),
             command_rx,
             EventSink { tx: events.into() },
             cancellation.clone(),
+            publication.clone(),
         ));
         let state = probe.await.unwrap();
         let (tap, commits) = mpsc::unbounded_channel();
@@ -304,6 +322,7 @@ impl Peer {
             let mut guard = lock.lock().await;
             guard.protocol.tap(tap)
         };
+        timeline.push(cut.clone());
         Self {
             commands,
             requests,
@@ -315,6 +334,8 @@ impl Peer {
             state,
             commits,
             gate: Gate::new(&cut),
+            publication,
+            timeline,
         }
     }
 
@@ -327,7 +348,25 @@ impl Peer {
         auth_methods: Value,
         configure: impl FnOnce(&mut Options),
     ) -> Self {
-        let mut peer = Self::connect(configure).await;
+        Self::start_on(
+            Publication::default(),
+            Vec::new(),
+            capabilities,
+            auth_methods,
+            configure,
+        )
+        .await
+    }
+
+    /// The next generation, started and ready.
+    async fn start_on(
+        publication: Publication,
+        timeline: Vec<Documents>,
+        capabilities: Value,
+        auth_methods: Value,
+        configure: impl FnOnce(&mut Options),
+    ) -> Self {
+        let mut peer = Self::connect_on(publication, timeline, configure).await;
         let initialize = peer.next_request().await;
         assert_eq!(initialize["method"], "initialize");
         peer.reply(
@@ -422,6 +461,18 @@ impl Peer {
     }
 
     // -- Client side ---------------------------------------------------------
+
+    /// Opens a v2 stream through the bridge actor (protocol §5.1).
+    async fn subscribe(&self, scopes: Vec<Subscribed>) -> Subscription {
+        let (reply, subscribed) = oneshot::channel();
+        self.commands
+            .send(BridgeInput::Subscribe { scopes, reply })
+            .unwrap();
+        tokio::time::timeout(WAIT, subscribed)
+            .await
+            .expect("the subscription was not registered")
+            .expect("the bridge dropped the subscription")
+    }
 
     fn submit(&self, command: Value) -> oneshot::Receiver<Result<Value, BridgeRequestError>> {
         let (response, result) = oneshot::channel();
@@ -524,6 +575,8 @@ impl Peer {
             .lock()
             .await
             .protocol
+            .publication
+            .lock()
             .publisher
             .attachment(session_id, attachment_id)
     }
@@ -532,6 +585,7 @@ impl Peer {
 
     /// Applies one tapped commit to the gate.
     fn apply(&mut self, commit: PublishedCommit) {
+        self.timeline.push(commit.documents.clone());
         let events: Vec<Value> = commit
             .events
             .iter()
@@ -582,15 +636,7 @@ impl Peer {
         );
         // Every commit before this guard is already in the tap.
         self.drain();
-        let publisher = &state.protocol.publisher;
-        let documents: Documents = publisher
-            .scopes()
-            .into_iter()
-            .map(|scope| {
-                let document = publisher.document(&scope).unwrap();
-                (scope, document)
-            })
-            .collect();
+        let documents = publication::documents(&state.protocol.publication.lock().publisher);
         self.gate.check(&documents);
     }
 
@@ -619,6 +665,19 @@ impl Peer {
     async fn stop(&mut self) -> Result<(), Error> {
         self.cancellation.cancel();
         self.finish().await
+    }
+
+    /// The Agent closes its end of the transport: the connection ends with
+    /// an EOF. Applies its last commits.
+    async fn eof(&mut self) -> Result<(), Error> {
+        self.responses.close_channel();
+        self.finish().await
+    }
+
+    /// What the next generation takes over once this connection ended.
+    fn handover(&mut self) -> (Publication, Vec<Documents>) {
+        assert!(self.task.is_none(), "the connection ended");
+        (self.publication.clone(), std::mem::take(&mut self.timeline))
     }
 
     /// Waits for the connection to end on its own and applies its last commits.
@@ -1912,3 +1971,4 @@ async fn the_same_history_gives_the_same_log_after_a_restart() {
 }
 
 mod review_lifecycle;
+mod stream;

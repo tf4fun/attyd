@@ -2967,6 +2967,8 @@ mod delivery_handoff_tests;
 mod request_timeout_tests;
 #[cfg(test)]
 mod session_presentation_tests;
+#[cfg(test)]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests {
