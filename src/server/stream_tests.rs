@@ -867,6 +867,79 @@ async fn resumes_on_the_same_stream(replay: Vec<Value>, next_replay: Vec<Value>,
     assert_eq!(server.agents.accepted(), 2);
 }
 
+/// The next v1 event's data.
+async fn v1_event(events: &mut Sse) -> Value {
+    loop {
+        let message = events
+            .message(WAIT)
+            .await
+            .expect("the v1 stream sent no event");
+        let data: Vec<&str> = message
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        if !data.is_empty() {
+            return serde_json::from_str(&data.join("\n")).unwrap();
+        }
+    }
+}
+
+/// Runs a real terminal login to success. Before step 6 the login starts
+/// through v1 and is not a v2 `terminal_login` operation, so its prompt and
+/// its exit are read from the v1 global events, opened while the connection
+/// runs and dropped once the login exited. The v2 stream alone then follows
+/// the next connection.
+async fn sign_in_through_v1(address: SocketAddr) {
+    let response = send(address, Method::GET, "/api/v1/events", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut events = Sse {
+        body: Body::new(response.into_body()).into_data_stream(),
+        buffer: String::new(),
+        replicas: BTreeMap::new(),
+        aligned: BTreeSet::new(),
+        ended: BTreeSet::new(),
+    };
+    let started = send(
+        address,
+        Method::POST,
+        "/api/v1/auth/terminal",
+        Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+    )
+    .await;
+    assert_eq!(started.status(), StatusCode::ACCEPTED);
+    let started: Value = serde_json::from_slice(
+        &axum::body::to_bytes(Body::new(started.into_body()), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let request_id = started["requestId"].as_str().unwrap().to_string();
+    // Input waits for the prompt the login prints.
+    let mut output = String::new();
+    while !output.contains("Enter access code") {
+        let event = v1_event(&mut events).await;
+        if event["type"] == "bridge/auth_terminal_output" && event["requestId"] == request_id {
+            output.push_str(event["data"].as_str().unwrap());
+        }
+    }
+    let input = send(
+        address,
+        Method::POST,
+        &format!("/api/v1/auth/terminal/{request_id}/input"),
+        Some(json!({"data": "open-sesame\r"})),
+    )
+    .await;
+    assert!(input.status().is_success(), "{}", input.status());
+    loop {
+        let event = v1_event(&mut events).await;
+        if event["type"] == "bridge/auth_terminal_exited" && event["requestId"] == request_id {
+            assert_eq!(event["status"], "succeeded", "{event}");
+            break;
+        }
+    }
+}
+
 /// Q2: a successful terminal login refreshes the connection. With only a
 /// global stream open, and no read or new subscription, the bridge starts the
 /// next connection once the old one ends; the original stream follows it.
@@ -933,46 +1006,9 @@ async fn a_successful_terminal_login_starts_the_next_connection_for_a_global_onl
     }
     assert_eq!(launched(), (1, 0));
 
-    let started = send(
-        address,
-        Method::POST,
-        "/api/v1/auth/terminal",
-        Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
-    )
-    .await;
-    assert_eq!(started.status(), StatusCode::ACCEPTED);
-    let started: Value = serde_json::from_slice(
-        &axum::body::to_bytes(Body::new(started.into_body()), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let request_id = started["requestId"].as_str().unwrap();
-    // The login owns its terminal; input waits for the prompt it prints.
-    while !stream.replica("global").live["terminals"]
-        .to_string()
-        .contains("Enter access code")
-    {
-        stream.event().await;
-    }
-    let input = send(
-        address,
-        Method::POST,
-        &format!("/api/v1/auth/terminal/{request_id}/input"),
-        Some(json!({"data": "open-sesame\r"})),
-    )
-    .await;
-    assert!(input.status().is_success(), "{}", input.status());
-
-    // The login completes, the old connection ends, and the next one becomes
-    // ready on the same stream.
-    loop {
-        stream.event().await;
-        let op = &stream.replica("global").live["op"];
-        if op["kind"] == "terminal_login" && op["status"] == "completed" {
-            break;
-        }
-    }
+    // The login runs to success; then the old connection ends, and the next
+    // one becomes ready on the same stream.
+    sign_in_through_v1(address).await;
     assert!(auth.exists(), "the login signed in");
     let mut ended = false;
     loop {
@@ -1315,35 +1351,7 @@ async fn a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing() 
         stream.event().await;
     }
 
-    let started = send(
-        address,
-        Method::POST,
-        "/api/v1/auth/terminal",
-        Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
-    )
-    .await;
-    assert_eq!(started.status(), StatusCode::ACCEPTED);
-    let started: Value = serde_json::from_slice(
-        &axum::body::to_bytes(Body::new(started.into_body()), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let request_id = started["requestId"].as_str().unwrap();
-    while !stream.replica("global").live["terminals"]
-        .to_string()
-        .contains("Enter access code")
-    {
-        stream.event().await;
-    }
-    let input = send(
-        address,
-        Method::POST,
-        &format!("/api/v1/auth/terminal/{request_id}/input"),
-        Some(json!({"data": "open-sesame\r"})),
-    )
-    .await;
-    assert!(input.status().is_success(), "{}", input.status());
+    sign_in_through_v1(address).await;
     let mut ended = false;
     loop {
         stream.event().await;
