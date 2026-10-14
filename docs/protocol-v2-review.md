@@ -1,12 +1,12 @@
 # Protocol v2 design review (draft)
 
-Status: working notes, 2026-10-14. Conclusion so far: the client API (v2) needs a
-redesign as attyd's own client ↔ bridge API; the current v2 is an intermediate
-state. These notes collect a design review that started
-from the last v1 dependencies of the web UI (attachment links and the Markdown
-export). They will be summarized into concrete changes to
-[protocol.md](protocol.md) and [state-sync.md](state-sync.md). Nothing here is
-implemented yet.
+Status: working notes, 2026-10-14. **Superseded** by the second version of
+[client-api-redesign.md](client-api-redesign.md). These notes are kept as the
+record of the review. In particular, the layer 2 conclusions below that rely on an
+ordered log (`seq`, resume, epochs as log identity, positions, `applied`) no longer
+hold: replicas align by a hash-chained log of completed turns and replace `live`,
+and writes name the current operation. Layer 1 is now treated as an ordinary ACP
+client and is out of the redesign's scope.
 
 ## Observation
 
