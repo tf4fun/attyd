@@ -1231,3 +1231,89 @@ fn every_event_round_trips_its_documented_wire_shape() {
         );
     }
 }
+
+#[test]
+fn later_identical_mode_notification_overrides_setup_response() {
+    let mut gate = Gate::new();
+    let update = json!({ "sessionUpdate": "current_mode_update", "currentModeId": "early" });
+    let incarnation = gate
+        .registry
+        .open_new_with_replay(
+            EPOCH,
+            "s",
+            "/s",
+            json!({
+                "sessionId": "s",
+                "modes": { "currentModeId": "response", "availableModes": [
+                    { "id": "early", "name": "Early" },
+                    { "id": "response", "name": "Response" }
+                ] }
+            }),
+            vec![update.clone()],
+        )
+        .unwrap();
+    gate.commit();
+    assert_eq!(
+        gate.live("session/s")["controls"]["modes"]["currentModeId"],
+        "response"
+    );
+    gate.registry
+        .update_control_state(EPOCH, "s", incarnation, "current_mode_update", update)
+        .unwrap();
+    let events = gate.commit();
+    assert_eq!(
+        gate.live("session/s")["controls"]["modes"]["currentModeId"],
+        "early"
+    );
+    assert!(single(&events, "session/s").get("live").is_some());
+}
+
+#[test]
+fn later_identical_config_notification_overrides_setup_response() {
+    let mut gate = Gate::new();
+    let early = json!([{ "type": "select", "id": "mode", "name": "Mode", "currentValue": "early", "options": [
+        { "value": "early", "name": "Early" },
+        { "value": "response", "name": "Response" }
+    ] }]);
+    let mut response = early.clone();
+    response[0]["currentValue"] = json!("response");
+    let update = json!({ "sessionUpdate": "config_option_update", "configOptions": early });
+    let incarnation = gate
+        .registry
+        .open_new_with_replay(
+            EPOCH,
+            "s",
+            "/s",
+            json!({ "sessionId": "s", "configOptions": response }),
+            vec![update.clone()],
+        )
+        .unwrap();
+    gate.commit();
+    assert_eq!(
+        gate.live("session/s")["controls"]["configOptions"][0]["currentValue"],
+        "response"
+    );
+    gate.registry
+        .update_control_state(EPOCH, "s", incarnation, "config_option_update", update)
+        .unwrap();
+    let events = gate.commit();
+    assert_eq!(gate.live("session/s")["controls"]["configOptions"], early);
+    assert!(single(&events, "session/s").get("live").is_some());
+}
+
+#[test]
+fn streamed_text_publishes_only_the_new_suffix() {
+    let mut gate = Gate::new();
+    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
+    gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
+    gate.update("s", incarnation, agent_chunk(text("hel")));
+    gate.commit();
+    gate.update("s", incarnation, agent_chunk(text("lo")));
+    let event = single(&gate.commit(), "session/s");
+    assert_eq!(
+        event["live"]["patch"],
+        json!([{
+            "op": "append", "path": "/op/process/0/content/text", "text": "lo"
+        }])
+    );
+}

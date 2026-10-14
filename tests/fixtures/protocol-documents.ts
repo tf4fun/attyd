@@ -110,3 +110,24 @@ export const events = [
     end: { reason: "load_failed", error: { code: "agent_error", message: "no such session" } },
   },
 ] satisfies Event[];
+
+// Actual process projections replace binary/embedded content with references.
+// These must be accepted without casting the wire data back to ACP types.
+export const processWithAttachments = [
+  {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "attachment", id: "image-id", block: "image", mimeType: "image/png" },
+  },
+  {
+    sessionUpdate: "tool_call",
+    toolCallId: "t",
+    title: "Read",
+    content: [{ type: "content", content: { type: "attachment", id: "resource-id", block: "resource", uri: "file:///s/readme" } }],
+  },
+  {
+    sessionUpdate: "compaction_update",
+    compactionId: "c",
+    status: "completed",
+    summary: [{ type: "attachment", id: "audio-id", block: "audio", mimeType: "audio/wav" }],
+  },
+] satisfies NonNullable<Operation["process"]>;
