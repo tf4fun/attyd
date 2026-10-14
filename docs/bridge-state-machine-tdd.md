@@ -253,8 +253,8 @@ prompt response until the public view exposes `cancelRequested: true` with a nul
 | S2 state implementation | separate shared HistoryCache and session phases | `session_mirror.rs`, `history_cache.rs` |
 | S3 ACP orchestration | cold load, burst replay, retry, validation, cross-session concurrency | `bridge.rs` and `server.rs` native tests; `burst-load-agent.mjs` replays 10,050 updates exceeding 1 MB; catalog calls complete before the fixture releases the load response. `scheduling.rs` checks response cuts and live-queue isolation; `history_replay.rs` checks incremental folding, poisoning and retirement |
 | S4 observer delivery | atomic baseline+overlay snapshot, suffix/reset, shared payload | `server.rs` subscriber, revision-gap and byte-accounting tests |
-| S5 command API | CAS/idempotency and browser-local deferred queue dispatch | native append tests, `use-acp.test.ts`, Chromium queue cases |
-| S6 browser projection | business snapshot/SSE rendering; no ACP lifecycle ownership | `use-acp.test.ts`, `state.test.ts`, Chromium reconnect cases |
+| S5 command API | CAS/idempotency and browser-local deferred queue dispatch | native append tests, `use-acp-v2.test.ts`, Chromium queue cases |
+| S6 browser projection | v2 replica rendering; no ACP lifecycle ownership | `replica.test.ts`, `use-acp-v2.test.ts`, `state.test.ts`, Chromium reconnect cases |
 | S7 removal | no browser raw-ACP transport or competing prompt admission registry | REST/SSE routes, protocol types and cleanup regressions |
 | S8 release | Rust/TS/browser/transport/protocol/memory gates all green | run the suites in [testing.md](testing.md) against the release commit; CI enforces the gates |
 

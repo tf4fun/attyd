@@ -489,7 +489,7 @@ export function useAcp(options: UseAcpOptions = {}) {
     activeSessionIdRef.current = routeSessionId;
     if (store.getState().sessionView == null) setSessionOpening({ sessionId: routeSessionId });
     void (async () => {
-      let cwd = global.sessions[routeSessionId]?.cwd ?? routeProjectCwd;
+      let cwd: string | undefined = global.sessions[routeSessionId]?.cwd ?? routeProjectCwd;
       if (cwd == null) {
         const discovered = await discovery;
         if (!stillCurrent()) return;

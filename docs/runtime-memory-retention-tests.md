@@ -29,7 +29,7 @@ Red 用例使用正常的正确行为断言，不使用 `ignore`、`should_panic
 | --- | --- | --- |
 | [Bridge publication](../src/bridge/memory_retention_tests.rs) | 真实 `flush_runtime` 与协调器 snapshot 路径 | 旧 overlay 的 Weak 释放、成功发布的连续水位、未交付后缀 |
 | [Hub/SSE](../src/server/memory_retention_tests.rs) | 真实 `BridgeHub::publish`、订阅与事件流 | 慢队列替换、共享 payload 引用、reset/owner/revision 边界 |
-| [Browser](../tests/runtime-memory-retention.test.tsx) | 真实 `useAcp` hook，受控 REST/SSE 次序 | 刷新合并、完整状态重建、迟到失败、重试内容、旧 owner 隔离 |
+| Browser：[v2 hook](../tests/use-acp-v2.test.ts)、[replica](../tests/replica.test.ts) | 真实 `useAcp` hook 与通用 replica，受控 v2 stream 次序 | reset 合并为一次快照读取、覆盖条目忽略、失败与重试内容只显示一次、旧 owner/epoch 隔离 |
 
 旧的 Legacy projection 层（`ActiveRuntimeProjection`）已在
 [#1](https://github.com/tf4fun/attyd/issues/1) 中删除：它只服务已移除的浏览器聚合事件流，

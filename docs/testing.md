@@ -175,9 +175,10 @@ remain failures. The classifier tests cover the endpoint, origin, and status bou
 Terminal authentication input is sent in keystroke order, waiting for each PTY write's
 HTTP response before sending the next input. The browser authentication case holds the
 first keystroke in transit while typing the remaining access code and Enter, then checks
-that authentication completes after releasing it. `tests/use-acp.test.ts` also covers
-discarding unsent input on cancellation, terminal exit, unmount, or a failed write, and
-isolating a new authentication attempt from late replies. A failed write is never replayed.
+that authentication completes after releasing it. `tests/use-acp-v2.test.ts` also covers
+keystroke order against the bridge's auth terminal request over protocol v2. Unsent input
+is discarded on cancellation, terminal exit, unmount, or a failed write, and a failed write
+is never replayed.
 The native `auth_terminal::tests` gate verifies PTY input and lifecycle behavior first.
 
 ## Backend behavior
