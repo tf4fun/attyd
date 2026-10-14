@@ -274,7 +274,7 @@ interface Operation {
 ### 5.1 Stream
 
 ```text
-GET /api/v2/stream?scope=global&scope=session/S&have=session/S:12:<hash>
+GET /api/v3/stream?scope=global&scope=session/S&have=session/S:12:<hash>
 ```
 
 `have` gives a scope's log head; without it the head is `(0, h_0)`. The stream
@@ -359,7 +359,7 @@ only on the user's request.
   `expect`:
 
   ```text
-  POST /api/v2/scopes/{scope}/resources/{id}/{action}
+  POST /api/v3/scopes/{scope}/resources/{id}/{action}
   ```
 
   They never wait for a client and fall outside S5 (S7). The resource ID identifies the
@@ -376,7 +376,7 @@ only on the user's request.
 ### 6.2 Request and response
 
 ```text
-POST /api/v2/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": { … } }
+POST /api/v3/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": { … } }
 ```
 
 - **Admitted:** `{ op: "<id>" }`. This is the new operation's ID, or the running
@@ -470,9 +470,9 @@ This section applies C2 and C3 to writes.
 
 | Read | Notes |
 | --- | --- |
-| `GET /api/v2/scopes/{scope}` | the document of a held scope once, as one cut; `404` when not held; holds nothing |
-| `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | content-addressed; served while the session's `log` or `live` references the ID, else `404` |
-| `GET /api/v2/sessions/{id}/files?query=`, `…/files/content?path=` | workspace context |
+| `GET /api/v3/scopes/{scope}` | the document of a held scope once, as one cut; `404` when not held; holds nothing |
+| `GET /api/v3/sessions/{id}/attachments/{attachmentId}` | content-addressed; served while the session's `log` or `live` references the ID, else `404` |
+| `GET /api/v3/sessions/{id}/files?query=`, `…/files/content?path=` | workspace context |
 
 Reads that may wait for a client are operations instead: the catalog is listed by
 the `list` operation (§6.1).
@@ -627,17 +627,21 @@ and are tested there. They add no duties to clients.
 
 ## 13. Migration
 
-1. **Settle this proposal**, then rewrite [protocol.md](protocol.md) and
-   [state-sync.md](state-sync.md) to match.
-2. **Bridge:** the document model, `canon` and the hash chain, alignment and the
-   event stream, operations with admission and occupation, the catalog scope, hold
-   by need. Bridge tests first (acceptance 1–16), following
+The protocol is specified in [protocol.md](protocol.md) (v3, under `/api/v3`, next
+to the current v2 until the web client moves), and the bridge work in
+[state-sync.md](state-sync.md). In outline:
+
+1. **Settle this proposal** and write protocol v3 and its implementation plan
+   (docs only).
+2. **Bridge:** `canon` and the hash chain; documents, operations with admission and
+   occupation, and the commit step; the stream with alignment and hold by need;
+   the operation endpoint, the catalog scope and resource actions. Bridge tests
+   first (acceptance 1–16), following
    [bridge-state-machine-tdd.md](bridge-state-machine-tdd.md).
-3. **Client:** the generic replica engine and the web projection on the new API.
-   PR #34 is reworked onto it rather than landed: its replica engine and
-   validation are reused; its process cache and compact-history projection are
-   removed.
-4. **Remove** the current v2 machinery listed in §10.1 and v1, including the
-   remaining v1 reads (attachment links, Markdown export).
+3. **Client:** the generic replica engine and the web projection on v3. PR #34 is
+   reworked onto it rather than landed: its replica engine and validation are
+   reused; its process cache and compact-history projection are removed.
+4. **Remove** v2 and v1, including the remaining v1 reads (attachment links,
+   Markdown export).
 5. **Layer 1 clean-up**, separately: remove incarnation-based isolation from the
    bridge internals, now that no client-visible behavior depends on it.

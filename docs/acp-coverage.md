@@ -81,8 +81,12 @@ Goose serve is an optional example, never a conformance gate or required backend
 
 ## Protocol v2 chain
 
-Each capability row above also needs its [protocol v2](protocol.md) chain
-([plan §4.2](state-sync.md#42-acp-semantic-coverage-gate-s8)):
+Each capability row above also needs its protocol v2 chain (the v2 coverage gate,
+[plan at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/state-sync.md#42-acp-semantic-coverage-gate-s8)).
+The chains below describe v2 as implemented, and their "protocol §" references are to
+[protocol v2 at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md).
+[Protocol v3](protocol.md) adds its own
+chains as its steps land ([plan §4.2](state-sync.md#42-acceptance)):
 
 ```text
 ACP capability → bridge authority → public projection / command → finished result
