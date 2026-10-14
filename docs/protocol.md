@@ -355,7 +355,10 @@ stream and ignores every event of the one it replaced.
 
 Subscribing to a session scope:
 
-- **held:** the scope is aligned at once, log and `live`;
+- **held, log known:** the scope is aligned at once, log and `live`;
+- **held, log unknown** (another client's subscription started the first load,
+  which still runs): the alignment carries `live` only, and the subscription
+  follows the load as below;
 - **not held, free:** the bridge starts holding it with a running `load`. Its log is
   unknown, so the alignment carries `live` only: the client keeps its log,
   unconfirmed, and shows and answers the load's interactions. When the load ends,
@@ -563,7 +566,7 @@ never resends input whose delivery is uncertain (C3).
 
 | Read | Notes |
 | --- | --- |
-| `GET /api/v2/scopes/{scope}` | `{ log, live }` of an existing scope, as one cut; `404` for an unheld session; holds nothing |
+| `GET /api/v2/scopes/{scope}` | `{ live, log? }` of an existing scope, as one cut; `404` for an unheld session; holds nothing. `log` is omitted while the session's log is unknown (S1); an empty log is `[]`, and the two never stand for each other. |
 | `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | the block, content-addressed; served while the session's `log` or `live` references it, else `404` |
 | `GET /api/v2/sessions/{id}/files?query=` | context search within the session's workspace |
 | `GET /api/v2/sessions/{id}/files/content?path=` | context read |

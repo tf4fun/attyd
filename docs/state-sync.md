@@ -118,16 +118,24 @@ The Hub owns delivery only:
   client's head if `have` matches, else from `0`, with `live: { replace }`. Events
   of later commits enter the subscriber's queue in the same critical section that
   produced them, so nothing falls between the cut and the stream (protocol S3).
-- **Baseline.** For each session scope the Hub keeps the subscription's baseline:
-  the head the client declared, advanced only when a log change is taken from the
-  replaceable queue and handed to the stream's ordered output. Every log change for
-  that subscriber is computed from the baseline, and a resync starts from it. A
-  change still in the queue never advances it, since coalescing may drop it. No
-  client acknowledgement, sequence number or retained log is needed.
+- **Baseline and queued tail.** For each session scope the Hub keeps two log
+  positions per subscription:
+  - the **baseline**: the head the client declared, advanced to an event's target
+    log position only when that event is taken from the replaceable queue and
+    handed to the stream's ordered output. A change still in the queue never
+    advances it, since coalescing may drop it;
+  - the **queued tail**: the target log position of the last event queued for the
+    scope, or the baseline when nothing is queued.
+
+  An ordinary log change is computed when it is queued, from the queued tail, so
+  each queued change follows the one before it; the queue is never pre-built from
+  a baseline that has not advanced yet. A resync is computed from the baseline. No
+  client acknowledgement, sequence number or retained log is needed; the
+  per-event convergence gate (§4.1) checks both positions.
 - **Coalescing.** A queue past its byte budget (1 MiB, as in the earlier draft) is
   collapsed per scope: queued events of a scope that still exists are replaced by
-  one alignment from the baseline; a queued `end` is kept, and nothing of its scope
-  follows it.
+  one alignment from the baseline, whose target becomes the queued tail; a queued
+  `end` is kept, and nothing of its scope follows it.
 - **Heartbeats.** An SSE comment on a stream idle for 15 seconds.
 - **Holding.** A subscription to a session scope counts as one subscriber of that
   session while the stream is open. Subscribing to an unheld session submits a
