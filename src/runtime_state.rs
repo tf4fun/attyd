@@ -1088,11 +1088,16 @@ impl SessionRegistry {
         let key = key.into();
         let incoming = update.clone();
         let update = fold_control_update(session.control_state.get(&key), update);
-        if session.control_state.get(&key) == Some(&update) {
+        let unchanged = session.control_state.get(&key) == Some(&update);
+        // A later notification overrides the setup response even when it
+        // repeats an earlier one (protocol §4.5), so the documents' controls
+        // fold it before the v1 store drops it as a duplicate.
+        self.fold_session_controls(session_id, &incoming);
+        if unchanged {
             return Ok(());
         }
+        let session = self.require_live_mut(session_id, incarnation)?;
         session.control_state.insert(key.clone(), update.clone());
-        self.fold_session_controls(session_id, &incoming);
         self.commit_control_update(session_id, incarnation, key, update);
         Ok(())
     }

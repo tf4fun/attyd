@@ -144,9 +144,9 @@ pub(crate) struct Operation {
     pub cancel_requested: bool,
     /// Pending, by interaction ID.
     pub interactions: BTreeMap<String, Interaction>,
-    /// A running prompt's updates, folded.
+    /// A running prompt's updates, folded, with content blocks normalized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional, type = "SessionUpdate[]"))]
+    #[cfg_attr(test, ts(optional, type = "ProcessUpdate[]"))]
     pub process: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "unknown"))]

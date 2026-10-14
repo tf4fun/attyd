@@ -48,12 +48,19 @@ struct PublishedSession {
 /// A published `op.process`: each update of the running prompt as projected,
 /// with the source it was projected from. The turn's updates are shared and an
 /// update folded in place is a new value, so pointer identity tells which
-/// updates changed (the identity diff).
+/// updates changed (the identity diff); an unchanged update keeps its
+/// projection.
 #[derive(Clone)]
 struct Process {
     op_id: String,
     source: SharedTurnUpdates,
-    items: Vec<(Value, Attachments)>,
+    items: Vec<Arc<ProcessItem>>,
+}
+
+/// One projected update and the blocks its references name.
+struct ProcessItem {
+    value: Value,
+    attachments: Attachments,
 }
 
 impl Process {
@@ -67,11 +74,11 @@ impl Process {
                     && let Some(old) = previous.source.get(index)
                     && Arc::ptr_eq(old, update)
                 {
-                    return previous.items[index].clone();
+                    return Arc::clone(&previous.items[index]);
                 }
                 let mut attachments = Attachments::default();
-                let projected = project_update(update, &mut attachments);
-                (projected, attachments)
+                let value = project_update(update, &mut attachments);
+                Arc::new(ProcessItem { value, attachments })
             })
             .collect();
         Self {
@@ -82,7 +89,7 @@ impl Process {
     }
 
     fn values(&self) -> Value {
-        Value::Array(self.items.iter().map(|(item, _)| item.clone()).collect())
+        Value::Array(self.items.iter().map(|item| item.value.clone()).collect())
     }
 
     /// The ops that turn `old`, of the same operation, into `self`.
@@ -97,12 +104,16 @@ impl Process {
             });
             return;
         }
-        for (index, ((new, _), (previous, _))) in self.items.iter().zip(&old.items).enumerate() {
-            if new != previous {
-                ops.push(Op::Set {
-                    path: diff::child(PROCESS, &index.to_string()),
-                    value: new.clone(),
-                });
+        // A changed update is patched in place: streamed text appends.
+        for (index, (new, previous)) in self.items.iter().zip(&old.items).enumerate() {
+            if !Arc::ptr_eq(new, previous) {
+                diff::diff(
+                    &diff::child(PROCESS, &index.to_string()),
+                    &previous.value,
+                    &new.value,
+                    &text_mode,
+                    ops,
+                );
             }
         }
         if self.items.len() > old.items.len() {
@@ -111,7 +122,7 @@ impl Process {
                 tail: AppendTail::Values {
                     values: self.items[old.items.len()..]
                         .iter()
-                        .map(|(item, _)| item.clone())
+                        .map(|item| item.value.clone())
                         .collect(),
                 },
             });
@@ -253,7 +264,7 @@ impl PublishedSession {
                     process
                         .items
                         .iter()
-                        .find_map(|(_, attachments)| attachments.get(attachment_id))
+                        .find_map(|item| item.attachments.get(attachment_id))
                 })
             })
     }

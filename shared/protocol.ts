@@ -88,9 +88,9 @@ input: unknown, cancelRequested: boolean,
  */
 interactions: { [key in string]: Interaction }, 
 /**
- * A running prompt's updates, folded.
+ * A running prompt's updates, folded, with content blocks normalized.
  */
-process?: SessionUpdate[], result?: unknown, error?: ProtocolError, };
+process?: ProcessUpdate[], result?: unknown, error?: ProtocolError, };
 
 export type Interaction = { "kind": "permission", interactionId: string, request: RequestPermissionRequest, } | { "kind": "elicitation", interactionId: string, request: CreateElicitationRequest, };
 
@@ -187,3 +187,15 @@ export type LiveChange = { replace: unknown, } | { patch: Array<Op>, };
 export type End = { reason: EndReason, error?: ProtocolError, };
 
 export type EndReason = "deleted" | "load_failed";
+
+export type ProcessUpdate = ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" }>, "content"> | ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "compaction_update" }>, "summary"> | ProjectedToolCall<Extract<SessionUpdate, { sessionUpdate: "tool_call" | "tool_call_update" }>> | Exclude<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" | "compaction_update" | "tool_call" | "tool_call_update" }>;
+
+export type ProjectedFields<T, K extends PropertyKey> = T extends unknown ? { [P in keyof T]: P extends K ? ProjectedBlocks<T[P]> : T[P] } : never;
+
+export type ProjectedBlocks<V> = V extends ContentBlock ? Block : V extends Array<infer B> ? Array<ProjectedBlocks<B>> : V;
+
+export type ProjectedToolCall<T> = T extends unknown ? { [P in keyof T]: P extends "content" ? ProjectedToolCallContents<T[P]> : T[P] } : never;
+
+export type ProjectedToolCallContents<V> = V extends Array<infer C> ? Array<ProjectedToolCallContent<C>> : V;
+
+export type ProjectedToolCallContent<C> = C extends { type: "content" } ? ProjectedFields<C, "content"> : C;
