@@ -60,6 +60,8 @@ mod inbound_requests;
 mod memory_efficiency_tests;
 #[cfg(test)]
 mod memory_retention_tests;
+#[cfg(test)]
+mod protocol_gate_tests;
 mod scheduling;
 #[cfg(test)]
 mod unobserved_tests;
