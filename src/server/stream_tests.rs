@@ -229,20 +229,7 @@ impl Server {
     }
 
     async fn send(&self, path: &str) -> Response<hyper::body::Incoming> {
-        let stream = TcpStream::connect(self.address).await.unwrap();
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        let request = Request::builder()
-            .uri(path)
-            .header(header::HOST, self.address.to_string())
-            .body(Body::empty())
-            .unwrap();
-        tokio::time::timeout(WAIT, sender.send_request(request))
-            .await
-            .expect("the server did not answer")
-            .unwrap()
+        send(self.address, Method::GET, path, None).await
     }
 
     /// `GET /api/v2/scopes/{scope}`: the status and the JSON body.
@@ -291,6 +278,35 @@ impl Server {
         link.reply(&new, json!({"sessionId": session_id})).await;
         created.await.unwrap().unwrap();
     }
+}
+
+async fn send(
+    address: SocketAddr,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Response<hyper::body::Incoming> {
+    let stream = TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, address.to_string());
+    let request = match body {
+        Some(body) => request
+            .header(header::ORIGIN, format!("http://{address}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string())),
+        None => request.body(Body::empty()),
+    }
+    .unwrap();
+    tokio::time::timeout(WAIT, sender.send_request(request))
+        .await
+        .expect("the server did not answer")
+        .unwrap()
 }
 
 /// An SSE response body, read message by message.
@@ -759,4 +775,138 @@ async fn resumes_on_the_same_stream(replay: Vec<Value>, next_replay: Vec<Value>,
     }
     assert_eq!(after["live"]["op"]["status"], "completed");
     assert_eq!(server.agents.accepted(), 2);
+}
+
+/// Q2: a successful terminal login refreshes the connection. With only a
+/// global stream open, and no read or new subscription, the bridge starts the
+/// next connection once the old one ends; the original stream follows it.
+#[tokio::test]
+async fn a_successful_terminal_login_starts_the_next_connection_for_a_global_only_stream() {
+    let root = tempfile::tempdir().unwrap();
+    let auth = root.path().join("authenticated");
+    let launches = root.path().join("launches");
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let fixture = std::path::Path::new(manifest).join("tests/fixtures/fake-agent.ts");
+    // Each launch, the Agent's and the login's (which appends its method's
+    // arguments), records its arguments before it becomes the fixture.
+    let script = format!(
+        "export ATTYD_FAKE_AUTH_FILE='{}'; echo \"$*\" >> '{}'; exec node --import tsx '{}' \"$@\"",
+        auth.display(),
+        launches.display(),
+        fixture.display(),
+    );
+    let options = Options::try_parse_from([
+        "attyd",
+        "--cwd",
+        manifest,
+        "--",
+        "sh",
+        "-c",
+        &script,
+        "agent",
+        "--terminal-auth-required",
+    ])
+    .unwrap()
+    .normalized()
+    .unwrap();
+    let options = Arc::new(options);
+    let hub = BridgeHub::new(options.clone());
+    hub.ensure_runtime().await;
+    let app = app_router(&options, hub.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let launched = || {
+        let lines = std::fs::read_to_string(&launches).unwrap_or_default();
+        let (logins, agents): (Vec<&str>, Vec<&str>) = lines
+            .lines()
+            .partition(|line| line.contains("--terminal-login"));
+        (agents.len(), logins.len())
+    };
+
+    let response = send(address, Method::GET, "/api/v2/stream?scope=global", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = Sse {
+        body: Body::new(response.into_body()).into_data_stream(),
+        buffer: String::new(),
+        replicas: BTreeMap::new(),
+        aligned: BTreeSet::new(),
+        ended: BTreeSet::new(),
+    };
+    let phase = |stream: &Sse| stream.replica("global").live["agent"]["phase"].clone();
+    while phase(&stream) != "ready" {
+        stream.event().await;
+    }
+    assert_eq!(launched(), (1, 0));
+
+    let started = send(
+        address,
+        Method::POST,
+        "/api/v1/auth/terminal",
+        Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+    )
+    .await;
+    assert_eq!(started.status(), StatusCode::ACCEPTED);
+    let started: Value = serde_json::from_slice(
+        &axum::body::to_bytes(Body::new(started.into_body()), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let request_id = started["requestId"].as_str().unwrap();
+    // The login owns its terminal; input waits for the prompt it prints.
+    while !stream.replica("global").live["terminals"]
+        .to_string()
+        .contains("Enter access code")
+    {
+        stream.event().await;
+    }
+    let input = send(
+        address,
+        Method::POST,
+        &format!("/api/v1/auth/terminal/{request_id}/input"),
+        Some(json!({"data": "open-sesame\r"})),
+    )
+    .await;
+    assert!(input.status().is_success(), "{}", input.status());
+
+    // The login completes, the old connection ends, and the next one becomes
+    // ready on the same stream.
+    loop {
+        stream.event().await;
+        let op = &stream.replica("global").live["op"];
+        if op["kind"] == "terminal_login" && op["status"] == "completed" {
+            break;
+        }
+    }
+    assert!(auth.exists(), "the login signed in");
+    let mut ended = false;
+    loop {
+        stream.event().await;
+        let phase = phase(&stream);
+        ended |= phase != "ready";
+        if ended && phase == "ready" {
+            break;
+        }
+    }
+    assert_eq!(
+        launched(),
+        (2, 1),
+        "one login and exactly one next connection"
+    );
+
+    let response = send(address, Method::GET, "/api/v2/scopes/global", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let read: Value = serde_json::from_slice(
+        &axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    stream.assert_document("global", &read);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(launched(), (2, 1), "the next connection is started once");
+    hub.shutdown().await;
 }
