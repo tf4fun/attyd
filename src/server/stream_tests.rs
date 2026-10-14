@@ -745,17 +745,98 @@ async fn resumes_on_the_same_stream(replay: Vec<Value>, next_replay: Vec<Value>,
     // No GET or replacement subscription may trigger this connection: the
     // original HTTP stream alone must cause the bridge to reconnect.
     let mut next = server.agents.accept(json!({"loadSession": true})).await;
-    let (status, waiting) = server.read("session/saved").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(waiting["live"]["op"]["kind"], "load");
-    assert_eq!(waiting["live"]["op"]["status"], "running");
-    assert_eq!(waiting["log"], before["log"], "the known log stays");
-
-    let load = next.serve_load("saved", &next_replay).await;
+    let load = next.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "saved");
     assert_eq!(load["params"]["cwd"], CWD);
-    let events = stream
-        .until("session/saved", |event| mentions(event, "completed"))
+
+    // The actual request on the new Agent connection is outstanding. A
+    // uniquely named elicitation from that connection is an ordered barrier:
+    // an old queued "running" event cannot satisfy it. Check every event of
+    // the original HTTP stream before the replay and again after its updates,
+    // while withholding the load response throughout.
+    for (stage, updates) in [
+        ("before-replay", &[] as &[Value]),
+        ("after-replay", next_replay.as_slice()),
+    ] {
+        for update in updates {
+            next.update("saved", update.clone()).await;
+        }
+        let barrier = format!("recovery-{stage}-{}", load["id"]);
+        next.send(json!({
+            "jsonrpc": "2.0", "id": barrier, "method": "elicitation/create",
+            "params": {
+                "sessionId": "saved", "mode": "form", "message": barrier,
+                "requestedSchema": {"type": "object", "properties": {}},
+            },
+        }))
         .await;
+        let interaction = loop {
+            let event = stream.event().await;
+            let replica = stream.replica("session/saved");
+            assert_eq!(
+                json!(replica.log),
+                before["log"],
+                "the known log must stay until load completion: {event}"
+            );
+            assert_eq!(replica.live["op"]["kind"], "load", "{event}");
+            assert_eq!(replica.live["op"]["status"], "running", "{event}");
+            if let Some((id, _)) = replica.live["op"]["interactions"]
+                .as_object()
+                .expect("the load has an interaction map")
+                .iter()
+                .find(|(_, interaction)| interaction["request"]["message"] == barrier)
+            {
+                break id.clone();
+            }
+        };
+        // This read only compares after the ordered SSE barrier. It also
+        // rejects a bridge that silently turns Known into Unknown, which
+        // would leave the client's cached log looking unchanged.
+        let (status, waiting) = server.read("session/saved").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(waiting["live"]["op"]["kind"], "load");
+        assert_eq!(waiting["live"]["op"]["status"], "running");
+        assert_eq!(
+            waiting["log"], before["log"],
+            "the bridge keeps its known log"
+        );
+        server
+            .hub
+            .business_request(json!({
+                "type": "elicitation/respond", "requestId": format!("answer-{barrier}"),
+                "sessionId": "saved", "elicitationId": interaction,
+                "response": {"action": "accept", "content": {}},
+            }))
+            .await
+            .unwrap();
+        let answered = next.next(WAIT).await.expect("the barrier was answered");
+        assert_eq!(answered["id"], barrier, "{answered}");
+        assert_eq!(answered["result"]["action"], "accept", "{answered}");
+    }
+
+    next.reply(&load, json!({})).await;
+    let expected_log = json!(log_values(TurnLog::from_replay(&next_replay).entries()));
+    let mut events = Vec::new();
+    loop {
+        let event = stream.event().await;
+        let replica = stream.replica("session/saved");
+        let completed = event["scope"] == "session/saved"
+            && replica.live["op"]["kind"] == "load"
+            && replica.live["op"]["status"] == "completed";
+        assert_eq!(
+            &json!(replica.log),
+            if completed {
+                &expected_log
+            } else {
+                &before["log"]
+            },
+            "only the event that completes the load may replace its known log: {event}"
+        );
+        events.push(event);
+        if completed {
+            break;
+        }
+    }
     let (status, after) = server.read("session/saved").await;
     assert_eq!(status, StatusCode::OK);
     stream.assert_document("session/saved", &after);

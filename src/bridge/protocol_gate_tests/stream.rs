@@ -557,6 +557,13 @@ async fn reconnecting_before_during_and_after_a_load_keeps_one_load_and_converge
     let replay = turns(&[("one", "1"), ("two", "2")]);
     let cached = history(&replay).await;
     let scope = session(SAVED);
+    let alignment_count = |reader: &Reader| {
+        reader
+            .events_of(&scope)
+            .iter()
+            .filter(|event| event["live"].get("replace").is_some())
+            .count()
+    };
     let mut peer = Peer::start(json!({"loadSession": true})).await;
     let mut stream = Stream::cached(
         &peer,
@@ -577,7 +584,7 @@ async fn reconnecting_before_during_and_after_a_load_keeps_one_load_and_converge
     stream.reopen(&peer, Some(CWD)).await;
     stream
         .until(&mut peer, "the second alignment", |reader| {
-            reader.events_of(&session(SAVED)).len() == 2
+            alignment_count(reader) == 2
         })
         .await;
     assert!(stream.events_of(&scope)[1].get("log").is_none());
@@ -601,7 +608,9 @@ async fn reconnecting_before_during_and_after_a_load_keeps_one_load_and_converge
     stream.reopen(&peer, Some(CWD)).await;
     stream
         .until(&mut peer, "the third alignment", |reader| {
-            reader.events_of(&session(SAVED)).len() == 3
+            // The barrier also delivered a live patch. Count alignments,
+            // not all messages received across the three subscriptions.
+            alignment_count(reader) == 3
         })
         .await;
     let barrier = interaction_ids(&stream.live(&scope)).remove(0);
