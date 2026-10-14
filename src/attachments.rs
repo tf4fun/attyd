@@ -363,6 +363,20 @@ mod tests {
     }
 
     #[test]
+    fn completed_compaction_summaries_project_and_resolve_their_attachments() {
+        let image = json!({"type":"image","mimeType":"image/png","data":"AQID"});
+        let mut original = json!({"bridgeEpoch":"epoch","sessionId":"session","sessionIncarnation":1,
+            "timeline":[{"sessionUpdate":"compaction_update","status":"completed","summary":[image]}]});
+        let mut projected = original.clone();
+        project(&mut projected);
+        assert!(!projected.to_string().contains("AQID"));
+        let block = &projected["timeline"][0]["summary"][0];
+        assert_eq!(block["type"], "resource_link");
+        let reference = reference(block).expect("host-owned reference");
+        assert_eq!(find(&mut original, &reference.id), Some(image));
+    }
+
+    #[test]
     fn serves_unicode_text_as_utf8_and_binary_bytes_unchanged() {
         for (mime, expected) in [
             ("text/markdown", "text/markdown;charset=utf-8"),

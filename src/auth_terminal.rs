@@ -446,6 +446,32 @@ mod tests {
         assert!(manager.write("cancel-auth", "late").is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_a_signalled_login_without_an_exit_code() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let manager = AuthTerminalManager::new(events);
+        let _cleanup = manager.close_on_drop();
+        manager
+            .start(
+                "signal-auth".into(),
+                method(json!({ "id": "login", "name": "Login", "type": "terminal" })),
+                &["/bin/sh".into(), "-c".into(), "kill -TERM $$".into()],
+                Path::new("/tmp"),
+                80,
+                24,
+            )
+            .unwrap();
+        let exited = event_of_type(&mut receiver, "bridge/auth_terminal_exited").await;
+        assert_eq!(exited["status"], "failed");
+        assert_eq!(exited["exitCode"], Value::Null);
+        let message = exited["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("terminal authentication was terminated by "),
+            "{message}"
+        );
+    }
+
     #[tokio::test]
     async fn collects_authentication_output_across_pty_chunks() {
         let (events, mut receiver) = mpsc::unbounded_channel();
