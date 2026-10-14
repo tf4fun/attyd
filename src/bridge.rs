@@ -2944,6 +2944,9 @@ fn fail_command_operation(
     state
         .sessions
         .fail_scope_operation(&scope, kind, operation_error(error, closing));
+    // The ended operation no longer keeps its session needed: an unfollowed
+    // session starts its release timer again (S6).
+    refresh_observer_timers(state);
     if kind == OpKind::Delete {
         // The failed delete frees what it occupied: the streams that waited
         // for it load the session.
