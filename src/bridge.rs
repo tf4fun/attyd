@@ -16,6 +16,9 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[cfg(test)]
+use self::publication::PublishedCommit;
+use self::publication::{BridgeLock, ProtocolState, agent_launch, operation_error};
 use self::scheduling::{ExecutionTurn, IngressSender};
 use crate::agent_process::StdioAcpAgent;
 use crate::auth_terminal::{AuthTerminalManager, validate_method as validate_terminal_auth_method};
@@ -29,6 +32,7 @@ use crate::mcp::McpManager;
 use crate::mcp_config::{server_name, server_type};
 use crate::options::{Options, Transport};
 use crate::ordered_ingress::{RequestClass, RequestOwner};
+use crate::protocol::documents::{OperationKind as OpKind, Scope as OpScope};
 use crate::runtime_state::{
     RuntimeEffect, SessionLifecycle, SessionOperationKind as RuntimeSessionOperationKind,
     SessionTurnError, UrlFlowResolution, UrlFlowStatus,
@@ -62,6 +66,7 @@ mod memory_efficiency_tests;
 mod memory_retention_tests;
 #[cfg(test)]
 mod protocol_gate_tests;
+mod publication;
 mod scheduling;
 #[cfg(test)]
 mod unobserved_tests;
@@ -269,6 +274,11 @@ struct BridgeState {
     observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
     observer_timeout: Option<i64>,
     observers_stopped: bool,
+    /// Protocol v2: the published documents and the Agent's state.
+    protocol: ProtocolState,
+    /// The connection's ingress, for tests that wait on its receipt.
+    #[cfg(test)]
+    ingress: Option<IngressSender>,
 }
 
 fn session_ingest<'a>(state: &'a BridgeState, session_id: &str) -> Option<&'a SessionResources> {
@@ -1701,7 +1711,7 @@ struct CommandContext {
     prepared_attachment: Option<PreparedAttachment>,
     ingress: Option<scheduling::IngressSender>,
     options: Arc<Options>,
-    state: Arc<Mutex<BridgeState>>,
+    state: Arc<BridgeLock>,
     sink: EventSink,
     terminals: Option<TerminalManager>,
     filesystem: Option<Arc<WorkspaceFileSystem>>,
@@ -2205,9 +2215,11 @@ async fn run_connection<T>(
 where
     T: ConnectTo<Client>,
 {
-    let state = Arc::new(Mutex::new(BridgeState::default()));
+    let state = Arc::new(BridgeLock::new(BridgeState::default()));
+    state.lock().await.protocol.agent.launch = agent_launch(&options);
     #[cfg(test)]
     memory_retention_tests::capture_coordinator_state(&state);
+    let final_state = state.clone();
     let epoch = state.lock().await.sessions.epoch().to_string();
     let (mut scheduling, ingress) =
         scheduling::Scheduling::new(epoch.clone(), sink.clone(), cancellation.clone())?;
@@ -2215,6 +2227,10 @@ where
     let (observer_events, mut observer_rx) = mpsc::unbounded_channel();
     {
         let mut state = state.lock().await;
+        #[cfg(test)]
+        {
+            state.ingress = Some(ingress.clone());
+        }
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
     }
@@ -2278,6 +2294,7 @@ where
         },
         url_registration: None,
         request_lease: None,
+        request_scope: None,
     };
     let builder = Client.builder().on_receive_dispatch(
         {
@@ -2289,10 +2306,12 @@ where
         agent_client_protocol::on_receive_dispatch!(),
     );
 
-    builder
+    let result = builder
         .connect_with(transport, async move |connection| {
             let _auth_terminal_cleanup = auth_terminal.close_on_drop();
             sink.send(json!({ "type": "bridge/phase", "phase": "initializing" }));
+            state.lock().await.protocol.agent.phase =
+                crate::protocol::documents::AgentPhase::Initializing;
             let initialize = InitializeRequest::new(ProtocolVersion::V1)
                 .client_capabilities(client_capabilities(&options))
                 .client_info(
@@ -2313,6 +2332,8 @@ where
             validate_configured_capabilities(&response.agent_capabilities, &options)?;
             {
                 let mut state = state.lock().await;
+                state.protocol.agent.phase = crate::protocol::documents::AgentPhase::Ready;
+                state.protocol.agent.initialize = Some(serde_json::to_value(&response)?);
                 state.agent_capabilities = Some(response.agent_capabilities.clone());
                 state.auth_methods = response
                     .auth_methods
@@ -2670,6 +2691,15 @@ where
                         )
                         .await
                     };
+                    if let Err(error) = &result {
+                        fail_command_operation(
+                            &mut *context.state.lock().await,
+                            &operation,
+                            intent_session_id.as_deref(),
+                            error,
+                            context.cancellation.is_cancelled(),
+                        );
+                    }
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
                         responder.error(error);
                     }
@@ -2757,7 +2787,48 @@ where
             }
             Ok(())
         })
+        .await;
+    // The last commit: running operations fail and the final agent shows.
+    final_state
+        .lock()
         .await
+        .end_connection(result.as_ref().err());
+    result
+}
+
+/// A v1 command failed: the protocol operation it ran for fails with it.
+fn fail_command_operation(
+    state: &mut BridgeState,
+    operation: &str,
+    session_id: Option<&str>,
+    error: &Error,
+    closing: bool,
+) {
+    let session = || session_id.map(|id| OpScope::Session(id.to_string()));
+    let (scope, kind) = match operation {
+        "session/new" => (OpScope::Global, OpKind::Create),
+        "session/list" => (OpScope::Catalog, OpKind::List),
+        "session/delete" => (OpScope::Global, OpKind::Delete),
+        "auth/authenticate" => (OpScope::Global, OpKind::Authenticate),
+        "auth/logout" => (OpScope::Global, OpKind::Logout),
+        "auth/terminal_start" => (OpScope::Global, OpKind::TerminalLogin),
+        "session/fork" => match session() {
+            Some(scope) => (scope, OpKind::Fork),
+            None => return,
+        },
+        "session/set_mode" => match session() {
+            Some(scope) => (scope, OpKind::SetMode),
+            None => return,
+        },
+        "session/set_config_option" => match session() {
+            Some(scope) => (scope, OpKind::SetConfig),
+            None => return,
+        },
+        _ => return,
+    };
+    state
+        .sessions
+        .fail_scope_operation(&scope, kind, operation_error(error, closing));
 }
 
 fn error_message(error: Error) -> String {
@@ -2766,7 +2837,7 @@ fn error_message(error: Error) -> String {
 
 #[cfg(test)]
 async fn resolve_session_view_waiters(
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     sink: &EventSink,
     session_id: &str,
     materialization_id: &str,
@@ -2903,10 +2974,7 @@ fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-async fn apply_runtime_effects(
-    state: &Arc<Mutex<BridgeState>>,
-    terminals: Option<&TerminalManager>,
-) {
+async fn apply_runtime_effects(state: &Arc<BridgeLock>, terminals: Option<&TerminalManager>) {
     let terminal_releases = {
         let mut locked = state.lock().await;
         drain_runtime_effects(&mut locked)
@@ -2946,7 +3014,7 @@ fn client_capabilities(options: &Options) -> ClientCapabilities {
 
 async fn handle_session_update(
     notification: SessionNotification,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     sink: &EventSink,
     _terminals: Option<&TerminalManager>,
 ) {
@@ -3280,7 +3348,7 @@ async fn handle_session_update(
 
 async fn cancel_prompts_on_shutdown(
     connection: &ConnectionTo<Agent>,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     sink: &EventSink,
     lifecycle: &PromptLifecycle,
 ) {
@@ -3464,7 +3532,7 @@ async fn send_history<Req: JsonRpcRequest>(
     connection: &ConnectionTo<Agent>,
     ingress: Option<&IngressSender>,
     execution: &mut Option<ExecutionTurn>,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     owner: RequestOwner,
     request: Req,
 ) -> Result<Result<Req::Response, Error>, Error> {
@@ -3718,6 +3786,15 @@ async fn handle_command_inner(
             )
             .await??;
             relay_bytes(&response)?;
+            {
+                let mut state = state.lock().await;
+                state.protocol.agent.authenticated_method_id = Some(method_id.to_string());
+                state.sessions.complete_scope_operation(
+                    &OpScope::Global,
+                    OpKind::Authenticate,
+                    json!({}),
+                );
+            }
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -3741,6 +3818,15 @@ async fn handle_command_inner(
             )
             .await??;
             relay_bytes(&response)?;
+            {
+                let mut state = state.lock().await;
+                state.protocol.agent.authenticated_method_id = None;
+                state.sessions.complete_scope_operation(
+                    &OpScope::Global,
+                    OpKind::Logout,
+                    json!({}),
+                );
+            }
             if let Some(responder) = &business_responder {
                 responder.success(serde_json::to_value(&response)?);
             }
@@ -3839,6 +3925,11 @@ async fn handle_command_inner(
                     }
 
                     session_mirror(&mut state).register_new(session_id.clone(), incarnation);
+                    state.sessions.complete_scope_operation(
+                        &OpScope::Global,
+                        OpKind::Create,
+                        json!({ "sessionId": session_id }),
+                    );
                     advance_catalog_revision(&mut state, &sink);
                     flush_runtime(&mut state, &sink);
                     let mirror_view = session_view_value(&mut state, &session_id, incarnation)?;
@@ -3920,6 +4011,15 @@ async fn handle_command_inner(
                     .listed_sessions
                     .insert(session.session_id.0.to_string(), session.clone());
             }
+            let page = serde_json::to_value(&response)?;
+            let result = json!({
+                "revision": state.catalog_revision.to_string(),
+                "sessions": page["sessions"],
+                "nextCursor": page["nextCursor"],
+            });
+            state
+                .sessions
+                .complete_scope_operation(&OpScope::Catalog, OpKind::List, result);
             drop(state);
             if let Some(responder) = &business_responder {
                 let mut response = serde_json::to_value(&response)?;
@@ -4837,6 +4937,7 @@ async fn handle_command_inner(
                 release_deletion(&mut locked, &session_id, deletion, &request_id);
                 result?;
                 locked.listed_sessions.remove(&session_id);
+                locked.sessions.complete_catalog_delete(&session_id);
                 advance_catalog_revision(&mut locked, &sink);
                 return Ok(());
             };
@@ -5605,6 +5706,9 @@ async fn handle_command_inner(
                     .sessions
                     .register_url_route(&url_id, owner.clone())
                     .map_err(mirror_error)?;
+                if owner.is_none() {
+                    locked.sessions.accept_joined_flow(&elicitation_id);
+                }
             }
             let business_delta = if let Some(owner) = &owner {
                 Some(advance_session_delta(
@@ -5695,14 +5799,36 @@ async fn handle_command_inner(
                 return Err(Error::invalid_request()
                     .data("authentication method is handled by the Agent, not a terminal"));
             };
-            auth_terminal.start(
+            // The running `terminal_login` owns the terminal, by its ID, from
+            // before the process can print (protocol §4.6).
+            let login = {
+                let mut locked = state.lock().await;
+                let global = &locked.sessions.scopes.global;
+                let op = global
+                    .is_running_kind(OpKind::TerminalLogin)
+                    .then(|| global.id.clone());
+                if let Some(op) = &op {
+                    locked.sessions.start_login_terminal(op, method_id);
+                }
+                op
+            };
+            let observer = login
+                .clone()
+                .map(|op| publication::login_observer(Arc::downgrade(&state), op));
+            if let Err(error) = auth_terminal.start_observed(
                 request_id,
                 method,
                 &options.command,
                 &options.cwd,
                 cols,
                 rows,
-            )?;
+                observer,
+            ) {
+                if let Some(op) = &login {
+                    state.lock().await.sessions.discard_login_terminal(op);
+                }
+                return Err(error);
+            }
         }
         "auth/terminal_input" => {
             let request_id = string_field(&command, "requestId")?;
@@ -5922,7 +6048,7 @@ enum HistorySyncOutcome {
 async fn synchronize_attached_history(
     connection: &ConnectionTo<Agent>,
     options: &Options,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     sink: &EventSink,
     cancellation: &CancellationToken,
     session_id: &str,
@@ -6052,7 +6178,7 @@ async fn synchronize_attached_history(
 async fn synchronize_authoritative_history(
     connection: &ConnectionTo<Agent>,
     options: &Options,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     sink: &EventSink,
     cancellation: &CancellationToken,
     session_id: &str,
@@ -6526,7 +6652,7 @@ fn local_additional_directories(options: &Options) -> Vec<PathBuf> {
 async fn reserve_attachment(
     session_id: &str,
     kind: RuntimeSessionOperationKind,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
 ) -> Result<AttachmentReservation, Error> {
     reserve_attachment_with_cwd(session_id, kind, None, "test-attachment", None, state).await
 }
@@ -6537,7 +6663,7 @@ async fn reserve_attachment_with_cwd(
     requested_cwd: Option<&str>,
     operation_id: &str,
     materialization_id: Option<&str>,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
 ) -> Result<AttachmentReservation, Error> {
     let mut state = state.lock().await;
     reserve_attachment_locked(
@@ -6954,7 +7080,7 @@ fn commit_runtime_delete_close_success(
 
 async fn require_live_session_incarnation(
     session_id: &str,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
 ) -> Result<u64, Error> {
     let state = state.lock().await;
     live_session_incarnation(&state, session_id).ok_or_else(|| {
@@ -6964,7 +7090,7 @@ async fn require_live_session_incarnation(
 
 async fn require_session_workspace(
     session_id: &str,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     filesystem: &WorkspaceFileSystem,
 ) -> Result<(u64, WorkspaceFileSystem), Error> {
     let (incarnation, cwd) = {
@@ -6980,7 +7106,7 @@ async fn require_session_workspace(
 async fn cancel_interactions(
     session_id: &str,
     incarnation: u64,
-    state: &Arc<Mutex<BridgeState>>,
+    state: &Arc<BridgeLock>,
     sink: &EventSink,
 ) {
     let mut state = state.lock().await;
@@ -7159,10 +7285,7 @@ fn validate_auth_methods(methods: &[AuthMethod], terminal_supported: bool) -> Re
     Ok(())
 }
 
-async fn require_agent_method(
-    operation: &str,
-    state: &Arc<Mutex<BridgeState>>,
-) -> Result<(), Error> {
+async fn require_agent_method(operation: &str, state: &Arc<BridgeLock>) -> Result<(), Error> {
     let capabilities = state
         .lock()
         .await
@@ -7700,7 +7823,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_completion_publishes_old_outcome_before_waiting_next_turn_can_admit() {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (tx, mut events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let mut locked = state.lock().await;
@@ -9145,7 +9268,7 @@ mod tests {
     async fn buffers_pre_response_updates_and_drops_late_unknown_sessions() {
         // Zed's ACP regression suite requires load replay notifications arriving before
         // the RPC response to survive. New/fork need the same ordering guarantee here.
-        let state = Arc::new(Mutex::new(BridgeState {
+        let state = Arc::new(BridgeLock::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));
@@ -10083,7 +10206,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_early_updates_prevent_session_commit_and_clear_cleanly() {
-        let state = Arc::new(Mutex::new(BridgeState {
+        let state = Arc::new(BridgeLock::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));
@@ -10377,7 +10500,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserves_listed_sessions_once_and_rejects_busy_attachments() {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         state.lock().await.listed_sessions.insert(
             "saved".to_string(),
             session_info("saved", "/agent/workspace"),
@@ -10782,7 +10905,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_owner_can_settle_materialization_waiters() {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (events, _events_rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: events.into() };
         let (sender, mut receiver) = oneshot::channel();
@@ -11064,7 +11187,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_completion_releases_exclusion_before_notifying_shutdown() {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (_incarnation, operation) = {
             let mut state = state.lock().await;
             let incarnation = register_test_session(&mut state, "session", "/workspace");
@@ -11167,7 +11290,7 @@ mod tests {
 
     #[tokio::test]
     async fn capability_gates_optional_methods_and_configured_features() {
-        let state = Arc::new(Mutex::new(BridgeState {
+        let state = Arc::new(BridgeLock::new(BridgeState {
             agent_capabilities: Some(AgentCapabilities::new()),
             ..BridgeState::default()
         }));
@@ -11439,7 +11562,7 @@ mod tests {
                 .unwrap();
             (permission, elicitation)
         }
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (tx, _events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let mut locked = state.lock().await;
@@ -11507,7 +11630,7 @@ mod tests {
 
     #[tokio::test]
     async fn retired_incarnation_effects_cannot_cancel_reused_interaction_or_url_routes() {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (old_permission_sender, old_permission) = oneshot::channel();
         let (old_elicitation_sender, old_elicitation) = oneshot::channel();
         let (new_permission_sender, mut new_permission) = oneshot::channel();
@@ -11695,7 +11818,7 @@ mod tests {
     async fn prompt_terminal_effects_cancel_owned_responders_in_the_adapter() {
         let (permission_sender, permission_receiver) = oneshot::channel();
         let (elicitation_sender, elicitation_receiver) = oneshot::channel();
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         {
             let mut state = state.lock().await;
             let epoch = state.sessions.epoch().to_string();
@@ -11862,7 +11985,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_cleanup_tombstone_blocks_same_id_reattachment() {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (tx, _events) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let incarnation = {
@@ -12181,7 +12304,7 @@ mod tests {
         let (permission_sender, permission_receiver) = oneshot::channel();
         let (session_sender, session_receiver) = oneshot::channel();
         let (request_sender, _request_receiver) = oneshot::channel();
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         {
             let mut state = state.lock().await;
             let epoch = state.sessions.epoch().to_string();
@@ -12367,7 +12490,7 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_early_update_bursts_until_creation_completes() {
-        let state = Arc::new(Mutex::new(BridgeState {
+        let state = Arc::new(BridgeLock::new(BridgeState {
             pending_creations: 1,
             ..BridgeState::default()
         }));

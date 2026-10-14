@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 
 use super::SessionControls;
 use super::canon::TurnLog;
-use super::documents::{End, EndReason, ErrorCode, OperationKind, ProtocolError, Scope};
+use super::documents::{
+    End, EndReason, ErrorCode, ExitStatus, LoginTerminal, OperationKind, ProtocolError, Scope,
+};
 use super::op::OpSlot;
 use crate::runtime_state::{PendingInteraction, SessionLiveState, SessionOperationKind};
 use crate::session_registry::SessionRegistry;
@@ -42,7 +44,24 @@ pub(crate) struct ScopeOps {
     pub occupied: BTreeMap<String, Scope>,
     /// Session scopes that ended since the last commit, and why.
     pub ended: Vec<(String, End)>,
+    /// Request-scoped elicitations, by interaction ID, and the operation they
+    /// joined: that of the scope whose ACP request they name (protocol §6.2).
+    pub joined: BTreeMap<String, Joined>,
+    /// Accepted request-scoped URL flows, by interaction ID, and their scope.
+    pub flow_scopes: BTreeMap<String, Scope>,
+    /// Terminal logins, by operation ID (protocol §4.6).
+    pub login_terminals: BTreeMap<String, LoginTerminal>,
 }
+
+/// The operation a request-scoped interaction joined.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Joined {
+    pub scope: Scope,
+    pub op: String,
+}
+
+/// The bound of a login terminal's output tail, in bytes.
+const LOGIN_OUTPUT_LIMIT: usize = 1 << 20;
 
 impl Default for ScopeOps {
     fn default() -> Self {
@@ -51,6 +70,9 @@ impl Default for ScopeOps {
             catalog: OpSlot::completed(OperationKind::None, Value::Null),
             occupied: BTreeMap::new(),
             ended: Vec::new(),
+            joined: BTreeMap::new(),
+            flow_scopes: BTreeMap::new(),
+            login_terminals: BTreeMap::new(),
         }
     }
 }
@@ -94,6 +116,16 @@ fn has_unanswered(live: &SessionLiveState) -> bool {
     unanswered(live.permissions.values().chain(live.elicitations.values()))
         .next()
         .is_some()
+}
+
+/// The ACP method of a request names the scope it belongs to: a list is the
+/// catalog's, a session's request is the session's, the rest are global.
+pub(crate) fn request_scope(session_id: Option<&str>, method: &str) -> Scope {
+    match (method, session_id) {
+        ("session/list", _) => Scope::Catalog,
+        (_, Some(session_id)) => Scope::Session(session_id.to_string()),
+        (_, None) => Scope::Global,
+    }
 }
 
 /// Starts an `agent_request` for interactions no operation runs for, and
@@ -205,23 +237,266 @@ impl SessionRegistry {
     // -----------------------------------------------------------------------
     // Transitions, called by the registry's v1 transitions.
 
+    /// Whether an unanswered request-scoped interaction joined `op`.
+    fn has_joined(&self, op: &str) -> bool {
+        unanswered(self.request_elicitations.values()).any(|pending| {
+            self.scopes
+                .joined
+                .get(&pending.interaction_id)
+                .is_some_and(|joined| joined.op == op)
+        })
+    }
+
     /// A transition of `session_id` ended: settle its `agent_request`.
     pub(crate) fn settle_session_ops(&mut self, session_id: &str) {
         if self.scopes.occupied.contains_key(session_id) {
             return;
         }
-        if let Some(live) = self.held_live_mut(session_id) {
-            let pending = has_unanswered(live);
-            settle_agent_request(&mut live.op, pending);
+        let Some(live) = self.held_live(session_id) else {
+            return;
+        };
+        let pending = has_unanswered(live) || self.has_joined(&live.op.id);
+        let live = self.held_live_mut(session_id).expect("held session");
+        settle_agent_request(&mut live.op, pending);
+    }
+
+    /// A connection-level transition ended: settle the `agent_request` of
+    /// `global` (its own interactions are those that joined no operation) and
+    /// of every scope a request-scoped interaction joined.
+    pub(crate) fn settle_global_ops(&mut self) {
+        let pending = unanswered(self.request_elicitations.values())
+            .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id))
+            || self.has_joined(&self.scopes.global.id);
+        settle_agent_request(&mut self.scopes.global, pending);
+        let pending = self.has_joined(&self.scopes.catalog.id);
+        settle_agent_request(&mut self.scopes.catalog, pending);
+        let sessions: Vec<String> = self
+            .scopes
+            .joined
+            .values()
+            .filter_map(|joined| match &joined.scope {
+                Scope::Session(session_id) => Some(session_id.clone()),
+                _ => None,
+            })
+            .collect();
+        for session_id in sessions {
+            self.settle_session_ops(&session_id);
         }
     }
 
-    /// A connection-level transition ended: settle `global`'s `agent_request`.
-    pub(crate) fn settle_global_ops(&mut self) {
-        let pending = unanswered(self.request_elicitations.values())
-            .next()
-            .is_some();
-        settle_agent_request(&mut self.scopes.global, pending);
+    /// A request-scoped interaction arrived for `scope`: it joins the running
+    /// operation shown there, or starts an `agent_request` (protocol §6.2).
+    /// An unheld session's request falls back to `global`.
+    pub(crate) fn join_interaction(&mut self, interaction_id: &str, scope: Scope) {
+        let scope = match &scope {
+            Scope::Session(session_id) if self.held_live(session_id).is_none() => Scope::Global,
+            _ => scope,
+        };
+        let owner = match &scope {
+            Scope::Session(session_id) => self
+                .scopes
+                .occupied
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| scope.clone()),
+            _ => scope.clone(),
+        };
+        let slot = self.slot_mut(&owner);
+        if !slot.is_running() {
+            *slot = OpSlot::running(OperationKind::AgentRequest, json!({}));
+        }
+        let op = slot.id.clone();
+        self.scopes
+            .joined
+            .insert(interaction_id.to_string(), Joined { scope, op });
+    }
+
+    /// An accepted request-scoped URL elicitation became a flow: it stays in
+    /// the scope of the interaction it came from.
+    pub(crate) fn accept_joined_flow(&mut self, interaction_id: &str) {
+        if let Some(joined) = self.scopes.joined.remove(interaction_id) {
+            self.scopes
+                .flow_scopes
+                .insert(interaction_id.to_string(), joined.scope);
+        }
+    }
+
+    /// Unanswered request-scoped interactions whose operation ended.
+    pub(crate) fn orphaned_interactions(&self) -> Vec<String> {
+        unanswered(self.request_elicitations.values())
+            .filter(|pending| {
+                self.scopes
+                    .joined
+                    .get(&pending.interaction_id)
+                    .is_some_and(|joined| {
+                        self.shown_slot(&joined.scope)
+                            .is_none_or(|slot| slot.id != joined.op || !slot.is_running())
+                    })
+            })
+            .map(|pending| pending.interaction_id.clone())
+            .collect()
+    }
+
+    /// Forgets joins and flow scopes whose interaction or flow is gone.
+    pub(crate) fn prune_joined(&mut self) {
+        let interactions = &self.request_elicitations;
+        self.scopes
+            .joined
+            .retain(|interaction_id, _| interactions.contains_key(interaction_id));
+        let flows: std::collections::BTreeSet<&str> = self
+            .request_url_flows
+            .values()
+            .map(|flow| flow.registration_id.as_str())
+            .collect();
+        self.scopes
+            .flow_scopes
+            .retain(|interaction_id, _| flows.contains(interaction_id.as_str()));
+    }
+
+    /// The running operation of `kind` in `scope` completed with `result`.
+    pub(crate) fn complete_scope_operation(
+        &mut self,
+        scope: &Scope,
+        kind: OperationKind,
+        result: Value,
+    ) {
+        if self.held_scope(scope) {
+            let slot = self.slot_mut(scope);
+            if slot.is_running_kind(kind) {
+                slot.complete(result);
+            }
+        }
+    }
+
+    /// The running operation of `kind` in `scope` failed. A failed delete
+    /// frees the session it occupied.
+    pub(crate) fn fail_scope_operation(
+        &mut self,
+        scope: &Scope,
+        kind: OperationKind,
+        error: ProtocolError,
+    ) {
+        if !self.held_scope(scope) || !self.slot_mut(scope).is_running_kind(kind) {
+            return;
+        }
+        if kind == OperationKind::Delete {
+            let occupied: Vec<String> = self
+                .scopes
+                .occupied
+                .iter()
+                .filter(|(_, occupier)| *occupier == scope)
+                .map(|(session_id, _)| session_id.clone())
+                .collect();
+            for session_id in occupied {
+                self.scopes.occupied.remove(&session_id);
+            }
+        }
+        self.slot_mut(scope).fail(error);
+    }
+
+    /// A delete of a session the bridge does not hold completed.
+    pub(crate) fn complete_catalog_delete(&mut self, session_id: &str) {
+        if let Some(occupier) = self.free_occupation(session_id) {
+            self.slot_mut(&occupier).complete(json!({}));
+        }
+    }
+
+    fn held_scope(&self, scope: &Scope) -> bool {
+        match scope {
+            Scope::Session(session_id) => self.held_live(session_id).is_some(),
+            _ => true,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal logins (protocol §4.6)
+
+    /// A `terminal_login` operation started its terminal.
+    pub(crate) fn start_login_terminal(&mut self, op: &str, method_id: &str) {
+        self.scopes.login_terminals.insert(
+            op.to_string(),
+            LoginTerminal {
+                terminal_id: op.to_string(),
+                output: String::new(),
+                truncated: false,
+                exit_status: None,
+                method_id: method_id.to_string(),
+            },
+        );
+    }
+
+    /// A login terminal could not start: it never existed.
+    pub(crate) fn discard_login_terminal(&mut self, op: &str) {
+        self.scopes.login_terminals.remove(op);
+    }
+
+    /// A login terminal printed `data`; its output keeps a bounded tail.
+    pub(crate) fn login_output(&mut self, op: &str, data: &str) {
+        let Some(terminal) = self.scopes.login_terminals.get_mut(op) else {
+            return;
+        };
+        terminal.output.push_str(data);
+        if terminal.output.len() > LOGIN_OUTPUT_LIMIT {
+            let mut cut = terminal.output.len() - LOGIN_OUTPUT_LIMIT;
+            while !terminal.output.is_char_boundary(cut) {
+                cut += 1;
+            }
+            terminal.output.drain(..cut);
+            terminal.truncated = true;
+        }
+    }
+
+    /// A login terminal's process exited: the terminal stays until dismissed,
+    /// and its operation ends with the exit (protocol §6.2).
+    pub(crate) fn login_exited(&mut self, op: &str, exit: LoginExit) {
+        if let Some(terminal) = self.scopes.login_terminals.get_mut(op) {
+            terminal.exit_status = Some(ExitStatus {
+                exit_code: exit.exit_code,
+                signal: exit.signal.clone(),
+            });
+        }
+        let slot = &mut self.scopes.global;
+        if slot.id != op || !slot.is_running_kind(OperationKind::TerminalLogin) {
+            return;
+        }
+        if let Some(failure) = exit.failure {
+            slot.fail(ProtocolError::new(ErrorCode::Unavailable, failure));
+        } else if exit.cancelled {
+            slot.status = super::documents::OperationStatus::Cancelled;
+        } else {
+            slot.complete(json!({ "exitCode": exit.exit_code, "signal": exit.signal }));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The Agent connection
+
+    /// The Agent connection ended (protocol §4.4, §4.6): every running
+    /// operation fails with `error`, pending interactions end with it, and the
+    /// connection's resources go.
+    pub(crate) fn end_connection(&mut self, error: ProtocolError) {
+        for slot in [&mut self.scopes.global, &mut self.scopes.catalog] {
+            if slot.is_running() {
+                slot.fail(error.clone());
+            }
+        }
+        for entry in self.sessions.values_mut() {
+            if let Some(live) = entry.state.live.as_mut() {
+                if live.op.is_running() {
+                    live.op.fail(error.clone());
+                }
+                live.permissions.clear();
+                live.elicitations.clear();
+                live.url_flows.clear();
+                live.terminals.clear();
+            }
+        }
+        self.scopes.occupied.clear();
+        self.request_elicitations.clear();
+        self.request_url_flows.clear();
+        self.scopes.joined.clear();
+        self.scopes.flow_scopes.clear();
+        self.scopes.login_terminals.clear();
     }
 
     /// A v1 session operation started; a reload runs as a `load`.
@@ -390,6 +665,17 @@ impl SessionRegistry {
             live.controls.fold_update(update);
         }
     }
+}
+
+/// How a login terminal's process ended.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoginExit {
+    pub exit_code: Option<i64>,
+    pub signal: Option<String>,
+    /// A cancel stopped it.
+    pub cancelled: bool,
+    /// Waiting for it failed.
+    pub failure: Option<String>,
 }
 
 /// How a prompt's turn ended.

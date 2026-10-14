@@ -236,6 +236,14 @@ impl<Event: Send + 'static> OrderedIngress<Event> {
         Ok(result)
     }
 
+    /// The owner and method of a pending request, read in wire order before
+    /// a later response can remove it.
+    pub(crate) fn pending_request(&self, request_id: &RequestId) -> Option<(RequestOwner, String)> {
+        let pending = self.inner.pending.lock().ok()?;
+        let reservation = pending.get(request_id)?;
+        Some((reservation.owner.clone(), reservation.method.clone()))
+    }
+
     /// Call from on_receive_dispatch. Unregistered responses and other dispatches are
     /// declined. A failed event delivery still routes the RPC response before returning
     /// its explicit error, so the original SDK waiter cannot remain parked indefinitely.

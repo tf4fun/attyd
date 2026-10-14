@@ -14,7 +14,7 @@ use agent_client_protocol::{
 
 #[derive(Clone)]
 pub(super) struct AgentContext {
-    pub(super) state: Arc<Mutex<BridgeState>>,
+    pub(super) state: Arc<BridgeLock>,
     pub(super) sink: EventSink,
     pub(super) terminals: Option<TerminalManager>,
     pub(super) filesystem: Option<Arc<WorkspaceFileSystem>>,
@@ -26,6 +26,8 @@ pub(super) struct AgentContext {
     pub(super) dispatch_owner: RequestOwner,
     pub(super) url_registration: Option<UrlRegistration>,
     pub(super) request_lease: Option<InboundRequestLease>,
+    /// See `CapturedRoute::request_scope`.
+    pub(super) request_scope: Option<OpScope>,
 }
 
 impl AgentContext {
@@ -538,6 +540,14 @@ async fn elicitation(
                 }
             }
             let epoch = state.sessions.epoch().to_owned();
+            // Joined before it is pending, so no scope settles without it.
+            if owner.is_none()
+                && let Some(scope) = &context.request_scope
+            {
+                state
+                    .sessions
+                    .join_interaction(&elicitation_id, scope.clone());
+            }
             state
                 .sessions
                 .upsert_elicitation(
@@ -872,7 +882,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn context() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
-        let state = Arc::new(Mutex::new(BridgeState::default()));
+        let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (events, receiver) = mpsc::unbounded_channel();
         let sink = EventSink { tx: events.into() };
         let epoch = state.try_lock().unwrap().sessions.epoch().to_owned();
@@ -896,6 +906,7 @@ mod tests {
                 },
                 url_registration: None,
                 request_lease: None,
+                request_scope: None,
             },
             scheduling,
             receiver,
@@ -936,6 +947,7 @@ mod tests {
                 owner: owner.clone(),
                 dispatch_owner: context.dispatch_owner.clone(),
                 url_registration: None,
+                request_scope: None,
             };
             route.dispatch_owner.session_id = owner.as_ref().map(|owner| owner.session_id.clone());
             route.dispatch_owner.incarnation = owner.as_ref().map(|owner| owner.incarnation);
@@ -1198,6 +1210,7 @@ mod tests {
                     owner: None,
                     dispatch_owner: context.dispatch_owner.clone(),
                     url_registration: None,
+                    request_scope: None,
                 };
                 route.dispatch_owner.attempt_id = Some(format!("allocation-{index}"));
                 let lease = inbound

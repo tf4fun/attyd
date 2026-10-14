@@ -26,6 +26,8 @@ use crate::completion_handoff::{
 use crate::ordered_ingress::{
     OrderedCompletion, OrderedIngress, RequestClass, RequestOwner, RequestReservation,
 };
+use crate::protocol::documents::Scope as OpScope;
+use crate::protocol::registry::request_scope;
 use crate::session_dispatch::{
     Delivery, DeliveryGuard, EventOrigin, SessionDispatch, SessionHandle, TrafficClass,
 };
@@ -62,6 +64,9 @@ pub(super) struct CapturedRoute {
     pub owner: Option<SessionResourceOwner>,
     pub dispatch_owner: RequestOwner,
     pub url_registration: Option<UrlRegistration>,
+    /// A request-scoped elicitation's scope: that of the bridge request it
+    /// names, resolved when it was received (protocol §6.2).
+    pub request_scope: Option<OpScope>,
 }
 
 /// One accepted event retains its wire order until its local transition finishes.
@@ -69,6 +74,8 @@ pub(super) struct IngressItem {
     pub request_lease: Option<InboundRequestLease>,
     pub event: BridgeIngress,
     pub route: Option<CapturedRoute>,
+    /// See `CapturedRoute::request_scope`.
+    pub request_scope: Option<OpScope>,
     bytes: usize,
     class: TrafficClass,
     origin: EventOrigin,
@@ -80,6 +87,7 @@ impl IngressItem {
             bytes: completion.response_bytes.max(1),
             event: BridgeIngress::RpcCompleted(completion),
             route: None,
+            request_scope: None,
             request_lease: None,
             class: TrafficClass::Reserved,
             origin: EventOrigin::RequiredInbound,
@@ -607,14 +615,39 @@ impl IngressSender {
                     }
                     _ => TrafficClass::Reserved,
                 };
-                self.submit(
+                let scope = self.named_request_scope(&message);
+                self.submit_scoped(
                     BridgeIngress::Acp(message),
                     class,
                     EventOrigin::RequiredInbound,
+                    scope,
                 )?;
                 Ok(Handled::Yes)
             }
         }
+    }
+
+    /// The scope of the bridge request a request-scoped elicitation names,
+    /// while that request is pending (protocol §6.2). Read at receipt: the
+    /// request's response may follow at once and remove it.
+    fn named_request_scope(&self, message: &Dispatch) -> Option<OpScope> {
+        let Dispatch::Request(message, _) = message else {
+            return None;
+        };
+        if message.method != "elicitation/create" {
+            return None;
+        }
+        let named = message.params.get("requestId").filter(|id| !id.is_null())?;
+        let named: RequestId = serde_json::from_value(named.clone()).ok()?;
+        let (owner, method) = self.inner.ordered.pending_request(&named)?;
+        Some(request_scope(owner.session_id.as_deref(), &method))
+    }
+
+    /// Whether a bridge request still awaits its response; tests use it as a
+    /// receipt barrier.
+    #[cfg(test)]
+    pub(super) fn is_pending(&self, request_id: &RequestId) -> bool {
+        self.inner.ordered.pending_request(request_id).is_some()
     }
 
     fn submit(
@@ -622,6 +655,16 @@ impl IngressSender {
         event: BridgeIngress,
         class: TrafficClass,
         origin: EventOrigin,
+    ) -> Result<(), Error> {
+        self.submit_scoped(event, class, origin, None)
+    }
+
+    fn submit_scoped(
+        &self,
+        event: BridgeIngress,
+        class: TrafficClass,
+        origin: EventOrigin,
+        request_scope: Option<OpScope>,
     ) -> Result<(), Error> {
         let admitted = (|| {
             if self.inner.closed.is_cancelled()
@@ -637,6 +680,7 @@ impl IngressSender {
                 match self.inner.events.send(IngressItem {
                     event,
                     route: None,
+                    request_scope,
                     request_lease: None,
                     bytes,
                     class,
@@ -1723,6 +1767,7 @@ mod tests {
                 owner: Some(captured),
                 registration_id: "registration-1".into(),
             }),
+            request_scope: None,
         });
         scheduling
             .route_global(item)

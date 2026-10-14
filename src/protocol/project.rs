@@ -76,13 +76,26 @@ fn session_interactions(live: &SessionLiveState, into: &mut BTreeMap<String, Int
     into.extend(unanswered(live.elicitations.values()).map(|pending| interaction(pending, false)));
 }
 
-/// The pending interactions of the operation in `owner`'s slot: its own
-/// scope's, and those of the scopes it occupies (protocol §6.2).
-fn interactions(registry: &SessionRegistry, owner: &Scope) -> BTreeMap<String, Interaction> {
+/// The pending interactions of the operation `op` in `owner`'s slot: its own
+/// scope's, those of the scopes it occupies, and the request-scoped ones that
+/// joined it (protocol §6.2).
+fn interactions(
+    registry: &SessionRegistry,
+    owner: &Scope,
+    op: &str,
+) -> BTreeMap<String, Interaction> {
     let mut interactions = BTreeMap::new();
+    let joined =
+        |pending: &&PendingInteraction| registry.scopes.joined.get(&pending.interaction_id);
+    interactions.extend(
+        unanswered(registry.request_elicitations.values())
+            .filter(|pending| joined(pending).is_some_and(|joined| joined.op == op))
+            .map(|pending| interaction(pending, false)),
+    );
     match owner {
         Scope::Global => interactions.extend(
             unanswered(registry.request_elicitations.values())
+                .filter(|pending| joined(pending).is_none())
                 .map(|pending| interaction(pending, false)),
         ),
         Scope::Catalog => {}
@@ -137,7 +150,26 @@ fn owner(registry: &SessionRegistry, scope: &Scope) -> Scope {
 fn shown_operation(registry: &SessionRegistry, scope: &Scope) -> Option<(Operation, Scope)> {
     let owner = owner(registry, scope);
     let slot = registry.shown_slot(scope)?;
-    Some((operation(slot, interactions(registry, &owner)), owner))
+    Some((
+        operation(slot, interactions(registry, &owner, &slot.id)),
+        owner,
+    ))
+}
+
+/// The accepted request-scoped URL flows of `scope`; a flow of no known scope
+/// is global's.
+fn request_flows<'a>(
+    registry: &'a SessionRegistry,
+    scope: &'a Scope,
+) -> impl Iterator<Item = &'a crate::runtime_state::UrlFlow> {
+    registry.request_url_flows.values().filter(move |flow| {
+        registry
+            .scopes
+            .flow_scopes
+            .get(&flow.registration_id)
+            .unwrap_or(&Scope::Global)
+            == scope
+    })
 }
 
 fn url_flows<'a>(
@@ -199,7 +231,11 @@ pub(crate) fn project_session(
         log: state.log.clone(),
         live: SessionLive {
             op,
-            url_flows: url_flows(live.url_flows.values()),
+            url_flows: url_flows(
+                live.url_flows
+                    .values()
+                    .chain(request_flows(registry, &scope)),
+            ),
             session_id: session_id.to_string(),
             cwd: live.cwd.to_string_lossy().into_owned(),
             controls: live.controls.clone(),
@@ -239,6 +275,7 @@ fn summary(
     let url_flows = live
         .url_flows
         .values()
+        .chain(request_flows(registry, &scope))
         .filter(|flow| flow.status == UrlFlowStatus::Waiting)
         .count();
     SessionSummary {
@@ -260,9 +297,9 @@ pub(crate) fn project_global(registry: &SessionRegistry, agent: &AgentInfo) -> G
     GlobalLive {
         op: operation(
             &registry.scopes.global,
-            interactions(registry, &Scope::Global),
+            interactions(registry, &Scope::Global, &registry.scopes.global.id),
         ),
-        url_flows: url_flows(registry.request_url_flows.values()),
+        url_flows: url_flows(request_flows(registry, &Scope::Global)),
         agent: agent.clone(),
         sessions: held_sessions(registry)
             .into_iter()
@@ -272,14 +309,17 @@ pub(crate) fn project_global(registry: &SessionRegistry, agent: &AgentInfo) -> G
                 Some((session_id, summary))
             })
             .collect(),
-        terminals: BTreeMap::new(),
+        terminals: registry.scopes.login_terminals.clone(),
     }
 }
 
 pub(crate) fn project_catalog(registry: &SessionRegistry, revision: u64) -> CatalogLive {
     CatalogLive {
-        op: operation(&registry.scopes.catalog, BTreeMap::new()),
-        url_flows: BTreeMap::new(),
+        op: operation(
+            &registry.scopes.catalog,
+            interactions(registry, &Scope::Catalog, &registry.scopes.catalog.id),
+        ),
+        url_flows: url_flows(request_flows(registry, &Scope::Catalog)),
         revision: revision.to_string(),
     }
 }
