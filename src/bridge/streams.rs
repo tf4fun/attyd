@@ -55,9 +55,9 @@ pub(super) fn serve(state: &mut BridgeState, sink: &EventSink) -> Option<Value> 
             state.sessions.end_unloadable(&session_id);
             continue;
         };
-        if !state.stream_reloads.is_empty() {
-            wake(state);
-        }
+        // The next pass serves the rest: the other held sessions, then the
+        // subscriptions registered while the Agent initialized.
+        wake(state);
         return Some(json!({
             "type": method, "requestId": format!("bridge-reload-{}", Uuid::new_v4()),
             "sessionId": session_id, "cwd": cwd,

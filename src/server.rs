@@ -1139,22 +1139,26 @@ impl BridgeHub {
                     .expect("the generation-race test releases its pause");
             }
         }
-        if let Some(input) = input {
-            let (reply, subscribed) = oneshot::channel();
-            if input
-                .send(bridge::BridgeInput::Subscribe {
-                    scopes: scopes.clone(),
-                    reply,
-                })
-                .is_ok()
-                && let Ok(subscription) = subscribed.await
-            {
-                return Some(subscription);
-            }
-        }
-        let mut failed = input;
+        // The input the request took, then the current generation's when
+        // that one went with the old generation.
+        let mut attempt = input;
+        let mut failed: Option<mpsc::UnboundedSender<bridge::BridgeInput>> = None;
         loop {
-            let current = {
+            if let Some(current) = attempt.take() {
+                let (reply, subscribed) = oneshot::channel();
+                if current
+                    .send(bridge::BridgeInput::Subscribe {
+                        scopes: scopes.clone(),
+                        reply,
+                    })
+                    .is_ok()
+                    && let Ok(subscription) = subscribed.await
+                {
+                    return Some(subscription);
+                }
+                failed = Some(current);
+            }
+            let subscription = {
                 let state = self.state.lock().await;
                 if state.shutting_down {
                     return None;
@@ -1162,32 +1166,26 @@ impl BridgeHub {
                 match (&state.input, &failed) {
                     // A generation started after the input the request
                     // took: it registers the subscription and serves it.
-                    (Some(current), Some(old)) if !current.same_channel(old) => current.clone(),
-                    (Some(current), None) => current.clone(),
+                    (Some(current), Some(old)) if !current.same_channel(old) => {
+                        attempt = Some(current.clone());
+                        continue;
+                    }
+                    (Some(current), None) => {
+                        attempt = Some(current.clone());
+                        continue;
+                    }
                     // No generation, or the ending one: the subscription
                     // registers from the published cut; the next generation
                     // serves it once it is ready.
                     _ => {
                         let published = &mut *self.publication.lock();
-                        let subscription = published.hub.subscribe(&published.publisher, &scopes);
-                        drop(state);
-                        self.recover().await;
-                        return Some(subscription);
+                        published.hub.subscribe(&published.publisher, &scopes)
                     }
                 }
             };
-            let (reply, subscribed) = oneshot::channel();
-            if current
-                .send(bridge::BridgeInput::Subscribe {
-                    scopes: scopes.clone(),
-                    reply,
-                })
-                .is_ok()
-                && let Ok(subscription) = subscribed.await
-            {
-                return Some(subscription);
-            }
-            failed = Some(current);
+            // Both guards are released before recovery reads them again.
+            self.recover().await;
+            return Some(subscription);
         }
     }
 
