@@ -1,6 +1,6 @@
 # Client API redesign
 
-Status: proposal for review, 2026-10-14 (fourth version). It replaces the client
+Status: proposal for review, 2026-10-14 (fifth version). It replaces the client
 protocol of [protocol.md](protocol.md) (v2) and the replication rules of
 [state-sync.md](state-sync.md). Nothing here is implemented yet. The review that
 led here is recorded in [protocol-v2-review.md](protocol-v2-review.md) and in the
@@ -68,7 +68,7 @@ status, … }`. The bridge generates `id` at random and never reuses it. An
 operation's ID identifies it and is what writes are admitted against; it says
 nothing about what a replica has seen.
 
-**S5 Admission.** Every write names `expect`, an operation ID, and the bridge
+**S5 Admission.** Every operation write names `expect`, an operation ID, and the bridge
 handles writes and loads one at a time:
 
 - a write that **starts an operation** is admitted when `expect` equals `op.id`,
@@ -316,9 +316,16 @@ only on the user's request.
   POST /api/v2/scopes/{scope}/resources/{id}/{action}
   ```
 
-  They never wait for a client and are idempotent by resource ID: dismissing a
-  flow twice, or one that already completed, leaves the same state. A missing
-  resource gives `404`.
+  They never wait for a client and fall outside S5. The resource ID identifies the
+  resource, not one action on it, so each action states its own repeat semantics:
+
+  | Action | Repeated |
+  | --- | --- |
+  | dismiss | no further effect: a second dismissal, or one after completion, gives `404` and leaves the same state |
+  | resize | sets a size: repeating the same size leaves the same state |
+  | input | **not idempotent**: the bytes are written to the terminal's stdin each time, in the order the bridge receives them |
+
+  A missing resource gives `404`.
 
 ### 6.2 Request and response
 
@@ -376,6 +383,11 @@ POST /api/v2/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": 
   `stale` does not prove it was not admitted. The client must not resubmit that
   input with a new `expect` by itself. It keeps the input as a draft for the user
   to judge.
+- **Terminal input follows the same rule.** Input whose delivery is uncertain is
+  never resent automatically, since the bridge may already have written it. A
+  client sends terminal input in order and one request at a time per terminal.
+  Input the user types again is new input and is delivered normally. No sequence
+  numbers or deduplication are needed.
 - **Queued input may be submitted automatically.** A queued prompt or control
   change that was never sent, or that was refused with a definite answer, is
   submitted when the replica shows the operation ended, naming that operation.
@@ -533,6 +545,10 @@ consistency is checked after **every** event, not only once synchronization ends
 15. **Client obligations (§6.4).** After a write without a definite answer, the
     client does not resubmit it with a new `expect` when it later sees `stale`;
     never-sent and definitely refused queued input is resubmitted.
+16. **Terminal input (§6.1, §6.4).** Input that the bridge wrote but whose
+    response was lost is not resent by the client; the same text typed again by the
+    user is delivered as new input. Repeated dismissal and repeated resize to the
+    same size leave the same state.
 
 The bridge's handling of ACP failures and its internal clean-up belong to layer 1
 and are tested there. They add no duties to clients.
@@ -562,7 +578,7 @@ and are tested there. They add no duties to clients.
    [state-sync.md](state-sync.md) to match.
 2. **Bridge:** the document model, `canon` and the hash chain, alignment and the
    event stream, operations with admission and occupation, the catalog scope, hold
-   by need. Bridge tests first (acceptance 1–15), following
+   by need. Bridge tests first (acceptance 1–16), following
    [bridge-state-machine-tdd.md](bridge-state-machine-tdd.md).
 3. **Client:** the generic replica engine and the web projection on the new API.
    PR #34 is reworked onto it rather than landed: its replica engine and
