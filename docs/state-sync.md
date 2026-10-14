@@ -147,6 +147,15 @@ The Hub owns delivery only:
   session while the stream is open. Subscribing to an unheld session submits a
   `load` to admission (§2.5); the stream waits for it under occupation.
 
+- **Across connections.** The published documents and the Hub belong to the host
+  and outlive one Agent connection, so a stream stays open across it. While the
+  Agent initializes, a new subscription is aligned from the published cut and its
+  loads wait for readiness. One cancellable recovery task starts the next
+  connection after the previous one's final commit, when an open stream follows a
+  session scope that has not ended, or once after a successful terminal login. It
+  decides the need again when it starts and backs off while attempts never become
+  ready. A global or catalog stream alone, and a read, start no connection.
+
 No log is retained: a client that reconnects is aligned from the published
 documents.
 
@@ -273,7 +282,7 @@ product keeps working throughout. Each step is one PR, validated in CI.
 | 3 | `canon.rs`: message reduction, turns, normalization, prompt resolution, hash chain; `TurnLog` built from live commits and from replays | 1 |
 | 4a | DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`, driven by the session registry's transitions; the per-event convergence gate on the session registry | 2, 5, 13, 18 |
 | 4b | The commit step in the bridge actor, run when the bridge lock's mutable guard is released; the bridge's remaining transitions (global and catalog operations, login terminals, the Agent connection); the gate through the real coordinator and ACP transport | — |
-| 5 | `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}`: Hub cut, alignment, coalescing, `end`; hold by subscription and need, `load` on subscription, release of loadable sessions only | 3, 4, 12 |
+| 5 | `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}`: Hub cut, alignment, coalescing, `end`; hold by subscription and need, `load` on subscription, release of loadable sessions only; the publication shared across connections and their automatic recovery | 3, 4, 12 |
 | 6 | `POST /api/v2/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16, 17 (bridge) |
 | 7 | Web UI on v2: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection. PR #34, built on the earlier draft, is not landed; `shared/replica.ts` and `shared/protocol-validate.ts` are carried over where they fit | 3, 4, 9, 15, 16 (client) |
 | 8 | Remove v1: routes, business events, browser compensating state; Markdown export and attachment links on v2 | — |

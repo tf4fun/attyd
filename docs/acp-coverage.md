@@ -79,6 +79,21 @@ Goose serve is an optional example, never a conformance gate or required backend
 | URL elicitation | Supported | HTTP(S)-only browser handoff; unique flow IDs, consent, accepted-only `elicitation/complete`, and session-lifecycle abortion are distinct states |
 | `mcp/connect`, request/notification `mcp/message`, `mcp/disconnect` | Supported (experimental) | Client-declared ACP transport; bidirectional inner MCP JSON-RPC, opaque connection IDs, connect/request cancellation, error preservation, process/message/request lifecycle tracking, and UI activity inspector |
 
+## Protocol chain (current protocol)
+
+The chains of the [current protocol](protocol.md), added as their migration steps
+land ([plan §5](state-sync.md#5-migration)). Tests in `bridge::protocol_gate_tests::stream`
+run the coordinator over a real ACP transport; tests in `server::stream_tests` add
+real HTTP. Step 5:
+
+| ACP capability | Bridge authority | Document or route | Result | Fresh replica | Lifecycle end | Test |
+| --- | --- | --- | --- | --- | --- | --- |
+| `initialize` | connection task; host recovery | `global.live.agent` | `phase = ready`, or `error` | `GET /api/v2/stream?scope=global` aligns from the published cut, also while initialize is unanswered | final commit; the next connection only for a session stream or once after a login | `a_new_global_stream_aligns_while_initialize_is_unanswered`, `after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_restarts_nothing`, `an_initialization_failure_keeps_recovering_while_a_session_stream_needs_it`, `recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_leaves`, `a_session_ended_with_load_failed_is_no_recovery_need_behind_a_global_stream` |
+| `session/load` | stream serving; session view load | `session/<id>` `op` (`load`) | log from the completed replay | alignment from `have`; an unknown log omitted | `end: load_failed` | `a_cold_reopen_keeps_the_client_log_and_confirms_it_when_the_load_ends`, `two_subscriptions_share_one_load_and_each_gets_its_log_from_its_own_head`, `reads_return_one_cut_hold_nothing_and_tell_an_unknown_log_from_an_empty_one`, `each_session_uses_its_own_have_and_cwd_on_a_multi_scope_stream`, `a_cold_load_cut_by_an_eof_keeps_the_cache_and_converges_on_the_next_connection` |
+| `session/load` or `session/resume` on the next connection | waiting sessions seeded before the first commit | `session/<id>` `op` (`load`) | a load replaces the known log only when it completes; a resume keeps it | the same stream, or a new one while initialize is unanswered | `end: load_failed` when the Agent cannot load again | `a_session_stream_waits_through_an_agent_eof_and_converges_on_the_next_connection`, `a_session_stream_applies_a_diverging_replay_after_an_agent_eof`, `a_known_session_aligns_on_a_new_stream_while_the_next_initialize_is_unanswered`, `review_resume_only_session_waits_across_eof_and_preserves_its_known_log`, `a_session_the_agent_cannot_load_again_ends_with_load_failed_at_the_connection_end` |
+| `session/close` | release on need (S6) | the session leaves `global.sessions` | released only when loadable or resumable | `404` on read | — | `subscribers_hold_a_loadable_session_and_the_last_one_leaving_releases_it`, `a_session_the_agent_can_neither_load_nor_resume_stays_held`, `review_an_unfollowed_session_is_released_when_the_agent_connection_ends` |
+| Terminal authentication | auth terminal manager; host recovery | `global.live.op` (`terminal_login`) | one next connection | the same stream follows it | the authorization is consumed by that connection | `a_successful_terminal_login_starts_the_next_connection_for_a_global_only_stream`, `a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing` |
+
 ## Protocol chain (earlier v2 draft)
 
 Each capability row above also needs its protocol chain (the earlier coverage gate,
