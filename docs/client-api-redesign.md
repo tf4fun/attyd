@@ -1,0 +1,695 @@
+# Client API redesign
+
+Status: settled in review, 2026-10-14 (sixth version). §3 is the complete rule set;
+the later sections specify and derive from it. It replaces the earlier v2 draft of
+the client protocol and its replication rules, and is specified normatively in
+[protocol.md](protocol.md). The review that led here is recorded in
+[protocol-v2-review.md](protocol-v2-review.md) and in the comments of PR #35.
+
+## 1. Scope
+
+attyd is a mediator without a persistence layer. Authority runs one way:
+
+```text
+FE (browser and other clients)  <  bridge memory  <  ACP server
+```
+
+There are two layers of interaction:
+
+1. **bridge ↔ ACP server.** The bridge is an ordinary ACP client. It connects,
+   loads, prompts, cancels and closes as any ACP client does, and it handles ACP
+   failures itself. This layer is not specified here; ACP specifies it.
+2. **FE ↔ bridge.** Clients replicate the bridge's in-memory representation and ask
+   the bridge to change it. This document specifies this layer only.
+
+The goal of layer 2 is a small set of rules, in the manner of Raft, from which
+every behavior (normal operation, concurrency, reconnection, reopen) follows. A
+client that implements these rules can present the bridge's state in any form: the
+web UI is one presentation layer among possible others.
+
+## 2. Roles
+
+| Raft | attyd layer 2 |
+| --- | --- |
+| leader | the bridge's memory; there is exactly one, and no election |
+| follower | a client: a read-only replica that never votes and persists nothing |
+| log, entries identified by `(index, term)` | `log`: the final messages of completed turns, entries identified by `(index, hash)` of a hash chain |
+| uncommitted entries, which may be overwritten | `live`: everything else, replaced as a whole on alignment |
+| AppendEntries consistency check | every log change names the position it follows; the client checks it |
+| a follower truncates a conflicting suffix | a client truncates the suffix that differs and installs the bridge's |
+| clients send requests to the leader | clients send writes to the bridge, which handles them serially |
+| a new leader may hold a different log | a rebuilt bridge (reload, restart) may hold a different log; clients converge the same way |
+
+Unlike Raft there is no majority, no term and no persistence. The bridge's memory
+is the authority for clients; the ACP server is the authority behind it.
+
+## 3. Rules
+
+The rules come in two groups: S1–S7 bind the bridge and the shape of the
+documents, and C1–C3 bind clients. Every behavior in §4–§8 follows from them; §3.3
+lists the main derivations.
+
+### 3.1 Bridge rules
+
+**S1 Document.** Every scope is one document with two parts: `log`, an append-only
+sequence of entries, and `live`, one JSON value. Each log entry has a chain hash
+`h_i = H(h_{i-1} ‖ canon(entry_i))`, with `h_0` fixed. A session scope's log is
+its turn history; every other scope's log is always empty. A session's log is
+**known** once the bridge holds the session's history: from its creation, or once
+its first load completed. Until then it is unknown, which is not the same as
+empty.
+
+**S2 Commit.** Only a completed turn enters the log. Appending its entry, removing
+its process from `live` and moving its operation to a final status are one event.
+Every other change happens in `live` only.
+
+**S3 Alignment.** A client subscribes with the head of the log it holds,
+`(n, h_n)`; this head is the subscription's **baseline**. The bridge takes one cut
+of the scope and sends it as one event: the whole of `live` and, once the scope's
+log is known, its log from the baseline if it has hash `h_n` at index `n`,
+otherwise from `0`. While the log is unknown, the client keeps its own log,
+unconfirmed. Taking the cut and continuing with the changes after it is one serial
+step of the bridge. The baseline advances only with the log changes handed to the
+subscriber's output stream; every log change is computed from it and names the
+position `(index, hash)` it follows. A client that cannot apply a log change
+closes the stream and subscribes again with the head it holds.
+
+**S4 Operation.** All bridge work that may wait for a client is an operation of a
+scope. Every scope's `live` holds exactly one operation, `op = { id, kind,
+status, … }`. The bridge generates `id` at random and never reuses it. An
+operation's ID identifies it and is what writes are admitted against; it says
+nothing about what a replica has seen.
+
+**S5 Admission.** Every operation write names `expect`, an operation ID, and the
+bridge handles writes and loads one at a time:
+
+- a write that **starts an operation** is admitted when `expect` equals `op.id`,
+  `op` has ended, and every other scope the operation acts on is free (below); the
+  new operation replaces `op` in the same step;
+- a write that **acts on the running operation** (cancel, answer) is admitted when
+  `expect` equals `op.id`, `op` is running and its kind accepts the write; an
+  answer must also cover exactly the operation's pending interactions.
+
+An admitted operation **occupies** every scope it acts on until it actually ends, a
+requested cancel included: it is the
+`op` of each such scope the bridge holds, and it holds back the load of each such
+scope the bridge does not hold. A scope is free when its `op` has ended and no
+operation occupies it. Anything else is refused.
+
+**S6 Holding.** The bridge holds a session while it is needed: a client subscribes
+to it, an operation occupies it, or a terminal or URL flow of it is alive. It may
+release a session that is not needed only if the Agent can load it again; a
+session it cannot load again stays held until it is deleted or the Agent
+connection ends. Subscribing to a session the bridge does not hold makes the bridge
+hold it, which starts a `load` operation. A one-off read holds nothing.
+
+**S7 Resources.** Terminals and URL flows are resources. They live in their
+scope's `live` by their own lifecycle; every scope has `urlFlows`. An operation's
+end clears its pending interactions but ends no resource it created. A URL flow is
+removed when the Agent completes it, a client dismisses it, or its scope or the
+Agent connection ends. A terminal is removed when the Agent releases it (a terminal
+login when it has exited and a client dismisses it), or its scope or the Agent
+connection ends. Resource actions (input, resize, dismiss) address a resource
+by its ID, take no `expect` and fall outside S5. Each states its repeat semantics:
+dismiss has no further effect, resize to the same size leaves the same state, and
+input is not idempotent: it is written in order, every time.
+
+### 3.2 Client rules
+
+**C1 Projection.** A client's presentation is a pure function of `log`, `live` and
+its own UI state (drafts, queued input, disclosure, scroll position). UI state
+never enters the protocol, and the client holds no authoritative state.
+
+**C2 Refusal.** A refused write leaves its input in the client, for the user to
+submit again once the replica is in sync. Queued input that was never sent, or that
+was refused with a definite answer, may be submitted automatically once the
+replica shows the operation ended, naming that operation.
+
+**C3 Uncertainty.** A write or terminal input that was sent without a definite
+answer may have taken effect; a later `stale` proves nothing. The client never
+resends it automatically, with a new `expect` or otherwise. It keeps the input for
+the user to judge.
+
+### 3.3 Derivations
+
+| Behavior | From |
+| --- | --- |
+| Open, reconnect, a slow subscriber, a replaced stream, a bridge restart and a reopen are all one alignment | S3 |
+| After a reopen, a matching history is kept; a diverged one is truncated and the bridge's installed | S1, S3 |
+| No event shows a committed entry beside its own process | S2, S3 |
+| Once a write that starts an operation is admitted, a competing write or a resend that still names the old `expect` gets `stale`, a fork resend included | S4, S5 |
+| Delete never races a prompt on the same session, nor a load triggered by subscription | S5 |
+| A result is the final `op`; no request records, intent tables or result ledgers | S4 |
+| Interactions of every operation, reads included, are answered the same way | S4, S5 |
+| A session released before its first subscription is loaded again; one that cannot be loaded is never released | S6 |
+| An accepted URL flow survives its operation and a client reload, and stops holding its session once removed | S6, S7 |
+| A lost response never turns into a duplicate prompt, fork or terminal input through an automatic resend; a submission the user makes again is new input | S5, C3 |
+
+## 4. Documents
+
+### 4.1 Log entries
+
+A log entry is one completed turn:
+
+```ts
+interface Turn {
+  prompt: Block[];          // the user's message, normalized
+  reply: Block[];           // the Agent's message content, in order, normalized
+}
+
+type Block =               // normalized content: protocol §3.1
+  | TextContent | ResourceLink         // ACP, verbatim
+  | AttachmentRef;                     // the bridge's reference to an image, audio or resource block
+}
+```
+
+`canon(turn)` defines its identity in three steps.
+
+1. **Messages.** Chunks are reduced to logical messages before anything else.
+   Chunks of the same kind (`user_message_chunk` or `agent_message_chunk`) belong to
+   one message when they carry the same `messageId`. Without `messageId`, they
+   belong to one message when they are consecutive, with only process updates
+   (thoughts, tool calls, plans) between them.
+2. **Turns.** A user message starts a turn. The Agent messages up to the next user
+   message are its reply, concatenated in order. Process updates are not part of
+   the entry.
+3. **Content.** `prompt` and `reply` are normalized by the same rules:
+   - adjacent text blocks are merged;
+   - image, audio and resource blocks are replaced by an attachment reference
+     `{ type: "attachment", id, … }`, where `id` is the SHA-256 of the canonical
+     block. This is the bridge's own type, not an ACP `ContentBlock`; a prompt
+     may use it, and the bridge resolves it before calling the Agent;
+   - `_meta` fields are dropped;
+   - the result is serialized as canonical JSON (RFC 8785).
+
+`h_0` is 32 zero bytes and `H` is SHA-256. On the wire a hash is the base64url form
+of its first 16 bytes.
+
+The same messages give the same entry, however they were chunked, and the same
+history gives the same chain, however often the session was opened. A live turn
+and a replayed one go through the same reduction: the live prompt is the
+operation's input, and its reply is the turn's Agent messages.
+
+A turn enters the log when the Agent answered its prompt, with any stop reason,
+`cancelled` included. A turn whose prompt failed with an error does not; its
+prompt and error stay on its operation (§4.4).
+
+Identity serves synchronization only. Admission never compares hashes (S5). Where
+the Agent's replay lacks information the live turn had (two prompts without a reply
+in between, for example), the entries differ and alignment replaces the client's
+log. That costs a redrawn history, never a wrong write.
+
+### 4.2 Live state
+
+```ts
+interface ScopeLive {            // what every scope's live has
+  op: Operation;
+  urlFlows: Record<string, UrlFlow>;     // accepted URL elicitations, by interaction
+}
+
+interface SessionLive extends ScopeLive {
+  cwd: string;
+  controls: Controls;            // modes, configOptions, commands, info, usage (reduced)
+  terminals: Record<string, Terminal>;   // terminals the Agent has not released
+}
+
+interface GlobalLive extends ScopeLive {
+  agent: AgentState;             // connection phase, launch, initialize, authentication
+  sessions: Record<string, SessionSummary>;  // sessions the bridge holds
+  terminals: Record<string, LoginTerminal>;  // terminal logins, each with its methodId
+}
+
+interface CatalogLive extends ScopeLive {
+  revision: string;              // changes when the Agent's session list may have changed
+}
+```
+
+- `live` contains only what the bridge holds now. Nothing is retained for clients
+  that come later.
+- **Every scope has `op` and `urlFlows`.** Any scope with operations can receive
+  interactions, so any scope can hold URL flows. A new scope gets both without
+  special handling.
+
+### 4.3 Resources
+
+This section specifies S7. Terminals and URL flows are **resources**: they live in
+their scope's `live` by their own lifecycle, not by the lifecycle of the operation
+that created them.
+
+- **An operation's end** clears its pending interactions. It does not end the
+  resources it created.
+- **A URL flow** starts when a client accepts a URL elicitation: the interaction
+  leaves the pending set and the flow enters `urlFlows`. Accepting only consents;
+  the external flow starts then. The flow is removed when one of these happens:
+  - the Agent sends its completion notification;
+  - a client dismisses it (§6.1), because ACP makes the completion notification
+    optional and the user must be able to give up waiting;
+  - its scope ends, or the Agent connection that started it ends.
+
+  No completion record is kept.
+- **A terminal** is removed when the Agent releases it, or when its scope or the
+  Agent connection ends. A terminal login is removed when it exits and a client
+  dismisses it.
+- **Holding.** A live resource keeps its session needed (S6). When the last
+  resource of an unsubscribed, unoccupied session is removed, the session may be
+  released.
+
+### 4.4 Operations
+
+```ts
+interface Operation {
+  id: string;
+  kind: string;                  // see §6.1
+  status: "running" | "completed" | "failed" | "cancelled";
+  input: unknown;                // the write's arguments: the prompt, the mode, …
+  cancelRequested: boolean;
+  interactions: Record<string, Interaction>;   // pending permissions and elicitations
+  process?: SessionUpdate[];     // a running turn: its updates, folded
+  result?: unknown;              // completed: the stop reason, a new session ID, …
+  error?: ProtocolError;         // failed
+}
+```
+
+- An operation's result is its final `op`, visible until the next operation
+  replaces it. A failed turn keeps its prompt and error there; a refused mode
+  change keeps the ACP error.
+- Any operation may wait for the user: waiting is a non-empty `interactions`, not a
+  separate state.
+- A session the bridge has just held starts with a `load` operation. A session
+  created by `create` or `fork` starts with a completed `open`.
+- **Agent requests.** An Agent request joins the running operation of its scope:
+  the scope's own, or the operation that occupies it (a delete's `session/close`
+  may ask for input in the session it occupies). If no operation runs, it starts
+  an `agent_request` operation in that scope, which holds the request's
+  interactions. An occupied held scope always shows its occupying operation, so
+  there is no other case.
+
+## 5. Replication
+
+### 5.1 Stream
+
+```text
+GET /api/v2/stream?scope=global&scope=session/S&have=session/S:12:<hash>
+```
+
+`have` gives a scope's log head; without it the head is `(0, h_0)`. The stream
+carries three kinds of event, in order per stream:
+
+```ts
+type Event =
+  | { scope: string; log: { from: number; prev: string; entries: Array<{ turn: Turn; hash: string }> };
+      live?: LiveChange }
+  | { scope: string; live: LiveChange }
+  | { scope: string; end: { reason: "deleted" | "load_failed"; error?: ProtocolError } };
+
+type LiveChange = { replace: unknown } | { patch: JsonPatchOperation[] };
+```
+
+A client applies a `log` event by checking that its hash at index `from` is
+`prev`, truncating its log to `from` entries, appending `entries`, and applying the
+event's `live` change. One event kind serves:
+
+- **alignment (S3):** `from` is the matched index and `live` is `{ replace }`; while
+  the session's log is unknown, the alignment carries `live` only;
+- **commit (S2):** `from` is the client's length and `live` is the patch that ends
+  the turn;
+- **a first load's end:** the log, from the baseline, with the patch that ends the
+  load.
+
+After every event the client's `live` is a `live` the bridge held at some moment,
+and its log is the bridge's log at that moment, or, while that log is unknown, the
+client's own. No event leaves a committed entry beside its own process.
+
+### 5.2 Synchronization
+
+Every synchronization is one alignment event (S3). In particular:
+
+- **Open and reconnect** are the same: subscribe with the log head the client
+  holds, if any. A client always subscribes with the head it holds at that
+  moment, never by retrying an earlier URL whose `have` may be out of date.
+- **A cold reopen** keeps the client's log while the session loads: the client
+  shows its own log as unconfirmed, and the load's interactions are shown and
+  answered as usual. When the load ends, a matching history is confirmed with its
+  suffix; a different one replaces the client's.
+- **A broken stream** is not resumed. The client subscribes again with its head.
+  It keeps every entry the bridge still has and replaces `live`.
+- **A diverged log** (after a reopen whose replay differs, or a bridge restart)
+  fails the head match. The bridge sends its whole log, and the client replaces
+  its own. If the bridge's log is shorter, the same happens.
+- **A slow subscriber** is treated as if it had subscribed again: the bridge drops
+  its queued events for the scope. For a scope that still exists, it queues one
+  alignment from the subscription's baseline: the last log position handed to the
+  output stream, never one that was only queued. For a scope that ended, it keeps
+  the `end` event and sends nothing after it.
+- **Changing the set of scopes** opens a new stream. A client ignores events from
+  a stream it replaced.
+
+UI state survives every synchronization: a draft or a queued prompt does not
+depend on the log it was written against.
+
+### 5.3 End
+
+A scope ends when its session was deleted, or when its load failed. The event
+gives the reason and, for `load_failed`, the error. The client drops the document.
+Subscribing again after `load_failed` tries the load again; the client does this
+only on the user's request.
+
+## 6. Writes
+
+### 6.1 Operations by scope
+
+| Scope | Starts an operation | Acts on the running operation |
+| --- | --- | --- |
+| `session/<id>` | `prompt { prompt }`, `set_mode { modeId }`, `set_config { configId, value }`, `fork { cwd }` | `cancel`, `answer { answers }` |
+| `global` | `create { cwd }`, `delete { sessionId }`, `authenticate { methodId }`, `logout`, `terminal_login { methodId }` | `cancel`, `answer { answers }` |
+| `catalog` | `list { cursor }` | `cancel`, `answer { answers }` |
+
+- **No open command.** Subscribing holds the session (S6).
+- **No close command.** A session that is not needed is released (S6).
+- **Delete** is a global operation, so it works for sessions the bridge does not
+  hold. It occupies `global` and `session/<id>` (S5):
+  - while the session is held, the delete is its `op`, so a prompt naming the
+    previous operation gets `stale`;
+  - while the session is not held, a subscription to it waits; it receives
+    `end: deleted` if the delete succeeds, and its `load` starts if the delete
+    fails.
+
+  The bridge closes a held session, deletes it on the Agent and ends the scope with
+  `deleted`. Its result or error is on `global.op`.
+- **The catalog** is its own scope, so that listing does not contend with global
+  writes. `list` runs the Agent's `session/list`. An elicitation the Agent sends
+  during it is an interaction of the `list` operation, answered like any other.
+- **Resource actions are not operations.** Terminal input, resize, and dismissing
+  a URL flow or an exited terminal login address a resource by its ID and take no
+  `expect`:
+
+  ```text
+  POST /api/v2/scopes/{scope}/resources/{id}/{action}
+  ```
+
+  They never wait for a client and fall outside S5 (S7). The resource ID identifies the
+  resource, not one action on it, so each action states its own repeat semantics:
+
+  | Action | Repeated |
+  | --- | --- |
+  | dismiss | no further effect: a second dismissal, or one after completion, gives `404` and leaves the same state |
+  | resize | sets a size: repeating the same size leaves the same state |
+  | input | **not idempotent**: the bytes are written to the terminal's stdin each time, in the order the bridge receives them |
+
+  A missing resource gives `404`.
+
+### 6.2 Request and response
+
+```text
+POST /api/v2/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": { … } }
+```
+
+- **Admitted:** `{ op: "<id>" }`. This is the new operation's ID, or the running
+  operation's ID for cancel and answer. A success means the write was admitted;
+  nothing more.
+- **Operations whose result the initiator consumes** (`create`, `fork`, `list`)
+  answer when they end, with `{ op, result }` or `{ op, error }`. The result is also
+  on the scope's `op` until the next operation replaces it. If that response is
+  lost, the initiator loses the result: a created session is still listed in
+  `global.sessions` while held and in the catalog, and a page can be listed again.
+- **Refused:** `{ error: { code, message } }`. The codes are:
+
+  | Code | Meaning |
+  | --- | --- |
+  | `stale` | `expect` is not the current `op.id` |
+  | `not_allowed` | the operation is running and the write starts one, or the operation has ended and the write acts on it, or another scope the operation acts on is not free, or an answer does not cover exactly the pending interactions |
+  | `invalid_request` | the request is malformed |
+  | `unsupported` | the Agent did not advertise the capability |
+  | `unavailable` | the Agent is not connected |
+
+- **What the replica shows.** The replica shows the bridge's current state, which
+  may lag behind or already be past a write. The protocol makes no promise that a
+  replica observes the effect of a particular write. An admitted answer may still
+  show its interactions until the stream catches up; a completed operation may
+  already have been replaced by the next one.
+
+### 6.3 Consequences of S5
+
+- **Concurrency.** Two clients that start an operation naming the same `expect`
+  race; the bridge admits one, and the other gets `stale`.
+- **Lost responses.** For a write that starts an operation: if the first send was
+  admitted, a resend still names the operation it replaced and gets `stale`; if it
+  was not, the resend may be the first one admitted. For writes that act on the
+  running operation, `op.id` does not change: a resent cancel succeeds again
+  without further effect, and a resent answer no longer covers the pending set and
+  gets `not_allowed`.
+- **No ABA.** A fork returns the source to the same history and to an ended
+  operation, but with a new `op.id`.
+- **Group answers.** An interaction that arrives or is cancelled while the user
+  composes changes the pending set, and the answer is refused. ACP requests do not
+  change after they arrive, so the IDs are enough to compare.
+- **Operations across scopes.** An operation that acts on several scopes occupies
+  all of them, so no conflicting write and no load can run on any of them meanwhile.
+- **No intent tables.** No idempotency key, intent table, tombstone or retention of
+  results is needed.
+
+### 6.4 Client obligations
+
+This section applies C2 and C3 to writes.
+
+- **Refused input stays in the client.** The prompt, answers or control change
+  remain, for the user to submit again once the replica is in sync.
+- **An uncertain write is never resent automatically.** If a write was sent and no
+  definite answer came back (the connection broke, the request timed out), a later
+  `stale` does not prove it was not admitted. The client must not resubmit that
+  input with a new `expect` by itself. It keeps the input as a draft for the user
+  to judge.
+- **Terminal input follows the same rule.** Input whose delivery is uncertain is
+  never resent automatically, since the bridge may already have written it. A
+  client sends terminal input in order and one request at a time per terminal.
+  Input the user types again is new input and is delivered normally. No sequence
+  numbers or deduplication are needed.
+- **Queued input may be submitted automatically.** A queued prompt or control
+  change that was never sent, or that was refused with a definite answer, is
+  submitted when the replica shows the operation ended, naming that operation.
+
+## 7. Holding
+
+- **Needed sessions are held.** A session is needed while a client subscribes to
+  it, an operation occupies it, or one of its terminals or URL flows is alive (S6).
+- **Release only what can be loaded again.** The bridge releases a session that is
+  not needed, as an ordinary ACP client would close it, only if the Agent
+  advertises `session/load` or `session/resume`. How long it waits first affects
+  performance only. Without either capability the session stays held until it is
+  deleted or the Agent connection ends.
+- **No hand-over race.** A session released between `create` or `fork` and the
+  client's subscription can be loaded again, so that subscription loads it, and
+  alignment (S3) continues its log. A session that cannot be loaded again was never
+  released.
+- **Reopen continues.** A release and a later hold, an ACP reconnect, and a bridge
+  restart all end in a `load` operation and a new alignment. If the replay gives
+  the same messages, the client keeps its log.
+- **Agent unavailable.** While the Agent is disconnected, a subscribed session's
+  operation is a running `load` waiting for the connection; `global.agent` shows
+  why. A session the Agent cannot load again ends with `load_failed` once the
+  connection that held it ends.
+- **Only subscriptions hold.** A one-off read of a scope (§8) does not make the
+  bridge hold anything. A client that wants a session held subscribes to it.
+
+## 8. Reads
+
+| Read | Notes |
+| --- | --- |
+| `GET /api/v2/scopes/{scope}` | the document of a held scope once, as one cut; `404` when not held; holds nothing |
+| `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | content-addressed; served while the session's `log` or `live` references the ID, else `404` |
+| `GET /api/v2/sessions/{id}/files?query=`, `…/files/content?path=` | workspace context |
+
+Reads that may wait for a client are operations instead: the catalog is listed by
+the `list` operation (§6.1).
+
+**Markdown export** is assembled by the client from the log and the attachment
+read. There is no process to fetch and no export endpoint.
+
+## 9. Extending
+
+- **A new presentation layer** (a CLI, an IDE extension, a mobile client)
+  implements the generic replica engine (alignment, log truncation and append,
+  `prev` checks, `live` replace and patch, subscribing again) and its own view
+  function.
+- **A new operation** is a new `kind` with its arguments, the scopes it occupies
+  and its result. Admission, responses and replication do not change.
+- **New state** is a new field of `live`. The engine does not change.
+
+## 10. What changes
+
+### 10.1 Removed
+
+- Session incarnations, owner-qualified scopes, `If-Match` owner tags,
+  `end: replaced`, retired-incarnation tables, first-subscription leases.
+- Epochs, `agent.predecessor`, log positions (`seq`, `Position`, `at`), the
+  retained log, `Last-Event-ID` resume, per-scope `prev` positions, `reset` and
+  snapshot fetch, the received, checkpoint and applied positions, read-your-writes.
+- `Idempotency-Key`, the intent table, tombstones, `resultExpired`, intent errors.
+- `global.requests` and `agent_request` records, their retention and
+  `DELETE /api/v2/requests/{id}`; turn outcomes and their retention; URL flow
+  completion records.
+- The compact history's process pages: `historyRevision`, `collapsedTurns`,
+  `visibleRanges`, `GET …/process`. A completed turn's process is gone (S2).
+- Open and close commands, the per-command endpoints, and `GET /api/v2/catalog`.
+- In the client: owner handling, intent recovery, request-record waits, the watched
+  process cache (`ObservedProcesses`), process-page export, and the v1
+  compensating state.
+
+### 10.2 Kept
+
+- JSON Pointer patches for `live`; the generic replica engine's patcher and
+  validation.
+- Control reduction (protocol §3.3), terminals, URL flows keyed by interaction,
+  content-addressed attachments.
+
+### 10.3 Added
+
+- The hash-chained log and `canon`, with message reduction.
+- Atomic alignment by log head, and one `log` event for alignment and commit.
+- The operation slot, `expect`, occupation across scopes, and one write endpoint.
+- The `catalog` scope and `agent_request` operations.
+- `urlFlows` on every scope; resource lifecycles independent of operations;
+  resource actions, including dismissing a URL flow.
+- Hold by subscription and need, release only of loadable sessions; delete as a
+  global operation.
+
+## 11. Acceptance
+
+Each rule gets tests at the bridge first and then in the client engine. Document
+consistency is checked after **every** event, not only once synchronization ends.
+
+1. **Identity (S1, §4.1).** The same messages give the same entry and hash when:
+   - streamed in different chunks;
+   - a user message has several content blocks (text and an image), live or
+     replayed as several chunks;
+   - committed live or replayed by `load`.
+
+   Normalized content with attachment references and prompts that reference
+   attachments pass the generated types and validation, and the bridge resolves
+   references before it calls the Agent.
+2. **Commit (S2).** A completed turn appends its entry, removes its process and
+   ends its operation in one event. A failed turn appends nothing and keeps its
+   prompt and error on `op`.
+3. **Alignment (S3).**
+   - A client with a matching head receives only the suffix.
+   - A client with a diverged or longer log receives the whole log and replaces
+     its own.
+   - After a reopen with the same replay, the client keeps its log.
+   - Alignment while a turn commits never yields a committed entry beside its own
+     process, for a new subscription, a reconnect and a slow subscriber alike.
+   - A cold reopen with the same history never clears the client's log first, and
+     interactions during the load can be answered. A disconnect before the load,
+     during it, and after it but before its log was delivered all converge on
+     reconnect. A history that did change is replaced by hash.
+4. **Synchronization (§5.2).** A broken stream, a slow subscriber and a replaced
+   stream all end with the client equal to the bridge. Events of a replaced stream
+   change nothing. With the client's consumption paused, a log change queued but
+   not sent and then coalesced leads, once consumption resumes, to an alignment the
+   client applies directly, without subscribing again.
+5. **Live changes (S1, S4).** Interactions and controls change while the log hash
+   stays the same, and the replica follows.
+6. **Admission (S5).** For each operation kind:
+   - once a write that starts an operation is admitted, a concurrent second write
+     and a resend with the same `expect` get `stale`; a resend of a write that was
+     not admitted may be admitted;
+   - a fork resend does not fork twice;
+   - a resent answer gets `not_allowed`;
+   - a resent cancel succeeds without further effect;
+   - a cancel of a kind that does not accept it gets `not_allowed`, and a requested
+     cancel keeps the operation's scopes occupied until it actually ends.
+7. **Group answers (S5).** An answer is refused after an interaction arrives or is
+   cancelled.
+8. **Interactions everywhere (§4.4).** Interactions of `load`, `fork`, `create`,
+   `set_config`, `list` and `agent_request` are shown, answered through the same
+   path as a turn's, and cleared when their operation ends. Interactions of a
+   delete's `session/close` join the delete and can be answered. A URL flow accepted in
+   an `agent_request` stays visible after that operation ends and after the next
+   operation replaces `op`.
+9. **Responses (§6.2).**
+   - An answer's HTTP success arriving before the stream shows the change, and an
+     operation B replaced by C before a slow subscriber sees B, both leave the
+     replica correct and the client waiting on nothing.
+   - `create` and `fork` deliver the new session ID in their response even when
+     `op` was already replaced.
+10. **Occupation (S5, §6.1).**
+    - A prompt on a held session racing its delete is refused.
+    - A subscription to an unheld session during its delete gets `end: deleted`,
+      or its load after a failed delete.
+11. **URL flows (S7).**
+    - A URL flow of `global` (authenticate), of `catalog` (`list`) and of a
+      session survives a reload of the client between accept and completion.
+    - It is removed on the Agent's completion, on a client's dismissal (also when
+      dismissed twice), and when its scope or the Agent connection ends.
+12. **Holding (S6, §7).**
+    - A session released before its first subscription is loaded by that
+      subscription and continues its log.
+    - A session created on an Agent without `session/load` and `session/resume` is
+      never released while the connection lasts, and a late first subscription
+      finds it.
+    - A one-off read holds nothing.
+    - A session kept only by a URL flow or terminal is released (if it can be
+      loaded again) once that resource is removed, and is not released before.
+13. **Attachments (§8).** Attachments are readable while referenced by `log` or
+    `live`, and stop being readable once only a released process referenced them.
+14. **Delete (§6.1).** Delete of a held session ends its scope with `deleted`; a
+    failed delete leaves its error on `global.op`.
+15. **Client obligations (C2, C3).** After a write without a definite answer, the
+    client does not resubmit it with a new `expect` when it later sees `stale`;
+    never-sent and definitely refused queued input is resubmitted.
+16. **Terminal input (S7, C3).** Input that the bridge wrote but whose
+    response was lost is not resent by the client; the same text typed again by the
+    user is delivered as new input. Repeated dismissal and repeated resize to the
+    same size leave the same state.
+17. **Terminal logins (S7).** A login with method A fails and is not dismissed; a
+    login with method B starts. A fresh replica shows both terminals with their
+    own method.
+18. **Controls (§4.2).** A successful `set_mode` or `set_config` whose response
+    comes without a notification shows the new mode or the confirmed config
+    options when its operation ends; a failed one changes nothing.
+
+The bridge's handling of ACP failures and its internal clean-up belong to layer 1
+and are tested there. They add no duties to clients.
+
+## 12. Defaults open to review
+
+1. `canon` takes the Agent's message content only. Tool call titles or results are
+   not part of the entry (§4.1).
+2. A turn whose prompt failed does not enter the log; after a reopen, the replay
+   decides (§4.1).
+3. Alignment negotiates the log head only and otherwise sends the whole log. The
+   log holds final messages only, so this is cheap. Several sample points per
+   subscription (`n`, `n-1`, `n-2`, `n-4`, …) are a compatible extension.
+4. Global operations (create, delete, authentication) are serialized through one
+   `global.op`. An interaction during a create blocks other global writes until it
+   is answered. Catalog listing is a separate scope and is not blocked by them.
+5. A completed turn's process disappears from every client, including the one that
+   watched it run.
+6. `create`, `fork` and `list` deliver their result in the HTTP response; a lost
+   response loses it for that client (§6.2).
+7. Sessions the Agent cannot load again are never released while the connection
+   lasts (§7).
+
+## 13. Migration
+
+The protocol is specified in [protocol.md](protocol.md) and the bridge work in
+[state-sync.md](state-sync.md). The earlier v2 draft was never completed, has no
+client on `main`, and is over-designed for this model, so it is removed rather than
+kept beside the new one; the new protocol takes its place under `/api/v2`. In
+outline:
+
+1. **Settle this proposal** and write the protocol and its implementation plan
+   (docs only).
+2. **Remove the earlier v2 draft** from the bridge: its routes, records, intents,
+   retained log, owner tags and their tests. The web UI keeps running on `/api/v1`.
+3. **Bridge:** `canon` and the hash chain; documents, operations with admission and
+   occupation, and the commit step; the stream with alignment and hold by need;
+   the operation endpoint, the catalog scope and resource actions. Bridge tests
+   first (acceptance 1–16), following
+   [bridge-state-machine-tdd.md](bridge-state-machine-tdd.md).
+4. **Client:** the generic replica engine and the web projection on the new v2.
+   PR #34, built on the earlier draft, is not landed; the parts that fit (the
+   replica engine and validation) are carried over.
+5. **Remove v1**, including the remaining v1 reads (attachment links, Markdown
+   export).
+6. **Layer 1 clean-up**, separately: remove incarnation-based isolation from the
+   bridge internals, now that no client-visible behavior depends on it.

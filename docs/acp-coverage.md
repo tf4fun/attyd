@@ -79,10 +79,14 @@ Goose serve is an optional example, never a conformance gate or required backend
 | URL elicitation | Supported | HTTP(S)-only browser handoff; unique flow IDs, consent, accepted-only `elicitation/complete`, and session-lifecycle abortion are distinct states |
 | `mcp/connect`, request/notification `mcp/message`, `mcp/disconnect` | Supported (experimental) | Client-declared ACP transport; bidirectional inner MCP JSON-RPC, opaque connection IDs, connect/request cancellation, error preservation, process/message/request lifecycle tracking, and UI activity inspector |
 
-## Protocol v2 chain
+## Protocol chain (earlier v2 draft)
 
-Each capability row above also needs its [protocol v2](protocol.md) chain
-([plan §4.2](state-sync.md#42-acp-semantic-coverage-gate-s8)):
+Each capability row above also needs its protocol chain (the earlier coverage gate,
+[plan at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/state-sync.md#42-acp-semantic-coverage-gate-s8)).
+The chains below describe the earlier v2 draft, and their "protocol §" references
+are to [that draft at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md).
+The draft is being removed; the [current protocol](protocol.md) replaces these
+chains with its own as its steps land ([plan §4.2](state-sync.md#42-acceptance)):
 
 ```text
 ACP capability → bridge authority → public projection / command → finished result
