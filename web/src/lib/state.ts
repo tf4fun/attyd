@@ -34,6 +34,7 @@ import type {
   SessionSyncPhase,
 } from "../../../shared/business-api";
 import { sameSessionOwner } from "../../../shared/business-api";
+import type { GlobalState, Request, SessionSummary } from "../../../shared/protocol";
 import type { SessionControlKind } from "./session-deltas";
 import { randomId } from "./id";
 import { timelineTurnStarts } from "./timeline-turns";
@@ -123,6 +124,10 @@ export interface PendingElicitation {
 }
 
 export interface ExternalElicitationFlow {
+  /** v2: the accepted elicitation that identifies this flow. */
+  interactionId?: string;
+  /** v2: the parent request of a request-scoped flow. */
+  requestId?: string;
   elicitationId: string;
   sessionId?: string;
   url?: string;
@@ -283,6 +288,11 @@ export interface AppState {
   permissions: PendingPermission[];
   elicitations: PendingElicitation[];
   externalFlows: ExternalElicitationFlow[];
+  /** v2 `global.sessions`: the sessions the bridge holds. */
+  globalSessions: Record<string, SessionSummary>;
+  /** v2 request-scoped elicitations and URL flows from `global`. */
+  globalElicitations: PendingElicitation[];
+  globalFlows: ExternalElicitationFlow[];
   backgroundEvents: unknown[];
   running: boolean;
   sessionSyncPhase?: SessionSyncPhase;
@@ -357,7 +367,15 @@ export type AppAction =
       kind: PendingSessionControl["kind"];
     }
   | { type: "session/reset" }
-  | { type: "session/deselect" };
+  | { type: "session/deselect" }
+  | { type: "v2/global"; global: GlobalState; previous?: GlobalState }
+  | {
+      type: "v2/session_live";
+      view: BridgeSessionView;
+      previous: BridgeSessionView;
+      /** Raw updates of the running turn since `previous`. */
+      turnUpdates: SessionUpdate[];
+    };
 
 export const initialState: AppState = {
   phase: "starting",
@@ -380,6 +398,9 @@ export const initialState: AppState = {
   permissions: [],
   elicitations: [],
   externalFlows: [],
+  globalSessions: {},
+  globalElicitations: [],
+  globalFlows: [],
   backgroundEvents: [],
   running: false,
 };
@@ -550,9 +571,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case "elicitation/dismiss_flow":
       return {
         ...state,
-        externalFlows: state.externalFlows.filter(
-          ({ elicitationId }) => elicitationId !== action.elicitationId,
-        ),
+        externalFlows: state.externalFlows.filter((flow) => flowKey(flow) !== action.elicitationId),
+        globalFlows: state.globalFlows.filter((flow) => flowKey(flow) !== action.elicitationId),
       };
     case "session/transition_start":
       if (
@@ -629,7 +649,192 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return { ...resetActiveSession(state), sessionView: undefined };
     case "session/deselect":
       return { ...resetActiveSession(cacheCurrentSession(state)), sessionView: undefined };
+    case "v2/global":
+      return applyGlobalDocument(state, action.global, action.previous);
+    case "v2/session_live":
+      return applySessionLive(state, action.view, action.previous, action.turnUpdates);
   }
+}
+
+/** Project the v2 `global` document, given the one it replaces. */
+function applyGlobalDocument(state: AppState, global: GlobalState, previous: GlobalState | undefined): AppState {
+  const { agent } = global;
+  let next = state;
+  if (previous == null || previous.agent.launch !== agent.launch) {
+    next = applyHello(next, { type: "bridge/hello", ...agent.launch });
+  }
+  if (agent.initialize != null && previous?.agent.initialize !== agent.initialize) {
+    next = applyInitialized(next, agent.initialize);
+  }
+  if (agent.error != null && previous?.agent.error !== agent.error) {
+    next = applyBridgeError(next, bridgeError(agent.error));
+  }
+  if (previous == null || previous.agent.phase !== agent.phase) {
+    next = applyConnectionPhase(next, agent.phase);
+  }
+  for (const request of Object.values(global.requests)) {
+    next = applyAuthRequest(next, request, previous?.requests[request.requestId]);
+  }
+  const globalElicitations = Object.values(global.interactions).flatMap((interaction): PendingElicitation[] => {
+    if (interaction.kind !== "elicitation") return [];
+    const current = next.globalElicitations.find(({ elicitationId }) => elicitationId === interaction.interactionId);
+    return [current != null && current.request === interaction.request
+      ? current
+      : { ...current, elicitationId: interaction.interactionId, request: interaction.request }];
+  });
+  const globalFlows = Object.values(global.urlFlows).map((flow): ExternalElicitationFlow => ({
+    interactionId: flow.interactionId,
+    requestId: flow.requestId,
+    elicitationId: flow.elicitationId,
+    url: flowUrl(flow.request),
+    message: flow.request.message,
+    status: flow.status,
+  }));
+  return { ...next, globalSessions: global.sessions, globalElicitations, globalFlows };
+}
+
+/** A URL flow's identity: its interaction in v2, else its elicitation. */
+export function flowKey(flow: ExternalElicitationFlow): string {
+  return flow.interactionId ?? flow.elicitationId;
+}
+
+function flowUrl(request: CreateElicitationRequest): string | undefined {
+  return request.mode === "url" && "url" in request && typeof request.url === "string" ? request.url : undefined;
+}
+
+function bridgeError(error: GlobalState["agent"]["error"] & object): BridgeError {
+  const data = error.data;
+  if (error.code === "agent_error" && data != null && typeof data === "object" && !Array.isArray(data)) {
+    const acp = data as { code?: unknown; message?: unknown; data?: unknown };
+    return {
+      message: typeof acp.message === "string" ? acp.message : error.message,
+      ...(typeof acp.code === "number" ? { code: acp.code } : {}),
+      ...(acp.data === undefined ? {} : { data: acp.data }),
+    };
+  }
+  return { message: error.message, ...(data === undefined ? {} : { data }) };
+}
+
+/** The ACP error of a failed request record, for the reducer's error paths. */
+export function requestRecordError(request: Request): BridgeError {
+  return bridgeError(request.error ?? { code: "agent_error", message: `${request.method} failed` });
+}
+
+/**
+ * Auth records drive the same transitions the v1 auth events did. A record
+ * this client started carries its `Idempotency-Key`, which is the pending
+ * operation's request ID here.
+ */
+function applyAuthRequest(state: AppState, request: Request, previous: Request | undefined): AppState {
+  if (request === previous) return state;
+  const ours = state.pendingAuth != null && request.clientIntentId === state.pendingAuth.requestId;
+  const requestId = ours ? state.pendingAuth!.requestId : request.requestId;
+  const finished = request.status !== "running";
+  const transition = previous?.status === "running" || ours;
+  switch (request.operation) {
+    case "auth_terminal": {
+      const methodId = request.methodId ?? "";
+      let next = state;
+      if (!finished && (previous == null || ours)) {
+        next = applyGlobalEvent(next, { type: "bridge/auth_terminal_started", requestId, methodId });
+      }
+      if (next.authTerminal?.requestId === requestId && request.terminal != null &&
+        (next.authTerminal.output !== request.terminal.output || next.authTerminal.truncated !== request.terminal.truncated)) {
+        next = { ...next, authTerminal: { ...next.authTerminal, output: request.terminal.output, truncated: request.terminal.truncated } };
+      }
+      if (finished && (transition || next.pendingAuth?.requestId === requestId)) {
+        next = applyGlobalEvent(next, {
+          type: "bridge/auth_terminal_exited",
+          requestId,
+          methodId,
+          status: request.status as "succeeded" | "failed" | "cancelled",
+          exitCode: request.terminal?.exitCode ?? null,
+          ...(request.terminal?.signal == null ? {} : { signal: request.terminal.signal }),
+          ...(request.terminal?.message == null
+            ? request.status === "failed" && request.error != null ? { message: request.error.message } : {}
+            : { message: request.terminal.message }),
+        });
+      }
+      return next;
+    }
+    case "authenticate":
+    case "logout": {
+      if (!finished || !transition) return state;
+      if (request.status === "succeeded") {
+        return applyGlobalEvent(state, request.operation === "authenticate"
+          ? { type: "acp/authenticated", requestId, methodId: request.methodId ?? "", response: {} }
+          : { type: "acp/logged_out", requestId, response: {} });
+      }
+      return applyBridgeError(state, { ...requestRecordError(request), requestId, operation: `auth/${request.operation}` });
+    }
+    default:
+      return state;
+  }
+}
+
+/**
+ * Apply a v2 session change that leaves history and the turn's identity
+ * alone: interactions, controls, terminals, the operation, and the running
+ * turn's raw updates. History and turn boundaries go through a hydrate.
+ */
+function applySessionLive(
+  state: AppState,
+  view: BridgeSessionView,
+  previous: BridgeSessionView,
+  turnUpdates: SessionUpdate[],
+): AppState {
+  if (state.session?.sessionId !== view.sessionId || !sameSessionOwner(state.sessionOwner, view)) {
+    return { ...state, sessionView: view };
+  }
+  let next = applySessionLiveView(state, view, undefined);
+  const notify = (update: SessionUpdate) => {
+    next = reduceSessionUpdate(next, { sessionId: view.sessionId, update });
+  };
+  for (const update of turnUpdates) notify(update);
+  for (const [kind, update] of Object.entries(view.controls)) {
+    if (previous.controls[kind] !== update) notify(update);
+  }
+  const session = view.workspace.session ?? {};
+  const previousSession = previous.workspace.session ?? {};
+  if (session.modes !== previousSession.modes || session.configOptions !== previousSession.configOptions) {
+    next = {
+      ...next,
+      session: { ...session, sessionId: view.sessionId },
+      modeId: session.modes?.currentModeId,
+      configOptions: session.configOptions ?? null,
+    };
+  }
+  if (view.interactions.urlFlows !== previous.interactions.urlFlows) {
+    next = { ...next, externalFlows: Object.values(view.interactions.urlFlows).map((flow) => ({
+      interactionId: flow.interactionId,
+      elicitationId: flow.elicitationId,
+      sessionId: view.sessionId,
+      url: flowUrl(flow.request),
+      message: flow.request.message,
+      status: flow.status,
+    })) };
+  }
+  for (const terminal of Object.values(view.terminals)) {
+    if (previous.terminals[terminal.terminalId] !== terminal) {
+      next = { ...next, terminalSnapshots: upsertTerminalSnapshot(next.terminalSnapshots, terminal) };
+    }
+  }
+  if (view.operation !== previous.operation) {
+    next = {
+      ...next,
+      runtimeOperation: view.operation == null
+        ? undefined
+        : { requestId: view.operation.operationId, operation: bridgeOperationKind(view.operation.kind) },
+    };
+  }
+  if (view.activeTurn?.cancelRequested && !previous.activeTurn?.cancelRequested && next.pendingPrompt != null) {
+    next = {
+      ...next,
+      pendingPrompt: { ...next.pendingPrompt, cancelRequested: true },
+      timeline: cancelTurnTools(next.timeline),
+    };
+  }
+  return { ...next, sessionSyncPhase: view.phase, sessionView: view };
 }
 
 function withSessionView(state: AppState, view: BridgeSessionView | undefined): AppState {
@@ -1838,6 +2043,7 @@ function hydrateBridgeSession(state: AppState, view: BridgeSessionView): AppStat
       request: pending.request,
     })),
     externalFlows: Object.values(view.interactions.urlFlows).map((flow) => ({
+      interactionId: flow.interactionId,
       elicitationId: flow.elicitationId,
       sessionId: elicitationSessionId(flow.request),
       url: flow.request.mode === "url" && "url" in flow.request &&

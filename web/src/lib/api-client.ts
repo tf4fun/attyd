@@ -58,7 +58,10 @@ export async function requestJson<T>(
           throw new RequestTimeoutError(body.timeoutMs, method);
         }
         const message = isRecord(body) && typeof body.error === "string"
-          ? body.error : `${method} ${path} failed (${response.status})`;
+          ? body.error
+          : isRecord(body) && isRecord(body.error) && typeof body.error.message === "string"
+            ? body.error.message
+            : `${method} ${path} failed (${response.status})`;
         throw new ApiError(message, response.status, body);
       }
       return body as T;
@@ -71,7 +74,7 @@ export async function requestJson<T>(
 }
 
 export function workspaceContextSearchPath(query: string, sessionId: string): string {
-  return `/api/v1/context/search?${new URLSearchParams({ query, sessionId })}`;
+  return `/api/v2/sessions/${encodeURIComponent(sessionId)}/files?${new URLSearchParams({ query })}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

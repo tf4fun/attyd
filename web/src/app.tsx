@@ -50,7 +50,7 @@ import { projectPath } from "./lib/session-route";
 import { randomId } from "./lib/id";
 import { collectPromptHistory } from "./lib/prompt-history";
 import { timelineToMarkdown } from "./lib/thread-markdown";
-import type { AgentActivity, TimelineItem } from "./lib/state";
+import { flowKey, type AgentActivity, type TimelineItem } from "./lib/state";
 import { useAcp } from "./lib/use-acp";
 
 const AuthTerminalCard = lazy(() => import("./components/acp/auth-terminal").then(
@@ -480,20 +480,38 @@ export default function App() {
         sessionId, cwd: cached.cwd, title: cached.title,
       });
     }
+    for (const held of Object.values(state.globalSessions)) {
+      const listed = sessions.get(held.sessionId);
+      sessions.set(held.sessionId, { ...listed, sessionId: held.sessionId, cwd: listed?.cwd ?? held.cwd,
+        title: held.title ?? listed?.title });
+    }
     if (state.session) sessions.set(state.session.sessionId, {
       ...sessions.get(state.session.sessionId),
       sessionId: state.session.sessionId, cwd: state.cwd, title: state.title,
     });
     return [...sessions.values()];
-  }, [state.sessions, state.cachedSessions, state.session, state.cwd, state.title]);
+  }, [state.sessions, state.cachedSessions, state.globalSessions, state.session, state.cwd, state.title]);
   const projectSessions = useMemo(() => knownSessions.filter(
     (session) => session.cwd === selectedProjectCwd,
   ), [knownSessions, selectedProjectCwd]);
-  const busySessionIds = [
+  const heldSessions = Object.values(state.globalSessions);
+  const busySessionIds = [...new Set([
     ...((state.running || state.runtimeOperation != null) && state.session ? [state.session.sessionId] : []),
     ...[...state.cachedSessions].filter(([, session]) => session.running || session.runtimeOperation != null)
       .map(([sessionId]) => sessionId),
-  ];
+    ...heldSessions.filter(({ work }) => work !== "idle").map(({ sessionId }) => sessionId),
+  ])];
+  // Markers come from the bridge's summaries, so background sessions and
+  // turns started by other clients show too.
+  const attentionSessionIds = [...new Set([
+    ...state.attentionSessionIds,
+    ...heldSessions.filter(({ work, pending }) => work === "awaiting_input" ||
+      pending.permissions + pending.elicitations > 0).map(({ sessionId }) => sessionId),
+  ])];
+  const openSessionIds = [...new Set([...state.cachedSessions.keys(), ...heldSessions.map(({ sessionId }) => sessionId)])];
+  const elicitations = [...state.elicitations, ...state.globalElicitations.filter((global) =>
+    !state.elicitations.some(({ elicitationId }) => elicitationId === global.elicitationId))];
+  const externalFlows = [...state.externalFlows, ...state.globalFlows];
   const navigationDisabled = transitioning || changingControl || authBlocksCurrent || queuedPrompts.length > 0;
   const browseProject = (cwd: string) => {
     if (sessionSwitcher.current) sessionSwitcher.current.open = false;
@@ -751,8 +769,8 @@ export default function App() {
                           canDelete={sessionCapabilities?.delete != null}
                           deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
                           busySessionIds={busySessionIds}
-                          attentionSessionIds={state.attentionSessionIds}
-                          openSessionIds={[...state.cachedSessions.keys()]}
+                          attentionSessionIds={attentionSessionIds}
+                          openSessionIds={openSessionIds}
                           disabled={navigationDisabled}
                           onAttach={openThread}
                           onDelete={requestSessionDeletion}
@@ -833,7 +851,7 @@ export default function App() {
           onRetry={retrySessionOpening}
         >{authContent}</SessionOpening> : !state.session ? <div className="browse-panel">
           {authContent}
-          {state.elicitations.map((pending) => (
+          {elicitations.map((pending) => (
             <ElicitationCard
               key={pending.elicitationId}
               agentName={agent?.title ?? agent?.name ?? t("agent")}
@@ -841,9 +859,9 @@ export default function App() {
               onRespond={(response) => respondElicitation(pending.elicitationId, response)}
             />
           ))}
-          {state.externalFlows.map((flow) => (
-            <ExternalFlowCard key={flow.elicitationId} flow={flow}
-              onDismiss={() => dismissExternalFlow(flow.elicitationId)} />
+          {externalFlows.map((flow) => (
+            <ExternalFlowCard key={flowKey(flow)} flow={flow}
+              onDismiss={() => dismissExternalFlow(flowKey(flow))} />
           ))}
           {state.timeline.some((item) => item.type === "error") ? (
             <Conversation timeline={state.timeline.filter((item) => item.type === "error")} />
@@ -864,9 +882,9 @@ export default function App() {
             canDelete={sessionCapabilities?.delete != null}
             disabled={navigationDisabled || state.phase !== "ready" || authBlocksNewSession}
             busySessionIds={busySessionIds}
-            attentionSessionIds={state.attentionSessionIds}
+            attentionSessionIds={attentionSessionIds}
             deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
-            openSessionIds={[...state.cachedSessions.keys()]}
+            openSessionIds={openSessionIds}
             onProject={browseProject}
             onAttach={openThread}
             onDelete={requestSessionDeletion}
@@ -942,7 +960,7 @@ export default function App() {
                 <div className="agent-working" role="status">
                   <Activity size={14} /> {state.pendingPrompt?.cancelRequested
                     ? t("activity.cancelling")
-                    : agentActivityLabel(state.agentActivity, state.permissions.length > 0 || state.elicitations.length > 0, t)}<span /><span /><span />
+                    : agentActivityLabel(state.agentActivity, state.permissions.length > 0 || elicitations.length > 0, t)}<span /><span /><span />
                 </div>
               ) : null}
             </div>
@@ -978,7 +996,7 @@ export default function App() {
                 onRespond={(outcome) => respondPermission(pending.permissionId, outcome)}
               />
             ))}
-            {state.elicitations.map((pending) => (
+            {elicitations.map((pending) => (
               <ElicitationCard
                 key={pending.elicitationId}
                 agentName={agent?.title ?? agent?.name ?? t("agent")}
@@ -986,11 +1004,11 @@ export default function App() {
                 onRespond={(response) => respondElicitation(pending.elicitationId, response)}
               />
             ))}
-            {state.externalFlows.map((flow) => (
+            {externalFlows.map((flow) => (
               <ExternalFlowCard
-                key={flow.elicitationId}
+                key={flowKey(flow)}
                 flow={flow}
-                onDismiss={() => dismissExternalFlow(flow.elicitationId)}
+                onDismiss={() => dismissExternalFlow(flowKey(flow))}
               />
             ))}
             {state.activePlan ? (
@@ -1039,8 +1057,8 @@ export default function App() {
               usage={state.usage}
               interactionPending={
                 state.permissions.length > 0 ||
-                state.elicitations.length > 0 ||
-                state.externalFlows.some(({ status }) => status === "waiting")
+                elicitations.length > 0 ||
+                externalFlows.some(({ status }) => status === "waiting")
               }
               connectionRecovery={state.phase === "error" || state.phase === "stopped"
                 ? {
