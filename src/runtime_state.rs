@@ -529,6 +529,36 @@ impl SessionRegistry {
         self.effects.drain(..).collect()
     }
 
+    /// Protocol v2: a session the previous Agent connection held, which a
+    /// subscription still needs, starts this connection held, with the log it
+    /// had and its waiting `load` (protocol S6, §5.4).
+    pub(crate) fn seed_waiting(
+        &mut self,
+        waiting: crate::protocol::registry::WaitingSession,
+    ) -> Result<u64, RuntimeStateError> {
+        let epoch = self.epoch.clone();
+        let incarnation = self.open_session(
+            &epoch,
+            waiting.session_id.clone(),
+            waiting.cwd,
+            waiting.session,
+            BTreeMap::new(),
+        )?;
+        self.register_new(waiting.session_id.clone(), incarnation);
+        let entry = self
+            .sessions
+            .get_mut(&waiting.session_id)
+            .expect("the session was opened");
+        entry.state.log = waiting.log;
+        entry
+            .state
+            .live
+            .as_mut()
+            .expect("an open session is live")
+            .op = waiting.op;
+        Ok(incarnation)
+    }
+
     pub(crate) fn open_new_with_replay(
         &mut self,
         expected_epoch: &str,
@@ -634,7 +664,10 @@ impl SessionRegistry {
         kind: SessionOperationKind,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        if kind != SessionOperationKind::Load {
+        if !matches!(
+            kind,
+            SessionOperationKind::Load | SessionOperationKind::Resume
+        ) {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let operation_id = operation_id.into();
@@ -703,7 +736,11 @@ impl SessionRegistry {
             });
         let collecting_reload = session.lifecycle == SessionLifecycle::Active
             && owner.operation.as_ref().is_some_and(|operation| {
-                operation.stage == "reloading" && operation.kind == SessionOperationKind::Load
+                operation.stage == "reloading"
+                    && matches!(
+                        operation.kind,
+                        SessionOperationKind::Load | SessionOperationKind::Resume
+                    )
             });
         if !collecting_attachment && !collecting_reload {
             return Err(RuntimeStateError::OperationMismatch);
@@ -733,7 +770,10 @@ impl SessionRegistry {
         if session.lifecycle != SessionLifecycle::Active
             || owner.operation.as_ref().is_none_or(|operation| {
                 operation.operation_id != operation_id
-                    || operation.kind != SessionOperationKind::Load
+                    || !matches!(
+                        operation.kind,
+                        SessionOperationKind::Load | SessionOperationKind::Resume
+                    )
                     || operation.stage != "reloading"
             })
         {
@@ -765,7 +805,10 @@ impl SessionRegistry {
         if session.lifecycle != SessionLifecycle::Active
             || owner.operation.as_ref().is_none_or(|operation| {
                 operation.operation_id != operation_id
-                    || operation.kind != SessionOperationKind::Load
+                    || !matches!(
+                        operation.kind,
+                        SessionOperationKind::Load | SessionOperationKind::Resume
+                    )
                     || operation.stage != "reloading"
             })
         {
@@ -6600,7 +6643,7 @@ mod tests {
                 "session",
                 incarnation,
                 "reload",
-                SessionOperationKind::Resume,
+                SessionOperationKind::Fork,
             ),
             Err(RuntimeStateError::OperationMismatch)
         );

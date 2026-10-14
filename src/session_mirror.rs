@@ -213,7 +213,19 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// Commits a replay: the session's log is rebuilt from it.
     pub(crate) fn commit_load(
+        &mut self,
+        session_id: &str,
+        incarnation: u64,
+        attempt_id: &str,
+    ) -> Result<Arc<HistorySnapshot>, MirrorError> {
+        let snapshot = self.commit_history(session_id, incarnation, attempt_id)?;
+        self.replace_session_log(session_id, snapshot.updates());
+        Ok(snapshot)
+    }
+
+    fn commit_history(
         &mut self,
         session_id: &str,
         incarnation: u64,
@@ -269,18 +281,19 @@ impl SessionRegistry {
         );
         self.overlay_bytes = self.overlay_bytes.saturating_sub(old_bytes);
         self.prune_retained_terminals(&key, snapshot.updates());
-        self.replace_session_log(session_id, snapshot.updates());
         Ok(snapshot)
     }
 
-    // Resume notifications are useful context, but do not promise a full replay.
+    // Resume notifications are useful context, but do not promise a full replay:
+    // they never replace a log the bridge already knows.
     pub(crate) fn commit_attachment_cache(
         &mut self,
         session_id: &str,
         incarnation: u64,
         attempt_id: &str,
     ) -> Result<Arc<HistorySnapshot>, MirrorError> {
-        let snapshot = self.commit_load(session_id, incarnation, attempt_id)?;
+        let snapshot = self.commit_history(session_id, incarnation, attempt_id)?;
+        self.adopt_session_log(session_id, snapshot.updates());
         self.require_state_mut(session_id, incarnation)?.phase = MirrorPhase::Cold;
         Ok(snapshot)
     }
@@ -302,7 +315,8 @@ impl SessionRegistry {
         for update in updates {
             self.append_load_update(session_id, incarnation, attempt, update.clone())?;
         }
-        self.commit_load(session_id, incarnation, attempt)?;
+        let snapshot = self.commit_history(session_id, incarnation, attempt)?;
+        self.adopt_session_log(session_id, snapshot.updates());
         self.require_state_mut(session_id, incarnation)?
             .history_notice = Some(notice);
         Ok(())

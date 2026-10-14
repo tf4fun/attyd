@@ -2,8 +2,9 @@
 //!
 //! The bridge state lives behind `BridgeLock`. A guard that took mutable access
 //! runs the commit step when it is released, on every return path, so no
-//! transition can change what clients see without publishing it (I1). The Hub
-//! (migration step 5) will take the events; until then a test tap does.
+//! transition can change what clients see without publishing it (I1). The
+//! published documents and the Hub are shared by the actor's generations
+//! (`Publication`); a test tap also takes every commit.
 #[cfg(test)]
 use std::collections::BTreeMap;
 
@@ -12,6 +13,8 @@ use crate::protocol::documents::{
     AgentInfo, AgentLaunch, AgentPhase, AgentTransport, ErrorCode, McpServerKind, McpServerSummary,
     ProtocolError,
 };
+use crate::protocol::hub::Publication;
+#[cfg(test)]
 use crate::protocol::publish::Publisher;
 
 pub(super) struct BridgeLock(Mutex<BridgeState>);
@@ -83,15 +86,15 @@ impl Drop for BridgeGuard<'_> {
 /// One commit as the test tap receives it: its events and every document
 /// published after it.
 #[cfg(test)]
-pub(super) struct PublishedCommit {
+pub(crate) struct PublishedCommit {
     pub events: Vec<crate::protocol::documents::Event>,
     pub documents: BTreeMap<String, crate::protocol::publish::Document>,
 }
 
 /// The protocol side of the bridge state: the published documents and the
-/// Agent's connection state.
+/// Hub, shared with the other generations, and the Agent's connection state.
 pub(super) struct ProtocolState {
-    pub(super) publisher: Publisher,
+    pub(super) publication: Publication,
     pub(super) agent: AgentInfo,
     #[cfg(test)]
     tap: Option<mpsc::UnboundedSender<PublishedCommit>>,
@@ -100,7 +103,7 @@ pub(super) struct ProtocolState {
 impl Default for ProtocolState {
     fn default() -> Self {
         Self {
-            publisher: Publisher::default(),
+            publication: Publication::default(),
             agent: AgentInfo {
                 phase: AgentPhase::Starting,
                 error: None,
@@ -122,34 +125,28 @@ impl ProtocolState {
         tap: mpsc::UnboundedSender<PublishedCommit>,
     ) -> BTreeMap<String, crate::protocol::publish::Document> {
         self.tap = Some(tap);
-        self.publisher
-            .scopes()
-            .into_iter()
-            .filter_map(|scope| {
-                let document = self.publisher.document(&scope)?;
-                Some((scope, document))
-            })
-            .collect()
+        documents(&self.publication.lock().publisher)
     }
 
-    fn publish(&mut self, events: Vec<crate::protocol::documents::Event>) {
-        if events.is_empty() {
-            return;
-        }
-        #[cfg(test)]
-        if let Some(tap) = &self.tap {
-            let documents = self
-                .publisher
-                .scopes()
-                .into_iter()
-                .filter_map(|scope| {
-                    let document = self.publisher.document(&scope)?;
-                    Some((scope, document))
-                })
-                .collect();
-            let _ = tap.send(PublishedCommit { events, documents });
-        }
+    #[cfg(test)]
+    pub(super) fn set_tap(&mut self, tap: mpsc::UnboundedSender<PublishedCommit>) {
+        self.tap = Some(tap);
     }
+}
+
+/// Every published document.
+#[cfg(test)]
+pub(crate) fn documents(
+    publisher: &Publisher,
+) -> BTreeMap<String, crate::protocol::publish::Document> {
+    publisher
+        .scopes()
+        .into_iter()
+        .filter_map(|scope| {
+            let document = publisher.document(&scope)?;
+            Some((scope, document))
+        })
+        .collect()
 }
 
 /// What `global.agent.launch` shows of the options.
@@ -202,18 +199,32 @@ impl BridgeState {
     /// every change since the last commit.
     pub(super) fn commit(&mut self) {
         self.retire_orphaned_interactions();
-        let events = self.protocol.publisher.commit(
+        let mut published = self.protocol.publication.lock();
+        let events = published.publisher.commit(
             &mut self.sessions,
             &self.protocol.agent,
             self.catalog_revision,
         );
-        self.protocol.publish(events);
+        // The events enter every queue in the critical section that produced
+        // them (S3); the tap sees the same commit under the same lock. A
+        // commit without events may still have released a session.
+        let published = &mut *published;
+        published.hub.dispatch(&published.publisher, &events);
+        #[cfg(test)]
+        if !events.is_empty()
+            && let Some(tap) = &self.protocol.tap
+        {
+            let _ = tap.send(PublishedCommit {
+                events,
+                documents: documents(&published.publisher),
+            });
+        }
     }
 
     /// Whether a commit now would publish anything (the gate's check, §4.1).
     #[cfg(test)]
     pub(super) fn unpublished(&self) -> bool {
-        self.protocol.publisher.diverges(
+        self.protocol.publication.lock().publisher.diverges(
             &self.sessions,
             &self.protocol.agent,
             self.catalog_revision,
@@ -318,6 +329,7 @@ impl BridgeState {
             ErrorCode::Unavailable,
             "the Agent connection ended",
         ));
+        self.hold_for_next_connection();
     }
 }
 

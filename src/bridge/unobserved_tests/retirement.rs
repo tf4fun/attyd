@@ -1,7 +1,7 @@
 use super::*;
 
 async fn creation_replay_after_retirement(late_retired_update: bool) -> (Value, Value) {
-    let mut agent = TestAgent::start(0, json!({})).await;
+    let mut agent = TestAgent::start(0, json!({"loadSession": true})).await;
     let first = agent.submit(json!({
         "type": "session/new", "requestId": "create-old", "cwd": "/repo",
     }));

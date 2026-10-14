@@ -66,8 +66,9 @@ mod memory_efficiency_tests;
 mod memory_retention_tests;
 #[cfg(test)]
 mod protocol_gate_tests;
-mod publication;
+pub(crate) mod publication;
 mod scheduling;
+mod streams;
 #[cfg(test)]
 mod unobserved_tests;
 
@@ -276,6 +277,9 @@ struct BridgeState {
     observers_stopped: bool,
     /// Protocol v2: the published documents and the Agent's state.
     protocol: ProtocolState,
+    /// Protocol v2: the sessions the previous connection held for a
+    /// subscription, which this one loads again once the Agent is ready.
+    stream_reloads: std::collections::VecDeque<String>,
     /// The connection's ingress, for tests that wait on its receipt.
     #[cfg(test)]
     ingress: Option<IngressSender>,
@@ -1119,15 +1123,25 @@ fn refresh_observer_timers(state: &mut BridgeState) {
     } else {
         state.observer_timeout.unwrap_or(-1)
     };
+    // Only a session the Agent can bring back is released, and only once it
+    // is not needed (S6); a needed one counts as running work.
+    let releasable = streams::releasable(state);
+    let followed = streams::followed(state);
     let owners = state
         .sessions
         .iter_entries()
         .map(|entry| {
+            let session_id = entry.state.session_id.clone();
+            let work = if streams::needed(state, &followed, &session_id) {
+                SessionWork::Running
+            } else {
+                SessionWork::of(entry)
+            };
             (
-                entry.state.session_id.clone(),
+                session_id,
                 entry.state.incarnation,
                 entry.state.live.as_ref().map(|live| live.lifecycle.clone()),
-                SessionWork::of(entry),
+                work,
             )
         })
         .collect::<Vec<_>>();
@@ -1135,7 +1149,7 @@ fn refresh_observer_timers(state: &mut BridgeState) {
         let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) else {
             continue;
         };
-        if state.observers_stopped {
+        if state.observers_stopped || !releasable {
             resources.observers.stop_absence();
             continue;
         }
@@ -1231,6 +1245,7 @@ fn finish_session_view_waiter(
         SessionViewWaiter::View(response) => {
             let _ = response.send(result);
         }
+        SessionViewWaiter::Stream => streams::finish_load(state, session_id, result),
         SessionViewWaiter::Observe {
             observer_id,
             lease,
@@ -1800,6 +1815,15 @@ pub(crate) enum BridgeInput {
         reservation: PreparedAttachment,
         response: Option<oneshot::Sender<Result<Value, BridgeRequestError>>>,
     },
+    /// A v2 stream (protocol §5.1): registers the subscription, holds and
+    /// loads its unheld sessions, and joins distribution under one bridge
+    /// guard.
+    Subscribe {
+        scopes: Vec<crate::protocol::hub::Subscribed>,
+        reply: oneshot::Sender<crate::protocol::hub::Subscription>,
+    },
+    /// Starts the next load v2 streams wait for.
+    ServeStreams,
 }
 
 impl BridgeInput {
@@ -1807,7 +1831,7 @@ impl BridgeInput {
     /// session ID is validated by the reducer, never used to redirect a reply.
     fn session_id<'a>(&'a self, state: &'a BridgeState) -> Option<&'a str> {
         match self {
-            Self::RuntimeSnapshotRequest => None,
+            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } | Self::ServeStreams => None,
             Self::SessionViewRequest { session_id, .. }
             | Self::ObserveSession { session_id, .. }
             | Self::UnobserveSession { session_id, .. }
@@ -1845,7 +1869,8 @@ impl BridgeInput {
     /// constructing a second serialized copy of a potentially large prompt.
     fn payload_bytes(&self) -> usize {
         let payload = match self {
-            Self::RuntimeSnapshotRequest => 0,
+            Self::RuntimeSnapshotRequest | Self::ServeStreams => 0,
+            Self::Subscribe { scopes, .. } => scopes.len().saturating_mul(256),
             Self::SessionViewRequest {
                 session_id,
                 cwd,
@@ -1888,7 +1913,7 @@ impl BridgeInput {
     /// and withdraw its observation lease; dropping a sender alone loses the cause.
     fn reject(self, error: Error) {
         match self {
-            Self::RuntimeSnapshotRequest => {}
+            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } | Self::ServeStreams => {}
             Self::SessionViewRequest { response, .. } => {
                 let _ = response.send(Err(SessionViewError::from(error)));
             }
@@ -1944,6 +1969,8 @@ fn browser_traffic_class(input: &BridgeInput) -> crate::session_dispatch::Traffi
 
 pub(crate) enum SessionViewWaiter {
     View(oneshot::Sender<Result<Value, SessionViewError>>),
+    /// The v2 streams waiting for the session (protocol §5.1).
+    Stream,
     Observe {
         observer_id: u64,
         lease: ObservationLease,
@@ -1955,6 +1982,7 @@ impl SessionViewWaiter {
     pub(crate) fn is_closed(&self) -> bool {
         match self {
             Self::View(reply) => reply.is_closed(),
+            Self::Stream => false,
             Self::Observe { lease, reply, .. } => lease.is_cancelled() || reply.is_closed(),
         }
     }
@@ -1965,6 +1993,7 @@ impl SessionViewWaiter {
             Self::View(reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::Stream => {}
             Self::Observe { lease, reply, .. } => {
                 lease.cancel();
                 let _ = reply.send(Err(error));
@@ -2092,11 +2121,31 @@ impl TurnResponder {
     }
 }
 
+#[cfg(test)]
 pub async fn run_with_cancellation(
     options: Arc<Options>,
     commands: mpsc::UnboundedReceiver<BridgeInput>,
     events: EventSender,
     cancellation: CancellationToken,
+) {
+    run_publishing(
+        options,
+        commands,
+        events,
+        cancellation,
+        crate::protocol::hub::Publication::default(),
+    )
+    .await
+}
+
+/// One generation of the bridge, publishing into `publication`, which the
+/// host shares across its generations (protocol §5.4).
+pub(crate) async fn run_publishing(
+    options: Arc<Options>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
+    events: EventSender,
+    cancellation: CancellationToken,
+    publication: crate::protocol::hub::Publication,
 ) {
     let sink = EventSink { tx: events };
     let mcp_servers = options
@@ -2127,12 +2176,13 @@ pub async fn run_with_cancellation(
                 .on_fatal(move |error| {
                     let _ = fatal_tx.send(error);
                 });
-            let connection = run_connection(
-                agent,
+            let connection = run_generation(
+                Ok(agent),
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
+                publication,
             );
             tokio::pin!(connection);
             tokio::select! {
@@ -2157,28 +2207,33 @@ pub async fn run_with_cancellation(
             }
         }
         Transport::Ws => {
-            run_connection(
-                crate::websocket_agent::WebSocketAgent::new(options.command[0].clone()),
+            run_generation(
+                Ok(crate::websocket_agent::WebSocketAgent::new(
+                    options.command[0].clone(),
+                )),
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
+                publication,
             )
             .await
         }
-        Transport::Http => match remote_http_client(&options.command[0]) {
-            Ok(client) => {
-                run_connection(
-                    client,
-                    options.clone(),
-                    commands,
-                    sink.clone(),
-                    cancellation.clone(),
-                )
-                .await
-            }
-            Err(error) => Err(Error::invalid_params().data(error.to_string())),
-        },
+        Transport::Http => {
+            // A transport that cannot be built still ends this generation
+            // through its final commit, so the documents show why.
+            let client = remote_http_client(&options.command[0])
+                .map_err(|error| Error::invalid_params().data(error.to_string()));
+            run_generation(
+                client,
+                options.clone(),
+                commands,
+                sink.clone(),
+                cancellation.clone(),
+                publication,
+            )
+            .await
+        }
     };
 
     match result {
@@ -2205,6 +2260,7 @@ fn remote_http_client(
     HttpClient::with_endpoint_and_client(endpoint, http)
 }
 
+#[cfg(test)]
 async fn run_connection<T>(
     transport: T,
     options: Arc<Options>,
@@ -2215,19 +2271,61 @@ async fn run_connection<T>(
 where
     T: ConnectTo<Client>,
 {
-    let state = Arc::new(BridgeLock::new(BridgeState::default()));
-    state.lock().await.protocol.agent.launch = agent_launch(&options);
-    #[cfg(test)]
-    memory_retention_tests::capture_coordinator_state(&state);
-    let result = run_connection_with(
-        state.clone(),
-        transport,
+    run_generation(
+        Ok(transport),
         options,
         commands,
         sink,
         cancellation,
+        crate::protocol::hub::Publication::default(),
     )
-    .await;
+    .await
+}
+
+/// One generation of the bridge actor: one Agent connection, publishing into
+/// `publication`, which the generations before and after it share. A
+/// transport that could not be built connects nothing; the generation still
+/// publishes and ends with its error.
+async fn run_generation<T>(
+    transport: Result<T, Error>,
+    options: Arc<Options>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
+    sink: EventSink,
+    cancellation: CancellationToken,
+    publication: crate::protocol::hub::Publication,
+) -> Result<(), Error>
+where
+    T: ConnectTo<Client>,
+{
+    let mut state = BridgeState::default();
+    state.protocol.publication = publication;
+    state.seed_from_previous_connection();
+    // A test's tap for this generation, set before its first commit.
+    #[cfg(test)]
+    {
+        let tap = state.protocol.publication.lock().next_tap.take();
+        if let Some(tap) = tap {
+            state.protocol.set_tap(tap);
+        }
+    }
+    let state = Arc::new(BridgeLock::new(state));
+    state.lock().await.protocol.agent.launch = agent_launch(&options);
+    #[cfg(test)]
+    memory_retention_tests::capture_coordinator_state(&state);
+    let result = match transport {
+        Ok(transport) => {
+            run_connection_with(
+                state.clone(),
+                transport,
+                options,
+                commands,
+                sink,
+                cancellation,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     // The last commit, on every return once the state exists: running
     // operations fail and the final agent shows.
     state.lock().await.end_connection(result.as_ref().err());
@@ -2259,6 +2357,8 @@ where
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
     }
+    // A closed v2 subscription may leave a session unneeded (S6).
+    let mut stream_closes = state.lock().await.protocol.publication.lock().hub.closes();
     sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(
         state.lock().await.sessions.snapshot(),
     )));
@@ -2342,7 +2442,34 @@ where
                 .client_info(
                     Implementation::new("attyd", crate::VERSION).title("attyd web client"),
                 );
-            let response = connection.send_request(initialize).block_task().await?;
+            // While initialize is unanswered, a stream subscribes from the
+            // published cut; the other inputs wait in ingress, in order.
+            let request = connection.send_request(initialize).block_task();
+            tokio::pin!(request);
+            let mut commands_open = true;
+            let response = loop {
+                tokio::select! {
+                    biased;
+                    // Cancellation ends the wait: the final commit below
+                    // shows the Agent stopped before the streams close.
+                    _ = cancellation.cancelled() => return Ok(()),
+                    response = &mut request => break response?,
+                    input = commands.recv(), if commands_open => match input {
+                        Some(BridgeInput::Subscribe { scopes, reply }) => {
+                            let state = state.lock().await;
+                            let _ = reply.send(streams::register(&state, &scopes));
+                        }
+                        Some(input) => {
+                            let class = browser_traffic_class(&input);
+                            let _ = ingress.try_browser(input, class);
+                        }
+                        None => {
+                            commands_open = false;
+                            cancellation.cancel();
+                        }
+                    },
+                }
+            };
             relay_bytes(&response)?;
             if response.protocol_version != ProtocolVersion::V1 {
                 return Err(Error::invalid_request().data(format!(
@@ -2365,6 +2492,8 @@ where
                     .iter()
                     .map(|method| (method.id().0.to_string(), method.clone()))
                     .collect();
+                // The streams wait for the Agent: load what they follow.
+                streams::wake(&state);
             }
             sink.typed("acp/initialized", &response);
             sink.send(json!({ "type": "bridge/phase", "phase": "ready" }));
@@ -2390,6 +2519,9 @@ where
                         // SDK foreground future. Stop admission and let the
                         // cleanup below drain already accepted deliveries.
                         _ = connection.incoming_closed() => break None,
+                        Ok(()) = stream_closes.changed() => {
+                            refresh_observer_timers(&mut *state.lock().await);
+                        }
                         input = observer_rx.recv() => {
                             if let Some(input) = input {
                                 let _ = ingress.try_browser(input, crate::session_dispatch::TrafficClass::Reserved);
@@ -2418,6 +2550,25 @@ where
                             state.sessions.release_published_runtime(through);
                         }
                         continue;
+                    }
+                    Some(BridgeInput::Subscribe { scopes, reply }) => {
+                        let mut state = state.lock().await;
+                        let (subscription, command) =
+                            streams::subscribe(&mut state, &sink, &scopes);
+                        let _ = reply.send(subscription);
+                        let Some(command) = command else {
+                            continue;
+                        };
+                        (command, None, None)
+                    }
+                    Some(BridgeInput::ServeStreams) => {
+                        let mut state = state.lock().await;
+                        let command = streams::serve(&mut state, &sink);
+                        refresh_observer_timers(&mut state);
+                        let Some(command) = command else {
+                            continue;
+                        };
+                        (command, None, None)
                     }
                     Some(BridgeInput::FinishHistorySync { owner }) => {
                         // A dropped task may not release its flow through the
@@ -2455,7 +2606,10 @@ where
                         // interaction owns the session's next step: cancel this
                         // countdown. Settling back to idle starts a fresh full
                         // interval rather than resuming a stale deadline.
-                        if session_blocks_unobserved_retire(&state, &session_id) {
+                        if session_blocks_unobserved_retire(&state, &session_id)
+                            || !streams::releasable(&state)
+                            || streams::needed(&state, &streams::followed(&state), &session_id)
+                        {
                             if let Ok(resources) =
                                 state.sessions.resources_mut(&session_id, incarnation)
                             {
@@ -2851,6 +3005,14 @@ fn fail_command_operation(
     state
         .sessions
         .fail_scope_operation(&scope, kind, operation_error(error, closing));
+    // The ended operation no longer keeps its session needed: an unfollowed
+    // session starts its release timer again (S6).
+    refresh_observer_timers(state);
+    if kind == OpKind::Delete {
+        // The failed delete frees what it occupied: the streams that waited
+        // for it load the session.
+        streams::wake(state);
+    }
 }
 
 fn error_message(error: Error) -> String {
@@ -4960,6 +5122,12 @@ async fn handle_command_inner(
                 result?;
                 locked.listed_sessions.remove(&session_id);
                 locked.sessions.complete_catalog_delete(&session_id);
+                streams::end_waiting(
+                    &locked,
+                    &session_id,
+                    crate::protocol::documents::EndReason::Deleted,
+                    None,
+                );
                 advance_catalog_revision(&mut locked, &sink);
                 return Ok(());
             };
@@ -6742,17 +6910,16 @@ fn reserve_attachment_locked(
         .map(|session| (session.live.cwd.clone(), session.state.incarnation));
     let reservation = match tracked {
         Some((cwd, incarnation)) => {
-            if kind != RuntimeSessionOperationKind::Load {
+            // A session the previous connection left waiting may also come
+            // back with a resume, which replays nothing (protocol §5.4).
+            if kind != RuntimeSessionOperationKind::Load
+                && !state.sessions.waits_for_load(session_id)
+            {
                 return Err(Error::invalid_request()
                     .data("an active tracked session can only be reloaded with session/load"));
             }
             session_mirror(state)
-                .begin_exclusive(
-                    session_id,
-                    incarnation,
-                    RuntimeSessionOperationKind::Load,
-                    operation_id,
-                )
+                .begin_exclusive(session_id, incarnation, kind, operation_id)
                 .map_err(mirror_error)?;
             if let Err(error) =
                 state
@@ -10817,6 +10984,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn owner_cancelled_observe_restarts_absence_and_fences_an_old_timer() {
         let mut state = BridgeState::default();
+        // Only a session the Agent can load again is released (S6).
+        state.agent_capabilities = Some(AgentCapabilities::new().load_session(true));
         let incarnation = register_test_session(&mut state, "session", "/workspace");
         let (input, mut commands) = mpsc::unbounded_channel();
         state.observer_events = Some(input);

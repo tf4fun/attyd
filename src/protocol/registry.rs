@@ -27,6 +27,18 @@ pub(crate) enum SessionLog {
     Known(Arc<TurnLog>),
 }
 
+/// A held session the next Agent connection loads again: bridge memory
+/// that outlives the connection (protocol S6, §5.4). It keeps the log the
+/// session had, with its attachments, and the waiting `load`.
+#[derive(Debug, Clone)]
+pub(crate) struct WaitingSession {
+    pub session_id: String,
+    pub cwd: std::path::PathBuf,
+    pub session: Value,
+    pub log: SessionLog,
+    pub op: OpSlot,
+}
+
 impl SessionLog {
     pub(crate) fn empty() -> Self {
         Self::Known(Arc::new(TurnLog::default()))
@@ -556,6 +568,41 @@ impl SessionRegistry {
         self.scopes.login_terminals.clear();
     }
 
+    /// The connection ended while a subscription follows the held session
+    /// and the Agent can load it again: it shows a running `load`, which the
+    /// next connection runs, and keeps its log (protocol S6, §5.4).
+    pub(crate) fn wait_for_next_connection(&mut self, session_id: &str) -> Option<WaitingSession> {
+        let entry = self.sessions.get_mut(session_id)?;
+        let live = entry.state.live.as_mut()?;
+        live.op = OpSlot::running(
+            OperationKind::Load,
+            json!({ "cwd": live.cwd.to_string_lossy() }),
+        );
+        Some(WaitingSession {
+            session_id: session_id.to_string(),
+            cwd: live.cwd.clone(),
+            session: live.session.clone(),
+            log: entry.state.log.clone(),
+            op: live.op.clone(),
+        })
+    }
+
+    /// The connection ended while a subscription follows the held session
+    /// and the Agent cannot load it again: its scope ends with `load_failed`.
+    pub(crate) fn end_unloadable(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+        self.scopes.ended.push((
+            session_id.to_string(),
+            End {
+                reason: EndReason::LoadFailed,
+                error: Some(ProtocolError::new(
+                    ErrorCode::Unavailable,
+                    "the Agent connection ended and the Agent cannot load the session again",
+                )),
+            },
+        ));
+    }
+
     /// A v1 session operation started; a reload runs as a `load`.
     pub(crate) fn begin_session_operation(&mut self, session_id: &str, kind: SessionOperationKind) {
         if kind != SessionOperationKind::Load {
@@ -706,6 +753,30 @@ impl SessionRegistry {
         if let Some(entry) = self.sessions.get_mut(session_id) {
             entry.state.log = SessionLog::Known(Arc::new(TurnLog::from_replay(replay)));
         }
+    }
+
+    /// A resume or the bridge's cache gave the session's context, which is no
+    /// replay: it is the log only of a session whose history is unknown, and a
+    /// known log stays (protocol S1).
+    pub(crate) fn adopt_session_log(&mut self, session_id: &str, updates: &[Value]) {
+        if let Some(entry) = self.sessions.get_mut(session_id)
+            && matches!(entry.state.log, SessionLog::Unknown)
+        {
+            entry.state.log = SessionLog::Known(Arc::new(TurnLog::from_replay(updates)));
+        }
+    }
+
+    /// Whether the held session shows the `load` the previous connection left
+    /// it waiting with, and nothing runs it yet (protocol S6, §5.4).
+    pub(crate) fn waits_for_load(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|entry| {
+            entry.state.operation.is_none()
+                && entry
+                    .state
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.op.is_running_kind(OperationKind::Load))
+        })
     }
 
     /// A setup response arrived: controls settle from the earlier updates and

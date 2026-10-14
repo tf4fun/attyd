@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 #[cfg(any(test, not(feature = "dev")))]
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, Request, State};
 #[cfg(not(feature = "dev"))]
 use axum::http::Method;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -34,6 +34,8 @@ use crate::bridge_event::{BridgeEvent, SessionEvent, SessionPosition};
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
+use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
+use crate::protocol::hub::{HEARTBEAT, Publication, Subscribed, Subscription};
 #[cfg(test)]
 use crate::runtime_state::fold_active_turn_update;
 use crate::runtime_state::{
@@ -45,6 +47,10 @@ use crate::session_resources::SessionResourceOwner;
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const HTTP_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(6);
 const JSON_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The recovery's delay after a connection that never became ready; it
+/// doubles per such attempt up to the maximum (protocol §5.4).
+const RECOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(8);
 
 #[cfg(not(feature = "dev"))]
 #[derive(RustEmbed)]
@@ -562,16 +568,49 @@ struct BridgeHubState {
     canonical: CanonicalProjection,
     canonical_resync_pending: bool,
     shutting_down: bool,
+    /// The one recovery task, while it waits to start the next connection.
+    recovery: Option<CancellationToken>,
+    /// A successful terminal login authorized one next connection (Q2).
+    login_restart: bool,
+    /// The recovery's delay before its next attempt.
+    recovery_backoff: Duration,
+}
+
+impl BridgeHubState {
+    /// Starts the next generation.
+    fn begin_generation(&mut self) -> BridgeRuntime {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.bootstrap = BridgeBootstrap::default();
+        self.canonical = CanonicalProjection::default();
+        self.canonical_resync_pending = false;
+        self.login_restart = false;
+        let (input_tx, input) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let (event_tx, events) = event_queue::channel(cancellation.clone());
+        self.input = Some(input_tx);
+        self.cancellation = Some(cancellation.clone());
+        BridgeRuntime {
+            generation: self.generation,
+            input,
+            events,
+            event_tx,
+            cancellation,
+        }
+    }
 }
 
 struct BridgeHub {
     options: Arc<Options>,
+    /// The published documents and the v2 streams, shared by the
+    /// generations (protocol §5.4).
+    publication: Publication,
+    // Per-host test barrier for a subscription crossing Agent generations.
+    #[cfg(test)]
+    after_subscribe_input: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     state: Mutex<BridgeHubState>,
     next_subscriber_id: AtomicU64,
     stopped: Notify,
 }
-
-impl BridgeHubState {}
 
 struct BridgeSubscription {
     id: u64,
@@ -1004,6 +1043,9 @@ impl BridgeHub {
     fn new(options: Arc<Options>) -> Arc<Self> {
         Arc::new(Self {
             options,
+            publication: Publication::default(),
+            #[cfg(test)]
+            after_subscribe_input: std::sync::Mutex::new(None),
             state: Mutex::new(BridgeHubState::default()),
             next_subscriber_id: AtomicU64::new(1),
             stopped: Notify::new(),
@@ -1016,26 +1058,134 @@ impl BridgeHub {
             if state.shutting_down || state.input.is_some() {
                 None
             } else {
-                state.generation = state.generation.wrapping_add(1).max(1);
-                state.bootstrap = BridgeBootstrap::default();
-                state.canonical = CanonicalProjection::default();
-                state.canonical_resync_pending = false;
-                let (input_tx, input) = mpsc::unbounded_channel();
-                let cancellation = CancellationToken::new();
-                let (event_tx, events) = event_queue::channel(cancellation.clone());
-                state.input = Some(input_tx);
-                state.cancellation = Some(cancellation.clone());
-                Some(BridgeRuntime {
-                    generation: state.generation,
-                    input,
-                    events,
-                    event_tx,
-                    cancellation,
-                })
+                Some(state.begin_generation())
             }
         };
         if let Some(runtime) = runtime {
             self.spawn_runtime(runtime);
+        }
+    }
+
+    /// Whether an open v2 stream needs a connection: it follows a session
+    /// scope that has not ended (S6, Q2). Global and catalog alone do not.
+    fn streams_need_connection(&self) -> bool {
+        !self.publication.lock().hub.followed_sessions().is_empty()
+    }
+
+    /// Schedules the one recovery task when no generation runs and a stream
+    /// or a login needs the next connection. GET never calls it.
+    async fn recover(self: &Arc<Self>) {
+        let (token, delay) = {
+            let mut state = self.state.lock().await;
+            if state.shutting_down
+                || state.input.is_some()
+                || state.recovery.is_some()
+                || !(state.login_restart || self.streams_need_connection())
+            {
+                return;
+            }
+            let token = CancellationToken::new();
+            state.recovery = Some(token.clone());
+            (token, state.recovery_backoff)
+        };
+        let hub = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            let Some(hub) = hub.upgrade() else {
+                return;
+            };
+            // The need is decided again when the attempt starts: a stream
+            // that left or ended during the delay starts nothing.
+            let runtime = {
+                let mut state = hub.state.lock().await;
+                if token.is_cancelled() {
+                    return;
+                }
+                state.recovery = None;
+                if state.shutting_down
+                    || state.input.is_some()
+                    || !(state.login_restart || hub.streams_need_connection())
+                {
+                    return;
+                }
+                state.begin_generation()
+            };
+            hub.spawn_runtime(runtime);
+        });
+    }
+
+    /// Opens a v2 stream (protocol §5.1). While a generation reads its
+    /// inputs, it registers the subscription under the bridge guard; with
+    /// none, the subscription is aligned from the published cut, and a
+    /// session it follows starts the next connection (Q2).
+    async fn subscribe(self: &Arc<Self>, scopes: Vec<Subscribed>) -> Option<Subscription> {
+        let input = {
+            let state = self.state.lock().await;
+            if state.shutting_down {
+                return None;
+            }
+            state.input.clone()
+        };
+        #[cfg(test)]
+        {
+            let pause = self.after_subscribe_input.lock().unwrap().take();
+            if let Some((reached, resume)) = pause {
+                let _ = reached.send(());
+                resume
+                    .await
+                    .expect("the generation-race test releases its pause");
+            }
+        }
+        // The input the request took, then the current generation's when
+        // that one went with the old generation.
+        let mut attempt = input;
+        let mut failed: Option<mpsc::UnboundedSender<bridge::BridgeInput>> = None;
+        loop {
+            if let Some(current) = attempt.take() {
+                let (reply, subscribed) = oneshot::channel();
+                if current
+                    .send(bridge::BridgeInput::Subscribe {
+                        scopes: scopes.clone(),
+                        reply,
+                    })
+                    .is_ok()
+                    && let Ok(subscription) = subscribed.await
+                {
+                    return Some(subscription);
+                }
+                failed = Some(current);
+            }
+            let subscription = {
+                let state = self.state.lock().await;
+                if state.shutting_down {
+                    return None;
+                }
+                match (&state.input, &failed) {
+                    // A generation started after the input the request
+                    // took: it registers the subscription and serves it.
+                    (Some(current), Some(old)) if !current.same_channel(old) => {
+                        attempt = Some(current.clone());
+                        continue;
+                    }
+                    (Some(current), None) => {
+                        attempt = Some(current.clone());
+                        continue;
+                    }
+                    // No generation, or the ending one: the subscription
+                    // registers from the published cut; the next generation
+                    // serves it once it is ready.
+                    _ => {
+                        let published = &mut *self.publication.lock();
+                        published.hub.subscribe(&published.publisher, &scopes)
+                    }
+                }
+            };
+            // Both guards are released before recovery reads them again.
+            self.recover().await;
+            return Some(subscription);
         }
     }
 
@@ -1229,8 +1379,9 @@ impl BridgeHub {
         } = runtime;
         let options = self.options.clone();
         let (runtime_done_tx, runtime_done_rx) = oneshot::channel();
+        let publication = self.publication.clone();
         tokio::spawn(async move {
-            bridge::run_with_cancellation(options, input, event_tx, cancellation).await;
+            bridge::run_publishing(options, input, event_tx, cancellation, publication).await;
             let _ = runtime_done_tx.send(());
         });
 
@@ -1374,7 +1525,11 @@ impl BridgeHub {
                     }
                     state.bootstrap.update(&event);
                     publish_to_global_subscribers(&mut state, &event);
-                    restart.then(|| state.cancellation.clone()).flatten()
+                    let cancellation = restart.then(|| state.cancellation.clone()).flatten();
+                    if cancellation.is_some() {
+                        state.login_restart = true;
+                    }
+                    cancellation
                 };
                 if let Some(cancellation) = restart_input {
                     cancellation.cancel();
@@ -1391,7 +1546,7 @@ impl BridgeHub {
         }
     }
 
-    async fn finish_generation(&self, generation: u64) {
+    async fn finish_generation(self: &Arc<Self>, generation: u64) {
         let (global_subscribers, session_subscribers) = {
             let mut state = self.state.lock().await;
             if state.generation != generation {
@@ -1399,6 +1554,16 @@ impl BridgeHub {
             }
             state.input = None;
             state.cancellation = None;
+            // A connection that became ready recovers at once; attempts that
+            // never did back off.
+            state.recovery_backoff = if state.bootstrap.initialized.is_some() {
+                Duration::ZERO
+            } else {
+                state
+                    .recovery_backoff
+                    .saturating_mul(2)
+                    .clamp(RECOVERY_INITIAL_BACKOFF, RECOVERY_MAX_BACKOFF)
+            };
             // The ended epoch's projections and subscriber backlogs belong to
             // it; keeping them would pin obsolete payloads past teardown. The
             // bootstrap marker stays: it records the last lifecycle phase, not
@@ -1413,6 +1578,8 @@ impl BridgeHub {
         drop(global_subscribers);
         drop(session_subscribers);
         self.stopped.notify_waiters();
+        // The generation's final commit is published: the next one may start.
+        self.recover().await;
     }
 
     #[cfg(test)]
@@ -1542,26 +1709,30 @@ impl BridgeHub {
         let cancellation = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
+            if let Some(recovery) = state.recovery.take() {
+                recovery.cancel();
+            }
             // Event streams must finish before HTTP graceful draining can
             // complete, including when no Agent runtime is currently active.
             state.global_subscribers.clear();
             state.session_subscribers.clear();
             state.cancellation.clone()
         };
-        let Some(cancellation) = cancellation else {
-            return;
-        };
-        cancellation.cancel();
-        let wait = async {
-            loop {
-                let stopped = self.stopped.notified();
-                if self.state.lock().await.input.is_none() {
-                    return;
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            let wait = async {
+                loop {
+                    let stopped = self.stopped.notified();
+                    if self.state.lock().await.input.is_none() {
+                        return;
+                    }
+                    stopped.await;
                 }
-                stopped.await;
-            }
-        };
-        let _ = tokio::time::timeout(BRIDGE_SHUTDOWN_GRACE_PERIOD, wait).await;
+            };
+            let _ = tokio::time::timeout(BRIDGE_SHUTDOWN_GRACE_PERIOD, wait).await;
+        }
+        // The v2 streams deliver the final commit, then end.
+        self.publication.lock().hub.close();
     }
 }
 
@@ -1585,7 +1756,7 @@ async fn forward_generation_events(
                 hub.publish(generation, event).await;
             }
             _ = &mut runtime_done => {
-                // run_with_cancellation emits its terminal phase before it
+                // run_publishing emits its terminal phase before it
                 // returns. Drain everything already queued, then ignore any
                 // leaked/late sender from this completed generation.
                 while let Ok(event) = events.try_recv() {
@@ -1734,6 +1905,8 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         // Event streams and frontend/HMR proxying are added after this layer.
         .route_layer(middleware::from_fn(enforce_json_request_timeout))
         .route("/api/v1/events", get(global_events))
+        .route("/api/v2/stream", get(protocol_stream))
+        .route("/api/v2/scopes/{*scope}", get(read_scope))
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
@@ -1847,6 +2020,61 @@ async fn global_events(State(state): State<AppState>) -> Response {
     );
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// A protocol error body `{ error: { code, message } }` (protocol §9).
+fn protocol_error(status: StatusCode, error: ProtocolError) -> Response {
+    (status, axum::Json(json!({ "error": error }))).into_response()
+}
+
+/// `GET /api/v2/scopes/{scope}` (protocol §8): the published document. It
+/// starts, loads and holds nothing; an unknown log is omitted.
+async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) -> Response {
+    if Scope::parse(&scope).is_none() {
+        return protocol_error(
+            StatusCode::BAD_REQUEST,
+            ProtocolError::new(ErrorCode::InvalidRequest, format!("no scope {scope}")),
+        );
+    }
+    let document = state.bridge.publication.lock().publisher.document(&scope);
+    let Some(document) = document else {
+        return protocol_error(
+            StatusCode::NOT_FOUND,
+            ProtocolError::new(ErrorCode::NotFound, format!("{scope} is not held")),
+        );
+    };
+    let mut body = json!({ "live": document.live });
+    if let Some(log) = document.log {
+        body["log"] = json!(log);
+    }
+    axum::Json(body).into_response()
+}
+
+/// `GET /api/v2/stream` (protocol §5): the events of the scopes it follows,
+/// without SSE ids, with a heartbeat while idle. Dropping the body closes
+/// the subscription.
+async fn protocol_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -> Response {
+    let scopes = match crate::protocol::hub::parse_stream_query(query.as_deref().unwrap_or("")) {
+        Ok(scopes) => scopes,
+        Err(error) => return protocol_error(StatusCode::BAD_REQUEST, error),
+    };
+    let Some(subscription) = state.bridge.subscribe(scopes).await else {
+        return protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
+        );
+    };
+    let stream = futures::stream::unfold(subscription, |subscription| async move {
+        let event = subscription.next().await?;
+        let data = serde_json::to_string(&event).expect("a protocol event serializes");
+        Some((
+            Ok::<_, Infallible>(SseEvent::default().data(data)),
+            subscription,
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(HEARTBEAT))
         .into_response()
 }
 
@@ -2967,6 +3195,8 @@ mod delivery_handoff_tests;
 mod request_timeout_tests;
 #[cfg(test)]
 mod session_presentation_tests;
+#[cfg(test)]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests {

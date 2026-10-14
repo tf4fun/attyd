@@ -300,6 +300,8 @@ async fn review_filesystem_setup_failure_publishes_final_agent_error() {
     let state = retained.lock().await;
     let global = state
         .protocol
+        .publication
+        .lock()
         .publisher
         .document("global")
         .expect("initial global published");
