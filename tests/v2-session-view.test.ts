@@ -131,6 +131,43 @@ describe("bridgeSessionView", () => {
   });
 });
 
+describe("watched processes", () => {
+  it("takes the final answer from history when the last watched overlay lacked it", () => {
+    const processes = new ObservedProcesses();
+    // The final chunk and the commit arrived in one entry.
+    const running = sessionState({
+      turn: { operationId: "op1", clientIntentId: "k1", prompt: [{ type: "text", text: "q" }], updates: [tool("c1", "read")], cancelRequested: false },
+    });
+    const committed = sessionState({
+      history: { revision: "r2", phase: "ready", error: null, notice: null, timeline: [user("q"), agent("final")], collapsedTurns: [
+        { turnId: "t1", operationId: "op1", beforeUpdate: 0, afterUpdate: 2, processCount: 1, visibleRanges: [{ start: 0, end: 1 }, { start: 1, end: 2 }] },
+      ] },
+    });
+    processes.observe(undefined, running);
+    processes.observe(running, committed);
+    const view = bridgeSessionView(committed, "e1", 2, processes);
+    expect(view.timeline).toEqual([user("q"), tool("c1", "read"), agent("final")]);
+    expect(view.collapsedTurns![0]).toMatchObject({ processIncluded: true, visibleRanges: [{ start: 0, end: 1 }, { start: 2, end: 3 }] });
+  });
+
+  it("falls back to the page when the watched overlay misses process entries", () => {
+    const processes = new ObservedProcesses();
+    const running = sessionState({
+      turn: { operationId: "op1", clientIntentId: "k1", prompt: [], updates: [], cancelRequested: false },
+    });
+    const committed = sessionState({
+      history: { revision: "r2", phase: "ready", error: null, notice: null, timeline: [user("q"), agent("final")], collapsedTurns: [
+        { turnId: "t1", operationId: "op1", beforeUpdate: 0, afterUpdate: 2, processCount: 2, visibleRanges: [{ start: 0, end: 2 }] },
+      ] },
+    });
+    processes.observe(undefined, running);
+    processes.observe(running, committed);
+    const view = bridgeSessionView(committed, "e1", 2, processes);
+    expect(view.timeline).toBe(committed.history.timeline);
+    expect(view.collapsedTurns![0].processIncluded).toBe(false);
+  });
+});
+
 describe("turnUpdateDelta", () => {
   it("passes appended updates through", () => {
     const first = agent("a");

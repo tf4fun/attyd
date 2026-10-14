@@ -80,20 +80,23 @@ export function bridgeSessionView(
     cursor = turn.afterUpdate;
     const beforeUpdate = timeline.length;
     const compact = history.timeline.slice(turn.beforeUpdate, turn.afterUpdate);
-    const observed = processes?.get(history.revision, turn.turnId);
+    const watched = processes?.get(history.revision, turn.turnId);
+    // The watched overlay supplies the process; the committed history stays
+    // the authority for the prompt and the final answer, which the last
+    // overlay this client saw may not have held yet.
+    const process = watched?.slice(leadingPrompt(watched).length).slice(0, turn.processCount);
+    const observed = process != null && process.length === turn.processCount ? process : undefined;
     let visibleRanges = shift(turn, beforeUpdate - turn.beforeUpdate);
     if (observed == null) {
       timeline.push(...compact);
     } else {
       expanded = true;
-      const echoed = observed[0]?.sessionUpdate === "user_message_chunk";
-      const prompt = echoed ? [] : leadingPrompt(compact);
-      timeline.push(...prompt, ...observed);
-      const promptLength = echoed ? leadingPrompt(observed).length : prompt.length;
-      const output = compact.length - leadingPrompt(compact).length;
+      const prompt = leadingPrompt(compact);
+      const output = compact.slice(prompt.length);
+      timeline.push(...prompt, ...observed, ...output);
       visibleRanges = [
-        ...(promptLength > 0 ? [{ start: beforeUpdate, end: beforeUpdate + promptLength }] : []),
-        ...(output > 0 ? [{ start: timeline.length - output, end: timeline.length }] : []),
+        ...(prompt.length > 0 ? [{ start: beforeUpdate, end: beforeUpdate + prompt.length }] : []),
+        ...(output.length > 0 ? [{ start: timeline.length - output.length, end: timeline.length }] : []),
       ];
     }
     const afterUpdate = timeline.length;
