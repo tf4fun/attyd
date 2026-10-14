@@ -16,8 +16,11 @@ fn assert_close(request: &Value) {
 }
 
 async fn refused_close_has_no_automatic_retry(timeout_seconds: i64) {
-    let mut agent =
-        TestAgent::start(timeout_seconds, json!({"sessionCapabilities":{"close":{}}})).await;
+    let mut agent = TestAgent::start(
+        timeout_seconds,
+        json!({"loadSession": true, "sessionCapabilities":{"close":{}}}),
+    )
+    .await;
     create_close_session(&mut agent).await;
     let close = agent
         .request_within(Duration::from_secs(timeout_seconds as u64 + 1))
@@ -50,7 +53,11 @@ async fn idle_retirement_refused_close_does_not_restart_the_timeout() {
 
 #[tokio::test(start_paused = true)]
 async fn idle_retirement_successful_close_retires_once() {
-    let mut agent = TestAgent::start(30, json!({"sessionCapabilities":{"close":{}}})).await;
+    let mut agent = TestAgent::start(
+        30,
+        json!({"loadSession": true, "sessionCapabilities":{"close":{}}}),
+    )
+    .await;
     create_close_session(&mut agent).await;
     let close = agent
         .request_within(Duration::from_secs(31))
@@ -70,7 +77,11 @@ async fn idle_retirement_successful_close_retires_once() {
 
 #[tokio::test(start_paused = true)]
 async fn idle_retirement_refused_close_preserves_turns_and_rearms_after_observation() {
-    let mut agent = TestAgent::start(30, json!({"sessionCapabilities":{"close":{}}})).await;
+    let mut agent = TestAgent::start(
+        30,
+        json!({"loadSession": true, "sessionCapabilities":{"close":{}}}),
+    )
+    .await;
     let created = create_close_session(&mut agent).await;
     let close = agent
         .request_within(Duration::from_secs(31))
