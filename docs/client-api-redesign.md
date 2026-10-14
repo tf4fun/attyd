@@ -1,7 +1,8 @@
 # Client API redesign
 
-Status: proposal for review, 2026-10-14 (fifth version). It replaces the client
-protocol of [protocol.md](protocol.md) (v2) and the replication rules of
+Status: proposal for final confirmation, 2026-10-14 (sixth version). §3 is the
+complete rule set; the later sections specify and derive from it. It replaces the
+client protocol of [protocol.md](protocol.md) (v2) and the replication rules of
 [state-sync.md](state-sync.md). Nothing here is implemented yet. The review that
 led here is recorded in [protocol-v2-review.md](protocol-v2-review.md) and in the
 comments of PR #35.
@@ -45,6 +46,12 @@ is the authority for clients; the ACP server is the authority behind it.
 
 ## 3. Rules
 
+The rules come in two groups: S1–S7 bind the bridge and the shape of the
+documents, and C1–C3 bind clients. Every behavior in §4–§8 follows from them; §3.3
+lists the main derivations.
+
+### 3.1 Bridge rules
+
 **S1 Document.** Every scope is one document with two parts: `log`, an append-only
 sequence of entries, and `live`, one JSON value. Each log entry has a chain hash
 `h_i = H(h_{i-1} ‖ canon(entry_i))`, with `h_0` fixed. A session scope's log is
@@ -68,8 +75,8 @@ status, … }`. The bridge generates `id` at random and never reuses it. An
 operation's ID identifies it and is what writes are admitted against; it says
 nothing about what a replica has seen.
 
-**S5 Admission.** Every operation write names `expect`, an operation ID, and the bridge
-handles writes and loads one at a time:
+**S5 Admission.** Every operation write names `expect`, an operation ID, and the
+bridge handles writes and loads one at a time:
 
 - a write that **starts an operation** is admitted when `expect` equals `op.id`,
   `op` has ended, and every other scope the operation acts on is free (below); the
@@ -88,11 +95,49 @@ to it, an operation occupies it, or a terminal or URL flow of it is alive. It ma
 release a session that is not needed only if the Agent can load it again; a
 session it cannot load again stays held until it is deleted or the Agent
 connection ends. Subscribing to a session the bridge does not hold makes the bridge
-hold it, which starts a `load` operation.
+hold it, which starts a `load` operation. A one-off read holds nothing.
 
-A client's presentation is a pure function of `log`, `live` and its own UI state
-(drafts, queued input, disclosure, scroll position). UI state never enters the
-protocol.
+**S7 Resources.** Terminals and URL flows are resources. They live in their
+scope's `live` by their own lifecycle; every scope has `urlFlows`. An operation's
+end clears its pending interactions but ends no resource it created. A URL flow is
+removed when the Agent completes it, a client dismisses it, or its scope or the
+Agent connection ends. A terminal is removed when the Agent releases it (a terminal
+login when it has exited and a client dismisses it), or its scope or the Agent
+connection ends. Resource actions (input, resize, dismiss) address a resource
+by its ID, take no `expect` and fall outside S5. Each states its repeat semantics:
+dismiss has no further effect, resize to the same size leaves the same state, and
+input is not idempotent: it is written in order, every time.
+
+### 3.2 Client rules
+
+**C1 Projection.** A client's presentation is a pure function of `log`, `live` and
+its own UI state (drafts, queued input, disclosure, scroll position). UI state
+never enters the protocol, and the client holds no authoritative state.
+
+**C2 Refusal.** A refused write leaves its input in the client, for the user to
+submit again once the replica is in sync. Queued input that was never sent, or that
+was refused with a definite answer, may be submitted automatically once the
+replica shows the operation ended, naming that operation.
+
+**C3 Uncertainty.** A write or terminal input that was sent without a definite
+answer may have taken effect; a later `stale` proves nothing. The client never
+resends it automatically, with a new `expect` or otherwise. It keeps the input for
+the user to judge.
+
+### 3.3 Derivations
+
+| Behavior | From |
+| --- | --- |
+| Open, reconnect, a slow subscriber, a replaced stream, a bridge restart and a reopen are all one alignment | S3 |
+| After a reopen, a matching history is kept; a diverged one is truncated and the bridge's installed | S1, S3 |
+| No event shows a committed entry beside its own process | S2, S3 |
+| A concurrent write, a resend after a lost response and a fork resend get `stale` | S4, S5 |
+| Delete never races a prompt on the same session, nor a load triggered by subscription | S5 |
+| A result is the final `op`; no request records, intent tables or result ledgers | S4 |
+| Interactions of every operation, reads included, are answered the same way | S4, S5 |
+| A session released before its first subscription is loaded again; one that cannot be loaded is never released | S6 |
+| An accepted URL flow survives its operation and a client reload, and stops holding its session once removed | S6, S7 |
+| A lost response never turns into a duplicate prompt, fork or terminal input | S5, C3 |
 
 ## 4. Documents
 
@@ -174,8 +219,9 @@ interface CatalogLive extends ScopeLive {
 
 ### 4.3 Resources
 
-Terminals and URL flows are **resources**: they live in their scope's `live` by
-their own lifecycle, not by the lifecycle of the operation that created them.
+This section specifies S7. Terminals and URL flows are **resources**: they live in
+their scope's `live` by their own lifecycle, not by the lifecycle of the operation
+that created them.
 
 - **An operation's end** clears its pending interactions. It does not end the
   resources it created.
@@ -316,7 +362,7 @@ only on the user's request.
   POST /api/v2/scopes/{scope}/resources/{id}/{action}
   ```
 
-  They never wait for a client and fall outside S5. The resource ID identifies the
+  They never wait for a client and fall outside S5 (S7). The resource ID identifies the
   resource, not one action on it, so each action states its own repeat semantics:
 
   | Action | Repeated |
@@ -375,6 +421,8 @@ POST /api/v2/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": 
   results is needed.
 
 ### 6.4 Client obligations
+
+This section applies C2 and C3 to writes.
 
 - **Refused input stays in the client.** The prompt, answers or control change
   remain, for the user to submit again once the replica is in sync.
@@ -524,7 +572,7 @@ consistency is checked after **every** event, not only once synchronization ends
     - A prompt on a held session racing its delete is refused.
     - A subscription to an unheld session during its delete gets `end: deleted`,
       or its load after a failed delete.
-11. **URL flows (§4.3).**
+11. **URL flows (S7).**
     - A URL flow of `global` (authenticate), of `catalog` (`list`) and of a
       session survives a reload of the client between accept and completion.
     - It is removed on the Agent's completion, on a client's dismissal (also when
@@ -542,10 +590,10 @@ consistency is checked after **every** event, not only once synchronization ends
     `live`, and stop being readable once only a released process referenced them.
 14. **Delete (§6.1).** Delete of a held session ends its scope with `deleted`; a
     failed delete leaves its error on `global.op`.
-15. **Client obligations (§6.4).** After a write without a definite answer, the
+15. **Client obligations (C2, C3).** After a write without a definite answer, the
     client does not resubmit it with a new `expect` when it later sees `stale`;
     never-sent and definitely refused queued input is resubmitted.
-16. **Terminal input (§6.1, §6.4).** Input that the bridge wrote but whose
+16. **Terminal input (S7, C3).** Input that the bridge wrote but whose
     response was lost is not resent by the client; the same text typed again by the
     user is delivered as new input. Repeated dismissal and repeated resize to the
     same size leave the same state.
