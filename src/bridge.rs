@@ -9343,7 +9343,7 @@ mod tests {
         register_test_session(&mut bridge, "session", "/workspace");
         start_test_turn(&mut bridge, "session", "prompt").unwrap();
         bridge.published_runtime_seq = bridge.sessions.seq();
-        let state = Arc::new(Mutex::new(bridge));
+        let state = Arc::new(BridgeLock::new(bridge));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let invalid: SessionNotification = serde_json::from_value(json!({
@@ -9408,7 +9408,7 @@ mod tests {
             .unwrap()
             .session["modes"] = json!({ "currentModeId": "build" });
         bridge_state.published_runtime_seq = bridge_state.sessions.seq();
-        let state = Arc::new(Mutex::new(bridge_state));
+        let state = Arc::new(BridgeLock::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let answer: SessionNotification = serde_json::from_value(json!({
@@ -9504,7 +9504,7 @@ mod tests {
             .revision()
             .to_string();
         let before = bridge_state.sessions.snapshot();
-        let state = Arc::new(Mutex::new(bridge_state));
+        let state = Arc::new(BridgeLock::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let late: SessionNotification = serde_json::from_value(json!({
@@ -9559,7 +9559,7 @@ mod tests {
                 register_created_terminal_locked(&mut bridge, &sink, &owner, "terminal").unwrap();
             }
             while rx.try_recv().is_ok() {}
-            let state = Arc::new(Mutex::new(bridge));
+            let state = Arc::new(BridgeLock::new(bridge));
             let notification = serde_json::from_value(json!({
                 "sessionId": "session",
                 "update": {
@@ -9675,7 +9675,7 @@ mod tests {
         let validation =
             ensure_session_validation(&mut bridge_state, "session", incarnation).unwrap();
         validate_and_track_session_update(validation, &json!({ "sessionUpdate": "compaction_update", "compactionId": "original", "status": "in_progress" })).unwrap();
-        let state = Arc::new(Mutex::new(bridge_state));
+        let state = Arc::new(BridgeLock::new(bridge_state));
         reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
             .await
             .unwrap();
@@ -9732,7 +9732,7 @@ mod tests {
             .is_err()
         );
         assert!(reserve_deletion(&mut state, "session", "delete").is_err());
-        let state = Arc::new(Mutex::new(state));
+        let state = Arc::new(BridgeLock::new(state));
         assert!(
             reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
                 .await
@@ -9896,7 +9896,7 @@ mod tests {
             waiters: Vec::new(),
             cancellation: cancellation.clone(),
         });
-        let state = Arc::new(Mutex::new(bridge));
+        let state = Arc::new(BridgeLock::new(bridge));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         for session_id in ["cold", "another-cold"] {
@@ -9973,7 +9973,7 @@ mod tests {
             incarnation: None,
             allocation: staging.validation.allocation.clone(),
         };
-        let state = Arc::new(Mutex::new(bridge));
+        let state = Arc::new(BridgeLock::new(bridge));
         let reservation = reserve_attachment_with_cwd(
             "session",
             RuntimeSessionOperationKind::Load,
@@ -10077,7 +10077,7 @@ mod tests {
             .begin_load("session", incarnation, "load")
             .unwrap();
         clear_attachment_delivery(&mut bridge_state, "session", incarnation);
-        let state = Arc::new(Mutex::new(bridge_state));
+        let state = Arc::new(BridgeLock::new(bridge_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let replay: SessionNotification = serde_json::from_value(json!({
@@ -10156,7 +10156,7 @@ mod tests {
     async fn invalid_same_session_reload_update_is_private_and_poisoned_for_rollback() {
         let mut bridge_state = BridgeState::default();
         let incarnation = register_test_session(&mut bridge_state, "session", "/workspace");
-        let state = Arc::new(Mutex::new(bridge_state));
+        let state = Arc::new(BridgeLock::new(bridge_state));
         reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
             .await
             .unwrap();
@@ -10367,7 +10367,7 @@ mod tests {
                 RuntimeSessionOperationKind::Load,
             )
             .unwrap();
-        let state = Arc::new(Mutex::new(bridge));
+        let state = Arc::new(BridgeLock::new(bridge));
         let (owner, filesystem) = require_session_workspace("session", &state, &filesystem)
             .await
             .unwrap();
@@ -10557,7 +10557,7 @@ mod tests {
     async fn reserves_an_idle_tracked_session_for_best_effort_authoritative_reload() {
         let mut bridge = BridgeState::default();
         let incarnation = register_test_session(&mut bridge, "session", "/agent/workspace");
-        let state = Arc::new(Mutex::new(bridge));
+        let state = Arc::new(BridgeLock::new(bridge));
         let reservation = reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
             .await
             .expect("an idle tracked session must reach the Agent's session/load implementation");
@@ -10817,7 +10817,7 @@ mod tests {
             .unwrap()
             .cancellation
             .clone();
-        let state = Arc::new(Mutex::new(bridge));
+        let state = Arc::new(BridgeLock::new(bridge));
         assert!(
             reserve_attachment_with_cwd(
                 "saved",
