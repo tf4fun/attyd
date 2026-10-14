@@ -137,7 +137,7 @@ pub(crate) fn reduce_messages(updates: &[Value]) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::new();
     let mut by_id = HashMap::new();
     // The message that a chunk without `messageId` may extend.
-    let mut open = None;
+    let mut open: Option<usize> = None;
     for update in updates {
         let Some(kind) = message_kind(update) else {
             continue;
