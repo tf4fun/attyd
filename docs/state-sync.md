@@ -57,8 +57,8 @@ ACP ──▶ bridge actor: transition ──▶ commit step ──────�
 - **Occupation.** An `occupied: HashMap<Scope, OpId>` records scopes an operation
   occupies besides its own (delete occupies `session/<id>`). A held occupied scope
   shows the occupying operation as its `op`.
-- **Turn log.** A held session keeps `TurnLog { entries: Vec<Arc<LogEntry>> }`,
-  appended by commits and rebuilt from a load's replay (§2.3).
+- **Turn log.** A held session keeps `TurnLog { entries: Vec<Arc<LogEntry>>,
+  attachments }`, appended by commits and rebuilt from a load's replay (§2.3).
 - **Holding need.** A session's need is computed, not stored: subscribers, occupation,
   or live resources (protocol S6).
 
@@ -94,17 +94,21 @@ lock's mutable guard is released (as in the earlier draft):
 **`canon` and hashing** live in `src/protocol/canon.rs`:
 
 - `reduce_messages(&[SessionUpdate]) -> Vec<Message>` applies protocol §3.2 step 1;
-- `turns(messages) -> Vec<Turn>` applies step 2;
-- `normalize(&[ContentBlock]) -> Vec<Block>` applies step 3, where `Block` is the
-  protocol's normalized content (text, resource links and `AttachmentRef`), a
-  bridge DTO rather than an ACP type;
-- `resolve(&[PromptBlock]) -> Vec<ContentBlock>` turns a prompt's references back
-  into the ACP blocks they name, before `session/prompt`;
-- `chain(prev, &Turn) -> Hash` hashes the JCS serialization.
+- `turns(messages) -> Vec<TurnContent>` applies step 2;
+- `normalize(&[ContentBlock], &mut Attachments) -> Vec<Block>` applies step 3,
+  where `Block` is the protocol's normalized content (text, resource links and
+  `AttachmentRef`), a bridge DTO rather than an ACP type; it keeps each referenced
+  block in the attachment table;
+- `resolve(&[PromptBlock], &Attachments) -> Result<Vec<ContentBlock>, UnknownAttachment>`
+  turns a prompt's references back into the ACP blocks they name, before
+  `session/prompt`;
+- `chain(&ChainHash, &Turn) -> ChainHash` hashes the JCS serialization
+  (`canonical_json`).
 
-A live commit builds the turn from the operation's prompt and the turn's Agent
-messages; a load builds every turn from the replay. Both go through the same
-functions, so the same messages give the same entry (acceptance 1).
+`TurnLog::commit(prompt, updates)` builds a live turn from the prompt sent in
+`session/prompt` and the Agent messages among the turn's updates;
+`TurnLog::from_replay(updates)` builds every turn from a replay. Both go through
+the same functions, so the same messages give the same entry (acceptance 1).
 
 Attachment references in entries point at blocks the session keeps in an attachment
 table keyed by ID, counted by references from the log and from `live`. A block whose

@@ -6,8 +6,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Entries (protocol §3.1)
@@ -94,7 +97,7 @@ pub(crate) struct LogEntry {
 // ---------------------------------------------------------------------------
 // `canon` (protocol §3.2)
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MessageKind {
     User,
     Agent,
@@ -131,21 +134,138 @@ pub(crate) struct UnknownAttachment(pub String);
 /// Step 1: reduces message chunks to logical messages. Every other update is
 /// skipped and does not separate chunks.
 pub(crate) fn reduce_messages(updates: &[Value]) -> Vec<Message> {
-    let _ = updates;
-    todo!("protocol §3.2 step 1")
+    let mut messages = Vec::new();
+    let mut by_id = HashMap::new();
+    // The message that a chunk without `messageId` may extend.
+    let mut open = None;
+    for update in updates {
+        let Some(kind) = message_kind(update) else {
+            continue;
+        };
+        let Some(content) = update.get("content") else {
+            continue;
+        };
+        let index = match update.get("messageId").and_then(Value::as_str) {
+            Some(id) => {
+                open = None;
+                *by_id
+                    .entry((kind, id))
+                    .or_insert_with(|| start_message(&mut messages, kind))
+            }
+            None => match open {
+                Some(index) if messages[index].kind == kind => index,
+                _ => *open.insert(start_message(&mut messages, kind)),
+            },
+        };
+        messages[index].content.push(content.clone());
+    }
+    messages
+}
+
+fn message_kind(update: &Value) -> Option<MessageKind> {
+    match update.get("sessionUpdate")?.as_str()? {
+        "user_message_chunk" => Some(MessageKind::User),
+        "agent_message_chunk" => Some(MessageKind::Agent),
+        _ => None,
+    }
+}
+
+fn start_message(messages: &mut Vec<Message>, kind: MessageKind) -> usize {
+    messages.push(Message {
+        kind,
+        content: Vec::new(),
+    });
+    messages.len() - 1
 }
 
 /// Step 2: groups messages into turns. A user message starts a turn; Agent
 /// messages before the first one form a turn with an empty prompt.
 pub(crate) fn turns(messages: Vec<Message>) -> Vec<TurnContent> {
-    let _ = messages;
-    todo!("protocol §3.2 step 2")
+    let mut turns: Vec<TurnContent> = Vec::new();
+    for message in messages {
+        match (message.kind, turns.last_mut()) {
+            (MessageKind::Agent, Some(turn)) => turn.reply.extend(message.content),
+            (MessageKind::Agent, None) => turns.push(TurnContent {
+                prompt: Vec::new(),
+                reply: message.content,
+            }),
+            (MessageKind::User, _) => turns.push(TurnContent {
+                prompt: message.content,
+                reply: Vec::new(),
+            }),
+        }
+    }
+    turns
 }
 
 /// Step 3: normalizes content, keeping each attachment's block in `attachments`.
 pub(crate) fn normalize(blocks: &[Value], attachments: &mut Attachments) -> Vec<Block> {
-    let _ = (blocks, attachments);
-    todo!("protocol §3.2 step 3")
+    let mut normalized: Vec<Block> = Vec::new();
+    for block in blocks {
+        let block = without_meta(block);
+        let block_type = block["type"].as_str().unwrap_or_default().to_owned();
+        let kind = match block_type.as_str() {
+            "text" => {
+                if let Some(Block::Content(previous)) = normalized.last_mut()
+                    && previous["type"] == "text"
+                    && let Some(Value::String(text)) = previous.get_mut("text")
+                {
+                    text.push_str(block["text"].as_str().unwrap_or_default());
+                } else {
+                    normalized.push(Block::Content(block));
+                }
+                continue;
+            }
+            "resource_link" => {
+                normalized.push(Block::Content(block));
+                continue;
+            }
+            "image" => AttachmentKind::Image,
+            "audio" => AttachmentKind::Audio,
+            "resource" => AttachmentKind::Resource,
+            // Not content the protocol carries.
+            _ => continue,
+        };
+        let source = match kind {
+            AttachmentKind::Resource => &block["resource"],
+            AttachmentKind::Image | AttachmentKind::Audio => &block,
+        };
+        let mime_type = source["mimeType"].as_str().map(String::from);
+        let uri = match kind {
+            AttachmentKind::Resource => source["uri"].as_str().map(String::from),
+            AttachmentKind::Image | AttachmentKind::Audio => None,
+        };
+        let id = Sha256::digest(canonical_json(&block))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        attachments
+            .0
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(block));
+        normalized.push(Block::Attachment(AttachmentRef {
+            r#type: AttachmentTag::Attachment,
+            id,
+            block: kind,
+            mime_type,
+            uri,
+        }));
+    }
+    normalized
+}
+
+/// Drops `_meta` at every level.
+fn without_meta(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| *key != "_meta")
+                .map(|(key, value)| (key.clone(), without_meta(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_meta).collect()),
+        value => value.clone(),
+    }
 }
 
 /// Turns a prompt's attachment references back into the blocks they name, before
@@ -154,14 +274,117 @@ pub(crate) fn resolve(
     prompt: &[PromptBlock],
     attachments: &Attachments,
 ) -> Result<Vec<Value>, UnknownAttachment> {
-    let _ = (prompt, attachments);
-    todo!("protocol §6.2")
+    prompt
+        .iter()
+        .map(|block| match block {
+            PromptBlock::Attachment(reference) => attachments
+                .get(&reference.id)
+                .cloned()
+                .ok_or_else(|| UnknownAttachment(reference.id.clone())),
+            PromptBlock::Content(block) => Ok(block.clone()),
+        })
+        .collect()
 }
 
 /// RFC 8785 (JCS) serialization.
 pub(crate) fn canonical_json(value: &Value) -> Vec<u8> {
-    let _ = value;
-    todo!("RFC 8785")
+    let mut out = Vec::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+fn write_canonical(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(value) => {
+            out.extend_from_slice(if *value { "true" } else { "false" }.as_bytes())
+        }
+        Value::Number(number) => out.extend_from_slice(canonical_number(number).as_bytes()),
+        Value::String(text) => write_string(text, out),
+        Value::Array(items) => {
+            out.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(b']');
+        }
+        Value::Object(map) => {
+            // Keys are ordered by their UTF-16 code units.
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+            out.push(b'{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_string(key, out);
+                out.push(b':');
+                write_canonical(value, out);
+            }
+            out.push(b'}');
+        }
+    }
+}
+
+fn write_string(text: &str, out: &mut Vec<u8>) {
+    out.push(b'"');
+    for c in text.chars() {
+        match c {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\u{8}' => out.extend_from_slice(b"\\b"),
+            '\u{c}' => out.extend_from_slice(b"\\f"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            c if c < ' ' => out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes()),
+            c => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    out.push(b'"');
+}
+
+/// A number as ECMAScript's `Number.prototype.toString` writes the double.
+fn canonical_number(number: &serde_json::Number) -> String {
+    const EXACT: i64 = 1 << 53;
+    if let Some(integer) = number.as_i64()
+        && (-EXACT..=EXACT).contains(&integer)
+    {
+        return integer.to_string();
+    }
+    let value = number.as_f64().expect("JSON numbers are finite");
+    if value == 0.0 {
+        return "0".into();
+    }
+    let sign = if value < 0.0 { "-" } else { "" };
+    // The shortest digits that round-trip, as `d.ddde<exponent>`.
+    let scientific = format!("{:e}", value.abs());
+    let (mantissa, exponent) = scientific.split_once('e').expect("exponent form");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let n = exponent.parse::<i32>().expect("exponent") + 1;
+    let body = if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        let (whole, fraction) = digits.split_at(n as usize);
+        format!("{whole}.{fraction}")
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat(-n as usize))
+    } else {
+        let exponent = n - 1;
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        let (first, rest) = digits.split_at(1);
+        let fraction = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(".{rest}")
+        };
+        format!("{first}{fraction}e{exponent_sign}{}", exponent.abs())
+    };
+    format!("{sign}{body}")
 }
 
 // ---------------------------------------------------------------------------
@@ -176,14 +399,17 @@ impl ChainHash {
     pub(crate) const ZERO: Self = Self([0; 32]);
 
     pub(crate) fn wire(&self) -> String {
-        todo!("protocol §3.3")
+        URL_SAFE_NO_PAD.encode(&self.0[..16])
     }
 }
 
 /// `h_i = SHA-256(h_{i-1} ‖ JCS(turn_i))`.
 pub(crate) fn chain(prev: &ChainHash, turn: &Turn) -> ChainHash {
-    let _ = (prev, turn);
-    todo!("protocol §3.3")
+    let turn = serde_json::to_value(turn).expect("turns serialize");
+    let mut hasher = Sha256::new();
+    hasher.update(prev.0);
+    hasher.update(canonical_json(&turn));
+    ChainHash(hasher.finalize().into())
 }
 
 // ---------------------------------------------------------------------------
@@ -200,16 +426,45 @@ pub(crate) struct TurnLog {
 impl TurnLog {
     /// Builds every turn of a `session/load` or `session/resume` replay.
     pub(crate) fn from_replay(updates: &[Value]) -> Self {
-        let _ = updates;
-        todo!("docs/state-sync.md §2.3")
+        let mut log = Self::default();
+        for turn in turns(reduce_messages(updates)) {
+            log.push(turn);
+        }
+        log
     }
 
     /// Appends a completed live turn: `prompt` is what the bridge sent in
     /// `session/prompt`, `updates` are the turn's session updates. Only the
     /// Agent's messages among them form the reply.
     pub(crate) fn commit(&mut self, prompt: &[Value], updates: &[Value]) -> Arc<LogEntry> {
-        let _ = (prompt, updates);
-        todo!("docs/state-sync.md §2.3")
+        let reply = reduce_messages(updates)
+            .into_iter()
+            .filter(|message| message.kind == MessageKind::Agent)
+            .flat_map(|message| message.content)
+            .collect();
+        self.push(TurnContent {
+            prompt: prompt.to_vec(),
+            reply,
+        })
+    }
+
+    fn push(&mut self, content: TurnContent) -> Arc<LogEntry> {
+        let turn = Turn {
+            prompt: normalize(&content.prompt, &mut self.attachments),
+            reply: normalize(&content.reply, &mut self.attachments),
+        };
+        let prev = self
+            .entries
+            .last()
+            .map_or(ChainHash::ZERO, |entry| entry.digest);
+        let digest = chain(&prev, &turn);
+        let entry = Arc::new(LogEntry {
+            turn,
+            hash: digest.wire(),
+            digest,
+        });
+        self.entries.push(Arc::clone(&entry));
+        entry
     }
 
     pub(crate) fn entries(&self) -> &[Arc<LogEntry>] {

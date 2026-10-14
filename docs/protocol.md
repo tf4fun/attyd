@@ -145,8 +145,9 @@ from a `session/load` or `session/resume` replay apply the same steps.
 1. **Messages.** `user_message_chunk` and `agent_message_chunk` updates are reduced
    to logical messages. Chunks of the same kind belong to one message when they
    carry the same `messageId`. Without `messageId`, they belong to one message when
-   they are consecutive, with only process updates (thoughts, tool calls, tool call
-   updates, plans) between them.
+   they are consecutive, with no other message chunk between them: process updates
+   (thoughts, tool calls, tool call updates, plans) and control updates do not
+   separate them.
 2. **Turns.** A user message starts a turn; for a live turn, the prompt is the
    operation's input. The Agent messages up to the next user message are its
    reply, concatenated in order. Agent messages before the first user message form

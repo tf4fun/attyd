@@ -168,8 +168,8 @@ type Block =               // normalized content: protocol §3.1
 1. **Messages.** Chunks are reduced to logical messages before anything else.
    Chunks of the same kind (`user_message_chunk` or `agent_message_chunk`) belong to
    one message when they carry the same `messageId`. Without `messageId`, they
-   belong to one message when they are consecutive, with only process updates
-   (thoughts, tool calls, plans) between them.
+   belong to one message when they are consecutive, with no other message chunk
+   between them; process and control updates do not separate them.
 2. **Turns.** A user message starts a turn. The Agent messages up to the next user
    message are its reply, concatenated in order. Process updates are not part of
    the entry.
