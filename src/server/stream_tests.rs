@@ -1674,3 +1674,57 @@ async fn review_an_http_transport_construction_error_is_published_to_v2() {
             .is_empty()
     );
 }
+
+/// Readiness must serve cold scopes registered during initialize as well as
+/// the held sessions inherited from the previous Agent connection.
+#[tokio::test]
+async fn review_a_cold_subscription_registered_during_initialize_is_served_after_reloads() {
+    let replay = turns(&[("one", "1")]);
+    let (mut server, old, mut keeper) = loaded(&replay).await;
+    old.close().await;
+    keeper
+        .until("session/saved", |event| mentions(event, "running"))
+        .await;
+
+    let mut next = server.agents.connect().await;
+    let initialize = next.request("initialize").await;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("scope", "session/new-cold")
+        .append_pair("cwd", &format!("session/new-cold:{CWD}"))
+        .finish();
+    let mut cold = server.stream(&query).await;
+    // The HTTP handshake only completes after the actor registers this
+    // subscription. Observe that registration before answering initialize;
+    // no sleep or a request captured from the previous generation is used.
+    wait_subscribers(&server.hub, "new-cold", 1).await;
+    assert_eq!(
+        server.read("session/new-cold").await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    next.reply(&initialize, initialized(json!({"loadSession": true})))
+        .await;
+    next.serve_load("saved", &replay).await;
+    keeper
+        .until("session/saved", |event| mentions(event, "completed"))
+        .await;
+    let (status, saved) = server.read("session/saved").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["live"]["op"]["status"], "completed");
+    keeper.assert_document("session/saved", &saved);
+
+    // Even after the inherited reload has succeeded, the new cold scope
+    // must start without another HTTP request, subscription or Agent event.
+    let load = next.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "new-cold", "{load}");
+    assert_eq!(load["params"]["cwd"], CWD, "{load}");
+    next.reply(&load, json!({})).await;
+    cold.until("session/new-cold", |event| mentions(event, "completed"))
+        .await;
+    let (status, document) = server.read("session/new-cold").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document["log"], json!([]));
+    cold.assert_document("session/new-cold", &document);
+    assert_eq!(server.agents.accepted(), 2);
+    server.hub.shutdown().await;
+}
