@@ -71,10 +71,10 @@ mechanism, and the reload is the fallback.
 
 ### 2.4 Consequences
 
-- Layer 1 needs no session incarnation. `(sessionId)` identifies the holding within
-  a log (§3.1).
+- Layer 1 needs no session incarnation. The session ID identifies the holding.
 - An ACP reconnect is an ordinary state change for clients (the agent's phase
-  changes; held sessions disappear and are loaded again), not a new client log.
+  changes; held sessions disappear and are loaded again), not something clients
+  must detect.
 - The incarnation-based isolation in the implementation (late-result ownership
   checks, per-incarnation resources, timers and retired tables) is no longer needed
   by the protocol. Removing it from `runtime_state`, `session_registry`, the
@@ -87,9 +87,10 @@ mechanism, and the reload is the fallback.
 A client is a read-only replica of the bridge's memory, like a MySQL replica. Its
 only goal is to hold the same data as the leader for the scopes it shows.
 
-- **Log.** Every state change commits one entry at `Position { epoch, seq }`.
-  `seq` increases by one per entry. **`epoch` identifies the log**: it changes only
-  when the bridge process starts a new log, not when the ACP connection changes.
+- **Log.** Every state change commits one entry at a position `seq` that increases
+  by one per entry. There is no `epoch`: clients care only about being in sync with
+  the bridge, not about which run of the bridge or which ACP connection produced the
+  state.
 - **Scopes.** `global`, and `session/<sessionId>` for a held session. Scopes are
   addressed by session ID only; there is no owner or incarnation.
 - **Stream.** `GET /api/v2/stream?scope=global&scope=session/<id>` delivers, for
@@ -99,11 +100,15 @@ only goal is to hold the same data as the leader for the scopes it shows.
 - **Continuity.** A stream carries a fixed set of scopes. Changing the set opens a
   new stream, which starts every scope with a snapshot. Continuity is checked on
   the stream's `seq` alone; no per-scope `prev`.
-- **Resume.** `Last-Event-ID: <epoch>:<seq>` in the current epoch resumes the
-  stream's suffix if it is still retained; otherwise every scope starts with a
-  snapshot. Another epoch always starts fresh.
-- **Lag.** For a slow subscriber the bridge may replace a scope's queued entries
-  with one snapshot at the latest position.
+- **Resume.** The SSE `id` is an opaque cursor that the bridge issued. `Last-Event-ID`
+  resumes the stream's suffix when the bridge still holds that log position;
+  otherwise every scope starts with a snapshot. The cursor is valid only for the log
+  that issued it, so a restarted bridge never mistakes an old cursor for one of its
+  own; clients never parse it.
+- **Compaction.** Like MySQL log compaction, the bridge may drop the intermediate
+  entries of a slow subscriber's queue (chunks, folded tool call updates, terminal
+  output steps) and send the consolidated data instead: one snapshot of the scope at
+  the latest position. Replicas never depend on seeing intermediate states.
 - **End.** When the bridge stops holding a session (or never held it), the scope
   gets `end`. The entry may carry an informational reason (`closed`, `deleted`,
   `retired`, `not_held`) for presentation; the replica's behavior does not depend
@@ -203,12 +208,20 @@ state machine.
 login running) and session creation. Global writes (open, create, authenticate,
 logout, start a terminal login) name `global.checkpoint`.
 
-- **Open** (`{ checkpoint, sessionId, cwd }`): asks the bridge to hold a session.
-  Accepted, `global.sessions[id]` appears in `loading`, and the client subscribes.
-  A session that is already held needs no write: the client subscribes directly.
-- **Create** and **fork** produce a session ID only when the Agent answers. The
-  state that holds the in-flight operation also holds its result (the new session
-  ID, or its error) once it finishes; see §6.
+- **Writes that bring a session into existence answer with it.** Open, create and
+  fork end in a held session or in a failure the client cannot get past, so their
+  response waits for that end:
+  - **Open** (`{ checkpoint, sessionId, cwd }`): asks the bridge to hold a session.
+    It answers with the held session at `idle` (`{ sessionId, checkpoint, at }`), or
+    with the load error. A load failure is the bridge's problem: the bridge cannot go
+    on, so neither can the client, and the error is returned explicitly rather than
+    kept as state. A session that is already held needs no write: the client
+    subscribes directly.
+  - **Create** (`{ checkpoint, cwd }`): answers with the new session at `idle`, or
+    the `session/new` error.
+  - **Fork** is an input on the source session, like a prompt: it names the source's
+    checkpoint, moves the source to `forking`, and answers with the new session at
+    `idle` (or the error) while the source returns to `idle`.
 - Request-scoped interactions during a create put `global` in `awaiting_input`,
   answered as a group like a session's.
 - **Terminal login** input and resize are not writes (§4.3).
@@ -221,12 +234,12 @@ POST /api/v2/…   { "checkpoint": 42, …body }
 
 - The checkpoint goes in the request body. `If-Match` is not used: this is
   attyd's own API, with no reason to borrow HTTP precondition headers.
-- **Accepted:** `{ at: Position }`. The effect shows once the replica received `at`
-  (read your writes).
+- **Accepted:** `{ at }`. The effect shows once the replica received `at` (read your
+  writes). Open, create and fork answer with the session they produced (§4.4).
 - **Refused:** `{ error: { code, message } }` with `stale` (the checkpoint is not
   current), `invalid_request`, `not_allowed` (the state does not allow this write),
   `unsupported` (the Agent did not advertise it) or `unavailable`.
-- ACP results never come back in a response; they are state (§4.6).
+- Other ACP results never come back in a response; they are state (§4.6).
 - A refusal only happens under concurrency. The client keeps the user's input
   (prompt, answers, control change) so the user can retry once synchronized. There
   is no request ID in state and no intent table.
@@ -237,11 +250,16 @@ POST /api/v2/…   { "checkpoint": 42, …body }
 | --- | --- |
 | turn start | `turn` while it runs; `outcomes` (completed, or failed with the ACP error and the exact prompt) |
 | set_mode, set_config | `controls`; a refusal as the control's error |
-| open | the session document; a load failure as the session's end reason and error |
-| create, fork | the in-flight operation's result in `global` (§4.4) |
+| open, create, fork | the response: the session at `idle`, or the error (§4.4) |
 | close, delete | the scope's `end` |
 | answer interactions | the group leaves state; a URL flow appears for an accepted URL elicitation |
 | authenticate, logout, terminal login | `agent` authentication state, terminal output and exit |
+
+**No retention beyond the current state.** attyd persists nothing; every durable
+fact lives on the ACP server. The bridge keeps only the state that matches what the
+Agent would return on `load`, plus what is in flight. Results are not retained for
+replicas that come later: a turn outcome, for example, is part of the history the
+Agent returns, and nothing else outlives the state it belongs to.
 
 ## 5. What changes
 
@@ -255,7 +273,10 @@ POST /api/v2/…   { "checkpoint": 42, …body }
 - `Idempotency-Key`, the intent table, tombstones, `resultExpired`,
   `intent_capacity`, `intent_conflict`.
 - `global.requests`, `agent_request` records, their retention and
-  `DELETE /api/v2/requests/{id}`.
+  `DELETE /api/v2/requests/{id}`; retention bounds for results beyond the current
+  state (protocol §3.4).
+- `epoch` in positions and scopes, `agent.predecessor`, and epoch handling in
+  clients.
 - Per-scope `prev`, `reset` plus HTTP snapshot fetch, covered-entry filtering, and
   the `applied` position with pending scopes: one stream with inline snapshots needs
   only the received position.
@@ -278,27 +299,24 @@ POST /api/v2/…   { "checkpoint": 42, …body }
 - Group answers for interactions.
 - Idle-only close for every path (request, delete, retirement), with cancel and
   wait for a running turn.
-- Inline snapshots on the stream; `end` with an informational reason.
+- Inline snapshots on the stream, compaction of slow queues into consolidated
+  snapshots, and an opaque resume cursor; `end` with an informational reason.
 - Attachment reads without a version.
 
-## 6. Open questions
+## 6. Decisions from review
 
-1. **Create and fork results.** With serial writes, the create or fork in flight is
-   unique, so its result can sit on the operation's state in `global` (or on the
-   fork source). The creating client recognizes it because its write was accepted
-   at that checkpoint. Is this enough, or should the result name the checkpoint it
-   answers?
-2. **Lag snapshots.** Inline snapshots of large sessions on a slow stream: is the
-   current coalescing budget (1 MiB per stream queue) still the right bound, or does
-   a large session need a separate snapshot path after all?
-3. **Load failure.** Should a session whose load failed stay held in an `error`
-   state that allows close, or end at once with the error as its reason?
-4. **Retained results.** `outcomes` and URL flows keep the protocol §3.4 retention
-   bounds. Are any other results (a control's refusal, a create's error) worth
-   retaining beyond the next transition?
-5. **Epoch.** Making `epoch` the bridge process lifetime means the log survives ACP
-   reconnects. The hub's per-generation replication source becomes one source for
-   the process lifetime.
+1. **Create and fork results.** Create answers with the new session at its `idle`
+   checkpoint. Fork is an input on the source session, like a prompt, and answers
+   the same way with the new session (§4.4).
+2. **Slow subscribers.** Coalescing is log compaction: drop intermediate entries
+   (chunks and other steps) and send the consolidated data (§3.1).
+3. **Load failure.** A bridge-level failure the client cannot get past; the open
+   answers with the error explicitly (§4.4).
+4. **Retained results.** Almost none: nothing is persisted, so the bridge's state
+   matches what the Agent returns on `load` (§4.6).
+5. **Epoch.** No meaning for clients, which care only about being in sync with the
+   bridge; removed. The resume cursor is opaque and bound to the log that issued it
+   (§3.1).
 
 ## 7. Migration
 
@@ -311,6 +329,7 @@ POST /api/v2/…   { "checkpoint": 42, …body }
    idle-only close, inline snapshots, the new scope naming and `end`, attachment
    reads without a version; then remove intents, records, owner tags and
    incarnations from the client protocol. The web client follows in the same step.
-4. **Layer 1 refactor:** remove incarnation-based isolation from the bridge
-   internals, and make `epoch` the bridge process lifetime.
+4. **Layer 1 refactor:** remove incarnation-based isolation and per-epoch
+   replication sources from the bridge internals; one log for the bridge's
+   lifetime.
 5. **Remove v1** (step 7 of the current plan), including the remaining v1 reads.
