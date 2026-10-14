@@ -131,13 +131,13 @@ the user to judge.
 | Open, reconnect, a slow subscriber, a replaced stream, a bridge restart and a reopen are all one alignment | S3 |
 | After a reopen, a matching history is kept; a diverged one is truncated and the bridge's installed | S1, S3 |
 | No event shows a committed entry beside its own process | S2, S3 |
-| A concurrent write, a resend after a lost response and a fork resend get `stale` | S4, S5 |
+| Once a write that starts an operation is admitted, a competing write or a resend that still names the old `expect` gets `stale`, a fork resend included | S4, S5 |
 | Delete never races a prompt on the same session, nor a load triggered by subscription | S5 |
 | A result is the final `op`; no request records, intent tables or result ledgers | S4 |
 | Interactions of every operation, reads included, are answered the same way | S4, S5 |
 | A session released before its first subscription is loaded again; one that cannot be loaded is never released | S6 |
 | An accepted URL flow survives its operation and a client reload, and stops holding its session once removed | S6, S7 |
-| A lost response never turns into a duplicate prompt, fork or terminal input | S5, C3 |
+| A lost response never turns into a duplicate prompt, fork or terminal input through an automatic resend; a submission the user makes again is new input | S5, C3 |
 
 ## 4. Documents
 
@@ -405,11 +405,14 @@ POST /api/v2/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": 
 
 ### 6.3 Consequences of S5
 
-- **Concurrency.** Two clients that name the same operation race; the bridge admits
-  one, and the other gets `stale`.
-- **Lost responses.** A resend names an operation that the first send already
-  replaced, and gets `stale`. A resent cancel is harmless. A resent answer finds
-  the interactions gone and is refused.
+- **Concurrency.** Two clients that start an operation naming the same `expect`
+  race; the bridge admits one, and the other gets `stale`.
+- **Lost responses.** For a write that starts an operation: if the first send was
+  admitted, a resend still names the operation it replaced and gets `stale`; if it
+  was not, the resend may be the first one admitted. For writes that act on the
+  running operation, `op.id` does not change: a resent cancel succeeds again
+  without further effect, and a resent answer no longer covers the pending set and
+  gets `not_allowed`.
 - **No ABA.** A fork returns the source to the same history and to an ended
   operation, but with a new `op.id`.
 - **Group answers.** An interaction that arrives or is cancelled while the user
@@ -551,10 +554,12 @@ consistency is checked after **every** event, not only once synchronization ends
 5. **Live changes (S1, S4).** Interactions and controls change while the log hash
    stays the same, and the replica follows.
 6. **Admission (S5).** For each operation kind:
-   - a concurrent second write and a resend after a lost response get `stale`;
+   - once a write that starts an operation is admitted, a concurrent second write
+     and a resend with the same `expect` get `stale`; a resend of a write that was
+     not admitted may be admitted;
    - a fork resend does not fork twice;
-   - a resent answer is refused;
-   - a resent cancel is harmless.
+   - a resent answer gets `not_allowed`;
+   - a resent cancel succeeds without further effect.
 7. **Group answers (S5).** An answer is refused after an interaction arrives or is
    cancelled.
 8. **Interactions everywhere (§4.4).** Interactions of `load`, `fork`, `create`,
