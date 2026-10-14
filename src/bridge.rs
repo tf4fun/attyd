@@ -2944,6 +2944,11 @@ fn fail_command_operation(
     state
         .sessions
         .fail_scope_operation(&scope, kind, operation_error(error, closing));
+    if kind == OpKind::Delete {
+        // The failed delete frees what it occupied: the streams that waited
+        // for it load the session.
+        streams::wake(state);
+    }
 }
 
 fn error_message(error: Error) -> String {
@@ -5050,10 +5055,6 @@ async fn handle_command_inner(
                 .await?;
                 let mut locked = state.lock().await;
                 release_deletion(&mut locked, &session_id, deletion, &request_id);
-                if result.is_err() {
-                    // The streams that waited for the delete load the session.
-                    streams::wake(&locked);
-                }
                 result?;
                 locked.listed_sessions.remove(&session_id);
                 locked.sessions.complete_catalog_delete(&session_id);

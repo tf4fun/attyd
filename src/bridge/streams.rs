@@ -61,7 +61,10 @@ pub(super) fn serve(state: &mut BridgeState, sink: &EventSink) -> Option<Value> 
     let followed = state.protocol.publication.lock().hub.followed_sessions();
     let mut command = None;
     for (session_id, waiting) in followed {
+        // An operation occupies the session from its admission, before its
+        // ACP request (S5): the subscription waits for it.
         if waiting.is_empty()
+            || state.sessions.scopes.occupied.contains_key(&session_id)
             || state.catalog_deletions.contains_key(&session_id)
             || session_materialization(state, &session_id).is_some()
             || published(&state.protocol.publication, &session_id)
