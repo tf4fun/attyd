@@ -264,7 +264,7 @@ fn hash_of(entry: &Value) -> String {
 
 /// The prompt `op` ran until one event appended its turn, removed its process
 /// and ended it; no state shows the new entry next to the process (S2, I8).
-fn assert_committed_once(stream: &Stream, scope: &str, op: &Value, entry: &str) {
+fn assert_committed_once(stream: &Stream, scope: &str, op: &str, entry: &str) {
     let carrying: Vec<Value> = stream
         .events_of(scope)
         .into_iter()
@@ -289,7 +289,7 @@ fn assert_committed_once(stream: &Stream, scope: &str, op: &Value, entry: &str) 
                 replica.live["op"].get("process").is_none(),
                 "the committed turn's process shows next to its entry: {replica:?}"
             );
-        } else if replica.live["op"]["id"] == *op {
+        } else if replica.live["op"]["id"] == op {
             assert_eq!(
                 replica.live["op"]["status"], "running",
                 "the prompt ended before its turn was committed: {replica:?}"
