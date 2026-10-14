@@ -319,7 +319,7 @@ book and intent table in `src/protocol/commands.rs`, and the routes in
 - **Leases.** `FirstLeases` (30 s) attaches an `ObservationLease` to the owner.
   `ReplicationSource::subscribe` takes it over when a stream attaches its own
   lease; otherwise its timer withdraws it through `UnobserveSession`. A fork grants
-  it in the transition that makes the target held (`fork_target_held`), before the
+  it in the transition that makes the target held (`returned_owner_held`), before the
   history workflow and the v1 response.
 - **Interaction responses** are refused synchronously (`conflict`) when the
   interaction is gone or another response to it is running; otherwise the record
@@ -327,7 +327,51 @@ book and intent table in `src/protocol/commands.rs`, and the routes in
   delivered.
 - **URL flows.** Settled session flows stay in their terminal status (the last 16
   per session) until `DELETE …/url-flows/{interactionId}` removes the one with that
-  interaction ID. Global flows follow in step 5.
+  interaction ID. Global flows follow the same rule (step 5).
+
+Step 5 adds the global commands and out-of-session records in the same files:
+
+- **Out-of-session records.** The v1 handlers of `authenticate`, `logout`,
+  `session/new`, `session/list` and a cold `session/delete` open the record before
+  they send the ACP request (`out_of_session_request`). A v2 command's request is
+  its own record; any other one, a v1 client's included, gets an `agent_request`
+  record that finishes with the handler. A read's record (`session/list`) leaves
+  as soon as its call ends.
+- **Parents.** The ingress keeps every RPC by its JSON-RPC ID until its completion
+  has passed the coordinator (`IngressSender::outstanding_owner`). The coordinator
+  resolves a request-scoped elicitation's `requestId` when it routes the event, so
+  the lookup follows wire order and a fast response can't race it. The record of
+  the named request parents the elicitation, out of session or a session command
+  such as `set_mode`. A named request-scoped elicitation lives while the RPC it
+  names is outstanding, whether or not that request has a record: the first commit
+  after the RPC's completion passed the coordinator cancels it, and the Agent gets
+  `cancel` (`end_finished_request_children`). That is before anything the handler
+  does after the response, such as a fork's optional history load. URL flows it
+  started stay. An elicitation naming a request that is no longer outstanding, or
+  whose record already finished, is answered `cancel` and never published. A
+  running session request without a record (a prompt) shows the interaction in
+  `global` without a parent; a `null` request scope is global and unparented.
+- **Global URL flows** keep their parent's `requestId`, stay terminal (the last 16)
+  until `DELETE /api/v2/url-flows/{interactionId}`, and are keyed by interaction.
+- **Auth.** `POST /api/v2/agent/authenticate`, `…/logout` and `…/auth-terminals`
+  check the offered method and capability in the admitting critical section. The
+  auth terminal manager also delivers its events to the bridge in order
+  (`auth_terminal_event`): output extends the record's bounded tail (64 KiB), and
+  the exit finishes the record `succeeded`, `failed` or `cancelled`, keeping
+  `methodId`; a signalled exit reports `signal` with a `null` `exitCode`. Input, resize and cancel are controls on a running record.
+  `agent.authenticatedMethodId` follows authenticate and logout.
+- **Create.** `POST /api/v2/sessions` is an operation command; the transition that
+  makes the new session held finishes its record and grants the lease
+  (`returned_owner_held`), as fork does.
+- **Catalog.** `GET /api/v2/catalog` refuses a stale `revision` with
+  `catalog_changed` before it sends anything, and maps the bridge's own
+  pagination check to the same error.
+- **Predecessor.** The hub notes why it ended a generation (`auth_restart` after a
+  successful terminal login, `shutdown`); otherwise the ended epoch's final agent
+  phase decides (`agent_error` or `agent_exit`). The next connection's source
+  carries it into `agent.predecessor`. An `auth_restart` starts the next
+  connection as soon as the old one finished, so a v2-only client sees the new
+  epoch; reading an ended epoch's `global` still never restarts the Agent.
 
 **Cold delete.** `If-Match: "<epoch>:0"` is checked against the registry in the same
 actor turn that starts the request, so there is no window in which the session

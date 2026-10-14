@@ -17,6 +17,8 @@ const AUTH_TERMINAL_READ_CHUNK_BYTES: usize = 32_768;
 pub struct AuthTerminalManager {
     active: Arc<Mutex<Option<Arc<ActiveAuthTerminal>>>>,
     events: EventSender,
+    /// The bridge's protocol v2 view of the same events, in order.
+    observer: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
 }
 
 struct AuthTerminalCleanup<'a>(&'a AuthTerminalManager);
@@ -46,7 +48,18 @@ impl AuthTerminalManager {
         Self {
             active: Arc::new(Mutex::new(None)),
             events: events.into(),
+            observer: None,
         }
+    }
+
+    /// Also delivers every lifecycle event to `observer`, in publication
+    /// order.
+    pub(crate) fn observed_by(
+        mut self,
+        observer: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    ) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub fn start(
@@ -224,11 +237,11 @@ impl AuthTerminalManager {
             *current = None;
         }
         let (exit_code, signal, wait_error) = match result {
-            Ok(status) => (
-                Some(status.exit_code()),
-                status.signal().map(ToOwned::to_owned),
-                None,
-            ),
+            // A signalled child has no exit status of its own.
+            Ok(status) => match status.signal() {
+                Some(signal) => (None, Some(signal.to_owned()), None),
+                None => (Some(status.exit_code()), None, None),
+            },
             Err(error) => (None, None, Some(error.to_string())),
         };
         let failure = active
@@ -251,14 +264,14 @@ impl AuthTerminalManager {
             "methodId": active.method_id,
             "status": status,
             "exitCode": exit_code,
+            "signal": signal.as_deref().and_then(signal_number),
         });
-        if let Some(signal) = signal {
+        if let Some(failure) = failure {
+            event["message"] = json!(failure);
+        } else if let Some(signal) = &signal {
             event["message"] = json!(format!(
                 "terminal authentication was terminated by {signal}"
             ));
-        }
-        if let Some(failure) = failure {
-            event["message"] = json!(failure);
         } else if status == "failed" {
             event["message"] = json!(match exit_code {
                 Some(code) => format!("terminal authentication exited with status {code}"),
@@ -269,8 +282,32 @@ impl AuthTerminalManager {
     }
 
     fn send(&self, event: serde_json::Value) {
+        if let Some(observer) = &self.observer {
+            let _ = observer.send(event.clone());
+        }
         let _ = self.events.send_value(event);
     }
+}
+
+/// The number of a signal portable-pty reports by its `strsignal` name.
+#[cfg(unix)]
+fn signal_number(name: &str) -> Option<i32> {
+    if let Some(number) = name.strip_prefix("Signal ") {
+        return number.parse().ok();
+    }
+    (1..65).find(|&number| {
+        // SAFETY: strsignal returns a pointer to a NUL-terminated string (or
+        // null) that stays valid until the next call; it is read at once,
+        // as portable-pty itself does.
+        let described = unsafe { libc::strsignal(number) };
+        !described.is_null()
+            && unsafe { std::ffi::CStr::from_ptr(described) }.to_bytes() == name.as_bytes()
+    })
+}
+
+#[cfg(not(unix))]
+fn signal_number(_name: &str) -> Option<i32> {
+    None
 }
 
 pub(crate) fn validate_method(method: &AuthMethodTerminal) -> Result<(), Error> {

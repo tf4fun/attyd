@@ -15,7 +15,7 @@ mod review_process_lifetime;
 mod review_replication;
 mod review_turns;
 
-async fn epoch(peer: &Peer) -> String {
+pub(super) async fn epoch(peer: &Peer) -> String {
     let (status, global) = get(&peer.router, "/api/v2/global").await;
     assert_eq!(status, StatusCode::OK);
     global["at"]["epoch"].as_str().unwrap().to_string()
@@ -48,7 +48,7 @@ async fn owner(peer: &mut Peer, session_id: &str) -> String {
     )
 }
 
-async fn command(
+pub(super) async fn command(
     peer: &Peer,
     method: &str,
     path: &str,
@@ -68,7 +68,7 @@ async fn command(
 
 /// A replica's recovery by intent: the record whose `clientIntentId` it
 /// chose (protocol §5.2).
-fn find(documents: &Documents, intent: &str) -> Option<Value> {
+pub(super) fn find(documents: &Documents, intent: &str) -> Option<Value> {
     documents[GLOBAL]["requests"]
         .as_object()?
         .values()
@@ -76,7 +76,17 @@ fn find(documents: &Documents, intent: &str) -> Option<Value> {
         .cloned()
 }
 
-async fn finished(peer: &mut Peer, intent: &str) -> Value {
+/// Command records; the setup's v1 `session/new` has an `agent_request`
+/// record of its own.
+fn commands(documents: &Documents) -> impl Iterator<Item = &Value> {
+    documents[GLOBAL]["requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|request| request["operation"] != "agent_request")
+}
+
+pub(super) async fn finished(peer: &mut Peer, intent: &str) -> Value {
     let documents = peer
         .until(&format!("the record of {intent} finishes"), |documents| {
             find(documents, intent).is_some_and(|request| request["status"] != "running")
@@ -463,7 +473,7 @@ async fn a_lost_response_recovers_from_public_state_or_gets_result_expired() {
     let documents = peer.check().await;
     assert!(find(&documents, "acknowledged").is_none());
     assert_eq!(
-        documents[GLOBAL]["requests"].as_object().unwrap().len(),
+        commands(&documents).count(),
         0,
         "an acknowledgement creates no record"
     );
@@ -1114,8 +1124,8 @@ async fn a_turn_cancel_is_a_control_on_the_running_turn() {
         })
         .await;
     assert_eq!(
-        documents[GLOBAL]["requests"],
-        json!({}),
+        commands(&documents).count(),
+        0,
         "a control action creates no record"
     );
     peer.reply(&prompt, json!({"stopReason": "cancelled"}))

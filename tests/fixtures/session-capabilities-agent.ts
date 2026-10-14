@@ -5,6 +5,9 @@ const noList = process.argv.includes("--no-list");
 const noLoad = process.argv.includes("--no-load");
 const splitList = process.argv.includes("--split-list");
 const forkSourceUpdateBeforeResponse = process.argv.includes("--fork-source-update-before-response");
+// A terminal login runs this fixture again with `--login-exit`; it succeeds at once.
+if (process.argv.includes("--login-exit")) process.exit(0);
+const terminalAuth = process.argv.includes("--terminal-auth");
 const listDiagnostics = process.argv.includes("--large-list-meta") ? "x".repeat(2_000_000) : undefined;
 let page = 0;
 let forks = 0;
@@ -28,7 +31,9 @@ const agent = acp.agent({ name: "session-capabilities-fixture" })
       auth: { logout: {} },
       sessionCapabilities: { ...(!noList ? { list: {} } : {}), fork: {}, resume: {}, ...(process.argv.includes("--close") ? { close: {} } : {}), ...(process.argv.includes("--delete") ? { delete: {} } : {}) },
     },
-    authMethods: [],
+    authMethods: terminalAuth
+      ? [{ id: "terminal-login", name: "Terminal login", type: "terminal", args: ["--login-exit"] }]
+      : [],
   }))
   .onRequest(acp.methods.agent.session.new, () => {
     newSessions += 1;

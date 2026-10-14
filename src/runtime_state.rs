@@ -194,6 +194,10 @@ pub(crate) struct PendingInteraction {
     pub request: Value,
     pub operation_id: Option<String>,
     pub responding_operation_id: Option<String>,
+    /// Protocol v2: the record of the out-of-session request a
+    /// request-scoped elicitation belongs to. v1 views never show it.
+    #[serde(skip)]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,6 +208,10 @@ pub(crate) struct UrlFlow {
     pub(crate) registration_id: String,
     pub request: Value,
     pub status: UrlFlowStatus,
+    /// Protocol v2: the parent record of a global flow, kept after the
+    /// request ends.
+    #[serde(skip)]
+    pub(crate) request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,6 +296,20 @@ pub(crate) enum UrlFlowResolution {
 pub(crate) const SETTLED_URL_FLOWS: usize = 16;
 pub(crate) const SETTLED_URL_FLOW_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(600);
+
+/// Keeps a finished URL flow; the oldest leave once both retention minimums
+/// have passed.
+fn settle(settled: &mut VecDeque<(UrlFlow, std::time::Instant)>, flow: UrlFlow) {
+    let now = std::time::Instant::now();
+    settled.push_back((flow, now));
+    while settled.len() > SETTLED_URL_FLOWS
+        && settled.front().is_some_and(|(_, finished)| {
+            now.saturating_duration_since(*finished) >= SETTLED_URL_FLOW_RETENTION
+        })
+    {
+        settled.pop_front();
+    }
+}
 
 /// Why a URL flow acknowledgement was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1367,6 +1389,7 @@ impl SessionRegistry {
                         request,
                         operation_id: active_operation,
                         responding_operation_id: None,
+                        request_id: None,
                     },
                 );
                 self.commit_session(session_id);
@@ -1393,12 +1416,21 @@ impl SessionRegistry {
                         request,
                         operation_id: None,
                         responding_operation_id: None,
+                        request_id: None,
                     },
                 );
                 self.commit_connection();
             }
         }
         Ok(InteractionUpsert::Inserted)
+    }
+
+    /// Protocol v2: names the record a request-scoped elicitation belongs
+    /// to. v1 views never show it, so nothing is journaled.
+    pub(crate) fn set_request_parent(&mut self, interaction_id: &str, request_id: String) {
+        if let Some(pending) = self.request_elicitations.get_mut(interaction_id) {
+            pending.request_id = Some(request_id);
+        }
     }
 
     pub(crate) fn resolve_elicitation(
@@ -1442,6 +1474,7 @@ impl SessionRegistry {
                             registration_id: interaction_id.to_string(),
                             request,
                             status: UrlFlowStatus::Waiting,
+                            request_id: None,
                         },
                     );
                 }
@@ -1464,7 +1497,11 @@ impl SessionRegistry {
                     .request_elicitations
                     .remove(interaction_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
-                let PendingInteraction { request, .. } = pending;
+                let PendingInteraction {
+                    request,
+                    request_id,
+                    ..
+                } = pending;
                 remember_resolved_interaction(
                     &mut self.resolved_request_elicitations,
                     interaction_id,
@@ -1479,6 +1516,7 @@ impl SessionRegistry {
                             registration_id: interaction_id.to_string(),
                             request,
                             status: UrlFlowStatus::Waiting,
+                            request_id,
                         },
                     );
                 }
@@ -1639,18 +1677,7 @@ impl SessionRegistry {
                 }
                 remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
                 flow.status = status;
-                let now = std::time::Instant::now();
-                session.settled_url_flows.push_back((flow, now));
-                while session.settled_url_flows.len() > SETTLED_URL_FLOWS
-                    && session
-                        .settled_url_flows
-                        .front()
-                        .is_some_and(|(_, settled)| {
-                            now.saturating_duration_since(*settled) >= SETTLED_URL_FLOW_RETENTION
-                        })
-                {
-                    session.settled_url_flows.pop_front();
-                }
+                settle(&mut session.settled_url_flows, flow);
                 self.commit_session(session_id);
             }
             None => {
@@ -1661,7 +1688,7 @@ impl SessionRegistry {
                 {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
-                let flow = self
+                let mut flow = self
                     .request_url_flows
                     .remove(elicitation_id)
                     .ok_or(RuntimeStateError::UnknownInteraction)?;
@@ -1669,6 +1696,8 @@ impl SessionRegistry {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
                 remember_resolved_interaction(&mut self.resolved_request_url_flows, elicitation_id);
+                flow.status = status;
+                settle(&mut self.settled_request_url_flows, flow);
                 self.commit_connection();
             }
         }
@@ -1705,6 +1734,32 @@ impl SessionRegistry {
             return Err(UrlFlowAcknowledgement::Unknown);
         }
         self.commit_session(session_id);
+        Ok(())
+    }
+
+    /// `DELETE /api/v2/url-flows/{interactionId}`: removes a finished global
+    /// URL flow by its interaction ID, never by its `elicitationId`.
+    pub(crate) fn acknowledge_request_url_flow(
+        &mut self,
+        expected_epoch: &str,
+        interaction_id: &str,
+    ) -> Result<(), UrlFlowAcknowledgement> {
+        self.require_epoch(expected_epoch)
+            .map_err(|_| UrlFlowAcknowledgement::Unknown)?;
+        if self
+            .request_url_flows
+            .values()
+            .any(|flow| flow.registration_id == interaction_id)
+        {
+            return Err(UrlFlowAcknowledgement::Waiting);
+        }
+        let before = self.settled_request_url_flows.len();
+        self.settled_request_url_flows
+            .retain(|(flow, _)| flow.registration_id != interaction_id);
+        if self.settled_request_url_flows.len() == before {
+            return Err(UrlFlowAcknowledgement::Unknown);
+        }
+        self.commit_connection();
         Ok(())
     }
 
@@ -2522,6 +2577,7 @@ mod session_live {
                 request,
                 operation_id: active_operation,
                 responding_operation_id: None,
+                request_id: None,
             },
         );
         Ok(InteractionUpsert::Inserted)

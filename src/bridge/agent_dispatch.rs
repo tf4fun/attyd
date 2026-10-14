@@ -25,6 +25,7 @@ pub(super) struct AgentContext {
     pub(super) owner: Option<SessionResourceOwner>,
     pub(super) dispatch_owner: RequestOwner,
     pub(super) url_registration: Option<UrlRegistration>,
+    pub(super) request_parent: Option<RequestOwner>,
     pub(super) request_lease: Option<InboundRequestLease>,
 }
 
@@ -523,6 +524,39 @@ async fn elicitation(
             .as_deref()
             .map(|id| context.require_owner(&state, id))
             .transpose()?;
+        // A request-scoped elicitation belongs to the request it names (plan
+        // §2.4): that request's record parents it, and once the request ended
+        // nothing can answer it. A running session request without a record
+        // (a prompt) leaves the interaction global and unparented.
+        let named = match request.scope() {
+            ElicitationScope::Request(scope)
+                if owner.is_none()
+                    && !matches!(
+                        scope.request_id,
+                        agent_client_protocol::schema::v1::RequestId::Null
+                    ) =>
+            {
+                Some(scope.request_id.clone())
+            }
+            _ => None,
+        };
+        let parent = if named.is_some() {
+            let parent = context.request_parent.as_ref();
+            match parent.map(|parent| commands::running_parent(&state, &parent.operation_id)) {
+                Some(Some(request_id)) => Some(request_id),
+                Some(None) if parent.is_some_and(|parent| parent.session_id.is_some()) => None,
+                _ => {
+                    drop(state);
+                    drop(turn);
+                    return respond(
+                        responder,
+                        Ok(CreateElicitationResponse::new(ElicitationAction::Cancel)),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         {
             if let Some(url_elicitation_id) = &url_elicitation_id {
                 if url_elicitation_id.is_empty() {
@@ -563,6 +597,14 @@ async fn elicitation(
                 state
                     .request_elicitations
                     .insert(elicitation_id.clone(), pending);
+                if let Some(request_id) = parent {
+                    state
+                        .sessions
+                        .set_request_parent(&elicitation_id, request_id);
+                }
+                if let Some(rpc) = named {
+                    state.request_children.insert(elicitation_id.clone(), rpc);
+                }
             }
             let delta = owner.as_ref().map(|owner| advance_session_delta(
                 &mut state, &owner.session_id, owner.incarnation,
@@ -895,6 +937,7 @@ mod tests {
                     attempt_id: Some("allocation".to_owned()),
                 },
                 url_registration: None,
+                request_parent: None,
                 request_lease: None,
             },
             scheduling,
@@ -936,6 +979,7 @@ mod tests {
                 owner: owner.clone(),
                 dispatch_owner: context.dispatch_owner.clone(),
                 url_registration: None,
+                request_parent: None,
             };
             route.dispatch_owner.session_id = owner.as_ref().map(|owner| owner.session_id.clone());
             route.dispatch_owner.incarnation = owner.as_ref().map(|owner| owner.incarnation);
@@ -1198,6 +1242,7 @@ mod tests {
                     owner: None,
                     dispatch_owner: context.dispatch_owner.clone(),
                     url_registration: None,
+                    request_parent: None,
                 };
                 route.dispatch_owner.attempt_id = Some(format!("allocation-{index}"));
                 let lease = inbound

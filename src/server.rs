@@ -344,6 +344,20 @@ impl BridgeBootstrap {
     }
 }
 
+/// Why the generation that just ended stopped, for the next one's
+/// `agent.predecessor`: the hub's own reason, else the Agent's final phase.
+fn predecessor(state: &mut BridgeHubState) -> Option<crate::protocol::EpochPredecessor> {
+    let reason = state.restart_reason.take();
+    let (epoch, phase) = state.replication.as_ref()?.ended_agent()?;
+    Some(crate::protocol::EpochPredecessor {
+        epoch,
+        reason: reason.unwrap_or(match phase {
+            crate::protocol::AgentPhase::Error => crate::protocol::EpochEndReason::AgentError,
+            _ => crate::protocol::EpochEndReason::AgentExit,
+        }),
+    })
+}
+
 fn terminal_auth_succeeded(event: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(event)
         .ok()
@@ -565,6 +579,8 @@ struct BridgeHubState {
     /// The current generation's protocol v2 state; after the generation
     /// ends, its final `global` document.
     replication: Option<bridge::ReplicationSource>,
+    /// Why the hub itself ended the current generation, when it did.
+    restart_reason: Option<crate::protocol::EpochEndReason>,
 }
 
 struct BridgeHub {
@@ -1027,7 +1043,7 @@ impl BridgeHub {
                 let (input_tx, input) = mpsc::unbounded_channel();
                 let cancellation = CancellationToken::new();
                 let (event_tx, events) = event_queue::channel(cancellation.clone());
-                let replication = bridge::ReplicationSource::default();
+                let replication = bridge::ReplicationSource::succeeding(predecessor(&mut state));
                 state.input = Some(input_tx);
                 state.cancellation = Some(cancellation.clone());
                 state.replication = Some(replication.clone());
@@ -1382,7 +1398,11 @@ impl BridgeHub {
                     }
                     state.bootstrap.update(&event);
                     publish_to_global_subscribers(&mut state, &event);
-                    restart.then(|| state.cancellation.clone()).flatten()
+                    let cancellation = restart.then(|| state.cancellation.clone()).flatten();
+                    if cancellation.is_some() {
+                        state.restart_reason = Some(crate::protocol::EpochEndReason::AuthRestart);
+                    }
+                    cancellation
                 };
                 if let Some(cancellation) = restart_input {
                     cancellation.cancel();
@@ -1550,6 +1570,7 @@ impl BridgeHub {
         let cancellation = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
+            state.restart_reason = Some(crate::protocol::EpochEndReason::Shutdown);
             // Event streams must finish before HTTP graceful draining can
             // complete, including when no Agent runtime is currently active.
             state.global_subscribers.clear();
@@ -1609,6 +1630,16 @@ async fn forward_generation_events(
     }
     if let Some(hub) = hub.upgrade() {
         hub.finish_generation(generation).await;
+        // A successful terminal login ends the epoch to restart the Agent:
+        // the restart is part of that lifecycle, whoever is connected.
+        let restart = {
+            let state = hub.state.lock().await;
+            !state.shutting_down
+                && state.restart_reason == Some(crate::protocol::EpochEndReason::AuthRestart)
+        };
+        if restart {
+            hub.ensure_runtime().await;
+        }
     }
 }
 
@@ -4411,6 +4442,126 @@ mod tests {
         .await
         .unwrap();
         (hub, observer)
+    }
+
+    /// A v2 request through the production routes of `hub`.
+    async fn v2_request(
+        hub: &Arc<BridgeHub>,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = axum::http::Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let body = body.map_or_else(Body::empty, |body| Body::from(body.to_string()));
+        let response = v2::router(v2::V2State::hub(hub.clone()))
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_login_restart_names_auth_restart_as_the_predecessor() {
+        let (hub, observer) = capability_fixture(&["--terminal-auth"]).await;
+        let (status, first) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let first_epoch = first["at"]["epoch"].as_str().unwrap().to_string();
+        assert_eq!(
+            first["state"]["agent"]["predecessor"],
+            serde_json::Value::Null
+        );
+        let (status, accepted) = v2_request(
+            &hub,
+            "POST",
+            "/api/v2/agent/auth-terminals",
+            &[("idempotency-key", "terminal-login")],
+            Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        hub.unsubscribe(observer.id, observer.generation).await;
+
+        // The login exits successfully and the hub restarts the Agent; the
+        // next epoch says why the previous one ended.
+        let next = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                hub.ensure_runtime().await;
+                let (_, global) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+                if global["at"]["epoch"]
+                    .as_str()
+                    .is_some_and(|epoch| epoch != first_epoch)
+                    && global["state"]["agent"]["phase"] == "ready"
+                {
+                    return global;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the Agent never restarted after the terminal login");
+        hub.shutdown().await;
+        assert_eq!(
+            next["state"]["agent"]["predecessor"],
+            json!({"epoch": first_epoch, "reason": "auth_restart"}),
+            "{next}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v2_terminal_login_restarts_without_a_v1_client_or_private_restart_call() {
+        let (hub, observer) = capability_fixture(&["--terminal-auth"]).await;
+        hub.unsubscribe(observer.id, observer.generation).await;
+        let (status, first) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let first_epoch = first["at"]["epoch"].as_str().unwrap().to_string();
+        let (status, accepted) = v2_request(
+            &hub,
+            "POST",
+            "/api/v2/agent/auth-terminals",
+            &[("idempotency-key", "v2-only-terminal-login")],
+            Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+
+        // A real v2 client can only read/reconnect through the public routes.
+        // Polling must not manufacture the restart with ensure_runtime().
+        let mut last = first;
+        let restarted = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (status, global) = v2_request(&hub, "GET", "/api/v2/global", &[], None).await;
+                assert_eq!(status, StatusCode::OK, "{global}");
+                last = global;
+                if last["at"]["epoch"]
+                    .as_str()
+                    .is_some_and(|epoch| epoch != first_epoch)
+                    && last["state"]["agent"]["phase"] == "ready"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        hub.shutdown().await;
+        assert!(
+            restarted.is_ok(),
+            "successful v2 terminal login must restart the Agent without a v1 client; last state: {last}"
+        );
+        assert_eq!(
+            last["state"]["agent"]["predecessor"],
+            json!({"epoch": first_epoch, "reason": "auth_restart"})
+        );
     }
 
     #[tokio::test]

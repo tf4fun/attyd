@@ -45,13 +45,19 @@ pub(crate) fn project_global(
             .request_elicitations
             .values()
             .map(|pending| {
-                let projected = elicitation(pending, None, None);
+                let projected = elicitation(pending, None, pending.request_id.clone());
                 (pending.interaction_id.clone(), projected)
             })
             .collect(),
         url_flows: registry
             .request_url_flows
             .values()
+            .chain(
+                registry
+                    .settled_request_url_flows
+                    .iter()
+                    .map(|(flow, _)| flow),
+            )
             .map(|flow| (flow.registration_id.clone(), url_flow(flow)))
             .collect(),
     }
@@ -380,8 +386,7 @@ fn url_flow(flow: &rt::UrlFlow) -> UrlFlow {
     UrlFlow {
         interaction_id: flow.registration_id.clone(),
         elicitation_id: flow.elicitation_id.clone(),
-        // Global parents arrive with migration step 5.
-        request_id: None,
+        request_id: flow.request_id.clone(),
         request: flow.request.clone(),
         status: match flow.status {
             rt::UrlFlowStatus::Waiting => UrlFlowStatus::Waiting,

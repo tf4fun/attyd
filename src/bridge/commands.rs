@@ -192,6 +192,206 @@ impl HeldCommand {
     }
 }
 
+/// A global operation command (protocol §5.4).
+#[derive(Debug, Clone)]
+pub(crate) enum GlobalCommand {
+    Authenticate {
+        method_id: String,
+    },
+    Logout,
+    AuthTerminal {
+        method_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Create {
+        cwd: String,
+    },
+}
+
+impl GlobalCommand {
+    fn operation(&self) -> RequestOperation {
+        match self {
+            Self::Authenticate { .. } => RequestOperation::Authenticate,
+            Self::Logout => RequestOperation::Logout,
+            Self::AuthTerminal { .. } => RequestOperation::AuthTerminal,
+            Self::Create { .. } => RequestOperation::Create,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Authenticate { .. } => "authenticate",
+            Self::Logout => "logout",
+            Self::AuthTerminal { .. } => "auth_terminal",
+            Self::Create { .. } => "create",
+        }
+    }
+
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Authenticate { .. } => "authenticate",
+            Self::Logout => "logout",
+            Self::AuthTerminal { .. } => "attyd/auth_terminal",
+            Self::Create { .. } => "session/new",
+        }
+    }
+
+    /// The fingerprint's body: the command's whole body.
+    fn body(&self) -> Value {
+        match self {
+            Self::Authenticate { method_id } => json!({ "methodId": method_id }),
+            Self::Logout => json!({}),
+            Self::AuthTerminal {
+                method_id,
+                cols,
+                rows,
+            } => json!({ "methodId": method_id, "cols": cols, "rows": rows }),
+            Self::Create { cwd } => json!({ "cwd": cwd }),
+        }
+    }
+
+    fn method_id(&self) -> Option<String> {
+        match self {
+            Self::Authenticate { method_id } | Self::AuthTerminal { method_id, .. } => {
+                Some(method_id.clone())
+            }
+            Self::Logout | Self::Create { .. } => None,
+        }
+    }
+
+    fn params(&self) -> BTreeMap<String, Value> {
+        match self {
+            Self::Create { cwd } => BTreeMap::from([("cwd".to_string(), json!(cwd))]),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    fn command(&self, request_id: &str) -> Value {
+        match self {
+            Self::Authenticate { method_id } => json!({
+                "type": "auth/authenticate", "requestId": request_id, "methodId": method_id,
+            }),
+            Self::Logout => json!({ "type": "auth/logout", "requestId": request_id }),
+            Self::AuthTerminal {
+                method_id,
+                cols,
+                rows,
+            } => json!({
+                "type": "auth/terminal_start", "requestId": request_id, "methodId": method_id,
+                "cols": cols, "rows": rows,
+            }),
+            Self::Create { cwd } => json!({
+                "type": "session/new", "requestId": request_id, "cwd": cwd,
+            }),
+        }
+    }
+}
+
+/// An auth terminal control action (protocol §5.4).
+#[derive(Debug, Clone)]
+pub(crate) enum TerminalControl {
+    Input { data: String },
+    Resize { cols: u16, rows: u16 },
+    Cancel,
+}
+
+/// The global commands' own admission, checked under the lock that commits
+/// the record.
+fn admit_global(state: &BridgeState, command: &GlobalCommand) -> Result<(), ProtocolError> {
+    let Some(capabilities) = state.agent_capabilities.as_ref() else {
+        return Err(unavailable());
+    };
+    let offered = |method_id: &str| {
+        state.auth_methods.get(method_id).ok_or_else(|| {
+            rejection(
+                ErrorCode::InvalidRequest,
+                format!("authentication method was not offered: {method_id}"),
+            )
+        })
+    };
+    match command {
+        GlobalCommand::Authenticate { method_id } => {
+            if matches!(offered(method_id)?, AuthMethod::Terminal(_)) {
+                return Err(rejection(
+                    ErrorCode::InvalidRequest,
+                    "a terminal authentication method starts an auth terminal",
+                ));
+            }
+        }
+        GlobalCommand::Logout => {
+            if capabilities.auth.logout.is_none() {
+                return Err(rejection(
+                    ErrorCode::Unsupported,
+                    "Agent did not advertise support for auth/logout",
+                ));
+            }
+        }
+        GlobalCommand::AuthTerminal {
+            method_id,
+            cols,
+            rows,
+        } => {
+            if !matches!(offered(method_id)?, AuthMethod::Terminal(_)) {
+                return Err(rejection(
+                    ErrorCode::InvalidRequest,
+                    "the authentication method is handled by the Agent, not a terminal",
+                ));
+            }
+            if *cols == 0 || *rows == 0 {
+                return Err(rejection(
+                    ErrorCode::InvalidRequest,
+                    "terminal dimensions must be positive",
+                ));
+            }
+            if running_record(state, |request| {
+                request.operation == RequestOperation::AuthTerminal
+            }) {
+                return Err(rejection(
+                    ErrorCode::Conflict,
+                    "an auth terminal is already running",
+                ));
+            }
+        }
+        GlobalCommand::Create { .. } => {}
+    }
+    Ok(())
+}
+
+/// The session a create or fork response returns.
+fn returned_session(response: &Value) -> RequestResult {
+    RequestResult::Session {
+        session_id: response
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        incarnation: response
+            .pointer("/view/session/incarnation")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    }
+}
+
+/// A rejection of a control action or read from the v1 handler.
+fn handler_rejection(error: &BridgeRequestError) -> ProtocolError {
+    let message = error
+        .data
+        .as_ref()
+        .and_then(Value::as_str)
+        .map_or(error.message.clone(), str::to_string);
+    let code = match error.code {
+        Some(code) if code == i32::from(agent_client_protocol::ErrorCode::MethodNotFound) => {
+            ErrorCode::Unsupported
+        }
+        Some(code) if code == i32::from(agent_client_protocol::ErrorCode::InvalidParams) => {
+            ErrorCode::InvalidRequest
+        }
+        _ => ErrorCode::Conflict,
+    };
+    rejection(code, message)
+}
+
 pub(crate) type Outcome<T> = Result<CommandResult<T>, ProtocolError>;
 
 fn rejection(code: ErrorCode, message: impl Into<String>) -> ProtocolError {
@@ -449,15 +649,12 @@ fn business(
     move |response| BridgeInput::BusinessRequest { command, response }
 }
 
-/// Finishes a record when its command's response arrives. A record that
-/// already finished (a fork whose target became held) stays as it is.
-fn finish_on_response(
+/// Runs `then` under the bridge lock once a command's response arrives,
+/// even after the HTTP caller went away.
+fn on_response(
     state: Weak<BridgeLock>,
-    request_id: String,
     response: oneshot::Receiver<Result<Value, BridgeRequestError>>,
-    outcome: impl FnOnce(Result<Value, BridgeRequestError>) -> Result<RequestResult, ProtocolError>
-    + Send
-    + 'static,
+    then: impl FnOnce(&mut BridgeState, Result<Value, BridgeRequestError>) + Send + 'static,
 ) {
     tokio::spawn(async move {
         let response = response.await.unwrap_or_else(|_| {
@@ -468,7 +665,21 @@ fn finish_on_response(
         let Some(state) = state.upgrade() else {
             return;
         };
-        let mut state = state.lock().await;
+        then(&mut *state.lock().await, response);
+    });
+}
+
+/// Finishes a record when its command's response arrives. A record that
+/// already finished (a fork whose target became held) stays as it is.
+fn finish_on_response(
+    state: Weak<BridgeLock>,
+    request_id: String,
+    response: oneshot::Receiver<Result<Value, BridgeRequestError>>,
+    outcome: impl FnOnce(Result<Value, BridgeRequestError>) -> Result<RequestResult, ProtocolError>
+    + Send
+    + 'static,
+) {
+    on_response(state, response, move |state, response| {
         state
             .sessions
             .commands
@@ -530,11 +741,14 @@ pub(super) fn require_admitted_owner(
     else {
         return Ok(());
     };
-    if state
+    // `0` is a cold delete's `"<epoch>:0"`: the bridge holds no incarnation,
+    // which is exactly when deletion takes the catalog path.
+    let admitted = state
         .sessions
         .state(session_id)
-        .is_some_and(|session| session.incarnation == expected)
-    {
+        .map_or(0, |session| session.incarnation)
+        == expected;
+    if admitted {
         Ok(())
     } else {
         Err(Error::invalid_params().data("the admitted session owner was replaced"))
@@ -612,9 +826,10 @@ pub(super) fn forget_first_subscription_lease(state: &mut BridgeState, observer_
         .retain(|lease| lease.observer_id != observer_id);
 }
 
-/// The fork's target is held: its record succeeds with the new owner, and the
-/// owner gets its lease in the same transition, before anything can retire it.
-pub(super) fn fork_target_held(
+/// The owner a create or fork returns is held: its record succeeds with the
+/// new owner, and the owner gets its lease in the same transition, before
+/// anything can retire it.
+pub(super) fn returned_owner_held(
     state: &mut BridgeState,
     request_id: &str,
     session_id: &str,
@@ -689,6 +904,201 @@ pub(super) fn settle_turn_intents(state: &mut BridgeState) {
     }
 }
 
+/// The record of an ACP request the bridge sends outside a held session
+/// (plan §2.4), opened in the turn that sends it. A v2 command's request is
+/// its own record; any other one, such as a v1 client's, gets an
+/// `agent_request` record.
+pub(super) fn out_of_session_request(
+    state: &mut BridgeState,
+    operation_id: &str,
+    method: &str,
+    target: Option<RequestTarget>,
+) {
+    if state.sessions.commands.request(operation_id).is_some()
+        || state.agent_requests.contains_key(operation_id)
+    {
+        return;
+    }
+    let request_id = state.sessions.commands.allocate_request_id();
+    state.sessions.commands.open(Request {
+        request_id: request_id.clone(),
+        operation: RequestOperation::AgentRequest,
+        method: method.to_string(),
+        client_intent_id: None,
+        target,
+        interaction_id: None,
+        method_id: None,
+        params: BTreeMap::new(),
+        status: RequestStatus::Running,
+        result: None,
+        error: None,
+        terminal: None,
+    });
+    state
+        .agent_requests
+        .insert(operation_id.to_string(), request_id);
+}
+
+/// The record a request-scoped elicitation belongs to, while the request it
+/// names still runs.
+pub(super) fn running_parent(state: &BridgeState, operation_id: &str) -> Option<String> {
+    let request_id = state
+        .agent_requests
+        .get(operation_id)
+        .map_or(operation_id, String::as_str);
+    state
+        .sessions
+        .commands
+        .request(request_id)
+        .filter(|request| request.status == RequestStatus::Running)
+        .map(|request| request.request_id.clone())
+}
+
+/// An out-of-session request ended: its `agent_request` record finishes with
+/// it, and a read's record leaves at once (protocol §6).
+pub(super) fn out_of_session_request_ended(
+    state: &mut BridgeState,
+    operation_id: &str,
+    result: &Result<(), Error>,
+) {
+    if let Some(request_id) = &state.agent_requests.remove(operation_id) {
+        let outcome = result
+            .as_ref()
+            .map(|_| RequestResult::Done)
+            .map_err(acp_error);
+        state
+            .sessions
+            .commands
+            .finish(request_id, outcome, Instant::now());
+        if state
+            .sessions
+            .commands
+            .request(request_id)
+            .is_some_and(|request| request.method == "session/list")
+        {
+            let _ = state.sessions.commands.acknowledge(request_id);
+        }
+    }
+}
+
+/// A named request-scoped elicitation lives while the RPC it names is
+/// outstanding (protocol §3.4): once that request ended, whether or not it
+/// has a record, the commit that sees it cancels the interaction and the
+/// Agent gets `cancel`. URL flows it started stay.
+pub(super) fn end_finished_request_children(state: &mut BridgeState) {
+    if state.request_children.is_empty() {
+        return;
+    }
+    let Some(outstanding) = state.outstanding_rpcs.clone() else {
+        return;
+    };
+    let ended = {
+        let outstanding = outstanding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .request_children
+            .iter()
+            .filter(|(_, request_id)| !outstanding.contains_key(request_id))
+            .map(|(interaction_id, _)| interaction_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let epoch = state.sessions.epoch().to_string();
+    for interaction_id in ended {
+        state.request_children.remove(&interaction_id);
+        if let Some(pending) = state.request_elicitations.remove(&interaction_id) {
+            let _ = state
+                .sessions
+                .resolve_elicitation(&epoch, None, &interaction_id, None);
+            let _ = pending
+                .sender
+                .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
+        }
+    }
+    // Answered or cancelled children leave the table with their interaction.
+    let pending = &state.request_elicitations;
+    state
+        .request_children
+        .retain(|interaction_id, _| pending.contains_key(interaction_id));
+}
+
+/// The bounded tail of an auth terminal record's output, in bytes.
+pub(crate) const AUTH_TERMINAL_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// An auth terminal event (`bridge/auth_terminal_*`) reaches its record:
+/// output extends the bounded tail, and the exit finishes the record with its
+/// status. `methodId` stays from start to end.
+pub(super) fn auth_terminal_event(state: &mut BridgeState, event: &Value) {
+    let Some(request_id) = event.get("requestId").and_then(Value::as_str) else {
+        return;
+    };
+    let commands = &mut state.sessions.commands;
+    if commands
+        .request(request_id)
+        .is_none_or(|request| request.operation != RequestOperation::AuthTerminal)
+    {
+        return;
+    }
+    match event.get("type").and_then(Value::as_str) {
+        Some("bridge/auth_terminal_output") => {
+            let data = event
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            commands.update_terminal(request_id, |terminal| {
+                terminal.output.push_str(data);
+                if terminal.output.len() > AUTH_TERMINAL_OUTPUT_LIMIT {
+                    let mut cut = terminal.output.len() - AUTH_TERMINAL_OUTPUT_LIMIT;
+                    while !terminal.output.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    terminal.output.drain(..cut);
+                    terminal.truncated = true;
+                }
+            });
+        }
+        Some("bridge/auth_terminal_exited") => {
+            let message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            commands.update_terminal(request_id, |terminal| {
+                terminal.exit_code = event
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .and_then(|code| i32::try_from(code).ok());
+                terminal.signal = event
+                    .get("signal")
+                    .and_then(Value::as_i64)
+                    .and_then(|signal| i32::try_from(signal).ok());
+                terminal.message = message.clone();
+            });
+            let now = Instant::now();
+            match event.get("status").and_then(Value::as_str) {
+                Some("succeeded") => {
+                    commands.finish(request_id, Ok(RequestResult::Done), now);
+                }
+                Some("cancelled") => {
+                    commands.cancel(request_id, now);
+                }
+                _ => {
+                    let error = ProtocolError::new(
+                        ErrorCode::AgentError,
+                        message.unwrap_or_else(|| "terminal authentication failed".to_string()),
+                    );
+                    commands.finish(request_id, Err(error), now);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A finished record's error for an ACP error the Agent returned.
+fn acp_error(error: &Error) -> ProtocolError {
+    record_error(&BridgeRequestError::from_acp(error))
+}
+
 impl ReplicationSource {
     /// `set_mode`, `set_config`, `fork`, `close` and held `delete`.
     pub(crate) async fn held_command(
@@ -740,22 +1150,9 @@ impl ReplicationSource {
             request_id.clone(),
             response,
             move |response| match command {
-                HeldCommand::Fork => {
-                    let response = response.map_err(|error| record_error(&error))?;
-                    let session_id = response
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let incarnation = response
-                        .pointer("/view/session/incarnation")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default();
-                    Ok(RequestResult::Session {
-                        session_id,
-                        incarnation,
-                    })
-                }
+                HeldCommand::Fork => response
+                    .map(|response| returned_session(&response))
+                    .map_err(|error| record_error(&error)),
                 _ => done(response),
             },
         );
@@ -1281,6 +1678,306 @@ impl ReplicationSource {
         }
     }
 
+    /// `POST /api/v2/agent/authenticate`, `…/logout`, `…/auth-terminals` and
+    /// `POST /api/v2/sessions` (protocol §5.4).
+    pub(crate) async fn global_command(
+        &self,
+        key: String,
+        command: GlobalCommand,
+    ) -> Outcome<RequestAccepted> {
+        let lock = self.live().ok_or_else(unavailable)?;
+        let mut state = lock.lock().await;
+        let fingerprint = Fingerprint::of(command.name(), &[], "", &command.body());
+        let scopes = vec![GLOBAL.to_string()];
+        if let Some(duplicate) = known_request(&state, &key, fingerprint)? {
+            renew_returned_owner(&mut state, &key);
+            return Ok(result(committed(&mut state), scopes, duplicate));
+        }
+        admit_global(&state, &command)?;
+        let request_id = state.sessions.commands.allocate_request_id();
+        let Some(response) = dispatch(&state, business(command.command(&request_id))) else {
+            return Err(unavailable());
+        };
+        let mut request = record(
+            &request_id,
+            command.operation(),
+            command.method(),
+            &key,
+            None,
+            command.params(),
+        );
+        request.method_id = command.method_id();
+        if let GlobalCommand::AuthTerminal { .. } = command {
+            request.terminal = Some(Default::default());
+        }
+        state.sessions.commands.open(request);
+        state
+            .sessions
+            .commands
+            .admit(&key, fingerprint, Subject::Request(request_id.clone()));
+        let at = committed(&mut state);
+        let id = request_id.clone();
+        on_response(Arc::downgrade(&lock), response, move |state, response| {
+            let outcome = match command {
+                GlobalCommand::Create { .. } => response
+                    .map(|response| returned_session(&response))
+                    .map_err(|error| record_error(&error)),
+                // A started terminal finishes with its exit.
+                GlobalCommand::AuthTerminal { .. } => match response {
+                    Ok(_) => return,
+                    Err(error) => Err(record_error(&error)),
+                },
+                _ => done(response),
+            };
+            state.sessions.commands.finish(&id, outcome, Instant::now());
+        });
+        Ok(result(at, scopes, accepted(request_id)))
+    }
+
+    /// `POST /api/v2/agent/auth-terminals/{requestId}/input`, `…/resize` and
+    /// `…/cancel`: control actions on a running auth terminal record.
+    pub(crate) async fn auth_terminal_control(
+        &self,
+        request_id: String,
+        control: TerminalControl,
+    ) -> Outcome<EmptyBody> {
+        let lock = self.live().ok_or_else(unavailable)?;
+        let response = {
+            let state = lock.lock().await;
+            match state.sessions.commands.request(&request_id) {
+                Some(request) if request.operation == RequestOperation::AuthTerminal => {
+                    if request.status != RequestStatus::Running {
+                        return Err(rejection(
+                            ErrorCode::Conflict,
+                            "the auth terminal already ended",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(rejection(
+                        ErrorCode::NotFound,
+                        format!("auth terminal {request_id} is not public"),
+                    ));
+                }
+            }
+            let command = match control {
+                TerminalControl::Input { data } => json!({
+                    "type": "auth/terminal_input", "requestId": request_id, "data": data,
+                }),
+                TerminalControl::Resize { cols, rows } => json!({
+                    "type": "auth/terminal_resize", "requestId": request_id,
+                    "cols": cols, "rows": rows,
+                }),
+                TerminalControl::Cancel => {
+                    json!({ "type": "auth/terminal_cancel", "requestId": request_id })
+                }
+            };
+            dispatch(&state, business(command)).ok_or_else(unavailable)?
+        };
+        response
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|error| handler_rejection(&error))?;
+        let state = lock.lock().await;
+        Ok(result(
+            position(&state),
+            vec![GLOBAL.to_string()],
+            EmptyBody {},
+        ))
+    }
+
+    /// `DELETE /api/v2/sessions/{id}` with `If-Match: "<epoch>:0"`: deletes a
+    /// session the bridge does not hold, without loading it (protocol §5.3).
+    pub(crate) async fn cold_delete(
+        &self,
+        key: String,
+        session_id: String,
+        tag: OwnerTag,
+    ) -> Outcome<RequestAccepted> {
+        let lock = self.live().ok_or_else(unavailable)?;
+        let mut state = lock.lock().await;
+        let fingerprint = Fingerprint::of(
+            "delete",
+            &[("sessionId", session_id.as_str())],
+            &tag.text(),
+            &json!({}),
+        );
+        let scopes = vec![GLOBAL.to_string()];
+        if let Some(duplicate) = known_request(&state, &key, fingerprint)? {
+            return Ok(result(committed(&mut state), scopes, duplicate));
+        }
+        if tag.epoch != state.sessions.epoch() {
+            return Err(rejection(
+                ErrorCode::OwnerMismatch,
+                "If-Match names another epoch",
+            ));
+        }
+        if state.replication.held_incarnation(&session_id).is_some()
+            || state
+                .sessions
+                .state(&session_id)
+                .is_some_and(|session| session.incarnation != 0)
+        {
+            return Err(rejection(
+                ErrorCode::OwnerMismatch,
+                format!("the bridge holds session {session_id}"),
+            ));
+        }
+        agent_method_supported(&state, "session/delete")?;
+        if state.catalog_deletions.contains_key(&session_id)
+            || running_record(&state, |request| targets(request, &session_id))
+        {
+            return Err(rejection(
+                ErrorCode::Conflict,
+                "another operation on this session is in progress",
+            ));
+        }
+        let request_id = state.sessions.commands.allocate_request_id();
+        let Some(response) = dispatch(
+            &state,
+            business(json!({
+                "type": "session/delete", "requestId": request_id, "sessionId": session_id,
+                "expectedOwnerIncarnation": 0,
+            })),
+        ) else {
+            return Err(unavailable());
+        };
+        state.sessions.commands.open(record(
+            &request_id,
+            RequestOperation::Delete,
+            "session/delete",
+            &key,
+            Some(RequestTarget {
+                session_id,
+                incarnation: None,
+            }),
+            BTreeMap::new(),
+        ));
+        state
+            .sessions
+            .commands
+            .admit(&key, fingerprint, Subject::Request(request_id.clone()));
+        let at = committed(&mut state);
+        finish_on_response(Arc::downgrade(&lock), request_id.clone(), response, done);
+        Ok(result(at, scopes, accepted(request_id)))
+    }
+
+    /// `GET /api/v2/catalog`: one page of the Agent's `session/list`. The read
+    /// leaves nothing behind but the record of its ACP call while that call
+    /// runs (protocol §6).
+    pub(crate) async fn catalog(
+        &self,
+        cursor: Option<String>,
+        revision: Option<String>,
+    ) -> Result<Value, ProtocolError> {
+        let lock = self.live().ok_or_else(unavailable)?;
+        let (response, request_id) = {
+            let mut state = lock.lock().await;
+            let Some(capabilities) = state.agent_capabilities.as_ref() else {
+                return Err(unavailable());
+            };
+            if capabilities.session_capabilities.list.is_none() {
+                return Err(rejection(
+                    ErrorCode::Unsupported,
+                    "Agent did not advertise support for session/list",
+                ));
+            }
+            let current = state.catalog_revision.to_string();
+            if revision
+                .as_ref()
+                .is_some_and(|revision| revision != &current)
+            {
+                return Err(catalog_changed());
+            }
+            let request_id = state.sessions.commands.allocate_request_id();
+            let command = json!({
+                "type": "session/list", "requestId": request_id, "cursor": cursor,
+                "expectedCatalogRevision": format!("{}:{current}", state.sessions.epoch()),
+            });
+            let response = dispatch(&state, business(command)).ok_or_else(unavailable)?;
+            let mut request = record(
+                &request_id,
+                RequestOperation::AgentRequest,
+                "session/list",
+                "",
+                None,
+                BTreeMap::new(),
+            );
+            request.client_intent_id = None;
+            state.sessions.commands.open(request);
+            (response, request_id)
+        };
+        // The record ends with its call, whether or not this caller waits.
+        let (answer, answered) = oneshot::channel();
+        on_response(Arc::downgrade(&lock), response, move |state, response| {
+            let commands = &mut state.sessions.commands;
+            commands.finish(
+                &request_id,
+                response
+                    .as_ref()
+                    .map(|_| RequestResult::Done)
+                    .map_err(record_error),
+                Instant::now(),
+            );
+            let _ = commands.acknowledge(&request_id);
+            let _ = answer.send(response);
+        });
+        let response = answered.await.map_err(|_| unavailable())?;
+        let page = response.map_err(|error| {
+            if error.data.as_ref().and_then(|data| data.get("kind"))
+                == Some(&json!("session_catalog_changed"))
+            {
+                catalog_changed()
+            } else if error.code.is_some_and(|code| {
+                code != i32::from(agent_client_protocol::ErrorCode::InvalidParams)
+            }) {
+                record_error(&error)
+            } else {
+                handler_rejection(&error)
+            }
+        })?;
+        let revision = page
+            .get("catalogRevision")
+            .and_then(Value::as_str)
+            .and_then(|revision| revision.rsplit(':').next())
+            .unwrap_or_default()
+            .to_string();
+        Ok(json!({
+            "revision": revision,
+            "sessions": page.get("sessions").cloned().unwrap_or_else(|| json!([])),
+            "nextCursor": page.get("nextCursor").cloned().unwrap_or(Value::Null),
+        }))
+    }
+
+    /// `DELETE /api/v2/url-flows/{interactionId}`: a control action on a
+    /// finished global URL flow.
+    pub(crate) async fn acknowledge_global_url_flow(
+        &self,
+        interaction_id: String,
+    ) -> Outcome<EmptyBody> {
+        let lock = self.live().ok_or_else(unavailable)?;
+        let mut state = lock.lock().await;
+        let epoch = state.sessions.epoch().to_string();
+        match state
+            .sessions
+            .acknowledge_request_url_flow(&epoch, &interaction_id)
+        {
+            Ok(()) => Ok(result(
+                committed(&mut state),
+                vec![GLOBAL.to_string()],
+                EmptyBody {},
+            )),
+            Err(UrlFlowAcknowledgement::Waiting) => Err(rejection(
+                ErrorCode::Conflict,
+                "the URL flow is still waiting",
+            )),
+            Err(UrlFlowAcknowledgement::Unknown) => Err(rejection(
+                ErrorCode::NotFound,
+                format!("URL flow {interaction_id} is not public"),
+            )),
+        }
+    }
+
     /// The v1 view of exactly the tagged owner, for the immutable and
     /// workspace reads. Never loads anything.
     pub(crate) async fn owner_view(
@@ -1358,28 +2055,18 @@ impl ReplicationSource {
             let state = lock.lock().await;
             dispatch(&state, business(command)).ok_or_else(unavailable)?
         };
-        response.await.map_err(|_| unavailable())?.map_err(|error| {
-            let message = error
-                .data
-                .as_ref()
-                .and_then(Value::as_str)
-                .map_or(error.message.clone(), str::to_string);
-            let code = match error.code {
-                Some(code)
-                    if code == i32::from(agent_client_protocol::ErrorCode::MethodNotFound) =>
-                {
-                    ErrorCode::Unsupported
-                }
-                Some(code)
-                    if code == i32::from(agent_client_protocol::ErrorCode::InvalidParams) =>
-                {
-                    ErrorCode::InvalidRequest
-                }
-                _ => ErrorCode::Conflict,
-            };
-            rejection(code, message)
-        })
+        response
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|error| handler_rejection(&error))
     }
+}
+
+fn catalog_changed() -> ProtocolError {
+    rejection(
+        ErrorCode::CatalogChanged,
+        "the catalog changed; read it again from the first page",
+    )
 }
 
 fn accepted(request_id: String) -> RequestAccepted {
