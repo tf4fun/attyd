@@ -269,6 +269,7 @@ impl SessionRegistry {
         );
         self.overlay_bytes = self.overlay_bytes.saturating_sub(old_bytes);
         self.prune_retained_terminals(&key, snapshot.updates());
+        self.replace_session_log(session_id, snapshot.updates());
         Ok(snapshot)
     }
 

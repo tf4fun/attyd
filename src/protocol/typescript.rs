@@ -5,6 +5,7 @@ use std::path::Path;
 use ts_rs::{Config, TS};
 
 use super::canon::*;
+use super::documents::*;
 use super::*;
 
 const OUTPUT: &str = "shared/protocol.ts";
@@ -14,8 +15,24 @@ const ACP_TYPES: &[&str] = &[
     "AvailableCommand",
     "ContentBlock",
     "Cost",
+    "CreateElicitationRequest",
+    "InitializeResponse",
+    "RequestPermissionRequest",
     "SessionConfigOption",
     "SessionMode",
+    "SessionUpdate",
+];
+
+/// Projections of ACP types that ts-rs cannot express. A process update is the
+/// SDK's `SessionUpdate` with each content position (the fields
+/// `attachments::update_blocks` visits) normalized to a `Block` (§4.4).
+const PROJECTED_TYPES: &[&str] = &[
+    "type ProcessUpdate = ProjectedFields<Extract<SessionUpdate, { sessionUpdate: \"user_message_chunk\" | \"agent_message_chunk\" | \"agent_thought_chunk\" | \"compaction_summary_chunk\" }>, \"content\"> | ProjectedFields<Extract<SessionUpdate, { sessionUpdate: \"compaction_update\" }>, \"summary\"> | ProjectedToolCall<Extract<SessionUpdate, { sessionUpdate: \"tool_call\" | \"tool_call_update\" }>> | Exclude<SessionUpdate, { sessionUpdate: \"user_message_chunk\" | \"agent_message_chunk\" | \"agent_thought_chunk\" | \"compaction_summary_chunk\" | \"compaction_update\" | \"tool_call\" | \"tool_call_update\" }>;",
+    "type ProjectedFields<T, K extends PropertyKey> = T extends unknown ? { [P in keyof T]: P extends K ? ProjectedBlocks<T[P]> : T[P] } : never;",
+    "type ProjectedBlocks<V> = V extends ContentBlock ? Block : V extends Array<infer B> ? Array<ProjectedBlocks<B>> : V;",
+    "type ProjectedToolCall<T> = T extends unknown ? { [P in keyof T]: P extends \"content\" ? ProjectedToolCallContents<T[P]> : T[P] } : never;",
+    "type ProjectedToolCallContents<V> = V extends Array<infer C> ? Array<ProjectedToolCallContent<C>> : V;",
+    "type ProjectedToolCallContent<C> = C extends { type: \"content\" } ? ProjectedFields<C, \"content\"> : C;",
 ];
 
 fn declarations(cfg: &Config) -> Vec<String> {
@@ -35,6 +52,33 @@ fn declarations(cfg: &Config) -> Vec<String> {
         AttachmentRef,
         AttachmentKind,
         LogEntry,
+        ProtocolError,
+        ErrorCode,
+        OperationKind,
+        OperationStatus,
+        Operation,
+        Interaction,
+        UrlFlow,
+        Terminal,
+        ExitStatus,
+        LoginTerminal,
+        SessionLive,
+        GlobalLive,
+        CatalogLive,
+        AgentInfo,
+        AgentPhase,
+        AgentLaunch,
+        AgentTransport,
+        McpServerSummary,
+        McpServerKind,
+        SessionSummary,
+        OperationSummary,
+        PendingCounts,
+        Event,
+        LogChange,
+        LiveChange,
+        End,
+        EndReason,
     ]
 }
 
@@ -50,7 +94,10 @@ fn render() -> String {
         output.push_str(&format!("  {name},\n"));
     }
     output.push_str("} from \"@agentclientprotocol/sdk\";\n");
-    for declaration in declarations(&cfg) {
+    let projected = PROJECTED_TYPES
+        .iter()
+        .map(|declaration| declaration.to_string());
+    for declaration in declarations(&cfg).into_iter().chain(projected) {
         output.push_str("\nexport ");
         output.push_str(&declaration);
         output.push('\n');

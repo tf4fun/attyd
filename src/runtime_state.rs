@@ -8,6 +8,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::protocol::SessionControls;
+use crate::protocol::documents::OperationKind;
+use crate::protocol::op::OpSlot;
+use crate::protocol::registry::TurnEnd;
 use crate::session_mirror::TurnOverlay;
 use crate::session_registry::{SessionEntry, SessionRegistry};
 use crate::session_state::{MirrorError, SessionAdmission, SessionState, TurnAdmission};
@@ -73,6 +77,10 @@ pub(crate) struct SessionLiveState {
     released_terminals: VecDeque<String>,
     attachment_candidate: Vec<Value>,
     attachment_candidate_bytes: usize,
+    /// The protocol v2 operation this session's `live.op` shows.
+    pub(crate) op: OpSlot,
+    /// The reduced controls (protocol §4.5).
+    pub(crate) controls: SessionControls,
 }
 
 impl SessionLiveState {
@@ -571,12 +579,17 @@ impl SessionRegistry {
         }
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
+        let cwd: PathBuf = cwd.into();
+        let op = OpSlot::running(
+            OperationKind::Load,
+            serde_json::json!({ "cwd": cwd.to_string_lossy() }),
+        );
         self.install_live(
             &session_id,
             incarnation,
             SessionLiveState {
                 revision: 0,
-                cwd: cwd.into(),
+                cwd,
                 session: Value::Null,
                 control_state: BTreeMap::new(),
                 lifecycle: SessionLifecycle::Attaching,
@@ -593,6 +606,8 @@ impl SessionRegistry {
                 history_revision: None,
                 phase: crate::session_state::MirrorPhase::Ready,
                 sync_error: None,
+                op,
+                controls: SessionControls::default(),
             },
         );
         self.sessions
@@ -662,6 +677,7 @@ impl SessionRegistry {
             uncertainty_reason: None,
         });
         session.attachment_candidate_bytes = 0;
+        self.begin_session_operation(session_id, kind);
 
         self.commit_session(session_id);
         Ok(())
@@ -728,6 +744,8 @@ impl SessionRegistry {
         session.control_state = extract_control_state(candidate);
         session.session = response;
         owner.operation = None;
+        self.settle_session_controls(session_id);
+        self.complete_session_operation(session_id, SessionOperationKind::Load, &Value::Null);
 
         self.commit_session(session_id);
         Ok(())
@@ -739,7 +757,7 @@ impl SessionRegistry {
         session_id: &str,
         incarnation: u64,
         operation_id: &str,
-        _error: Value,
+        error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
@@ -756,6 +774,7 @@ impl SessionRegistry {
         session.attachment_candidate.clear();
         session.attachment_candidate_bytes = 0;
         owner.operation = None;
+        self.fail_session_operation(session_id, SessionOperationKind::Load, &error);
 
         self.commit_session(session_id);
         Ok(())
@@ -793,6 +812,8 @@ impl SessionRegistry {
         session.session = response;
         session.lifecycle = SessionLifecycle::Active;
         owner.operation = None;
+        self.settle_session_controls(session_id);
+        self.complete_session_operation(session_id, kind, &Value::Null);
 
         self.commit_session(session_id);
         Ok(())
@@ -806,7 +827,7 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
-        _error: Value,
+        error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         {
@@ -828,6 +849,7 @@ impl SessionRegistry {
         let effects = drain_session_liveness(session_id, incarnation, &mut session);
 
         self.effects.extend(effects);
+        self.fail_session_load(session_id, &error);
 
         self.commit_removal(session_id, incarnation);
         Ok(())
@@ -882,6 +904,7 @@ impl SessionRegistry {
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
         let session = retain_session_metadata(&session_id, session);
+        let controls = SessionControls::settle(&control_state, &session);
         self.install_live(
             &session_id,
             incarnation,
@@ -904,6 +927,8 @@ impl SessionRegistry {
                 history_revision: None,
                 phase: crate::session_state::MirrorPhase::Ready,
                 sync_error: None,
+                op: OpSlot::completed(OperationKind::Open, serde_json::json!({})),
+                controls,
             },
         );
         self.commit_session(&session_id);
@@ -1061,10 +1086,17 @@ impl SessionRegistry {
             return Err(RuntimeStateError::SessionNotActive);
         }
         let key = key.into();
+        let incoming = update.clone();
         let update = fold_control_update(session.control_state.get(&key), update);
-        if session.control_state.get(&key) == Some(&update) {
+        let unchanged = session.control_state.get(&key) == Some(&update);
+        // A later notification overrides the setup response even when it
+        // repeats an earlier one (protocol §4.5), so the documents' controls
+        // fold it before the v1 store drops it as a duplicate.
+        self.fold_session_controls(session_id, &incoming);
+        if unchanged {
             return Ok(());
         }
+        let session = self.require_live_mut(session_id, incarnation)?;
         session.control_state.insert(key.clone(), update.clone());
         self.commit_control_update(session_id, incarnation, key, update);
         Ok(())
@@ -1093,6 +1125,7 @@ impl SessionRegistry {
         }
         session.session = response;
         session.control_state = controls;
+        self.settle_session_controls(session_id);
         self.commit_session(session_id);
         Ok(())
     }
@@ -1114,6 +1147,7 @@ impl SessionRegistry {
             return Ok(());
         }
         execution.cancel_requested = true;
+        self.request_session_cancel(session_id);
         self.commit_session(session_id);
         Ok(())
     }
@@ -1126,13 +1160,13 @@ impl SessionRegistry {
         operation_id: &str,
         response: Value,
     ) -> Result<(), RuntimeStateError> {
-        drop(response);
         self.seal_turn(
             expected_epoch,
             session_id,
             incarnation,
             operation_id,
             TurnTerminal { lifecycle: None },
+            TurnEnd::Completed(&response),
         )
     }
 
@@ -1144,13 +1178,13 @@ impl SessionRegistry {
         operation_id: &str,
         error: Value,
     ) -> Result<(), RuntimeStateError> {
-        drop(error);
         self.seal_turn(
             expected_epoch,
             session_id,
             incarnation,
             operation_id,
             TurnTerminal { lifecycle: None },
+            TurnEnd::Failed(&error),
         )
     }
 
@@ -1162,7 +1196,7 @@ impl SessionRegistry {
         operation_id: &str,
         reason: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
-        drop(reason.into());
+        let reason = reason.into();
         self.seal_turn(
             expected_epoch,
             session_id,
@@ -1171,6 +1205,7 @@ impl SessionRegistry {
             TurnTerminal {
                 lifecycle: Some(SessionLifecycle::Uncertain),
             },
+            TurnEnd::Uncertain(&reason),
         )
     }
 
@@ -1181,10 +1216,12 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: &str,
         terminal: TurnTerminal,
+        end: TurnEnd<'_>,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
         let retired = session_live::seal_turn(owner, operation_id, terminal)?;
+        self.end_session_turn(session_id, end);
         self.effects
             .extend(retired.permissions.into_iter().map(|interaction_id| {
                 RuntimeEffect::CancelPermissionResponder {
@@ -1805,6 +1842,7 @@ impl SessionRegistry {
         let effects = drain_session_liveness(session_id, incarnation, &mut session);
 
         self.effects.extend(effects);
+        self.complete_session_delete(session_id);
 
         self.commit_removal(session_id, incarnation);
         Ok(())
@@ -1848,7 +1886,7 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
-        _result: Value,
+        result: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
@@ -1861,6 +1899,7 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         owner.operation = None;
+        self.complete_session_operation(session_id, kind, &result);
 
         self.commit_session(session_id);
         Ok(())
@@ -1894,8 +1933,11 @@ impl SessionRegistry {
         }
         session
             .control_state
-            .insert(control_key.into(), control_update);
+            .insert(control_key.into(), control_update.clone());
         owner.operation = None;
+        // The acknowledgement folds after every earlier notification (§4.5).
+        self.fold_session_controls(session_id, &control_update);
+        self.complete_session_operation(session_id, kind, &Value::Null);
 
         self.commit_session(session_id);
         Ok(())
@@ -1908,7 +1950,7 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
-        _error: Value,
+        error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
@@ -1927,6 +1969,7 @@ impl SessionRegistry {
             SessionOperationKind::Delete => SessionLifecycle::Active,
             _ => session.lifecycle.clone(),
         };
+        self.fail_session_operation(session_id, kind, &error);
 
         self.commit_session(session_id);
         Ok(())
@@ -2161,6 +2204,7 @@ impl SessionRegistry {
     }
 
     fn commit_session(&mut self, session_id: &str) {
+        self.settle_session_ops(session_id);
         let Some(entry) = self.sessions.get_mut(session_id) else {
             return;
         };
@@ -2185,6 +2229,7 @@ impl SessionRegistry {
     }
 
     fn commit_connection(&mut self) {
+        self.settle_global_ops();
         self.connection_revision = self.connection_revision.wrapping_add(1).max(1);
         self.commit_delta(
             Some(self.connection_revision),

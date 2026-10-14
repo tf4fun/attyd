@@ -7,6 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::history_cache::HistoryCacheError;
+use crate::protocol::registry::SessionLog;
 use crate::runtime_state::{
     SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
     SharedTurnUpdates, fold_shared_active_turn_update,
@@ -76,6 +77,9 @@ pub(crate) struct SessionState {
     pub(crate) load_origin: Option<MirrorPhase>,
     #[serde(skip)]
     pub(crate) active_overlay_bytes: usize,
+    /// The protocol v2 turn log: unknown until a load or creation.
+    #[serde(skip)]
+    pub(crate) log: SessionLog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +168,7 @@ impl SessionState {
             load_attempt: None,
             load_origin: None,
             active_overlay_bytes: 0,
+            log: SessionLog::Unknown,
         }
     }
 
@@ -175,6 +180,7 @@ impl SessionState {
         let mut session = Self::cold(session_id, incarnation);
         session.phase = MirrorPhase::Ready;
         session.history_revision = Some(history_revision);
+        session.log = SessionLog::empty();
         session
     }
 

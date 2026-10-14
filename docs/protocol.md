@@ -246,10 +246,17 @@ interface Operation {
                                             // `Block[]`), or the load's cwd
   cancelRequested: boolean;
   interactions: Record<string, Interaction>;  // pending, by interactionId
-  process?: SessionUpdate[];                // prompt while running: its updates, folded
+  process?: ProcessUpdate[];                // prompt while running: its updates, folded
   result?: unknown;                         // completed (§6.2)
   error?: ProtocolError;                    // failed
 }
+
+// A `SessionUpdate` whose content positions are normalized like the log's
+// content (§3.2): the `content` of message, thought and compaction summary
+// chunks, the `content` items of type "content" in `tool_call` and
+// `tool_call_update`, and a `compaction_update`'s `summary` are `Block`s.
+// Every other field, and every other update, is the SDK's.
+type ProcessUpdate = SessionUpdate /* with those positions as Block */;
 ```
 
 - `op` keeps its final status, result or error until the next operation replaces
