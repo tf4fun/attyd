@@ -59,7 +59,8 @@ export default function DevProbe() {
     const sockets: string[] = [];
     page.on("websocket", (socket) => sockets.push(socket.url()));
     const stream = page.waitForResponse((response) =>
-      response.url().includes("/api/v1/sessions/saved-session/events") && response.status() === 200
+      new URL(response.url()).pathname === "/api/v2/stream" && response.status() === 200 &&
+      new URL(response.url()).searchParams.getAll("scope").some((scope) => scope.startsWith("session/saved-session@"))
     );
     const response = await page.goto(`${origin}/sessions/saved-session`);
     expect(await response!.text()).toContain("/@vite/client");

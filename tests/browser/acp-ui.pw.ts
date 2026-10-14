@@ -66,7 +66,7 @@ test.describe("interface localization", () => {
     const originalUrl = page.url();
     let sessionRequests = 0;
     page.on("request", (request) => {
-      if (new URL(request.url()).pathname.startsWith("/api/v1/sessions/")) sessionRequests += 1;
+      if (new URL(request.url()).pathname.startsWith("/api/v2/sessions/")) sessionRequests += 1;
     });
     await page.getByRole("button", { name: "界面设置", exact: true }).click();
     await page.getByRole("combobox", { name: "界面语言", exact: true }).selectOption("en");
@@ -194,7 +194,7 @@ test.describe("interface appearance", () => {
     const originalUrl = page.url();
     let sessionRequests = 0;
     page.on("request", (request) => {
-      if (new URL(request.url()).pathname.startsWith("/api/v1/sessions/")) sessionRequests += 1;
+      if (new URL(request.url()).pathname.startsWith("/api/v2/sessions/")) sessionRequests += 1;
     });
 
     for (const viewport of [
@@ -354,7 +354,7 @@ for (const { kind, listState } of [
     let notifyListStarted!: () => void;
     const listStarted = new Promise<void>((resolve) => { notifyListStarted = resolve; });
     const listError = "Session listing failed during reload";
-    await page.route("**/api/v1/sessions", async (route) => {
+    await page.route("**/api/v2/catalog**", async (route) => {
       if (route.request().method() !== "GET") {
         await route.continue();
         return;
@@ -858,7 +858,7 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await expect(content.locator("a.attachment-chip")).toHaveCount(6);
   await expect(content.locator("pre, img, audio, iframe, object, embed, [download]")).toHaveCount(0);
   await expect(content).not.toContainText("# 完整的中文附件");
-  const view = await (await page.request.get("/api/v1/sessions/saved-session?presentation=compact")).json();
+  const view = (await (await page.request.get("/api/v2/sessions/saved-session")).json()).state.history;
   expect(JSON.stringify(view)).not.toContain("# 完整的中文附件");
   expect(JSON.stringify(view)).not.toContain(wave.toString("base64"));
   const hosted = view.timeline.filter((update: { sessionUpdate: string; content?: { _meta?: Record<string, unknown> } }) =>
@@ -1294,8 +1294,8 @@ test("deletes an unopened session from its project without creating or opening a
   const sessionRequests: string[] = [];
   page.on("request", (request) => {
     const path = new URL(request.url()).pathname;
-    if (path.startsWith("/api/v1/sessions/") ||
-      (path === "/api/v1/sessions" && request.method() === "POST")) {
+    if (path.startsWith("/api/v2/sessions/") ||
+      (path === "/api/v2/sessions" && request.method() === "POST")) {
       sessionRequests.push(`${request.method()} ${path}`);
     }
   });
@@ -1311,17 +1311,17 @@ test("deletes an unopened session from its project without creating or opening a
     await expect(dialog).toContainText("Saved ACP session");
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "DELETE" &&
-      new URL(response.url()).pathname === "/api/v1/sessions/saved-session"
+      new URL(response.url()).pathname === "/api/v2/sessions/saved-session"
     );
     await dialog.getByRole("button", { name: "Delete session", exact: true }).click();
-    expect((await deleted).status()).toBe(204);
+    expect((await deleted).status()).toBe(200);
     await expect(page.locator(".project-session-link").filter({ hasText: "Saved ACP session" })).toHaveCount(0);
     await expect(page.locator(".project-session-link").filter({ hasText: "Earlier Agent thread" })).toBeVisible();
     await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(cwd));
     await page.reload();
     await expect(page.locator(".project-browser-path")).toHaveText(cwd);
     await expect(page.locator(".project-session-link")).toHaveCount(1);
-    expect(sessionRequests).toEqual(["DELETE /api/v1/sessions/saved-session"]);
+    expect(sessionRequests).toEqual(["DELETE /api/v2/sessions/saved-session"]);
     await expect(page.getByRole("alert")).toHaveCount(0);
     expect(browserErrors).toEqual([]);
     await page.screenshot({ path: test.info().outputPath("project-after-cold-delete.png") });
@@ -1391,15 +1391,17 @@ for (const action of ["close", "delete"] as const) {
   test(`retires the open session after an external ${action} without SSE reopening it`, async ({ page }) => {
     const browserErrors = collectBrowserErrors(page);
     const sessionEvents: string[] = [];
+    const observesSession = (url: string) => {
+      const parsed = new URL(url);
+      return parsed.pathname === "/api/v2/stream" &&
+        parsed.searchParams.getAll("scope").some((scope) => scope.startsWith("session/saved-session@"));
+    };
     page.on("request", (request) => {
-      if (new URL(request.url()).pathname === "/api/v1/sessions/saved-session/events") {
+      if (observesSession(request.url()) || new URL(request.url()).pathname === "/api/v2/sessions/saved-session/open") {
         sessionEvents.push(request.url());
       }
     });
-    const observed = page.waitForResponse((response) =>
-      new URL(response.url()).pathname === "/api/v1/sessions/saved-session/events" &&
-      response.status() === 200
-    );
+    const observed = page.waitForResponse((response) => observesSession(response.url()) && response.status() === 200);
     await page.goto("/sessions/saved-session");
     await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
     const composer = page.locator('textarea[role="combobox"]');
@@ -1428,7 +1430,7 @@ for (const action of ["close", "delete"] as const) {
     });
     const refreshed = page.waitForResponse((response) =>
       response.request().method() === "GET" &&
-      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      new URL(response.url()).pathname === "/api/v2/catalog" &&
       response.status() === 200
     );
     await page.getByRole("button", { name: "Refresh projects and sessions", exact: true }).click();
@@ -1451,8 +1453,9 @@ test("keeps a reopened session when its old close HTTP response arrives late", a
   await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
   await expect(composer).toBeEnabled();
   const origin = new URL(page.url()).origin;
-  const viewUrl = `${origin}/api/v1/sessions/saved-session`;
-  const original = await (await page.request.get(viewUrl)).json();
+  // The v2 snapshot read never materializes a session.
+  const viewUrl = `${origin}/api/v2/sessions/saved-session`;
+  const original = (await (await page.request.get(viewUrl)).json()).state;
   let releaseResponse!: () => void;
   const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
   let notifyClosed!: (status: number) => void;
@@ -1461,7 +1464,7 @@ test("keeps a reopened session when its old close HTTP response arrives late", a
     notifyClosed = resolve;
     rejectClosed = reject;
   });
-  await page.route("**/api/v1/sessions/saved-session/close", async (route) => {
+  await page.route("**/api/v2/sessions/saved-session/close", async (route) => {
     try {
       const response = await route.fetch();
       notifyClosed(response.status());
@@ -1484,7 +1487,7 @@ test("keeps a reopened session when its old close HTTP response arrives late", a
     // the first close request's browser callback is still waiting behind the gate.
     const projectListed = page.waitForResponse((response) =>
       response.request().method() === "GET" &&
-      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      new URL(response.url()).pathname === "/api/v2/catalog" &&
       response.status() === 200
     );
     await page.goBack();
@@ -1494,17 +1497,17 @@ test("keeps a reopened session when its old close HTTP response arrives late", a
     await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
     await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
     await expect(composer).toBeEnabled();
-    const reopened = await (await page.request.get(viewUrl)).json();
-    expect(reopened.sessionIncarnation).toBeGreaterThan(original.sessionIncarnation);
+    const reopened = (await (await page.request.get(viewUrl)).json()).state;
+    expect(reopened.incarnation).toBeGreaterThan(original.incarnation);
     await composer.fill("Keep the new incarnation's draft");
 
     const oldResponse = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v1/sessions/saved-session/close"
+      new URL(response.url()).pathname === "/api/v2/sessions/saved-session/close"
     );
     const refreshedAfterReply = page.waitForResponse((response) =>
       response.request().method() === "GET" &&
-      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      new URL(response.url()).pathname === "/api/v2/catalog" &&
       response.status() === 200
     );
     releaseResponse();
@@ -1516,8 +1519,8 @@ test("keeps a reopened session when its old close HTTP response arrives late", a
     await expect(page.getByRole("heading", { name: "Saved ACP session", exact: true })).toBeVisible();
     await expect(composer).toBeEnabled();
     await expect(composer).toHaveValue("Keep the new incarnation's draft");
-    expect((await (await page.request.get(viewUrl)).json()).sessionIncarnation)
-      .toBe(reopened.sessionIncarnation);
+    expect((await (await page.request.get(viewUrl)).json()).state.incarnation)
+      .toBe(reopened.incarnation);
     expect(browserErrors).toEqual([]);
   } finally {
     releaseResponse();
@@ -1532,24 +1535,25 @@ test("keeps the session and composer when deletion fails during close", async ({
     command: [process.execPath, "--import", "tsx", join(cwd, "tests/fixtures/fake-agent.ts"), "--fail-close-once"],
   });
   const origin = `http://127.0.0.1:${server.port}`;
-  const browserErrors = collectBrowserErrors(page, [409]);
+  const browserErrors = collectBrowserErrors(page);
   try {
     await page.goto(`${origin}/sessions/saved-session`);
     const composer = page.locator('textarea[role="combobox"]');
     const heading = page.getByRole("heading", { name: "Saved ACP session", exact: true });
     await expect(heading).toBeVisible();
     await expect(composer).toBeEnabled();
-    const original = await (await page.request.get(`${origin}/api/v1/sessions/saved-session`)).json();
+    const original = (await (await page.request.get(`${origin}/api/v2/sessions/saved-session`)).json()).state;
     await composer.fill("Keep my draft after failed deletion");
     await page.getByRole("button", { name: "Thread actions", exact: true }).click();
     await page.getByRole("button", { name: "Delete thread", exact: true }).click();
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "DELETE" &&
-      new URL(response.url()).pathname === "/api/v1/sessions/saved-session"
+      new URL(response.url()).pathname === "/api/v2/sessions/saved-session"
     );
     await page.getByRole("alertdialog", { name: "Delete session?" })
       .getByRole("button", { name: "Delete session", exact: true }).click();
-    expect((await deleted).status()).toBe(409);
+    // The delete is accepted; its request record reports the failed close.
+    expect((await deleted).status()).toBe(200);
     await expect(page.getByText("Synthetic close failure", { exact: true })).toBeVisible();
     await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
     await expect(heading).toBeVisible();
@@ -1559,9 +1563,9 @@ test("keeps the session and composer when deletion fails during close", async ({
     await expect(page.locator(".project-browser-path")).toHaveCount(0);
     // Here the close itself failed, so the original owner remains materialized.
     // Check its identity only after asserting that the UI never left it.
-    const retained = await (await page.request.get(`${origin}/api/v1/sessions/saved-session`)).json();
-    expect(retained.phase).toBe("ready");
-    expect(retained.sessionIncarnation).toBe(original.sessionIncarnation);
+    const retained = (await (await page.request.get(`${origin}/api/v2/sessions/saved-session`)).json()).state;
+    expect(retained.history.phase).toBe("ready");
+    expect(retained.incarnation).toBe(original.incarnation);
     expect(browserErrors).toEqual([]);
   } finally {
     await server.close();
@@ -2460,7 +2464,7 @@ test("keeps live terminal output across reconnect and retains released output fo
     await expect(restored).toHaveCount(0);
     const processResponse = page.waitForResponse((response) => {
       const url = new URL(response.url());
-      return url.pathname.startsWith("/api/v1/sessions/saved-session/turns/") &&
+      return url.pathname.startsWith("/api/v2/sessions/saved-session/history/") &&
         url.pathname.endsWith("/process") && url.searchParams.get("offset") === "0";
     });
     await revealTurnProcess(restoredPrompt);
@@ -2702,7 +2706,9 @@ for (const storedSessionId of ["stale-session", "earlier-session"]) {
     }, storedSessionId);
     const sessionRequests: string[] = [];
     page.on("request", (request) => {
-      if (/^\/api\/v1\/sessions\/[^/]+(?:\/events)?$/u.test(new URL(request.url()).pathname)) {
+      const url = new URL(request.url());
+      if (/^\/api\/v2\/sessions\/[^/]+(?:\/open)?$/u.test(url.pathname) ||
+        url.searchParams.getAll("scope").some((scope) => scope.startsWith("session/"))) {
         sessionRequests.push(request.url());
       }
     });
@@ -2741,7 +2747,7 @@ test("keeps the homepage selected when a previous create response arrives late",
   const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
   let notifyCreated!: () => void;
   const createdUpstream = new Promise<void>((resolve) => { notifyCreated = resolve; });
-  await page.route("**/api/v1/sessions", async (route) => {
+  await page.route("**/api/v2/sessions", async (route) => {
     if (route.request().method() !== "POST") {
       await route.continue();
       return;
@@ -2770,10 +2776,10 @@ test("keeps the homepage selected when a previous create response arrives late",
 
     const delivered = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v1/sessions"
+      new URL(response.url()).pathname === "/api/v2/sessions"
     );
     releaseCreate();
-    expect((await delivered).status()).toBe(201);
+    expect((await delivered).status()).toBe(200);
     await page.evaluate(() => new Promise<void>((resolve) => {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
     }));
@@ -2798,7 +2804,7 @@ test("serializes session list requests while startup and route refreshes overlap
   let listRequests = 0;
   let inFlight = 0;
   let maximumInFlight = 0;
-  await page.route("**/api/v1/sessions", async (route) => {
+  await page.route("**/api/v2/catalog**", async (route) => {
     if (route.request().method() !== "GET") {
       await route.continue();
       return;
@@ -2863,7 +2869,7 @@ for (const width of [1280, 390]) {
     await dialog.getByLabel("Project working directory", { exact: true }).fill(cwd);
     await page.screenshot({ path: test.info().outputPath("new-project-dialog.png") });
     const created = page.waitForRequest((request) =>
-      request.method() === "POST" && new URL(request.url()).pathname === "/api/v1/sessions"
+      request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/sessions"
     );
     await dialog.getByRole("button", { name: "Create project", exact: true }).click();
     expect((await created).postDataJSON()).toMatchObject({ cwd });
@@ -3082,7 +3088,7 @@ test("creates a session in the selected project instead of the startup directory
   const dialog = page.getByRole("dialog", { name: "New thread" });
   await expect(dialog.getByLabel("Agent workspace", { exact: true })).toHaveValue(cwd);
   const created = page.waitForRequest((request) =>
-    request.method() === "POST" && new URL(request.url()).pathname === "/api/v1/sessions"
+    request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/sessions"
   );
   await dialog.getByRole("button", { name: "Create thread" }).click();
   expect((await created).postDataJSON()).toMatchObject({ cwd });
@@ -3131,7 +3137,7 @@ test("reloads a created session URL even when the Agent list is empty", async ({
     await page.getByRole("button", { name: "New project", exact: true }).click();
     const refreshedList = page.waitForResponse((response) =>
       response.request().method() === "GET" &&
-      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      new URL(response.url()).pathname === "/api/v2/catalog" &&
       response.status() === 200
     );
     await page.getByRole("dialog", { name: "New project" })
@@ -3224,7 +3230,7 @@ test("browses cross-workspace projects and restores a shared session with its ow
     await page.getByRole("button", { name: "Thread actions" }).click();
     const refreshedList = page.waitForResponse((response) =>
       response.request().method() === "GET" &&
-      new URL(response.url()).pathname === "/api/v1/sessions" &&
+      new URL(response.url()).pathname === "/api/v2/catalog" &&
       response.status() === 200
     );
     await page.getByRole("button", { name: "Close thread" }).click();
@@ -3237,7 +3243,7 @@ test("browses cross-workspace projects and restores a shared session with its ow
     const listedCursors: Array<string | null> = [];
     shared.on("request", (request) => {
       const url = new URL(request.url());
-      if (request.method() === "GET" && url.pathname === "/api/v1/sessions") {
+      if (request.method() === "GET" && url.pathname === "/api/v2/catalog") {
         listedCursors.push(url.searchParams.get("cursor"));
       }
     });
@@ -3325,7 +3331,8 @@ test("offers an explicit reconnect over the composer after the ACP connection st
   await expect(composer).toBeEnabled();
   await composer.fill("disconnect-flow");
   // The fixture exits the Agent while a session-view refresh may be in flight.
-  expectedHttpErrors.push({ status: 503, pathname: "/api/v1/sessions/saved-session" });
+  expectedHttpErrors.push({ status: 503, pathname: "/api/v2/sessions/saved-session" },
+    { status: 503, pathname: "/api/v2/stream" });
   await composer.press("Enter");
 
   const recovery = page.locator(".composer-reconnect");
@@ -3400,7 +3407,8 @@ test("reconnects a stale mobile-style socket after a focus liveness probe", asyn
   await expect(composer).toBeEnabled();
   await composer.fill("disconnect-flow");
   // Only the stopped session's GET may return 503 during this deliberate outage.
-  expectedHttpErrors.push({ status: 503, pathname: "/api/v1/sessions/saved-session" });
+  expectedHttpErrors.push({ status: 503, pathname: "/api/v2/sessions/saved-session" },
+    { status: 503, pathname: "/api/v2/stream" });
   await composer.press("Enter");
   await expect(page.locator(".composer-reconnect")).toBeVisible();
 
@@ -3485,7 +3493,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   let releaseFirstInput!: () => void;
   const firstInputGate = new Promise<void>((resolve) => { releaseFirstInput = resolve; });
   const inputChunks: string[] = [];
-  await page.route("**/api/v1/auth/terminal/*/input", async (route) => {
+  await page.route("**/api/v2/agent/auth-terminals/*/input", async (route) => {
     inputChunks.push(route.request().postDataJSON().data);
     if (inputChunks.length === 1) await firstInputGate;
     await route.continue();

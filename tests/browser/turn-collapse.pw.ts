@@ -57,7 +57,7 @@ test("shows the live process and keeps only the final answer after completion at
 test("releases an observed completed turn after five minutes folded and restores it through pagination", async ({ page, collapseFixture }) => {
   await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
   const processRequests: string[] = [];
-  const isProcessUrl = (url: string) => /\/api\/v1\/sessions\/saved-session\/turns\/[^/]+\/process$/u.test(new URL(url).pathname);
+  const isProcessUrl = (url: string) => /\/api\/v2\/sessions\/saved-session\/history\/[^/]+\/turns\/[^/]+\/process$/u.test(new URL(url).pathname);
   page.on("request", (request) => {
     if (isProcessUrl(request.url())) processRequests.push(request.url());
   });

@@ -2,7 +2,7 @@ import { expect, test as baseTest, type Locator, type Page } from "@playwright/t
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
 
-const SESSION_PATH = "/api/v1/sessions/lazy-process-session";
+const SESSION_PATH = "/api/v2/sessions/lazy-process-session";
 const FINAL_ANSWER = "The final answer is available without loading execution details.";
 const test = baseTest.extend<{ fixtureUrl: string }>({
   fixtureUrl: async ({}, use) => {
@@ -25,7 +25,7 @@ test("transmits the final answer first and fetches execution details only in req
   });
   const initialResponse = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return url.pathname === SESSION_PATH && url.searchParams.get("presentation") === "compact" && response.ok();
+    return url.pathname === SESSION_PATH && response.request().method() === "GET" && response.ok();
   });
   await page.goto("/sessions/lazy-process-session");
   const response = await initialResponse;
@@ -33,9 +33,9 @@ test("transmits the final answer first and fetches execution details only in req
   expect(raw).toContain(FINAL_ANSWER);
   expect(raw).not.toContain("HIDDEN_PROCESS_PAYLOAD_");
   expect(raw).not.toContain("Inspect process item");
-  const snapshot = JSON.parse(raw);
-  expect(snapshot.collapsedTurns).toHaveLength(1);
-  expect(snapshot.collapsedTurns[0].processCount).toBe(25);
+  const snapshot = JSON.parse(raw).state;
+  expect(snapshot.history.collapsedTurns).toHaveLength(1);
+  expect(snapshot.history.collapsedTurns[0].processCount).toBe(25);
   const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
   await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
   await expect(turn.locator(".turn-process-count")).toHaveText("25 items");
@@ -220,7 +220,7 @@ test("keeps task progress on the left and recovers composer space when the mobil
 
 function isProcessUrl(url: string): boolean {
   const path = new URL(url).pathname;
-  return path.startsWith(`${SESSION_PATH}/turns/`) && path.endsWith("/process");
+  return path.startsWith(`${SESSION_PATH}/history/`) && path.endsWith("/process");
 }
 
 async function expectToolSpacing(before: Locator, after: Locator) {

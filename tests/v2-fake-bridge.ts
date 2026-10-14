@@ -93,7 +93,11 @@ export class FakeBridge {
   fetch = async (input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(String(input), "http://test");
     const headers: Record<string, string> = {};
-    new Headers(init.headers).forEach((value, key) => { headers[key] = value; });
+    const source = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+    for (const name of ["idempotency-key", "if-match", "content-type"]) {
+      const value = source.get(name);
+      if (value != null) headers[name] = value;
+    }
     const request: RecordedRequest = {
       method: (init.method ?? "GET").toUpperCase(),
       path: url.pathname + url.search,

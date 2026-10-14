@@ -330,6 +330,14 @@ export function useAcp(options: UseAcpOptions = {}) {
       `/api/v2/sessions/${encodeURIComponent(sessionId)}/open`, { key, body: { cwd } },
     );
     if (!isCurrent()) return;
+    // A load or resume that fails ends the open's record; an authentication
+    // requirement then asks the user to sign in.
+    void client().finished(result.requestId).then((finished) => {
+      if (finished?.status === "failed" && isCurrent()) {
+        setSessionOpening({ sessionId, error: requestRecordError(finished).message });
+        reportRecordError(finished, key, "session/load");
+      }
+    });
     const record = client().global()?.requests[result.requestId];
     const incarnation = record?.result?.kind === "session" ? record.result.incarnation : record?.target?.incarnation;
     const epoch = client().replica.epoch;
@@ -342,7 +350,7 @@ export function useAcp(options: UseAcpOptions = {}) {
       return;
     }
     subscribe({ sessionId, epoch, incarnation });
-  }, [subscribe]);
+  }, [reportRecordError, subscribe]);
 
   const activateSession = useCallback((session: SessionInfo, transition = true) => {
     if (transition) navigationRef.current += 1;
@@ -468,11 +476,12 @@ export function useAcp(options: UseAcpOptions = {}) {
       if (!stillCurrent() || (routeSessionId == null && routeProjectCwd == null)) return undefined;
       let selected = listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
       const cursors = new Set<string>();
-      while (selected == null && listed.nextCursor != null && stillCurrent()) {
+      // A project route lists every page, so the project shows all its sessions.
+      while (listed.nextCursor != null && stillCurrent()) {
         if (cursors.has(listed.nextCursor)) throw new Error(i18n.t("errors.repeatedCursor"));
         cursors.add(listed.nextCursor);
         listed = await readSessionList(listed.nextCursor, stillCurrent);
-        selected = listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
+        selected ??= listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
       }
       return selected;
     }).then(

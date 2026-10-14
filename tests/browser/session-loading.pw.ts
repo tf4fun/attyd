@@ -24,7 +24,7 @@ for (const theme of ["light", "dark"] as const) {
       }, theme);
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
-      await page.route("**/api/v1/sessions/lazy-process-session?*", async (route) => {
+      await page.route("**/api/v2/sessions/lazy-process-session/open", async (route) => {
         await gate;
         await route.continue();
       });
@@ -60,7 +60,7 @@ for (const theme of ["light", "dark"] as const) {
 test("replaces loading with a timeout message and manually retries the session read", async ({ page }) => {
   let fail = true;
   let reads = 0;
-  await page.route("**/api/v1/sessions/lazy-process-session?*", async (route) => {
+  await page.route("**/api/v2/sessions/lazy-process-session/open", async (route) => {
     reads += 1;
     if (fail) {
       await route.fulfill({ status: 504, contentType: "application/json", body: JSON.stringify({
