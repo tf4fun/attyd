@@ -371,4 +371,18 @@ describe("useAcp on protocol v2", () => {
     expect(bridge.streams.length).toBe(streams + 1);
     expect(bridge.requests.filter(({ path }) => path.startsWith("/api/v2/agent/"))).toEqual([]);
   });
+
+  it("reopens the routed session in the next epoch after the Agent connection was replaced", async () => {
+    await openAlpha();
+    await act(async () => bridge.restart("e2"));
+    await settle();
+    await act(async () => acp.reconnect());
+    await settle();
+    expect(bridge.commands("POST", "/api/v2/sessions/alpha/open")).toHaveLength(2);
+    expect(acp.state.phase).toBe("ready");
+    expect(acp.state.session?.sessionId).toBe("alpha");
+    expect(acp.state.sessionView).toMatchObject({ bridgeEpoch: "e2", sessionIncarnation: 1 });
+    expect(bridge.stream.subscriptions).toEqual(["global", "session/alpha@e2:1"]);
+  });
 });
+

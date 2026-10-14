@@ -39,6 +39,7 @@ export interface CommandInit {
 
 const CLOSED = 2;
 const LOST_RESPONSE_RETRIES = 2;
+const RETRY_MS = 1000;
 
 /** The v2 code of an error response, if it has one. */
 export function protocolErrorCode(error: unknown): string | undefined {
@@ -111,6 +112,13 @@ export class V2Client {
     source.onerror = () => {
       if (this.source !== source) return;
       this.options.onError?.();
+      // EventSource gives up on a non-200 answer, such as 503 while the bridge
+      // replaces its Agent connection. Resync from scratch shortly after.
+      if (source.readyState === CLOSED) {
+        setTimeout(() => {
+          if (this.source === source && !this.disposed) this.connect(this.replica.subscriptions());
+        }, RETRY_MS);
+      }
     };
   }
 

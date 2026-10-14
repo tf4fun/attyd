@@ -74,7 +74,7 @@ export function useAcp(options: UseAcpOptions = {}) {
   /** A submitted prompt the replica does not show yet. */
   const pendingTurnRef = useRef<{ key: string; sessionId: string } | undefined>(undefined);
   const navigationRef = useRef(0);
-  const routeRestoreRef = useRef<{ sessionId: string; epoch: string } | undefined>(undefined);
+  const routeRestoreRef = useRef<{ sessionId: string; epoch: string; pending: boolean } | undefined>(undefined);
   const terminalRequestsRef = useRef(new Map<string, string>());
   const authInputQueueRef = useRef<{ requestId: string; tail: Promise<void>; closed: boolean } | undefined>(undefined);
   const catalogRevisionRef = useRef<string | undefined>(undefined);
@@ -507,8 +507,11 @@ export function useAcp(options: UseAcpOptions = {}) {
     );
     if (routeSessionId == null) return;
     const restore = routeRestoreRef.current;
-    if (restore?.sessionId === routeSessionId && restore.epoch === epoch && subscribedRef.current != null) return;
-    routeRestoreRef.current = { sessionId: routeSessionId, epoch };
+    // One open per routed session and epoch, while it runs or once subscribed.
+    if (restore?.sessionId === routeSessionId && restore.epoch === epoch &&
+      (restore.pending || subscribedRef.current != null)) return;
+    const attempt = { sessionId: routeSessionId, epoch, pending: true };
+    routeRestoreRef.current = attempt;
     activeSessionIdRef.current = routeSessionId;
     if (store.getState().sessionView == null) setSessionOpening({ sessionId: routeSessionId });
     void (async () => {
@@ -518,6 +521,11 @@ export function useAcp(options: UseAcpOptions = {}) {
       if (cwd == null && sessionListSupported()) {
         const discovered = await discovery;
         if (!stillCurrent()) return;
+        if (discovered.ok && discovered.selected == null) {
+          // Neither held nor in the Agent's catalog: there is no such session.
+          returnHome(true, false);
+          return;
+        }
         if (discovered.ok) cwd = discovered.selected?.cwd ?? undefined;
       }
       cwd ??= routeProjectCwd;
@@ -535,7 +543,7 @@ export function useAcp(options: UseAcpOptions = {}) {
         return;
       }
       await openSession(routeSessionId, cwd, stillCurrent);
-    })().catch((error: unknown) => {
+    })().finally(() => { attempt.pending = false; }).catch((error: unknown) => {
       if (!stillCurrent()) return;
       routeRestoreRef.current = undefined;
       if (protocolErrorCode(error) === "not_found") {

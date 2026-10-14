@@ -155,6 +155,19 @@ export class FakeBridge {
     this.commit("global", [{ op: "remove", path: `/sessions/${pointer(sessionId)}` }]);
   }
 
+  /** The Agent connection ends; streams fail and the next one sees `epoch`. */
+  restart(epoch: string): void {
+    for (const stream of this.streams) {
+      stream.readyState = 2;
+      stream.onerror?.({} as Event);
+    }
+    this.epoch = epoch;
+    this.seq = 1;
+    this.lastSeq.clear();
+    this.sessions.clear();
+    this.global = { ...globalState(), agent: { ...globalState().agent, predecessor: { epoch: "e1", reason: "agent_exit" } } };
+  }
+
   /** Holds a session, as a create or open does. */
   hold(sessionId: string, cwd: string, configure: (state: SessionState) => SessionState = (state) => state): SessionState {
     const incarnation = (this.global.sessions[sessionId]?.incarnation ?? 0) + 1;
@@ -220,7 +233,7 @@ export class FakeBridge {
       const owner = subscription.slice(subscription.lastIndexOf("@") + 1);
       const held = this.sessions.get(sessionId);
       if (held != null && owner === `${this.epoch}:${held.incarnation}`) entries.push({ type: "reset", scope, at });
-      else entries.push({ type: "end", scope, at, reason: held == null ? "closed" : "replaced" });
+      else entries.push({ type: "end", scope, at, reason: held == null && owner.startsWith(`${this.epoch}:`) ? "closed" : "replaced" });
     }
     entries.forEach((entry, index) => source.deliver(entry, index === entries.length - 1 ? `${this.epoch}:${this.seq}` : ""));
   }

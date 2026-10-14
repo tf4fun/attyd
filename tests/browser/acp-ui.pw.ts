@@ -3430,7 +3430,8 @@ test("recovers startup through Agent-owned ACP authentication", async ({ page })
       "--auth-required",
     ],
   });
-  const browserErrors = collectBrowserErrors(page, [409]);
+  // Listing the catalog before sign-in is refused by the Agent.
+  const browserErrors = collectBrowserErrors(page, [{ status: 502, pathname: "/api/v2/catalog" }]);
 
   try {
     await page.goto(`http://127.0.0.1:${authServer.port}/sessions/saved-session`);
