@@ -197,8 +197,9 @@ pub(super) fn followed(state: &BridgeState) -> std::collections::BTreeSet<String
 }
 
 /// Whether a held session is needed (S6): a subscription follows it, an
-/// operation occupies it, or a resource of its own is still there, an
-/// accepted URL flow or a terminal not released yet, even an exited one.
+/// operation runs in it or occupies it, from its admission on, or a resource
+/// of its own is still there, an accepted URL flow or a terminal not released
+/// yet, even an exited one.
 pub(super) fn needed(
     state: &BridgeState,
     followed: &std::collections::BTreeSet<String>,
@@ -209,7 +210,9 @@ pub(super) fn needed(
     followed.contains(session_id)
         || registry.scopes.occupied.contains_key(session_id)
         || registry.session_ref(session_id).is_some_and(|session| {
-            !session.live.url_flows.is_empty() || !session.live.terminals.is_empty()
+            session.live.op.is_running()
+                || !session.live.url_flows.is_empty()
+                || !session.live.terminals.is_empty()
         })
         || registry
             .request_url_flows
