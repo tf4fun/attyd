@@ -5,14 +5,23 @@
 //! embedded ACP values stay `serde_json::Value` in Rust and name their
 //! `@agentclientprotocol/sdk` type in TypeScript.
 //!
-//! So far: the control reduction (`controls`), the JSON Pointer ops (`diff`), and
-//! `canon` with the hash chain and the turn log (`canon`). The bridge uses them
-//! from migration step 4 on (docs/state-sync.md §5).
+//! So far: the control reduction (`controls`), the JSON Pointer ops (`diff`),
+//! `canon` with the hash chain and the turn log (`canon`), the documents and
+//! events (`documents`), operation slots (`op`, `registry`), the projections
+//! (`project`) and the commit step (`publish`). The bridge actor runs the commit
+//! step from migration step 4b on (docs/state-sync.md §5).
 #![allow(dead_code)]
 
 pub(crate) mod canon;
 mod controls;
+#[cfg(test)]
+mod convergence_tests;
 pub(crate) mod diff;
+pub(crate) mod documents;
+pub(crate) mod op;
+pub(crate) mod project;
+pub(crate) mod publish;
+pub(crate) mod registry;
 #[cfg(test)]
 mod typescript;
 

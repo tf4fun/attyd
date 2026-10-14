@@ -5,6 +5,7 @@ use std::path::Path;
 use ts_rs::{Config, TS};
 
 use super::canon::*;
+use super::documents::*;
 use super::*;
 
 const OUTPUT: &str = "shared/protocol.ts";
@@ -14,8 +15,12 @@ const ACP_TYPES: &[&str] = &[
     "AvailableCommand",
     "ContentBlock",
     "Cost",
+    "CreateElicitationRequest",
+    "InitializeResponse",
+    "RequestPermissionRequest",
     "SessionConfigOption",
     "SessionMode",
+    "SessionUpdate",
 ];
 
 fn declarations(cfg: &Config) -> Vec<String> {
@@ -35,6 +40,33 @@ fn declarations(cfg: &Config) -> Vec<String> {
         AttachmentRef,
         AttachmentKind,
         LogEntry,
+        ProtocolError,
+        ErrorCode,
+        OperationKind,
+        OperationStatus,
+        Operation,
+        Interaction,
+        UrlFlow,
+        Terminal,
+        ExitStatus,
+        LoginTerminal,
+        SessionLive,
+        GlobalLive,
+        CatalogLive,
+        AgentInfo,
+        AgentPhase,
+        AgentLaunch,
+        AgentTransport,
+        McpServerSummary,
+        McpServerKind,
+        SessionSummary,
+        OperationSummary,
+        PendingCounts,
+        Event,
+        LogChange,
+        LiveChange,
+        End,
+        EndReason,
     ]
 }
 
