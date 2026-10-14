@@ -900,3 +900,68 @@ fn a_stream_query_names_scopes_heads_and_load_directories() {
         );
     }
 }
+
+#[test]
+fn review_an_uncoalesced_first_event_is_the_subscription_cut_before_later_commits() {
+    let mut world = World::new();
+    let incarnation = world.open("s");
+    world.turn("s", incarnation, "before subscribe", "first reply");
+    let cut = world.publisher.document("session/s").unwrap();
+    let mut reader = Reader::new(&["session/s"]);
+    let subscription = world.subscribe(&mut reader);
+
+    // The initial alignment stays queued while a later complete turn is
+    // published. With no coalescing, that later cut cannot replace the first.
+    world.turn("s", incarnation, "after subscribe", "second reply");
+    assert_eq!(subscription.coalesced(), 0);
+    let first = world.take(&mut reader, &subscription).unwrap();
+    assert_eq!(first["live"]["replace"], cut.live);
+    assert_eq!(first["log"]["from"], 0);
+    assert_eq!(
+        first["log"]["entries"],
+        serde_json::to_value(cut.log.unwrap()).unwrap()
+    );
+
+    world.drain(&mut reader, &subscription);
+    reader.converged(&world.documents());
+    assert_eq!(reader.log("session/s").len(), 2);
+}
+
+#[test]
+fn review_end_filters_later_same_scope_events_before_and_after_delivery() {
+    let mut world = World::new();
+    let incarnation = world.open("s");
+    let mut old_reader = Reader::new(&["session/s"]);
+    let old = world.subscribe(&mut old_reader);
+    world.drain(&mut old_reader, &old);
+
+    world.delete("s", incarnation);
+    // The same scope can exist again, but its old stream has already been
+    // ended. This also covers changes arriving while End is still queued.
+    let reopened = world.open("s");
+    world.turn("s", reopened, "new session", "new reply");
+    let delivered = world.drain(&mut old_reader, &old);
+    let end_index = delivered
+        .iter()
+        .position(|event| event.get("end").is_some())
+        .unwrap();
+    assert_eq!(
+        end_index + 1,
+        delivered.len(),
+        "nothing follows End on this stream"
+    );
+    assert_eq!(delivered[end_index]["end"]["reason"], "deleted");
+
+    let mut new_reader = Reader::new(&["session/s"]);
+    let new = world.subscribe(&mut new_reader);
+    world.drain(&mut new_reader, &new);
+    new_reader.converged(&world.documents());
+    world.turn("s", reopened, "another turn", "another reply");
+    assert!(
+        world.drain(&mut old_reader, &old).is_empty(),
+        "a delivered End stays final"
+    );
+    world.drain(&mut new_reader, &new);
+    new_reader.converged(&world.documents());
+    assert_eq!(new_reader.log("session/s").len(), 2);
+}

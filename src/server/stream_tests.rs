@@ -4,7 +4,7 @@
 //! The server listens on a TCP port and its bridge connects to a scripted
 //! Agent over the WebSocket transport, so each Agent connection is a real ACP
 //! connection the test answers. Requests go through a hyper client.
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+
+use crate::protocol::canon::TurnLog;
+use crate::protocol::stream_check::{Replica, log_values};
 
 use super::*;
 
@@ -270,6 +273,9 @@ impl Server {
         Sse {
             body: Body::new(response.into_body()).into_data_stream(),
             buffer: String::new(),
+            replicas: BTreeMap::new(),
+            aligned: BTreeSet::new(),
+            ended: BTreeSet::new(),
         }
     }
 
@@ -291,9 +297,34 @@ impl Server {
 struct Sse {
     body: axum::body::BodyDataStream,
     buffer: String,
+    replicas: BTreeMap<String, Replica>,
+    aligned: BTreeSet<String>,
+    ended: BTreeSet<String>,
 }
 
 impl Sse {
+    /// A client's pre-existing cache, installed before its first event. GET
+    /// responses are only compared with; they never repair these replicas.
+    fn cache_log(&mut self, scope: &str, log: Vec<Value>) {
+        assert!(!self.aligned.contains(scope));
+        self.replicas.entry(scope.to_string()).or_default().log = log;
+    }
+
+    fn replica(&self, scope: &str) -> &Replica {
+        self.replicas.get(scope).expect("the scope was delivered")
+    }
+
+    fn assert_document(&self, scope: &str, document: &Value) {
+        let replica = self.replica(scope);
+        assert_eq!(
+            replica.live, document["live"],
+            "{scope}: live from HTTP SSE"
+        );
+        if let Some(log) = document.get("log") {
+            assert_eq!(&json!(replica.log), log, "{scope}: log from HTTP SSE");
+        }
+    }
+
     /// The next SSE message, as its raw lines, within `period`.
     async fn message(&mut self, period: Duration) -> Option<String> {
         tokio::time::timeout(period, async {
@@ -328,7 +359,26 @@ impl Sse {
             if data.is_empty() {
                 continue;
             }
-            return serde_json::from_str(&data.join("\n")).unwrap();
+            let event: Value = serde_json::from_str(&data.join("\n")).unwrap();
+            let scope = event["scope"].as_str().expect("an event names its scope");
+            assert!(!self.ended.contains(scope), "an event after end: {event}");
+            if event.get("end").is_some() {
+                self.replicas.remove(scope);
+                self.ended.insert(scope.to_string());
+            } else {
+                if self.aligned.insert(scope.to_string()) {
+                    assert!(
+                        event["live"].get("replace").is_some(),
+                        "the first event is an alignment: {event}"
+                    );
+                }
+                self.replicas
+                    .entry(scope.to_string())
+                    .or_default()
+                    .apply(&event)
+                    .unwrap_or_else(|error| panic!("invalid HTTP SSE event: {error}"));
+            }
+            return event;
         }
     }
 
@@ -353,7 +403,17 @@ fn mentions(event: &Value, value: &str) -> bool {
 }
 
 fn query_scope(scope: &str) -> String {
-    scope.replace('/', "%2F").replace(':', "%3A")
+    url::form_urlencoded::byte_serialize(scope.as_bytes()).collect()
+}
+
+fn assert_error_body(body: &Value, code: &str) {
+    assert_eq!(body["error"]["code"], code, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "a structured protocol error has a message: {body}"
+    );
 }
 
 /// A server whose Agent holds `saved`, loaded with `replay` through a stream
@@ -392,15 +452,17 @@ async fn reads_return_one_cut_hold_nothing_and_tell_an_unknown_log_from_an_empty
     assert_eq!(status, StatusCode::OK);
     assert_eq!(created["log"], json!([]), "a known empty log is []");
 
-    let (status, _) = server.read("session/unheld").await;
+    let (status, body) = server.read("session/unheld").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an unheld session");
+    assert_error_body(&body, "not_found");
     link.quiet(Duration::from_millis(300)).await;
-    let (status, _) = server.read("session/unheld").await;
+    let (status, body) = server.read("session/unheld").await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "a read holds and loads nothing"
     );
+    assert_error_body(&body, "not_found");
 
     let mut stream = server
         .stream(&format!(
@@ -430,6 +492,7 @@ async fn reads_return_one_cut_hold_nothing_and_tell_an_unknown_log_from_an_empty
     assert_eq!(end["log"]["entries"].as_array().unwrap().len(), 1, "{end}");
     let (_, loaded) = server.read("session/saved").await;
     assert_eq!(loaded["log"], end["log"]["entries"]);
+    stream.assert_document("session/saved", &loaded);
 }
 
 // ---------------------------------------------------------------------------
@@ -470,11 +533,21 @@ async fn have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_
     assert_eq!(log.len(), 2);
     let h1 = log[0]["hash"].as_str().unwrap();
     let h2 = log[1]["hash"].as_str().unwrap();
-    for (have, from, appended) in [
-        (format!("1:{h1}"), 1, 1),
-        (format!("2:{h2}"), 2, 0),
-        ("1:wrong".to_string(), 0, 2),
-        (format!("3:{h2}"), 0, 2),
+    let longer = log_values(
+        TurnLog::from_replay(&turns(&[("one", "1"), ("two", "2"), ("three", "3")])).entries(),
+    );
+    let mut wrong = log[..1].to_vec();
+    wrong[0]["hash"] = json!("wrong");
+    for (have, from, appended, cached) in [
+        (format!("1:{h1}"), 1, 1, log[..1].to_vec()),
+        (format!("2:{h2}"), 2, 0, log.clone()),
+        ("1:wrong".to_string(), 0, 2, wrong),
+        (
+            format!("3:{}", longer[2]["hash"].as_str().unwrap()),
+            0,
+            2,
+            longer,
+        ),
     ] {
         let mut stream = server
             .stream(&format!(
@@ -482,6 +555,7 @@ async fn have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_
                 query_scope(&format!("session/saved:{have}"))
             ))
             .await;
+        stream.cache_log("session/saved", cached);
         let aligned = stream.event().await;
         assert_eq!(aligned["log"]["from"], from, "have {have}: {aligned}");
         assert_eq!(
@@ -490,7 +564,83 @@ async fn have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_
             "have {have}"
         );
         assert!(aligned["live"].get("replace").is_some());
+        stream.assert_document("session/saved", &document);
     }
+}
+
+#[tokio::test]
+async fn each_session_uses_its_own_have_and_cwd_on_a_multi_scope_stream() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let alpha_replay = turns(&[("alpha one", "a1"), ("alpha two", "a2")]);
+    let beta_replay = turns(&[("beta one", "b1"), ("beta two", "b2"), ("beta three", "b3")]);
+    let alpha_cache = log_values(TurnLog::from_replay(&alpha_replay[..2]).entries());
+    let beta_cache = log_values(TurnLog::from_replay(&beta_replay[..4]).entries());
+    let alpha_cwd = "/workspace/alpha:one + space";
+    let beta_cwd = "/workspace/beta:two & more";
+    // Scope, have and cwd orders intentionally differ; association is by scope.
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("scope", "session/alpha")
+        .append_pair("scope", "session/beta")
+        .append_pair(
+            "have",
+            &format!("session/beta:2:{}", beta_cache[1]["hash"].as_str().unwrap()),
+        )
+        .append_pair("cwd", &format!("session/alpha:{alpha_cwd}"))
+        .append_pair(
+            "have",
+            &format!(
+                "session/alpha:1:{}",
+                alpha_cache[0]["hash"].as_str().unwrap()
+            ),
+        )
+        .append_pair("cwd", &format!("session/beta:{beta_cwd}"))
+        .finish();
+    let mut stream = server.stream(&query).await;
+    stream.cache_log("session/alpha", alpha_cache);
+    stream.cache_log("session/beta", beta_cache);
+
+    // Do not assume an order or concurrent admission of the two loads.
+    let mut loaded = BTreeSet::new();
+    for _ in 0..2 {
+        let load = link.request("session/load").await;
+        let id = load["params"]["sessionId"].as_str().unwrap();
+        assert!(loaded.insert(id.to_string()), "a duplicate load: {load}");
+        let (cwd, replay) = match id {
+            "alpha" => (alpha_cwd, &alpha_replay),
+            "beta" => (beta_cwd, &beta_replay),
+            _ => panic!("an unexpected load: {load}"),
+        };
+        assert_eq!(load["params"]["cwd"], cwd, "the cwd belongs to {id}");
+        for update in replay {
+            link.update(id, update.clone()).await;
+        }
+        link.reply(&load, json!({})).await;
+    }
+
+    let mut log_from = BTreeMap::new();
+    while !["session/alpha", "session/beta"].iter().all(|scope| {
+        stream
+            .replicas
+            .get(*scope)
+            .is_some_and(|replica| replica.live["op"]["status"] == "completed")
+    }) {
+        let event = stream.event().await;
+        if let Some(log) = event.get("log") {
+            log_from.insert(
+                event["scope"].as_str().unwrap().to_string(),
+                log["from"].clone(),
+            );
+            assert_eq!(log["entries"].as_array().unwrap().len(), 1, "{event}");
+        }
+    }
+    assert_eq!(log_from["session/alpha"], 1, "alpha resumes its own head");
+    assert_eq!(log_from["session/beta"], 2, "beta resumes its own head");
+    for scope in ["session/alpha", "session/beta"] {
+        let (status, document) = server.read(scope).await;
+        assert_eq!(status, StatusCode::OK);
+        stream.assert_document(scope, &document);
+    }
+    link.quiet(Duration::from_millis(200)).await;
 }
 
 #[tokio::test]
@@ -503,6 +653,11 @@ async fn an_invalid_stream_query_is_refused() {
     ] {
         let response = server.send(&format!("/api/v2/stream?{query}")).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query:?}");
+        let bytes = axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).expect("a JSON protocol error");
+        assert_error_body(&body, "invalid_request");
     }
 }
 
@@ -532,37 +687,76 @@ async fn after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_r
         1,
         "neither a read nor a global stream starts a connection"
     );
-    let (status, _) = server.read("session/unheld").await;
+    let (status, body) = server.read("session/unheld").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_error_body(&body, "not_found");
     assert_eq!(server.agents.accepted(), 1);
 }
 
 #[tokio::test]
 async fn a_session_stream_waits_through_an_agent_eof_and_converges_on_the_next_connection() {
     let replay = turns(&[("one", "1"), ("two", "2")]);
+    resumes_on_the_same_stream(replay.clone(), replay, false).await;
+}
+
+#[tokio::test]
+async fn a_session_stream_applies_a_diverging_replay_after_an_agent_eof() {
+    resumes_on_the_same_stream(
+        turns(&[("one", "1"), ("two", "2")]),
+        turns(&[("one", "1"), ("other", "3")]),
+        true,
+    )
+    .await;
+}
+
+async fn resumes_on_the_same_stream(replay: Vec<Value>, next_replay: Vec<Value>, diverged: bool) {
     let (mut server, link, mut stream) = loaded(&replay).await;
-    let (_, before) = server.read("session/saved").await;
+    let (status, before) = server.read("session/saved").await;
+    assert_eq!(status, StatusCode::OK);
+    stream.assert_document("session/saved", &before);
     link.close().await;
     stream
         .until("session/saved", |event| mentions(event, "running"))
         .await;
-    let (_, waiting) = server.read("session/saved").await;
+    assert_eq!(stream.replica("session/saved").live["op"]["kind"], "load");
+    assert_eq!(
+        stream.replica("session/saved").live["op"]["status"],
+        "running"
+    );
+    assert_eq!(json!(stream.replica("session/saved").log), before["log"]);
+
+    // No GET or replacement subscription may trigger this connection: the
+    // original HTTP stream alone must cause the bridge to reconnect.
+    let mut next = server.agents.accept(json!({"loadSession": true})).await;
+    let (status, waiting) = server.read("session/saved").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(waiting["live"]["op"]["kind"], "load");
     assert_eq!(waiting["live"]["op"]["status"], "running");
     assert_eq!(waiting["log"], before["log"], "the known log stays");
 
-    // The pending session subscription starts the next connection.
-    let mut next = server.agents.accept(json!({"loadSession": true})).await;
-    let load = next.serve_load("saved", &replay).await;
+    let load = next.serve_load("saved", &next_replay).await;
     assert_eq!(load["params"]["cwd"], CWD);
-    stream
+    let events = stream
         .until("session/saved", |event| mentions(event, "completed"))
         .await;
-    let (_, after) = server.read("session/saved").await;
-    assert_eq!(
-        after["log"], before["log"],
-        "the same history keeps the log"
-    );
+    let (status, after) = server.read("session/saved").await;
+    assert_eq!(status, StatusCode::OK);
+    stream.assert_document("session/saved", &after);
+    if diverged {
+        let rebuilt = events
+            .iter()
+            .rev()
+            .find(|event| event["scope"] == "session/saved" && event.get("log").is_some())
+            .expect("the original stream receives the rebuilt log");
+        assert_eq!(rebuilt["log"]["from"], 1, "the common prefix is preserved");
+        assert_eq!(after["log"][0], before["log"][0]);
+        assert_ne!(after["log"][1], before["log"][1]);
+    } else {
+        assert_eq!(
+            after["log"], before["log"],
+            "the same history keeps the log"
+        );
+    }
     assert_eq!(after["live"]["op"]["status"], "completed");
     assert_eq!(server.agents.accepted(), 2);
 }
