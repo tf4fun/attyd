@@ -2121,11 +2121,31 @@ impl TurnResponder {
     }
 }
 
+#[cfg(test)]
 pub async fn run_with_cancellation(
     options: Arc<Options>,
     commands: mpsc::UnboundedReceiver<BridgeInput>,
     events: EventSender,
     cancellation: CancellationToken,
+) {
+    run_publishing(
+        options,
+        commands,
+        events,
+        cancellation,
+        crate::protocol::hub::Publication::default(),
+    )
+    .await
+}
+
+/// One generation of the bridge, publishing into `publication`, which the
+/// host shares across its generations (protocol §5.4).
+pub(crate) async fn run_publishing(
+    options: Arc<Options>,
+    commands: mpsc::UnboundedReceiver<BridgeInput>,
+    events: EventSender,
+    cancellation: CancellationToken,
+    publication: crate::protocol::hub::Publication,
 ) {
     let sink = EventSink { tx: events };
     let mcp_servers = options
@@ -2156,12 +2176,13 @@ pub async fn run_with_cancellation(
                 .on_fatal(move |error| {
                     let _ = fatal_tx.send(error);
                 });
-            let connection = run_connection(
+            let connection = run_generation(
                 agent,
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
+                publication,
             );
             tokio::pin!(connection);
             tokio::select! {
@@ -2186,23 +2207,25 @@ pub async fn run_with_cancellation(
             }
         }
         Transport::Ws => {
-            run_connection(
+            run_generation(
                 crate::websocket_agent::WebSocketAgent::new(options.command[0].clone()),
                 options.clone(),
                 commands,
                 sink.clone(),
                 cancellation.clone(),
+                publication,
             )
             .await
         }
         Transport::Http => match remote_http_client(&options.command[0]) {
             Ok(client) => {
-                run_connection(
+                run_generation(
                     client,
                     options.clone(),
                     commands,
                     sink.clone(),
                     cancellation.clone(),
+                    publication,
                 )
                 .await
             }
@@ -2234,6 +2257,7 @@ fn remote_http_client(
     HttpClient::with_endpoint_and_client(endpoint, http)
 }
 
+#[cfg(test)]
 async fn run_connection<T>(
     transport: T,
     options: Arc<Options>,
@@ -2408,7 +2432,31 @@ where
                 .client_info(
                     Implementation::new("attyd", crate::VERSION).title("attyd web client"),
                 );
-            let response = connection.send_request(initialize).block_task().await?;
+            // While initialize is unanswered, a stream subscribes from the
+            // published cut; the other inputs wait in ingress, in order.
+            let request = connection.send_request(initialize).block_task();
+            tokio::pin!(request);
+            let mut commands_open = true;
+            let response = loop {
+                tokio::select! {
+                    biased;
+                    response = &mut request => break response?,
+                    input = commands.recv(), if commands_open => match input {
+                        Some(BridgeInput::Subscribe { scopes, reply }) => {
+                            let state = state.lock().await;
+                            let _ = reply.send(streams::register(&state, &scopes));
+                        }
+                        Some(input) => {
+                            let class = browser_traffic_class(&input);
+                            let _ = ingress.try_browser(input, class);
+                        }
+                        None => {
+                            commands_open = false;
+                            cancellation.cancel();
+                        }
+                    },
+                }
+            };
             relay_bytes(&response)?;
             if response.protocol_version != ProtocolVersion::V1 {
                 return Err(Error::invalid_request().data(format!(

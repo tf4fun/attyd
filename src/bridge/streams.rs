@@ -18,13 +18,18 @@ pub(super) fn subscribe(
     sink: &EventSink,
     scopes: &[Subscribed],
 ) -> (Subscription, Option<Value>) {
-    let subscription = {
-        let published = &mut *state.protocol.publication.lock();
-        published.hub.subscribe(&published.publisher, scopes)
-    };
+    let subscription = register(state, scopes);
     let command = serve(state, sink);
     refresh_observer_timers(state);
     (subscription, command)
+}
+
+/// Registers a subscription under the bridge guard, from the cut the guard
+/// sees, without starting a load: while the Agent initializes, its
+/// capabilities are not known yet. Its readiness serves the streams.
+pub(super) fn register(state: &BridgeState, scopes: &[Subscribed]) -> Subscription {
+    let published = &mut *state.protocol.publication.lock();
+    published.hub.subscribe(&published.publisher, scopes)
 }
 
 /// Asks the actor to serve the streams again.
