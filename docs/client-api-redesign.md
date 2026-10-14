@@ -1,11 +1,10 @@
 # Client API redesign
 
-Status: proposal for final confirmation, 2026-10-14 (sixth version). §3 is the
-complete rule set; the later sections specify and derive from it. It replaces the
-client protocol of [protocol.md](protocol.md) (v2) and the replication rules of
-[state-sync.md](state-sync.md). Nothing here is implemented yet. The review that
-led here is recorded in [protocol-v2-review.md](protocol-v2-review.md) and in the
-comments of PR #35.
+Status: settled in review, 2026-10-14 (sixth version). §3 is the complete rule set;
+the later sections specify and derive from it. It replaces the earlier v2 draft of
+the client protocol and its replication rules, and is specified normatively in
+[protocol.md](protocol.md). The review that led here is recorded in
+[protocol-v2-review.md](protocol-v2-review.md) and in the comments of PR #35.
 
 ## 1. Scope
 
@@ -274,7 +273,7 @@ interface Operation {
 ### 5.1 Stream
 
 ```text
-GET /api/v3/stream?scope=global&scope=session/S&have=session/S:12:<hash>
+GET /api/v2/stream?scope=global&scope=session/S&have=session/S:12:<hash>
 ```
 
 `have` gives a scope's log head; without it the head is `(0, h_0)`. The stream
@@ -359,7 +358,7 @@ only on the user's request.
   `expect`:
 
   ```text
-  POST /api/v3/scopes/{scope}/resources/{id}/{action}
+  POST /api/v2/scopes/{scope}/resources/{id}/{action}
   ```
 
   They never wait for a client and fall outside S5 (S7). The resource ID identifies the
@@ -376,7 +375,7 @@ only on the user's request.
 ### 6.2 Request and response
 
 ```text
-POST /api/v3/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": { … } }
+POST /api/v2/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": { … } }
 ```
 
 - **Admitted:** `{ op: "<id>" }`. This is the new operation's ID, or the running
@@ -470,9 +469,9 @@ This section applies C2 and C3 to writes.
 
 | Read | Notes |
 | --- | --- |
-| `GET /api/v3/scopes/{scope}` | the document of a held scope once, as one cut; `404` when not held; holds nothing |
-| `GET /api/v3/sessions/{id}/attachments/{attachmentId}` | content-addressed; served while the session's `log` or `live` references the ID, else `404` |
-| `GET /api/v3/sessions/{id}/files?query=`, `…/files/content?path=` | workspace context |
+| `GET /api/v2/scopes/{scope}` | the document of a held scope once, as one cut; `404` when not held; holds nothing |
+| `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | content-addressed; served while the session's `log` or `live` references the ID, else `404` |
+| `GET /api/v2/sessions/{id}/files?query=`, `…/files/content?path=` | workspace context |
 
 Reads that may wait for a client are operations instead: the catalog is listed by
 the `list` operation (§6.1).
@@ -627,21 +626,25 @@ and are tested there. They add no duties to clients.
 
 ## 13. Migration
 
-The protocol is specified in [protocol.md](protocol.md) (v3, under `/api/v3`, next
-to the current v2 until the web client moves), and the bridge work in
-[state-sync.md](state-sync.md). In outline:
+The protocol is specified in [protocol.md](protocol.md) and the bridge work in
+[state-sync.md](state-sync.md). The earlier v2 draft was never completed, has no
+client on `main`, and is over-designed for this model, so it is removed rather than
+kept beside the new one; the new protocol takes its place under `/api/v2`. In
+outline:
 
-1. **Settle this proposal** and write protocol v3 and its implementation plan
+1. **Settle this proposal** and write the protocol and its implementation plan
    (docs only).
-2. **Bridge:** `canon` and the hash chain; documents, operations with admission and
+2. **Remove the earlier v2 draft** from the bridge: its routes, records, intents,
+   retained log, owner tags and their tests. The web UI keeps running on `/api/v1`.
+3. **Bridge:** `canon` and the hash chain; documents, operations with admission and
    occupation, and the commit step; the stream with alignment and hold by need;
    the operation endpoint, the catalog scope and resource actions. Bridge tests
    first (acceptance 1–16), following
    [bridge-state-machine-tdd.md](bridge-state-machine-tdd.md).
-3. **Client:** the generic replica engine and the web projection on v3. PR #34 is
-   reworked onto it rather than landed: its replica engine and validation are
-   reused; its process cache and compact-history projection are removed.
-4. **Remove** v2 and v1, including the remaining v1 reads (attachment links,
-   Markdown export).
-5. **Layer 1 clean-up**, separately: remove incarnation-based isolation from the
+4. **Client:** the generic replica engine and the web projection on the new v2.
+   PR #34, built on the earlier draft, is not landed; the parts that fit (the
+   replica engine and validation) are carried over.
+5. **Remove v1**, including the remaining v1 reads (attachment links, Markdown
+   export).
+6. **Layer 1 clean-up**, separately: remove incarnation-based isolation from the
    bridge internals, now that no client-visible behavior depends on it.

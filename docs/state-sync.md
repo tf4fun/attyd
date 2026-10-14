@@ -1,33 +1,41 @@
 # Sync protocol implementation plan
 
 Status: plan, 2026-10-14. This document is how the bridge implements
-[attyd protocol v3](protocol.md), settled in
+[attyd protocol v2](protocol.md), settled in
 [client-api-redesign.md](client-api-redesign.md). It covers the internal design,
-the invariants tests enforce, and the migration from protocol v2 and `/api/v1`.
+the invariants tests enforce, and the migration from the earlier v2 draft and
+`/api/v1`.
 Lifecycle and concurrency changes follow the
 [TDD ledger](bridge-state-machine-tdd.md): bridge behavior is tested before browser
 projections.
 
 ## 1. Starting point
 
-Protocol v2 is implemented on `main` (its migration steps 1–5). The v3 work reuses
-what does not depend on the machinery v3 removes:
+An earlier v2 draft is implemented on `main` (its migration steps 1–5). It was never
+completed: no client uses it, and the web UI still runs on `/api/v1`. It is also
+over-designed for the settled model (incarnation owner tags, epochs and log
+positions, a retained log with resume, request records, intent tables, process
+pages). It is therefore **removed first** (§5, step 2), not kept beside the new
+protocol, which takes its place under `/api/v2`.
 
-| v2 piece | Path | In v3 |
+Three generic parts implement rules the new protocol keeps unchanged. Step 2 keeps
+them, with their tests:
+
+| Part | Path | Rule it implements |
 | --- | --- | --- |
-| Protocol DTOs, generated `shared/protocol.ts` | `src/protocol/mod.rs`, `typescript.rs` | kept; the types are replaced (§3) |
-| Control reduction | `src/protocol/controls.rs` | kept as is (protocol §4.5) |
-| Projections | `src/protocol/project.rs` | rewritten for `log` and `live` (§2.2) |
-| Commit step, identity diff | `src/protocol/publish.rs`, `diff.rs` | kept for `live`; gains the log (§2.3) |
-| Replication log | `src/protocol/log.rs` | removed: v3 has no retained log |
-| Hub | `src/protocol/hub.rs` | kept for cut, routing, queues and coalescing; resume, `prev` and `position` go (§2.4) |
-| Records and intents | `src/protocol/commands.rs` | removed; replaced by operation slots (§2.5) |
-| Convergence replicas | `src/protocol/replica.rs`, `stream_replica.rs` | rewritten for alignment events (§4) |
-| Routes | `src/server/v2.rs` | v3 routes in `src/server/v3.rs`; v2 removed with the web client's move |
+| Control reduction | `src/protocol/controls.rs` | protocol §4.5 |
+| JSON Pointer patcher and generic diff | `src/protocol/diff.rs` | protocol §5.3 |
+| DTO-to-TypeScript generation | `src/protocol/typescript.rs` | §3 |
+
+Two more techniques of the draft are reused when the new code is written, but their
+modules go with the draft: the identity diff of turn updates
+(`src/protocol/publish.rs`, for `op.process` in §2.3) and byte-budgeted subscriber
+queues (`src/protocol/hub.rs`, §2.4). Nothing else of the draft is a constraint:
+its routes, documents, records, intents, log, owner handling and tests go.
 
 Layer 1 (bridge ↔ ACP server) is not changed by this plan until its last step: the
-bridge keeps its sessions, incarnations, ingress and coordinator internally. v3
-never exposes them.
+bridge keeps its sessions, incarnations, ingress and coordinator internally. The
+protocol never exposes them.
 
 ## 2. Design
 
@@ -68,14 +76,14 @@ once the turn committed, so released process content never enters a document.
 ### 2.3 Commit step
 
 Every transition in the bridge actor ends with one commit step, run when the bridge
-lock's mutable guard is released (as in v2):
+lock's mutable guard is released (as in the earlier draft):
 
 1. **Log.** For each held session, compare its `TurnLog` with the published one.
    - unchanged (the same `Arc`): nothing;
    - appended: a `LogChange { from: old length, prev, entries: new tail }`;
    - rebuilt (a load replaced it): `from` is the longest common prefix of the two
      chains, found by comparing hashes.
-2. **Live.** Project, then diff against the published `live` with the v2 identity
+2. **Live.** Project, then diff against the published `live` with the identity
    diff (pointer comparison for `op.process`, value comparison for small fields,
    `trim` plus `append` for terminal tails).
 3. **Publish.** Emit one event per changed scope. A log change and the same scope's
@@ -108,7 +116,7 @@ The Hub owns delivery only:
   produced them, so nothing falls between the cut and the stream (protocol S3).
 - **Per-subscriber position.** For each scope the Hub remembers the log length and
   head it last queued to the subscriber, which is all a resync needs.
-- **Coalescing.** A queue past its byte budget (1 MiB, as in v2) is collapsed per
+- **Coalescing.** A queue past its byte budget (1 MiB, as in the earlier draft) is collapsed per
   scope: queued events of a scope that still exists are replaced by one alignment
   from the remembered position; a queued `end` is kept, and nothing of its scope
   follows it.
@@ -129,7 +137,7 @@ Operation writes are handled in the bridge actor, one at a time:
    arguments and Agent connection.
 2. **Install.** A starting operation replaces the scope's slot and occupies its
    other scopes, in the same critical section. The commit step publishes it.
-3. **Run.** The operation enters the bridge input, as v2 commands do. Interactions
+3. **Run.** The operation enters the bridge input, as v1 commands do. Interactions
    of its ACP requests are added to its slot; answers are delivered by the existing
    interaction delivery path.
 4. **End.** The transition that ends it sets its final status, result or error,
@@ -168,7 +176,7 @@ order; the bridge does not deduplicate it.
 The documents, events, ops, operation requests and results, and errors are typed
 Rust DTOs. TypeScript in `shared/protocol.ts` is generated from them, and a test
 fails when the generated output is stale. ACP types are referenced from
-`@agentclientprotocol/sdk`, not regenerated. v2 types are deleted with v2.
+`@agentclientprotocol/sdk`, not regenerated. The earlier draft's types are deleted in step 2.
 
 ## 4. Invariants and gates
 
@@ -204,9 +212,10 @@ divergence.
 
 The acceptance cases of
 [client-api-redesign.md §11](client-api-redesign.md#11-acceptance) (1–16) are the
-v3 acceptance suite. Each lands, as a bridge test, in the step that makes it
+acceptance suite. Each lands, as a bridge test, in the step that makes it
 reachable (§5), and again in the client engine where it has a client half (3, 4, 9,
-15, 16). The [coverage ledger](acp-coverage.md) gains a v3 chain per capability:
+15, 16). The [coverage ledger](acp-coverage.md) replaces the earlier draft's chains with one per
+capability:
 
 ```text
 ACP capability → bridge authority → document path or operation → result in op
@@ -215,22 +224,23 @@ ACP capability → bridge authority → document path or operation → result in
 
 ## 5. Migration
 
-v3 is built next to v2 and v1 under `/api/v3`, and the web UI moves to it in one
-step, so the product keeps working throughout. Each step is one PR, validated in CI.
+The web UI stays on `/api/v1` until it moves to the new v2 in one step, so the
+product keeps working throughout. Each step is one PR, validated in CI.
 
 | Step | Work | Acceptance |
 | --- | --- | --- |
-| 1 | This plan, protocol v3 and the redesign settled (docs only) | — |
-| 2 | `canon.rs`: message reduction, turns, normalization, hash chain; `TurnLog` built from live commits and from replays | 1 |
-| 3 | v3 DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`; the per-event convergence gate | 2, 5, 13 |
-| 4 | `GET /api/v3/stream` and `GET /api/v3/scopes/{scope}`: Hub cut, alignment, coalescing, `end`; hold by subscription and need, `load` on subscription, release of loadable sessions only | 3, 4, 12 |
-| 5 | `POST /api/v3/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16 (bridge) |
-| 6 | Web UI on v3: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection; PR #34 is reworked onto it, reusing `shared/replica.ts` and `shared/protocol-validate.ts` | 3, 4, 9, 15, 16 (client) |
-| 7 | Remove v2 and v1: routes, records, intents, the retained log, process pages, owner tags, the v1 events and browser compensating state; Markdown export and attachment links on v3 | — |
-| 8 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | — |
+| 1 | The redesign settled, the protocol and this plan (docs only) | — |
+| 2 | Remove the earlier v2 draft: `src/server/v2.rs` and its routes, the records and intent table, the replication log and Hub, the commit step, owner-qualified subscriptions, the projections and their tests, and the generated `shared/protocol.ts` types; `controls.rs`, `diff.rs` and `typescript.rs` stay (§1); v1 unchanged | v1 suites still pass |
+| 3 | `canon.rs`: message reduction, turns, normalization, hash chain; `TurnLog` built from live commits and from replays | 1 |
+| 4 | DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`; the per-event convergence gate | 2, 5, 13 |
+| 5 | `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}`: Hub cut, alignment, coalescing, `end`; hold by subscription and need, `load` on subscription, release of loadable sessions only | 3, 4, 12 |
+| 6 | `POST /api/v2/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16 (bridge) |
+| 7 | Web UI on v2: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection. PR #34, built on the earlier draft, is not landed; `shared/replica.ts` and `shared/protocol-validate.ts` are carried over where they fit | 3, 4, 9, 15, 16 (client) |
+| 8 | Remove v1: routes, business events, browser compensating state; Markdown export and attachment links on v2 | — |
+| 9 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | — |
 
-Dependencies: 1 → 2 → 3 → 4 → 5 → 6 → 7, and 8 after 7. #16 and #17 are fixed
-visibly in step 6.
+Dependencies: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8, and 9 after 8. #16 and #17 are fixed
+visibly in step 7.
 
 ## 6. Open questions
 

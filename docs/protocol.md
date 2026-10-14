@@ -1,9 +1,11 @@
-# attyd protocol v3
+# attyd protocol v2
 
 Status: specification, 2026-10-14. Not implemented yet. This document defines the
 client ↔ bridge protocol settled in [client-api-redesign.md](client-api-redesign.md),
-which holds its rationale, derivations and acceptance cases. It replaces protocol
-v2 (served under `/api/v2`) and `/api/v1`. The
+which holds its rationale, derivations and acceptance cases. It replaces the earlier
+v2 draft ([`11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md)),
+which was never completed and whose implementation is removed, and then `/api/v1`.
+The
 [implementation plan](state-sync.md) describes how the bridge produces it. The
 [ACP coverage ledger](acp-coverage.md) lists the capabilities it must carry.
 
@@ -72,7 +74,7 @@ document specifies their fields, endpoints and behavior.
 - **C3 Uncertainty.** A write or terminal input sent without a definite answer may
   have taken effect. The client never resends it automatically.
 
-**Conventions.** All paths are under `/api/v3`. JSON field names are camelCase.
+**Conventions.** All paths are under `/api/v2`. JSON field names are camelCase.
 Embedded ACP types (`ContentBlock`, `SessionUpdate`, `RequestPermissionRequest`,
 `InitializeResponse`, …) are carried verbatim, as the ACP schema pinned in
 `Cargo.lock` defines them.
@@ -310,7 +312,7 @@ No completion record is kept. A live resource keeps its session needed (S6).
 ### 5.1 Subscribing
 
 ```text
-GET /api/v3/stream?scope=global&scope=session/S&have=session/S:12:<hash>&cwd=session/S:<path>
+GET /api/v2/stream?scope=global&scope=session/S&have=session/S:12:<hash>&cwd=session/S:<path>
 ```
 
 | Parameter | Meaning |
@@ -408,7 +410,7 @@ The bridge sends an SSE comment at least every 15 seconds on an idle stream.
 ### 6.1 Request
 
 ```text
-POST /api/v3/scopes/{scope}/ops
+POST /api/v2/scopes/{scope}/ops
 { "expect": "<op.id>", "kind": "<kind>", "args": { … } }
 ```
 
@@ -501,7 +503,7 @@ across scopes, Agent connections and bridge restarts.
 ## 7. Resource actions
 
 ```text
-POST /api/v3/scopes/{scope}/resources/{resourceId}/{action}
+POST /api/v2/scopes/{scope}/resources/{resourceId}/{action}
 ```
 
 Resource actions take no `expect` and are not operations (S7). They answer `204`, or
@@ -521,10 +523,10 @@ never resends input whose delivery is uncertain (C3).
 
 | Read | Notes |
 | --- | --- |
-| `GET /api/v3/scopes/{scope}` | `{ log, live }` of an existing scope, as one cut; `404` for an unheld session; holds nothing |
-| `GET /api/v3/sessions/{id}/attachments/{attachmentId}` | the block, content-addressed; served while the session's `log` or `live` references it, else `404` |
-| `GET /api/v3/sessions/{id}/files?query=` | context search within the session's workspace |
-| `GET /api/v3/sessions/{id}/files/content?path=` | context read |
+| `GET /api/v2/scopes/{scope}` | `{ log, live }` of an existing scope, as one cut; `404` for an unheld session; holds nothing |
+| `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | the block, content-addressed; served while the session's `log` or `live` references it, else `404` |
+| `GET /api/v2/sessions/{id}/files?query=` | context search within the session's workspace |
+| `GET /api/v2/sessions/{id}/files/content?path=` | context read |
 
 The catalog is listed by the `list` operation (§6.2), not by a read, because the
 Agent may ask for input while it lists. **Markdown export** is assembled by the
@@ -554,9 +556,9 @@ type ErrorCode =
 The body of every non-2xx response is `{ error: ProtocolError }`. A stream that
 fails ends; the client subscribes again with its heads.
 
-## 10. Mapping from v2
+## 10. Changes from the earlier v2 draft
 
-| v2 | v3 |
+| Earlier v2 draft | v2 |
 | --- | --- |
 | `Position`, `epoch`, `seq`, `Last-Event-ID`, `at`, `prev` positions | none; alignment by log head (§5) |
 | `snapshot`, `reset` plus `GET /sessions/{id}` | alignment event `{ log, live: { replace } }` |
@@ -575,7 +577,9 @@ fails ends; the client subscribes again with its heads.
 | per-command endpoints | `POST /scopes/{scope}/ops` |
 | auth terminal input, resize, cancel | resource actions; `cancel` operation |
 | `GET /api/v2/catalog` | `list` on `catalog` |
-| `GET /api/v2/global`, `GET /api/v2/sessions/{id}` | `GET /api/v3/scopes/{scope}` |
+| `GET /api/v2/global`, `GET /api/v2/sessions/{id}` | `GET /api/v2/scopes/{scope}` |
 | `owner_mismatch`, `history_mismatch`, `precondition_required`, `conflict`, `intent_conflict`, `intent_capacity`, `gone`, `interaction_ended` | `stale`, `not_allowed` |
 
-v1 maps to v3 through v2 ([v2 mapping](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md#8-mapping-from-v1)).
+For `/api/v1`, the earlier draft's
+[mapping from v1](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md#8-mapping-from-v1)
+applies through this table.
