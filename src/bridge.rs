@@ -2177,7 +2177,7 @@ pub(crate) async fn run_publishing(
                     let _ = fatal_tx.send(error);
                 });
             let connection = run_generation(
-                agent,
+                Ok(agent),
                 options.clone(),
                 commands,
                 sink.clone(),
@@ -2208,7 +2208,9 @@ pub(crate) async fn run_publishing(
         }
         Transport::Ws => {
             run_generation(
-                crate::websocket_agent::WebSocketAgent::new(options.command[0].clone()),
+                Ok(crate::websocket_agent::WebSocketAgent::new(
+                    options.command[0].clone(),
+                )),
                 options.clone(),
                 commands,
                 sink.clone(),
@@ -2217,20 +2219,21 @@ pub(crate) async fn run_publishing(
             )
             .await
         }
-        Transport::Http => match remote_http_client(&options.command[0]) {
-            Ok(client) => {
-                run_generation(
-                    client,
-                    options.clone(),
-                    commands,
-                    sink.clone(),
-                    cancellation.clone(),
-                    publication,
-                )
-                .await
-            }
-            Err(error) => Err(Error::invalid_params().data(error.to_string())),
-        },
+        Transport::Http => {
+            // A transport that cannot be built still ends this generation
+            // through its final commit, so the documents show why.
+            let client = remote_http_client(&options.command[0])
+                .map_err(|error| Error::invalid_params().data(error.to_string()));
+            run_generation(
+                client,
+                options.clone(),
+                commands,
+                sink.clone(),
+                cancellation.clone(),
+                publication,
+            )
+            .await
+        }
     };
 
     match result {
@@ -2269,7 +2272,7 @@ where
     T: ConnectTo<Client>,
 {
     run_generation(
-        transport,
+        Ok(transport),
         options,
         commands,
         sink,
@@ -2280,9 +2283,11 @@ where
 }
 
 /// One generation of the bridge actor: one Agent connection, publishing into
-/// `publication`, which the generations before and after it share.
+/// `publication`, which the generations before and after it share. A
+/// transport that could not be built connects nothing; the generation still
+/// publishes and ends with its error.
 async fn run_generation<T>(
-    transport: T,
+    transport: Result<T, Error>,
     options: Arc<Options>,
     commands: mpsc::UnboundedReceiver<BridgeInput>,
     sink: EventSink,
@@ -2307,15 +2312,20 @@ where
     state.lock().await.protocol.agent.launch = agent_launch(&options);
     #[cfg(test)]
     memory_retention_tests::capture_coordinator_state(&state);
-    let result = run_connection_with(
-        state.clone(),
-        transport,
-        options,
-        commands,
-        sink,
-        cancellation,
-    )
-    .await;
+    let result = match transport {
+        Ok(transport) => {
+            run_connection_with(
+                state.clone(),
+                transport,
+                options,
+                commands,
+                sink,
+                cancellation,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     // The last commit, on every return once the state exists: running
     // operations fail and the final agent shows.
     state.lock().await.end_connection(result.as_ref().err());
@@ -2440,6 +2450,9 @@ where
             let response = loop {
                 tokio::select! {
                     biased;
+                    // Cancellation ends the wait: the final commit below
+                    // shows the Agent stopped before the streams close.
+                    _ = cancellation.cancelled() => return Ok(()),
                     response = &mut request => break response?,
                     input = commands.recv(), if commands_open => match input {
                         Some(BridgeInput::Subscribe { scopes, reply }) => {

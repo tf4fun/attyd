@@ -315,7 +315,7 @@ impl Peer {
         });
         let probe = super::memory_retention_tests::probe_coordinator_state();
         let task = tokio::spawn(run_generation(
-            transport,
+            Ok(transport),
             Arc::new(options(configure)),
             command_rx,
             EventSink { tx: events.into() },

@@ -1152,16 +1152,43 @@ impl BridgeHub {
                 return Some(subscription);
             }
         }
-        let subscription = {
-            let state = self.state.lock().await;
-            if state.shutting_down {
-                return None;
+        let mut failed = input;
+        loop {
+            let current = {
+                let state = self.state.lock().await;
+                if state.shutting_down {
+                    return None;
+                }
+                match (&state.input, &failed) {
+                    // A generation started after the input the request
+                    // took: it registers the subscription and serves it.
+                    (Some(current), Some(old)) if !current.same_channel(old) => current.clone(),
+                    (Some(current), None) => current.clone(),
+                    // No generation, or the ending one: the subscription
+                    // registers from the published cut; the next generation
+                    // serves it once it is ready.
+                    _ => {
+                        let published = &mut *self.publication.lock();
+                        let subscription = published.hub.subscribe(&published.publisher, &scopes);
+                        drop(state);
+                        self.recover().await;
+                        return Some(subscription);
+                    }
+                }
+            };
+            let (reply, subscribed) = oneshot::channel();
+            if current
+                .send(bridge::BridgeInput::Subscribe {
+                    scopes: scopes.clone(),
+                    reply,
+                })
+                .is_ok()
+                && let Ok(subscription) = subscribed.await
+            {
+                return Some(subscription);
             }
-            let published = &mut *self.publication.lock();
-            published.hub.subscribe(&published.publisher, &scopes)
-        };
-        self.recover().await;
-        Some(subscription)
+            failed = Some(current);
+        }
     }
 
     async fn subscribe_global(self: &Arc<Self>) -> Option<BridgeSubscription> {
