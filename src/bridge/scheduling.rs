@@ -471,7 +471,8 @@ impl IngressSender {
         let origin = match &input {
             BridgeInput::RuntimeSnapshotRequest
             | BridgeInput::UnobserveSession { .. }
-            | BridgeInput::RetireUnobservedSession { .. } => EventOrigin::RequiredInbound,
+            | BridgeInput::RetireUnobservedSession { .. }
+            | BridgeInput::ServeStreams => EventOrigin::RequiredInbound,
             _ => EventOrigin::Command,
         };
         self.submit(BridgeIngress::Browser(input), class, origin)

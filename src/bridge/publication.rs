@@ -324,6 +324,7 @@ impl BridgeState {
             ErrorCode::Unavailable,
             "the Agent connection ended",
         ));
+        self.hold_for_next_connection();
     }
 }
 

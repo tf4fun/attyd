@@ -529,6 +529,36 @@ impl SessionRegistry {
         self.effects.drain(..).collect()
     }
 
+    /// Protocol v2: a session the previous Agent connection held, which a
+    /// subscription still needs, starts this connection held, with the log it
+    /// had and its waiting `load` (protocol S6, §5.4).
+    pub(crate) fn seed_waiting(
+        &mut self,
+        waiting: crate::protocol::registry::WaitingSession,
+    ) -> Result<u64, RuntimeStateError> {
+        let epoch = self.epoch.clone();
+        let incarnation = self.open_session(
+            &epoch,
+            waiting.session_id.clone(),
+            waiting.cwd,
+            waiting.session,
+            BTreeMap::new(),
+        )?;
+        self.register_new(waiting.session_id.clone(), incarnation);
+        let entry = self
+            .sessions
+            .get_mut(&waiting.session_id)
+            .expect("the session was opened");
+        entry.state.log = waiting.log;
+        entry
+            .state
+            .live
+            .as_mut()
+            .expect("an open session is live")
+            .op = waiting.op;
+        Ok(incarnation)
+    }
+
     pub(crate) fn open_new_with_replay(
         &mut self,
         expected_epoch: &str,

@@ -68,6 +68,7 @@ mod memory_retention_tests;
 mod protocol_gate_tests;
 mod publication;
 mod scheduling;
+mod streams;
 #[cfg(test)]
 mod unobserved_tests;
 
@@ -276,6 +277,9 @@ struct BridgeState {
     observers_stopped: bool,
     /// Protocol v2: the published documents and the Agent's state.
     protocol: ProtocolState,
+    /// Protocol v2: the sessions the previous connection held for a
+    /// subscription, which this one loads again once the Agent is ready.
+    stream_reloads: std::collections::VecDeque<String>,
     /// The connection's ingress, for tests that wait on its receipt.
     #[cfg(test)]
     ingress: Option<IngressSender>,
@@ -1119,15 +1123,25 @@ fn refresh_observer_timers(state: &mut BridgeState) {
     } else {
         state.observer_timeout.unwrap_or(-1)
     };
+    // Only a session the Agent can bring back is released, and only once it
+    // is not needed (S6); a needed one counts as running work.
+    let releasable = streams::releasable(state);
+    let followed = streams::followed(state);
     let owners = state
         .sessions
         .iter_entries()
         .map(|entry| {
+            let session_id = entry.state.session_id.clone();
+            let work = if streams::needed(state, &followed, &session_id) {
+                SessionWork::Running
+            } else {
+                SessionWork::of(entry)
+            };
             (
-                entry.state.session_id.clone(),
+                session_id,
                 entry.state.incarnation,
                 entry.state.live.as_ref().map(|live| live.lifecycle.clone()),
-                SessionWork::of(entry),
+                work,
             )
         })
         .collect::<Vec<_>>();
@@ -1135,7 +1149,7 @@ fn refresh_observer_timers(state: &mut BridgeState) {
         let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) else {
             continue;
         };
-        if state.observers_stopped {
+        if state.observers_stopped || !releasable {
             resources.observers.stop_absence();
             continue;
         }
@@ -1231,6 +1245,7 @@ fn finish_session_view_waiter(
         SessionViewWaiter::View(response) => {
             let _ = response.send(result);
         }
+        SessionViewWaiter::Stream => streams::finish_load(state, session_id, result),
         SessionViewWaiter::Observe {
             observer_id,
             lease,
@@ -1807,6 +1822,8 @@ pub(crate) enum BridgeInput {
         scopes: Vec<crate::protocol::hub::Subscribed>,
         reply: oneshot::Sender<crate::protocol::hub::Subscription>,
     },
+    /// Starts the next load v2 streams wait for.
+    ServeStreams,
 }
 
 impl BridgeInput {
@@ -1814,7 +1831,7 @@ impl BridgeInput {
     /// session ID is validated by the reducer, never used to redirect a reply.
     fn session_id<'a>(&'a self, state: &'a BridgeState) -> Option<&'a str> {
         match self {
-            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } => None,
+            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } | Self::ServeStreams => None,
             Self::SessionViewRequest { session_id, .. }
             | Self::ObserveSession { session_id, .. }
             | Self::UnobserveSession { session_id, .. }
@@ -1852,7 +1869,7 @@ impl BridgeInput {
     /// constructing a second serialized copy of a potentially large prompt.
     fn payload_bytes(&self) -> usize {
         let payload = match self {
-            Self::RuntimeSnapshotRequest => 0,
+            Self::RuntimeSnapshotRequest | Self::ServeStreams => 0,
             Self::Subscribe { scopes, .. } => scopes.len().saturating_mul(256),
             Self::SessionViewRequest {
                 session_id,
@@ -1896,7 +1913,7 @@ impl BridgeInput {
     /// and withdraw its observation lease; dropping a sender alone loses the cause.
     fn reject(self, error: Error) {
         match self {
-            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } => {}
+            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } | Self::ServeStreams => {}
             Self::SessionViewRequest { response, .. } => {
                 let _ = response.send(Err(SessionViewError::from(error)));
             }
@@ -1952,6 +1969,8 @@ fn browser_traffic_class(input: &BridgeInput) -> crate::session_dispatch::Traffi
 
 pub(crate) enum SessionViewWaiter {
     View(oneshot::Sender<Result<Value, SessionViewError>>),
+    /// The v2 streams waiting for the session (protocol §5.1).
+    Stream,
     Observe {
         observer_id: u64,
         lease: ObservationLease,
@@ -1963,6 +1982,7 @@ impl SessionViewWaiter {
     pub(crate) fn is_closed(&self) -> bool {
         match self {
             Self::View(reply) => reply.is_closed(),
+            Self::Stream => false,
             Self::Observe { lease, reply, .. } => lease.is_cancelled() || reply.is_closed(),
         }
     }
@@ -1973,6 +1993,7 @@ impl SessionViewWaiter {
             Self::View(reply) => {
                 let _ = reply.send(Err(error));
             }
+            Self::Stream => {}
             Self::Observe { lease, reply, .. } => {
                 lease.cancel();
                 let _ = reply.send(Err(error));
@@ -2249,6 +2270,7 @@ where
 {
     let mut state = BridgeState::default();
     state.protocol.publication = publication;
+    state.seed_from_previous_connection();
     let state = Arc::new(BridgeLock::new(state));
     state.lock().await.protocol.agent.launch = agent_launch(&options);
     #[cfg(test)]
@@ -2293,6 +2315,8 @@ where
         state.observer_events = Some(observer_events.clone());
         state.observer_timeout = Some(options.session_unobserved_timeout);
     }
+    // A closed v2 subscription may leave a session unneeded (S6).
+    let mut stream_closes = state.lock().await.protocol.publication.lock().hub.closes();
     sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(
         state.lock().await.sessions.snapshot(),
     )));
@@ -2399,6 +2423,8 @@ where
                     .iter()
                     .map(|method| (method.id().0.to_string(), method.clone()))
                     .collect();
+                // The streams wait for the Agent: load what they follow.
+                streams::wake(&state);
             }
             sink.typed("acp/initialized", &response);
             sink.send(json!({ "type": "bridge/phase", "phase": "ready" }));
@@ -2424,6 +2450,9 @@ where
                         // SDK foreground future. Stop admission and let the
                         // cleanup below drain already accepted deliveries.
                         _ = connection.incoming_closed() => break None,
+                        Ok(()) = stream_closes.changed() => {
+                            refresh_observer_timers(&mut *state.lock().await);
+                        }
                         input = observer_rx.recv() => {
                             if let Some(input) = input {
                                 let _ = ingress.try_browser(input, crate::session_dispatch::TrafficClass::Reserved);
@@ -2454,8 +2483,23 @@ where
                         continue;
                     }
                     Some(BridgeInput::Subscribe { scopes, reply }) => {
-                        let _ = (scopes, reply);
-                        todo!("subscribe a v2 stream")
+                        let mut state = state.lock().await;
+                        let (subscription, command) =
+                            streams::subscribe(&mut state, &sink, &scopes);
+                        let _ = reply.send(subscription);
+                        let Some(command) = command else {
+                            continue;
+                        };
+                        (command, None, None)
+                    }
+                    Some(BridgeInput::ServeStreams) => {
+                        let mut state = state.lock().await;
+                        let command = streams::serve(&mut state, &sink);
+                        refresh_observer_timers(&mut state);
+                        let Some(command) = command else {
+                            continue;
+                        };
+                        (command, None, None)
                     }
                     Some(BridgeInput::FinishHistorySync { owner }) => {
                         // A dropped task may not release its flow through the
@@ -2493,7 +2537,10 @@ where
                         // interaction owns the session's next step: cancel this
                         // countdown. Settling back to idle starts a fresh full
                         // interval rather than resuming a stale deadline.
-                        if session_blocks_unobserved_retire(&state, &session_id) {
+                        if session_blocks_unobserved_retire(&state, &session_id)
+                            || !streams::releasable(&state)
+                            || streams::needed(&state, &streams::followed(&state), &session_id)
+                        {
                             if let Ok(resources) =
                                 state.sessions.resources_mut(&session_id, incarnation)
                             {
@@ -4995,9 +5042,19 @@ async fn handle_command_inner(
                 .await?;
                 let mut locked = state.lock().await;
                 release_deletion(&mut locked, &session_id, deletion, &request_id);
+                if result.is_err() {
+                    // The streams that waited for the delete load the session.
+                    streams::wake(&locked);
+                }
                 result?;
                 locked.listed_sessions.remove(&session_id);
                 locked.sessions.complete_catalog_delete(&session_id);
+                streams::end_waiting(
+                    &locked,
+                    &session_id,
+                    crate::protocol::documents::EndReason::Deleted,
+                    None,
+                );
                 advance_catalog_revision(&mut locked, &sink);
                 return Ok(());
             };

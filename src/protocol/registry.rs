@@ -27,6 +27,18 @@ pub(crate) enum SessionLog {
     Known(Arc<TurnLog>),
 }
 
+/// A held session the next Agent connection loads again: bridge memory
+/// that outlives the connection (protocol S6, §5.4). It keeps the log the
+/// session had, with its attachments, and the waiting `load`.
+#[derive(Debug, Clone)]
+pub(crate) struct WaitingSession {
+    pub session_id: String,
+    pub cwd: std::path::PathBuf,
+    pub session: Value,
+    pub log: SessionLog,
+    pub op: OpSlot,
+}
+
 impl SessionLog {
     pub(crate) fn empty() -> Self {
         Self::Known(Arc::new(TurnLog::default()))
@@ -554,6 +566,41 @@ impl SessionRegistry {
         self.scopes.joined.clear();
         self.scopes.flow_scopes.clear();
         self.scopes.login_terminals.clear();
+    }
+
+    /// The connection ended while a subscription follows the held session
+    /// and the Agent can load it again: it shows a running `load`, which the
+    /// next connection runs, and keeps its log (protocol S6, §5.4).
+    pub(crate) fn wait_for_next_connection(&mut self, session_id: &str) -> Option<WaitingSession> {
+        let entry = self.sessions.get_mut(session_id)?;
+        let live = entry.state.live.as_mut()?;
+        live.op = OpSlot::running(
+            OperationKind::Load,
+            json!({ "cwd": live.cwd.to_string_lossy() }),
+        );
+        Some(WaitingSession {
+            session_id: session_id.to_string(),
+            cwd: live.cwd.clone(),
+            session: live.session.clone(),
+            log: entry.state.log.clone(),
+            op: live.op.clone(),
+        })
+    }
+
+    /// The connection ended while a subscription follows the held session
+    /// and the Agent cannot load it again: its scope ends with `load_failed`.
+    pub(crate) fn end_unloadable(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+        self.scopes.ended.push((
+            session_id.to_string(),
+            End {
+                reason: EndReason::LoadFailed,
+                error: Some(ProtocolError::new(
+                    ErrorCode::Unavailable,
+                    "the Agent connection ended and the Agent cannot load the session again",
+                )),
+            },
+        ));
     }
 
     /// A v1 session operation started; a reload runs as a `load`.

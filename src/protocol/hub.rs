@@ -145,6 +145,14 @@ pub(crate) fn parse_stream_query(query: &str) -> Result<Vec<Subscribed>, Protoco
 
 pub(crate) type SubscriptionId = u64;
 
+/// A subscription that follows a session not published yet, and the
+/// directory it gave for its load.
+#[derive(Debug, Clone)]
+pub(crate) struct Waiting {
+    pub id: SubscriptionId,
+    pub cwd: Option<String>,
+}
+
 /// The open subscriptions and their queues.
 pub(crate) struct Hub {
     subscriptions: Vec<Arc<Shared>>,
@@ -186,6 +194,7 @@ impl Hub {
                 subscribed.scope.to_string(),
                 Followed {
                     session: matches!(subscribed.scope, Scope::Session(_)),
+                    cwd: subscribed.cwd.clone(),
                     baseline: subscribed.have.clone(),
                     tail: subscribed.have.clone(),
                     aligned: false,
@@ -335,8 +344,8 @@ impl Hub {
 
     /// The sessions some open subscription follows, with the subscriptions
     /// that follow each and have not seen it published yet.
-    pub(crate) fn followed_sessions(&self) -> BTreeMap<String, Vec<SubscriptionId>> {
-        let mut sessions: BTreeMap<String, Vec<SubscriptionId>> = BTreeMap::new();
+    pub(crate) fn followed_sessions(&self) -> BTreeMap<String, Vec<Waiting>> {
+        let mut sessions: BTreeMap<String, Vec<Waiting>> = BTreeMap::new();
         for shared in &self.subscriptions {
             let queue = shared.queue();
             if queue.closed {
@@ -348,7 +357,10 @@ impl Hub {
                 {
                     let waiting = sessions.entry(session_id).or_default();
                     if !followed.aligned {
-                        waiting.push(shared.id);
+                        waiting.push(Waiting {
+                            id: shared.id,
+                            cwd: followed.cwd.clone(),
+                        });
                     }
                 }
             }
@@ -441,6 +453,8 @@ struct Queue {
 
 struct Followed {
     session: bool,
+    /// The directory the subscription loads an unheld session in.
+    cwd: Option<String>,
     /// The log position last handed to the output.
     baseline: Head,
     /// The target of the last queued log change, or the baseline.
@@ -661,6 +675,9 @@ impl Drop for Subscription {
 pub(crate) struct Published {
     pub publisher: Publisher,
     pub hub: Hub,
+    /// The held sessions an ended connection left for the next one to load
+    /// again, because a subscription follows them (S6, §5.4).
+    pub waiting: Vec<super::registry::WaitingSession>,
 }
 
 #[derive(Clone, Default)]
