@@ -2189,6 +2189,16 @@ async fn read_session(
         [session_id, ref read @ ..] if !session_id.is_empty() => (session_id, read),
         _ => return invalid_request("no session"),
     };
+    // An attachment ID is the lowercase hex SHA-256 of its block (§3.1); any
+    // other is malformed.
+    if let ["attachments", attachment_id] = read
+        && (attachment_id.len() != 64
+            || !attachment_id
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        return invalid_request(format!("{attachment_id} is not an attachment ID"));
+    }
     let scope = Scope::Session(session_id.to_string()).to_string();
     let held = state
         .bridge
@@ -3262,7 +3272,9 @@ async fn get_attachment(
         || !valid_api_identifier(&query.expected_epoch)
         || query.expected_incarnation == 0
         || attachment_id.len() != 64
-        || !attachment_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !attachment_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return api_bad_request("invalid attachment reference");
     }
