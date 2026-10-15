@@ -1,4 +1,4 @@
-//! URL flows (protocol S7, §4.6, §7; acceptance 9): accepting a URL
+//! URL flows (protocol S7, §4.6, §7; acceptance 11): accepting a URL
 //! elicitation moves it to its scope's `urlFlows`, where it lives by its own
 //! lifecycle. An operation's end or replacement ends no flow; the Agent's
 //! `elicitation/complete`, a client's dismissal, the scope's end and the

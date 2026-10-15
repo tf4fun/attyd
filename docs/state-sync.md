@@ -1,6 +1,6 @@
 # Sync protocol implementation plan
 
-Status: implemented through step 8, 2026-10-15; step 9 is in progress (§5). This document is how
+Status: implemented, steps 1–9, 2026-10-15 (§5). This document is how
 the bridge implements
 [attyd protocol v2](protocol.md), settled in
 [client-api-redesign.md](client-api-redesign.md). It covers the internal design,
@@ -36,9 +36,10 @@ queues (now in `src/protocol/hub.rs`, §2.4). Nothing else of the draft was a
 constraint: its routes, documents, records, intents, log, owner handling and tests
 went.
 
-Layer 1 (bridge ↔ ACP server) is not changed by this plan until its last step (9,
-still open): the bridge keeps its sessions, incarnations, ingress and coordinator
-internally. The protocol never exposes them.
+Layer 1 (bridge ↔ ACP server) was not changed by this plan until its last step
+(9): until then the bridge kept its sessions, incarnations, ingress and
+coordinator internally, and the protocol never exposed them. Step 9 removed the
+session incarnation (§5); the bridge now identifies a session by its ID only.
 
 ## 2. Design
 
@@ -317,7 +318,7 @@ The web UI stayed on `/api/v1` until it moved to v2 in one step (7), so the
 product kept working throughout. Each step is one PR, validated in CI. Steps 1–8 are
 done: step 8 (PR #46) removed the v1 routes and SSE, the business events and
 journal, the browser's v1 store and compensation, and drove the backend smokes over
-v2. Step 9 is in progress.
+v2. Step 9 (PR #47) is done, below.
 
 | Step | Work | Acceptance |
 | --- | --- | --- |
@@ -330,10 +331,10 @@ v2. Step 9 is in progress.
 | 6 | `POST /api/v2/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16, 17 (bridge) |
 | 7 | Web UI on v2: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection. PR #34, built on the earlier draft, is not landed; `shared/replica.ts` and `shared/protocol-validate.ts` are carried over where they fit | 3, 4, 9, 15, 16 (client) |
 | 8 | Remove v1: routes, business events, browser compensating state; Markdown export and attachment links on v2 | — |
-| 9 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | — |
+| 9 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | existing gates |
 
-Step 9 removes the session incarnation entirely, without a renamed successor
-(no session generation, owner token or tombstone). That covers:
+Step 9 removed the session incarnation entirely, without a renamed successor
+(no session generation, owner token or tombstone). That covered:
 
 - its allocation and storage: `SessionRegistry::next_incarnation` and
   `SessionState.incarnation`;
@@ -346,12 +347,47 @@ Step 9 removes the session incarnation entirely, without a renamed successor
 - every `StaleIncarnation` check and error, and the tests that only simulate an
   old incarnation number.
 
+It also removed three mechanisms that only served that identity:
+
+- the per-registration allocation of a session queue (`SessionHandle`'s
+  `allocation`, `next_allocation` and `StaleHandle`): registering an existing
+  queue returns it, with its queued events and busy delivery;
+- the retired-ID filter (`SessionRegistry.retired_ids`, `is_retired`) for late
+  notifications of a session the connection had once retired;
+- the pointer identity of a session update's validation owner
+  (`SessionUpdateOwner` and its `Arc<()>` allocation): an ordinary
+  `session/update` is validated against the current session's validation or the
+  creation staging under one lock.
+
 What stays is ordinary ACP: JSON-RPC request/response correlation, the exact end
 of the current op, cancellation and shutdown draining, one load's candidate
 committed atomically or rolled back, and each resource's own ID and responder
 (permission and elicitation requests, URL registrations, terminals). The bridge
 generation (one Agent connection, its `epoch`) and an outstanding RPC's own
 allocation also stay. A session is identified by its ID, as in ACP.
+
+The result, in the code:
+
+- A load's history candidate is keyed by session ID; every append, commit and
+  discard still checks the load's attempt ID. A replay validation backup records
+  the actual request (`request_id` of an explicit load, `attempt_id` of an
+  automatic sync), and only that request commits or rolls it back.
+- A session installed under an ID that names an idle entry replaces it: the old
+  entry's resources are cancelled and removed (`retire_entry`) and its history is
+  cleared.
+- A delete takes the session path when the entry has a running session, and the
+  catalog path otherwise (an unopened history row or a cold placeholder).
+- Agent input naming a cold placeholder (an entry without a running session) takes
+  the connection-level path, so a `session/update` before the creation response
+  is staged and replayed into the created session.
+- A `session/update` naming no running session is dropped, unless a creation is
+  pending: then it is staged, bounded by the number of pending creations, and only
+  the created session's ID is replayed into it. ACP notifications carry only a
+  `sessionId`, so the bridge does not tell a late notification of a session
+  replaced under the same ID from one of the current session; it applies to the
+  session that runs under that ID.
+
+The browser protocol (`/api/v2`) did not change.
 
 Dependencies: 1 → 2 → 3 → 4a → 4b → 5 → 6 → 7 → 8, and 9 after 8. #16 and #17 are fixed
 visibly in step 7.

@@ -240,6 +240,8 @@ Z01 版本检查、Z02 截断方向、Z03 HTTP MCP 门控、Z04 条件性 termin
 
 代次隔离的边界：A02 必须拒绝“处理期间所属会话已关闭或替换”的通知和旧加载回滚。ACP `session/update` 只有 sessionId，没有 turn/load/incarnation 标识；若旧通知在同 ID 重开后才首次到达，客户端无法仅凭标准字段还原它的旧归属。本项目不增加私有协议字段来伪造这种保证。
 
+历史界限（2026-10-15）：上表 A01 的“保持 incarnation”和 A02 的“代次隔离回归”记录的是当时的实现。迁移第 9 步（PR #47，[state-sync §5](state-sync.md#5-migration)）已从 bridge 删除 session incarnation，session 只按 ID 标识。现在没有运行中会话的 ID 收到的通知被丢弃（创建进行中时按上限暂存）；同 ID 已有新会话时，通知归这个新会话。旧加载的提交与回滚仍按该次加载的 attempt ID 结清；A01 的会话根与越界保护不依赖代次，保持不变。上面关于 sessionId 的事实不变。
+
 ## 五、缺陷修复基线验收（29d90b5）
 
 - `npm run check`：通过，239 项 Vitest、三个 TypeScript 配置检查及生产前端构建通过。

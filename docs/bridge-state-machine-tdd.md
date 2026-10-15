@@ -7,6 +7,16 @@
 > current client contract and its gates are [protocol v2](protocol.md) and
 > [state-sync §4](state-sync.md#4-invariants-and-gates). Sections on those removed contracts
 > are kept as history.
+>
+> Migration step 9 ([state-sync §5](state-sync.md#5-migration), PR #47) also removed the
+> session incarnation from the bridge internals. Wherever this ledger fences by incarnation
+> (`SessionKey`, "new incarnation", `expectedIncarnation`, epoch/incarnation/attempt tickets,
+> "retirement filtering") or gates on v1 idempotency (`Idempotency-Key`, intent results,
+> history-revision CAS), it is history: do not restore those mechanisms from it. What still
+> applies is the method — failing behaviour tests first, deterministic barriers, the real
+> per-session FIFO, one load candidate committed atomically or rolled back by its own attempt,
+> and exact cleanup of each resource — with a session identified by its ID, the connection by
+> its epoch, and a load by its attempt.
 
 This ledger defines the regression gates for the authoritative history projection in
 [active-turn-runtime.md](active-turn-runtime.md). The detailed test
@@ -370,7 +380,8 @@ Keep these retired behaviors out of the production path:
 - Bridge-owned unversioned queued prompt admission.
 
 Epoch/incarnation isolation, semantic folding, live-resource registries, per-session operation
-exclusion and canonical suffix-gap handling are retained and adapted. Delivery queues are
+exclusion and canonical suffix-gap handling are retained and adapted. (Since step 9 the
+isolation is by epoch only; the incarnation part is removed.) Delivery queues are
 unbounded so valid bursts cannot be converted into connection failures.
 
 ## Lossless burst delivery regression
