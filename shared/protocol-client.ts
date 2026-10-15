@@ -281,7 +281,8 @@ export class WriteQueue {
 
   enqueue(scope: string, write: StartingWrite): number {
     this.#next += 1;
-    this.#queue(scope).items.push({ id: this.#next, write, state: "queued" });
+    const queue = this.#queue(scope);
+    queue.items = [...queue.items, { id: this.#next, write, state: "queued" }];
     this.update(scope);
     return this.#next;
   }
