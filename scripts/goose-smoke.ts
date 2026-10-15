@@ -445,28 +445,43 @@ async function exerciseConfiguredBridge(
     const scope = sessionScope((created.outcome.result as { sessionId: string }).sessionId);
     client.follow([{ scope: "global" }, { scope }]);
     await client.ended(scope);
-    const started = await client.ops.write(scope, {
-      kind: "prompt",
-      args: { prompt: [{ type: "text", text: `Use the shell tool to print ${LOCAL_TOOL_OUTPUT}, then report completion.` }] },
-    });
-    if (started.kind !== "accepted") throw new Error(`Configured Goose prompt was refused: ${JSON.stringify(started)}`);
-    // The tool call lives in the running prompt's process, which its commit removes.
-    let toolProcess = false;
+    // The tool call lives in the running prompt's process, which its commit
+    // removes, and the stream may show it all before the write is answered:
+    // watch from before the write, noting only which prompts showed the tool.
+    const opened = sessionLive(client.replicas.get(scope))!.op.id;
+    const toolOps = new Set<string>();
     const answered = new Set<string>();
-    const completed = await client.until(scope, (replica) => {
-      const op = sessionLive(replica)?.op;
-      if (op?.id !== started.op) return undefined;
-      if (op.status !== "running") return op;
+    const answers: Promise<void>[] = [];
+    const unsubscribe = client.replicas.subscribe((changed) => {
+      const op = sessionLive(client.replicas.get(changed))?.op;
+      if (changed !== scope || op?.kind !== "prompt" || op.id === opened || op.status !== "running") return;
       const updates = JSON.stringify(op.process ?? []);
-      toolProcess ||= updates.includes('"sessionUpdate":"tool_call"') && updates.includes('"rawOutput"') &&
-        updates.includes(LOCAL_TOOL_OUTPUT);
+      if (updates.includes('"sessionUpdate":"tool_call"') && updates.includes('"rawOutput"') &&
+          updates.includes(LOCAL_TOOL_OUTPUT)) toolOps.add(op.id);
       const pending = Object.keys(op.interactions).sort().join(" ");
       if (pending !== "" && !answered.has(pending)) {
         answered.add(pending);
-        void client.ops.answer(scope, permissionAnswers(op));
+        answers.push(client.ops.answer(scope, permissionAnswers(op)).then((outcome) => {
+          if (outcome.kind !== "accepted") throw new Error(`Goose permission answer: ${JSON.stringify(outcome)}`);
+        }));
       }
-      return undefined;
-    }, "configured Goose bridge turn", 15_000);
+    });
+    let completed: Operation;
+    try {
+      const started = await client.ops.write(scope, {
+        kind: "prompt",
+        args: { prompt: [{ type: "text", text: `Use the shell tool to print ${LOCAL_TOOL_OUTPUT}, then report completion.` }] },
+      });
+      if (started.kind !== "accepted") throw new Error(`Configured Goose prompt was refused: ${JSON.stringify(started)}`);
+      completed = await client.until(scope, (replica) => {
+        const op = sessionLive(replica)?.op;
+        return op?.id === started.op && op.status !== "running" ? op : undefined;
+      }, "configured Goose bridge turn", 15_000);
+      await Promise.all(answers);
+    } finally {
+      unsubscribe();
+    }
+    const toolProcess = toolOps.has(completed.id);
     const log = client.replicas.get(scope)!.log;
     if (completed.status !== "completed" || !toolProcess || log.length !== 1 || !replyText(log[0]).includes(LOCAL_AGENT_OUTPUT)) {
       throw new Error(`Configured Goose bridge lost its tool turn: ${JSON.stringify({ completed, toolProcess, log })}`);

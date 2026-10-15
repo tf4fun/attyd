@@ -5,6 +5,7 @@ import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import * as acp from "@agentclientprotocol/sdk";
 import { startRustTestServer } from "./rust-test-server.js";
 import type { OpArgs } from "../shared/protocol.js";
 import { globalLive, replyText, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
@@ -52,17 +53,23 @@ try {
     "fake Agent initialization");
   const live = client;
   // The Agent lists sessions only while signed in: `list` succeeds, or ends
-  // with its `auth_required` error.
+  // with the Agent's own auth-required error, carried verbatim.
+  const authRequired = acp.RequestError.authRequired({ hint: "Use agent-login" });
   const listed = async () => {
     await live.ended("catalog");
     const outcome = await live.ops.write("catalog", { kind: "list", args: {} });
     assert.ok(outcome.kind === "ended", JSON.stringify(outcome));
     await live.ended("catalog", outcome.op);
-    return "result" in outcome.outcome;
+    if ("result" in outcome.outcome) return true;
+    assert.equal(outcome.outcome.error.code, "agent_error", JSON.stringify(outcome));
+    assert.deepEqual(outcome.outcome.error.data, {
+      code: authRequired.code, message: authRequired.message, data: authRequired.data,
+    });
+    return false;
   };
   assert.equal(await listed(), true);
   const globalOp = async () => (await live.ended("global")).id;
-  /** A global write with `headers`: admitted, then shown ended. */
+  /** A global write with `headers`: admitted, then shown completed. */
   const writeGlobal = async (write: OpArgs, headers: Record<string, string>) => {
     const response = await fetch(`${origin}/api/v2/scopes/global/ops`, {
       method: "POST",
@@ -71,7 +78,8 @@ try {
     });
     const text = await response.text();
     assert.equal(response.status, 202, `${write.kind} with ${JSON.stringify(headers)}: ${text}`);
-    await live.ended("global", (JSON.parse(text) as { op: string }).op);
+    const ended = await live.ended("global", (JSON.parse(text) as { op: string }).op);
+    assert.equal(ended.status, "completed", `${write.kind}: ${JSON.stringify(ended.error)}`);
   };
 
   // Iframe navigations can omit Origin, so request-origin checks alone cannot

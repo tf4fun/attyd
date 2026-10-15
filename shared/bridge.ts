@@ -4,12 +4,9 @@ export interface TerminalSnapshot {
   sessionId: string;
   terminalId: string;
   output: string;
-  outputBytes?: string;
   truncated: boolean;
   exitStatus?: TerminalExitStatus | null;
   released: boolean;
-  outputAppend?: boolean;
-  retainedBytes?: number;
 }
 
 export interface WorkspaceContextMatch {
