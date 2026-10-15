@@ -1,6 +1,7 @@
 # attyd protocol v2
 
-Status: specification, 2026-10-14. Not implemented yet. This document defines the
+Status: specification, 2026-10-14; implemented under `/api/v2`, the only browser API since
+`/api/v1` was removed (PR #46). This document defines the
 client ↔ bridge protocol settled in [client-api-redesign.md](client-api-redesign.md),
 which holds its rationale, derivations and acceptance cases. It replaces the earlier
 v2 draft ([`11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md)),
@@ -633,6 +634,6 @@ fails ends; the client subscribes again with its heads.
 | `GET /api/v2/global`, `GET /api/v2/sessions/{id}` | `GET /api/v2/scopes/{scope}` |
 | `owner_mismatch`, `history_mismatch`, `precondition_required`, `conflict`, `intent_conflict`, `intent_capacity`, `gone`, `interaction_ended` | `stale`, `not_allowed` |
 
-For `/api/v1`, the earlier draft's
+`/api/v1` no longer exists. For the record of how its routes map here, the earlier draft's
 [mapping from v1](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md#8-mapping-from-v1)
 applies through this table.

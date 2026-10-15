@@ -31,9 +31,9 @@
 
 | 编号/对应审查 | ACP 允许什么 | Zed 当前实现 | attyd 审查时实现 | 决策状态与实施内容 |
 | --- | --- | --- | --- | --- |
-| T01 / A10 | 生成中可切 mode/config；close 可取消活动工作 | 控制请求不以 prompt idle 为前置，thread release 可 close | 同 session 的 prompt 与控制/lifecycle mutation 互斥 | 已实施：允许生成中提交设置；手动关闭先确认；离开页面不立即关闭，随后采用 T02 的无观察者倒计时。 |
-| T02 / A18 | 不规定客户端累计历史内存预算 | 编辑器实体和资源生命周期与 Web bridge 不同，不能直接移植预算 | 明确选择完整保留当前物化会话，不按累计字节截断；关闭/释放时回收 | 已实施：无观察者持续达到 CLI 配置时长后自动关闭；返回观察取消计时。继续使用生命周期回收，不增加累计历史裁剪或持久化。 |
-| T03 / A07、A08 的无历史部分 | resume 独立于 load，不返回旧历史；fork 能力也不隐含 load | resume 可继续而不补 load；固定外部 adapter 没有 fork | 公开冷恢复需要 load；resume/fork 仍有 load 能力硬前置 | 已实施：消息展示尽力恢复，优先 Agent 历史，其次内存缓存，再明确缺失；fork 同样处理。历史完整性不作为继续会话的前提。 |
+| T01 / A10 | 生成中可切 mode/config；close 可取消活动工作 | 控制请求不以 prompt idle 为前置，thread release 可 close | 同 session 的 prompt 与控制/lifecycle mutation 互斥 | 已由协议 v2 S5/S6 取代（PR #46）：同一 scope 一次只运行一个操作，prompt 运行时不接受设置；没有客户端关闭操作，离开只是停止关注；会话不再被需要后才按 CLI 时长释放，绝不切断运行中的工作。 |
+| T02 / A18 | 不规定客户端累计历史内存预算 | 编辑器实体和资源生命周期与 Web bridge 不同，不能直接移植预算 | 明确选择完整保留当前物化会话，不按累计字节截断；关闭/释放时回收 | 现行（协议 S6）：会话没有订阅、运行或占用中的操作、未释放终端或已接受 URL flow 时，达到 CLI 配置时长后释放，且只释放 Agent 能 load 或 resume 的会话。不增加累计历史裁剪或持久化。 |
+| T03 / A07、A08 的无历史部分 | resume 独立于 load，不返回旧历史；fork 能力也不隐含 load | resume 可继续而不补 load；固定外部 adapter 没有 fork | 公开冷恢复需要 load；resume/fork 仍有 load 能力硬前置 | 现行（协议 S1）：log 由 Agent 回放构建，空回放即空 log；Agent 重启后的 resume 保留已知 log；fork 无回放时沿用来源会话已知的 log。缺失历史提示和带标注的来源快照已删除。 |
 | T04 / A21 | 有 configOptions 时 SHOULD 排他使用它，legacy modes 仍在 v1 | 存在 configOptions 就不用 legacy modes | 仅发现 mode 类 config 时隐藏 legacy modes | 已实施：遵循 ACP 建议及 Zed，提供 configOptions 就排他使用；未提供才回退 modes，显式空数组不触发回退。 |
 | T05 / 终端执行 | 要求 create/output/wait/kill/release 语义，不规定 shell、PTY 或 detached 子进程政策 | 本地 Unix 固定 /bin/sh，Windows 优先 Git Bash；项目环境、PTY、交互 shell 标志，命令 stdin 重定向为空 | Unix 非交互 /bin/sh、pipes、字面 argv；正常退出不补杀后台组，运行中显式终止清理 | 已确认、保留现状：Unix 固定 /bin/sh，保持 Agent 执行入口稳定；保留非交互、管道输出、环境继承及已确认的子进程策略。 |
 | T06 / 卡片与媒体 | 必要字段语义和内容必须正确；不规定布局、折叠、编辑器导航或所有二进制播放器 | 多种编辑器呈现方式；本版本 audio/混合媒体仍有降级 | 统一卡片、原始细节折叠、Web media；binary resource 暂为摘要 | 2026-09-26 更新：附件统一为紧凑入口，工具内采用文件行；点击在新页面打开，预览/下载交由浏览器。内容由 attyd 会话内存托管，不新增预览器或持久化。 |
@@ -42,7 +42,7 @@
 
 ### T01 已确认：控制权与关闭副作用
 
-状态：以下产品规则已落实到运行逻辑、关闭确认 UI 和回归测试。
+状态：**已由协议 v2 的 S5（准入）与 S6（保持）取代**（PR #46）。生成中提交设置、手动关闭确认和无观察者关闭倒计时都已删除；现行规则见 [usage](usage.md#projects-and-sessions)。下文保留为当时的决策记录；关于终端与子进程的边界仍然适用，只是关闭现在只发生在会话释放时。
 
 - 允许生成中提交 mode/config 请求，以 Agent 响应及通知确认设置。实际生效时点由 Agent 控制，不承诺本轮推理立即采用新设置，也不自动取消或重发 prompt。
 - 用户主动关闭会话时，先显示确认框，再调用已协商的 `session/close`；成功后清理本地会话资源。错误或结果不明时保留可恢复状态，如实显示结果，不声称 Agent 已停止或已经回滚所有副作用。
@@ -70,6 +70,9 @@
 
 ### T02 已确认：无观察者自动关闭倒计时
 
+状态：**已由协议 v2 的 S6 取代**（PR #46）：计时只在会话不再被需要后开始，运行中的工作、未释放终端和已接受 URL flow 都让会话保持；只释放 Agent 能 load 或 resume 的会话，默认 300 秒。下文保留为当时的决策记录。
+
+
 采用一个由 CLI 控制的后端回收策略，支持禁用、立即关闭和倒计时关闭。CLI 是用户预先选择的自动回收策略；自动关闭不等待一个无人查看的确认框。手动关闭继续遵守 T01 的确认要求。
 
 - 按 session 统计观察者；任一浏览器仍订阅该会话的事件流时不计时。项目列表和全局状态订阅不算该会话的观察者。
@@ -95,6 +98,9 @@ CLI 必须接受负数参数，不能将其误识别为另一个选项。自动�
 原审查将累计内存无预算列为实现缺陷，但 [运行态契约](active-turn-runtime.md#memory-model)及 [TDD ledger](bridge-state-machine-tdd.md#memory-invariants)已经明确选择不截断协议有效历史。因此本轮将它改为 **T02 架构资源权衡**。继续记账且关闭时回收；不擅自增加 LRU、历史裁剪、终端快照淘汰或持久化。文档中若把“单项有界”写成“累计内存有界”，则直接纠正文案。
 
 ### T03 已确认：消息上下文尽力恢复
+
+状态：**已由协议 v2 的 S1 取代**（PR #46）：log 只由 Agent 回放和本地提交构建，内存缓存降级、缺失历史提示 `historyNotice` 和带标注的来源快照都已删除。下文保留为当时的决策记录。
+
 
 沿用无持久化、尽力展示完整消息上下文的设计；不新增要求用户选择的“无历史模式”。这里的服务器历史指 ACP Agent 提供的历史，attyd 的服务端与浏览器缓存都只存在于内存中。
 
@@ -247,8 +253,8 @@ Z01 版本检查、Z02 截断方向、Z03 HTTP MCP 门控、Z04 条件性 termin
 
 ## 六、权衡实施与验收
 
-- T01/T02：[runtime](../src/runtime_state.rs)、[bridge](../src/bridge.rs)、[server](../src/server.rs) 支持运行中设置/关闭、观察者倒计时及代次隔离；[关闭确认框](../web/src/components/acp/close-session-dialog.tsx) 默认聚焦保留会话，取消不发送请求。
-- T03/T04：[mirror](../src/session_mirror.rs) 保留历史降级来源；Agent 空回放仍是权威结果。UI 保留缺失配置与显式空列表的区别。
+- T01/T02（历史；现由协议 S5/S6 取代）：当时 runtime、bridge 与 server 支持运行中设置/关闭、观察者倒计时及代次隔离，关闭确认框已删除。现行准入与释放见 `protocol::admission` 与 `bridge::streams::needed`。
+- T03/T04：[mirror](../src/session_mirror.rs) 按 Agent 回放构建 log，空回放仍是权威结果，fork 无回放时沿用来源 log。UI 保留缺失配置与显式空列表的区别。
 - T06/T08：[内容组件](../web/src/components/acp/content-block.tsx) 统一附件预览/导出；[文件服务](../src/filesystem.rs) 提供可诊断的写入失败信息。
 - T05/T07：保留固定 `/bin/sh`、stdio/HTTP/SSE/WebSocket 及已协商草案能力；[使用说明](usage.md) 和 [兼容性矩阵](acp-coverage.md) 明确实现与维护范围。
 

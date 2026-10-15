@@ -1,5 +1,13 @@
 # Bridge state-machine TDD ledger
 
+> **Status (2026-10-15).** The method of this ledger still applies: bridge behavior is tested
+> before browser projections, with deterministic barriers rather than timing. Its client-facing
+> contracts — `If-Match`/`Idempotency-Key` appends, intent results, snapshot/delta observers,
+> `/api/v1/runtime` and the publication journal — belong to the v1 API removed in PR #46. The
+> current client contract and its gates are [protocol v2](protocol.md) and
+> [state-sync §4](state-sync.md#4-invariants-and-gates). Sections on those removed contracts
+> are kept as history.
+
 This ledger defines the regression gates for the authoritative history projection in
 [active-turn-runtime.md](active-turn-runtime.md). The detailed test
 matrix is [active-turn-runtime-tests.md](active-turn-runtime-tests.md).

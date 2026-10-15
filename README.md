@@ -86,7 +86,7 @@ See [deployment guidance](docs/usage.md#deployment-and-trust-boundaries).
 
 - [Usage](docs/usage.md) — installation, configuration, remote connections, and agent examples.
 - [ACP compatibility](docs/acp-coverage.md) — supported features and protocol boundaries.
-- [Contributor guide](AGENTS.md), [tests](docs/testing.md), and [architecture](docs/active-turn-runtime.md) — development and verification.
+- [Contributor guide](AGENTS.md), [tests](docs/testing.md), and [protocol](docs/protocol.md) with its [implementation plan](docs/state-sync.md) — development and verification.
 - [Security policy](SECURITY.md) — reporting vulnerabilities and support scope.
 
 Licensed under [Apache-2.0](LICENSE).

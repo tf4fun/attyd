@@ -1,5 +1,11 @@
 # 历史同步与空闲回收：生命周期修复方案
 
+> **历史记录（2026-10-15）。** 下文的源快照标注、缺失历史提示、`historyRevision` 与 v1 空闲回收状态机
+> 已随 v1 删除（PR #46），`src/bridge/unobserved_tests/` 也已不存在。现行规则：会话在有订阅、运行或占用中的操作、
+> 未释放的终端或已接受的 URL flow 时一直保留；不再需要后经 `--session-unobserved-timeout` 释放，且只释放
+> Agent 能 load 或 resume 的会话（[协议 S6](protocol.md)）。fork 使用 Agent 回放；没有回放时沿用来源会话已知的 log。
+> 下文保留为当时的方案与验证记录。
+
 状态：已实施，生命周期验收门槛已 Green。生产修复自 `0857250` 落地。
 历史 Red 基线：`a65d5d16fc0eb8674c2f9b26888eb9dbda7933c8`；当前验证提交：`5f66a6a`。
 最新 [CI 35682667713](https://github.com/tf4fun/attyd/actions/runs/35682667713)

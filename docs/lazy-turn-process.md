@@ -1,5 +1,11 @@
 # 已完成轮次的过程按需加载
 
+> **历史记录（2026-10-15）。** `presentation=compact`、`collapsedTurns`、过程分页、折叠缓存和
+> 显式完整快照导出都已随 v1 删除（PR #46）。现行协议中，已完成轮次只以 log 条目（提问与最终消息）传输，
+> 运行中的过程只在 `op.process` 里；提交后过程不再进入任何文档，也无法取回
+> （[协议 §3、§4.4](protocol.md)，[state-sync I8](state-sync.md#4-invariants-and-gates)）。
+> Markdown 导出由客户端从 log 与附件组装。下文保留为当时的设计与验证记录。
+
 日期：2026-09-22。
 
 ## 范围与数据职责

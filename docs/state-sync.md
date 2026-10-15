@@ -1,6 +1,7 @@
 # Sync protocol implementation plan
 
-Status: plan, 2026-10-14. This document is how the bridge implements
+Status: implemented through step 8, 2026-10-15; step 9 is open (§5). This document is how
+the bridge implements
 [attyd protocol v2](protocol.md), settled in
 [client-api-redesign.md](client-api-redesign.md). It covers the internal design,
 the invariants tests enforce, and the migration from the earlier v2 draft and
@@ -11,9 +12,9 @@ projections.
 
 ## 1. Starting point
 
-An earlier v2 draft was implemented on `main` (its migration steps 1–5, last at
+This section records where the migration started, on 2026-10-14. An earlier v2 draft was implemented on `main` (its migration steps 1–5, last at
 `11d04d0`) until step 2 removed it. It was never completed: no client used it, and
-the web UI still runs on `/api/v1`. It was also
+the web UI then ran on `/api/v1`. It was also
 over-designed for the settled model (incarnation owner tags, epochs and log
 positions, a retained log with resume, request records, intent tables, process
 pages). It is therefore **removed first** (§5, step 2), not kept beside the new
@@ -28,15 +29,16 @@ them, with their tests:
 | JSON Pointer patcher and generic diff | `src/protocol/diff.rs` | protocol §5.3 |
 | DTO-to-TypeScript generation | `src/protocol/typescript.rs` | §3 |
 
-Two more techniques of the draft are reused when the new code is written, but their
-modules go with the draft: the identity diff of turn updates
-(`src/protocol/publish.rs`, for `op.process` in §2.3) and byte-budgeted subscriber
-queues (`src/protocol/hub.rs`, §2.4). Nothing else of the draft is a constraint:
-its routes, documents, records, intents, log, owner handling and tests go.
+Two more techniques of the draft were reused in the new code, while the draft's own
+modules went with it in step 2: the identity diff of turn updates (now in
+`src/protocol/publish.rs`, for `op.process` in §2.3) and byte-budgeted subscriber
+queues (now in `src/protocol/hub.rs`, §2.4). Nothing else of the draft was a
+constraint: its routes, documents, records, intents, log, owner handling and tests
+went.
 
-Layer 1 (bridge ↔ ACP server) is not changed by this plan until its last step: the
-bridge keeps its sessions, incarnations, ingress and coordinator internally. The
-protocol never exposes them.
+Layer 1 (bridge ↔ ACP server) is not changed by this plan until its last step (9,
+still open): the bridge keeps its sessions, incarnations, ingress and coordinator
+internally. The protocol never exposes them.
 
 ## 2. Design
 
@@ -51,7 +53,9 @@ ACP ──▶ bridge actor: transition ──▶ commit step ──────�
 ### 2.1 Bridge state added
 
 - **Operation slots.** Every scope has an `OpSlot { id, kind, status, input,
-  cancel_requested, result, error }` in bridge state. A held session keeps it in
+  cancel_requested, result, error, attachments, completion }` in bridge state
+  (`src/protocol/op.rs`); `attachments` are the blocks a prompt input references,
+  and `completion` is the held response of a `create`, `fork` or `list`. A held session keeps it in
   its registry entry; `global` and `catalog` keep theirs in the registry. The
   operation's pending interactions are the scope's pending Agent requests, which
   the bridge keeps as today; the projection reads them from there.
@@ -67,11 +71,14 @@ ACP ──▶ bridge actor: transition ──▶ commit step ──────�
 
 Pure functions define the published documents:
 
-- `project_session(&SessionRegistry, session_id) -> Option<(Arc<TurnLog>, SessionLive)>`
-- `project_global(&AgentState, &SessionRegistry, &OpSlot) -> GlobalLive`
-- `project_catalog(&CatalogState) -> CatalogLive`
+- `project_session(&SessionRegistry, session_id: &str) -> Option<SessionDocument>`
+- `project_global(&SessionRegistry, &AgentInfo) -> GlobalLive`
+- `project_catalog(&SessionRegistry, revision: u64) -> CatalogLive`
 
-They live in `src/protocol/project.rs` and are the only definition of what clients
+`SessionDocument` hands the commit step what it publishes separately: the `log`
+(`Unknown` until the first load completes, else `Known`), the `live` document, the
+running prompt's `process`, and the attachments its `op.input` references. They
+live in `src/protocol/project.rs` and are the only definition of what clients
 see. `op.process` comes from the running turn's `SharedTurnUpdates`; it is absent
 once the turn committed, so released process content never enters a document.
 
@@ -168,7 +175,8 @@ Operation writes are handled in the bridge actor, one at a time:
    arguments and Agent connection.
 2. **Install.** A starting operation replaces the scope's slot and occupies its
    other scopes, in the same critical section. The commit step publishes it.
-3. **Run.** The operation enters the bridge input, as v1 commands do. Interactions
+3. **Run.** `bridge::operations` turns the operation into the bridge command of its kind,
+   which the coordinator runs over ACP. Interactions
    of its ACP requests are added to its slot; answers are delivered by the existing
    interaction delivery path.
 4. **End.** The transition that ends it sets its final status, result or error,
@@ -208,9 +216,9 @@ reads the body field by field and sends it to the actor as one input.
 `bridge::operations` installs a starting operation and builds the command of its
 kind under the same guard, or applies `cancel` and `answer` there. An `answer` is
 checked whole before anything is delivered. Each interaction is found by its ID
-wherever it waits, and is delivered through the same permission and elicitation
-helpers as the v1 responses. An accepted URL elicitation becomes a flow in that
-step. A cancel sets `cancel_requested` once on the owning slot. A prompt or login
+wherever it waits, and is resolved and delivered to its pending responder in the
+same guard (`resolve_permission`, `resolve_elicitation`). An accepted URL
+elicitation becomes a flow in that step. A cancel sets `cancel_requested` once on the owning slot. A prompt or login
 whose ACP call has not started yet sees the flag when it starts.
 
 **Release.** A session whose need ends starts the existing retirement timer
@@ -305,8 +313,11 @@ ACP capability → bridge authority → document path or operation → result in
 
 ## 5. Migration
 
-The web UI stays on `/api/v1` until it moves to the new v2 in one step, so the
-product keeps working throughout. Each step is one PR, validated in CI.
+The web UI stayed on `/api/v1` until it moved to v2 in one step (7), so the
+product kept working throughout. Each step is one PR, validated in CI. Steps 1–8 are
+done: step 8 (PR #46) removed the v1 routes and SSE, the business events and
+journal, the browser's v1 store and compensation, and drove the backend smokes over
+v2. Step 9 is open.
 
 | Step | Work | Acceptance |
 | --- | --- | --- |

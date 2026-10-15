@@ -1,5 +1,11 @@
 # 运行期内存优化第二阶段：局部更新与交付边界
 
+> **历史记录（2026-10-15）。** 本文涉及的 journal、legacy 投影、浏览器保留视图、`shared/business-api.ts`
+> 与 `test:memory:web`、`test:memory:efficiency:web` 浏览器门槛都已随 v1 删除（PR #46）。
+> 仍然有效的是 Rust 内存门槛 `npm run test:memory:efficiency:rust`（`session_state::memory_efficiency_tests`）
+> 和 `npm run test:memory:rust`（`bridge::memory_retention_tests`）。现行发布与交付规则见
+> [state-sync §2](state-sync.md#2-design)。下文保留为当时的方案与验证记录。
+
 日期：2026-09-22。代码基线：`802c20b`，已从远端快进拉取。
 本轮先以自然 Red 建立验收门槛，随后完成第二阶段生产优化；未部署到 `pi4.lan`。
 第一阶段诊断见 [内存保留方案](runtime-memory-retention.md)，历史 Red 记录见
