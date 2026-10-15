@@ -1,6 +1,6 @@
 # Sync protocol implementation plan
 
-Status: implemented through step 8, 2026-10-15; step 9 is open (§5). This document is how
+Status: implemented through step 8, 2026-10-15; step 9 is in progress (§5). This document is how
 the bridge implements
 [attyd protocol v2](protocol.md), settled in
 [client-api-redesign.md](client-api-redesign.md). It covers the internal design,
@@ -317,7 +317,7 @@ The web UI stayed on `/api/v1` until it moved to v2 in one step (7), so the
 product kept working throughout. Each step is one PR, validated in CI. Steps 1–8 are
 done: step 8 (PR #46) removed the v1 routes and SSE, the business events and
 journal, the browser's v1 store and compensation, and drove the backend smokes over
-v2. Step 9 is open.
+v2. Step 9 is in progress.
 
 | Step | Work | Acceptance |
 | --- | --- | --- |
@@ -331,6 +331,27 @@ v2. Step 9 is open.
 | 7 | Web UI on v2: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection. PR #34, built on the earlier draft, is not landed; `shared/replica.ts` and `shared/protocol-validate.ts` are carried over where they fit | 3, 4, 9, 15, 16 (client) |
 | 8 | Remove v1: routes, business events, browser compensating state; Markdown export and attachment links on v2 | — |
 | 9 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | — |
+
+Step 9 removes the session incarnation entirely, without a renamed successor
+(no session generation, owner token or tombstone). That covers:
+
+- its allocation and storage: `SessionRegistry::next_incarnation` and
+  `SessionState.incarnation`;
+- its use in resource addressing: `SessionResourceOwner`, the permission,
+  elicitation and URL routes, terminals, the history-sync owner, and the unused
+  v1 attachment reference;
+- its use in the ingress, the per-session FIFO (`SessionHandle` with its
+  registration allocation), the coordinator, RPC completion hand-off, and
+  load/replay continuations;
+- every `StaleIncarnation` check and error, and the tests that only simulate an
+  old incarnation number.
+
+What stays is ordinary ACP: JSON-RPC request/response correlation, the exact end
+of the current op, cancellation and shutdown draining, one load's candidate
+committed atomically or rolled back, and each resource's own ID and responder
+(permission and elicitation requests, URL registrations, terminals). The bridge
+generation (one Agent connection, its `epoch`) and an outstanding RPC's own
+allocation also stay. A session is identified by its ID, as in ACP.
 
 Dependencies: 1 → 2 → 3 → 4a → 4b → 5 → 6 → 7 → 8, and 9 after 8. #16 and #17 are fixed
 visibly in step 7.
