@@ -352,3 +352,151 @@ describe("the stream of a replica set (§5.1, §5.4; acceptance 4)", () => {
     expect(set.get("catalog")).toBeUndefined();
   });
 });
+
+describe("patch ops on the root and on arrays (§5.3)", () => {
+  it("set on the root replaces the whole value", () => {
+    expect(applyOps({ a: 1 }, [{ op: "set", path: "", value: { b: 2 } }])).toEqual({ b: 2 });
+  });
+
+  it("remove of an array index drops that item", () => {
+    expect(applyOps({ a: [1, 2, 3] }, [{ op: "remove", path: "/a/1" }])).toEqual({ a: [1, 3] });
+  });
+
+  it("refuses remove of an array index past the end", () => {
+    expect(() => applyOps({ a: [1] }, [{ op: "remove", path: "/a/1" }])).toThrow(PatchError);
+  });
+});
+
+describe("a confirmed replica subscribed again while the history is unknown (S1, S3)", () => {
+  const loading = live({ id: "load-2", kind: "load", status: "running", input: "/work" });
+
+  function confirmedThenReopened() {
+    const set = new ReplicaSet();
+    const first = set.open([{ scope: S, cwd: "/work" }]);
+    expect(set.receive(first.stream, {
+      scope: S, log: { from: 0, prev: H0, entries: [e1, e2] }, live: { replace: live() },
+    })).toBe("applied");
+    expect(set.get(S)?.confirmed).toBe(true);
+    const second = set.open([{ scope: S, cwd: "/work" }]);
+    expect(streamParams(second.url).getAll("have")).toEqual([`${S}:2:${e2.hash}`]);
+    expect(set.receive(second.stream, { scope: S, live: { replace: loading } })).toBe("applied");
+    return { set, stream: second.stream };
+  }
+
+  it("keeps its log but no longer counts it as confirmed", () => {
+    const { set } = confirmedThenReopened();
+    expect(set.get(S)).toMatchObject({ log: [e1, e2], confirmed: false, live: loading });
+  });
+
+  it("stays unconfirmed through live patches, the load's interactions included", () => {
+    const { set, stream } = confirmedThenReopened();
+    expect(set.receive(stream, {
+      scope: S,
+      live: { patch: [{ op: "set", path: "/op/interactions/p1", value: { kind: "permission", interactionId: "p1" } }] },
+    })).toBe("applied");
+    expect(set.receive(stream, {
+      scope: S, live: { patch: [{ op: "remove", path: "/op/interactions/p1" }] },
+    })).toBe("applied");
+    expect(set.get(S)).toMatchObject({ log: [e1, e2], confirmed: false });
+  });
+
+  it("clears its log only on an explicitly empty log, and confirms it then", () => {
+    const { set, stream } = confirmedThenReopened();
+    expect(set.receive(stream, {
+      scope: S,
+      log: { from: 0, prev: H0, entries: [] },
+      live: { patch: [{ op: "set", path: "/op/status", value: "completed" }] },
+    })).toBe("applied");
+    expect(set.get(S)).toMatchObject({ log: [], confirmed: true });
+  });
+
+  it("a live patch on a confirmed replica keeps it confirmed", () => {
+    const replica = applied(applyEvent(aligned([e1]), {
+      scope: S, live: { patch: [{ op: "set", path: "/cwd", value: "/other" }] },
+    }));
+    expect(replica.confirmed).toBe(true);
+  });
+});
+
+describe("an event that fails part-way takes no effect (§5.2)", () => {
+  const nested = () => live({
+    id: "op-2", kind: "prompt", status: "running",
+    process: [{ sessionUpdate: "plan", entries: [] }],
+    input: { prompt: [{ type: "text", text: "hi" }] },
+  });
+
+  function heldSet() {
+    const set = new ReplicaSet();
+    const { stream } = set.open([{ scope: S, cwd: "/work" }]);
+    expect(set.receive(stream, {
+      scope: S, log: { from: 0, prev: H0, entries: [e1] }, live: { replace: nested() },
+    })).toBe("applied");
+    return { set, stream };
+  }
+
+  it("leaves log and live unchanged when a later op fails after earlier ones applied", () => {
+    const { set, stream } = heldSet();
+    const before = set.get(S)!;
+    const snapshot = structuredClone({ log: before.log, live: before.live });
+    expect(set.receive(stream, {
+      scope: S,
+      log: { from: 1, prev: e1.hash, entries: [e2] },
+      live: { patch: [
+        { op: "set", path: "/op/input/prompt/0/text", value: "changed" },
+        { op: "append", path: "/op/process", values: [{ sessionUpdate: "plan", entries: [1] }] },
+        { op: "set", path: "/op/process/0/entries", value: [9] },
+        { op: "remove", path: "/op/interactions/missing" },
+      ] },
+    })).toBe("resubscribe");
+    expect({ log: before.log, live: before.live }).toEqual(snapshot);
+    const after = set.get(S)!;
+    expect({ log: after.log, live: after.live, confirmed: after.confirmed }).toEqual({ ...snapshot, confirmed: true });
+  });
+
+  it("leaves live unchanged when its log part has a bad prev and its patch is valid", () => {
+    const { set, stream } = heldSet();
+    const snapshot = structuredClone(set.get(S)!.live);
+    expect(set.receive(stream, {
+      scope: S,
+      log: { from: 1, prev: e1x(), entries: [e2] },
+      live: { patch: [{ op: "set", path: "/op/status", value: "completed" }] },
+    })).toBe("resubscribe");
+    expect(set.get(S)!.live).toEqual(snapshot);
+    expect(set.get(S)!.log).toEqual([e1]);
+  });
+
+  function e1x() {
+    return "h1-xxxxxxxxxxxxxxxxxxx";
+  }
+});
+
+describe("end acts on its own scope and stream only (§5.2 step 3)", () => {
+  const globalLive = () => ({ op: { id: "g-1", kind: "none", status: "completed", interactions: {} }, urlFlows: {}, sessions: {} });
+
+  it("keeps the other scopes following, and lets a new stream align the ended scope again", () => {
+    const set = new ReplicaSet();
+    const first = set.open([{ scope: "global" }, { scope: S, cwd: "/work" }]);
+    expect(set.receive(first.stream, { scope: "global", live: { replace: globalLive() } })).toBe("applied");
+    expect(set.receive(first.stream, {
+      scope: S, log: { from: 0, prev: H0, entries: [e1] }, live: { replace: live() },
+    })).toBe("applied");
+
+    expect(set.receive(first.stream, { scope: S, end: { reason: "deleted" } })).toBe("ended");
+    expect(set.get(S)).toBeUndefined();
+    expect(set.receive(first.stream, {
+      scope: "global", live: { patch: [{ op: "set", path: "/sessions/T", value: { sessionId: "T" } }] },
+    })).toBe("applied");
+    expect(set.get("global")?.live).toMatchObject({ sessions: { T: { sessionId: "T" } } });
+    expect(set.receive(first.stream, { scope: S, live: { replace: live() } })).toBe("ignored");
+
+    const second = set.open([{ scope: "global" }, { scope: S, cwd: "/work" }]);
+    expect(set.receive(second.stream, {
+      scope: S, log: { from: 0, prev: H0, entries: [e2x] }, live: { replace: live({ id: "op-9" }) },
+    })).toBe("applied");
+    expect(set.get(S)).toMatchObject({ log: [e2x], confirmed: true, live: live({ id: "op-9" }) });
+
+    // A late end of the replaced stream changes nothing.
+    expect(set.receive(first.stream, { scope: S, end: { reason: "deleted" } })).toBe("ignored");
+    expect(set.get(S)?.log).toEqual([e2x]);
+  });
+});
