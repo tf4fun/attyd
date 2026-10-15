@@ -121,7 +121,7 @@ function shown() {
   };
 }
 
-const prompt = (text: string): OpArgs => ({ kind: "prompt", args: { prompt: [{ type: "text", text }] } });
+const prompt = (text: string): Extract<OpArgs, { kind: "prompt" }> => ({ kind: "prompt", args: { prompt: [{ type: "text", text }] } });
 
 afterEach(() => {
   vi.useRealTimers();

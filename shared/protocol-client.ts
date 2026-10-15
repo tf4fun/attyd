@@ -5,16 +5,9 @@
 // automatically (C3); queued input that was never sent, or was refused with
 // a definite answer, is submitted once the replica shows the operation
 // ended (C2).
-//
-// Test phase: the shapes below are the client's interface; the behavior is
-// not implemented yet.
 
-import type { Answer, OpArgs, OpOutcome, ProtocolError } from "./protocol";
-import type { Follow, Replica } from "./replica";
-
-function notImplemented(): never {
-  throw new Error("protocol client: not implemented");
-}
+import type { Answer, ErrorCode, Event, OpArgs, OpOutcome, Operation, ProtocolError } from "./protocol";
+import { ReplicaSet, type Follow, type Received, type Replica } from "./replica";
 
 // ---------------------------------------------------------------------------
 // Transport
@@ -47,23 +40,92 @@ export type Schedule = (reconnect: () => void) => void;
  * nothing over HTTP.
  */
 export class ReplicaClient {
-  constructor(_openStream: OpenStream, _schedule?: Schedule) {}
+  readonly #set = new ReplicaSet();
+  readonly #listeners = new Set<(scope: string) => void>();
+  readonly #openStream: OpenStream;
+  readonly #schedule: Schedule;
+  #follow: readonly Follow[] = [];
+  #source: StreamSource | undefined;
+  /** Counts connections; a callback or reconnect of an earlier one changes nothing. */
+  #generation = 0;
+  #closed = false;
 
-  follow(_follow: readonly Follow[]): void {
-    notImplemented();
+  constructor(openStream: OpenStream, schedule: Schedule = (reconnect) => void setTimeout(reconnect, 1000)) {
+    this.#openStream = openStream;
+    this.#schedule = schedule;
   }
 
-  get(_scope: string): Replica | undefined {
-    return notImplemented();
+  follow(follow: readonly Follow[]): void {
+    if (this.#closed) return;
+    this.#follow = follow;
+    this.#connect();
+  }
+
+  get(scope: string): Replica | undefined {
+    return this.#set.get(scope);
   }
 
   /** Calls `listener` with a scope each time its replica changes or ends. */
-  subscribe(_listener: (scope: string) => void): () => void {
-    return notImplemented();
+  subscribe(listener: (scope: string) => void): () => void {
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
   }
 
   close(): void {
-    notImplemented();
+    this.#closed = true;
+    this.#disconnect();
+  }
+
+  #connect(): void {
+    this.#disconnect();
+    const generation = this.#generation;
+    const { stream, url } = this.#set.open(this.#follow);
+    const source = this.#openStream(url);
+    this.#source = source;
+    source.onmessage = ({ data }) => {
+      if (generation === this.#generation) this.#receive(stream, data);
+    };
+    source.onerror = () => {
+      if (generation === this.#generation) this.#broken();
+    };
+  }
+
+  /** Closes the current stream, if any, and lets nothing of it through. */
+  #disconnect(): void {
+    this.#generation += 1;
+    const source = this.#source;
+    this.#source = undefined;
+    if (source === undefined) return;
+    source.onmessage = null;
+    source.onerror = null;
+    source.close();
+  }
+
+  #receive(stream: number, data: string): void {
+    let scope: string;
+    let received: Received;
+    try {
+      const event = JSON.parse(data) as Event;
+      scope = event.scope;
+      received = this.#set.receive(stream, event);
+    } catch {
+      // Not an event of the protocol: the stream cannot be trusted further.
+      this.#broken();
+      return;
+    }
+    if (received === "resubscribe") this.#broken();
+    else if (received !== "ignored") this.#listeners.forEach((listener) => listener(scope));
+  }
+
+  /** The stream failed: close it, and subscribe again later with the heads held then (§5.4). */
+  #broken(): void {
+    this.#disconnect();
+    const generation = this.#generation;
+    this.#schedule(() => {
+      if (!this.#closed && generation === this.#generation) this.#connect();
+    });
   }
 }
 
@@ -92,11 +154,19 @@ export interface ReplicaSource {
  * the HTTP answer only, with no short timeout, and never for the stream.
  */
 export class OpsClient {
-  constructor(_fetch: HttpFetch, _replicas: ReplicaSource) {}
+  readonly #fetch: HttpFetch;
+  readonly #replicas: ReplicaSource;
+
+  constructor(fetch: HttpFetch, replicas: ReplicaSource) {
+    this.#fetch = fetch;
+    this.#replicas = replicas;
+  }
 
   /** Sends `write` with `expect` set to the replica's `op.id`. */
-  write(_scope: string, _write: OpArgs): Promise<WriteOutcome> {
-    return notImplemented();
+  write(scope: string, write: OpArgs): Promise<WriteOutcome> {
+    const op = shownOp(this.#replicas, scope);
+    if (op === undefined) return Promise.resolve(blocked(`no aligned replica of ${scope}`));
+    return this.#send(scope, op.id, write);
   }
 
   /**
@@ -104,9 +174,73 @@ export class OpsClient {
    * once; it is blocked, unsent, unless `answers` covers exactly those the
    * replica shows.
    */
-  answer(_scope: string, _answers: Readonly<Record<string, Answer>>): Promise<WriteOutcome> {
-    return notImplemented();
+  answer(scope: string, answers: Readonly<Record<string, Answer>>): Promise<WriteOutcome> {
+    const op = shownOp(this.#replicas, scope);
+    if (op === undefined) return Promise.resolve(blocked(`no aligned replica of ${scope}`));
+    if (op.status !== "running") return Promise.resolve(blocked(`${op.id} is not running`));
+    const pending = Object.keys(op.interactions ?? {});
+    const given = Object.keys(answers);
+    if (given.length !== pending.length || !pending.every((id) => Object.hasOwn(answers, id))) {
+      return Promise.resolve(blocked("the answers do not cover exactly the pending interactions"));
+    }
+    return this.#send(scope, op.id, { kind: "answer", args: { answers: { ...answers } } });
   }
+
+  async #send(scope: string, expect: string, write: OpArgs): Promise<WriteOutcome> {
+    let response: Awaited<ReturnType<HttpFetch>>;
+    try {
+      response = await this.#fetch(`/api/v2/scopes/${encodeURIComponent(scope)}/ops`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expect, kind: write.kind, args: write.args }),
+      });
+    } catch {
+      return { kind: "uncertain" };
+    }
+    const body = await response.json().catch(() => undefined);
+    if (response.status === 202) {
+      return isRecord(body) && typeof body.op === "string" ? { kind: "accepted", op: body.op } : { kind: "uncertain" };
+    }
+    if (response.status === 200) {
+      if (!isRecord(body) || typeof body.op !== "string") return { kind: "uncertain" };
+      if ("result" in body) return { kind: "ended", op: body.op, outcome: { result: body.result } };
+      if (isProtocolError(body.error)) return { kind: "ended", op: body.op, outcome: { error: body.error } };
+      return { kind: "uncertain" };
+    }
+    return refusal(response.status, body);
+  }
+}
+
+/** The `op` of the aligned replica of `scope`. */
+function shownOp(replicas: ReplicaSource, scope: string): Operation | undefined {
+  const live = replicas.get(scope)?.live;
+  if (!isRecord(live) || !isRecord(live.op) || typeof live.op.id !== "string") return undefined;
+  return live.op as unknown as Operation;
+}
+
+function blocked(reason: string): WriteOutcome {
+  return { kind: "blocked", reason };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([
+  "invalid_request", "not_found", "stale", "not_allowed", "catalog_changed", "unsupported", "unavailable", "agent_error",
+]);
+
+function isProtocolError(value: unknown): value is ProtocolError {
+  return isRecord(value) && typeof value.code === "string" && ERROR_CODES.has(value.code) && typeof value.message === "string";
+}
+
+/**
+ * A non-success answer: refused when its body is the protocol's error (§9),
+ * otherwise, as from a proxy, without a definite answer.
+ */
+function refusal(status: number, body: unknown): { kind: "refused"; error: ProtocolError } | { kind: "uncertain" } {
+  if (status >= 200 && status < 300) return { kind: "uncertain" };
+  return isRecord(body) && isProtocolError(body.error) ? { kind: "refused", error: body.error } : { kind: "uncertain" };
 }
 
 // ---------------------------------------------------------------------------
@@ -135,30 +269,107 @@ export interface QueuedWrite {
  * resubmits it.
  */
 export class WriteQueue {
-  constructor(_ops: OpsClient, _replicas: ReplicaSource) {}
+  readonly #ops: OpsClient;
+  readonly #replicas: ReplicaSource;
+  readonly #scopes = new Map<string, ScopeQueue>();
+  #next = 0;
 
-  enqueue(_scope: string, _write: StartingWrite): number {
-    return notImplemented();
+  constructor(ops: OpsClient, replicas: ReplicaSource) {
+    this.#ops = ops;
+    this.#replicas = replicas;
   }
 
-  items(_scope: string): readonly QueuedWrite[] {
-    return notImplemented();
+  enqueue(scope: string, write: StartingWrite): number {
+    this.#next += 1;
+    this.#queue(scope).items.push({ id: this.#next, write, state: "queued" });
+    this.update(scope);
+    return this.#next;
+  }
+
+  items(scope: string): readonly QueuedWrite[] {
+    return this.#scopes.get(scope)?.items ?? [];
   }
 
   /** Called when the replica of `scope` changes; sends the next write if it may. */
-  update(_scope: string): void {
-    notImplemented();
+  update(scope: string): void {
+    const queue = this.#scopes.get(scope);
+    if (queue === undefined || queue.sending !== undefined) return;
+    const op = shownOp(this.#replicas, scope);
+    // One write per ended `op`: until the replica shows another, a second
+    // one against it could only be refused as stale.
+    if (op === undefined || op.status === "running" || op.id === queue.expect) return;
+    const index = queue.items.findIndex(({ state }) => state === "queued" || state === "refused");
+    if (index < 0) return;
+    const item: QueuedWrite = { id: queue.items[index].id, write: queue.items[index].write, state: "sending" };
+    queue.items = replaced(queue.items, index, item);
+    queue.sending = item.id;
+    queue.expect = op.id;
+    void this.#ops.write(scope, item.write).then((outcome) => this.#answered(scope, item.id, outcome));
   }
 
   /** The user sends `id` again, as new input. */
-  resubmit(_scope: string, _id: number): void {
-    notImplemented();
+  resubmit(scope: string, id: number): void {
+    const queue = this.#scopes.get(scope);
+    const item = queue?.items.find((candidate) => candidate.id === id);
+    if (queue === undefined || item === undefined || item.state === "queued" || item.state === "sending") return;
+    queue.items = [...queue.items.filter((candidate) => candidate.id !== id), { id, write: item.write, state: "queued" }];
+    // New input is sent against the `op` the replica shows, whichever it is.
+    queue.expect = undefined;
+    this.update(scope);
   }
 
   /** The user takes `id` back. */
-  remove(_scope: string, _id: number): void {
-    notImplemented();
+  remove(scope: string, id: number): void {
+    const queue = this.#scopes.get(scope);
+    if (queue === undefined || queue.sending === id) return;
+    queue.items = queue.items.filter((item) => item.id !== id);
   }
+
+  #queue(scope: string): ScopeQueue {
+    let queue = this.#scopes.get(scope);
+    if (queue === undefined) {
+      queue = { items: [] };
+      this.#scopes.set(scope, queue);
+    }
+    return queue;
+  }
+
+  #answered(scope: string, id: number, outcome: WriteOutcome): void {
+    const queue = this.#queue(scope);
+    queue.sending = undefined;
+    const index = queue.items.findIndex((item) => item.id === id);
+    const { write } = queue.items[index];
+    switch (outcome.kind) {
+      case "accepted":
+      case "ended":
+        queue.items = queue.items.filter((item) => item.id !== id);
+        break;
+      case "refused":
+        queue.items = replaced(queue.items, index, { id, write, state: "refused", error: outcome.error });
+        break;
+      case "uncertain":
+        queue.items = replaced(queue.items, index, { id, write, state: "uncertain" });
+        break;
+      case "blocked":
+        queue.items = replaced(queue.items, index, { id, write, state: "queued" });
+        queue.expect = undefined;
+        break;
+    }
+    // The stream may already show a later `op` ended.
+    this.update(scope);
+  }
+}
+
+interface ScopeQueue {
+  items: readonly QueuedWrite[];
+  /** The write waiting for its HTTP answer. */
+  sending?: number;
+  /** The `op.id` the last write was sent against. */
+  expect?: string;
+}
+
+function replaced<T>(items: readonly T[], index: number, item: T): readonly T[] {
+  return items.map((candidate, i) => (i === index ? item : candidate));
 }
 
 // ---------------------------------------------------------------------------
@@ -175,17 +386,45 @@ export type ActionOutcome =
  * resent (§7, C3).
  */
 export class ResourceClient {
-  constructor(_fetch: HttpFetch) {}
+  readonly #fetch: HttpFetch;
+  /** The last input sent to each terminal; the next waits for its answer. */
+  readonly #inputs = new Map<string, Promise<ActionOutcome>>();
 
-  input(_scope: string, _terminalId: string, _data: string): Promise<ActionOutcome> {
-    return notImplemented();
+  constructor(fetch: HttpFetch) {
+    this.#fetch = fetch;
   }
 
-  resize(_scope: string, _terminalId: string, _cols: number, _rows: number): Promise<ActionOutcome> {
-    return notImplemented();
+  input(scope: string, terminalId: string, data: string): Promise<ActionOutcome> {
+    const key = JSON.stringify([scope, terminalId]);
+    const previous = this.#inputs.get(key);
+    const send = () => this.#send(scope, terminalId, "input", { data });
+    const sent = previous === undefined ? send() : previous.then(send);
+    this.#inputs.set(key, sent);
+    void sent.then(() => {
+      if (this.#inputs.get(key) === sent) this.#inputs.delete(key);
+    });
+    return sent;
   }
 
-  dismiss(_scope: string, _resourceId: string): Promise<ActionOutcome> {
-    return notImplemented();
+  resize(scope: string, terminalId: string, cols: number, rows: number): Promise<ActionOutcome> {
+    return this.#send(scope, terminalId, "resize", { cols, rows });
+  }
+
+  dismiss(scope: string, resourceId: string): Promise<ActionOutcome> {
+    return this.#send(scope, resourceId, "dismiss", {});
+  }
+
+  async #send(scope: string, resourceId: string, action: string, body: unknown): Promise<ActionOutcome> {
+    let response: Awaited<ReturnType<HttpFetch>>;
+    try {
+      response = await this.#fetch(
+        `/api/v2/scopes/${encodeURIComponent(scope)}/resources/${encodeURIComponent(resourceId)}/${action}`,
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+      );
+    } catch {
+      return { kind: "uncertain" };
+    }
+    if (response.status >= 200 && response.status < 300) return { kind: "done" };
+    return refusal(response.status, await response.json().catch(() => undefined));
   }
 }
