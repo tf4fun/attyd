@@ -574,9 +574,12 @@ export default function App() {
       cwd: state.cwd,
       terminalSnapshots: state.terminalSnapshots,
     };
-    // The local reads finish well within the click's transient activation.
+    // The click opens the tab; the reads may outlast its transient activation.
+    const tab = window.open("", "_blank");
+    if (tab == null) return;
+    tab.opener = null;
     void withAttachedBlocks(state.attachments, state.timeline).then((timeline) =>
-      openThreadMarkdown(timelineToMarkdown(timeline, options)));
+      showThreadMarkdown(tab, timelineToMarkdown(timeline, options)));
   }, [
     agent?.name,
     agent?.title,
@@ -1089,17 +1092,10 @@ export default function App() {
   );
 }
 
-function openThreadMarkdown(markdown: string): void {
+function showThreadMarkdown(tab: Window, markdown: string): void {
   const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  link.style.display = "none";
-  document.body.append(link);
-  link.click();
-  link.remove();
+  tab.location.href = url;
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 

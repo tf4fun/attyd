@@ -850,7 +850,8 @@ export class Workspace {
       const scope = this.#opScope(opId);
       const op = scope == null ? undefined : this.#scopeOp(scope);
       if (op == null) {
-        this.#answers.delete(opId);
+        // Until the routed session aligns, its operation is unknown, not ended.
+        if (this.#sessionScope() == null || this.#shown() != null) this.#answers.delete(opId);
         continue;
       }
       const pending = new Set(Object.keys(op.interactions ?? {}));
