@@ -7,7 +7,6 @@ import { SessionActionDialog } from "../web/src/components/acp/session-action-di
 import { ContentBlockView } from "../web/src/components/acp/content-block";
 import { Conversation } from "../web/src/components/acp/conversation";
 import { SessionControls } from "../web/src/components/acp/session-controls";
-import { attachmentHref } from "../web/src/lib/hosted-attachment";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -78,9 +77,9 @@ describe("ACP presentation boundaries", () => {
 
   it.each(["user", "protocol-user"] as const)("opens %s attachment references as compact native links", async (role) => {
     const attachments = [
-      hosted("notes 中文.md", "text/markdown", 300), hosted("note.txt", "text/plain", 6),
-      hosted("image.png", "image/png", 100), hosted("voice.wav", "audio/wav", 200),
-      hosted("report.pdf", "application/pdf", 400), hosted("empty.txt", "text/plain", 0),
+      linked("notes 中文.md", "text/markdown", 300), linked("note.txt", "text/plain", 6),
+      linked("image.png", "image/png", 100), linked("voice.wav", "audio/wav", 200),
+      linked("report.pdf", "application/pdf", 400), linked("empty.txt", "text/plain", 0),
     ];
     await act(async () => root.render(<Conversation timeline={[{
       id: "prompt", type: "message", role, raw: [],
@@ -97,7 +96,7 @@ describe("ACP presentation boundaries", () => {
     expect(links[5].textContent).toContain("0 B");
     for (const [index, link] of links.entries()) {
       expect(link.tagName).toBe("A");
-      expect(link.getAttribute("href")).toBe(attachmentHref(attachments[index]));
+      expect(link.getAttribute("href")).toBe((attachments[index] as { uri: string }).uri);
       expect(link.target).toBe("_blank");
       expect(link.rel).toContain("noopener");
       expect(link.hasAttribute("download")).toBe(false);
@@ -137,7 +136,7 @@ describe("ACP presentation boundaries", () => {
   });
 
   it.each(["message", "tool"] as const)("uses the same attachment link for %s output", async (presentation) => {
-    await act(async () => root.render(<ContentBlockView presentation={presentation} block={hosted("result.md", "text/markdown", 20)} />));
+    await act(async () => root.render(<ContentBlockView presentation={presentation} block={linked("result.md", "text/markdown", 20)} />));
     expect(container.querySelector("a.attachment-chip")?.textContent).toContain("result.md");
     expect(container.querySelector("pre, details")).toBeNull();
   });
@@ -252,9 +251,8 @@ describe("ACP presentation boundaries", () => {
   });
 });
 
-function hosted(name: string, mimeType: string, size: number): ContentBlock {
+function linked(name: string, mimeType: string, size: number): ContentBlock {
   return {
-    type: "resource_link", name, mimeType, size, uri: `attyd://attachment/${encodeURIComponent(name)}`,
-    _meta: { "attyd/attachment": { id: "a".repeat(64), sessionId: "session/中文", bridgeEpoch: "epoch", sessionIncarnation: 1 } },
+    type: "resource_link", name, mimeType, size, uri: `https://files.example/${encodeURIComponent(name)}`,
   };
 }

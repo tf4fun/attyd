@@ -33,8 +33,6 @@
   "signOutConfirm": "Sign out of this ACP Agent? Active sessions may behave differently afterward.",
   "capabilities": "Capabilities",
   "initializeResponse": "initialize response",
-  "backgroundEvents": "Background events ({{count}})",
-  "otherSessionEvents": "non-current session events",
   "newSession": "New agent session",
   "switchSession": "Switch project session",
   "newThread": "New thread",
@@ -81,13 +79,6 @@
     "promptNotReady": "The ACP session is not ready to accept this prompt",
     "uncertainWrite": "The {{operation}} request may have taken effect; its response was lost and it is not sent again.",
     "refused": "The {{operation}} request was refused: {{message}}"
-  },
-  "historyNotices": {
-    "resumePartial": "Only context received while resuming is available; earlier history may be missing.",
-    "forkSnapshot": "Showing a snapshot of the source session from memory; branch history may differ.",
-    "forkPartial": "Only context received while forking is available; earlier branch history may be missing.",
-    "unavailable": "Earlier messages are unavailable from the Agent and memory cache. You can continue this session.",
-    "loadUnsupported": "History unavailable: this Agent does not support loading saved session history."
   },
   "interfaceSettings": {
     "title": "Interface settings",

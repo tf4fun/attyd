@@ -1242,9 +1242,7 @@ describe("ACP interactive UI contract", () => {
       { type: "text", text: "Description A:", annotations: { audience: ["user"] }, _meta: { source: "A" } },
       { type: "image", uri: "file:///A.png", mimeType: "image/png", data: "AQID" },
       { type: "text", text: "Description B:", _meta: { source: "B" } },
-      { type: "resource_link", uri: "attyd://attachment/B.png", name: "B.png", _meta: {
-        "attyd/attachment": { id: "a".repeat(64), sessionId: "session", bridgeEpoch: "epoch", sessionIncarnation: 1 },
-      } },
+      { type: "resource_link", uri: "urn:fixture:B.png", name: "B.png", _meta: { source: "B-link" } },
     ];
     await render(root, <PromptComposer disabled={false} running={false} commands={[]}
       draft={{ id: "interleaved", blocks }} onSubmit={onSubmit} onCancel={vi.fn()} />);

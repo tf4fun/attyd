@@ -1,6 +1,5 @@
 import type { TFunction } from "i18next";
 import { useTranslation } from "./i18n";
-import { translateHistoryNotice } from "./i18n/history-notice";
 import { InterfaceSettings } from "./components/interface-settings";
 import type { SessionInfo } from "@agentclientprotocol/sdk";
 import type { PromptBlock } from "../../shared/protocol";
@@ -19,7 +18,6 @@ import {
   LogOut,
   Plus,
   Search as SearchIcon,
-  ScrollText,
   Settings2,
   ShieldCheck,
   Trash2,
@@ -99,7 +97,7 @@ export default function App() {
   // without them (as a test double provides) shows none.
   const queuedPrompts = state.queue ?? [];
   const queuePaused = state.queuePaused ?? false;
-  const authTerminals: AuthTerminalState[] = state.authTerminals ?? (state.authTerminal ? [state.authTerminal] : []);
+  const authTerminals: AuthTerminalState[] = state.authTerminals ?? [];
   const [newThreadOpen, setNewThreadOpen] = useState(false);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>();
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
@@ -465,17 +463,12 @@ export default function App() {
   const selectedProjectCwd = state.session ? state.cwd : projectCwd;
   const knownSessions = useMemo(() => {
     const sessions = new Map(state.sessions.map((session) => [session.sessionId, session]));
-    for (const [sessionId, cached] of state.cachedSessions) {
-      if (!sessions.has(sessionId)) sessions.set(sessionId, {
-        sessionId, cwd: cached.cwd, title: cached.title,
-      });
-    }
     if (state.session) sessions.set(state.session.sessionId, {
       ...sessions.get(state.session.sessionId),
       sessionId: state.session.sessionId, cwd: state.cwd, title: state.title,
     });
     return [...sessions.values()];
-  }, [state.sessions, state.cachedSessions, state.session, state.cwd, state.title]);
+  }, [state.sessions, state.session, state.cwd, state.title]);
   const projectSessions = useMemo(() => knownSessions.filter(
     (session) => session.cwd === selectedProjectCwd,
   ), [knownSessions, selectedProjectCwd]);
@@ -483,15 +476,13 @@ export default function App() {
     ...((state.running || state.runtimeOperation != null) && state.session ? [state.session.sessionId] : []),
     // Sessions occupied by a running operation, from `global.sessions` (§4.3).
     ...(state.busySessionIds ?? []),
-    ...[...state.cachedSessions].filter(([, session]) => session.running || session.runtimeOperation != null)
-      .map(([sessionId]) => sessionId),
   ];
   // A create or fork waiting for its HTTP result does not hold the user: a
   // late result never moves a page the user moved since (§6.3).
   const navigationDisabled = sessionOpening != null || changingControl || authBlocksCurrent ||
     queuedPrompts.some(({ state: queued }) => queued !== "uncertain");
   // Held sessions can be opened again even when the Agent cannot load them.
-  const openSessionIds = state.openSessionIds ?? [...state.cachedSessions.keys()];
+  const openSessionIds = state.openSessionIds ?? [];
   const browseProject = (cwd: string) => {
     if (sessionSwitcher.current) sessionSwitcher.current.open = false;
     openProject(cwd);
@@ -693,12 +684,6 @@ export default function App() {
           <details className="sidebar-details">
             <summary><Settings2 size={13} /> {t("capabilities")} <ChevronDown size={12} /></summary>
             <RawJson label={t("initializeResponse")} value={state.initialized} />
-          </details>
-        ) : null}
-        {state.backgroundEvents.length > 0 ? (
-          <details className="sidebar-details">
-            <summary><ScrollText size={13} /> {t("backgroundEvents", { count: state.backgroundEvents.length })} <ChevronDown size={12} /></summary>
-            <RawJson label={t("otherSessionEvents")} value={state.backgroundEvents} />
           </details>
         ) : null}
       </div>
@@ -907,7 +892,6 @@ export default function App() {
           >
             <div className="conversation-wrap">
               {authContent}
-              {state.historyNotice ? <p className="history-notice" role="status">{translateHistoryNotice(state.historyNotice, t)}</p> : null}
               {(!showAuthCard && !terminalAuthOwnsInteraction) || state.timeline.length > 0 ? <Conversation
                 key={state.session?.sessionId}
                 timeline={state.timeline}
