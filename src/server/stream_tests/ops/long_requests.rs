@@ -150,5 +150,14 @@ async fn create_fork_and_list_responses_outlive_the_json_deadline() {
     assert_eq!(forked, json!({"sessionId": "forked"}));
     watch.until_op("global", &create, "completed").await;
     watch.until_op("session/s", &fork, "completed").await;
+    // The create/fork also change catalog. Its event may follow those
+    // scopes' completion events; GET is only a target, never a repair of
+    // the stream replica, and each consumed event still passes the gate.
+    let revision = bench.document("catalog").await["live"]["revision"].clone();
+    watch
+        .until_live("catalog", "the final catalog revision", |live| {
+            live["revision"] == revision
+        })
+        .await;
     watch.converged(&bench).await;
 }
