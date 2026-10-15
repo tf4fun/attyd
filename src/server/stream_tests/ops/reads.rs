@@ -236,6 +236,71 @@ async fn attachments_are_served_while_their_own_session_references_them() {
     watch.converged(&bench).await;
 }
 
+/// A compaction summary's block is a process block: served while the running
+/// prompt's process references it, not found once the commit removes the
+/// process, and never in the log.
+#[tokio::test]
+async fn a_compaction_summary_block_is_served_until_its_turn_commits() {
+    let (bench, mut link) = Bench::ws(json!({"promptCapabilities": {"image": true}})).await;
+    bench.create(&mut link, "s", json!({})).await;
+    let mut watch = bench.watch(&scopes(&["session/s"])).await;
+    watch
+        .until("the alignment", |watch| watch.has("session/s"))
+        .await;
+    let summary = image("c3VtbWFyeQ==");
+
+    let open = bench.expect_of("session/s").await;
+    let (status, body) = bench
+        .op(
+            "session/s",
+            &open,
+            "prompt",
+            json!({"prompt": [text("go")]}),
+        )
+        .await;
+    let prompt = assert_accepted(status, &body, "the prompt");
+    let request = link.request("session/prompt").await;
+    link.update(
+        "s",
+        json!({"sessionUpdate": "compaction_update", "compactionId": "c", "status": "in_progress"}),
+    )
+    .await;
+    link.update(
+        "s",
+        json!({
+            "sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed",
+            "summary": [summary.clone()],
+        }),
+    )
+    .await;
+    watch
+        .until_live("session/s", "the process references the summary", |live| {
+            live["op"]["id"] == prompt && !references(&live["op"]["process"]).is_empty()
+        })
+        .await;
+    let in_process = references(&watch.live("session/s")["op"]["process"]);
+    assert_eq!(in_process.len(), 1, "{in_process:?}");
+    assert_served(&bench, "s", &in_process[0], &summary).await;
+
+    link.reply(&request, json!({"stopReason": "end_turn"}))
+        .await;
+    watch.until_op("session/s", &prompt, "completed").await;
+    assert!(
+        references(&json!(watch.log("session/s"))).is_empty(),
+        "the summary block never enters the log"
+    );
+    assert_unserved(
+        &bench,
+        "s",
+        &in_process[0],
+        "a summary block after the commit",
+    )
+    .await;
+    link.quiet(QUIET).await;
+    watch.quiet(QUIET).await;
+    watch.converged(&bench).await;
+}
+
 /// A read holds nothing: an unheld session's attachment is not found and
 /// loads nothing, and once a loaded session is actually released, its
 /// logged attachment is not found either and it is not held again.
