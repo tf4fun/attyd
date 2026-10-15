@@ -20,6 +20,7 @@ mod login_terminals;
 mod long_requests;
 mod occupation;
 mod reads;
+mod retired_v1;
 #[cfg(unix)]
 mod review_terminal_io;
 mod url_flows;
