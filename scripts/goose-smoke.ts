@@ -6,36 +6,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import type { Answer, CatalogPage, GlobalLive, Operation } from "../shared/protocol.js";
+import { globalLive, replyText, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
 const LOCAL_PROVIDER_KEY = "attyd-local-provider-fixture";
 const LOCAL_TOOL_OUTPUT = "ATTYD_GOOSE_TOOL_OK";
 const LOCAL_AGENT_OUTPUT = "LOCAL_GOOSE_ACP_OK";
-
-interface RuntimeView {
-  connected: boolean;
-  initialized?: { response?: { agentInfo?: { name?: string; version?: string } } } | null;
-  phase?: { phase?: string } | null;
-}
-
-interface SessionView {
-  historyRevision: string | null;
-  phase: string;
-  syncError: string | null;
-  timeline: unknown[];
-  activeTurn: unknown | null;
-  interactions: {
-    permissions: Record<string, {
-      interactionId: string;
-      request: { options?: Array<{ optionId: string; kind: string }> };
-    }>;
-  };
-}
-
-interface CreatedSession {
-  sessionId: string;
-  view: SessionView;
-}
 
 const stateRoot = await mkdtemp(join(tmpdir(), "attyd-goose-smoke-"));
 await Promise.all([
@@ -157,7 +134,7 @@ try {
     await provider.close();
   }
   console.log(
-    `goose ${response.agentInfo.version}: ACP v${response.protocolVersion} recovery plus local prompt/tool raw and bridge REST/SSE lifecycles passed`,
+    `goose ${response.agentInfo.version}: ACP v${response.protocolVersion} recovery plus local prompt/tool raw and bridge protocol v2 lifecycles passed`,
   );
 } catch (error) {
   if (stderr) console.error(stderr);
@@ -454,96 +431,61 @@ async function exerciseConfiguredBridge(
     cwd: process.cwd(),
     env,
   });
-  const origin = `http://127.0.0.1:${server.port}`;
-  let observer: AbortController | undefined;
-  let observerReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  const client = new SmokeClient(`http://127.0.0.1:${server.port}`);
   try {
-    const runtime = await waitForValue(
-      () => getJson<RuntimeView>(`${origin}/api/v1/runtime`),
-      (value) => value.connected && value.phase?.phase === "ready",
-      "configured Goose bridge initialization",
-    );
-    if (
-      runtime.initialized?.response?.agentInfo?.name !== "goose" ||
-      runtime.initialized.response.agentInfo.version !== expectedVersion
-    ) {
-      throw new Error(`Configured Goose bridge identity mismatch: ${JSON.stringify(runtime.initialized)}`);
+    const agent = await readyAgent(client, "configured Goose bridge initialization");
+    if (agent.initialize?.agentInfo?.name !== "goose" || agent.initialize.agentInfo.version !== expectedVersion) {
+      throw new Error(`Configured Goose bridge identity mismatch: ${JSON.stringify(agent.initialize)}`);
     }
 
-    const created = await postJson<CreatedSession>(
-      `${origin}/api/v1/sessions`,
-      { cwd: process.cwd() },
-      201,
-    );
-    const sessionId = created.sessionId;
-    if (!created.view.historyRevision) throw new Error("Configured Goose session has no revision");
-
-    observer = new AbortController();
-    const observed = await fetch(
-      `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}/events`,
-      { signal: observer.signal },
-    );
-    if (observed.status !== 200) {
-      throw new Error(`Configured Goose session observer returned ${observed.status}`);
+    const created = await client.ops.write("global", { kind: "create", args: { cwd: process.cwd() } });
+    if (created.kind !== "ended" || !("result" in created.outcome)) {
+      throw new Error(`Configured Goose session was not created: ${JSON.stringify(created)}`);
     }
-    observerReader = observed.body?.getReader();
-    await observerReader?.read();
-
-    await postTurn(
-      origin,
-      sessionId,
-      created.view.historyRevision,
-      "goose-configured-prompt",
-      `Use the shell tool to print ${LOCAL_TOOL_OUTPUT}, then report completion.`,
-    );
-    const completed = await waitForConfiguredBridgeTurn(origin, sessionId);
-    const timeline = JSON.stringify(completed.timeline);
-    if (
-      completed.syncError != null ||
-      !timeline.includes('"sessionUpdate":"tool_call"') ||
-      !timeline.includes('"rawOutput"') ||
-      !timeline.includes(LOCAL_TOOL_OUTPUT) ||
-      !timeline.includes(LOCAL_AGENT_OUTPUT)
-    ) {
-      throw new Error(`Configured Goose bridge lost its tool turn: ${JSON.stringify(completed)}`);
+    const scope = sessionScope((created.outcome.result as { sessionId: string }).sessionId);
+    client.follow([{ scope: "global" }, { scope }]);
+    await client.ended(scope);
+    const started = await client.ops.write(scope, {
+      kind: "prompt",
+      args: { prompt: [{ type: "text", text: `Use the shell tool to print ${LOCAL_TOOL_OUTPUT}, then report completion.` }] },
+    });
+    if (started.kind !== "accepted") throw new Error(`Configured Goose prompt was refused: ${JSON.stringify(started)}`);
+    // The tool call lives in the running prompt's process, which its commit removes.
+    let toolProcess = false;
+    const answered = new Set<string>();
+    const completed = await client.until(scope, (replica) => {
+      const op = sessionLive(replica)?.op;
+      if (op?.id !== started.op) return undefined;
+      if (op.status !== "running") return op;
+      const updates = JSON.stringify(op.process ?? []);
+      toolProcess ||= updates.includes('"sessionUpdate":"tool_call"') && updates.includes('"rawOutput"') &&
+        updates.includes(LOCAL_TOOL_OUTPUT);
+      const pending = Object.keys(op.interactions).sort().join(" ");
+      if (pending !== "" && !answered.has(pending)) {
+        answered.add(pending);
+        void client.ops.answer(scope, permissionAnswers(op));
+      }
+      return undefined;
+    }, "configured Goose bridge turn", 15_000);
+    const log = client.replicas.get(scope)!.log;
+    if (completed.status !== "completed" || !toolProcess || log.length !== 1 || !replyText(log[0]).includes(LOCAL_AGENT_OUTPUT)) {
+      throw new Error(`Configured Goose bridge lost its tool turn: ${JSON.stringify({ completed, toolProcess, log })}`);
     }
   } finally {
-    observer?.abort();
-    await observerReader?.cancel().catch(() => undefined);
+    client.close();
     await server.close();
   }
 }
 
-async function waitForConfiguredBridgeTurn(
-  origin: string,
-  sessionId: string,
-): Promise<SessionView> {
-  const responded = new Set<string>();
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    const view = await getSession(origin, sessionId);
-    for (const permission of Object.values(view.interactions.permissions)) {
-      if (responded.has(permission.interactionId)) continue;
-      responded.add(permission.interactionId);
-      const option = permission.request.options?.find(({ kind }) => kind.startsWith("allow"));
-      await postJson(
-        `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}` +
-          `/interactions/${encodeURIComponent(permission.interactionId)}/response`,
-        {
-          kind: "permission",
-          outcome: option
-            ? { outcome: "selected", optionId: option.optionId }
-            : { outcome: "cancelled" },
-        },
-      );
-    }
-    if (view.phase === "blocked") {
-      throw new Error(`Configured Goose bridge turn blocked: ${JSON.stringify(view)}`);
-    }
-    if (view.phase === "ready" && view.activeTurn == null && view.timeline.length > 0) return view;
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+/** Allows every pending permission once, or cancels it when it offers no allow. */
+function permissionAnswers(op: Operation): Record<string, Answer> {
+  const answers: Record<string, Answer> = {};
+  for (const [id, pending] of Object.entries(op.interactions)) {
+    if (pending.kind !== "permission") throw new Error(`Unexpected Goose interaction: ${JSON.stringify(pending)}`);
+    const option = pending.request.options.find(({ kind }) => kind.startsWith("allow"));
+    answers[id] = { outcome: option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" } };
   }
-  throw new Error("Timed out waiting for configured Goose bridge turn");
+  return answers;
 }
 
 async function exerciseBridge(
@@ -555,114 +497,40 @@ async function exerciseBridge(
     cwd: process.cwd(),
     env,
   });
-  const origin = `http://127.0.0.1:${server.port}`;
+  const client = new SmokeClient(`http://127.0.0.1:${server.port}`);
   try {
-    const runtime = await waitForValue(
-      () => getJson<RuntimeView>(`${origin}/api/v1/runtime`),
-      (value) => value.connected && value.phase?.phase === "ready",
-      "isolated Goose bridge initialization",
-    );
-    if (
-      runtime.initialized?.response?.agentInfo?.name !== "goose" ||
-      runtime.initialized.response.agentInfo.version !== expectedVersion
-    ) {
-      throw new Error(`Goose bridge did not initialize correctly: ${JSON.stringify(runtime.initialized)}`);
+    const agent = await readyAgent(client, "isolated Goose bridge initialization");
+    if (agent.initialize?.agentInfo?.name !== "goose" || agent.initialize.agentInfo.version !== expectedVersion) {
+      throw new Error(`Goose bridge did not initialize correctly: ${JSON.stringify(agent.initialize)}`);
     }
 
-    const create = await fetch(`${origin}/api/v1/sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cwd: process.cwd() }),
-    });
-    const error = await create.json() as {
-      code?: number;
-      message?: string;
-      data?: unknown;
-    };
-    if (
-      create.status !== 409 ||
-      error.code !== -32_603 ||
-      !JSON.stringify(error.data).includes("GOOSE_PROVIDER")
-    ) {
-      throw new Error(`Goose bridge lost ACP error details: ${JSON.stringify(error)}`);
+    const create = await client.ops.write("global", { kind: "create", args: { cwd: process.cwd() } });
+    const error = create.kind === "ended" && "error" in create.outcome ? create.outcome.error : undefined;
+    const acpError = error?.data as { code?: number; data?: unknown } | undefined;
+    if (error?.code !== "agent_error" || acpError?.code !== -32_603 || !JSON.stringify(acpError.data).includes("GOOSE_PROVIDER")) {
+      throw new Error(`Goose bridge lost ACP error details: ${JSON.stringify(create)}`);
     }
 
-    const listed = await getJson<{ sessions: unknown[]; nextCursor?: unknown }>(
-      `${origin}/api/v1/sessions`,
-    );
-    if (listed.sessions.length !== 0 || listed.nextCursor != null) {
+    client.follow([{ scope: "global" }, { scope: "catalog" }]);
+    await client.ended("catalog");
+    const listed = await client.ops.write("catalog", { kind: "list", args: {} });
+    const page = listed.kind === "ended" && "result" in listed.outcome ? listed.outcome.result as CatalogPage : undefined;
+    if (page === undefined || page.sessions.length !== 0 || page.nextCursor != null) {
       throw new Error(`Goose bridge recovery list was invalid: ${JSON.stringify(listed)}`);
     }
-    const recovered = await getJson<RuntimeView>(`${origin}/api/v1/runtime`);
-    if (!recovered.connected || recovered.phase?.phase !== "ready") {
+    if (globalLive(client.replicas.get("global"))?.agent.phase !== "ready") {
       throw new Error("Goose bridge did not remain usable after session/new failed");
     }
   } finally {
+    client.close();
     await server.close();
   }
 }
 
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
-  if (response.status !== 200) {
-    throw new Error(`${url} returned ${response.status}: ${await response.text()}`);
-  }
-  return await response.json() as T;
-}
-
-async function postJson<T = unknown>(
-  url: string,
-  body: unknown,
-  expectedStatus = 200,
-  headers: Record<string, string> = {},
-): Promise<T> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify(body),
-  });
-  const text = await response.text();
-  if (response.status !== expectedStatus) {
-    throw new Error(`${url} returned ${response.status}: ${text}`);
-  }
-  return (text === "" ? undefined : JSON.parse(text)) as T;
-}
-
-async function getSession(origin: string, sessionId: string): Promise<SessionView> {
-  return await getJson<SessionView>(
-    `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}`,
-  );
-}
-
-async function postTurn(
-  origin: string,
-  sessionId: string,
-  historyRevision: string,
-  intentId: string,
-  text: string,
-): Promise<void> {
-  await postJson(
-    `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
-    { prompt: [{ type: "text", text }] },
-    202,
-    {
-      "If-Match": `"${historyRevision}"`,
-      "Idempotency-Key": intentId,
-    },
-  );
-}
-
-async function waitForValue<T>(
-  read: () => Promise<T>,
-  predicate: (value: T) => boolean,
-  label: string,
-): Promise<T> {
-  const deadline = Date.now() + 10_000;
-  let latest: T | undefined;
-  while (Date.now() < deadline) {
-    latest = await read();
-    if (predicate(latest)) return latest;
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-  }
-  throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(latest)}`);
+async function readyAgent(client: SmokeClient, label: string): Promise<GlobalLive["agent"]> {
+  client.follow([{ scope: "global" }]);
+  return await client.until("global", (replica) => {
+    const agent = globalLive(replica)?.agent;
+    return agent?.phase === "ready" ? agent : undefined;
+  }, label);
 }

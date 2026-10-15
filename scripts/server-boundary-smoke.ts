@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { startRustTestServer } from "./rust-test-server.js";
-import type { BridgeSessionView, CreatedSessionResult } from "../shared/business-api.js";
+import type { OpArgs } from "../shared/protocol.js";
+import { globalLive, replyText, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
 
 // Real HTTP and process-lifecycle checks; no model, account, or user workspace.
 const cwd = process.cwd();
@@ -41,15 +42,37 @@ let stderr = "";
 host.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
 host.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 const observer = new AbortController();
+let client: SmokeClient | undefined;
 
 try {
   const origin = await eventually(() => /attyd listening on (http:\/\/[^\s]+)/u.exec(stdout)?.[1], "HTTP listener");
-  await eventually(async () => {
-    const runtime = await (await fetch(`${origin}/api/v1/runtime`)).json() as { phase?: { phase?: string } };
-    return runtime.phase?.phase === "ready";
-  }, "fake Agent initialization");
-  const list = () => fetch(`${origin}/api/v1/sessions`);
-  assert.equal((await list()).status, 200);
+  client = new SmokeClient(origin);
+  client.follow([{ scope: "global" }, { scope: "catalog" }]);
+  await client.until("global", (replica) => (globalLive(replica)?.agent.phase === "ready" ? true : undefined),
+    "fake Agent initialization");
+  const live = client;
+  // The Agent lists sessions only while signed in: `list` succeeds, or ends
+  // with its `auth_required` error.
+  const listed = async () => {
+    await live.ended("catalog");
+    const outcome = await live.ops.write("catalog", { kind: "list", args: {} });
+    assert.ok(outcome.kind === "ended", JSON.stringify(outcome));
+    await live.ended("catalog", outcome.op);
+    return "result" in outcome.outcome;
+  };
+  assert.equal(await listed(), true);
+  const globalOp = async () => (await live.ended("global")).id;
+  /** A global write with `headers`: admitted, then shown ended. */
+  const writeGlobal = async (write: OpArgs, headers: Record<string, string>) => {
+    const response = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ expect: await globalOp(), ...write }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 202, `${write.kind} with ${JSON.stringify(headers)}: ${text}`);
+    await live.ended("global", (JSON.parse(text) as { op: string }).op);
+  };
 
   // Iframe navigations can omit Origin, so request-origin checks alone cannot
   // prevent another site from presenting the Agent controls inside a frame.
@@ -71,34 +94,44 @@ try {
   })), "entry HTML and SPA routes must deny framing even without Origin");
 
   for (const attackOrigin of ["http://127.0.0.1:1", "https://evil.example", "null"]) {
-    const attack = await fetch(`${origin}/api/v1/auth/logout`, {
+    // A real write and real reads, refused for their origin alone.
+    const attack = await fetch(`${origin}/api/v2/scopes/global/ops`, {
       method: "POST",
       headers: { Origin: attackOrigin, "Content-Type": "application/x-www-form-urlencoded" },
       body: "unused=1",
     });
     assert.equal(attack.status, 403, `unexpected acceptance of ${attackOrigin}`);
-    assert.equal((await fetch(`${origin}/api/v1/runtime`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin reads must also be denied");
-    assert.equal((await list()).status, 200, "rejected logout must not change Agent authentication");
+    const forged = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+      method: "POST",
+      headers: { Origin: attackOrigin, "Content-Type": "application/json" },
+      body: JSON.stringify({ expect: await globalOp(), kind: "logout", args: {} }),
+    });
+    assert.equal(forged.status, 403, `unexpected acceptance of a JSON write from ${attackOrigin}`);
+    assert.equal((await fetch(`${origin}/api/v2/scopes/global`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin reads must also be denied");
+    assert.equal((await fetch(`${origin}/api/v2/stream?scope=global`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin streams must also be denied");
+    assert.equal(await listed(), true, "a rejected logout must not change Agent authentication");
   }
 
-  const sameOriginLogout = await fetch(`${origin}/api/v1/auth/logout`, { method: "POST", headers: { Origin: origin } });
-  assert.equal(sameOriginLogout.status, 200);
-  assert.equal((await list()).status, 409, "same-origin logout must reach the Agent");
-  assert.equal((await fetch(`${origin}/api/v1/auth/agent-login`, { method: "POST" })).status, 200, "CLI without Origin must work");
-  assert.equal((await list()).status, 200);
-  assert.equal((await fetch(`${origin}/api/v1/auth/logout`, { method: "POST" })).status, 200);
-  assert.equal((await list()).status, 409, "CLI logout must reach the Agent");
-  assert.equal((await fetch(`${origin}/api/v1/auth/agent-login`, { method: "POST", headers: { Origin: "https://agent.example" } })).status, 200, "explicit TLS proxy origin with rewritten upstream Host must work");
-  assert.equal((await list()).status, 200);
+  const logout = { kind: "logout", args: {} } as const;
+  const login = { kind: "authenticate", args: { methodId: "agent-login" } } as const;
+  await writeGlobal(logout, { Origin: origin });
+  assert.equal(await listed(), false, "same-origin logout must reach the Agent");
+  await writeGlobal(login, {});
+  assert.equal(await listed(), true, "CLI without Origin must work");
+  await writeGlobal(logout, {});
+  assert.equal(await listed(), false, "CLI logout must reach the Agent");
+  await writeGlobal(login, { Origin: "https://agent.example" });
+  assert.equal(await listed(), true, "explicit TLS proxy origin with rewritten upstream Host must work");
 
   assert.equal(await statusWithHost(origin, { Host: "evil.example" }), 403, "DNS rebinding Host must be rejected");
   assert.equal(await statusWithHost(origin, { Host: "evil.example", "X-Forwarded-Host": new URL(origin).host }), 403);
   assert.equal(await statusWithHost(origin, { Host: "agent.example", Origin: "https://agent.example" }), 200);
   assert.equal(await statusWithHost(origin, { Host: "agent.example", Origin: "http://agent.example", "X-Forwarded-Proto": "https" }), 403);
 
-  await verifyLargeRequestBody(origin);
+  await verifyLargeRequestBody(origin, live);
 
-  const events = await fetch(`${origin}/api/v1/events`, { signal: observer.signal });
+  live.close();
+  const events = await fetch(`${origin}/api/v2/stream?scope=global`, { signal: observer.signal });
   assert.equal(events.status, 200);
   const reader = events.body!.getReader();
   assert.equal((await reader.read()).done, false);
@@ -131,6 +164,7 @@ try {
   console.error({ stdout, stderr });
   throw error;
 } finally {
+  client?.close();
   observer.abort();
   if (host.exitCode == null && host.signalCode == null) {
     host.kill("SIGTERM");
@@ -170,7 +204,7 @@ async function verifyWildcardOrigin(): Promise<void> {
 
 function statusWithHost(origin: string, headers: Record<string, string | undefined>): Promise<number> {
   return new Promise((resolve, reject) => {
-    const req = request(`${origin}/api/v1/runtime`, { headers }, (response) => {
+    const req = request(`${origin}/api/v2/scopes/global`, { headers }, (response) => {
       response.resume();
       response.once("end", () => resolve(response.statusCode!));
     });
@@ -179,27 +213,15 @@ function statusWithHost(origin: string, headers: Record<string, string | undefin
   });
 }
 
-async function verifyLargeRequestBody(origin: string): Promise<void> {
-  const createdResponse = await fetch(`${origin}/api/v1/sessions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  });
-  assert.equal(createdResponse.status, 201);
-  const created = await createdResponse.json() as CreatedSessionResult;
-  const sessionUrl = `${origin}/api/v1/sessions/${encodeURIComponent(created.sessionId)}`;
-  const view = async () => {
-    const response = await fetch(sessionUrl);
-    assert.equal(response.status, 200);
-    return response.json() as Promise<BridgeSessionView>;
-  };
-  const before = await view();
-  assert.ok(before.historyRevision);
-  const headers = {
-    "Content-Type": "application/json",
-    "If-Match": `"${before.historyRevision}"`,
-    "Idempotency-Key": "large-body-regression",
-  };
+async function verifyLargeRequestBody(origin: string, client: SmokeClient): Promise<void> {
+  await client.ended("global");
+  const created = await client.ops.write("global", { kind: "create", args: { cwd } });
+  assert.ok(created.kind === "ended" && "result" in created.outcome, JSON.stringify(created));
+  const sessionId = (created.outcome.result as { sessionId: string }).sessionId;
+  const scope = sessionScope(sessionId);
+  // The stream holds and follows the session until its result is read.
+  client.follow([{ scope: "global" }, { scope: "catalog" }, { scope }]);
+  const opened = await client.ended(scope);
   // Valid PCM WAV beyond the former 3 MiB attachment and 5 MiB HTTP limits.
   // Verify the Agent receives every decoded byte and all prompt blocks.
   const wav = Buffer.alloc(4 * 1024 * 1024);
@@ -208,45 +230,34 @@ async function verifyLargeRequestBody(origin: string): Promise<void> {
   wav.writeUInt32LE(8_000, 24); wav.writeUInt32LE(16_000, 28);
   wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
   wav.write("data", 36); wav.writeUInt32LE(wav.length - 44, 40);
-  const body = JSON.stringify({ prompt: [
+  const body = JSON.stringify({ expect: opened.id, kind: "prompt", args: { prompt: [
     ...Array.from({ length: 65 }, () => ({ type: "text", text: "large-attachment-input-flow" })),
     { type: "audio", mimeType: "audio/wav", data: wav.toString("base64") },
-  ] });
+  ] } });
   assert.ok(Buffer.byteLength(body) > 5 * 1024 * 1024);
-  const controller = new AbortController();
-  const events = await fetch(`${sessionUrl}/events`, { signal: controller.signal });
-  assert.equal(events.status, 200);
-  const reader = events.body!.getReader();
-  const drain = (async () => {
-    while (!(await reader.read()).done) { /* retain and consume the live session */ }
-  })().catch((error: unknown) => { if (!controller.signal.aborted) throw error; });
-  try {
-    const accepted = await postJson(`${sessionUrl}/turns`, headers, body);
-    assert.equal(accepted.status, 202, "a supported attachment must reach the turn handler");
-    const completed = await eventually(async () => {
-      const current = await view();
-      return current.phase === "ready" && current.historyRevision !== before.historyRevision ? current : undefined;
-    }, "large attachment completion");
-    const result = completed.timeline.find((update) =>
-      update.sessionUpdate === "agent_message_chunk" && update.messageId === "large-attachment-result"
-    );
-    assert.ok(result?.sessionUpdate === "agent_message_chunk" && result.content.type === "text");
-    assert.deepEqual(JSON.parse(result.content.text), [{ mimeType: "audio/wav", bytes: wav.length }]);
-  } finally {
-    controller.abort();
-    await drain;
-  }
+  const accepted = await postJson(`${origin}/api/v2/scopes/${encodeURIComponent(scope)}/ops`, { "Content-Type": "application/json" }, body);
+  assert.equal(accepted.status, 202, "a supported attachment must reach the prompt");
+  const op = (JSON.parse(accepted.body) as { op: string }).op;
+  const completed = await client.ended(scope, op);
+  assert.equal(completed.status, "completed", JSON.stringify(completed.error));
+  const log = client.replicas.get(scope)!.log;
+  assert.equal(log.length, 1);
+  assert.deepEqual(JSON.parse(replyText(log[0])), [{ mimeType: "audio/wav", bytes: wav.length }]);
+  assert.equal(sessionLive(client.replicas.get(scope))?.sessionId, sessionId);
+  assert.deepEqual(client.streamErrors, []);
 }
 
-function postJson(url: string, headers: Record<string, string>, body: string): Promise<{ status: number }> {
+function postJson(url: string, headers: Record<string, string>, body: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = request(url, {
       method: "POST",
       headers: { ...headers, "Content-Length": Buffer.byteLength(body), Expect: "100-continue" },
     }, (response) => {
-      response.resume();
+      let text = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => { text += chunk; });
       response.once("end", () => {
-        resolve({ status: response.statusCode! });
+        resolve({ status: response.statusCode!, body: text });
         req.destroy();
       });
       response.once("error", reject);

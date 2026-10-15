@@ -10,37 +10,10 @@ import {
 } from "@agentclientprotocol/sdk/experimental/node";
 import { AcpServer } from "@agentclientprotocol/sdk/experimental/server";
 import { WebSocketServer } from "ws";
-
-interface RuntimeView {
-  connected: boolean;
-  phase?: { phase?: string } | null;
-}
-
-interface SessionView {
-  bridgeEpoch: string;
-  sessionIncarnation: number;
-  historyRevision: string | null;
-  phase: string;
-  timeline: unknown[];
-  activeTurn: { operationId: string; prompt: unknown[]; cancelRequested?: boolean; terminal?: unknown } | null;
-}
-
-interface CreatedSession {
-  sessionId: string;
-  cwd?: string;
-  view: SessionView;
-}
-
-interface StartedTurn {
-  operationId: string;
-  disposition: "accepted" | "duplicate";
-}
+import type { PromptResult } from "../shared/protocol.js";
+import { globalLive, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
 
 type RecordEvent = (event: string, details?: unknown) => void;
-
-interface EventObserver {
-  close(): Promise<void>;
-}
 
 for (const transport of ["http", "ws"] as const) {
   const started = performance.now();
@@ -90,147 +63,105 @@ for (const transport of ["http", "ws"] as const) {
   const endpoint = `${transport === "http" ? "http" : "ws"}://127.0.0.1:${remote.port}/acp`;
   const host = await startRustHost(transport, endpoint);
   const origin = `http://127.0.0.1:${host.port}`;
-  let observer: EventObserver | undefined;
-  let globalObserver: EventObserver | undefined;
-  let testFailed = false;
+  const client = new SmokeClient(origin);
 
   try {
-    await waitForValue(
-      () => getJson<RuntimeView>(`${origin}/api/v1/runtime`),
-      (runtime) => runtime.connected && runtime.phase?.phase === "ready",
-      `${transport} runtime initialization`,
-    );
+    client.follow([{ scope: "global" }]);
+    await client.until("global", (replica) => (globalLive(replica)?.agent.phase === "ready" ? true : undefined),
+      `${transport} runtime initialization`);
     assert.equal(initializedCapabilities?.terminal, false);
     assert.deepEqual(initializedCapabilities?.fs, {
       readTextFile: false,
       writeTextFile: false,
     });
     assert.equal(initializedCapabilities?.auth?.terminal, false);
-    globalObserver = await observeEvents(`${origin}/api/v1/events`, record);
 
-    const missingCwd = await fetch(`${origin}/api/v1/sessions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    assert.equal(missingCwd.status, 409);
-    assert.match(
-      JSON.stringify(await missingCwd.json()),
-      /requires an absolute Agent workspace/u,
-    );
+    const missingCwd = await client.ops.write("global", { kind: "create", args: {} as { cwd: string } });
+    assert.ok(missingCwd.kind === "refused", JSON.stringify(missingCwd));
+    assert.equal(missingCwd.error.code, "invalid_request");
 
-    const created = await postJson<CreatedSession>(
-      `${origin}/api/v1/sessions`,
-      { cwd: "/home/agent/project" },
-      201,
-    );
-    assert.equal(created.cwd, "/home/agent/project");
-    assert.equal(created.sessionId, `${transport}-session-1`);
+    const created = await createSession(client, "/home/agent/project");
+    assert.equal(created, `${transport}-session-1`);
     assert.equal(createdCwd, "/home/agent/project");
-    assert.ok(created.view.historyRevision);
+    const first = sessionScope(created);
+    client.follow([{ scope: "global" }, { scope: first }]);
+    const opened = await client.ended(first);
+    assert.equal(sessionLive(client.replicas.get(first))?.cwd, "/home/agent/project");
+    assert.equal(opened.kind, "open");
 
-    observer = await observeSession(origin, created, record);
-
-    const firstTurn = await postTurn(
-      origin,
-      created.sessionId,
-      created.view.historyRevision,
-      `${transport}-prompt`,
-      "keep running while the browser reconnects",
-    );
-    assert.equal(firstTurn.disposition, "accepted");
+    const firstTurn = await prompt(client, first, "keep running while the browser reconnects");
     await waitUntil(() => promptStarted, `${transport} prompt to start`);
 
-    const concurrentCreated = await postJson<CreatedSession>(
-      `${origin}/api/v1/sessions`,
-      { cwd: "/home/agent/other-project" },
-      201,
-    );
-    assert.equal(concurrentCreated.sessionId, `${transport}-session-2`);
-    assert.ok(concurrentCreated.view.historyRevision);
-    // Creating another thread navigates the browser to that session. Keep
-    // consuming its events just as EventSource does, while the first turn runs.
-    await observer.close();
-    observer = await observeSession(origin, concurrentCreated, record);
-    record("concurrent.turn.submit", { sessionId: concurrentCreated.sessionId });
-    const concurrentTurn = await postTurn(
-      origin,
-      concurrentCreated.sessionId,
-      concurrentCreated.view.historyRevision,
-      `${transport}-prompt-concurrent`,
-      "run alongside the first session",
-    );
-    record("concurrent.turn.accepted", concurrentTurn);
-    await waitUntil(
-      () => concurrentPromptReceived,
-      `${transport} concurrent session prompt`,
-    );
-    await waitForValue(
-      () => getSession(origin, concurrentCreated.sessionId),
-      (view) => view.phase === "ready" && view.activeTurn == null,
-      `${transport} concurrent turn reconciliation`,
-    );
+    const concurrent = await createSession(client, "/home/agent/other-project");
+    assert.equal(concurrent, `${transport}-session-2`);
+    // Creating another thread navigates the browser to that session: its
+    // stream replaces the first session's while the first turn runs.
+    const second = sessionScope(concurrent);
+    client.follow([{ scope: "global" }, { scope: second }]);
+    await client.ended(second);
+    record("concurrent.turn.submit", { sessionId: concurrent });
+    const concurrentTurn = await prompt(client, second, "run alongside the first session");
+    record("concurrent.turn.accepted", { op: concurrentTurn });
+    await waitUntil(() => concurrentPromptReceived, `${transport} concurrent session prompt`);
+    assert.equal((await client.ended(second, concurrentTurn)).status, "completed");
+    assert.equal(client.replicas.get(second)?.log.length, 1);
 
-    await observer.close();
-    observer = undefined;
+    // No stream follows the first session now; leaving it cancels nothing.
+    client.follow([{ scope: "global" }]);
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(cancellationObserved, false);
 
-    const restored = await waitForValue(
-      () => getSession(origin, created.sessionId),
-      (view) => view.phase === "running" && view.activeTurn != null,
-      `${transport} active turn restoration`,
-    );
-    assert.equal(restored.activeTurn?.operationId, firstTurn.operationId);
-    assert.deepEqual(restored.activeTurn?.prompt, [{
+    // The replica held from the earlier stream stays until the new stream aligns it.
+    const before = client.replicas.get(first);
+    client.follow([{ scope: "global" }, { scope: first }]);
+    const restored = await client.until(first,
+      (replica) => (replica !== before ? sessionLive(replica)?.op : undefined), `${transport} running turn alignment`);
+    assert.equal(restored.id, firstTurn);
+    assert.equal(restored.status, "running");
+    assert.deepEqual(restored.input, { prompt: [{
       type: "text",
       text: "keep running while the browser reconnects",
-    }]);
-    observer = await observeSession(origin, { ...created, view: restored }, record);
+    }] });
 
-    await postJson(
-      `${origin}/api/v1/sessions/${encodeURIComponent(created.sessionId)}/turns/${encodeURIComponent(firstTurn.operationId)}/cancel`,
-      undefined,
-    );
-    await waitUntil(
-      () => cancellationObserved,
-      `${transport} explicit cancellation after reconnect`,
-    );
-    const cancelling = await getSession(origin, created.sessionId);
-    assert.equal(cancelling.phase, "running");
-    assert.equal(cancelling.activeTurn?.cancelRequested, true);
-    assert.equal(cancelling.activeTurn?.terminal, null);
-    assert.equal(cancelling.activeTurn?.operationId, firstTurn.operationId);
+    const cancel = await client.ops.write(first, { kind: "cancel", args: {} });
+    assert.ok(cancel.kind === "accepted" && cancel.op === firstTurn, JSON.stringify(cancel));
+    await waitUntil(() => cancellationObserved, `${transport} explicit cancellation after reconnect`);
+    // A requested cancel ends nothing: the turn runs until the Agent answers.
+    const cancelling = await client.until(first, (replica) => {
+      const op = sessionLive(replica)?.op;
+      return op?.cancelRequested ? op : undefined;
+    }, `${transport} cancel request`);
+    assert.equal(cancelling.status, "running");
+    assert.equal(cancelling.id, firstTurn);
     finishPrompt?.();
     finishPrompt = undefined;
-    await waitForValue(
-      () => getSession(origin, created.sessionId),
-      (view) => view.phase === "ready" && view.activeTurn == null,
-      `${transport} cancelled turn reconciliation`,
-    );
+    const answered = await client.ended(first, firstTurn);
+    assert.equal(answered.id, firstTurn);
+    assert.equal(answered.status, "completed");
+    assert.equal((answered.result as PromptResult).stopReason, "cancelled");
+    assert.equal(client.replicas.get(first)?.log.length, 1);
 
     // Remote workspaces belong to the Agent host, including Windows Agents
     // reached from a POSIX client. Preserve both drive-letter and UNC paths.
     for (const agentCwd of ["C:\\agent\\project", "\\\\agent-host\\workspace\\project"]) {
-      const windowsSession = await postJson<CreatedSession>(
-        `${origin}/api/v1/sessions`,
-        { cwd: agentCwd },
-        201,
-      );
-      assert.equal(windowsSession.cwd, agentCwd);
+      const windowsSession = await createSession(client, agentCwd);
       assert.equal(createdCwd, agentCwd, "the Agent must receive the original remote path");
-      assert.equal((await getSession(origin, windowsSession.sessionId)).phase, "ready");
+      const summary = await client.until("global",
+        (replica) => globalLive(replica)?.sessions[windowsSession], `${transport} ${agentCwd} session`);
+      assert.equal(summary.cwd, agentCwd);
+      assert.equal(summary.op.status, "completed");
     }
+    assert.deepEqual(client.streamErrors, []);
   } catch (error) {
-    testFailed = true;
     record("test.failed", String(error));
     // Preserve both sides before teardown cancels the outstanding prompt. A 202
     // only confirms admission; it does not prove the ACP request reached the Agent.
     const snapshots = await Promise.allSettled([
-      "/api/v1/runtime",
-      `/api/v1/sessions/${transport}-session-1`,
-      `/api/v1/sessions/${transport}-session-2`,
-    ].map(async (path) => {
+      "global",
+      sessionScope(`${transport}-session-1`),
+      sessionScope(`${transport}-session-2`),
+    ].map(async (scope) => {
+      const path = `/api/v2/scopes/${encodeURIComponent(scope)}`;
       const response = await fetch(`${origin}${path}`, { signal: AbortSignal.timeout(1_000) });
       return { path, status: response.status, body: await response.json() };
     }));
@@ -240,6 +171,7 @@ for (const transport of ["http", "ws"] as const) {
       promptStarted,
       concurrentPromptReceived,
       cancellationObserved,
+      streamErrors: client.streamErrors,
       snapshots: snapshots.map((result) => result.status === "fulfilled"
         ? result.value
         : { error: String(result.reason) }),
@@ -248,68 +180,29 @@ for (const transport of ["http", "ws"] as const) {
     }, null, 2));
     throw error;
   } finally {
-    const closed = await Promise.allSettled([observer?.close(), globalObserver?.close()]);
+    client.close();
     finishPrompt?.();
     await host.close();
     await remote.close();
-    for (const result of closed) {
-      if (result.status !== "rejected") continue;
-      if (!testFailed) throw result.reason;
-      console.error("Browser event cleanup failed:", result.reason);
-    }
   }
 }
 
 console.log("Rust remote ACP smoke passed (HTTP/SSE and WebSocket Agent transports)");
 
-function observeSession(origin: string, session: CreatedSession, record: RecordEvent): Promise<EventObserver> {
-  const query = new URLSearchParams({
-    expectedEpoch: session.view.bridgeEpoch,
-    expectedIncarnation: String(session.view.sessionIncarnation),
-  });
-  return observeEvents(
-    `${origin}/api/v1/sessions/${encodeURIComponent(session.sessionId)}/events?${query}`,
-    record,
-  );
+/** Creates a session in `cwd`; `create` answers at its end with the session ID. */
+async function createSession(client: SmokeClient, cwd: string): Promise<string> {
+  await client.ended("global");
+  const created = await client.ops.write("global", { kind: "create", args: { cwd } });
+  assert.ok(created.kind === "ended" && "result" in created.outcome, JSON.stringify(created));
+  await client.ended("global", created.op);
+  return (created.outcome.result as { sessionId: string }).sessionId;
 }
 
-async function observeEvents(url: string, record: RecordEvent): Promise<EventObserver> {
-  const controller = new AbortController();
-  const startup = setTimeout(() => controller.abort(), 10_000);
-  let reader: ReadableStreamDefaultReader<Uint8Array>;
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    assert.equal(response.status, 200, `${url} returned ${response.status}`);
-    assert.ok(response.body);
-    reader = response.body.getReader();
-    assert.equal((await reader.read()).done, false, `${url} ended before its initial event`);
-  } catch (error) {
-    controller.abort();
-    throw error;
-  } finally {
-    clearTimeout(startup);
-  }
-  let failure: unknown;
-  const drained = (async () => {
-    try {
-      while (!(await reader.read()).done) { /* Continuously consume browser events. */ }
-      if (!controller.signal.aborted) throw new Error(`${url} ended unexpectedly`);
-    } catch (error) {
-      if (!controller.signal.aborted) {
-        failure = error;
-        record("browser.events.failed", { url, error: String(error) });
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  })();
-  return {
-    async close() {
-      controller.abort();
-      await drained;
-      if (failure != null) throw failure;
-    },
-  };
+/** Starts a prompt of `text`; returns its operation ID. */
+async function prompt(client: SmokeClient, scope: string, text: string): Promise<string> {
+  const started = await client.ops.write(scope, { kind: "prompt", args: { prompt: [{ type: "text", text }] } });
+  assert.ok(started.kind === "accepted", JSON.stringify(started));
+  return started.op;
 }
 
 async function startRemoteAgent(agent: ReturnType<typeof acp.agent>, record: RecordEvent): Promise<{
@@ -415,74 +308,6 @@ async function startRustHost(
       if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
     },
   };
-}
-
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
-  assert.equal(response.status, 200, `${url} returned ${response.status}`);
-  return await response.json() as T;
-}
-
-async function postJson<T = unknown>(
-  url: string,
-  body?: unknown,
-  expectedStatus = 200,
-  headers: Record<string, string> = {},
-): Promise<T> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: body === undefined
-      ? headers
-      : { "content-type": "application/json", ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await response.text();
-  assert.equal(
-    response.status,
-    expectedStatus,
-    `${url} returned ${response.status}: ${text}`,
-  );
-  return (text === "" ? undefined : JSON.parse(text)) as T;
-}
-
-async function getSession(origin: string, sessionId: string): Promise<SessionView> {
-  return await getJson<SessionView>(
-    `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}`,
-  );
-}
-
-async function postTurn(
-  origin: string,
-  sessionId: string,
-  historyRevision: string | null,
-  intentId: string,
-  text: string,
-): Promise<StartedTurn> {
-  assert.ok(historyRevision, "a new session must expose a history revision");
-  return await postJson<StartedTurn>(
-    `${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
-    { prompt: [{ type: "text", text }] },
-    202,
-    {
-      "If-Match": `"${historyRevision}"`,
-      "Idempotency-Key": intentId,
-    },
-  );
-}
-
-async function waitForValue<T>(
-  read: () => Promise<T>,
-  predicate: (value: T) => boolean,
-  label: string,
-): Promise<T> {
-  const deadline = Date.now() + 10_000;
-  let latest: T | undefined;
-  while (Date.now() < deadline) {
-    latest = await read();
-    if (predicate(latest)) return latest;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(latest)}`);
 }
 
 async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
