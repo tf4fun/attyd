@@ -139,7 +139,6 @@ pub(crate) struct PendingInteraction {
     pub interaction_id: String,
     pub request: Value,
     pub operation_id: Option<String>,
-    pub responding_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -164,12 +163,6 @@ pub(crate) enum UrlFlowStatus {
 pub(crate) enum InteractionResolution {
     Applied,
     AlreadyResolved,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InteractionResponseStart {
-    Applied,
-    Duplicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -968,48 +961,6 @@ impl SessionRegistry {
         Ok(outcome)
     }
 
-    pub(crate) fn begin_permission_response(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        interaction_id: &str,
-        operation_id: impl Into<String>,
-    ) -> Result<InteractionResponseStart, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let operation_id = operation_id.into();
-        let operation_in_use = self.operation_in_use(&operation_id);
-        let session = self.require_live_mut(session_id, incarnation)?;
-        let outcome = session_live::begin_permission_response(
-            session,
-            interaction_id,
-            operation_id,
-            operation_in_use,
-        )?;
-        if outcome == InteractionResponseStart::Applied {
-            self.settle_session_ops(session_id);
-        }
-        Ok(outcome)
-    }
-
-    pub(crate) fn complete_permission_response(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        incarnation: u64,
-        interaction_id: &str,
-        operation_id: &str,
-    ) -> Result<InteractionResolution, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let session = self.require_live_mut(session_id, incarnation)?;
-        let outcome =
-            session_live::complete_permission_response(session, interaction_id, operation_id)?;
-        if outcome == InteractionResolution::Applied {
-            self.settle_session_ops(session_id);
-        }
-        Ok(outcome)
-    }
-
     pub(crate) fn upsert_elicitation(
         &mut self,
         expected_epoch: &str,
@@ -1050,7 +1001,6 @@ impl SessionRegistry {
                         interaction_id,
                         request,
                         operation_id: active_operation,
-                        responding_operation_id: None,
                     },
                 );
                 self.settle_session_ops(session_id);
@@ -1076,7 +1026,6 @@ impl SessionRegistry {
                         interaction_id,
                         request,
                         operation_id: None,
-                        responding_operation_id: None,
                     },
                 );
                 self.settle_global_ops();
@@ -1170,105 +1119,6 @@ impl SessionRegistry {
             }
         }
         Ok(InteractionResolution::Applied)
-    }
-
-    pub(crate) fn begin_elicitation_response(
-        &mut self,
-        expected_epoch: &str,
-        scope: Option<(&str, u64)>,
-        interaction_id: &str,
-        operation_id: impl Into<String>,
-    ) -> Result<InteractionResponseStart, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let operation_id = operation_id.into();
-        let responding_operation_id = match scope {
-            Some((session_id, incarnation)) => self
-                .require_live(session_id, incarnation)?
-                .elicitations
-                .get(interaction_id)
-                .ok_or(RuntimeStateError::UnknownInteraction)?
-                .responding_operation_id
-                .as_deref(),
-            None => self
-                .request_elicitations
-                .get(interaction_id)
-                .ok_or(RuntimeStateError::UnknownInteraction)?
-                .responding_operation_id
-                .as_deref(),
-        };
-        match responding_operation_id {
-            Some(existing) if existing == operation_id => {
-                return Ok(InteractionResponseStart::Duplicate);
-            }
-            Some(_) => return Err(RuntimeStateError::InteractionCollision),
-            None => {}
-        }
-        if self.operation_in_use(&operation_id) {
-            return Err(RuntimeStateError::OperationCollision);
-        }
-
-        match scope {
-            Some((session_id, incarnation)) => {
-                self.require_live_mut(session_id, incarnation)?
-                    .elicitations
-                    .get_mut(interaction_id)
-                    .ok_or(RuntimeStateError::UnknownInteraction)?
-                    .responding_operation_id = Some(operation_id);
-                self.settle_session_ops(session_id);
-            }
-            None => {
-                self.request_elicitations
-                    .get_mut(interaction_id)
-                    .ok_or(RuntimeStateError::UnknownInteraction)?
-                    .responding_operation_id = Some(operation_id);
-                self.settle_global_ops();
-            }
-        }
-        Ok(InteractionResponseStart::Applied)
-    }
-
-    pub(crate) fn complete_elicitation_response(
-        &mut self,
-        expected_epoch: &str,
-        scope: Option<(&str, u64)>,
-        interaction_id: &str,
-        operation_id: &str,
-        accepted_url_id: Option<&str>,
-    ) -> Result<InteractionResolution, RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        let already_resolved = match scope {
-            Some((session_id, incarnation)) => self
-                .require_live(session_id, incarnation)?
-                .resolved_elicitations
-                .iter()
-                .any(|resolved| resolved == interaction_id),
-            None => self
-                .resolved_request_elicitations
-                .iter()
-                .any(|resolved| resolved == interaction_id),
-        };
-        if already_resolved {
-            return Ok(InteractionResolution::AlreadyResolved);
-        }
-        let responding_operation_id = match scope {
-            Some((session_id, incarnation)) => self
-                .require_live(session_id, incarnation)?
-                .elicitations
-                .get(interaction_id)
-                .ok_or(RuntimeStateError::UnknownInteraction)?
-                .responding_operation_id
-                .as_deref(),
-            None => self
-                .request_elicitations
-                .get(interaction_id)
-                .ok_or(RuntimeStateError::UnknownInteraction)?
-                .responding_operation_id
-                .as_deref(),
-        };
-        if responding_operation_id != Some(operation_id) {
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        self.resolve_elicitation(expected_epoch, scope, interaction_id, accepted_url_id)
     }
 
     pub(crate) fn settle_url_registration(
@@ -1838,18 +1688,7 @@ impl SessionRegistry {
                                 && operation.stage == "reserved"
                         })
                 })
-                || owner.live.as_ref().is_some_and(|live| {
-                    live.permissions
-                        .values()
-                        .chain(live.elicitations.values())
-                        .any(|interaction| {
-                            interaction.responding_operation_id.as_deref() == Some(operation_id)
-                        })
-                })
-        }) || self
-            .request_elicitations
-            .values()
-            .any(|interaction| interaction.responding_operation_id.as_deref() == Some(operation_id))
+        })
     }
 
     pub(crate) fn url_flow_in_use(&self, elicitation_id: &str) -> bool {
@@ -1866,10 +1705,9 @@ impl SessionRegistry {
 // registry or publication journal nor perform I/O, and can move with its owner.
 mod session_live {
     use super::{
-        InteractionResolution, InteractionResponseStart, InteractionUpsert, PendingInteraction,
-        RuntimeStateError, SessionLifecycle, SessionLiveState, SessionOperationKind,
-        SessionOperationState, SessionState, TurnTerminal, remember_resolved_interaction,
-        remember_resolved_permission,
+        InteractionResolution, InteractionUpsert, PendingInteraction, RuntimeStateError,
+        SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
+        SessionState, TurnTerminal, remember_resolved_interaction, remember_resolved_permission,
     };
 
     pub(super) struct TurnRetirement {
@@ -2024,7 +1862,6 @@ mod session_live {
                 interaction_id,
                 request,
                 operation_id: active_operation,
-                responding_operation_id: None,
             },
         );
         Ok(InteractionUpsert::Inserted)
@@ -2046,59 +1883,6 @@ mod session_live {
             .remove(interaction_id)
             .ok_or(RuntimeStateError::UnknownInteraction)?;
         remember_resolved_permission(session, interaction_id);
-        Ok(InteractionResolution::Applied)
-    }
-
-    pub(super) fn begin_permission_response(
-        session: &mut SessionLiveState,
-        interaction_id: &str,
-        operation_id: String,
-        operation_in_use: bool,
-    ) -> Result<InteractionResponseStart, RuntimeStateError> {
-        let pending = session
-            .permissions
-            .get(interaction_id)
-            .ok_or(RuntimeStateError::UnknownInteraction)?;
-        match pending.responding_operation_id.as_deref() {
-            Some(existing) if existing == operation_id => {
-                return Ok(InteractionResponseStart::Duplicate);
-            }
-            Some(_) => return Err(RuntimeStateError::InteractionCollision),
-            None => {}
-        }
-        if operation_in_use {
-            return Err(RuntimeStateError::OperationCollision);
-        }
-        let pending = session
-            .permissions
-            .get_mut(interaction_id)
-            .expect("permission was checked before mutation");
-        pending.responding_operation_id = Some(operation_id);
-        Ok(InteractionResponseStart::Applied)
-    }
-
-    pub(super) fn complete_permission_response(
-        session: &mut SessionLiveState,
-        interaction_id: &str,
-        operation_id: &str,
-    ) -> Result<InteractionResolution, RuntimeStateError> {
-        if session
-            .resolved_permissions
-            .iter()
-            .any(|resolved| resolved == interaction_id)
-        {
-            return Ok(InteractionResolution::AlreadyResolved);
-        }
-        let pending = session
-            .permissions
-            .get(interaction_id)
-            .ok_or(RuntimeStateError::UnknownInteraction)?;
-        if pending.responding_operation_id.as_deref() != Some(operation_id) {
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        session.permissions.remove(interaction_id);
-        remember_resolved_permission(session, interaction_id);
-
         Ok(InteractionResolution::Applied)
     }
 }
@@ -2804,37 +2588,6 @@ mod tests {
                 "reserved"
             );
         }
-    }
-
-    #[test]
-    fn a_reserved_operation_still_checks_request_response_identities() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state.register_new("session", incarnation);
-        state
-            .upsert_elicitation("epoch", None, "elicitation", json!({}))
-            .unwrap();
-        state
-            .begin_elicitation_response("epoch", None, "elicitation", "response-id")
-            .unwrap();
-        state
-            .sessions
-            .get_mut("session")
-            .unwrap()
-            .state
-            .begin_exclusive(SessionOperationKind::SetMode, "response-id")
-            .unwrap();
-        assert_eq!(
-            state.start_operation(
-                "epoch",
-                "session",
-                incarnation,
-                "response-id",
-                SessionOperationKind::SetMode,
-                "request"
-            ),
-            Err(RuntimeStateError::OperationCollision)
-        );
     }
 
     #[test]
@@ -4107,92 +3860,6 @@ mod tests {
     }
 
     #[test]
-    fn permission_response_is_visible_and_exactly_correlated() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-        let response_operation = "permission-response".to_string();
-        state
-            .upsert_permission(
-                "epoch",
-                "session",
-                incarnation,
-                "permission",
-                json!({ "options": ["allow"] }),
-            )
-            .unwrap();
-
-        assert_eq!(
-            state
-                .begin_permission_response(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    "permission",
-                    &response_operation,
-                )
-                .unwrap(),
-            InteractionResponseStart::Applied,
-        );
-        let responding_seq = state.live_snapshot();
-        assert_eq!(
-            state.session("session").unwrap().permissions["permission"]
-                .responding_operation_id
-                .as_deref(),
-            Some(response_operation.as_str()),
-        );
-        assert_eq!(
-            state
-                .begin_permission_response(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    "permission",
-                    &response_operation,
-                )
-                .unwrap(),
-            InteractionResponseStart::Duplicate,
-        );
-        assert_eq!(state.live_snapshot(), responding_seq);
-        assert_eq!(
-            state.begin_permission_response(
-                "epoch",
-                "session",
-                incarnation,
-                "permission",
-                "response-2",
-            ),
-            Err(RuntimeStateError::InteractionCollision),
-        );
-
-        let before_stale_completion = state.live_snapshot();
-        assert_eq!(
-            state.complete_permission_response(
-                "epoch",
-                "session",
-                incarnation,
-                "permission",
-                "stale-response",
-            ),
-            Err(RuntimeStateError::OperationMismatch),
-        );
-        assert_eq!(state.live_snapshot(), before_stale_completion);
-        assert_eq!(
-            state
-                .complete_permission_response(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    "permission",
-                    &response_operation,
-                )
-                .unwrap(),
-            InteractionResolution::Applied,
-        );
-        assert!(state.session("session").unwrap().permissions.is_empty());
-        assert!(!state.operation_in_use(&response_operation));
-    }
-
-    #[test]
     fn close_then_delete_is_irreversible_and_partial_failure_stays_closed() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
@@ -5455,99 +5122,6 @@ mod tests {
                 .request_elicitations
                 .contains_key("request-scope")
         );
-    }
-
-    #[test]
-    fn elicitation_response_is_transactional_for_session_and_request_scopes() {
-        let mut state = state();
-        let incarnation = open(&mut state, "session");
-        let session_response = "session-form-response".to_string();
-        state
-            .upsert_elicitation(
-                "epoch",
-                Some(("session", incarnation)),
-                "session-form",
-                json!({ "mode": "form" }),
-            )
-            .unwrap();
-        assert_eq!(
-            state
-                .begin_elicitation_response(
-                    "epoch",
-                    Some(("session", incarnation)),
-                    "session-form",
-                    &session_response,
-                )
-                .unwrap(),
-            InteractionResponseStart::Applied,
-        );
-        assert_eq!(
-            state
-                .begin_elicitation_response(
-                    "epoch",
-                    Some(("session", incarnation)),
-                    "session-form",
-                    &session_response,
-                )
-                .unwrap(),
-            InteractionResponseStart::Duplicate,
-        );
-        assert_eq!(
-            state.begin_elicitation_response(
-                "epoch",
-                Some(("session", incarnation)),
-                "session-form",
-                "response-2",
-            ),
-            Err(RuntimeStateError::InteractionCollision),
-        );
-        assert_eq!(
-            state.complete_elicitation_response(
-                "epoch",
-                Some(("session", incarnation)),
-                "session-form",
-                "stale-response",
-                None,
-            ),
-            Err(RuntimeStateError::OperationMismatch),
-        );
-        state
-            .complete_elicitation_response(
-                "epoch",
-                Some(("session", incarnation)),
-                "session-form",
-                &session_response,
-                Some("url-flow"),
-            )
-            .unwrap();
-        let session = state.session("session").unwrap();
-        assert!(!session.elicitations.contains_key("session-form"));
-        assert_eq!(session.url_flows["url-flow"].status, UrlFlowStatus::Waiting);
-        assert!(!state.operation_in_use(&session_response));
-
-        state
-            .upsert_elicitation("epoch", None, "request-form", json!({ "mode": "form" }))
-            .unwrap();
-        let request_response = "request-form-response".to_string();
-        state
-            .begin_elicitation_response("epoch", None, "request-form", &request_response)
-            .unwrap();
-        assert_eq!(
-            state.live_snapshot().request_elicitations["request-form"]
-                .responding_operation_id
-                .as_deref(),
-            Some(request_response.as_str()),
-        );
-        state
-            .complete_elicitation_response("epoch", None, "request-form", &request_response, None)
-            .unwrap();
-        assert!(
-            !state
-                .live_snapshot()
-                .request_elicitations
-                .contains_key("request-form")
-        );
-        assert!(!state.operation_in_use(&request_response));
     }
 
     #[test]

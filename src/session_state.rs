@@ -25,7 +25,6 @@ pub(crate) enum MirrorPhase {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TurnOverlay {
     pub operation_id: String,
-    pub client_intent_id: String,
     pub prompt: Arc<Vec<Value>>,
     pub updates: SharedTurnUpdates,
     pub terminal: Option<Value>,
@@ -227,7 +226,6 @@ impl SessionState {
         self.phase = MirrorPhase::Running;
         self.active_turn = Some(TurnOverlay {
             operation_id,
-            client_intent_id: client_intent_id.to_string(),
             prompt: Arc::new(prompt),
             updates: Arc::new(Vec::new()),
             terminal: None,
