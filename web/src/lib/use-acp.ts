@@ -145,10 +145,12 @@ class NotifyingOps extends OpsClient {
 
 export class Workspace {
   readonly #listeners = new Set<() => void>();
-  readonly #replicas: ReplicaClient;
-  readonly #ops: NotifyingOps;
-  readonly #queue: WriteQueue;
-  readonly #resources: ResourceClient;
+  // The clients of one connection: `start()` makes them, its cleanup closes them,
+  // so a StrictMode remount gets a working stream again.
+  #replicas!: ReplicaClient;
+  #ops!: NotifyingOps;
+  #queue!: WriteQueue;
+  #resources!: ResourceClient;
   #route: Route = readRoute();
   /** Counts navigations; a write's late result never moves a page the user moved since. */
   #navigation = 0;
@@ -177,15 +179,27 @@ export class Workspace {
   #closed = false;
 
   constructor() {
+    this.#connect();
+  }
+
+  #connect(): void {
     const fetchJson: HttpFetch = (url, init) => fetch(url, init);
-    this.#replicas = new ReplicaClient((url) => this.#open(url));
-    this.#ops = new NotifyingOps(fetchJson, this.#replicas, () => this.#changed());
-    this.#queue = new WriteQueue(this.#ops, this.#replicas);
+    const replicas = new ReplicaClient((url) => this.#open(url));
+    this.#replicas = replicas;
+    this.#ops = new NotifyingOps(fetchJson, replicas, () => {
+      if (this.#replicas === replicas) this.#changed();
+    });
+    this.#queue = new WriteQueue(this.#ops, replicas);
     this.#resources = new ResourceClient(fetchJson);
-    this.#replicas.subscribe((scope) => this.#received(scope));
+    replicas.subscribe((scope) => {
+      if (this.#replicas === replicas) this.#received(scope);
+    });
+    this.#follow = "";
+    this.#aligned = undefined;
   }
 
   start(): () => void {
+    if (this.#closed) this.#connect();
     this.#closed = false;
     const popstate = () => {
       this.#setRoute(readRoute());
@@ -631,7 +645,9 @@ export class Workspace {
 
   listSessions = (cursor?: string): void => {
     if (cursor == null) {
-      this.#catalog = { ...this.#catalog, refresh: true, failedRevision: undefined };
+      // The user asks again: a new attempt, which may go against the same `op`
+      // a refused list was sent against. Nothing is resent without this (C3).
+      this.#catalog = { ...this.#catalog, refresh: true, failedRevision: undefined, sentAgainst: undefined };
       this.#changed();
     } else if (!this.#catalog.listing) {
       this.#list(cursor);
@@ -825,6 +841,8 @@ export class Workspace {
       if (state.sent != null && (state.sent.op !== op?.id || !state.sent.ids.some((id) => pending.has(id)))) {
         state.sent = undefined;
       }
+      // The pending set may have shrunk to what the user answered already.
+      this.#sendAnswers(scope);
     }
   }
 
@@ -926,7 +944,9 @@ export class Workspace {
     const loading = live != null && op?.kind === "load" && op.status === "running" && shown!.log.length === 0 &&
       !shown!.confirmed && pendingInteractions(op).length === 0;
     const visible = live != null && !loading;
-    const ended = scope == null ? undefined : this.#ended.get(scope);
+    // The end of the route's session: its replica is gone once it ended.
+    const routeScope = this.#sessionScope();
+    const ended = routeScope == null ? undefined : this.#ended.get(routeScope);
     const sessionOpening = route.kind !== "session" || visible ? undefined : {
       sessionId: route.sessionId,
       ...(ended?.reason === "load_failed" && !needsAuthentication(ended.error)
@@ -972,7 +992,11 @@ export class Workspace {
         return catalog != null ? [[CATALOG, catalog.op] as const] : [];
       })(),
     ];
+    // One operation occupying several scopes is the `op` of each (§6.4): show its interactions once.
+    const projectedOps = new Set<string>();
     for (const [owner, ownerOp] of interactionScopes) {
+      if (projectedOps.has(ownerOp.id)) continue;
+      projectedOps.add(ownerOp.id);
       for (const interaction of pendingInteractions(ownerOp)) {
         const status = this.#interactionStatus(owner, interaction.interactionId);
         pushInteraction(interaction, status, permissions, elicitations);
