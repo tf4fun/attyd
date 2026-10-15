@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CatalogLive, Event, GlobalLive, LogEntry, Operation, SessionLive } from "../shared/protocol";
 import { H0 } from "../shared/replica";
-import { sessionPath } from "../web/src/lib/session-route";
+import { projectPath, sessionPath } from "../web/src/lib/session-route";
 import { useAcp } from "../web/src/lib/use-acp";
 
 const sessionId = "review-lifecycle";
@@ -212,5 +212,71 @@ describe("v2 workspace lifecycle review", () => {
     expect(acp.state.timeline).toContainEqual(expect.objectContaining({
       type: "assistant", chunks: [expect.objectContaining({ blocks: [{ type: "text", text: "Recovered answer" }] })],
     }));
+  });
+
+  it("discovers a project's sessions on later catalog pages after its URL is opened", async () => {
+    const targetCwd = "/other-workspace";
+    const revision = "catalog-revision";
+    const nextCursor = "other-workspace-page";
+    const requests: Array<{ expect: string; kind: string; args: Record<string, unknown> }> = [];
+    const replies: Array<(response: Response) => void> = [];
+    let inFlight = 0;
+    let maximumInFlight = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("/api/v2/scopes/catalog/ops");
+      expect(init?.method).toBe("POST");
+      requests.push(JSON.parse(String(init?.body)));
+      inFlight += 1;
+      maximumInFlight = Math.max(maximumInFlight, inFlight);
+      return new Promise<Response>((resolve) => replies.push(resolve))
+        .finally(() => { inFlight -= 1; });
+    });
+
+    await mount(projectPath(targetCwd));
+    const source = activeStream();
+    await emit(source, alignment("global", globalLive(true)));
+    await emit(source, alignment("catalog", { ...catalogLive(), op: operation("c0") }));
+    expect(requests).toEqual([{ expect: "c0", kind: "list", args: {} }]);
+    await emit(source, { scope: "catalog", live: { patch: [{
+      op: "set", path: "/op", value: operation("c1", { kind: "list", status: "running", input: {} }),
+    }] } });
+
+    // The first result has arrived, but its operation is still running in the
+    // replica. A later page must wait for the stream's completed operation.
+    await act(async () => replies[0](new Response(JSON.stringify({
+      op: "c1",
+      result: { revision, nextCursor, sessions: [{ sessionId: "A", cwd, title: "First workspace" }] },
+    }), { status: 200 })));
+    expect(acp.state.sessions.map((session) => session.sessionId)).toEqual(["A"]);
+    expect(acp.state.nextSessionCursor).toBe(nextCursor);
+    expect(inFlight).toBe(0);
+    expect(requests).toHaveLength(1);
+
+    await emit(source, { scope: "catalog", live: { patch: [{
+      op: "set", path: "/op", value: operation("c1", { kind: "list", input: {} }),
+    }] } });
+    expect(requests).toEqual([
+      { expect: "c0", kind: "list", args: {} },
+      { expect: "c1", kind: "list", args: { cursor: nextCursor, revision } },
+    ]);
+    expect(inFlight).toBe(1);
+    await emit(source, { scope: "catalog", live: { patch: [{
+      op: "set", path: "/op", value: operation("c2", { kind: "list", input: { cursor: nextCursor, revision } }),
+    }] } });
+    expect(requests).toHaveLength(2);
+    await act(async () => replies[1](new Response(JSON.stringify({
+      op: "c2",
+      result: { revision, nextCursor: null, sessions: [{ sessionId: "B", cwd: targetCwd, title: "Target workspace" }] },
+    }), { status: 200 })));
+
+    expect(acp.projectCwd).toBe(targetCwd);
+    expect(window.location.pathname).toBe(projectPath(targetCwd));
+    expect(acp.state.sessions.filter((session) => session.cwd === targetCwd)).toEqual([
+      { sessionId: "B", cwd: targetCwd, title: "Target workspace" },
+    ]);
+    expect(acp.state.nextSessionCursor).toBeNull();
+    expect(requests).toHaveLength(2);
+    expect(inFlight).toBe(0);
+    expect(maximumInFlight).toBe(1);
   });
 });
