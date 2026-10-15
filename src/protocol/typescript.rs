@@ -6,6 +6,7 @@ use ts_rs::{Config, TS};
 
 use super::canon::*;
 use super::documents::*;
+use super::wire::*;
 use super::*;
 
 const OUTPUT: &str = "shared/protocol.ts";
@@ -16,7 +17,10 @@ const ACP_TYPES: &[&str] = &[
     "ContentBlock",
     "Cost",
     "CreateElicitationRequest",
+    "CreateElicitationResponse",
     "InitializeResponse",
+    "PromptResponse",
+    "RequestPermissionOutcome",
     "RequestPermissionRequest",
     "SessionConfigOption",
     "SessionMode",
@@ -79,6 +83,35 @@ fn declarations(cfg: &Config) -> Vec<String> {
         LiveChange,
         End,
         EndReason,
+        OpRequest,
+        OpArgs,
+        Empty,
+        PromptArgs,
+        SetModeArgs,
+        SetConfigArgs,
+        ConfigValue,
+        ForkArgs,
+        CreateArgs,
+        DeleteArgs,
+        MethodArgs,
+        TerminalLoginArgs,
+        ListArgs,
+        AnswerArgs,
+        Answer,
+        OpAccepted,
+        OpEnded,
+        OpOutcome,
+        SessionCreated,
+        CatalogPage,
+        PromptResult,
+        TerminalInput,
+        TerminalResize,
+        ScopeRead,
+        ContextMatches,
+        ContextMatch,
+        ContextRead,
+        ContextAttachment,
+        ErrorBody,
     ]
 }
 

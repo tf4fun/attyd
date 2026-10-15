@@ -37,6 +37,7 @@ use crate::options::{Options, normalize_origin};
 use crate::protocol::admission::{self, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
 use crate::protocol::hub::{HEARTBEAT, Publication, Subscribed, Subscription};
+use crate::protocol::wire;
 #[cfg(test)]
 use crate::runtime_state::fold_active_turn_update;
 use crate::runtime_state::{
@@ -2139,7 +2140,7 @@ async fn global_events(State(state): State<AppState>) -> Response {
 
 /// A protocol error body `{ error: { code, message } }` (protocol §9).
 fn protocol_error(status: StatusCode, error: ProtocolError) -> Response {
-    (status, axum::Json(json!({ "error": error }))).into_response()
+    (status, axum::Json(wire::ErrorBody { error })).into_response()
 }
 
 /// `GET /api/v2/scopes/{scope}` (protocol §8): the published document. It
@@ -2339,8 +2340,8 @@ fn resource_action(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<bridge::resources::ResourceAction, Response> {
-    use crate::protocol::wire::{TerminalInput, TerminalResize};
     use bridge::resources::ResourceAction;
+    use wire::{TerminalInput, TerminalResize};
     let body = json_body(headers, body)?;
     let invalid = |error: serde_json::Error| invalid_request(format!("{action}: {error}"));
     match action {
@@ -2438,19 +2439,21 @@ async fn write_scope(
     };
     let op = admission.op;
     let Some(end) = admission.end else {
-        return (StatusCode::ACCEPTED, axum::Json(json!({ "op": op }))).into_response();
+        return (StatusCode::ACCEPTED, axum::Json(wire::OpAccepted { op })).into_response();
     };
     state.bridge.before_op_response(&op).await;
     // A dropped response drops only this receiver; the operation runs on.
-    let body = match end.await {
-        Ok(Ok(result)) => json!({ "op": op, "result": result }),
-        Ok(Err(error)) => json!({ "op": op, "error": error }),
-        Err(_) => json!({
-            "op": op,
-            "error": ProtocolError::new(ErrorCode::Unavailable, "the operation ended without a result"),
-        }),
+    let end = match end.await {
+        Ok(Ok(result)) => wire::OpOutcome::Result { result },
+        Ok(Err(error)) => wire::OpOutcome::Error { error },
+        Err(_) => wire::OpOutcome::Error {
+            error: ProtocolError::new(
+                ErrorCode::Unavailable,
+                "the operation ended without a result",
+            ),
+        },
     };
-    axum::Json(body).into_response()
+    axum::Json(wire::OpEnded { op, end }).into_response()
 }
 
 /// `GET /api/v2/stream` (protocol §5): the events of the scopes it follows,
