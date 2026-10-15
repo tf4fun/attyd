@@ -199,6 +199,45 @@ describe("the stream client (§5.1, §5.4; acceptance 4)", () => {
     expect(client.get(S)).toBeUndefined();
   });
 
+  it("closes a healthy stream and lets nothing of it through afterwards", () => {
+    const fake = streams();
+    const client = new ReplicaClient(fake.open, fake.schedule);
+    client.follow([{ scope: S, cwd: "/work" }]);
+    const [source] = fake.sources;
+    source.emit({ scope: S, log: { from: 0, prev: H0, entries: [e1] }, live: { replace: sessionLive() } });
+    const held = client.get(S);
+
+    client.close();
+    expect(source.closed).toBe(true);
+    source.emit({ scope: S, log: { from: 1, prev: e1.hash, entries: [e2] } });
+    source.fail();
+    fake.runScheduled();
+    expect(client.get(S)).toBe(held);
+    expect(client.get(S)?.log).toEqual([e1]);
+    expect(fake.sources).toHaveLength(1);
+  });
+
+  it("drops a reconnect queued by a broken stream once a new set is followed", () => {
+    const fake = streams();
+    const client = new ReplicaClient(fake.open, fake.schedule);
+    client.follow([{ scope: S, cwd: "/work" }]);
+    const [first] = fake.sources;
+    first.emit({ scope: S, log: { from: 0, prev: H0, entries: [e1] }, live: { replace: sessionLive() } });
+    first.fail();
+    expect(fake.scheduled).toHaveLength(1);
+
+    client.follow([{ scope: "global" }]);
+    expect(fake.sources).toHaveLength(2);
+    const [, second] = fake.sources;
+    // The queued reconnect of the broken stream runs late.
+    fake.runScheduled();
+    expect(fake.sources).toHaveLength(2);
+    expect(second.closed).toBe(false);
+    expect(new URL(second.url, "http://bridge.test").searchParams.getAll("scope")).toEqual(["global"]);
+    second.emit({ scope: "global", live: { replace: { op: {}, urlFlows: {}, sessions: {} } } });
+    expect(client.get("global")).toBeDefined();
+  });
+
   it("opens nothing after it is closed", () => {
     const fake = streams();
     const client = new ReplicaClient(fake.open, fake.schedule);
@@ -245,7 +284,7 @@ describe("operation writes (§6; acceptance 9)", () => {
     const ops = new OpsClient(net.fetch, view.source);
     const created = ops.write("global", { kind: "create", args: { cwd: "/work" } });
     expect(net.calls[0]).toMatchObject({ url: "/api/v2/scopes/global/ops", body: { expect: "g-1", kind: "create" } });
-    view.show({ id: "g-3", kind: "list", status: "running" }, "global");
+    view.show({ id: "g-3", kind: "authenticate", status: "running" }, "global");
     net.calls[0].respond(200, { op: "g-2", result: { sessionId: "NEW" } });
     expect(await created).toEqual({ kind: "ended", op: "g-2", outcome: { result: { sessionId: "NEW" } } });
   });
@@ -291,6 +330,31 @@ describe("operation writes (§6; acceptance 9)", () => {
     expect(await proxy).toEqual({ kind: "uncertain" });
   });
 
+  it("reports an operation that ended in failure as ended, not refused", async () => {
+    const net = http();
+    const view = shown();
+    view.show({ id: "g-1", status: "completed" }, "global");
+    const ops = new OpsClient(net.fetch, view.source);
+    const created = ops.write("global", { kind: "create", args: { cwd: "/work" } });
+    const error = { code: "agent_error", message: "session/new failed", data: { code: -32603, message: "boom" } };
+    net.calls[0].respond(200, { op: "g-2", error });
+    expect(await created).toEqual({ kind: "ended", op: "g-2", outcome: { error } });
+  });
+
+  it.each<[string, number, unknown]>([
+    ["a 202 without a body", 202, undefined],
+    ["a 202 without its op", 202, {}],
+    ["a 200 with neither result nor error", 200, { op: "g-2" }],
+  ])("treats %s as a write without a definite answer", async (_name, status, body) => {
+    const net = http();
+    const view = shown();
+    view.show({ id: "g-1", status: "completed" }, "global");
+    const ops = new OpsClient(net.fetch, view.source);
+    const sent = ops.write("global", { kind: "create", args: { cwd: "/work" } });
+    net.calls[0].respond(status, body);
+    expect(await sent).toEqual({ kind: "uncertain" });
+  });
+
   it("sends nothing to a scope it holds no aligned replica of", async () => {
     const net = http();
     const ops = new OpsClient(net.fetch, shown().source);
@@ -300,43 +364,52 @@ describe("operation writes (§6; acceptance 9)", () => {
 });
 
 describe("answers (§6.4; acceptance 7, client half)", () => {
-  const permission = (id: string) => ({ kind: "permission", interactionId: id, request: {} });
+  const permission = { kind: "permission", interactionId: "p1", request: { sessionId: "S", toolCall: { toolCallId: "t" }, options: [] } };
+  const elicitation = { kind: "elicitation", interactionId: "e1", request: { mode: "form", message: "Name?", requestedSchema: {} } };
   const allow = { outcome: { outcome: "selected", optionId: "allow" } } as const;
+  const accept = { response: { action: "accept", content: { name: "attyd" } } } as const;
+  const full = { p1: allow, e1: accept };
 
   function running() {
     const net = http();
     const view = shown();
-    view.show({ id: "op-P", kind: "prompt", status: "running", interactions: { p1: permission("p1"), p2: permission("p2") } });
-    return { net, view, ops: new OpsClient(net.fetch, view.source) };
+    view.show({ id: "op-P", kind: "prompt", status: "running", interactions: { p1: permission, e1: elicitation } });
+    const interactions = structuredClone((view.source.get(S)!.live as ReturnType<typeof sessionLive>).op.interactions);
+    const untouched = () => {
+      expect((view.source.get(S)!.live as ReturnType<typeof sessionLive>).op.interactions).toEqual(interactions);
+    };
+    return { net, view, untouched, ops: new OpsClient(net.fetch, view.source) };
   }
 
-  it("sends every pending interaction's answer in one write against the running op", async () => {
-    const { net, ops } = running();
-    const sent = ops.answer(S, { p1: allow, p2: allow });
+  it("sends every pending interaction's whole answer in one write against the running op", async () => {
+    const { net, untouched, ops } = running();
+    const sent = ops.answer(S, full);
     expect(net.calls).toHaveLength(1);
-    expect(net.calls[0]).toMatchObject({ url: OPS, body: { expect: "op-P", kind: "answer" } });
-    expect(Object.keys((net.calls[0].body as { args: { answers: object } }).args.answers).sort()).toEqual(["p1", "p2"]);
+    expect(net.calls[0].url).toBe(OPS);
+    expect(net.calls[0].body).toEqual({ expect: "op-P", kind: "answer", args: { answers: full } });
     net.calls[0].respond(202, { op: "op-P" });
     expect(await sent).toEqual({ kind: "accepted", op: "op-P" });
+    // The interactions leave only when the stream says so.
+    untouched();
   });
 
   it.each([
     ["one missing", { p1: allow }],
-    ["one more than pending", { p1: allow, p2: allow, p3: allow }],
+    ["one more than pending", { ...full, p3: allow }],
   ])("is blocked, unsent, with %s", async (_name, answers) => {
     const { net, ops } = running();
     expect((await ops.answer(S, answers)).kind).toBe("blocked");
     expect(net.calls).toHaveLength(0);
   });
 
-  it("leaves the user's answers as they were when the bridge refuses them", async () => {
-    const { net, ops } = running();
-    const answers = { p1: allow, p2: allow };
-    const kept = structuredClone(answers);
+  it("leaves the user's answers and the replica as they were when the bridge refuses them", async () => {
+    const { net, untouched, ops } = running();
+    const answers = structuredClone(full);
     const sent = ops.answer(S, answers);
     net.calls[0].respond(409, { error: { code: "not_allowed", message: "the pending interactions changed" } });
     expect(await sent).toMatchObject({ kind: "refused", error: { code: "not_allowed" } });
-    expect(answers).toEqual(kept);
+    expect(answers).toEqual(full);
+    untouched();
   });
 });
 
@@ -391,6 +464,40 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     expect(net.calls).toHaveLength(2);
     expect(net.calls[1].body).toMatchObject({ expect: "op-C" });
     expect(texts(net.calls)).toEqual(["one", "two"]);
+  });
+
+  it("sends the next write when the HTTP answer comes after the stream already showed a later op ended", async () => {
+    const { net, view, queue: q } = queue();
+    q.enqueue(S, prompt("one"));
+    q.enqueue(S, prompt("two"));
+    view.show({ id: "op-A", status: "completed" });
+    q.update(S);
+    expect(net.calls).toHaveLength(1);
+    // The stream runs ahead of the HTTP answer: a later op has already ended.
+    view.show({ id: "op-C", status: "completed" });
+    q.update(S);
+    expect(net.calls).toHaveLength(1);
+    // The answer arrives; no further stream event or update follows.
+    net.calls[0].respond(202, { op: "op-B" });
+    await flush();
+    expect(net.calls).toHaveLength(2);
+    expect(net.calls[1].body).toMatchObject({ expect: "op-C" });
+    expect(texts(net.calls)).toEqual(["one", "two"]);
+  });
+
+  it("lets an operation that ended in failure leave the queue, never retried as a refusal", async () => {
+    const { net, view, queue: q } = queue();
+    q.enqueue(S, { kind: "fork", args: {} });
+    view.show({ id: "op-A", status: "completed" });
+    q.update(S);
+    net.calls[0].respond(200, { op: "op-F", error: { code: "agent_error", message: "fork failed" } });
+    await flush();
+    expect(q.items(S)).toEqual([]);
+    view.show({ id: "op-F", kind: "fork", status: "failed" });
+    q.update(S);
+    view.show({ id: "op-G", status: "completed" });
+    q.update(S);
+    expect(net.calls).toHaveLength(1);
   });
 
   it("sends a definitely refused write again only once a later op has ended", async () => {

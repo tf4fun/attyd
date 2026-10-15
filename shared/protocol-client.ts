@@ -112,11 +112,14 @@ export class OpsClient {
 // ---------------------------------------------------------------------------
 // Queued writes (C2, C3)
 
+/** A write that starts an operation; `cancel` and `answer` are sent at once, never queued. */
+export type StartingWrite = Exclude<OpArgs, { kind: "cancel" | "answer" }>;
+
 export type QueuedState = "queued" | "sending" | "refused" | "uncertain";
 
 export interface QueuedWrite {
   readonly id: number;
-  readonly write: OpArgs;
+  readonly write: StartingWrite;
   readonly state: QueuedState;
   /** The refusal of a `refused` write. */
   readonly error?: ProtocolError;
@@ -124,15 +127,17 @@ export interface QueuedWrite {
 
 /**
  * The writes a user queued for a scope while its operation ran. One is sent
- * at a time, once the replica shows `op` ended; an admitted write leaves the
- * queue. A refused write is sent again only after the replica shows a later
+ * at a time, once the replica shows `op` ended, against that `op`; a write
+ * admitted, or answered at its operation's end, leaves the queue, and the
+ * next is sent as soon as its answer comes if the replica already shows a
+ * later `op` ended. A refused write is sent again only after the replica shows a later
  * `op` ended; an uncertain one is never sent again unless the user
  * resubmits it.
  */
 export class WriteQueue {
   constructor(_ops: OpsClient, _replicas: ReplicaSource) {}
 
-  enqueue(_scope: string, _write: OpArgs): number {
+  enqueue(_scope: string, _write: StartingWrite): number {
     return notImplemented();
   }
 
