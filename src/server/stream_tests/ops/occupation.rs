@@ -380,6 +380,77 @@ async fn a_failed_held_delete_keeps_its_error_and_the_subscription() {
     }
 }
 
+/// A subscription joining the first load already follows a held session
+/// (§5.1), even before that session becomes Active. It keeps the bridge's
+/// directory after the client that started the load leaves.
+#[tokio::test]
+async fn a_subscription_during_the_first_load_keeps_its_recovery_directory() {
+    let (bench, mut link) = Bench::ws(deletable()).await;
+    let mut first = bench.watch(&cold("s")).await;
+    let load = link.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "s");
+    assert_eq!(load["params"]["cwd"], CWD);
+
+    // The withheld response keeps the session Attaching. The new stream's
+    // alignment proves it registered in that state, without supplying cwd.
+    let mut watch = bench.watch(&scopes(&["global", "session/s"])).await;
+    watch
+        .until("the held, still-loading alignment", |watch| {
+            watch.has("global")
+                && watch.has("session/s")
+                && watch.live("session/s")["op"]["kind"] == "load"
+                && watch.live("session/s")["op"]["status"] == "running"
+        })
+        .await;
+    let loading = watch.live("session/s")["op"]["id"].clone();
+    link.reply(&load, json!({})).await;
+    first.until_op("session/s", &loading, "completed").await;
+    watch.until_op("session/s", &loading, "completed").await;
+    watch
+        .until_live("global", "the loaded session's summary", |live| {
+            live["sessions"]["s"]["op"] == json!({"kind": "load", "status": "completed"})
+        })
+        .await;
+    drop(first);
+    wait_subscribers(&bench.hub, "s", 1).await;
+
+    let global = watch.live("global")["op"]["id"].clone();
+    let (status, body) = bench
+        .op("global", &global, "delete", json!({"sessionId": "s"}))
+        .await;
+    let delete = assert_accepted(status, &body, "the delete");
+    let close = link.request("session/close").await;
+    link.reply(&close, json!({})).await;
+    let request = link.request("session/delete").await;
+    link.refuse(&request).await;
+    watch.until_op("global", &delete, "failed").await;
+    let error = watch.live("global")["op"]["error"].clone();
+    assert_eq!(error["code"], "agent_error", "{error}");
+
+    let load = link.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "s");
+    assert_eq!(load["params"]["cwd"], CWD);
+    watch
+        .until_live("session/s", "the recovery load runs", |live| {
+            live["op"]["kind"] == "load" && live["op"]["status"] == "running"
+        })
+        .await;
+    let recovery = watch.live("session/s")["op"]["id"].clone();
+    assert_ne!(recovery, loading);
+    link.reply(&load, json!({})).await;
+    watch.until_op("session/s", &recovery, "completed").await;
+    watch
+        .until_live("global", "the recovered session's summary", |live| {
+            live["sessions"]["s"]["op"] == json!({"kind": "load", "status": "completed"})
+        })
+        .await;
+    assert!(watch.ended("session/s").is_none());
+    assert_eq!(watch.live("global")["op"]["id"], delete);
+    assert_eq!(watch.live("global")["op"]["error"], error);
+    watch.quiet(QUIET).await;
+    watch.converged(&bench).await;
+}
+
 /// Remembering an existing subscription's directory does not supply a
 /// directory to a new subscription of an unheld session (§5.1).
 #[tokio::test]
