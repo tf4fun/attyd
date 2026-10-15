@@ -15,8 +15,7 @@ While a turn runs, its replies, thinking, tools, plans and file changes stream
 directly into the conversation. Once the Agent answers the prompt, the turn keeps
 the prompt and the Agent's messages; thinking, tool calls, plans and their output
 end with the turn and are not shown again, also not after a reload. The whole
-reply is shown as one Agent message. If you scroll up while a turn runs, the
-process is removed only once you return to the bottom. Markdown export contains
+reply is shown as one Agent message. Markdown export contains
 the prompts and messages, with their attachments. A failed prompt keeps its error
 and the prompt for Retry.
 
