@@ -498,6 +498,67 @@ async fn prompt_attachment_references_are_resolved_and_an_unknown_one_is_refused
     watch.converged(&bench).await;
 }
 
+/// The setup response replaces early config options for both the published
+/// controls and the ACP execution of a later, legally admitted write (§4.5).
+#[tokio::test]
+async fn review_setup_config_options_are_used_for_admission_and_execution() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    let early = json!([{
+        "type": "boolean", "id": "only-early", "name": "Early", "currentValue": false,
+    }]);
+    let response = json!([{
+        "type": "boolean", "id": "from-response", "name": "Response", "currentValue": false,
+    }]);
+    let expect = bench.expect_of("global").await;
+    let created = bench.spawn_op("global", &expect, "create", json!({"cwd": CWD}));
+    let new = link.request("session/new").await;
+    // These two messages use the same ordered ACP connection. The option
+    // offered before the response must not override the response's options.
+    link.update(
+        "s",
+        json!({"sessionUpdate": "config_option_update", "configOptions": early}),
+    )
+    .await;
+    link.reply(&new, json!({"sessionId": "s", "configOptions": response}))
+        .await;
+    let (status, body) = created.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "create: {body}");
+    assert_eq!(body["result"], json!({"sessionId": "s"}), "{body}");
+
+    let mut watch = bench.watch(&scopes(&["session/s"])).await;
+    watch
+        .until("the session alignment", |watch| watch.has("session/s"))
+        .await;
+    let live = watch.live("session/s");
+    assert_eq!(live["controls"]["configOptions"], response);
+    let (status, body) = bench
+        .op(
+            "session/s",
+            &live["op"]["id"],
+            "set_config",
+            json!({"configId": "from-response", "value": true}),
+        )
+        .await;
+    let op = assert_accepted(status, &body, "the option offered by the setup response");
+    // A 202 alone is insufficient: execution must use the same options as
+    // admission and actually send the accepted write to the Agent.
+    let request = link.request("session/set_config_option").await;
+    assert_eq!(request["params"]["sessionId"], "s");
+    assert_eq!(request["params"]["configId"], "from-response");
+    assert_eq!(request["params"]["value"], true);
+    let confirmed = json!([{
+        "type": "boolean", "id": "from-response", "name": "Response", "currentValue": true,
+    }]);
+    link.reply(&request, json!({"configOptions": confirmed}))
+        .await;
+    watch.until_op("session/s", &op, "completed").await;
+    assert_eq!(
+        watch.live("session/s")["controls"]["configOptions"],
+        confirmed
+    );
+    watch.converged(&bench).await;
+}
+
 /// A successful `set_mode` or `set_config` folds its acknowledgement into
 /// `controls` in the event that ends it; a failed one changes nothing
 /// (acceptance 18).
