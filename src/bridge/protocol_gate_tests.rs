@@ -1907,6 +1907,10 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
     peer.settled().await;
 
     peer.stop().await.unwrap();
+    assert!(
+        peer.state.upgrade().is_none(),
+        "the stopped connection still owns its coordinator with requests pending"
+    );
     let global = peer.live("global");
     assert_eq!(global["agent"]["phase"], "stopped");
     for scope in ["global", "catalog"] {
