@@ -12,7 +12,6 @@ use crate::protocol::SessionControls;
 use crate::protocol::documents::OperationKind;
 use crate::protocol::op::OpSlot;
 use crate::protocol::registry::TurnEnd;
-use crate::session_mirror::TurnOverlay;
 use crate::session_registry::{SessionEntry, SessionRegistry};
 use crate::session_state::{MirrorError, SessionAdmission, SessionState, TurnAdmission};
 

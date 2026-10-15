@@ -650,12 +650,6 @@ impl SessionRegistry {
             .map(|turn| turn.operation_id.as_str())
     }
 
-    pub(crate) fn touch(&mut self, session_id: &str, incarnation: u64) -> Result<u64, MirrorError> {
-        let session = self.require_state_mut(session_id, incarnation)?;
-        session.view_revision = next_revision(session.view_revision);
-        Ok(session.view_revision)
-    }
-
     #[cfg(test)]
     pub(crate) fn abort_turn(
         &mut self,

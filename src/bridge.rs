@@ -7662,8 +7662,6 @@ mod tests {
             .sessions
             .close_session(&epoch, "session", first, "close")
             .unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
         complete_session_retirement(
             &mut state,
             "session",
@@ -9682,8 +9680,6 @@ mod tests {
     #[tokio::test]
     async fn close_cleanup_tombstone_blocks_same_id_reattachment() {
         let state = Arc::new(BridgeLock::new(BridgeState::default()));
-        let (tx, _events) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
         let incarnation = {
             let mut state = state.lock().await;
             let incarnation = register_test_session(&mut state, "session", "/workspace");
@@ -9806,8 +9802,6 @@ mod tests {
                 .stage,
             "cleanup"
         );
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
         complete_session_retirement(
             &mut state,
             "session",

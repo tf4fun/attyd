@@ -186,6 +186,21 @@ async fn assert_interaction_sequence(
     coordinator::dispatch_ready(update, scheduling, connection, services, false)
         .await
         .unwrap();
+    // The connection runs the update's handler; wait until the session has it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let mut state = services.state.lock().await;
+                let view = state.sessions.view(SESSION, incarnation).unwrap();
+                if !view.baseline.updates().is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the session update was applied");
     let mut state = services.state.lock().await;
     let view = state.sessions.view(SESSION, incarnation).unwrap();
     assert_eq!(view.baseline.updates().len(), 1);
