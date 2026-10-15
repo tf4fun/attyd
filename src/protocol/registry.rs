@@ -145,7 +145,11 @@ fn settle_agent_request(slot: &mut OpSlot, unjoined: bool, joined: bool) {
     if unjoined && !slot.is_running() {
         *slot = OpSlot::running(OperationKind::AgentRequest, json!({}));
     } else if !unjoined && !joined && slot.is_running_kind(OperationKind::AgentRequest) {
-        slot.complete(json!({}));
+        if slot.cancel_requested {
+            slot.status = super::documents::OperationStatus::Cancelled;
+        } else {
+            slot.complete(json!({}));
+        }
     }
 }
 
@@ -228,6 +232,47 @@ impl SessionRegistry {
             self.scopes.occupied.insert(session_id, scope.clone());
         }
         Ok(id)
+    }
+
+    /// The held response of the running operation `op` in `scope` takes its
+    /// end (protocol §6.3).
+    pub(crate) fn hold_response(
+        &mut self,
+        scope: &Scope,
+        op: &str,
+        sender: tokio::sync::oneshot::Sender<super::op::OpEnd>,
+    ) {
+        if self.held_scope(scope) {
+            let slot = self.slot_mut(scope);
+            if slot.id == op && slot.is_running() {
+                slot.completion = super::op::Completion::new(sender);
+            }
+        }
+    }
+
+    /// The running operation `op`, wherever it is, failed: it frees the
+    /// sessions it occupies. Another operation is never touched, whatever its
+    /// kind.
+    pub(crate) fn fail_protocol_operation(&mut self, op: &str, error: ProtocolError) {
+        let scope = [Scope::Global, Scope::Catalog]
+            .into_iter()
+            .find(|scope| self.slot_mut(scope).id == op)
+            .or_else(|| {
+                self.sessions.iter().find_map(|(session_id, entry)| {
+                    let live = entry.state.live.as_ref()?;
+                    (live.op.id == op).then(|| Scope::Session(session_id.clone()))
+                })
+            });
+        let Some(scope) = scope else {
+            return;
+        };
+        if !self.slot_mut(&scope).is_running() {
+            return;
+        }
+        self.scopes
+            .occupied
+            .retain(|_, occupier| *occupier != scope);
+        self.slot_mut(&scope).fail(error);
     }
 
     /// The slot a held scope shows: the occupying operation's, if any.
@@ -736,6 +781,36 @@ impl SessionRegistry {
                 .op
                 .fail(ProtocolError::new(ErrorCode::Unavailable, reason)),
         }
+    }
+
+    /// A cancel of the running operation `op` that `scope` shows was
+    /// requested: it sets `cancelRequested` once. Whether this is the first.
+    pub(crate) fn request_operation_cancel(&mut self, scope: &Scope, op: &str) -> bool {
+        let owner = match scope {
+            Scope::Session(session_id) => self
+                .scopes
+                .occupied
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| scope.clone()),
+            _ => scope.clone(),
+        };
+        if !self.held_scope(&owner) {
+            return false;
+        }
+        let slot = self.slot_mut(&owner);
+        if slot.id != op || !slot.is_running() || slot.cancel_requested {
+            return false;
+        }
+        slot.cancel_requested = true;
+        true
+    }
+
+    /// Whether a cancel of the running operation `op` of `scope` was
+    /// requested.
+    pub(crate) fn operation_cancel_requested(&self, scope: &Scope, op: &str) -> bool {
+        self.shown_slot(scope)
+            .is_some_and(|slot| slot.id == op && slot.is_running() && slot.cancel_requested)
     }
 
     /// A cancel of the running turn was requested.

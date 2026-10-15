@@ -12,6 +12,7 @@
 //! runs the commit step from migration step 4b on (docs/state-sync.md §5).
 #![allow(dead_code)]
 
+pub(crate) mod admission;
 pub(crate) mod canon;
 mod controls;
 #[cfg(test)]
@@ -29,6 +30,7 @@ pub(crate) mod registry;
 pub(crate) mod stream_check;
 #[cfg(test)]
 mod typescript;
+pub(crate) mod wire;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

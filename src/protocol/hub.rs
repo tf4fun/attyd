@@ -190,11 +190,20 @@ impl Hub {
         self.next_id += 1;
         let mut queue = Queue::default();
         for subscribed in scopes {
+            // A session held at the cut ignores the subscription's directory
+            // (§5.1): the subscription keeps the session's own, so a later
+            // load of it runs where the session ran.
+            let cwd = match publisher.live(&subscribed.scope) {
+                Some(live) if matches!(subscribed.scope, Scope::Session(_)) => {
+                    live["cwd"].as_str().map(str::to_string)
+                }
+                _ => subscribed.cwd.clone(),
+            };
             queue.followed.insert(
                 subscribed.scope.to_string(),
                 Followed {
                     session: matches!(subscribed.scope, Scope::Session(_)),
-                    cwd: subscribed.cwd.clone(),
+                    cwd,
                     baseline: subscribed.have.clone(),
                     tail: subscribed.have.clone(),
                     aligned: false,

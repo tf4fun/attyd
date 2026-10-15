@@ -202,6 +202,17 @@ subscriber's baseline where the client declared it. The load reuses the existing
 its baseline together with the patch that ends the load. A reload of a held session
 (after an Agent restart) keeps its known log until the replay replaces it.
 
+**Where step 6 lands.** `POST /api/v2/scopes/{scope}/ops` (`server::write_scope`)
+reads the body field by field and sends it to the actor as one input.
+`protocol::admission` checks it on the published documents in admission order;
+`bridge::operations` installs a starting operation and builds the command of its
+kind under the same guard, or applies `cancel` and `answer` there. An `answer` is
+checked whole before anything is delivered. Each interaction is found by its ID
+wherever it waits, and is delivered through the same permission and elicitation
+helpers as the v1 responses. An accepted URL elicitation becomes a flow in that
+step. A cancel sets `cancel_requested` once on the owning slot. A prompt or login
+whose ACP call has not started yet sees the flag when it starts.
+
 **Release.** A session whose need ends starts the existing retirement timer
 (`--session-unobserved-timeout`), now only a performance setting. When it fires and
 the session is still not needed, the bridge closes it only if the Agent advertises
@@ -217,11 +228,33 @@ terminal manager and its ordered events; its operation ends with the process exi
 and its terminal stays until dismissed. Terminal input is written as received, in
 order; the bridge does not deduplicate it.
 
+Step 6 lands the resource actions (protocol §7) in `bridge::resources`:
+- The resource is found by the full scope and resource ID. It is checked under
+  one guard, without `expect` and without an operation.
+- A URL flow is named by its interaction ID (the flow's registration). Dismissing
+  it reuses the settle and route primitives that end a flow with its scope, so a
+  late dismissal of an old flow never reaches a new flow that reuses its
+  `elicitationId`.
+- A login terminal's dismissal is allowed only after the terminal exits, and it
+  leaves the ended operation as it is.
+- Input and resize run after the guard is released. Input goes on the terminal's
+  own blocking writer, in the order the actor receives it. A stdin under
+  backpressure therefore never holds the bridge lock that the terminal's output
+  observer takes.
+
+The session reads (protocol §8) are `server::read_session`:
+- An attachment comes from the published cut (`Publisher::attachment`).
+- The context search and read run outside the actor, in the workspace the actor
+  returns for the held session's own `cwd`, with the existing workspace checks.
+- A read holds, loads and renews nothing.
+
 ## 3. Types
 
 The documents, events, ops, operation requests and results, and errors are typed
 Rust DTOs. TypeScript in `shared/protocol.ts` is generated from them, and a test
-fails when the generated output is stale. ACP types are referenced from
+fails when the generated output is stale. The HTTP bodies of writes, resource
+actions, reads and errors are in `src/protocol/wire.rs`. The bridge's own
+admission and delivery types are internal. ACP types are referenced from
 `@agentclientprotocol/sdk`, not regenerated. The earlier draft's types are deleted in step 2.
 
 ## 4. Invariants and gates

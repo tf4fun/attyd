@@ -34,8 +34,10 @@ use crate::bridge_event::{BridgeEvent, SessionEvent, SessionPosition};
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
+use crate::protocol::admission::{self, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
 use crate::protocol::hub::{HEARTBEAT, Publication, Subscribed, Subscription};
+use crate::protocol::wire;
 #[cfg(test)]
 use crate::runtime_state::fold_active_turn_update;
 use crate::runtime_state::{
@@ -607,9 +609,21 @@ struct BridgeHub {
     // Per-host test barrier for a subscription crossing Agent generations.
     #[cfg(test)]
     after_subscribe_input: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    // Per-host test barrier for the next `create`, `fork` or `list` response.
+    #[cfg(test)]
+    before_op_response: std::sync::Mutex<Option<ResponseHold>>,
     state: Mutex<BridgeHubState>,
     next_subscriber_id: AtomicU64,
     stopped: Notify,
+}
+
+/// The next `create`, `fork` or `list` write, once admitted, tells its op ID
+/// through `admitted` and waits for `resume` before its response takes the
+/// operation's result.
+#[cfg(test)]
+struct ResponseHold {
+    admitted: oneshot::Sender<String>,
+    resume: oneshot::Receiver<()>,
 }
 
 struct BridgeSubscription {
@@ -1046,6 +1060,8 @@ impl BridgeHub {
             publication: Publication::default(),
             #[cfg(test)]
             after_subscribe_input: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_op_response: std::sync::Mutex::new(None),
             state: Mutex::new(BridgeHubState::default()),
             next_subscriber_id: AtomicU64::new(1),
             stopped: Notify::new(),
@@ -1657,6 +1673,102 @@ impl BridgeHub {
             .map_err(|_| "bridge stopped before admitting the turn".to_string())?
     }
 
+    /// An operation write (protocol §6): the bridge admits it under one
+    /// guard. Without an Agent connection the same checks run on the published
+    /// documents, and an admissible write is `unavailable`; nothing starts a
+    /// connection.
+    async fn operate(
+        &self,
+        scope: Scope,
+        write: OpWrite,
+    ) -> Result<bridge::operations::OperationAdmission, ProtocolError> {
+        let input = self.state.lock().await.input.clone();
+        if let Some(input) = input {
+            let (reply, admitted) = oneshot::channel();
+            let sent = input.send(bridge::BridgeInput::Operation {
+                scope: scope.clone(),
+                write: write.clone(),
+                reply,
+            });
+            if sent.is_ok()
+                && let Ok(admitted) = admitted.await
+            {
+                return admitted;
+            }
+        }
+        admission::admit(&self.publication.lock().publisher, &scope, &write)?;
+        Err(ProtocolError::new(
+            ErrorCode::Unavailable,
+            "there is no Agent connection",
+        ))
+    }
+
+    /// A resource action (protocol §7), applied under one bridge guard.
+    /// Without an Agent connection its resources are gone with it.
+    async fn act(
+        &self,
+        scope: Scope,
+        resource: String,
+        action: bridge::resources::ResourceAction,
+    ) -> Result<(), ProtocolError> {
+        let input = self.state.lock().await.input.clone();
+        if let Some(input) = input {
+            let (reply, acted) = oneshot::channel();
+            let sent = input.send(bridge::BridgeInput::Resource {
+                scope: scope.clone(),
+                resource: resource.clone(),
+                action,
+                reply,
+            });
+            if sent.is_ok()
+                && let Ok(acted) = acted.await
+            {
+                return acted;
+            }
+        }
+        Err(ProtocolError::new(
+            ErrorCode::NotFound,
+            format!("{scope} has no resource {resource}"),
+        ))
+    }
+
+    /// The workspace of a held session's context reads (protocol §8).
+    async fn workspace(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::filesystem::WorkspaceFileSystem, ProtocolError> {
+        let input = self.state.lock().await.input.clone();
+        if let Some(input) = input {
+            let (reply, workspace) = oneshot::channel();
+            let sent = input.send(bridge::BridgeInput::Workspace {
+                session_id: session_id.to_string(),
+                reply,
+            });
+            if sent.is_ok()
+                && let Ok(workspace) = workspace.await
+            {
+                return workspace;
+            }
+        }
+        Err(ProtocolError::new(
+            ErrorCode::Unavailable,
+            "there is no Agent connection",
+        ))
+    }
+
+    /// The test barrier of the next held response, once admitted.
+    #[cfg(test)]
+    async fn before_op_response(&self, op: &str) {
+        let hold = self.before_op_response.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _ = hold.admitted.send(op.to_string());
+            let _ = hold.resume.await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn before_op_response(&self, _op: &str) {}
+
     async fn business_request(
         &self,
         command: serde_json::Value,
@@ -1906,7 +2018,10 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route_layer(middleware::from_fn(enforce_json_request_timeout))
         .route("/api/v1/events", get(global_events))
         .route("/api/v2/stream", get(protocol_stream))
-        .route("/api/v2/scopes/{*scope}", get(read_scope))
+        // Writes share the read's wildcard; held `create`, `fork` and `list`
+        // responses take no JSON deadline (protocol §6.3).
+        .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
+        .route("/api/v2/sessions/{*read}", get(read_session))
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
@@ -2025,7 +2140,7 @@ async fn global_events(State(state): State<AppState>) -> Response {
 
 /// A protocol error body `{ error: { code, message } }` (protocol §9).
 fn protocol_error(status: StatusCode, error: ProtocolError) -> Response {
-    (status, axum::Json(json!({ "error": error }))).into_response()
+    (status, axum::Json(wire::ErrorBody { error })).into_response()
 }
 
 /// `GET /api/v2/scopes/{scope}` (protocol §8): the published document. It
@@ -2049,6 +2164,297 @@ async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) ->
         body["log"] = json!(log);
     }
     axum::Json(body).into_response()
+}
+
+/// The reads of a held session (protocol §8): an attachment its published
+/// `log` or `live` references, and its workspace context. A read holds,
+/// loads and renews nothing; an unheld session is `not_found`. The raw path
+/// is split before decoding, so an encoded session ID keeps its `/`.
+async fn read_session(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let segments: Option<Vec<String>> = uri
+        .path()
+        .strip_prefix("/api/v2/sessions/")
+        .unwrap_or_default()
+        .split('/')
+        .map(path_segment)
+        .collect();
+    let Some(segments) = segments else {
+        return invalid_request("the path is not valid percent-encoded UTF-8");
+    };
+    let segments = segments.iter().map(String::as_str).collect::<Vec<_>>();
+    let (session_id, read) = match segments[..] {
+        [session_id, ref read @ ..] if !session_id.is_empty() => (session_id, read),
+        _ => return invalid_request("no session"),
+    };
+    // An attachment ID is the lowercase hex SHA-256 of its block (§3.1); any
+    // other is malformed.
+    if let ["attachments", attachment_id] = read
+        && (attachment_id.len() != 64
+            || !attachment_id
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        return invalid_request(format!("{attachment_id} is not an attachment ID"));
+    }
+    let session = Scope::Session(session_id.to_string());
+    let held = state
+        .bridge
+        .publication
+        .lock()
+        .publisher
+        .live(&session)
+        .is_some();
+    let scope = session.to_string();
+    let unheld = || {
+        refused(ProtocolError::new(
+            ErrorCode::NotFound,
+            format!("{scope} is not held"),
+        ))
+    };
+    if !held {
+        return unheld();
+    }
+    let parameter = |name: &str| {
+        url::form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes())
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| invalid_request(format!("{name} is required")))
+    };
+    match read {
+        ["attachments", attachment_id] => {
+            let block = state
+                .bridge
+                .publication
+                .lock()
+                .publisher
+                .attachment(session_id, attachment_id);
+            match block {
+                Some(block) => axum::Json(block).into_response(),
+                None => refused(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!("{scope} references no attachment {attachment_id}"),
+                )),
+            }
+        }
+        ["files"] => {
+            let query = match parameter("query") {
+                Ok(query) => query,
+                Err(response) => return response,
+            };
+            let workspace = match state.bridge.workspace(session_id).await {
+                Ok(workspace) => workspace,
+                Err(error) => return refused(error),
+            };
+            match workspace.search_context(&query).await {
+                Ok(matches) => axum::Json(json!({ "matches": matches })).into_response(),
+                Err(error) => refused(bridge::resources::refusal(error)),
+            }
+        }
+        ["files", "content"] => {
+            let path = match parameter("path") {
+                Ok(path) if !path.is_empty() => path,
+                Ok(_) => return invalid_request("path is required"),
+                Err(response) => return response,
+            };
+            let workspace = match state.bridge.workspace(session_id).await {
+                Ok(workspace) => workspace,
+                Err(error) => return refused(error),
+            };
+            match workspace.read_context(std::path::Path::new(&path)).await {
+                Ok(attachment) => axum::Json(json!({ "attachment": attachment })).into_response(),
+                Err(error) => refused(bridge::resources::refusal(error)),
+            }
+        }
+        _ => refused(ProtocolError::new(
+            ErrorCode::NotFound,
+            format!("no such read of {scope}"),
+        )),
+    }
+}
+
+/// The status of a refusal (protocol §9).
+fn error_status(code: ErrorCode) -> StatusCode {
+    match code {
+        ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        ErrorCode::NotFound => StatusCode::NOT_FOUND,
+        ErrorCode::Stale | ErrorCode::NotAllowed | ErrorCode::CatalogChanged => {
+            StatusCode::CONFLICT
+        }
+        ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
+        ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::AgentError => StatusCode::BAD_GATEWAY,
+    }
+}
+
+fn refused(error: ProtocolError) -> Response {
+    protocol_error(error_status(error.code), error)
+}
+
+fn invalid_request(message: impl Into<String>) -> Response {
+    refused(ProtocolError::new(ErrorCode::InvalidRequest, message))
+}
+
+/// Percent-decodes one raw path segment, so an encoded `/` stays inside it.
+fn path_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// A write's JSON body. Its media type is exactly `application/json`, in
+/// any case, with optional parameters.
+fn json_body(headers: &HeaderMap, body: &[u8]) -> Result<serde_json::Value, Response> {
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| {
+            media
+                .trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("application/json")
+        });
+    if !json {
+        return Err(invalid_request("the body must be application/json"));
+    }
+    serde_json::from_slice(body)
+        .map_err(|error| invalid_request(format!("the body is not JSON: {error}")))
+}
+
+/// A resource action's body (protocol §7).
+fn resource_action(
+    action: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<bridge::resources::ResourceAction, Response> {
+    use bridge::resources::ResourceAction;
+    use wire::{TerminalInput, TerminalResize};
+    let body = json_body(headers, body)?;
+    let invalid = |error: serde_json::Error| invalid_request(format!("{action}: {error}"));
+    match action {
+        "input" => {
+            let TerminalInput { data } = serde_json::from_value(body).map_err(invalid)?;
+            Ok(ResourceAction::Input { data })
+        }
+        "resize" => {
+            let TerminalResize { cols, rows } = serde_json::from_value(body).map_err(invalid)?;
+            crate::auth_terminal::validate_size(cols, rows)
+                .map_err(|error| refused(bridge::resources::refusal(error)))?;
+            Ok(ResourceAction::Resize { cols, rows })
+        }
+        _ if body.is_object() => Ok(ResourceAction::Dismiss),
+        _ => Err(invalid_request("dismiss: the body must be an object")),
+    }
+}
+
+/// The operation write in a request body (protocol §6.1).
+fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
+    let body = json_body(headers, body)?;
+    let field = |name: &str| {
+        body[name]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| invalid_request(format!("{name} must be a string")))
+    };
+    let args = match body.get("args") {
+        None => json!({}),
+        Some(args) if args.is_object() => args.clone(),
+        Some(_) => return Err(invalid_request("args must be an object")),
+    };
+    Ok(OpWrite {
+        expect: field("expect")?,
+        kind: field("kind")?,
+        args,
+    })
+}
+
+/// `POST /api/v2/scopes/{scope}/ops` (protocol §6) and the resource actions
+/// (§7). The raw path is split before decoding, so an encoded session ID
+/// keeps its `/`.
+async fn write_scope(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let segments: Option<Vec<String>> = uri
+        .path()
+        .strip_prefix("/api/v2/scopes/")
+        .unwrap_or_default()
+        .split('/')
+        .map(path_segment)
+        .collect();
+    let Some(segments) = segments else {
+        return invalid_request("the path is not valid percent-encoded UTF-8");
+    };
+    let Some(scope) = segments.first().and_then(|scope| Scope::parse(scope)) else {
+        return invalid_request(format!(
+            "no scope {}",
+            segments.first().map_or("", |scope| scope)
+        ));
+    };
+    match segments[1..].iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["ops"] => {}
+        [
+            "resources",
+            resource,
+            action @ ("input" | "resize" | "dismiss"),
+        ] => {
+            let action = match resource_action(action, &headers, &body) {
+                Ok(action) => action,
+                Err(response) => return response,
+            };
+            return match state.bridge.act(scope, resource.to_string(), action).await {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(error) => refused(error),
+            };
+        }
+        _ => {
+            return refused(ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("no such write in {scope}"),
+            ));
+        }
+    }
+    let write = match op_write(&headers, &body) {
+        Ok(write) => write,
+        Err(response) => return response,
+    };
+    let admission = match state.bridge.operate(scope, write).await {
+        Ok(admission) => admission,
+        Err(error) => return refused(error),
+    };
+    let op = admission.op;
+    let Some(end) = admission.end else {
+        return (StatusCode::ACCEPTED, axum::Json(wire::OpAccepted { op })).into_response();
+    };
+    state.bridge.before_op_response(&op).await;
+    // A dropped response drops only this receiver; the operation runs on.
+    let end = match end.await {
+        Ok(Ok(result)) => wire::OpOutcome::Result { result },
+        Ok(Err(error)) => wire::OpOutcome::Error { error },
+        Err(_) => wire::OpOutcome::Error {
+            error: ProtocolError::new(
+                ErrorCode::Unavailable,
+                "the operation ended without a result",
+            ),
+        },
+    };
+    axum::Json(wire::OpEnded { op, end }).into_response()
 }
 
 /// `GET /api/v2/stream` (protocol §5): the events of the scopes it follows,
@@ -2870,7 +3276,9 @@ async fn get_attachment(
         || !valid_api_identifier(&query.expected_epoch)
         || query.expected_incarnation == 0
         || attachment_id.len() != 64
-        || !attachment_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !attachment_id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return api_bad_request("invalid attachment reference");
     }

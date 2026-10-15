@@ -598,7 +598,8 @@ type ErrorCode =
   | "not_found"             // 404: unknown scope or resource
   | "stale"                 // 409: `expect` is not the current op.id
   | "not_allowed"           // 409: the operation's status, the occupied scopes or the
-                            //      pending interactions do not allow the write
+                            //      pending interactions do not allow the write, or the
+                            //      resource's state does not allow the action
   | "catalog_changed"       // 409: stale catalog revision
   | "unsupported"           // 501: the Agent did not advertise the capability
   | "unavailable"           // 503: no Agent connection

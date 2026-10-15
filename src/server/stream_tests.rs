@@ -20,6 +20,8 @@ use crate::protocol::stream_check::{Replica, log_values};
 
 use super::*;
 
+mod ops;
+
 const WAIT: Duration = Duration::from_secs(10);
 const CWD: &str = "/workspace";
 

@@ -6,7 +6,10 @@ import type {
   ContentBlock,
   Cost,
   CreateElicitationRequest,
+  CreateElicitationResponse,
   InitializeResponse,
+  PromptResponse,
+  RequestPermissionOutcome,
   RequestPermissionRequest,
   SessionConfigOption,
   SessionMode,
@@ -187,6 +190,76 @@ export type LiveChange = { replace: unknown, } | { patch: Array<Op>, };
 export type End = { reason: EndReason, error?: ProtocolError, };
 
 export type EndReason = "deleted" | "load_failed";
+
+export type OpRequest = { 
+/**
+ * The `op.id` the write expects the scope to show.
+ */
+expect: string, } & ({ "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty } | { "kind": "answer", "args": AnswerArgs });
+
+export type OpArgs = { "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty } | { "kind": "answer", "args": AnswerArgs };
+
+export type Empty = Record<symbol, never>;
+
+export type PromptArgs = { prompt: Array<PromptBlock>, };
+
+export type SetModeArgs = { modeId: string, };
+
+export type SetConfigArgs = { configId: string, value: ConfigValue, };
+
+export type ConfigValue = string | boolean;
+
+export type ForkArgs = { cwd?: string, };
+
+export type CreateArgs = { cwd: string, };
+
+export type DeleteArgs = { sessionId: string, };
+
+export type MethodArgs = { methodId: string, };
+
+export type TerminalLoginArgs = { methodId: string, cols: number, rows: number, };
+
+export type ListArgs = { cursor?: string, 
+/**
+ * Refused with `catalog_changed` unless it is `catalog.live.revision`.
+ */
+revision?: string, };
+
+export type AnswerArgs = { answers: { [key in string]: Answer }, };
+
+export type Answer = { outcome: RequestPermissionOutcome, } | { response: CreateElicitationResponse, };
+
+export type OpAccepted = { op: string, };
+
+export type OpEnded = { op: string, } & ({ result: unknown, } | { error: ProtocolError, });
+
+export type OpOutcome = { result: unknown, } | { error: ProtocolError, };
+
+export type SessionCreated = { sessionId: string, };
+
+export type CatalogPage = { revision: string, sessions: Array<import("@agentclientprotocol/sdk").SessionInfo>, nextCursor: string | null, };
+
+export type PromptResult = { stopReason: PromptResponse["stopReason"], usage?: PromptResponse["usage"], };
+
+export type TerminalInput = { data: string, };
+
+export type TerminalResize = { cols: number, rows: number, };
+
+export type ScopeRead = { live: SessionLive | GlobalLive | CatalogLive, log?: Array<LogEntry>, };
+
+export type ContextMatches = { matches: Array<ContextMatch>, };
+
+export type ContextMatch = { 
+/**
+ * Absolute.
+ */
+path: string, name: string, relativePath: string, rootName: string, size: number, };
+
+export type ContextRead = { attachment: ContextAttachment, };
+
+export type ContextAttachment = { name: string, size: number, block: Extract<ContentBlock, { type: "resource" }>, };
+
+export type ErrorBody = { error: ProtocolError, };
 
 export type ProcessUpdate = ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" }>, "content"> | ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "compaction_update" }>, "summary"> | ProjectedToolCall<Extract<SessionUpdate, { sessionUpdate: "tool_call" | "tool_call_update" }>> | Exclude<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" | "compaction_update" | "tool_call" | "tool_call_update" }>;
 

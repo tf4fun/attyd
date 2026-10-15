@@ -64,9 +64,11 @@ mod inbound_requests;
 mod memory_efficiency_tests;
 #[cfg(test)]
 mod memory_retention_tests;
+pub(crate) mod operations;
 #[cfg(test)]
 mod protocol_gate_tests;
 pub(crate) mod publication;
+pub(crate) mod resources;
 mod scheduling;
 mod streams;
 #[cfg(test)]
@@ -390,6 +392,88 @@ fn pending_elicitation<'a>(
         .sessions
         .elicitation(interaction_id)
         .map(|(owner, pending)| (Some(owner), pending))
+}
+
+/// Delivers `response` to the pending permission `permission_id` of `owner`
+/// and publishes its removal; `resolve` retires the runtime interaction.
+/// Returns whether the Agent still waited for it.
+fn deliver_permission(
+    locked: &mut BridgeState,
+    sink: &EventSink,
+    owner: &SessionResourceOwner,
+    permission_id: &str,
+    response: RequestPermissionResponse,
+    resolve: impl FnOnce(&mut BridgeState) -> Result<(), Error>,
+) -> Result<bool, Error> {
+    let pending = locked
+        .sessions
+        .take_permission(permission_id, owner)
+        .expect("exact permission owner checked under the same lock");
+    flush_runtime(locked, sink);
+    // oneshot delivery is synchronous: keep owner retirement and canonical
+    // completion ordered before another request can replace this incarnation.
+    let delivered = pending.sender.send(response).is_ok();
+    resolve(locked)?;
+    let business_delta = advance_session_delta(
+        locked,
+        &owner.session_id,
+        owner.incarnation,
+        json!({
+            "kind": "interaction_remove", "interactionId": permission_id,
+        }),
+    )?;
+    flush_runtime(locked, sink);
+    sink.send(business_delta);
+    Ok(delivered)
+}
+
+/// Delivers `response` to the pending elicitation `elicitation_id` (of
+/// `owner`, or request-scoped) and publishes its removal; `resolve` retires
+/// the runtime interaction, and a delivered accept of a URL elicitation
+/// becomes its flow with its route in the same step. Returns whether the
+/// Agent still waited for it.
+fn deliver_elicitation(
+    locked: &mut BridgeState,
+    sink: &EventSink,
+    elicitation_id: &str,
+    owner: Option<&SessionResourceOwner>,
+    response: CreateElicitationResponse,
+    accepted_url_id: Option<String>,
+    resolve: impl FnOnce(&mut BridgeState, Option<&str>) -> Result<(), Error>,
+) -> Result<bool, Error> {
+    let pending = take_pending_elicitation(locked, elicitation_id, owner)
+        .expect("exact elicitation owner checked under the same lock");
+    flush_runtime(locked, sink);
+    let delivered = pending.sender.send(response).is_ok();
+    // Immediate Agent completion/reuse cannot overtake accepted URL registration.
+    let accepted_url_id = accepted_url_id.filter(|_| delivered);
+    resolve(locked, accepted_url_id.as_deref())?;
+    if let Some(url_id) = accepted_url_id {
+        locked
+            .sessions
+            .register_url_route(&url_id, owner.cloned())
+            .map_err(mirror_error)?;
+        if owner.is_none() {
+            locked.sessions.accept_joined_flow(elicitation_id);
+        }
+    }
+    let business_delta = if let Some(owner) = owner {
+        Some(advance_session_delta(
+            locked,
+            &owner.session_id,
+            owner.incarnation,
+            json!({
+                "kind": "interaction_remove", "interactionId": elicitation_id,
+            }),
+        )?)
+    } else {
+        None
+    };
+    flush_runtime(locked, sink);
+    if let Some(delta) = business_delta {
+        sink.send(delta);
+    }
+    Ok(delivered)
 }
 
 fn take_pending_elicitation(
@@ -1824,6 +1908,30 @@ pub(crate) enum BridgeInput {
     },
     /// Starts the next load v2 streams wait for.
     ServeStreams,
+    /// An operation write (protocol §6): admitted and installed under one
+    /// bridge guard, then run as the command of its kind.
+    Operation {
+        scope: OpScope,
+        write: crate::protocol::admission::OpWrite,
+        reply: oneshot::Sender<
+            Result<operations::OperationAdmission, crate::protocol::documents::ProtocolError>,
+        >,
+    },
+    /// A resource action (protocol §7): found and applied under one bridge
+    /// guard; it installs no operation.
+    Resource {
+        scope: OpScope,
+        resource: String,
+        action: resources::ResourceAction,
+        reply: oneshot::Sender<Result<(), crate::protocol::documents::ProtocolError>>,
+    },
+    /// The workspace of a held session, for its context reads (protocol §8);
+    /// it holds, loads and renews nothing.
+    Workspace {
+        session_id: String,
+        reply:
+            oneshot::Sender<Result<WorkspaceFileSystem, crate::protocol::documents::ProtocolError>>,
+    },
 }
 
 impl BridgeInput {
@@ -1831,13 +1939,18 @@ impl BridgeInput {
     /// session ID is validated by the reducer, never used to redirect a reply.
     fn session_id<'a>(&'a self, state: &'a BridgeState) -> Option<&'a str> {
         match self {
-            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } | Self::ServeStreams => None,
+            Self::RuntimeSnapshotRequest
+            | Self::Subscribe { .. }
+            | Self::ServeStreams
+            | Self::Resource { .. }
+            | Self::Workspace { .. } => None,
             Self::SessionViewRequest { session_id, .. }
             | Self::ObserveSession { session_id, .. }
             | Self::UnobserveSession { session_id, .. }
             | Self::RetireUnobservedSession { session_id, .. }
             | Self::TurnRequest { session_id, .. } => Some(session_id),
             Self::FinishHistorySync { owner } => Some(&owner.session.session_id),
+            Self::Operation { scope, write, .. } => operations::write_session(scope, write),
             Self::BusinessRequest { command, .. } | Self::PreparedAttachment { command, .. } => {
                 match command.get("type").and_then(Value::as_str)? {
                     "permission/respond" => state
@@ -1905,6 +2018,14 @@ impl BridgeInput {
             Self::BusinessRequest { command, .. } | Self::PreparedAttachment { command, .. } => {
                 serialized_value_len(command)
             }
+            Self::Operation { write, .. } => serialized_value_len(&write.args),
+            Self::Resource {
+                resource, action, ..
+            } => serialized_value_len(resource).saturating_add(match action {
+                resources::ResourceAction::Input { data } => data.len(),
+                _ => 0,
+            }),
+            Self::Workspace { session_id, .. } => serialized_value_len(session_id),
         };
         payload.saturating_add(256)
     }
@@ -1939,6 +2060,24 @@ impl BridgeInput {
                     let _ = response.send(Err(BridgeRequestError::from_acp(&error)));
                 }
             }
+            Self::Operation { reply, .. } => {
+                let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
+                    crate::protocol::documents::ErrorCode::Unavailable,
+                    error_message(error),
+                )));
+            }
+            Self::Resource { reply, .. } => {
+                let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
+                    crate::protocol::documents::ErrorCode::Unavailable,
+                    error_message(error),
+                )));
+            }
+            Self::Workspace { reply, .. } => {
+                let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
+                    crate::protocol::documents::ErrorCode::Unavailable,
+                    error_message(error),
+                )));
+            }
         }
     }
 }
@@ -1947,6 +2086,9 @@ fn browser_traffic_class(input: &BridgeInput) -> crate::session_dispatch::Traffi
     use crate::session_dispatch::TrafficClass;
     match input {
         BridgeInput::TurnRequest { .. } => TrafficClass::Ordinary,
+        BridgeInput::Operation { write, .. } if operations::ordinary(write) => {
+            TrafficClass::Ordinary
+        }
         BridgeInput::BusinessRequest { command, .. }
             if matches!(
                 command.get("type").and_then(Value::as_str),
@@ -2745,6 +2887,61 @@ where
                         prepared_attachment = Some(reservation);
                         (command, None, response.map(BusinessResponder::new))
                     }
+                    Some(BridgeInput::Operation { scope, write, reply }) => {
+                        let mut state = state.lock().await;
+                        match operations::admit(&mut state, &scope, &write) {
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                            Ok(operations::Write::Running(admitted)) => {
+                                let applied = operations::apply(
+                                    &mut state,
+                                    &sink,
+                                    &connection,
+                                    &auth_terminal,
+                                    &scope,
+                                    admitted,
+                                );
+                                let _ = reply.send(applied);
+                                continue;
+                            }
+                            Ok(operations::Write::Start(admission, command)) => {
+                                let _ = reply.send(Ok(admission));
+                                // A prompt runs on the turn path; nothing waits
+                                // for its v1 admission reply.
+                                let turn = (command["type"] == "session/prompt")
+                                    .then(|| TurnResponder::new(oneshot::channel().0));
+                                (command, turn, None)
+                            }
+                        }
+                    }
+                    Some(BridgeInput::Resource {
+                        scope,
+                        resource,
+                        action,
+                        reply,
+                    }) => {
+                        let acted = {
+                            let mut state = state.lock().await;
+                            resources::act(&mut state, &sink, &scope, &resource, action)
+                        };
+                        match acted {
+                            Ok(Some(io)) => resources::perform(&auth_terminal, io, reply),
+                            acted => {
+                                let _ = reply.send(acted.map(drop));
+                            }
+                        }
+                        continue;
+                    }
+                    Some(BridgeInput::Workspace { session_id, reply }) => {
+                        let workspace = {
+                            let state = state.lock().await;
+                            resources::workspace(&state, filesystem.as_deref(), &session_id)
+                        };
+                        let _ = reply.send(workspace);
+                        continue;
+                    }
                     None => break,
                 };
                 let operation = command
@@ -2781,6 +2978,10 @@ where
                         .get("sessionId")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
+                    let protocol_operation = command
+                        .get(operations::OPERATION_FIELD)
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
                     let bridge_managed_materialization = command
                         .get("bridgeManagedMaterialization")
                         .and_then(Value::as_bool)
@@ -2799,6 +3000,12 @@ where
                         ) {
                             if let Some(responder) = &business_responder {
                                 responder.error(&error);
+                            }
+                            if let Some(op) = &protocol_operation {
+                                state.sessions.fail_protocol_operation(op, operation_error(&error, false));
+                                if operation == "session/delete" {
+                                    streams::wake(&state);
+                                }
                             }
                             return Ok(());
                         }
@@ -2871,16 +3078,31 @@ where
                         .await
                     };
                     if let Err(error) = &result {
-                        fail_command_operation(
-                            &mut *context.state.lock().await,
-                            &operation,
-                            intent_session_id.as_deref(),
-                            error,
-                            // The Agent connection ending, by a cancel or by
-                            // the transport closing, is not the Agent's error.
-                            context.cancellation.is_cancelled()
-                                || is_incoming_transport_closed(error),
-                        );
+                        // The Agent connection ending, by a cancel or by the
+                        // transport closing, is not the Agent's error.
+                        let closing = context.cancellation.is_cancelled()
+                            || is_incoming_transport_closed(error);
+                        let mut state = context.state.lock().await;
+                        match &protocol_operation {
+                            // A write's command settles its own operation only.
+                            Some(op) => {
+                                state.sessions.fail_protocol_operation(op, operation_error(error, closing));
+                                refresh_observer_timers(&mut state);
+                                if operation == "session/delete" {
+                                    // The failed delete frees what it occupied:
+                                    // the streams that waited for it load the
+                                    // session.
+                                    streams::wake(&state);
+                                }
+                            }
+                            None => fail_command_operation(
+                                &mut state,
+                                &operation,
+                                intent_session_id.as_deref(),
+                                error,
+                                closing,
+                            ),
+                        }
                     }
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
                         responder.error(error);
@@ -4560,7 +4782,12 @@ async fn handle_command_inner(
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {source_id}"))
                 })?;
-                let cwd = source.live.cwd.clone();
+                // A fork's explicit `cwd` overrides the source's (protocol §6.2).
+                let cwd = command
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| source.live.cwd.clone());
                 let source_incarnation = source.state.incarnation;
                 let source_baseline = session_mirror(&mut state)
                     .view(&source_id, source_incarnation)
@@ -5315,7 +5542,7 @@ async fn handle_command_inner(
                 validate_prompt_capabilities(blocks, &state)?;
             }
             let prompt: Vec<ContentBlock> = serde_json::from_value(prompt_value)?;
-            let (incarnation, mirror_operation_id) = {
+            let (incarnation, mirror_operation_id, cancelled) = {
                 let mut state = state.lock().await;
                 let incarnation = state
                     .sessions
@@ -5355,12 +5582,21 @@ async fn handle_command_inner(
                 state
                     .sessions
                     .supersede_history_sync(&session_id, incarnation);
+                // A v2 prompt cancelled before its turn started is cancelled
+                // as soon as it is sent.
+                let cancelled = state.sessions.operation_cancel_requested(
+                    &OpScope::Session(session_id.clone()),
+                    &client_intent_id,
+                );
+                if cancelled {
+                    commit_session_cancel(&mut state, &sink, &session_id, incarnation)?;
+                }
                 flush_runtime(&mut state, &sink);
                 let view = session_view_value(&mut state, &session_id, incarnation)?;
                 sink.send(json!({
                     "type": "bridge/session_view", "sessionId": session_id, "view": view,
                 }));
-                (incarnation, mirror_operation_id)
+                (incarnation, mirror_operation_id, cancelled)
             };
             turn_responder.success(json!({
                 "operationId": mirror_operation_id,
@@ -5378,6 +5614,10 @@ async fn handle_command_inner(
                 || {
                     if let Some(prompt_start) = prompt_start.as_mut() {
                         prompt_start.finish();
+                    }
+                    if cancelled {
+                        let _ = connection
+                            .send_notification(CancelNotification::new(session_id.clone()));
                     }
                 },
             )
@@ -5810,34 +6050,26 @@ async fn handle_command_inner(
                     request_id.clone(),
                 )
                 .map_err(runtime_state_error)?;
-            let pending = locked
-                .sessions
-                .take_permission(&permission_id, &owner)
-                .expect("exact permission owner checked under the same lock");
-            flush_runtime(&mut locked, &sink);
-            // oneshot delivery is synchronous: keep owner retirement and canonical
-            // completion ordered before another request can replace this incarnation.
-            let delivered = pending.sender.send(response).is_ok();
-            locked
-                .sessions
-                .complete_permission_response(
-                    &owner.epoch,
-                    &owner.session_id,
-                    owner.incarnation,
-                    &permission_id,
-                    &request_id,
-                )
-                .map_err(runtime_state_error)?;
-            let business_delta = advance_session_delta(
+            let delivered = deliver_permission(
                 &mut locked,
-                &owner.session_id,
-                owner.incarnation,
-                json!({
-                    "kind": "interaction_remove", "interactionId": permission_id,
-                }),
+                &sink,
+                &owner,
+                &permission_id,
+                response,
+                |locked| {
+                    locked
+                        .sessions
+                        .complete_permission_response(
+                            &owner.epoch,
+                            &owner.session_id,
+                            owner.incarnation,
+                            &permission_id,
+                            &request_id,
+                        )
+                        .map(drop)
+                        .map_err(runtime_state_error)
+                },
             )?;
-            flush_runtime(&mut locked, &sink);
-            sink.send(business_delta);
             ensure_interaction_delivered(delivered, "permission")?;
         }
         "elicitation/respond" => {
@@ -5876,46 +6108,27 @@ async fn handle_command_inner(
                     request_id.clone(),
                 )
                 .map_err(runtime_state_error)?;
-            let pending = take_pending_elicitation(&mut locked, &elicitation_id, owner.as_ref())
-                .expect("exact elicitation owner checked under the same lock");
-            flush_runtime(&mut locked, &sink);
-            let delivered = pending.sender.send(response.clone()).is_ok();
-            // Immediate Agent completion/reuse cannot overtake accepted URL registration.
-            locked
-                .sessions
-                .complete_elicitation_response(
-                    &epoch,
-                    runtime_scope,
-                    &elicitation_id,
-                    &request_id,
-                    delivered.then_some(accepted_url_id.as_deref()).flatten(),
-                )
-                .map_err(runtime_state_error)?;
-            if delivered && let Some(url_id) = accepted_url_id {
-                locked
-                    .sessions
-                    .register_url_route(&url_id, owner.clone())
-                    .map_err(mirror_error)?;
-                if owner.is_none() {
-                    locked.sessions.accept_joined_flow(&elicitation_id);
-                }
-            }
-            let business_delta = if let Some(owner) = &owner {
-                Some(advance_session_delta(
-                    &mut locked,
-                    &owner.session_id,
-                    owner.incarnation,
-                    json!({
-                        "kind": "interaction_remove", "interactionId": elicitation_id,
-                    }),
-                )?)
-            } else {
-                None
-            };
-            flush_runtime(&mut locked, &sink);
-            if let Some(delta) = business_delta {
-                sink.send(delta);
-            }
+            let delivered = deliver_elicitation(
+                &mut locked,
+                &sink,
+                &elicitation_id,
+                owner.as_ref(),
+                response,
+                accepted_url_id,
+                |locked, accepted_url_id| {
+                    locked
+                        .sessions
+                        .complete_elicitation_response(
+                            &epoch,
+                            runtime_scope,
+                            &elicitation_id,
+                            &request_id,
+                            accepted_url_id,
+                        )
+                        .map(drop)
+                        .map_err(runtime_state_error)
+                },
+            )?;
             ensure_interaction_delivered(delivered, "elicitation")?;
         }
         "context/search" => {
@@ -5991,17 +6204,28 @@ async fn handle_command_inner(
             };
             // The running `terminal_login` owns the terminal, by its ID, from
             // before the process can print (protocol §4.6).
-            let login = {
-                let mut locked = state.lock().await;
-                let global = &locked.sessions.scopes.global;
-                let op = global
-                    .is_running_kind(OpKind::TerminalLogin)
-                    .then(|| global.id.clone());
-                if let Some(op) = &op {
-                    locked.sessions.start_login_terminal(op, method_id);
+            // It starts under the guard a cancel takes, so a cancel either
+            // finds the process to stop or keeps it from starting.
+            let mut locked = state.lock().await;
+            let global = &locked.sessions.scopes.global;
+            let login = global
+                .is_running_kind(OpKind::TerminalLogin)
+                .then(|| global.id.clone());
+            if let Some(op) = &login {
+                if global.cancel_requested {
+                    locked.sessions.login_exited(
+                        op,
+                        crate::protocol::registry::LoginExit {
+                            exit_code: None,
+                            signal: None,
+                            cancelled: true,
+                            failure: None,
+                        },
+                    );
+                    return Ok(());
                 }
-                op
-            };
+                locked.sessions.start_login_terminal(op, method_id);
+            }
             let observer = login
                 .clone()
                 .map(|op| publication::login_observer(Arc::downgrade(&state), op));
@@ -6015,7 +6239,7 @@ async fn handle_command_inner(
                 observer,
             ) {
                 if let Some(op) = &login {
-                    state.lock().await.sessions.discard_login_terminal(op);
+                    locked.sessions.discard_login_terminal(op);
                 }
                 return Err(error);
             }
@@ -6767,7 +6991,7 @@ fn validate_session_list_page(
     Ok(())
 }
 
-fn valid_session_path(value: &str) -> bool {
+pub(crate) fn valid_session_path(value: &str) -> bool {
     !value.is_empty() && !value.contains('\0') && is_portable_absolute_path(value)
 }
 
