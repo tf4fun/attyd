@@ -23,9 +23,7 @@ use self::scheduling::{ExecutionTurn, IngressSender};
 use crate::agent_process::StdioAcpAgent;
 use crate::auth_terminal::{AuthTerminalManager, validate_method as validate_terminal_auth_method};
 use crate::bridge_event::BridgeEvent;
-use crate::elicitation_validation::{
-    validate_elicitation_request, validate_elicitation_response_value,
-};
+use crate::elicitation_validation::validate_elicitation_request;
 use crate::event_queue::EventSender;
 use crate::filesystem::WorkspaceFileSystem;
 use crate::mcp::McpManager;
@@ -368,6 +366,11 @@ fn take_sync_control_candidate(state: &mut BridgeState, session_id: &str) -> Syn
 fn interaction_owner_is_live(state: &BridgeState, owner: &SessionResourceOwner) -> bool {
     state.sessions.owns_resources(owner)
         && state.sessions.resource_session(&owner.session_id).is_some()
+}
+
+#[cfg(test)]
+fn pending_elicitation_count(state: &BridgeState) -> usize {
+    state.request_elicitations.len() + state.sessions.elicitation_owners.len()
 }
 
 fn pending_elicitation<'a>(
@@ -1637,7 +1640,6 @@ struct CommandContext {
     state: Arc<BridgeLock>,
     sink: EventSink,
     terminals: Option<TerminalManager>,
-    filesystem: Option<Arc<WorkspaceFileSystem>>,
     auth_terminal: AuthTerminalManager,
     prompt_lifecycle: Arc<PromptLifecycle>,
     cancellation: CancellationToken,
@@ -2247,7 +2249,7 @@ where
                     Some(BridgeInput::Subscribe { scopes, reply }) => {
                         let mut state = state.lock().await;
                         let (subscription, command) =
-                            streams::subscribe(&mut state, &sink, &scopes);
+                            streams::subscribe(&mut state, &scopes);
                         let _ = reply.send(subscription);
                         let Some(command) = command else {
                             continue;
@@ -2256,7 +2258,7 @@ where
                     }
                     Some(BridgeInput::ServeStreams) => {
                         let mut state = state.lock().await;
-                        let command = streams::serve(&mut state, &sink);
+                        let command = streams::serve(&mut state);
                         refresh_observer_timers(&mut state);
                         let Some(command) = command else {
                             continue;
@@ -2396,8 +2398,7 @@ where
                     state: state.clone(),
                     sink: sink.clone(),
                     terminals: terminals.clone(),
-                    filesystem: filesystem.clone(),
-                    auth_terminal: auth_terminal.clone(),
+                                        auth_terminal: auth_terminal.clone(),
                     prompt_lifecycle: prompt_lifecycle.clone(),
                     cancellation: cancellation.clone(),
                     history_flow: Arc::new(HistoryFlowGuard {
@@ -3457,7 +3458,6 @@ async fn handle_command_inner(
         state,
         sink,
         terminals,
-        filesystem,
         auth_terminal,
         prompt_lifecycle,
         cancellation,
@@ -7162,19 +7162,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Business evidence that the bridge started (or retried) a history load.
-    fn is_history_load(event: &Value, session_id: &str) -> bool {
-        event["sessionId"] == session_id
-            && ((event["type"] == "bridge/session_delta"
-                && event["change"]["kind"] == "sync_state"
-                && matches!(
-                    event["change"]["phase"].as_str(),
-                    Some("loading" | "retrying")
-                ))
-                || (event["type"] == "bridge/session_view"
-                    && event["view"]["session"]["phase"] == "loading"))
-    }
-
     /// The business publication of an accepted session update: a turn delta
     /// while a turn runs, otherwise a refreshed session view.
     fn is_relayed_update(event: &Value, session_id: &str) -> bool {
@@ -7605,81 +7592,65 @@ mod tests {
         })
         .await
         .expect("bridge did not initialize");
-        request(
-            &commands,
-            json!({
-                "type": "session/new",
-                "requestId": "new",
-                "cwd": cwd,
-            }),
-        )
-        .await
-        .unwrap();
-        let initial_revision = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
-                if event["type"] == "bridge/session_view" && event["sessionId"] == "test-session" {
-                    break event["view"]["session"]["historyRevision"]
-                        .as_str()
-                        .unwrap()
-                        .to_string();
-                }
-            }
-        })
-        .await
-        .expect("new session view was not published");
+        let mut global = V2Stream::open(&commands, &[("global", None)]).await;
+        global
+            .until(|stream| stream.live("global").is_object())
+            .await;
+        let created = global
+            .write(&commands, "global", "create", json!({"cwd": cwd}))
+            .await;
+        let created = tokio::time::timeout(Duration::from_secs(10), created.end.unwrap())
+            .await
+            .expect("the create did not end")
+            .unwrap()
+            .unwrap();
+        assert_eq!(created["sessionId"], "test-session");
+        let scope = "session/test-session";
+        let mut session = V2Stream::open(&commands, &[(scope, None)]).await;
+        session.until(|stream| stream.live(scope).is_object()).await;
+        assert!(session.replicas[scope].log.is_empty());
+        let initial_head = session.replicas[scope].head();
 
-        request(
-            &commands,
-            json!({
-                "type": "session/prompt",
-                "requestId": "turn",
-                "clientIntentId": "stable-turn-intent",
-                "historyRevision": initial_revision.clone(),
-                "sessionId": "test-session",
-                "prompt": [{ "type": "text", "text": "message-actions-flow" }],
-            }),
-        )
-        .await
-        .unwrap();
-
-        let mut prompt_starts = 0;
-        let mut saw_post_turn_load = false;
-        let successor = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
-                if event["type"] == "bridge/session_view"
-                    && event["sessionId"] == "test-session"
-                    && event["view"]["session"]["phase"] == "running"
-                {
-                    prompt_starts += 1;
-                }
-                if is_history_load(&event, "test-session") {
-                    saw_post_turn_load = true;
-                }
-                if event["type"] == "bridge/session_view"
-                    && event["sessionId"] == "test-session"
-                    && event["view"]["session"]["phase"] == "ready"
-                    && event["view"]["baseline"]["updates"]
-                        .as_array()
-                        .is_some_and(|updates| !updates.is_empty())
-                {
-                    break event["view"]["session"]["historyRevision"]
-                        .as_str()
-                        .unwrap()
-                        .to_string();
-                }
-            }
-        })
-        .await
-        .expect("in-memory commit did not publish a successor view");
-
+        let prompt = session
+            .write(
+                &commands,
+                scope,
+                "prompt",
+                json!({"prompt": [{ "type": "text", "text": "message-actions-flow" }]}),
+            )
+            .await
+            .op;
+        // From its admission on, the session shows only this prompt: the
+        // committed turn neither reloads the session nor runs the prompt again.
+        let mut ops = Vec::new();
+        while !(session.live(scope)["op"]["id"] == prompt
+            && session.live(scope)["op"]["status"] == "completed")
+        {
+            session.next().await;
+            ops.push(session.live(scope)["op"].clone());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Some(event) = session.stream.try_next() {
+            let event = serde_json::to_value(event).unwrap();
+            session
+                .replicas
+                .get_mut(scope)
+                .unwrap()
+                .apply(&event)
+                .unwrap();
+            ops.push(session.live(scope)["op"].clone());
+        }
         assert!(
-            !saw_post_turn_load,
-            "a completed turn must stay in memory instead of issuing session/load"
+            ops.iter().all(|op| op["id"] == prompt),
+            "a completed turn must stay in memory instead of issuing session/load: {ops:?}"
         );
-        assert_eq!(prompt_starts, 1, "history commit redispatched the prompt");
-        assert_ne!(successor, initial_revision);
+        let log = &session.replicas[scope].log;
+        assert_eq!(log.len(), 1, "history commit redispatched the prompt");
+        assert_eq!(
+            log[0]["turn"]["prompt"],
+            json!([{ "type": "text", "text": "message-actions-flow" }])
+        );
+        assert_ne!(session.replicas[scope].head(), initial_head);
 
         cancellation.cancel();
         tokio::time::timeout(Duration::from_secs(5), bridge)
