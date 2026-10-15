@@ -6,6 +6,9 @@
 //! way before it answers `unavailable`. The checks run in §6.4's order:
 //! `expect`, then status and occupation, then capability and arguments. A
 //! refusal changes nothing.
+use agent_client_protocol::schema::v1::{
+    CreateElicitationResponse, RequestPermissionOutcome, RequestPermissionResponse,
+};
 use serde_json::{Value, json};
 
 use super::canon::AttachmentRef;
@@ -26,8 +29,21 @@ pub(crate) enum Admitted {
     /// Starts an operation of `kind` with `input` (its `args`). A prompt's
     /// `input` is its blocks with every attachment reference resolved.
     Start { kind: OperationKind, input: Value },
-    /// `cancel` or `answer` of the running operation `op`.
-    Running { op: String, kind: String },
+    /// `cancel` of the running operation `op` of `kind`.
+    Cancel { op: String, kind: OperationKind },
+    /// `answer` of the running operation `op`: one validated answer for each
+    /// of its pending interactions, by interaction ID.
+    Answer {
+        op: String,
+        answers: Vec<(String, Answer)>,
+    },
+}
+
+/// A validated answer to one pending interaction (protocol §6.2).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Answer {
+    Permission(RequestPermissionOutcome),
+    Elicitation(CreateElicitationResponse),
 }
 
 fn refuse(code: ErrorCode, message: impl Into<String>) -> ProtocolError {
@@ -81,17 +97,29 @@ pub(crate) fn admit(
     }
     let running = op["status"] == "running";
     let Some(kind) = started else {
-        // `cancel` and `answer` are wired by the next segment of step 6.
         if !running {
             return Err(refuse(
                 ErrorCode::NotAllowed,
                 format!("the operation of {scope} has ended"),
             ));
         }
-        return Err(refuse(
-            ErrorCode::Unsupported,
-            format!("{} is not served yet", write.kind),
-        ));
+        let id = write.expect.clone();
+        if write.kind == "cancel" {
+            let kind = serde_json::from_value::<OperationKind>(op["kind"].clone())
+                .map_err(|error| invalid(format!("unknown operation kind: {error}")))?;
+            if !matches!(
+                kind,
+                OperationKind::Prompt | OperationKind::TerminalLogin | OperationKind::AgentRequest
+            ) {
+                return Err(refuse(
+                    ErrorCode::NotAllowed,
+                    format!("a {} refuses a cancel", op["kind"].as_str().unwrap_or("")),
+                ));
+            }
+            return Ok(Admitted::Cancel { op: id, kind });
+        }
+        let answers = answers(&op["interactions"], &write.args)?;
+        return Ok(Admitted::Answer { op: id, answers });
     };
     if running {
         return Err(refuse(
@@ -150,6 +178,70 @@ fn optional_string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, 
         None | Some(Value::Null) => Ok(None),
         Some(_) => string(args, field).map(Some),
     }
+}
+
+/// An answer's keys must be exactly the pending interactions (§6.4), then
+/// every answer must be valid for its request; either refuses it whole.
+fn answers(pending: &Value, args: &Value) -> Result<Vec<(String, Answer)>, ProtocolError> {
+    let answers = args["answers"]
+        .as_object()
+        .ok_or_else(|| invalid("answers must be an object keyed by interaction ID"))?;
+    let pending = pending.as_object().cloned().unwrap_or_default();
+    if answers.len() != pending.len() || answers.keys().any(|id| !pending.contains_key(id)) {
+        return Err(refuse(
+            ErrorCode::NotAllowed,
+            "the answers do not name exactly the pending interactions",
+        ));
+    }
+    pending
+        .iter()
+        .map(|(id, interaction)| {
+            let answer = &answers[id];
+            let request = &interaction["request"];
+            let answer = match interaction["kind"].as_str() {
+                Some("permission") => Answer::Permission(permission_answer(request, answer)?),
+                _ => Answer::Elicitation(elicitation_answer(request, answer)?),
+            };
+            Ok((id.clone(), answer))
+        })
+        .collect()
+}
+
+/// `{ outcome }`, selecting an option the request offers, if any.
+fn permission_answer(
+    request: &Value,
+    answer: &Value,
+) -> Result<RequestPermissionOutcome, ProtocolError> {
+    let outcome = answer
+        .get("outcome")
+        .ok_or_else(|| invalid("a permission answer needs an outcome"))?;
+    let response: RequestPermissionResponse = serde_json::from_value(json!({ "outcome": outcome }))
+        .map_err(|error| invalid(format!("invalid permission outcome: {error}")))?;
+    if let RequestPermissionOutcome::Selected(selected) = &response.outcome {
+        let offered = request["options"].as_array().is_some_and(|options| {
+            options
+                .iter()
+                .any(|option| option["optionId"] == selected.option_id.0.as_ref())
+        });
+        if !offered {
+            return Err(invalid("the permission did not offer that option"));
+        }
+    }
+    Ok(response.outcome)
+}
+
+/// `{ response }`, valid for the elicitation's request.
+fn elicitation_answer(
+    request: &Value,
+    answer: &Value,
+) -> Result<CreateElicitationResponse, ProtocolError> {
+    let response = answer
+        .get("response")
+        .ok_or_else(|| invalid("an elicitation answer needs a response"))?;
+    crate::elicitation_validation::validate_elicitation_response_value(request, response)
+        .map_err(invalid)?;
+    serde_json::from_value(response.clone())
+        .map_err(|error| invalid(format!("invalid elicitation response: {error}")))
 }
 
 /// The advertised authentication method `id`, if any.

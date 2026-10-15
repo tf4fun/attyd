@@ -2227,7 +2227,7 @@ impl SessionRegistry {
             .any(|interaction| interaction.responding_operation_id.as_deref() == Some(operation_id))
     }
 
-    fn url_flow_in_use(&self, elicitation_id: &str) -> bool {
+    pub(crate) fn url_flow_in_use(&self, elicitation_id: &str) -> bool {
         self.request_url_flows.contains_key(elicitation_id)
             || self
                 .sessions
