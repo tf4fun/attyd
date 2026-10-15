@@ -373,6 +373,9 @@ const agent = acp.agent({ name: "protocol-ui-fixture" })
       record("load/permission", { sessionId: params.sessionId, outcome });
     }
     if (armed(`load-${params.sessionId}`)) await barrier(`load-${params.sessionId}`);
+    // A held session's v2 title comes from its notifications, not session/list.
+    const title = titles.get(params.sessionId);
+    if (title != null) await notify(params.sessionId, { sessionUpdate: "session_info_update", title });
     for (const update of history) await notify(params.sessionId, update);
     return controls(params.sessionId);
   })

@@ -285,6 +285,15 @@ const agent = acp
     if (failLoadAlways) {
       throw acp.RequestError.invalidParams(undefined, "Synthetic deterministic load failure");
     }
+    // A held session's v2 title comes from its notifications, not session/list.
+    const title = params.sessionId === "saved-session" ? "Saved ACP session"
+      : params.sessionId === "earlier-session" ? "Earlier Agent thread" : undefined;
+    if (title != null) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "session_info_update", title },
+      });
+    }
     if (invalidLoadModeOnce && loadAttempts === 1) {
       await client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
