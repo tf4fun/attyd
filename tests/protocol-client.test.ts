@@ -554,6 +554,35 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     expect(q.items(S)).toEqual([]);
   });
 
+  it("sends different new input after the user removes an uncertain write while the op stays ended", async () => {
+    const { net, view, queue: q } = queue();
+    view.show({ id: "op-A", status: "completed" });
+    const uncertain = q.enqueue(S, prompt("old input"));
+    net.calls[0].lose();
+    await flush();
+    expect(q.items(S).find((item) => item.id === uncertain)?.state).toBe("uncertain");
+
+    // The request may never have reached the bridge, so no newer op or SSE
+    // is guaranteed. Keeping the uncertain item must not resend it.
+    q.update(S);
+    await flush();
+    expect(net.calls).toHaveLength(1);
+    q.remove(S, uncertain);
+    expect(q.items(S)).toEqual([]);
+
+    // This explicit user input is different from the removed uncertain one.
+    q.enqueue(S, prompt("new input"));
+    q.update(S);
+    await flush();
+    expect(texts(net.calls)).toEqual(["old input", "new input"]);
+    expect(net.calls[1].body).toEqual({
+      expect: "op-A", kind: "prompt", args: { prompt: [{ type: "text", text: "new input" }] },
+    });
+    net.calls[1].respond(202, { op: "op-B" });
+    await flush();
+    expect(q.items(S)).toEqual([]);
+  });
+
   it("never sends a write without a definite answer again, whatever is refused later", async () => {
     const { net, view, queue: q } = queue();
     const uncertain = q.enqueue(S, prompt("maybe"));
