@@ -287,6 +287,114 @@ async fn a_create_response_survives_its_replacement_and_a_late_reader_converges(
     late.converged(&bench).await;
 }
 
+/// Agent EOF ends admitted writes with their own errors, even when the
+/// fork's source already shows its next load or has left the published scopes.
+#[tokio::test]
+async fn admitted_create_fork_and_list_keep_their_errors_when_the_agent_disconnects() {
+    for loadable in [false, true] {
+        let (bench, mut link) = Bench::ws(json!({
+            "loadSession": loadable,
+            "sessionCapabilities": {"fork": {}, "list": {}},
+        }))
+        .await;
+        bench.create(&mut link, "source", json!({})).await;
+        let mut watch = bench
+            .watch(&scopes(&["global", "catalog", "session/source"]))
+            .await;
+        watch
+            .until("the alignments", |watch| {
+                watch.has("global") && watch.has("catalog") && watch.has("session/source")
+            })
+            .await;
+
+        let mut pending = Vec::new();
+        for (scope, kind, method, args) in [
+            ("global", "create", "session/new", json!({"cwd": CWD})),
+            ("session/source", "fork", "session/fork", json!({})),
+            ("catalog", "list", "session/list", json!({})),
+        ] {
+            let expect = watch.live(scope)["op"]["id"].clone();
+            let mut held = bench.hold();
+            let response = bench.spawn_op(scope, &expect, kind, args);
+            let op = held.admitted().await;
+            let request = link.request(method).await;
+            if kind == "fork" {
+                assert_eq!(request["params"]["sessionId"], "source");
+            }
+            watch.until_op(scope, &op, "running").await;
+            assert!(!response.is_finished(), "the {kind} response is held");
+            // No ACP response is sent: the connection's end must settle it.
+            pending.push((kind, op, held, response));
+        }
+        let fork = pending[1].1.clone();
+        if loadable {
+            bench.follow_next_generation().await;
+        }
+        link.close().await;
+
+        // Do not require a separately published failed fork: ending the
+        // connection may replace or remove it in the same commit.
+        if loadable {
+            watch
+                .until_live(
+                    "session/source",
+                    "the source waits for its next load",
+                    |live| {
+                        live["op"]["kind"] == "load"
+                            && live["op"]["status"] == "running"
+                            && live["op"]["id"] != fork
+                    },
+                )
+                .await;
+            let source = bench.document("session/source").await;
+            assert_eq!(source["live"]["op"]["kind"], "load");
+            assert_ne!(source["live"]["op"]["id"], fork);
+            // The next Agent's initialize is deliberately not answered;
+            // none of the old HTTP responses may wait for this new load.
+        } else {
+            watch
+                .until("the source scope ends", |watch| {
+                    watch.ended("session/source").is_some()
+                })
+                .await;
+            let end = watch.ended("session/source").unwrap();
+            assert_eq!(end["reason"], "load_failed", "{end}");
+            let (status, body) = bench.read("session/source").await;
+            not_found(status, &body, "the source left the held scopes");
+        }
+
+        // Let each response take its result only after the source's old slot
+        // is no longer available. This delays the HTTP waiters, not the work.
+        for (kind, op, mut held, response) in pending {
+            assert!(!response.is_finished(), "the {kind} response is held");
+            held.resume();
+            let (status, body) = tokio::time::timeout(WAIT, response)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{kind} did not finish after Agent EOF; loadable={loadable}")
+                })
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{kind}, loadable={loadable}: {body}"
+            );
+            assert_eq!(
+                body["op"], op,
+                "{kind} must answer for its admitted operation"
+            );
+            assert_eq!(body["error"]["code"], "unavailable", "{kind}: {body}");
+            assert!(body.get("result").is_none(), "{kind}: {body}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()),
+                "{kind}: {body}"
+            );
+        }
+    }
+}
+
 /// A dropped HTTP connection drops only the response: the admitted create
 /// still runs to its end.
 #[tokio::test]
