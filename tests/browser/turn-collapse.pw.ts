@@ -103,10 +103,17 @@ for (const distance of [24, 500]) {
     await collapseFixture.advance("finish");
     await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
     await expectCommitted(turn);
-    // The reply above the reading position is unchanged by the commit.
-    expect(await anchor.evaluate((element) => element.getBoundingClientRect().top)).toBe(anchorTop);
+    // Removing process can shorten the scroll range past the old offset. The
+    // browser must clamp there; within the remaining range the offset stays put.
+    const maximum = await thread.evaluate((element) => element.scrollHeight - element.clientHeight);
+    const expectedPosition = Math.min(readingPosition, maximum);
+    expect(await thread.evaluate((element) => element.scrollTop)).toBe(expectedPosition);
+    expect(await anchor.evaluate((element) => element.getBoundingClientRect().top))
+      .toBe(anchorTop + readingPosition - expectedPosition);
 
-    await page.getByRole("button", { name: "Jump to bottom of thread", exact: true }).click();
+    if (expectedPosition < maximum) {
+      await page.getByRole("button", { name: "Jump to bottom of thread", exact: true }).click();
+    }
     await expectBottom(thread);
   });
 }

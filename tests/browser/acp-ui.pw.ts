@@ -553,7 +553,7 @@ test("queues ACP follow-ups and uses session cancel for Send now", async ({ page
   await page.getByRole("button", { name: "Send queued message 1 now" }).click();
   await expect(permission).toBeHidden();
   await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
-  await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
+  // The next queued prompt replaces the prior op's result (protocol §4.4).
   await expect(page.locator(".message-user").filter({ hasText: "usage-flow" })).toBeVisible();
   await expect(page.locator(".message-user").filter({ hasText: "request-error-flow" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeVisible();

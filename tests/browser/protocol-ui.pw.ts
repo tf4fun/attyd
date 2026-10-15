@@ -651,7 +651,7 @@ test.describe("operations and answers", () => {
   test("shows a failed prompt's error without a history entry and retries the exact prompt on request", async ({ page, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "fail now");
-    await expect(page.getByText("Synthetic prompt failure", { exact: false })).toBeVisible();
+    await expect(page.getByText("Synthetic prompt failure", { exact: true })).toBeVisible();
     await expect.poll(() => sessionLive(received(tap, ALPHA)).op.status).toBe("failed");
     expect(logOf(tap, ALPHA)).toHaveLength(1);
     expect(bodies(proxy, ALPHA, "prompt").map(promptText)).toEqual(["fail now"]);
@@ -673,10 +673,12 @@ test.describe("operations and answers", () => {
     expect(bodies(proxy, ALPHA, "cancel")).toEqual([{ expect: running.id, kind: "cancel", args: {} }]);
     await expect(queue).toContainText("1 queued · paused");
     // A requested cancel does not end the operation.
-    await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeVisible();
+    const cancelling = page.getByRole("button", { name: "Cancelling the current turn…", exact: true });
+    await expect(cancelling).toBeVisible();
+    await expect(cancelling).toBeDisabled();
     await fixture.gates.open("stop");
     await expect.poll(() => sessionLive(received(tap, ALPHA)).op.result).toMatchObject({ stopReason: "cancelled" });
-    await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+    await expect(cancelling).toBeHidden();
     await expect(queue).toContainText("1 queued · paused");
     expect(bodies(proxy, ALPHA, "prompt").map(promptText)).toEqual(["wait stop"]);
   });
@@ -860,12 +862,21 @@ test.describe("resources and media", () => {
   test.describe("terminal login", () => {
     test.use({ serverEnv: { ATTYD_UI_REQUIRE_AUTH: "1" } });
 
+    function currentLogins(proxy: BarrierProxy) {
+      // Listing and then loading the unauthenticated route change the scopes
+      // followed by the page. Read its current stream, not the initial global
+      // stream that was closed when the page tried to load alpha.
+      const tap = proxy.latestStream();
+      if (tap == null || tap.isClosed || !tap.scopes.includes("global") ||
+        !tap.delivered.some((event) => event.scope === "global" && "live" in event &&
+          event.live != null && "replace" in event.live)) return [];
+      return Object.values(globalLive(received(tap, "global")).terminals);
+    }
+
     test("keeps each login terminal as its own resource with its methodId and sends its input serially", async ({ browser, page, fixture, pageProxy: proxy }) => {
-      const global = proxy.stream(follows("global"));
       await page.goto(sessionPath("alpha", cwd));
       await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeVisible();
-      const tap = await global;
-      const logins = () => Object.values(globalLive(received(tap, "global")).terminals);
+      const logins = () => currentLogins(proxy);
       const card = (viewer: Page, method: string) => viewer.locator(".auth-terminal-card")
         .filter({ has: viewer.getByRole("heading", { name: `Sign in with ${method}`, exact: true }) });
 
@@ -895,7 +906,13 @@ test.describe("resources and media", () => {
         const freshGlobal = fresh.proxy.stream(follows("global"));
         await fresh.page.goto(sessionPath("alpha", cwd));
         const freshTap = await freshGlobal;
-        await expect.poll(() => Object.values(globalLive(received(freshTap, "global")).terminals ?? {})
+        const firstGlobalCut = (): GlobalLive | undefined => {
+          const event = freshTap.delivered.find((event) => event.scope === "global");
+          return event != null && "live" in event && event.live != null && "replace" in event.live
+            ? event.live.replace as GlobalLive : undefined;
+        };
+        await expect.poll(firstGlobalCut).toBeDefined();
+        expect(Object.values(firstGlobalCut()!.terminals)
           .map((terminal) => [terminal.methodId, terminal.exitStatus?.exitCode ?? null]).sort())
           .toEqual([["login-a", 1], ["login-b", null]]);
         await expect(card(fresh.page, "login-a")).toBeVisible();
@@ -923,16 +940,14 @@ test.describe("resources and media", () => {
     });
 
     test("does not resend terminal input whose response was lost", async ({ page, pageProxy: proxy }) => {
-      const global = proxy.stream(follows("global"));
       await page.goto(sessionPath("alpha", cwd));
       await page.getByRole("button", { name: "Authenticate with Sign in with login-a" }).click();
-      const tap = await global;
       const input = page.getByLabel("Agent terminal authentication input");
       await expect(input).toBeFocused();
       proxy.loseResponse(isAction("global", "input"));
       await input.pressSequentially("x");
       await expect.poll(() => proxy.actions("global", "input").map((exchange) => exchange.lost ?? false)).toEqual([true]);
-      await expect.poll(() => Object.values(globalLive(received(tap, "global")).terminals)[0]?.output ?? "").toContain("x");
+      await expect.poll(() => currentLogins(proxy)[0]?.output ?? "").toContain("x");
       await input.pressSequentially("y");
       await expect.poll(() => proxy.actions("global", "input").map((exchange) => (JSON.parse(exchange.body) as { data: string }).data))
         .toEqual(["x", "y"]);
