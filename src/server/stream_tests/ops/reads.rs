@@ -412,6 +412,16 @@ async fn context_reads_follow_each_sessions_own_workspace() {
     }
     let (a, b) = (sessions[0].as_str(), sessions[1].as_str());
     assert_ne!(a, b);
+    // A read is not an operation: no document changes, whether it succeeds
+    // or is refused.
+    let mut before = Vec::new();
+    for scope in [
+        "global".to_string(),
+        format!("session/{a}"),
+        format!("session/{b}"),
+    ] {
+        before.push((bench.document(&scope).await, scope));
+    }
 
     for (session, own, other, content) in [
         (a, &alpha, &beta, "alpha 内容"),
@@ -456,15 +466,27 @@ async fn context_reads_follow_each_sessions_own_workspace() {
         );
     }
 
-    let global = bench.document("global").await;
+    // Refused reads answer the protocol's error body.
+    let (status, body) = bench
+        .get(&content_path(a, &alpha.join("missing 文件.md")))
+        .await;
+    not_found(status, &body, "a missing file");
+    let (status, body) = bench
+        .get(&format!("/api/v2/sessions/{a}/files/content"))
+        .await;
+    invalid(status, &body, "a read without a path");
+    let (status, body) = bench.get(&files_path(a, "nul\0query")).await;
+    invalid(status, &body, "a search query with a NUL byte");
     let (status, body) = bench.get(&files_path("unheld", name)).await;
     not_found(status, &body, "an unheld session's search");
     let (status, body) = bench.get(&content_path("unheld", &alpha.join(name))).await;
     not_found(status, &body, "an unheld session's read");
     tokio::time::sleep(QUIET).await;
-    assert_eq!(
-        bench.document("global").await,
-        global,
-        "reads hold and load nothing"
-    );
+    for (document, scope) in before {
+        assert_eq!(
+            bench.document(&scope).await,
+            document,
+            "{scope}: reads hold, load and change nothing"
+        );
+    }
 }

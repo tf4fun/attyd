@@ -127,22 +127,28 @@ async fn create_fork_and_list_responses_outlive_the_json_deadline() {
         link.response("list-question").await["result"]["action"],
         "accept"
     );
+    // The list settles first, so its catalog revision check does not race
+    // the create and fork that follow.
     link.reply(&list_request, json!({"sessions": [], "nextCursor": null}))
         .await;
-    link.reply(&fork_request, json!({"sessionId": "forked"}))
-        .await;
-    link.reply(&new, json!({"sessionId": "created"})).await;
-
-    let created = finished("create", created, &create).await;
-    assert_eq!(created, json!({"sessionId": "created"}));
-    let forked = finished("fork", forked, &fork).await;
-    assert_eq!(forked, json!({"sessionId": "forked"}));
     let listed = finished("list", listed, &list).await;
     assert_eq!(listed["sessions"], json!([]), "{listed}");
     assert_eq!(listed["nextCursor"], Value::Null, "{listed}");
     assert!(listed["revision"].is_string(), "{listed}");
+    watch.until_op("catalog", &list, "completed").await;
+    assert!(
+        !created.is_finished() && !forked.is_finished(),
+        "the create and fork responses still wait for their operations"
+    );
+
+    link.reply(&fork_request, json!({"sessionId": "forked"}))
+        .await;
+    link.reply(&new, json!({"sessionId": "created"})).await;
+    let created = finished("create", created, &create).await;
+    assert_eq!(created, json!({"sessionId": "created"}));
+    let forked = finished("fork", forked, &fork).await;
+    assert_eq!(forked, json!({"sessionId": "forked"}));
     watch.until_op("global", &create, "completed").await;
     watch.until_op("session/s", &fork, "completed").await;
-    watch.until_op("catalog", &list, "completed").await;
     watch.converged(&bench).await;
 }
