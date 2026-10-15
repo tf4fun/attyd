@@ -12,7 +12,7 @@ pub(crate) use crate::session_registry::SessionRegistry as SessionMirror;
 use crate::session_registry::{SessionEntry, SessionRegistry};
 use crate::session_state::SessionAdmission;
 pub(crate) use crate::session_state::{
-    MirrorError, MirrorPhase, SessionState as MirrorSessionState, TurnOverlay,
+    MirrorError, MirrorPhase, SessionState as MirrorSessionState,
 };
 
 impl SessionRegistry {

@@ -136,7 +136,7 @@ async fn assert_interaction_sequence(
     );
     assert_eq!(cancel.turn.handle().unwrap().incarnation(), incarnation);
     {
-        let mut state = services.state.lock().await;
+        let state = services.state.lock().await;
         let resources = state.sessions.resources(SESSION, incarnation).unwrap();
         assert!(
             if permission {
@@ -152,7 +152,7 @@ async fn assert_interaction_sequence(
         .await
         .unwrap();
     {
-        let mut state = services.state.lock().await;
+        let state = services.state.lock().await;
         let resources = state.sessions.resources(SESSION, incarnation).unwrap();
         assert!(resources.permissions.is_empty());
         assert!(resources.elicitations.is_empty());
