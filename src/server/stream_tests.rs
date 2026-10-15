@@ -825,15 +825,19 @@ async fn resumes_on_the_same_stream(replay: Vec<Value>, next_replay: Vec<Value>,
             waiting["log"], before["log"],
             "the bridge keeps its known log"
         );
-        server
-            .hub
-            .business_request(json!({
-                "type": "elicitation/respond", "requestId": format!("answer-{barrier}"),
-                "sessionId": "saved", "elicitationId": interaction,
-                "response": {"action": "accept", "content": {}},
-            }))
-            .await
-            .unwrap();
+        let answer = send(
+            server.address,
+            Method::POST,
+            "/api/v2/scopes/session%2Fsaved/ops",
+            Some(json!({
+                "expect": waiting["live"]["op"]["id"], "kind": "answer",
+                "args": {"answers": {
+                    &interaction: {"response": {"action": "accept", "content": {}}},
+                }},
+            })),
+        )
+        .await;
+        assert_eq!(answer.status(), StatusCode::ACCEPTED);
         let answered = next.next(WAIT).await.expect("the barrier was answered");
         assert_eq!(answered["id"], barrier, "{answered}");
         assert_eq!(answered["result"]["action"], "accept", "{answered}");
