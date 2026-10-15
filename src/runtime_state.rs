@@ -4427,9 +4427,10 @@ mod tests {
         assert!(derived.permissions.is_empty());
         assert!(derived.terminals.is_empty());
         assert!(derived.active_turn.is_none());
+        // The source's prompt and update are the JSON strings "Q" and "A".
         let derived_payload = serde_json::to_string(&derived).unwrap();
-        assert!(!derived_payload.contains("Q"));
-        assert!(!derived_payload.contains("A"));
+        assert!(!derived_payload.contains(r#""Q""#));
+        assert!(!derived_payload.contains(r#""A""#));
 
         state
             .open_forked(
