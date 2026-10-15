@@ -253,17 +253,143 @@ async fn a_close_interaction_is_answered_through_either_scope_that_shows_it() {
     watch.converged(&bench).await;
 }
 
-/// A held session's failed delete keeps the session; `global.op.error`
-/// carries the Agent's error, and the session is free again.
+/// A failed delete keeps its error on `global.op`. A refused close leaves
+/// the session usable; a successful close needs a real load before the same
+/// subscription can use the session again (S5, S6; acceptance 14).
 #[tokio::test]
-async fn a_failed_held_delete_keeps_its_session_and_the_error() {
+async fn a_failed_held_delete_keeps_its_error_and_the_subscription() {
+    for (close_succeeds, supplied_cwd) in [
+        (false, None),
+        (true, None),
+        (true, Some("/workspace/ignored-subscription-directory")),
+    ] {
+        let (bench, mut link) = Bench::ws(deletable()).await;
+        bench.create(&mut link, "s", json!({})).await;
+        // A held session needs no cwd, and ignores a supplied directory.
+        // Neither case may change the directory of a later recovery load.
+        let mut query = scopes(&["global", "session/s"]);
+        if let Some(cwd) = supplied_cwd {
+            query.push_str(&format!("&cwd={}", encoded(&format!("session/s:{cwd}"))));
+        }
+        let mut watch = bench.watch(&query).await;
+        watch
+            .until("the alignments", |watch| {
+                watch.has("global") && watch.has("session/s")
+            })
+            .await;
+        let global = watch.live("global")["op"]["id"].clone();
+        let (status, body) = bench
+            .op("global", &global, "delete", json!({"sessionId": "s"}))
+            .await;
+        let delete = assert_accepted(status, &body, "the delete");
+        let close = link.request("session/close").await;
+        watch.until_op("global", &delete, "running").await;
+        watch.until_op("session/s", &delete, "running").await;
+        if close_succeeds {
+            link.reply(&close, json!({})).await;
+            let request = link.request("session/delete").await;
+            link.refuse(&request).await;
+        } else {
+            link.refuse(&close).await;
+        }
+        watch.until_op("global", &delete, "failed").await;
+        let error = watch.live("global")["op"]["error"].clone();
+        assert_eq!(error["code"], "agent_error", "{error}");
+        assert_eq!(error["data"]["code"], -32600, "{error}");
+
+        if close_succeeds {
+            // The failed delete cannot undo the Agent's successful close.
+            // Its occupation ends, so the existing subscription resumes by
+            // loading in the directory the bridge already knew.
+            let load = link.request("session/load").await;
+            assert_eq!(load["params"]["sessionId"], "s");
+            assert_eq!(load["params"]["cwd"], CWD);
+            watch
+                .until_live("session/s", "the recovery load runs", |live| {
+                    live["op"]["kind"] == "load" && live["op"]["status"] == "running"
+                })
+                .await;
+            let loading = watch.live("session/s")["op"]["id"].clone();
+            for (kind, content) in [
+                ("user_message_chunk", "earlier prompt"),
+                ("agent_message_chunk", "earlier reply"),
+            ] {
+                link.update(
+                    "s",
+                    json!({"sessionUpdate": kind, "content": text(content)}),
+                )
+                .await;
+            }
+            link.reply(&load, json!({})).await;
+            watch.until_op("session/s", &loading, "completed").await;
+            watch
+                .until_live("global", "the restored session's summary", |live| {
+                    live["sessions"]["s"]["op"] == json!({"kind": "load", "status": "completed"})
+                })
+                .await;
+            let log = watch.log("session/s");
+            assert_eq!(log.len(), 1, "the Agent's replay is installed: {log:?}");
+            assert_eq!(
+                log[0]["turn"],
+                json!({"prompt": [text("earlier prompt")], "reply": [text("earlier reply")]})
+            );
+        } else {
+            // A refused close never retired the original session. It is
+            // usable without another load, once the delete frees it.
+            watch
+                .until_live("session/s", "the session is released", |live| {
+                    live["op"]["status"] != "running"
+                })
+                .await;
+            assert!(watch.live("global")["sessions"].get("s").is_some());
+        }
+        assert!(
+            watch.ended("session/s").is_none(),
+            "a failed delete leaves the existing subscription following the session"
+        );
+        assert_eq!(watch.live("global")["op"]["id"], delete);
+        assert_eq!(watch.live("global")["op"]["error"], error);
+        watch.converged(&bench).await;
+
+        let released = watch.live("session/s")["op"]["id"].clone();
+        let (status, body) = bench
+            .op(
+                "session/s",
+                &released,
+                "prompt",
+                json!({"prompt": [text("still here")]}),
+            )
+            .await;
+        let prompt = assert_accepted(status, &body, "a prompt after the failed delete");
+        // In the refused-close branch this also rejects an unexpected
+        // session/load or session/delete before the prompt.
+        let turn = link.request("session/prompt").await;
+        link.reply(&turn, json!({"stopReason": "end_turn"})).await;
+        watch.until_op("session/s", &prompt, "completed").await;
+        watch
+            .until_live("global", "the prompt's summary", |live| {
+                live["sessions"]["s"]["op"] == json!({"kind": "prompt", "status": "completed"})
+            })
+            .await;
+        // Neither the recovery load nor the prompt replaces the global error.
+        assert_eq!(watch.live("global")["op"]["id"], delete);
+        assert_eq!(watch.live("global")["op"]["status"], "failed");
+        assert_eq!(watch.live("global")["op"]["error"], error);
+        watch.quiet(QUIET).await;
+        watch.converged(&bench).await;
+    }
+}
+
+/// Remembering an existing subscription's directory does not supply a
+/// directory to a new subscription of an unheld session (§5.1).
+#[tokio::test]
+async fn a_new_subscription_after_a_partially_failed_delete_still_needs_cwd() {
     let (bench, mut link) = Bench::ws(deletable()).await;
     bench.create(&mut link, "s", json!({})).await;
-    let mut watch = bench.watch(&scopes(&["global", "session/s"])).await;
+    // There is no session subscription to retain a recovery directory.
+    let mut watch = bench.watch(&scopes(&["global"])).await;
     watch
-        .until("the alignments", |watch| {
-            watch.has("global") && watch.has("session/s")
-        })
+        .until("the global alignment", |watch| watch.has("global"))
         .await;
     let global = watch.live("global")["op"]["id"].clone();
     let (status, body) = bench
@@ -277,41 +403,26 @@ async fn a_failed_held_delete_keeps_its_session_and_the_error() {
     watch.until_op("global", &delete, "failed").await;
     let error = watch.live("global")["op"]["error"].clone();
     assert_eq!(error["code"], "agent_error", "{error}");
-    assert_eq!(error["data"]["code"], -32600, "{error}");
-    assert!(watch.live("global")["sessions"].get("s").is_some());
+    let (status, body) = bench.read("session/s").await;
+    not_found(status, &body, "the Agent closed the session");
 
-    // The delete's occupation of the session has ended; whatever `op` the
-    // session shows now is not running, and the session takes a prompt on it.
-    watch
-        .until_live("session/s", "the session is released", |live| {
-            live["op"]["status"] != "running"
+    let mut missing = bench.watch(&scopes(&["session/s"])).await;
+    missing
+        .until("the missing-directory error", |watch| {
+            watch.ended("session/s").is_some()
         })
         .await;
-    assert!(watch.ended("session/s").is_none(), "the session stays");
-    let released = watch.live("session/s")["op"]["id"].clone();
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &released,
-            "prompt",
-            json!({"prompt": [text("still here")]}),
-        )
-        .await;
-    let prompt = assert_accepted(status, &body, "a prompt after the failed delete");
-    let turn = link.request("session/prompt").await;
-    link.reply(&turn, json!({"stopReason": "end_turn"})).await;
-    watch.until_op("session/s", &prompt, "completed").await;
-    watch
-        .until_live("global", "the prompt's summary", |live| {
-            live["sessions"]["s"]["op"] == json!({"kind": "prompt", "status": "completed"})
-        })
-        .await;
-    // `global` keeps the failed delete and its error.
+    let end = missing.ended("session/s").unwrap();
+    assert_eq!(end["reason"], "load_failed", "{end}");
+    assert_eq!(end["error"]["code"], "invalid_request", "{end}");
+    assert!(!missing.has("session/s"));
+    link.quiet(QUIET).await;
     assert_eq!(watch.live("global")["op"]["id"], delete);
-    assert_eq!(watch.live("global")["op"]["status"], "failed");
     assert_eq!(watch.live("global")["op"]["error"], error);
     watch.quiet(QUIET).await;
+    missing.quiet(QUIET).await;
     watch.converged(&bench).await;
+    missing.converged(&bench).await;
 }
 
 /// An unheld session's delete loads nothing: a subscription to it waits, and

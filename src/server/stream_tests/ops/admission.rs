@@ -498,6 +498,11 @@ async fn refusals_follow_the_admission_order() {
     link.reply(&request, json!({"stopReason": "end_turn"}))
         .await;
     watch.until_op("session/s", &running, "completed").await;
+    watch
+        .until_live("global", "the completed prompt's summary", |live| {
+            live["sessions"]["s"]["op"] == json!({"kind": "prompt", "status": "completed"})
+        })
+        .await;
 
     // Not advertised: unsupported, before the arguments.
     let (status, body) = bench
