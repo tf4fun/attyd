@@ -214,7 +214,7 @@ describe("v2 workspace lifecycle review", () => {
     }));
   });
 
-  it("discovers a project's sessions on later catalog pages after its URL is opened", async () => {
+  it("loads a project's later catalog page when the user requests it, preserving revision and request order", async () => {
     const targetCwd = "/other-workspace";
     const revision = "catalog-revision";
     const nextCursor = "other-workspace-page";
@@ -240,6 +240,8 @@ describe("v2 workspace lifecycle review", () => {
     await emit(source, { scope: "catalog", live: { patch: [{
       op: "set", path: "/op", value: operation("c1", { kind: "list", status: "running", input: {} }),
     }] } });
+    expect(requests).toHaveLength(1);
+    expect(inFlight).toBe(1);
 
     // The first result has arrived, but its operation is still running in the
     // replica. A later page must wait for the stream's completed operation.
@@ -255,6 +257,10 @@ describe("v2 workspace lifecycle review", () => {
     await emit(source, { scope: "catalog", live: { patch: [{
       op: "set", path: "/op", value: operation("c1", { kind: "list", input: {} }),
     }] } });
+    expect(requests).toHaveLength(1);
+    // Opening a project need not scan the catalog. This is the public hook
+    // action used by the "Load more sessions" button, after the list ended.
+    await act(async () => acp.listSessions(nextCursor));
     expect(requests).toEqual([
       { expect: "c0", kind: "list", args: {} },
       { expect: "c1", kind: "list", args: { cursor: nextCursor, revision } },

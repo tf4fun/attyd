@@ -3261,6 +3261,7 @@ test("browses cross-workspace projects and restores a shared session with its ow
 
     await page.reload();
     await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(otherCwd));
+    await page.getByRole("button", { name: "Load more sessions", exact: true }).click();
     await expect(page.locator(".project-session-link")).toHaveCount(1);
     await expect(page.locator(".project-session-link")).toContainText("Earlier Agent thread");
     await page.locator(".project-session-link").click();
@@ -3280,29 +3281,14 @@ test("browses cross-workspace projects and restores a shared session with its ow
     await expect(newThread.getByLabel("Agent workspace", { exact: true })).toHaveValue(otherCwd);
     await newThread.getByRole("button", { name: "Cancel new thread" }).click();
 
-    // Leave the session so a shared URL must discover its cwd and subscribe
-    // with it; leaving is local navigation (no public close, protocol §10).
+    // Leaving is local navigation (no public close, protocol §10); the shared
+    // URL below carries the session's own cwd.
     await page.getByRole("button", { name: "Thread actions" }).click();
-    const refreshedList = page.waitForResponse((response) =>
-      response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/catalog/ops" &&
-      response.request().postDataJSON()?.kind === "list" &&
-      response.status() === 200
-    );
     await page.getByRole("button", { name: "Close thread" }).click();
     await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(otherCwd));
     await expect(page.locator(".project-browser-path")).toHaveText(otherCwd);
-    await refreshedList;
     const shared = await browser.newPage();
     const sharedErrors = collectBrowserErrors(shared);
-    const listedCursors: Array<string | null> = [];
-    shared.on("request", (request) => {
-      const url = new URL(request.url());
-      if (request.method() === "POST" && url.pathname === "/api/v2/scopes/catalog/ops" &&
-        request.postDataJSON()?.kind === "list") {
-        listedCursors.push(request.postDataJSON().args?.cursor ?? null);
-      }
-    });
     try {
       await shared.goto(`${origin}${sessionPath("earlier-session", otherCwd)}`);
       await expect(shared.getByRole("heading", { name: "Earlier Agent thread" })).toBeVisible();
@@ -3311,8 +3297,6 @@ test("browses cross-workspace projects and restores a shared session with its ow
       await expect(shared.locator('textarea[role="combobox"]')).toBeEnabled();
       await expect.poll(() => new URL(shared.url()).pathname).toBe(sessionPath("earlier-session", otherCwd));
       await expect(shared.getByRole("alert")).toHaveCount(0);
-      expect(listedCursors).toContain(null);
-      expect(listedCursors.some((cursor) => cursor != null)).toBe(true);
       expect(sharedErrors).toEqual([]);
     } finally {
       await shared.close();
