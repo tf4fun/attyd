@@ -218,6 +218,13 @@ impl SessionObservers {
         self.cancel_absence();
     }
 
+    /// A v2 subscription follows the session: like an observer, it keeps the
+    /// session and starts a fresh absence cycle for its next release.
+    pub(crate) fn follow(&mut self) {
+        self.cancel_absence();
+        self.close_attempted = false;
+    }
+
     /// The caller publishes an end marker before finishing these leases. Taking
     /// them prevents resource retirement from turning an ordered end into abort.
     pub(crate) fn drain_for_finish(&mut self) -> Vec<(u64, ObservationLease)> {

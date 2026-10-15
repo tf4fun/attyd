@@ -1222,6 +1222,7 @@ fn refresh_observer_timers(state: &mut BridgeState) {
                 SessionWork::of(entry)
             };
             (
+                followed.contains(&session_id),
                 session_id,
                 entry.state.incarnation,
                 entry.state.live.as_ref().map(|live| live.lifecycle.clone()),
@@ -1229,12 +1230,18 @@ fn refresh_observer_timers(state: &mut BridgeState) {
             )
         })
         .collect::<Vec<_>>();
-    for (session_id, incarnation, lifecycle, work) in owners {
+    for (is_followed, session_id, incarnation, lifecycle, work) in owners {
         let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) else {
             continue;
         };
         if state.observers_stopped || !releasable {
             resources.observers.stop_absence();
+            continue;
+        }
+        if is_followed {
+            // A subscription follows the session again: its next absence is
+            // a new cycle, which may close it even after a refused close.
+            resources.observers.follow();
             continue;
         }
         let Some(timer) = resources.observers.refresh(
