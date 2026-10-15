@@ -41,6 +41,7 @@ const terminalAuthFile = process.env.ATTYD_FAKE_AUTH_FILE;
 const disconnectCancelFile = process.env.ATTYD_FAKE_DISCONNECT_CANCEL_FILE;
 const processMarkerFile = process.env.ATTYD_FAKE_PROCESS_MARKER_FILE;
 const turnCollapseGate = process.env.ATTYD_FAKE_TURN_COLLAPSE_GATE;
+const turnEndGate = process.env.ATTYD_FAKE_TURN_END_GATE;
 const turnDesign = process.env.ATTYD_FAKE_TURN_DESIGN === "1";
 // A JSON array that replaces the advertised authentication methods.
 const authMethodsOverride = process.env.ATTYD_FAKE_AUTH_METHODS;
@@ -564,7 +565,9 @@ const agent = acp
       observedMcpNotifications.push(params);
     },
   )
-  .onRequest(acp.methods.agent.session.prompt, async ({ params, client, requestId }) => {
+  // `holdTurnEnd` lets a browser test inspect a turn's process before the turn
+  // ends; protocol v2 removes the process when the turn commits.
+  .onRequest(acp.methods.agent.session.prompt, async (context) => holdTurnEnd(context.params, await (async ({ params, client, requestId }: typeof context) => {
     const promptText = params.prompt
       .filter((block) => block.type === "text")
       .map((block) => block.text)
@@ -2421,7 +2424,7 @@ const agent = acp
       },
     });
     return { stopReason: "end_turn" };
-  })
+  })(context)))
   .onNotification(acp.methods.agent.session.cancel, () => {
     if (disconnectCancelFile) writeFileSync(disconnectCancelFile, "cancel\n");
     finishDisconnectPrompt?.();
@@ -2434,6 +2437,23 @@ const stream = acp.ndJsonStream(
 );
 const connection = agent.connect(stream);
 await connection.closed;
+
+// A prompt whose text contains `[hold:<name>]` ends only once the test writes
+// `<ATTYD_FAKE_TURN_END_GATE>/<name>`; the Agent writes `<name>.reached` when
+// the turn is ready to end.
+async function holdTurnEnd<T>(params: acp.PromptRequest, result: T): Promise<T> {
+  const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+  const name = /\[hold:([\w-]+)\]/u.exec(text)?.[1];
+  if (name == null) return result;
+  if (turnEndGate == null) throw new Error("[hold:…] prompts require ATTYD_FAKE_TURN_END_GATE");
+  writeFileSync(join(turnEndGate, `${name}.reached`), "");
+  const deadline = Date.now() + 30_000;
+  while (!existsSync(join(turnEndGate, name))) {
+    if (Date.now() >= deadline) throw new Error(`Timed out holding the end of turn ${name}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return result;
+}
 
 function requireAuthentication(): void {
   if (!authenticated) {
