@@ -486,7 +486,12 @@ export default function App() {
     ...[...state.cachedSessions].filter(([, session]) => session.running || session.runtimeOperation != null)
       .map(([sessionId]) => sessionId),
   ];
-  const navigationDisabled = transitioning || changingControl || authBlocksCurrent || queuedPrompts.length > 0;
+  // A create or fork waiting for its HTTP result does not hold the user: a
+  // late result never moves a page the user moved since (§6.3).
+  const navigationDisabled = sessionOpening != null || changingControl || authBlocksCurrent ||
+    queuedPrompts.some(({ state: queued }) => queued !== "uncertain");
+  // Held sessions can be opened again even when the Agent cannot load them.
+  const openSessionIds = state.openSessionIds ?? [...state.cachedSessions.keys()];
   const browseProject = (cwd: string) => {
     if (sessionSwitcher.current) sessionSwitcher.current.open = false;
     openProject(cwd);
@@ -535,6 +540,29 @@ export default function App() {
         </Suspense>
       ) : null;
     })}
+  </>;
+  // Interactions and URL flows outside a shown thread: a catalog list or a
+  // global operation may ask while the page opens a session or browses.
+  const pendingContent = <>
+    {state.permissions.map((pending) => (
+      <PermissionCard
+        key={pending.permissionId}
+        pending={pending}
+        onRespond={(outcome) => respondPermission(pending.permissionId, outcome)}
+      />
+    ))}
+    {state.elicitations.map((pending) => (
+      <ElicitationCard
+        key={pending.elicitationId}
+        agentName={agent?.title ?? agent?.name ?? t("agent")}
+        pending={pending}
+        onRespond={(response) => respondElicitation(pending.elicitationId, response)}
+      />
+    ))}
+    {state.externalFlows.map((flow) => (
+      <ExternalFlowCard key={flow.elicitationId} flow={flow}
+        onDismiss={() => dismissExternalFlow(flow.elicitationId)} />
+    ))}
   </>;
   const openActiveThreadMarkdown = useCallback(() => {
     // The thread as shown: the log's turns and the current operation.
@@ -718,7 +746,7 @@ export default function App() {
                           deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
                           busySessionIds={busySessionIds}
                           attentionSessionIds={state.attentionSessionIds}
-                          openSessionIds={[...state.cachedSessions.keys()]}
+                          openSessionIds={openSessionIds}
                           disabled={navigationDisabled}
                           onAttach={openThread}
                           onDelete={requestSessionDeletion}
@@ -760,7 +788,7 @@ export default function App() {
                         <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> {t("forkThread")}</button>
                       ) : null}
                       {/* Leaving only stops following the session: no public close exists (§10, S6). */}
-                      <button type="button" disabled={transitioning} onClick={closeSession}><LogOut size={14} /> {t("closeThread")}</button>
+                      <button type="button" onClick={closeSession}><LogOut size={14} /> {t("closeThread")}</button>
                       {sessionCapabilities?.delete != null ? (
                         <button
                           type="button"
@@ -796,20 +824,9 @@ export default function App() {
           backLabel={selectedProjectCwd ? t("backProject") : t("backProjects")}
           onBack={() => selectedProjectCwd ? browseProject(selectedProjectCwd) : browseHome()}
           onRetry={retrySessionOpening}
-        >{authContent}</SessionOpening> : !state.session ? <div className="browse-panel">
+        >{authContent}{pendingContent}</SessionOpening> : !state.session ? <div className="browse-panel">
           {authContent}
-          {state.elicitations.map((pending) => (
-            <ElicitationCard
-              key={pending.elicitationId}
-              agentName={agent?.title ?? agent?.name ?? t("agent")}
-              pending={pending}
-              onRespond={(response) => respondElicitation(pending.elicitationId, response)}
-            />
-          ))}
-          {state.externalFlows.map((flow) => (
-            <ExternalFlowCard key={flow.elicitationId} flow={flow}
-              onDismiss={() => dismissExternalFlow(flow.elicitationId)} />
-          ))}
+          {pendingContent}
           {state.timeline.some((item) => item.type === "error") ? (
             <Conversation timeline={state.timeline.filter((item) => item.type === "error")} />
           ) : null}
@@ -831,7 +848,7 @@ export default function App() {
             busySessionIds={busySessionIds}
             attentionSessionIds={state.attentionSessionIds}
             deletingSessionIds={state.pendingSessionDeletions.map(({ sessionId }) => sessionId)}
-            openSessionIds={[...state.cachedSessions.keys()]}
+            openSessionIds={openSessionIds}
             onProject={browseProject}
             onAttach={openThread}
             onDelete={requestSessionDeletion}

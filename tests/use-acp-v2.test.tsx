@@ -34,7 +34,7 @@ interface Post {
 }
 
 let posts: Post[];
-let respond: (post: Post) => { status: number; body: unknown };
+let respond: (post: Post) => { status: number; body: unknown } | Promise<{ status: number; body: unknown }>;
 
 function open(): FakeEventSource[] {
   return FakeEventSource.sources.filter((source) => !source.closed);
@@ -128,7 +128,7 @@ describe("v2 workspace hook", () => {
       if (init?.method !== "POST") return new Response("{}", { status: 404 });
       const post = { url, body: JSON.parse(init.body ?? "{}") as Post["body"] };
       posts.push(post);
-      const { status, body } = respond(post);
+      const { status, body } = await respond(post);
       return new Response(JSON.stringify(body), { status });
     }));
     container = document.createElement("div");
@@ -151,6 +151,66 @@ describe("v2 workspace hook", () => {
     await act(async () => root.render(strict ? <StrictMode><Probe /></StrictMode> : <Probe />));
     await settle();
   }
+
+  it("offers held sessions as open, whether or not the Agent can load them", async () => {
+    await mount("/");
+    await emit(align("global", globalLive({ sessions: held })));
+    expect(hook.state.openSessionIds).toEqual(["s1"]);
+  });
+
+  it("answers a catalog interaction while a cold session waits for its cwd", async () => {
+    let finishList!: () => void;
+    respond = (post) => post.body.kind === "list"
+      ? new Promise((resolve) => {
+        finishList = () => resolve({ status: 200, body: { op: "l1", result: { revision: "r1", sessions: [{ sessionId: "cold", cwd: "/w" }], nextCursor: null } } });
+      })
+      : { status: 202, body: { op: "l1" } };
+    await mount("/sessions/cold");
+    await emit(align("global", globalLive()));
+    await emit(align("catalog", { op: op({ id: "c0" }), urlFlows: {}, revision: "r1" }));
+    expect(lists()).toHaveLength(1);
+    const form: Interaction = {
+      interactionId: "E", kind: "elicitation",
+      request: { mode: "form", message: "Pick", requestedSchema: { type: "object", properties: {} } } as never,
+    };
+    await emit({ scope: "catalog", live: { patch: [{ op: "set", path: "/op", value: op({
+      id: "l1", kind: "list", status: "running", input: {}, interactions: { E: form },
+    }) }] } });
+    expect(hook.sessionOpening).toMatchObject({ sessionId: "cold" });
+    expect(hook.state.elicitations.map(({ elicitationId }) => elicitationId)).toEqual(["E"]);
+    await act(async () => hook.respondElicitation("E", { action: "accept", content: {} }));
+    await settle();
+    expect(answers().map((post) => [post.url, post.body.expect])).toEqual([["/api/v2/scopes/catalog/ops", "l1"]]);
+    finishList();
+    await settle();
+    await emit({ scope: "catalog", live: { patch: [{ op: "set", path: "/op", value: op({ id: "l1", kind: "list" }) }] } });
+    const loading = current();
+    expect(loading.scopes).toContain("session/cold");
+  });
+
+  it("lets the user leave while a fork's response is held, and keeps them there when it arrives", async () => {
+    let finishFork!: () => void;
+    respond = (post) => post.body.kind === "fork"
+      ? new Promise((resolve) => {
+        finishFork = () => resolve({ status: 200, body: { op: "f1", result: { sessionId: "forked" } } });
+      })
+      : { status: 202, body: { op: "x" } };
+    await mount("/sessions/s1");
+    await emit(align("global", globalLive({ sessions: held })));
+    await emit(align("catalog", { op: op({ id: "c0" }), urlFlows: {}, revision: "r1" }));
+    await emit(align("session/s1", sessionLive(op({ id: "o1", kind: "open" }))));
+    await act(async () => hook.forkSession());
+    await settle();
+    expect(posts.filter((post) => post.body.kind === "fork")).toHaveLength(1);
+    expect(hook.state.sessionTransition).toBeDefined();
+    await act(async () => hook.attachSession({ sessionId: "s2", cwd: "/w" }));
+    await settle();
+    expect(window.location.pathname).toMatch(/\/sessions\/s2$/u);
+    expect(hook.state.sessionTransition).toBeUndefined();
+    finishFork();
+    await settle();
+    expect(window.location.pathname).toMatch(/\/sessions\/s2$/u);
+  });
 
   it("keeps one working stream across a StrictMode effect replay and closes it on unmount", async () => {
     await mount("/", true);

@@ -92,6 +92,8 @@ export interface WorkspaceState extends AppState {
   queuePaused: boolean;
   /** Login terminals, each its own resource (§4.6). */
   authTerminals: AuthTerminalState[];
+  /** Sessions the bridge holds (`global.sessions`): they open without a load. */
+  openSessionIds: string[];
   /** Held sessions whose operation runs (`global.sessions`). */
   busySessionIds: string[];
   /** Session terminals no tool card of the thread shows (S7). */
@@ -1069,6 +1071,7 @@ export class Workspace {
       } : undefined,
       sessions,
       nextSessionCursor: this.#catalog.nextCursor,
+      openSessionIds: summaries.map(({ sessionId: id }) => id),
       busySessionIds: summaries.filter(({ op: summary }) => summary.status === "running").map(({ sessionId: id }) => id),
       attentionSessionIds: summaries.filter(({ pending }) => pending.interactions > 0 || pending.urlFlows > 0)
         .map(({ sessionId: id }) => id),
