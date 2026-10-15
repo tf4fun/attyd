@@ -2844,6 +2844,9 @@ where
                             }
                             if let Some(op) = &protocol_operation {
                                 state.sessions.fail_protocol_operation(op, operation_error(&error, false));
+                                if operation == "session/delete" {
+                                    streams::wake(&state);
+                                }
                             }
                             return Ok(());
                         }
@@ -2926,6 +2929,12 @@ where
                             Some(op) => {
                                 state.sessions.fail_protocol_operation(op, operation_error(error, closing));
                                 refresh_observer_timers(&mut state);
+                                if operation == "session/delete" {
+                                    // The failed delete frees what it occupied:
+                                    // the streams that waited for it load the
+                                    // session.
+                                    streams::wake(&state);
+                                }
                             }
                             None => fail_command_operation(
                                 &mut state,

@@ -176,6 +176,8 @@ fn arguments(
             let blocks = args["prompt"]
                 .as_array()
                 .ok_or_else(|| invalid("prompt must be an array of blocks"))?;
+            // The content's capability comes before its arguments (§6.4).
+            prompt_capabilities(initialize, blocks)?;
             let prompt = blocks
                 .iter()
                 .map(|block| prompt_block(publisher, session_id, block))
@@ -204,92 +206,6 @@ fn arguments(
                 value,
             )
             .map_err(invalid)?;
-            Ok(json!({ "configId": config_id, "value": value }))
-        }
-        OperationKind::Fork => "/agentCapabilities/sessionCapabilities/fork",
-        OperationKind::List => "/agentCapabilities/sessionCapabilities/list",
-        OperationKind::Delete => "/agentCapabilities/sessionCapabilities/delete",
-        OperationKind::Logout => "/agentCapabilities/auth/logout",
-        _ => return Ok(()),
-    };
-    match initialize {
-        Some(initialize) if initialize.pointer(pointer).is_none_or(Value::is_null) => Err(refuse(
-            ErrorCode::Unsupported,
-            format!("the Agent did not advertise {pointer}"),
-        )),
-        _ => Ok(()),
-    }
-}
-
-fn string<'a>(args: &'a Value, field: &str) -> Result<&'a str, ProtocolError> {
-    args[field]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid(format!("{field} must be a non-empty string")))
-}
-
-fn optional_string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, ProtocolError> {
-    match args.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(_) => string(args, field).map(Some),
-    }
-}
-
-/// The advertised authentication method `id`, if any.
-fn auth_method<'a>(initialize: Option<&'a Value>, id: &str) -> Option<&'a Value> {
-    initialize?["authMethods"]
-        .as_array()?
-        .iter()
-        .find(|method| method["id"] == id)
-}
-
-fn arguments(
-    publisher: &Publisher,
-    initialize: Option<&Value>,
-    scope: &Scope,
-    live: &Value,
-    kind: OperationKind,
-    args: &Value,
-) -> Result<Value, ProtocolError> {
-    match kind {
-        OperationKind::Prompt => {
-            let Scope::Session(session_id) = scope else {
-                unreachable!("a prompt is a session's");
-            };
-            let blocks = args["prompt"]
-                .as_array()
-                .ok_or_else(|| invalid("prompt must be an array of blocks"))?;
-            let prompt = blocks
-                .iter()
-                .map(|block| prompt_block(publisher, session_id, block))
-                .collect::<Result<Vec<_>, _>>()?;
-            prompt_capabilities(initialize, &prompt)?;
-            Ok(json!({ "prompt": prompt }))
-        }
-        OperationKind::SetMode => {
-            let mode_id = string(args, "modeId")?;
-            let known = live["controls"]["modes"]["availableModes"]
-                .as_array()
-                .is_some_and(|modes| modes.iter().any(|mode| mode["id"] == mode_id));
-            if !known {
-                return Err(invalid(format!("the session has no mode {mode_id}")));
-            }
-            Ok(json!({ "modeId": mode_id }))
-        }
-        OperationKind::SetConfig => {
-            let config_id = string(args, "configId")?;
-            let known = live["controls"]["configOptions"]
-                .as_array()
-                .is_some_and(|options| options.iter().any(|option| option["id"] == config_id));
-            if !known {
-                return Err(invalid(format!(
-                    "the session has no configuration option {config_id}"
-                )));
-            }
-            let value = match args.get("value") {
-                Some(value @ (Value::Bool(_) | Value::String(_))) => value.clone(),
-                _ => return Err(invalid("value must be a boolean or a string")),
-            };
             Ok(json!({ "configId": config_id, "value": value }))
         }
         OperationKind::Fork => Ok(match optional_string(args, "cwd")? {
@@ -369,6 +285,8 @@ fn prompt_block(
             .attachment(session_id, &reference.id)
             .ok_or_else(|| invalid(format!("the session has no attachment {}", reference.id)));
     }
+    serde_json::from_value::<agent_client_protocol::schema::v1::ContentBlock>(block.clone())
+        .map_err(|error| invalid(format!("invalid prompt block: {error}")))?;
     crate::semantic::validate_content_block(block, "Prompt content").map_err(invalid)?;
     Ok(block.clone())
 }
