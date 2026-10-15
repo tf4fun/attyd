@@ -1447,9 +1447,7 @@ mod tests {
     async fn shutdown_signal_bypasses_a_command_backlog() {
         let hub = test_hub();
         let (input, _commands) = mpsc::unbounded_channel();
-        input
-            .send(bridge::BridgeInput::RuntimeSnapshotRequest)
-            .unwrap();
+        input.send(bridge::BridgeInput::ServeStreams).unwrap();
         let input_probe = input.clone();
         let cancellation = CancellationToken::new();
         {
@@ -1466,11 +1464,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), cancellation.cancelled())
             .await
             .expect("shutdown was blocked behind the command queue");
-        assert!(
-            input_probe
-                .send(bridge::BridgeInput::RuntimeSnapshotRequest)
-                .is_ok()
-        );
+        assert!(input_probe.send(bridge::BridgeInput::ServeStreams).is_ok());
         hub.finish_generation(1).await;
         shutdown.await.unwrap();
     }

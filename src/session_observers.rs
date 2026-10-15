@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use crate::auto_close::AutoClosePermit;
 use crate::runtime_state::SessionLifecycle;
-use crate::session_observation::ObservationLease;
 use crate::session_registry::SessionEntry;
 
 /// Attention state machine input: what an unobserved session is doing.
@@ -91,12 +89,11 @@ fn terminal_is_running(terminal: &serde_json::Value) -> bool {
 /// leases; it never decides whether a session is eligible to close.
 #[derive(Default)]
 pub(crate) struct SessionObservers {
-    observers: HashMap<u64, ObservationLease>,
     next_absence: u64,
     absence: Option<AbsenceTimer>,
     /// An automatic close was already dispatched for this observation-absence
     /// cycle. A refused or failed attempt must not rearm itself through its own
-    /// Running-to-Idle transition; only a fresh observation permits another.
+    /// Running-to-Idle transition; only a following subscription permits another.
     close_attempted: bool,
 }
 
@@ -128,35 +125,8 @@ impl AbsenceTimer {
 }
 
 impl SessionObservers {
-    pub(crate) fn observe(&mut self, id: u64, lease: ObservationLease) -> bool {
-        if lease.is_cancelled() || lease.is_finished() {
-            return false;
-        }
-        if let Some(existing) = self.observers.get(&id) {
-            return existing.same_identity(&lease);
-        }
-        self.observers.insert(id, lease);
-        self.cancel_absence();
-        self.close_attempted = false;
-        true
-    }
-
-    pub(crate) fn unobserve(&mut self, id: u64, lease: &ObservationLease) -> bool {
-        if !self
-            .observers
-            .get(&id)
-            .is_some_and(|existing| existing.same_identity(lease))
-        {
-            return false;
-        }
-        if let Some(lease) = self.observers.remove(&id) {
-            lease.cancel();
-        }
-        true
-    }
-
     /// Called after an owner transition. The absence interval measures
-    /// *continuously idle* time: an observer or any non-Idle work state clears
+    /// *continuously idle* time: any non-Idle work state clears
     /// the deadline, and settling back into idle starts a fresh interval.
     pub(crate) fn refresh(
         &mut self,
@@ -165,12 +135,10 @@ impl SessionObservers {
         timeout_seconds: i64,
         now: Instant,
     ) -> Option<AbsenceTimer> {
-        self.observers.retain(|_, lease| !lease.is_cancelled());
         if timeout_seconds < 0
             || lifecycle.is_none_or(|phase| {
                 matches!(phase, SessionLifecycle::Closed | SessionLifecycle::Deleting)
             })
-            || !self.observers.is_empty()
             || work != SessionWork::Idle
         {
             self.cancel_absence();
@@ -195,7 +163,7 @@ impl SessionObservers {
 
     /// The bridge committed this absence interval to an automatic close. The
     /// outcome is settled by that attempt: idle transitions must not rearm a
-    /// replacement timer until a fresh observation cycle begins.
+    /// replacement timer until a following subscription starts a new cycle.
     pub(crate) fn mark_close_attempted(&mut self) {
         self.close_attempted = true;
     }
@@ -204,32 +172,21 @@ impl SessionObservers {
         self.absence
             .as_ref()
             .is_some_and(|absence| absence.id == id && absence.permit.same_identity(permit))
-            && self.observers.values().all(ObservationLease::is_cancelled)
     }
 
     pub(crate) fn shutdown(&mut self) {
         self.cancel_absence();
-        for (_, lease) in self.observers.drain() {
-            lease.cancel();
-        }
     }
 
     pub(crate) fn stop_absence(&mut self) {
         self.cancel_absence();
     }
 
-    /// A v2 subscription follows the session: like an observer, it keeps the
-    /// session and starts a fresh absence cycle for its next release.
+    /// A subscription follows the session: it keeps the session and starts a
+    /// fresh absence cycle for its next release.
     pub(crate) fn follow(&mut self) {
         self.cancel_absence();
         self.close_attempted = false;
-    }
-
-    /// The caller publishes an end marker before finishing these leases. Taking
-    /// them prevents resource retirement from turning an ordered end into abort.
-    pub(crate) fn drain_for_finish(&mut self) -> Vec<(u64, ObservationLease)> {
-        self.cancel_absence();
-        self.observers.drain().collect()
     }
 
     fn cancel_absence(&mut self) {
@@ -263,14 +220,8 @@ mod tests {
         let mut owner = SessionObservers::default();
         let old = arm(&mut owner, 0).unwrap();
         assert!(old.wait().await);
-        let first = ObservationLease::default();
-        let second = ObservationLease::default();
-        assert!(owner.observe(1, first.clone()));
-        assert!(owner.observe(2, second.clone()));
+        owner.follow();
         assert!(!old.permit.claim());
-        owner.unobserve(1, &first);
-        assert!(arm(&mut owner, 30).is_none());
-        owner.unobserve(2, &second);
         let next = arm(&mut owner, 30).unwrap();
         assert!(!owner.matches_absence(old.id, &old.permit));
         let waiting = next.wait();
@@ -312,26 +263,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancelled_handshake_and_old_unobserve_do_not_leak_or_remove_other_lease() {
-        let mut owner = SessionObservers::default();
-        let cancelled = ObservationLease::default();
-        cancelled.cancel();
-        assert!(!owner.observe(1, cancelled));
-        let lease = ObservationLease::default();
-        assert!(owner.observe(1, lease.clone()));
-        assert!(!owner.unobserve(1, &ObservationLease::default()));
-        assert!(arm(&mut owner, 30).is_none());
-        lease.cancel();
-        let timer = arm(&mut owner, 30).unwrap();
-        tokio::time::advance(Duration::from_secs(29)).await;
-        let waiting = timer.wait();
-        tokio::pin!(waiting);
-        assert!(futures::poll!(&mut waiting).is_pending());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(waiting.await);
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn negative_timeouts_disable_and_huge_timeouts_do_not_overflow() {
         for timeout in [i64::MIN, -2, -1] {
             assert!(arm(&mut SessionObservers::default(), timeout).is_none());
@@ -367,34 +298,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stopping_timers_preserves_delivery_until_ordered_finish() {
+    async fn stopping_timers_cancels_the_pending_close() {
         let mut owner = SessionObservers::default();
         let old_timer = arm(&mut owner, 30).unwrap();
         owner.stop_absence();
         assert!(!old_timer.permit.claim());
-        let lease = ObservationLease::new();
-        owner.observe(1, lease.clone());
-        owner.stop_absence();
-        assert!(!lease.is_cancelled());
-        let drained = owner.drain_for_finish();
-        assert_eq!(drained.len(), 1);
-        assert!(drained[0].1.same_identity(&lease));
-        drained[0].1.finish();
-        drop(owner);
-        assert!(lease.is_finished());
-        assert!(
-            !lease.is_cancelled(),
-            "normal retirement must not abort queued events"
-        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn observation_cannot_revoke_an_already_dispatched_close() {
+    async fn following_cannot_revoke_an_already_dispatched_close() {
         let mut owner = SessionObservers::default();
         let timer = arm(&mut owner, 0).unwrap();
         assert!(timer.permit.claim());
-        assert!(owner.observe(1, ObservationLease::default()));
+        owner.follow();
         assert!(!timer.permit.pending());
         assert!(!timer.permit.claim());
+    }
+
+    #[test]
+    fn only_a_following_subscription_rearms_after_a_close_attempt() {
+        let mut owner = SessionObservers::default();
+        assert!(arm(&mut owner, 30).is_some());
+        owner.mark_close_attempted();
+        owner.stop_absence();
+        // The attempt's own Running-to-Idle transition does not rearm it.
+        assert!(
+            owner
+                .refresh(
+                    Some(&SessionLifecycle::Active),
+                    SessionWork::Running,
+                    30,
+                    Instant::now()
+                )
+                .is_none()
+        );
+        assert!(arm(&mut owner, 30).is_none());
+        owner.follow();
+        assert!(arm(&mut owner, 30).is_some());
     }
 }

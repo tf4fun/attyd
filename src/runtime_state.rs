@@ -2167,7 +2167,7 @@ impl SessionRegistry {
             && previous != incarnation
         {
             self.clear_history_for_replacement(session_id, previous);
-            self.retire_entry(session_id, previous, "session incarnation was replaced");
+            self.retire_entry(session_id, previous);
         }
         self.sessions
             .entry(session_id.to_string())

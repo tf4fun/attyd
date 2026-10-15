@@ -72,7 +72,7 @@ impl SessionRegistry {
         {
             self.clear_history_for_replacement(&session_id, previous);
             if previous != incarnation {
-                self.retire_entry(&session_id, previous, "session incarnation was replaced");
+                self.retire_entry(&session_id, previous);
             }
         }
         let snapshot = self
@@ -715,7 +715,7 @@ impl SessionRegistry {
                 && session.operation.is_none()
                 && entry.resources.materialization.is_none()
         }) {
-            self.retire_entry(session_id, incarnation, "session was removed");
+            self.retire_entry(session_id, incarnation);
         }
     }
 

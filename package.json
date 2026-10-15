@@ -14,7 +14,6 @@
     "test": "vitest run",
     "test:rust": "ATTYD_SKIP_WEB_BUILD=1 cargo test",
     "protocol:types": "ATTYD_SKIP_WEB_BUILD=1 ATTYD_UPDATE_PROTOCOL_TS=1 cargo test protocol::typescript",
-    "test:idle-retirement": "ATTYD_SKIP_WEB_BUILD=1 cargo test bridge::unobserved_tests",
     "test:memory:rust": "ATTYD_SKIP_WEB_BUILD=1 cargo test memory_retention",
     "test:memory:web": "vitest run tests/runtime-memory-retention.test.tsx",
     "test:memory:efficiency:rust": "ATTYD_SKIP_WEB_BUILD=1 cargo test memory_efficiency",

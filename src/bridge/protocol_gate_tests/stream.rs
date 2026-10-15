@@ -1175,15 +1175,15 @@ async fn review_a_sessions_own_admitted_operation_keeps_it_held_before_dispatch(
 }
 
 #[tokio::test]
-async fn review_a_subscription_waits_from_delete_admission_before_its_rpc_starts() {
+async fn review_a_subscription_after_delete_admission_waits_for_its_end() {
     let caps = json!({"loadSession": true, "sessionCapabilities": {"delete": {}}});
     let mut peer = Peer::start(caps).await;
     let scope = session(SAVED);
     peer.start_op("global", "delete", json!({"sessionId": SAVED}))
         .await;
 
-    // Occupation begins at admission, before the ACP request is dispatched.
-    // A subscription must not steal that interval to start a load.
+    // An admitted delete that has not ended occupies the session: a
+    // subscription opened meanwhile starts no load and waits for its end.
     let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
     let delete = peer.request("session/delete").await;
     peer.quiet(Duration::from_millis(200)).await;
@@ -1613,81 +1613,6 @@ async fn review_waiting_session_uses_the_new_connections_resume_capability() {
     assert_eq!(stream.live(&scope)["op"]["kind"], "load");
     assert_eq!(stream.live(&scope)["op"]["status"], "running");
     review_resume_on_next_connection_keeps_known_log(&mut old, &mut stream, SAVED, &cached).await;
-}
-
-#[tokio::test]
-async fn review_a_pre_dispatch_config_refusal_restarts_the_idle_release_timer() {
-    let mut peer = Peer::start_with(loadable(), json!([]), |options| {
-        options.session_unobserved_timeout = 1;
-    })
-    .await;
-    peer.create(
-        CREATED,
-        json!({"configOptions": [{
-            "id": "verbose", "name": "Verbose", "type": "boolean", "currentValue": false,
-        }]}),
-    )
-    .await;
-    let scope = session(CREATED);
-    let mut stream = Stream::open(&peer, &[scope.as_str()], None).await;
-    stream
-        .until(&mut peer, "the offered config option", |reader| {
-            reader.live(&session(CREATED))["controls"]["configOptions"][0]["id"] == "verbose"
-        })
-        .await;
-    // This request is valid when admitted. As in the other step-5 tests,
-    // install uses the future admission entry, before the shared ACP executor.
-    let op = peer
-        .install(
-            &scope,
-            OperationKind::SetConfig,
-            json!({"configId": "verbose", "value": true}),
-        )
-        .await;
-    // The Agent changes its offered options before this admitted command is
-    // dispatched. Wait for the actual notification's published projection.
-    peer.update(
-        CREATED,
-        json!({"sessionUpdate": "config_option_update", "configOptions": []}),
-    )
-    .await;
-    stream
-        .until(&mut peer, "the Agent's removal of verbose", |reader| {
-            reader.live(&session(CREATED))["controls"]["configOptions"] == json!([])
-        })
-        .await;
-    assert_eq!(stream.live(&scope)["op"]["id"], op);
-    assert_eq!(stream.live(&scope)["op"]["status"], "running");
-
-    stream.close();
-    peer.until_subscribers(CREATED, 0).await;
-    // The last observer's departure is processed while the admitted op still
-    // owns the session. A whole idle interval must pass without any close.
-    peer.quiet(BEYOND_TIMER).await;
-    peer.settled().await;
-    assert!(!peer.released(&scope));
-    assert_eq!(peer.live(&scope)["op"]["status"], "running");
-
-    let refused = peer.submit(json!({
-        "type": "session/set_config_option", "requestId": "removed-config-option",
-        "sessionId": CREATED, "configId": "verbose", "value": true,
-    }));
-    Peer::result(refused).await.unwrap_err();
-    peer.until("the admitted operation fails before ACP dispatch", |peer| {
-        peer.live(&scope)["op"]["id"] == op && peer.live(&scope)["op"]["status"] == "failed"
-    })
-    .await;
-    // No Agent set_config_option request is permitted for the removed option;
-    // once failure releases the operation, the ordinary timer must close it.
-    let close = peer.request("session/close").await;
-    assert_eq!(close["params"]["sessionId"], CREATED);
-    peer.reply(&close, json!({})).await;
-    peer.until("the idle session is released after the refusal", |peer| {
-        peer.released(&scope)
-    })
-    .await;
-    peer.settled().await;
-    assert!(peer.publication.lock().publisher.document(&scope).is_none());
 }
 
 /// Automatic release is still an ordinary ACP close: a refusal keeps the

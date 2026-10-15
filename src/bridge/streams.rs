@@ -90,14 +90,7 @@ pub(super) fn serve(state: &mut BridgeState, sink: &EventSink) -> Option<Value> 
             end_waiting(state, &session_id, EndReason::LoadFailed, Some(error));
             continue;
         };
-        command = prepare_session_view_request_for_owner(
-            state,
-            sink,
-            session_id,
-            Some(cwd),
-            None,
-            SessionViewWaiter::Stream,
-        );
+        command = prepare_session_load(state, session_id, Some(cwd));
     }
     command
 }
@@ -141,7 +134,7 @@ pub(super) fn end_waiting(
 pub(super) fn finish_load(
     state: &mut BridgeState,
     session_id: &str,
-    result: Result<Value, SessionViewError>,
+    result: Result<(), SessionViewError>,
 ) {
     let Err(error) = result else {
         return;
@@ -161,9 +154,6 @@ pub(super) fn finish_load(
         }
         SessionViewError::Unavailable(message) => {
             ProtocolError::new(ErrorCode::Unavailable, message)
-        }
-        SessionViewError::Retired(_) | SessionViewError::ConnectionReplaced { .. } => {
-            ProtocolError::new(ErrorCode::Unavailable, "the session load was replaced")
         }
     };
     end_waiting(state, session_id, EndReason::LoadFailed, Some(error));
@@ -241,11 +231,7 @@ impl BridgeState {
                     .state(&session_id)
                     .map(|session| session.incarnation)
                 {
-                    self.sessions.retire_entry(
-                        &session_id,
-                        incarnation,
-                        "the Agent connection ended",
-                    );
+                    self.sessions.retire_entry(&session_id, incarnation);
                 }
             } else if !reloadable {
                 self.sessions.end_unloadable(&session_id);

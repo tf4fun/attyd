@@ -469,10 +469,9 @@ impl Drop for Scheduling {
 impl IngressSender {
     pub(super) fn try_browser(&self, input: BridgeInput, class: TrafficClass) -> Result<(), Error> {
         let origin = match &input {
-            BridgeInput::RuntimeSnapshotRequest
-            | BridgeInput::UnobserveSession { .. }
-            | BridgeInput::RetireUnobservedSession { .. }
-            | BridgeInput::ServeStreams => EventOrigin::RequiredInbound,
+            BridgeInput::RetireUnobservedSession { .. } | BridgeInput::ServeStreams => {
+                EventOrigin::RequiredInbound
+            }
             _ => EventOrigin::Command,
         };
         self.submit(BridgeIngress::Browser(input), class, origin)
@@ -1036,13 +1035,10 @@ mod tests {
     }
 
     fn browser_input() -> BridgeInput {
-        let (response, _receiver) = oneshot::channel();
-        BridgeInput::TurnRequest {
+        let (reply, _receiver) = oneshot::channel();
+        BridgeInput::Workspace {
             session_id: "a".into(),
-            history_revision: "base".into(),
-            client_intent_id: "intent".into(),
-            prompt: Vec::new(),
-            response,
+            reply,
         }
     }
 
@@ -1073,7 +1069,7 @@ mod tests {
         let session_turn = scheduling.pump().unwrap().unwrap();
         assert!(scheduling.has_local_work());
         sender
-            .try_browser(BridgeInput::RuntimeSnapshotRequest, TrafficClass::Reserved)
+            .try_browser(BridgeInput::ServeStreams, TrafficClass::Reserved)
             .unwrap();
         let item = scheduling.ingress_rx.try_recv().unwrap();
         scheduling
@@ -1102,7 +1098,7 @@ mod tests {
             ));
         }
         sender
-            .try_browser(BridgeInput::RuntimeSnapshotRequest, TrafficClass::Reserved)
+            .try_browser(BridgeInput::ServeStreams, TrafficClass::Reserved)
             .unwrap();
         for index in 0..4_096 {
             let item = scheduling.ingress_rx.try_recv().unwrap();
@@ -1113,7 +1109,7 @@ mod tests {
         }
         assert!(matches!(
             scheduling.ingress_rx.try_recv().unwrap().event,
-            BridgeIngress::Browser(BridgeInput::RuntimeSnapshotRequest)
+            BridgeIngress::Browser(BridgeInput::ServeStreams)
         ));
         assert!(!cancellation.is_cancelled());
         assert!(errors.try_recv().is_err());
@@ -1287,7 +1283,7 @@ mod tests {
         assert!(!cancellation.is_cancelled());
         assert!(errors.try_recv().is_err());
         sender
-            .try_browser(BridgeInput::RuntimeSnapshotRequest, TrafficClass::Reserved)
+            .try_browser(BridgeInput::ServeStreams, TrafficClass::Reserved)
             .unwrap();
         scheduling.close();
         assert_eq!(

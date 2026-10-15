@@ -491,23 +491,6 @@ impl Peer {
             .expect("the bridge dropped the subscription")
     }
 
-    fn submit(&self, command: Value) -> oneshot::Receiver<Result<Value, BridgeRequestError>> {
-        let (response, result) = oneshot::channel();
-        self.commands
-            .send(BridgeInput::BusinessRequest { command, response })
-            .unwrap();
-        result
-    }
-
-    async fn result(
-        result: oneshot::Receiver<Result<Value, BridgeRequestError>>,
-    ) -> Result<Value, BridgeRequestError> {
-        tokio::time::timeout(WAIT, result)
-            .await
-            .expect("command did not settle")
-            .unwrap()
-    }
-
     /// A v2 operation write in `scope` through the bridge's admission
     /// (protocol §6), expecting the scope's published operation.
     async fn write(
@@ -1469,41 +1452,6 @@ async fn a_failed_delete_frees_the_session_it_occupied() {
     peer.install(&scope, OperationKind::SetMode, json!({"modeId": "x"}))
         .await;
     peer.settled().await;
-}
-
-#[tokio::test]
-async fn a_close_releases_the_session_without_an_end() {
-    let mut peer = Peer::start(json!({"sessionCapabilities": {"close": {}}})).await;
-    peer.create(CREATED, json!({})).await;
-    let scope = format!("session/{CREATED}");
-    peer.settled().await;
-    let cached = (peer.live(&scope), peer.log(&scope));
-    let closed = peer.submit(json!({
-        "type": "session/close", "requestId": "close", "sessionId": CREATED,
-    }));
-    let close = peer.request("session/close").await;
-    peer.reply(&close, json!({})).await;
-    Peer::result(closed).await.unwrap();
-    peer.until("the session leaves global", |peer| {
-        peer.live("global")["sessions"].get(CREATED).is_none()
-    })
-    .await;
-    peer.settled().await;
-    assert!(
-        peer.gate.released.contains(&scope),
-        "the session was released"
-    );
-    assert_eq!(
-        (peer.live(&scope), peer.log(&scope)),
-        cached,
-        "the client keeps its copy of a released session"
-    );
-    assert!(
-        peer.events_of(&scope)
-            .iter()
-            .all(|event| event.get("end").is_none()),
-        "a release sends no end"
-    );
 }
 
 #[tokio::test]
