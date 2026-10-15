@@ -78,7 +78,9 @@
     "repeatedCursor": "Agent 的会话列表返回了重复的游标",
     "searchNotReady": "请等待 ACP 会话就绪后再搜索工作区上下文",
     "contextNotReady": "请等待 ACP 会话就绪后再添加工作区上下文",
-    "promptNotReady": "ACP 会话尚未就绪，暂时无法接收此消息"
+    "promptNotReady": "ACP 会话尚未就绪，暂时无法接收此消息",
+    "uncertainWrite": "{{operation}} 请求可能已生效；响应丢失，不会再次发送。",
+    "refused": "{{operation}} 请求被拒绝：{{message}}"
   },
   "historyNotices": {
     "resumePartial": "当前仅包含恢复会话时收到的上下文，可能缺少更早的历史消息。",
@@ -94,5 +96,6 @@
     "light": "浅色",
     "dark": "深色",
     "localNotice": "偏好设置保存在当前浏览器中。"
-  }
+  },
+  "sessionTerminals": "Agent 终端"
 }

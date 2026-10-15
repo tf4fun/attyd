@@ -1,13 +1,12 @@
 import type {
   Annotations,
-  ContentBlock,
   PlanEntry,
-  ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import type { TerminalSnapshot } from "../../../shared/bridge";
+import type { PromptBlock } from "../../../shared/protocol";
 import i18n from "../i18n";
 import { assertNever } from "../../../shared/exhaustive";
-import type { TimelineItem } from "./state";
+import type { TimelineItem, ViewToolCallContent } from "./state";
 
 export interface ThreadMarkdownOptions {
   title: string;
@@ -36,7 +35,7 @@ export function timelineToMarkdown(
   return [...header, ...entries].filter((section) => section.length > 0).join("\n\n").trimEnd() + "\n";
 }
 
-export function contentBlocksToMarkdown(blocks: ContentBlock[]): string {
+export function contentBlocksToMarkdown(blocks: PromptBlock[]): string {
   return blocks.map(contentBlockToMarkdown).filter(Boolean).join("\n\n");
 }
 
@@ -103,7 +102,7 @@ function timelineItemToMarkdown(
   return assertNever(item, "thread timeline item");
 }
 
-function contentBlockToMarkdown(block: ContentBlock): string {
+function contentBlockToMarkdown(block: PromptBlock): string {
   let content: string;
   switch (block.type) {
     case "text":
@@ -135,6 +134,11 @@ function contentBlockToMarkdown(block: ContentBlock): string {
       }
       break;
     }
+    case "attachment":
+      // The log names media by reference (protocol §3.1); its content is read separately.
+      content = `[${i18n.t("markdown.attachment", { ns: "conversation", details: [block.block, block.mimeType, block.uri]
+        .filter((value): value is string => value != null && value.length > 0).join(" · ") })}]`;
+      return content;
     default:
       return assertNever(block, "ACP content block markdown");
   }
@@ -143,7 +147,7 @@ function contentBlockToMarkdown(block: ContentBlock): string {
 }
 
 function toolContentToMarkdown(
-  content: ToolCallContent,
+  content: ViewToolCallContent,
   terminalSnapshots: TerminalSnapshot[],
 ): string {
   switch (content.type) {

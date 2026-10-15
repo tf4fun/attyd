@@ -2,7 +2,6 @@ import type {
   AuthenticateResponse,
   AvailableCommand,
   CompactionStatus,
-  ContentBlock,
   CreateElicitationRequest,
   InitializeResponse,
   NewSessionResponse,
@@ -14,8 +13,10 @@ import type {
   SessionNotification,
   SessionUpdate,
   ToolCall,
+  ToolCallContent,
   ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
+import type { PromptBlock } from "../../../shared/protocol";
 import type {
   ConnectionPhase,
   ElicitationAbortReason,
@@ -39,10 +40,21 @@ import { randomId } from "./id";
 import { timelineTurnStarts } from "./timeline-turns";
 import { releaseSessionViewProcess, releaseTimelineProcess, releaseUnreferencedTerminals } from "./process-retention";
 
+/**
+ * Tool call content as the thread shows it. A running prompt's process carries
+ * content blocks normalized like the log's (protocol §4.4), so a block may be
+ * an `AttachmentRef` rather than an ACP `ContentBlock`.
+ */
+export type ViewToolCallContent =
+  | Exclude<ToolCallContent, { type: "content" }>
+  | (Omit<Extract<ToolCallContent, { type: "content" }>, "content"> & { content: PromptBlock });
+
+export type ViewToolCall = Omit<ToolCall, "content"> & { content?: ViewToolCallContent[] };
+
 export interface AssistantMessageChunk {
   id: string;
   role: "agent" | "thought";
-  blocks: ContentBlock[];
+  blocks: PromptBlock[];
   messageId?: string | null;
   raw: unknown[];
 }
@@ -60,10 +72,10 @@ export type TimelineItem = (
       id: string;
       type: "message";
       role: "user" | "protocol-user";
-      blocks: ContentBlock[];
+      blocks: PromptBlock[];
       messageId?: string | null;
       turnOperationId?: string;
-      echoBlocks?: ContentBlock[];
+      echoBlocks?: PromptBlock[];
       raw: unknown[];
     }
   | {
@@ -74,19 +86,19 @@ export type TimelineItem = (
   | {
       id: string;
       type: "tool";
-      call: ToolCall;
+      call: ViewToolCall;
       cancelled?: boolean;
       raw: unknown[];
     }
-  | { id: string; type: "plan"; update: SessionUpdate; raw: SessionNotification[] }
+  | { id: string; type: "plan"; update: SessionUpdate; raw: unknown[] }
   | {
       id: string;
       type: "compaction";
       compactionId: string;
       status: CompactionStatus;
-      blocks: ContentBlock[];
+      blocks: PromptBlock[];
       error?: string;
-      raw: SessionNotification[];
+      raw: unknown[];
     }
   | { id: string; type: "protocol"; notification: SessionNotification }
   | { id: string; type: "stop"; response: PromptResponse }
@@ -100,7 +112,7 @@ export type TimelineItem = (
       data?: unknown;
       dataTruncated?: boolean;
       dataBytes?: number;
-      retryBlocks?: ContentBlock[];
+      retryBlocks?: PromptBlock[];
     }
 ) & {
   historyTurnId?: string;
@@ -112,6 +124,8 @@ export interface PendingPermission {
   permissionId: string;
   request: RequestPermissionRequest;
   responseRequestId?: string;
+  /** What the card says while its answer is held or sent, instead of "Sending". */
+  responseStatus?: string;
   responseError?: string;
 }
 
@@ -119,6 +133,8 @@ export interface PendingElicitation {
   elicitationId: string;
   request: CreateElicitationRequest;
   responseRequestId?: string;
+  /** What the card says while its answer is held or sent, instead of "Sending". */
+  responseStatus?: string;
   responseError?: string;
 }
 
@@ -207,7 +223,7 @@ export interface PendingSessionControl {
 export interface PendingPrompt {
   requestId: string;
   sessionId: string;
-  blocks: ContentBlock[];
+  blocks: PromptBlock[];
   cancelRequested?: boolean;
 }
 
@@ -338,7 +354,7 @@ export type AppAction =
       type: "user/prompt";
       requestId: string;
       sessionId: string;
-      blocks: ContentBlock[];
+      blocks: PromptBlock[];
     }
   | { type: "elicitation/dismiss_flow"; elicitationId: string }
   | {
@@ -970,7 +986,7 @@ function startPrompt(
   state: AppState,
   requestId: string,
   sessionId: string,
-  blocks: ContentBlock[],
+  blocks: PromptBlock[],
 ): AppState {
   if (state.pendingPrompt?.requestId === requestId) return state;
   if (
@@ -1373,7 +1389,7 @@ function reduceCompactionUpdate(
 function appendContent(
   timeline: TimelineItem[],
   role: "agent" | "thought" | "protocol-user",
-  block: ContentBlock,
+  block: PromptBlock,
   messageId: string | null | undefined,
   turnOperationId: string | undefined,
   raw: unknown,
@@ -1385,7 +1401,7 @@ function appendContent(
 
 function appendProtocolUserContent(
   timeline: TimelineItem[],
-  block: ContentBlock,
+  block: PromptBlock,
   messageId: string | null | undefined,
   turnOperationId: string | undefined,
   raw: unknown,
@@ -1454,7 +1470,7 @@ function appendProtocolUserContent(
 function appendAssistantContent(
   timeline: TimelineItem[],
   role: AssistantMessageChunk["role"],
-  block: ContentBlock,
+  block: PromptBlock,
   messageId: string | null | undefined,
   raw: unknown,
 ): TimelineItem[] {
@@ -1564,7 +1580,7 @@ function archiveActivePlan(state: AppState): AppState {
   };
 }
 
-function contentBlockEqual(left: ContentBlock, right: ContentBlock): boolean {
+function contentBlockEqual(left: PromptBlock, right: PromptBlock): boolean {
   try {
     return JSON.stringify(left) === JSON.stringify(right);
   } catch {
@@ -1572,7 +1588,7 @@ function contentBlockEqual(left: ContentBlock, right: ContentBlock): boolean {
   }
 }
 
-function mergeTextBlock(blocks: ContentBlock[], incoming: ContentBlock): ContentBlock[] {
+function mergeTextBlock(blocks: PromptBlock[], incoming: PromptBlock): PromptBlock[] {
   const last = blocks.at(-1);
   if (last?.type === "text" && incoming.type === "text" &&
     contentBlockEqual({ ...last, text: "" }, { ...incoming, text: "" })) {
@@ -1581,7 +1597,7 @@ function mergeTextBlock(blocks: ContentBlock[], incoming: ContentBlock): Content
   return [...blocks, incoming];
 }
 
-function promptEchoRemainder(blocks: ContentBlock[], incoming: ContentBlock): ContentBlock[] | undefined {
+function promptEchoRemainder(blocks: PromptBlock[], incoming: PromptBlock): PromptBlock[] | undefined {
   const first = blocks[0];
   if (first == null) return undefined;
   if (contentBlockEqual(first, incoming)) return blocks.slice(1);
@@ -2353,7 +2369,7 @@ function isCurrentSession(state: AppState, sessionId: string): boolean {
 
 function errorTimelineItem(
   event: BridgeError,
-  retryBlocks?: ContentBlock[],
+  retryBlocks?: PromptBlock[],
 ): Extract<TimelineItem, { type: "error" }> {
   return {
     id: randomId(),

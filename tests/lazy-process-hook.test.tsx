@@ -8,7 +8,7 @@ import type { BridgeSessionView, BridgeTurnProcessPage } from "../shared/busines
 import { REQUEST_TIMEOUT_MS } from "../web/src/lib/api-client";
 import type { DeferredTurnProcess } from "../web/src/lib/state";
 import { sessionPath } from "../web/src/lib/session-route";
-import { useAcp } from "../web/src/lib/use-acp";
+import { useAcp } from "../web/src/lib/use-acp-v1";
 
 const owner = { bridgeEpoch: "epoch", sessionId: "history-session", sessionIncarnation: 3 };
 const sessionUrl = `/api/v1/sessions/${owner.sessionId}`;

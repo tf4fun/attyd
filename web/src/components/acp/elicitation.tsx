@@ -129,6 +129,7 @@ export function ElicitationCard({
             </div>
             <a
               className="elicitation-url"
+              role="button"
               href={externalUrl}
               target="_blank"
               rel="noreferrer"
@@ -154,7 +155,7 @@ export function ElicitationCard({
         <button type="button" className="ghost" disabled={responding} onClick={() => onRespond({ action: "decline" })}>{t("elicitation.decline")}</button>
         <button type="button" className="ghost" disabled={responding} onClick={() => onRespond({ action: "cancel" })}>{t("common.cancel")}</button>
       </div>
-      {responding ? <p className="interaction-status" role="status">{t("common.sending")}</p> : null}
+      {responding ? <p className="interaction-status" role="status">{pending.responseStatus ?? t("common.sending")}</p> : null}
       {pending.responseError ? <p className="interaction-error" role="alert">{pending.responseError}</p> : null}
       <RawJson label={t("elicitation.request")} value={request} />
     </form>
@@ -187,7 +188,6 @@ export function ExternalFlowCard({
   const { t } = useTranslation("cards");
   const completed = flow.status === "completed";
   const cancelled = flow.status === "cancelled";
-  const ended = completed || cancelled;
   return (
     <div className={`external-flow-card ${flow.status}`} role="status" aria-live="polite">
       {completed
@@ -204,7 +204,8 @@ export function ExternalFlowCard({
         <small>{flow.message} · {flow.elicitationId}</small>
       </span>
       {flow.url && safeHttpUrl(flow.url) ? <a href={safeHttpUrl(flow.url)} target="_blank" rel="noreferrer">{t("common.open")} <ExternalLink size={11} /></a> : null}
-      {ended ? <button type="button" aria-label={t("externalFlow.dismiss")} onClick={onDismiss}><X size={13} /></button> : null}
+      {/* A waiting flow may be dismissed too: dismissal removes it (protocol §7). */}
+      <button type="button" aria-label={t("externalFlow.dismiss")} onClick={onDismiss}><X size={13} /></button>
     </div>
   );
 }

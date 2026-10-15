@@ -2,7 +2,8 @@ import type { TFunction } from "i18next";
 import { useTranslation } from "./i18n";
 import { translateHistoryNotice } from "./i18n/history-notice";
 import { InterfaceSettings } from "./components/interface-settings";
-import type { ContentBlock, SessionInfo, ToolCall } from "@agentclientprotocol/sdk";
+import type { SessionInfo } from "@agentclientprotocol/sdk";
+import type { PromptBlock } from "../../shared/protocol";
 import {
   Activity,
   ArrowDownToLine,
@@ -37,10 +38,8 @@ import {
   type ComposerDraft,
   type ThreadNavigationTarget,
 } from "./components/acp/prompt-composer";
-import {
-  QueuedPrompts,
-  type QueuedPrompt,
-} from "./components/acp/queued-prompts";
+import { QueuedPrompts } from "./components/acp/queued-prompts";
+import { ToolContentView } from "./components/acp/tool-call";
 import { RawJson } from "./components/acp/raw-json";
 import { SessionControls } from "./components/acp/session-controls";
 import { SessionHistory } from "./components/acp/session-history";
@@ -50,7 +49,8 @@ import { projectPath } from "./lib/session-route";
 import { randomId } from "./lib/id";
 import { collectPromptHistory } from "./lib/prompt-history";
 import { timelineToMarkdown } from "./lib/thread-markdown";
-import type { AgentActivity, TimelineItem } from "./lib/state";
+import type { AgentActivity, AuthTerminalState, TimelineItem, ViewToolCall } from "./lib/state";
+import { AttachmentReaderContext } from "./lib/attachments";
 import { useAcp } from "./lib/use-acp";
 
 const AuthTerminalCard = lazy(() => import("./components/acp/auth-terminal").then(
@@ -59,7 +59,7 @@ const AuthTerminalCard = lazy(() => import("./components/acp/auth-terminal").the
 
 export default function App() {
   const { t } = useTranslation("app");
-  const [sessionAction, setSessionAction] = useState<{ kind: "close" | "delete"; sessionId: string }>();
+  const [sessionAction, setSessionAction] = useState<{ kind: "delete"; sessionId: string }>();
   const {
     state,
     sessionOpening,
@@ -73,6 +73,11 @@ export default function App() {
     logout,
     prompt,
     cancel,
+    pauseQueue,
+    takeQueued,
+    clearQueue,
+    sendQueuedNow,
+    resendQueued,
     setMode,
     setConfig,
     respondPermission,
@@ -89,15 +94,14 @@ export default function App() {
     deleteSession,
     searchWorkspaceContext,
     readWorkspaceContext,
-    loadTurnProcess,
-    releaseTurnProcess,
-    readThreadForExport,
   } = useAcp();
+  // The queue and the login terminals belong to the v2 projection; a state
+  // without them (as a test double provides) shows none.
+  const queuedPrompts = state.queue ?? [];
+  const queuePaused = state.queuePaused ?? false;
+  const authTerminals: AuthTerminalState[] = state.authTerminals ?? (state.authTerminal ? [state.authTerminal] : []);
   const [newThreadOpen, setNewThreadOpen] = useState(false);
   const [composerDraft, setComposerDraft] = useState<ComposerDraft>();
-  const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
-  const [queueError, setQueueError] = useState<"queue.sessionChanged" | "queue.sendFailed">();
-  const [queuePaused, setQueuePaused] = useState(false);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchFocusRequest, setThreadSearchFocusRequest] = useState(0);
   const [threadScroll, setThreadScroll] = useState({
@@ -434,26 +438,13 @@ export default function App() {
   useEffect(() => {
     setSessionAction(undefined);
     setComposerDraft(undefined);
-    setQueuedPrompts([]);
-    setQueueError(undefined);
-    setQueuePaused(false);
     setThreadSearchOpen(false);
   }, [state.session?.sessionId]);
-
-  useEffect(() => {
-    if (state.phase !== "stopped" && state.phase !== "error") return;
-    setQueuedPrompts([]);
-    setQueueError(undefined);
-    setQueuePaused(false);
-  }, [state.phase]);
 
   const agent = state.initialized?.agentInfo;
   const agentCapabilities = state.initialized?.agentCapabilities;
   const sessionCapabilities = agentCapabilities?.sessionCapabilities;
   const authMethods = state.initialized?.authMethods ?? [];
-  const authTerminalMethod = state.authTerminal == null
-    ? undefined
-    : authMethods.find(({ id }) => id === state.authTerminal?.methodId);
   const transitioning = state.sessionTransition != null || sessionOpening != null;
   const changingControl = state.pendingSessionControl != null;
   const authBlocksCurrent = state.authStatus === "required" || state.pendingAuth != null;
@@ -465,9 +456,8 @@ export default function App() {
   const composerAvailable = state.phase === "ready" && state.session != null &&
     !transitioning && !changingControl && !deletingCurrentSession && state.runtimeOperation == null && !authBlocksCurrent &&
     (state.sessionSyncPhase === "ready" || state.running);
-  const terminalAuthOwnsInteraction = state.authTerminal?.status === "starting" ||
-    state.authTerminal?.status === "running" ||
-    state.authTerminal?.status === "succeeded";
+  const terminalAuthOwnsInteraction = authTerminals.some(({ status }) =>
+    status === "starting" || status === "running" || status === "succeeded");
   const showAuthCard = authMethods.length > 0 &&
     (state.authStatus === "required" || state.authStatus === "logged_out") &&
     !terminalAuthOwnsInteraction;
@@ -491,6 +481,8 @@ export default function App() {
   ), [knownSessions, selectedProjectCwd]);
   const busySessionIds = [
     ...((state.running || state.runtimeOperation != null) && state.session ? [state.session.sessionId] : []),
+    // Sessions occupied by a running operation, from `global.sessions` (§4.3).
+    ...(state.busySessionIds ?? []),
     ...[...state.cachedSessions].filter(([, session]) => session.running || session.runtimeOperation != null)
       .map(([sessionId]) => sessionId),
   ];
@@ -527,34 +519,35 @@ export default function App() {
         onAuthenticate={authenticate}
       />
     ) : null}
-    {state.authTerminal && authTerminalMethod ? (
-      <Suspense fallback={<div className="auth-terminal-loading" role="status">{t("openingTerminal")}</div>}>
-        <AuthTerminalCard
-          terminalState={state.authTerminal}
-          method={authTerminalMethod}
-          onInput={writeAuthTerminal}
-          onResize={resizeAuthTerminal}
-          onCancel={cancelAuthTerminal}
-          onRetry={authenticate}
-          onDismiss={dismissAuthTerminal}
-        />
-      </Suspense>
-    ) : null}
+    {authTerminals.map((terminal) => {
+      const method = authMethods.find(({ id }) => id === terminal.methodId);
+      return method ? (
+        <Suspense key={terminal.requestId} fallback={<div className="auth-terminal-loading" role="status">{t("openingTerminal")}</div>}>
+          <AuthTerminalCard
+            terminalState={terminal}
+            method={method}
+            onInput={writeAuthTerminal}
+            onResize={resizeAuthTerminal}
+            onCancel={cancelAuthTerminal}
+            onRetry={authenticate}
+            onDismiss={() => dismissAuthTerminal(terminal.requestId)}
+          />
+        </Suspense>
+      ) : null;
+    })}
   </>;
-  const openActiveThreadMarkdown = useCallback(async () => {
-    const complete = await readThreadForExport();
-    if (complete == null) return;
-    openThreadMarkdown(timelineToMarkdown(complete.timeline, {
+  const openActiveThreadMarkdown = useCallback(() => {
+    // The thread as shown: the log's turns and the current operation.
+    openThreadMarkdown(timelineToMarkdown(state.timeline, {
       title: state.title ?? t("agentThread"),
       agentName: agent?.title ?? agent?.name,
       sessionId: state.session?.sessionId,
       cwd: state.cwd,
-      terminalSnapshots: complete.terminalSnapshots,
+      terminalSnapshots: state.terminalSnapshots,
     }));
   }, [
     agent?.name,
     agent?.title,
-    readThreadForExport,
     state.cwd,
     state.session?.sessionId,
     state.terminalSnapshots,
@@ -566,30 +559,12 @@ export default function App() {
     setSessionAction({ kind: "delete", sessionId });
   }, []);
 
-  useEffect(() => {
-    if (!ready || state.running || queuePaused || queuedPrompts.length === 0) return;
-    const next = queuedPrompts[0];
-    if (next.sessionId !== state.session?.sessionId) {
-      setQueuedPrompts((current) => current.filter(({ id }) => id !== next.id));
-      setQueueError("queue.sessionChanged");
-      return;
-    }
-    if (!prompt(next.blocks)) {
-      setQueueError("queue.sendFailed");
-      return;
-    }
-    setQueuedPrompts((current) => current[0]?.id === next.id
-      ? current.slice(1)
-      : current.filter(({ id }) => id !== next.id));
-    setQueueError(undefined);
-  }, [prompt, queuePaused, queuedPrompts, ready, state.running, state.session?.sessionId]);
-
   const submitPrompt = (
     text: string,
-    attachments: ContentBlock[],
-    restoredBlocks?: ContentBlock[],
+    attachments: PromptBlock[],
+    restoredBlocks?: PromptBlock[],
   ): boolean => {
-    const blocks: ContentBlock[] = restoredBlocks ?? [
+    const blocks: PromptBlock[] = restoredBlocks ?? [
       ...(text ? [{ type: "text" as const, text }] : []),
       ...attachments,
     ];
@@ -601,19 +576,9 @@ export default function App() {
       followLatestOnViewport.current = atBottom;
     }
     setComposerDraft(undefined);
-    if (!state.running) {
-      setQueuePaused(false);
-      return prompt(blocks);
-    }
-    const sessionId = state.session?.sessionId;
-    if (!sessionId) return false;
-    setQueuedPrompts((current) => [
-      ...current,
-      { id: randomId(), sessionId, blocks },
-    ]);
-    setQueuePaused(false);
-    setQueueError(undefined);
-    return true;
+    // Every prompt goes through the queue, which sends it once the turn has
+    // ended (C2). One sent while idle goes ahead of prompts paused by Stop.
+    return prompt(blocks, !state.running);
   };
 
   const parentNavigation = selectedProjectCwd != null ? (
@@ -705,6 +670,7 @@ export default function App() {
   );
 
   return (
+    <AttachmentReaderContext.Provider value={state.attachments}>
     <div className={`app-shell ${state.session ? "session-page" : "browse-page"}`}>
       <main
         className="main-panel"
@@ -793,9 +759,8 @@ export default function App() {
                       {sessionCapabilities?.fork != null ? (
                         <button type="button" disabled={state.running || transitioning || changingControl || queuedPrompts.length > 0} onClick={forkSession}><GitFork size={14} /> {t("forkThread")}</button>
                       ) : null}
-                      {sessionCapabilities?.close != null ? (
-                        <button type="button" className="danger" disabled={transitioning || changingControl || state.runtimeOperation != null} onClick={() => state.session && setSessionAction({ kind: "close", sessionId: state.session.sessionId })}><LogOut size={14} /> {t("closeThread")}</button>
-                      ) : null}
+                      {/* Leaving only stops following the session: no public close exists (§10, S6). */}
+                      <button type="button" disabled={transitioning} onClick={closeSession}><LogOut size={14} /> {t("closeThread")}</button>
                       {sessionCapabilities?.delete != null ? (
                         <button
                           type="button"
@@ -929,15 +894,26 @@ export default function App() {
                 agentActivity={state.agentActivity}
                 onNavigateThread={navigateThread}
                 onOpenThreadMarkdown={openActiveThreadMarkdown}
-                onLoadTurnProcess={loadTurnProcess}
-                onReleaseTurnProcess={releaseTurnProcess}
                 canReusePrompt={ready && !state.running}
-                onReusePrompt={(blocks: ContentBlock[]) => setComposerDraft({
+                onReusePrompt={(blocks: PromptBlock[]) => setComposerDraft({
                   id: randomId(),
                   blocks,
                 })}
-                onRetryPrompt={prompt}
+                onRetryPrompt={(blocks: PromptBlock[]) => prompt(blocks, true)}
               /> : null}
+              {(state.standaloneTerminals ?? []).length > 0 ? (
+                // Terminals live by their own lifecycle (S7): after their turn,
+                // until the Agent releases them.
+                <section className="session-terminals" aria-label={t("sessionTerminals")}>
+                  {state.standaloneTerminals.map((terminal) => (
+                    <ToolContentView
+                      key={terminal.terminalId}
+                      content={{ type: "terminal", terminalId: terminal.terminalId }}
+                      terminalSnapshots={state.terminalSnapshots}
+                    />
+                  ))}
+                </section>
+              ) : null}
               {state.running && state.timeline.at(-1)?.type !== "stop" ? (
                 <div className="agent-working" role="status">
                   <Activity size={14} /> {state.pendingPrompt?.cancelRequested
@@ -998,34 +974,18 @@ export default function App() {
             ) : null}
             <QueuedPrompts
               prompts={queuedPrompts}
-              error={queueError ? t(queueError) : undefined}
               paused={queuePaused}
               canSendNow={composerAvailable && state.running}
               onEdit={(queued) => {
-                setQueuedPrompts((current) => current.filter(({ id }) => id !== queued.id));
-                setQueueError(undefined);
-                setComposerDraft({ id: randomId(), blocks: queued.blocks });
+                const blocks = takeQueued(queued.id);
+                if (blocks) setComposerDraft({ id: randomId(), blocks });
               }}
-              onRemove={(id) => {
-                setQueuedPrompts((current) => current.filter((queued) => queued.id !== id));
-                setQueueError(undefined);
-              }}
-              onClear={() => {
-                setQueuedPrompts([]);
-                setQueueError(undefined);
-                setQueuePaused(false);
-              }}
+              onRemove={(id) => { takeQueued(id); }}
+              onClear={clearQueue}
               onSendNow={(id) => {
-                if (!state.running) return;
-                setQueuedPrompts((current) => {
-                  const selected = current.find((queued) => queued.id === id);
-                  return selected
-                    ? [selected, ...current.filter((queued) => queued.id !== id)]
-                    : current;
-                });
-                setQueuePaused(false);
-                cancel();
+                if (state.running) sendQueuedNow(id);
               }}
+              onResend={resendQueued}
             />
             <PromptComposer
               key={state.session?.sessionId ?? "no-session"}
@@ -1055,13 +1015,14 @@ export default function App() {
                   options={state.configOptions}
                   modes={state.session?.modes}
                   currentMode={state.modeId}
-                  disabled={state.phase !== "ready" || !state.session || transitioning || changingControl || state.runtimeOperation != null || authBlocksCurrent || !["ready", "running", "reconciling"].includes(state.sessionSyncPhase ?? "")}
+                  // A control write starts an operation, so it waits until the current one ended (§6.2).
+                  disabled={state.phase !== "ready" || !state.session || transitioning || changingControl || state.runtimeOperation != null || authBlocksCurrent || state.sessionSyncPhase !== "ready"}
                   onMode={setMode}
                   onConfig={setConfig}
                 />
               )}
               onCancel={() => {
-                setQueuePaused(true);
+                pauseQueue();
                 cancel();
               }}
               onNavigateThread={navigateThread}
@@ -1073,23 +1034,17 @@ export default function App() {
         </div>
         </>}
       </main>
-      {sessionAction && (sessionAction.kind === "delete" || sessionAction.sessionId === state.session?.sessionId) ? (
+      {sessionAction ? (
         <SessionActionDialog
           action={sessionAction.kind}
           sessionTitle={knownSessions.find(({ sessionId }) => sessionId === sessionAction.sessionId)?.title ?? undefined}
-          disabled={state.phase !== "ready" || transitioning || changingControl || (sessionAction.kind === "close"
-            ? state.runtimeOperation != null
-            : busySessionIds.includes(sessionAction.sessionId) || navigationDisabled ||
-              state.pendingSessionDeletions.some(({ sessionId }) => sessionId === sessionAction.sessionId))}
+          disabled={state.phase !== "ready" || transitioning || changingControl ||
+            busySessionIds.includes(sessionAction.sessionId) || navigationDisabled ||
+            state.pendingSessionDeletions.some(({ sessionId }) => sessionId === sessionAction.sessionId)}
           onCancel={() => setSessionAction(undefined)}
           onConfirm={() => {
             setSessionAction(undefined);
-            if (sessionAction.kind === "delete") {
-              deleteSession(sessionAction.sessionId);
-            } else {
-              setQueuePaused(true);
-              closeSession();
-            }
+            deleteSession(sessionAction.sessionId);
           }}
         />
       ) : null}
@@ -1108,6 +1063,7 @@ export default function App() {
         />
       ) : null}
     </div>
+    </AttachmentReaderContext.Provider>
   );
 }
 
@@ -1125,7 +1081,7 @@ function openThreadMarkdown(markdown: string): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
-function findToolCall(timeline: TimelineItem[], toolCallId: string): ToolCall | undefined {
+function findToolCall(timeline: TimelineItem[], toolCallId: string): ViewToolCall | undefined {
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     const item = timeline[index];
     if (item.historyTurnId == null && item.type === "tool" && item.call.toolCallId === toolCallId) return item.call;

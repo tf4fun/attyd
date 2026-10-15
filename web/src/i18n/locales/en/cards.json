@@ -154,6 +154,11 @@
     "stoppedSignal": "Stopped ({{signal}})"
   },
   "content": {
+    "attachmentKind": {
+      "image": "Image",
+      "audio": "Audio",
+      "resource": "Context"
+    },
     "expandText": "Show full message",
     "collapseText": "Show less",
     "annotations": "ACP content annotations",
@@ -212,5 +217,10 @@
     "tokens_one": "{{value}} tokens",
     "tokens_other": "{{value}} tokens",
     "reportedBy": "Reported by the Agent via ACP <code>usage_update</code>."
+  },
+  "interaction": {
+    "waitingOthers": "Answer saved; it is sent together with the other pending requests.",
+    "uncertain": "The answer may have reached the Agent; its outcome is unknown and it is not sent again.",
+    "refused": "The answer was refused: {{message}}"
   }
 }

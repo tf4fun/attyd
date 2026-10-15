@@ -1,4 +1,4 @@
-import type { ContentBlock } from "@agentclientprotocol/sdk";
+import type { PromptBlock } from "../../../shared/protocol";
 import type { TimelineItem } from "./state";
 
 
@@ -9,8 +9,8 @@ import type { TimelineItem } from "./state";
  */
 export function collectPromptHistory(
   timeline: TimelineItem[],
-): ContentBlock[][] {
-  const prompts: Array<{ blocks: ContentBlock[]; role: "user" | "protocol-user" }> = [];
+): PromptBlock[][] {
+  const prompts: Array<{ blocks: PromptBlock[]; role: "user" | "protocol-user" }> = [];
 
   for (let index = 0; index < timeline.length; index += 1) {
     const item = timeline[index];
@@ -37,7 +37,7 @@ export function collectPromptHistory(
   return prompts.map(({ blocks }) => blocks);
 }
 
-function contentBlocksEqual(left: ContentBlock[], right: ContentBlock[]): boolean {
+function contentBlocksEqual(left: PromptBlock[], right: PromptBlock[]): boolean {
   return jsonValueEqual(left, right);
 }
 

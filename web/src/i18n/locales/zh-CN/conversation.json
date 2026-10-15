@@ -152,6 +152,7 @@
     "history_other": "历史提示词 {{index}} / {{count, number}}"
   },
   "markdown": {
+    "attachment": "附件 · {{details}}",
     "metadata": {
       "agent": "Agent：{{name}}",
       "session": "会话：{{id}}",

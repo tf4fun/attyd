@@ -16,11 +16,13 @@ import remarkGfm from "remark-gfm";
 import { useTranslation } from "../../i18n";
 import { safeHttpUrl } from "../../lib/safe-url";
 import { attachmentHref } from "../../lib/hosted-attachment";
+import { useAttachedBlock, useBlockUrl } from "../../lib/attachments";
+import type { AttachmentRef, PromptBlock } from "../../../../shared/protocol";
 import { validateContentBlockSemantics } from "../../../../shared/content-validation";
 import { assertNever } from "../../../../shared/exhaustive";
 
 export function ContentBlocks({ blocks, presentation = "message" }: {
-  blocks: ContentBlock[];
+  blocks: PromptBlock[];
   presentation?: "message" | "prompt";
 }) {
   return (
@@ -36,10 +38,16 @@ export function ContentBlockView({
   block,
   presentation = "message",
 }: {
-  block: ContentBlock;
+  block: PromptBlock;
   presentation?: "message" | "tool" | "prompt";
 }) {
   switch (block.type) {
+    case "attachment":
+      return (
+        <div className={`content-block content-block-${block.block}`}>
+          <AttachmentReference reference={block} presentation={presentation} />
+        </div>
+      );
     case "text":
       return (
         <ContentBlockFrame block={block} showAnnotations={presentation !== "tool"}>
@@ -223,12 +231,46 @@ function formatBytes(value: number, language: string | undefined): string {
   return `${amount.toLocaleString(language, { maximumFractionDigits: 1 })} ${unit}`;
 }
 
-function Attachment({ block, tool }: {
+/**
+ * An attachment the log or the running prompt names by reference (protocol
+ * §3.1). Its block is read through the session's attachment read; an image an
+ * Agent replied with is shown inline, everything else as a chip that opens the
+ * read bytes locally.
+ */
+function AttachmentReference({ reference, presentation }: {
+  reference: AttachmentRef;
+  presentation: "message" | "tool" | "prompt";
+}) {
+  const { t } = useTranslation("cards");
+  const block = useAttachedBlock(reference);
+  const local = useBlockUrl(block);
+  if (block?.type === "image" && presentation === "message" && local != null && !local.download) {
+    return <img className="content-image" src={local.url} alt={attachmentName(block.uri ?? undefined, block.mimeType)} />;
+  }
+  if (block != null) {
+    return <Attachment block={block} tool={presentation === "tool"} localHref={local?.url} localDownload={local?.download} />;
+  }
+  const name = attachmentName(reference.uri, reference.mimeType ?? "application/octet-stream");
+  return (
+    <span className={`attachment-chip${presentation === "tool" ? " attachment-row" : ""}`} aria-label={name}
+      aria-disabled="true" title={[name, reference.uri, reference.mimeType].filter(Boolean).join("\n")}>
+      {presentation === "tool" ? <File size={12} aria-hidden="true" /> : <Paperclip size={14} aria-hidden="true" />}
+      <strong>{name}</strong>
+      <small>{t(`content.attachmentKind.${reference.block}`)}</small>
+    </span>
+  );
+}
+
+function Attachment({ block, tool, localHref }: {
   block: Extract<ContentBlock, { type: "image" | "audio" | "resource" | "resource_link" }>;
   tool: boolean;
+  /** An object URL with the bytes of a block read by reference. */
+  localHref?: string;
+  /** Whether that URL may only be downloaded: it would run as a document (`useBlockUrl`). */
+  localDownload?: boolean;
 }) {
   const { t, i18n } = useTranslation("cards");
-  const hostedHref = attachmentHref(block);
+  const hostedHref = attachmentHref(block) ?? localHref;
   const href = hostedHref ?? (block.type === "resource_link" ? safeHttpUrl(block.uri) : undefined);
   const resource = block.type === "resource" ? block.resource : block;
   const uri = "uri" in resource ? resource.uri ?? undefined : undefined;
@@ -272,8 +314,10 @@ function Attachment({ block, tool }: {
     title,
     "aria-description": title,
   };
+  const download = localHref != null && localDownload ? name : undefined;
   return href && valid
-    ? <a {...props} href={href} target="_blank" rel="noopener noreferrer" aria-label={t("content.openNamed", { name })}>{contents}</a>
+    ? <a {...props} href={href} target="_blank" rel="noopener noreferrer" download={download}
+      aria-label={t("content.openNamed", { name })}>{contents}</a>
     : <span {...props} aria-label={name} aria-disabled="true">{contents}</span>;
 }
 

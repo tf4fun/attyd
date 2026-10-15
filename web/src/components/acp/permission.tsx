@@ -1,8 +1,8 @@
-import type { RequestPermissionResponse, ToolCall } from "@agentclientprotocol/sdk";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import { ShieldAlert } from "lucide-react";
 import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { useTranslation } from "../../i18n";
-import type { PendingPermission } from "../../lib/state";
+import type { PendingPermission, ViewToolCall, ViewToolCallContent } from "../../lib/state";
 import { useInteractionFocus } from "../../lib/use-interaction-focus";
 import { RawJson } from "./raw-json";
 import { ToolContentView, visibleToolContents } from "./tool-call";
@@ -14,7 +14,7 @@ export function PermissionCard({
   onRespond,
 }: {
   pending: PendingPermission;
-  toolCall?: ToolCall;
+  toolCall?: ViewToolCall;
   terminalSnapshots?: TerminalSnapshot[];
   onRespond: (outcome: RequestPermissionResponse["outcome"]) => void;
 }) {
@@ -26,7 +26,7 @@ export function PermissionCard({
   const kind = request.toolCall.kind ?? toolCall?.kind;
   const locations = request.toolCall.locations ?? toolCall?.locations;
   const rawInput = request.toolCall.rawInput ?? toolCall?.rawInput ?? undefined;
-  const content = visibleToolContents(request.toolCall.content ?? toolCall?.content ?? []);
+  const content = visibleToolContents((request.toolCall.content ?? toolCall?.content ?? []) as ViewToolCallContent[]);
   const inspectable = rawInput !== undefined || (locations?.length ?? 0) > 0 || content.length > 0;
   const card = useInteractionFocus<HTMLDivElement>();
   return (
@@ -95,7 +95,7 @@ export function PermissionCard({
           {t("common.cancel")}
         </button>
       </div>
-      {responding ? <p className="interaction-status" role="status">{t("common.sending")}</p> : null}
+      {responding ? <p className="interaction-status" role="status">{pending.responseStatus ?? t("common.sending")}</p> : null}
       {pending.responseError ? <p className="interaction-error" role="alert">{pending.responseError}</p> : null}
       <RawJson label={t("permission.request")} value={request} />
     </div>
