@@ -264,7 +264,7 @@ struct Peer {
     requests: futures::channel::mpsc::Receiver<String>,
     responses: futures::channel::mpsc::Sender<io::Result<String>>,
     buffered: VecDeque<Value>,
-    _events: mpsc::UnboundedReceiver<String>,
+    _events: mpsc::UnboundedReceiver<BridgeEvent>,
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     state: Weak<BridgeLock>,
@@ -321,7 +321,7 @@ impl Peer {
             Ok(transport),
             Arc::new(options(configure)),
             command_rx,
-            EventSink { tx: events.into() },
+            EventSink { tx: events },
             cancellation.clone(),
             publication.clone(),
         ));

@@ -253,7 +253,7 @@ async fn review_filesystem_setup_failure_publishes_final_agent_error() {
             transport,
             Arc::new(configured),
             command_rx,
-            EventSink { tx: events.into() },
+            EventSink { tx: events },
             CancellationToken::new(),
         ),
     )

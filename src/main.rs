@@ -7,7 +7,6 @@ mod bridge_event;
 mod completion_handoff;
 mod dev_proxy;
 mod elicitation_validation;
-mod event_queue;
 mod filesystem;
 mod history_cache;
 mod history_replay;

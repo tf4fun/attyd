@@ -182,7 +182,7 @@ mod tests {
         let (tx, _events) = mpsc::unbounded_channel();
         Scheduling::new(
             "epoch".to_owned(),
-            EventSink { tx: tx.into() },
+            EventSink { tx },
             CancellationToken::new(),
         )
         .unwrap()

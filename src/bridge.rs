@@ -22,8 +22,8 @@ use self::publication::{BridgeLock, ProtocolState, agent_launch, operation_error
 use self::scheduling::{ExecutionTurn, IngressSender};
 use crate::agent_process::StdioAcpAgent;
 use crate::auth_terminal::{AuthTerminalManager, validate_method as validate_terminal_auth_method};
+use crate::bridge_event::{BridgeEvent, EventSender};
 use crate::elicitation_validation::validate_elicitation_request;
-use crate::event_queue::EventSender;
 use crate::filesystem::WorkspaceFileSystem;
 use crate::mcp::McpManager;
 use crate::mcp_config::{server_name, server_type};
@@ -72,70 +72,30 @@ const SHUTDOWN_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const RECONCILE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const RECONCILE_MAX_BACKOFF: Duration = Duration::from_secs(8);
 
+/// What the bridge tells its host, and where it records its diagnostics.
 #[derive(Clone)]
 struct EventSink {
     tx: EventSender,
 }
 
 impl EventSink {
-    fn send(&self, event: Value) {
-        let _ = self.tx.send_value(event);
+    /// The Agent connection initialized (see `BridgeEvent`).
+    fn initialized(&self) {
+        let _ = self.tx.send(BridgeEvent::Initialized);
     }
 
-    fn typed(&self, kind: &str, value: impl Serialize) {
-        match serde_json::to_value(value) {
-            Ok(value) => self.send(json!({ "type": kind, "response": value })),
-            Err(error) => self.error(
-                format!("failed to serialize ACP value: {error}"),
-                None,
-                None,
-            ),
-        }
-    }
-
-    fn error(&self, message: impl Into<String>, request_id: Option<&str>, operation: Option<&str>) {
-        self.report(error_event(message, request_id, operation));
-    }
-
+    /// Records an ACP error. Request- and operation-scoped failures are also
+    /// answered through their own response or operation.
     fn acp_error(&self, error: Error, request_id: Option<&str>, operation: Option<&str>) {
-        self.report(acp_error_event(error, request_id, operation));
+        tracing::warn!(
+            request_id = ?request_id,
+            operation = ?operation,
+            code = i32::from(error.code),
+            data = ?error.data,
+            "{}",
+            error.message
+        );
     }
-
-    /// Connection-level errors reach the browser as `bridge/connection_error`.
-    /// Request- and operation-scoped failures are answered through their own
-    /// REST response or session outcome, so they are only logged here.
-    fn report(&self, event: Value) {
-        if event.get("requestId").is_none() && event.get("operation").is_none() {
-            self.send(event);
-        } else {
-            let request_id = event.get("requestId").and_then(Value::as_str);
-            let operation = event.get("operation").and_then(Value::as_str);
-            let code = event.get("code").and_then(Value::as_i64);
-            let message = event.get("message").and_then(Value::as_str);
-            tracing::warn!(
-                request_id = ?request_id,
-                operation = ?operation,
-                code = ?code,
-                "{}",
-                message.unwrap_or_default()
-            );
-        }
-    }
-}
-
-fn error_event(
-    message: impl Into<String>,
-    request_id: Option<&str>,
-    operation: Option<&str>,
-) -> Value {
-    let mut event = json!({ "type": "bridge/error", "message": message.into() });
-    if let Some(request_id) = request_id {
-        event["requestId"] = json!(request_id);
-    }
-    if let Some(operation) = operation {
-        event["operation"] = json!(operation);
-    }
-    event
 }
 
 fn ensure_interaction_delivered(delivered: bool, interaction: &str) -> Result<(), Error> {
@@ -145,26 +105,6 @@ fn ensure_interaction_delivered(delivered: bool, interaction: &str) -> Result<()
         )));
     }
     Ok(())
-}
-
-fn acp_error_event(error: Error, request_id: Option<&str>, operation: Option<&str>) -> Value {
-    let message = error.message;
-    let mut event = json!({
-        "type": "bridge/error",
-        "message": message,
-        "code": i32::from(error.code),
-    });
-    if let Some(data) = error.data {
-        event["dataBytes"] = json!(serde_json::to_vec(&data).map_or(0, |encoded| encoded.len()));
-        event["data"] = data;
-    }
-    if let Some(request_id) = request_id {
-        event["requestId"] = json!(request_id);
-    }
-    if let Some(operation) = operation {
-        event["operation"] = json!(operation);
-    }
-    event
 }
 
 fn relay_bytes(value: &impl Serialize) -> Result<usize, Error> {
@@ -1605,22 +1545,6 @@ pub(crate) async fn run_publishing(
     publication: crate::protocol::hub::Publication,
 ) {
     let sink = EventSink { tx: events };
-    let mcp_servers = options
-        .mcp_servers
-        .iter()
-        .map(|server| json!({ "name": server_name(server), "type": server_type(server) }))
-        .collect::<Vec<_>>();
-    sink.send(json!({
-        "type": "bridge/hello",
-        "transport": options.transport.as_str(),
-        "command": options.command,
-        "cwd": options.cwd,
-        "readOnly": options.read_only,
-        "additionalDirectories": options.additional_directories,
-        "mcpServers": mcp_servers,
-    }));
-    sink.send(json!({ "type": "bridge/phase", "phase": "starting" }));
-
     let result = match options.transport {
         Transport::Stdio => {
             let config = AcpAgentConfig::new(&options.command[0])
@@ -1693,13 +1617,8 @@ pub(crate) async fn run_publishing(
         }
     };
 
-    match result {
-        Ok(()) => sink.send(json!({ "type": "bridge/phase", "phase": "stopped" })),
-        Err(error) => {
-            tracing::error!(error = ?error, "ACP bridge failed");
-            sink.acp_error(error, None, None);
-            sink.send(json!({ "type": "bridge/phase", "phase": "error" }));
-        }
+    if let Err(error) = result {
+        tracing::error!(error = ?error, "ACP bridge failed");
     }
 }
 
@@ -1828,7 +1747,11 @@ where
         .map(Arc::new);
     let (terminal_snapshot_tx, mut terminal_snapshot_rx) = mpsc::unbounded_channel();
     let terminals = filesystem.clone().map(|filesystem| {
-        TerminalManager::new_with_snapshots(filesystem, sink.tx.clone(), Some(terminal_snapshot_tx))
+        TerminalManager::new_with_snapshots(
+            filesystem,
+            cancellation.clone(),
+            Some(terminal_snapshot_tx),
+        )
     });
     let (terminal_barrier, mut terminal_barrier_rx) =
         mpsc::unbounded_channel::<oneshot::Sender<()>>();
@@ -1888,7 +1811,6 @@ where
     builder
         .connect_with(transport, async move |connection| {
             let _auth_terminal_cleanup = auth_terminal.close_on_drop();
-            sink.send(json!({ "type": "bridge/phase", "phase": "initializing" }));
             state.lock().await.protocol.agent.phase =
                 crate::protocol::documents::AgentPhase::Initializing;
             let initialize = InitializeRequest::new(ProtocolVersion::V1)
@@ -1949,8 +1871,7 @@ where
                 // The streams wait for the Agent: load what they follow.
                 streams::wake(&state);
             }
-            sink.typed("acp/initialized", &response);
-            sink.send(json!({ "type": "bridge/phase", "phase": "ready" }));
+            sink.initialized();
 
             loop {
                 let next = loop {
@@ -3195,12 +3116,6 @@ async fn handle_command_inner(
                     json!({}),
                 );
             }
-            sink.send(json!({
-                "type": "acp/authenticated",
-                "requestId": request_id,
-                "methodId": method_id,
-                "response": response,
-            }));
         }
         "auth/logout" => {
             let request_id = string_field(&command, "requestId")?;
@@ -3224,11 +3139,6 @@ async fn handle_command_inner(
                     json!({}),
                 );
             }
-            sink.send(json!({
-                "type": "acp/logged_out",
-                "requestId": request_id,
-                "response": response,
-            }));
         }
         "session/new" => {
             let request_id = string_field(&command, "requestId")?.to_string();
@@ -3324,7 +3234,7 @@ async fn handle_command_inner(
                         OpKind::Create,
                         json!({ "sessionId": session_id }),
                     );
-                    advance_catalog_revision(&mut state, &sink);
+                    advance_catalog_revision(&mut state);
                     refresh_observer_timers(&mut state);
                     creation_finish.committed(incarnation)?;
                 }
@@ -3965,7 +3875,7 @@ async fn handle_command_inner(
                 .begin_history_sync(&history_owner)
                 .map_err(mirror_error)?;
             history_flow.register(history_owner.clone());
-            advance_catalog_revision(&mut state, &sink);
+            advance_catalog_revision(&mut state);
             refresh_observer_timers(&mut state);
             creation_finish.committed(incarnation)?;
             drop(state);
@@ -4274,7 +4184,7 @@ async fn handle_command_inner(
                     crate::protocol::documents::EndReason::Deleted,
                     None,
                 );
-                advance_catalog_revision(&mut locked, &sink);
+                advance_catalog_revision(&mut locked);
                 return Ok(());
             };
             let (close_before_delete, runtime_incarnation) = {
@@ -4422,7 +4332,7 @@ async fn handle_command_inner(
                     &request_id,
                 );
                 state.listed_sessions.remove(&session_id);
-                advance_catalog_revision(&mut state, &sink);
+                advance_catalog_revision(&mut state);
             }
         }
         "session/prompt" => {
@@ -5429,16 +5339,11 @@ fn require_catalog_revision(state: &BridgeState, expected: &str) -> Result<(), E
     Ok(())
 }
 
-fn advance_catalog_revision(state: &mut BridgeState, sink: &EventSink) -> u64 {
+fn advance_catalog_revision(state: &mut BridgeState) -> u64 {
     state.catalog_revision = state
         .catalog_revision
         .checked_add(1)
         .expect("catalog revision exhausted");
-    sink.send(json!({
-        "type": "bridge/catalog_changed",
-        "bridgeEpoch": state.sessions.epoch(),
-        "revision": state.catalog_revision,
-    }));
     state.catalog_revision
 }
 
@@ -6299,12 +6204,10 @@ async fn require_agent_method(operation: &str, state: &Arc<BridgeLock>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    const FORMER_BRIDGE_MESSAGE_BYTES: usize = 5 * 1024 * 1024;
     const FORMER_BRIDGE_IDENTIFIER_LENGTH: usize = 1_024;
     const FORMER_BRIDGE_PATH_LENGTH: usize = 16_384;
     const FORMER_AGENT_RELAY_BYTES: usize = 4_000_000;
     const FORMER_TRACKED_SESSIONS: usize = 32;
-    const FORMER_BRIDGE_ERROR_DATA_BYTES: usize = 256 * 1024;
 
     use clap::Parser;
 
@@ -6618,21 +6521,15 @@ mod tests {
         let mut bridge = tokio::spawn(run_with_cancellation(
             Arc::new(options),
             command_rx,
-            event_tx.into(),
+            event_tx,
             cancellation.clone(),
         ));
         let result = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let raw = events
-                    .recv()
-                    .await
-                    .expect("bridge stopped before initialization");
-                let event: Value = serde_json::from_str(&raw).unwrap();
-                assert_ne!(event["type"], "bridge/error", "{event}");
-                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
-                    break;
-                }
-            }
+            assert_eq!(
+                events.recv().await,
+                Some(BridgeEvent::Initialized),
+                "bridge stopped before initialization"
+            );
             // The session's v2 stream, as a client reads it.
             fn apply(
                 replica: &mut Replica,
@@ -6711,24 +6608,11 @@ mod tests {
             if !bridge.is_finished() {
                 (&mut bridge).await.unwrap();
             }
-            let mut stopped = false;
-            let mut errors = Vec::new();
-            while let Some(raw) = events.recv().await {
-                let event: Value = serde_json::from_str(&raw).unwrap();
-                assert!(
-                    !stopped,
-                    "event published after bridge stopped: {}",
-                    event["type"]
-                );
-                if matches!(event["type"].as_str(), Some("acp/error" | "bridge/error")) {
-                    errors.push(event.clone());
-                }
-                if event["type"] == "bridge/phase" {
-                    assert_eq!(event["phase"], "stopped", "{event}; errors: {errors:?}");
-                    stopped = true;
-                }
-            }
-            assert!(stopped, "clean EOF did not publish a stopped phase");
+            assert_eq!(
+                events.recv().await,
+                None,
+                "a clean EOF tells the host nothing more"
+            );
             let prompts = ops
                 .iter()
                 .filter(|op| op["kind"] == "prompt")
@@ -6880,21 +6764,15 @@ mod tests {
         let bridge = tokio::spawn(run_with_cancellation(
             Arc::new(options),
             command_rx,
-            event_tx.into(),
+            event_tx,
             cancellation.clone(),
         ));
         let result = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let raw = events
-                    .recv()
-                    .await
-                    .expect("bridge stopped before initialization");
-                let event: Value = serde_json::from_str(&raw).unwrap();
-                assert_ne!(event["type"], "bridge/error", "{event}");
-                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
-                    break;
-                }
-            }
+            assert_eq!(
+                events.recv().await,
+                Some(BridgeEvent::Initialized),
+                "bridge stopped before initialization"
+            );
             let scope = "session/burst-history";
             let mut stream =
                 V2Stream::open(&commands, &[("catalog", None), (scope, Some(cwd))]).await;
@@ -6985,17 +6863,12 @@ mod tests {
         let bridge = tokio::spawn(run_with_cancellation(
             Arc::new(options),
             command_rx,
-            event_tx.into(),
+            event_tx,
             cancellation.clone(),
         ));
 
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
-                if event["type"] == "bridge/phase" && event["phase"] == "ready" {
-                    break;
-                }
-            }
+            assert_eq!(events.recv().await, Some(BridgeEvent::Initialized));
         })
         .await
         .expect("bridge did not initialize");
@@ -7119,7 +6992,7 @@ mod tests {
             ..BridgeState::default()
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let notification: SessionNotification = serde_json::from_value(json!({
             "sessionId": "new-session",
             "update": {
@@ -7191,7 +7064,7 @@ mod tests {
         start_test_turn(&mut bridge, "session", "prompt").unwrap();
         let state = Arc::new(BridgeLock::new(bridge));
         let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let invalid: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -7254,7 +7127,7 @@ mod tests {
             );
         let state = Arc::new(BridgeLock::new(bridge_state));
         let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let answer: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -7296,8 +7169,8 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             let filesystem =
                 Arc::new(WorkspaceFileSystem::new(workspace.path(), false, &[]).unwrap());
-            let (terminal_events, _terminal_rx) = mpsc::unbounded_channel();
-            let terminals = TerminalManager::new_with_snapshots(filesystem, terminal_events, None);
+            let terminals =
+                TerminalManager::new_with_snapshots(filesystem, CancellationToken::new(), None);
             let mut bridge = BridgeState::default();
             let incarnation = register_test_session(&mut bridge, "session", "/workspace");
             let owner = bridge
@@ -7305,7 +7178,7 @@ mod tests {
                 .resource_owner("session", incarnation)
                 .unwrap();
             let (tx, _rx) = mpsc::unbounded_channel();
-            let sink = EventSink { tx: tx.into() };
+            let sink = EventSink { tx };
             if valid {
                 register_created_terminal_locked(&mut bridge, &owner, "terminal").unwrap();
             }
@@ -7622,7 +7495,7 @@ mod tests {
         });
         let state = Arc::new(BridgeLock::new(bridge));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         for session_id in ["cold", "another-cold"] {
             handle_session_update(
                 serde_json::from_value(json!({
@@ -7726,7 +7599,7 @@ mod tests {
         };
         assert_eq!(owner.incarnation, Some(incarnation));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         handle_session_update(serde_json::from_value(json!({
             "sessionId": "session", "update": { "sessionUpdate": "agent_message_chunk", "messageId": "loaded",
                 "content": { "type": "text", "text": "attachment replay" } }
@@ -7766,9 +7639,7 @@ mod tests {
         ));
         assert!(owner.matches(&state, "session"));
         drop(state);
-        assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|event| {
-            serde_json::from_str::<Value>(&event).unwrap()["type"] != "bridge/error"
-        }));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -7803,7 +7674,7 @@ mod tests {
         clear_attachment_delivery(&mut bridge_state, "session", incarnation);
         let state = Arc::new(BridgeLock::new(bridge_state));
         let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let replay: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -7893,7 +7764,7 @@ mod tests {
                 .unwrap();
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let invalid: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
             "update": {
@@ -7920,9 +7791,7 @@ mod tests {
         );
         drop(state);
         assert!(
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-                .all(|event| event["type"] != "bridge/error"),
+            rx.try_recv().is_err(),
             "invalid reload input is reported through the load outcome"
         );
     }
@@ -7934,7 +7803,7 @@ mod tests {
             ..BridgeState::default()
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let invalid: SessionNotification = serde_json::from_value(json!({
             "sessionId": "new-session",
             "update": {
@@ -7981,46 +7850,9 @@ mod tests {
     }
 
     #[test]
-    fn relays_complete_structured_acp_errors() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
-        sink.acp_error(
-            Error::internal_error()
-                .data(json!({ "payload": "x".repeat(FORMER_BRIDGE_ERROR_DATA_BYTES + 1) })),
-            None,
-            None,
-        );
-        let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(event["type"], "bridge/error");
-        assert!(event.get("dataTruncated").is_none());
-        assert_eq!(
-            event["data"]["payload"].as_str().unwrap().len(),
-            FORMER_BRIDGE_ERROR_DATA_BYTES + 1
-        );
-
-        // Request- and operation-scoped failures answer their own caller and
-        // are only logged, so they never reach the connection error stream.
-        sink.acp_error(
-            Error::internal_error(),
-            Some("request"),
-            Some("session/prompt"),
-        );
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn relays_large_values_and_browser_events_without_replacement() {
+    fn relays_large_values_without_replacement() {
         assert!(relay_bytes(&json!({ "ok": true })).is_ok());
         assert!(relay_bytes(&json!({ "padding": "x".repeat(FORMER_AGENT_RELAY_BYTES) })).is_ok());
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
-        sink.send(json!({ "padding": "x".repeat(FORMER_BRIDGE_MESSAGE_BYTES) }));
-        let event: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(
-            event["padding"].as_str().unwrap().len(),
-            FORMER_BRIDGE_MESSAGE_BYTES
-        );
     }
 
     #[test]
@@ -9110,7 +8942,7 @@ mod tests {
         }
         let state = Arc::new(BridgeLock::new(BridgeState::default()));
         let (tx, _events) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let mut locked = state.lock().await;
         let incarnation = register_test_session(&mut locked, "session", "/workspace");
         let operation = start_test_turn(&mut locked, "session", "old-intent").unwrap();
@@ -9342,7 +9174,7 @@ mod tests {
             ElicitationAction::Cancel
         ));
         let (tx, mut events) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         apply_runtime_effects(&state, None).await;
         cancel_interactions("session", old_incarnation, &state, &sink).await;
         assert!(matches!(
@@ -9902,7 +9734,7 @@ mod tests {
                 .unwrap();
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         let incarnation = state
             .lock()
             .await
@@ -9961,7 +9793,7 @@ mod tests {
             ..BridgeState::default()
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
+        let sink = EventSink { tx };
         for index in 0..10_016 {
             let notification: SessionNotification = serde_json::from_value(json!({
                 "sessionId": "new-session",
@@ -10009,7 +9841,7 @@ mod catalog_command_tests {
         requests: futures::channel::mpsc::Receiver<String>,
         responses: futures::channel::mpsc::Sender<io::Result<String>>,
         buffered: VecDeque<Value>,
-        _events: mpsc::UnboundedReceiver<String>,
+        _events: mpsc::UnboundedReceiver<BridgeEvent>,
         cancellation: CancellationToken,
         task: tokio::task::JoinHandle<Result<(), Error>>,
     }
@@ -10036,7 +9868,7 @@ mod catalog_command_tests {
                 transport,
                 Arc::new(options),
                 command_rx,
-                EventSink { tx: events.into() },
+                EventSink { tx: events },
                 cancellation.clone(),
             ));
             let mut wire = Self {
@@ -10182,7 +10014,7 @@ mod ordered_command_tests {
         let (events, _events) = mpsc::unbounded_channel();
         let (mut scheduling, ingress) = Scheduling::new(
             "epoch".into(),
-            EventSink { tx: events.into() },
+            EventSink { tx: events },
             CancellationToken::new(),
         )
         .unwrap();
@@ -10313,7 +10145,7 @@ mod ordered_command_tests {
         let (events, _events) = mpsc::unbounded_channel();
         let (mut scheduling, ingress) = Scheduling::new(
             "epoch".into(),
-            EventSink { tx: events.into() },
+            EventSink { tx: events },
             CancellationToken::new(),
         )
         .unwrap();

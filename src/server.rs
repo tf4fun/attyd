@@ -24,9 +24,8 @@ use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::bridge;
-use crate::bridge_event::BridgeEvent;
+use crate::bridge_event::{BridgeEvent, EventReceiver, EventSender};
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
-use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
 use crate::protocol::admission::{self, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
@@ -121,16 +120,6 @@ async fn enforce_origin(
     next.run(request).await
 }
 
-fn terminal_auth_succeeded(event: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(event)
-        .ok()
-        .is_some_and(|value| {
-            value.get("type").and_then(serde_json::Value::as_str)
-                == Some("bridge/auth_terminal_exited")
-                && value.get("status").and_then(serde_json::Value::as_str) == Some("succeeded")
-        })
-}
-
 #[derive(Default)]
 struct BridgeHubState {
     generation: u64,
@@ -155,7 +144,7 @@ impl BridgeHubState {
         self.login_restart = false;
         let (input_tx, input) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
-        let (event_tx, events) = event_queue::channel(cancellation.clone());
+        let (event_tx, events) = mpsc::unbounded_channel();
         self.input = Some(input_tx);
         self.cancellation = Some(cancellation.clone());
         BridgeRuntime {
@@ -377,23 +366,24 @@ impl BridgeHub {
     }
 
     async fn publish(&self, generation: u64, event: BridgeEvent) {
-        let BridgeEvent::Lifecycle(event) = event;
-        let restart = terminal_auth_succeeded(&event);
         let restart_input = {
             let mut state = self.state.lock().await;
             if state.generation != generation || state.input.is_none() {
                 return;
             }
-            if serde_json::from_str::<serde_json::Value>(&event)
-                .is_ok_and(|value| value["type"] == "acp/initialized")
-            {
-                state.initialized = true;
+            match event {
+                BridgeEvent::Initialized => {
+                    state.initialized = true;
+                    None
+                }
+                BridgeEvent::TerminalLoginSucceeded => {
+                    let cancellation = state.cancellation.clone();
+                    if cancellation.is_some() {
+                        state.login_restart = true;
+                    }
+                    cancellation
+                }
             }
-            let cancellation = restart.then(|| state.cancellation.clone()).flatten();
-            if cancellation.is_some() {
-                state.login_restart = true;
-            }
-            cancellation
         };
         if let Some(cancellation) = restart_input {
             cancellation.cancel();
@@ -560,18 +550,15 @@ async fn forward_generation_events(
                 let Some(event) = event else {
                     break;
                 };
-                let (event, _lease) = event.into_parts();
                 let Some(hub) = hub.upgrade() else {
                     return;
                 };
                 hub.publish(generation, event).await;
             }
             _ = &mut runtime_done => {
-                // run_publishing emits its terminal phase before it
-                // returns. Drain everything already queued, then ignore any
-                // leaked/late sender from this completed generation.
+                // Drain everything run_publishing queued before it returned,
+                // then ignore any leaked/late sender of this generation.
                 while let Ok(event) = events.try_recv() {
-                    let (event, _lease) = event.into_parts();
                     let Some(hub) = hub.upgrade() else {
                         return;
                     };
@@ -1385,19 +1372,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restarts_only_after_successful_terminal_authentication() {
-        assert!(terminal_auth_succeeded(
-            r#"{"type":"bridge/auth_terminal_exited","status":"succeeded"}"#
-        ));
-        assert!(!terminal_auth_succeeded(
-            r#"{"type":"bridge/auth_terminal_exited","status":"cancelled"}"#
-        ));
-        assert!(!terminal_auth_succeeded(
-            r#"{"type":"acp/authenticated","status":"succeeded"}"#
-        ));
-    }
-
     #[tokio::test]
     async fn bridge_completion_finishes_generation_with_a_leaked_event_sender() {
         let hub = test_hub();
@@ -1413,12 +1387,10 @@ mod tests {
         let forwarder = tokio::spawn(forward_generation_events(
             Arc::downgrade(&hub),
             1,
-            event_rx.into(),
+            event_rx,
             done_rx,
         ));
-        event_tx
-            .send(r#"{"type":"acp/initialized"}"#.to_string())
-            .unwrap();
+        event_tx.send(BridgeEvent::Initialized).unwrap();
         done_tx.send(()).unwrap();
 
         tokio::time::timeout(Duration::from_millis(100), forwarder)
@@ -1434,9 +1406,7 @@ mod tests {
         );
         drop(state);
         assert!(
-            leaked_sender
-                .send(r#"{"type":"bridge/phase","phase":"ready"}"#.to_string())
-                .is_err(),
+            leaked_sender.send(BridgeEvent::Initialized).is_err(),
             "late senders from a completed generation must be disconnected"
         );
     }

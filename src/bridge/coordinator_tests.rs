@@ -11,10 +11,14 @@ use std::io;
 const SESSION: &str = "ordered-interaction";
 const AGENT_REQUEST_ID: u64 = 17;
 
-fn setup() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
+fn setup() -> (
+    AgentContext,
+    Scheduling,
+    mpsc::UnboundedReceiver<BridgeEvent>,
+) {
     let state = Arc::new(BridgeLock::new(BridgeState::default()));
     let (events, receiver) = mpsc::unbounded_channel();
-    let sink = EventSink { tx: events.into() };
+    let sink = EventSink { tx: events };
     let epoch = state.try_lock().unwrap().sessions.epoch().to_owned();
     let (scheduling, ingress) =
         Scheduling::new(epoch.clone(), sink.clone(), CancellationToken::new()).unwrap();

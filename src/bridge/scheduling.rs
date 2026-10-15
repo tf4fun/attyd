@@ -105,8 +105,7 @@ struct FaultReporter {
 impl FaultReporter {
     fn fail(&self, error: &Error) {
         if !self.reported.swap(true, Ordering::AcqRel) {
-            // This error stops the entire connection. Publish it in global
-            // scope so runtime recovery and business SSE retain the cause.
+            // This error stops the entire connection: record its cause once.
             self.sink.acp_error(error.clone(), None, None);
         }
         self.cancellation.cancel();
@@ -1002,6 +1001,7 @@ fn measure_event(event: &BridgeIngress) -> Result<usize, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge_event::BridgeEvent;
     use agent_client_protocol::{Client, Lines, UntypedMessage};
     use futures::{SinkExt, StreamExt};
     use serde_json::{Value, json};
@@ -1011,16 +1011,12 @@ mod tests {
         Scheduling,
         IngressSender,
         CancellationToken,
-        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<BridgeEvent>,
     ) {
         let (tx, errors) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
-        let (scheduling, sender) = Scheduling::new(
-            "epoch".into(),
-            EventSink { tx: tx.into() },
-            cancellation.clone(),
-        )
-        .unwrap();
+        let (scheduling, sender) =
+            Scheduling::new("epoch".into(), EventSink { tx }, cancellation.clone()).unwrap();
         (scheduling, sender, cancellation, errors)
     }
 
