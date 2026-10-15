@@ -1,5 +1,10 @@
 # Authoritative-history runtime TDD plan
 
+> **History (2026-10-15).** This plan's browser, revision, intent and journal gates belong to the
+> v1 API removed in PR #46. Current gates are listed in [state-sync §4](state-sync.md#4-invariants-and-gates)
+> and [the coverage ledger](acp-coverage.md#protocol-chain-current-protocol). The text below is
+> kept as the record of that plan.
+
 This is the executable acceptance plan for
 [active-turn-runtime.md](active-turn-runtime.md). The production transition is not complete until
 the old active-only assertions have been replaced and every P0 test below is green.

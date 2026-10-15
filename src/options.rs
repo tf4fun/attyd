@@ -78,8 +78,8 @@ pub struct Options {
     #[arg(long)]
     pub read_only: bool,
 
-    /// Close sessions after this many unobserved seconds: negative disables, zero closes immediately.
-    /// Closing may stop Agent tasks and managed terminals; history recovery depends on the Agent.
+    /// Release a session this many seconds after nothing needs it: negative disables, zero releases
+    /// immediately. Only a session the Agent can load or resume is released.
     #[arg(long, default_value_t = 300, allow_negative_numbers = true)]
     pub session_unobserved_timeout: i64,
 

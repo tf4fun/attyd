@@ -124,7 +124,6 @@
       "other": "Other"
     },
     "empty": {
-      "cancelled": "Cancelled before the tool finished.",
       "completed": "Completed without output.",
       "failed": "No error details were provided.",
       "waitingOutput": "Waiting for output…",
@@ -134,8 +133,7 @@
       "pending": "Pending",
       "in_progress": "Running",
       "completed": "Completed",
-      "failed": "Failed",
-      "cancelled": "Cancelled"
+      "failed": "Failed"
     },
     "statusLabel": "Tool status: {{status}}"
   },

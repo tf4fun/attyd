@@ -9,7 +9,6 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::SessionViewWaiter;
 use crate::semantic::SessionUpdateSemanticState;
 use crate::session_observers::SessionObservers;
 
@@ -52,7 +51,6 @@ pub(crate) struct ReplayValidationBackup {
 
 pub(crate) struct MaterializationResources {
     pub(crate) attempt_id: String,
-    pub(crate) waiters: Vec<SessionViewWaiter>,
     pub(crate) cancellation: CancellationToken,
 }
 
@@ -89,7 +87,7 @@ impl SessionResources {
     /// Cancel externally awaited work explicitly before removing its owner.
     /// Sending a terminal result also distinguishes retirement from an accidentally
     /// dropped sender. Repeated cancellation is harmless because handles are moved.
-    pub(crate) fn cancel(&mut self, reason: &str) {
+    pub(crate) fn cancel(&mut self) {
         for (_, permission) in self.permissions.drain() {
             let _ = permission.sender.send(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,
@@ -102,9 +100,6 @@ impl SessionResources {
         }
         if let Some(materialization) = self.materialization.take() {
             materialization.cancellation.cancel();
-            for waiter in materialization.waiters {
-                waiter.cancel(reason);
-            }
         }
         if let Some(history_sync) = self.history_sync.take() {
             history_sync.cancellation.cancel();
@@ -116,7 +111,7 @@ impl SessionResources {
 impl Drop for SessionResources {
     fn drop(&mut self) {
         // Covers connection teardown as well as explicit Registry retirement.
-        self.cancel("session resource owner was dropped");
+        self.cancel();
     }
 }
 

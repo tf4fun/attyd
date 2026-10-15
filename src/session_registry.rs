@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use serde_json::Value;
 use uuid::Uuid;
 
-use crate::history_cache::{HistoryCache, SessionKey};
+use crate::history_cache::HistoryCache;
 use crate::protocol::registry::ScopeOps;
 use crate::runtime_state::{
-    PendingInteraction, RuntimeEffect, RuntimeJournal, SessionLifecycle, SessionLiveState, UrlFlow,
+    PendingInteraction, RuntimeEffect, SessionLifecycle, SessionLiveState, UrlFlow,
 };
 use crate::session_observers::SessionWork;
 use crate::session_resources::{
@@ -36,8 +35,7 @@ impl SessionEntry {
     }
 }
 
-/// Owns each session once. History and live transitions operate on the same entry;
-/// the journal retains committed delivery records without a second session map.
+/// Owns each session once. History and live transitions operate on the same entry.
 pub(crate) struct SessionRegistry {
     pub(crate) epoch: String,
     pub(crate) next_incarnation: u64,
@@ -51,16 +49,11 @@ pub(crate) struct SessionRegistry {
     pub(crate) elicitation_owners: HashMap<String, SessionResourceOwner>,
     pub(crate) url_owners: HashMap<String, UrlRegistration>,
     pub(crate) history: HistoryCache,
-    pub(crate) overlay_bytes: usize,
-    pub(crate) retained_terminals: HashMap<SessionKey, BTreeMap<String, Value>>,
-    pub(crate) retained_terminal_bytes: usize,
-    pub(crate) connection_revision: u64,
     pub(crate) request_elicitations: BTreeMap<String, PendingInteraction>,
     pub(crate) request_url_flows: BTreeMap<String, UrlFlow>,
     pub(crate) resolved_request_elicitations: VecDeque<String>,
     pub(crate) resolved_request_url_flows: VecDeque<String>,
     pub(crate) effects: VecDeque<RuntimeEffect>,
-    pub(crate) journal: RuntimeJournal,
     /// Protocol v2 operation slots of `global` and `catalog`, and occupation.
     pub(crate) scopes: ScopeOps,
 }
@@ -375,7 +368,7 @@ impl SessionRegistry {
 
     /// Final physical removal is centralized so pending senders are answered and
     /// observer/materialization cancellation tokens are never silently discarded.
-    pub(crate) fn cancel_resources(&mut self, session_id: &str, incarnation: u64, reason: &str) {
+    pub(crate) fn cancel_resources(&mut self, session_id: &str, incarnation: u64) {
         if self
             .sessions
             .get(session_id)
@@ -392,7 +385,7 @@ impl SessionRegistry {
             .get_mut(session_id)
             .expect("validated resource owner")
             .resources
-            .cancel(reason);
+            .cancel();
     }
 
     /// A session ID the bridge once owned and fully released. Retirement
@@ -402,7 +395,7 @@ impl SessionRegistry {
         self.retired_ids.contains(session_id)
     }
 
-    pub(crate) fn retire_entry(&mut self, session_id: &str, incarnation: u64, reason: &str) {
+    pub(crate) fn retire_entry(&mut self, session_id: &str, incarnation: u64) {
         if self
             .sessions
             .get(session_id)
@@ -410,7 +403,7 @@ impl SessionRegistry {
         {
             return;
         }
-        self.cancel_resources(session_id, incarnation, reason);
+        self.cancel_resources(session_id, incarnation);
         self.sessions.remove(session_id);
         self.retired_ids.insert(session_id.to_string());
     }
@@ -418,7 +411,7 @@ impl SessionRegistry {
     pub(crate) fn new(epoch: impl Into<String>) -> Self {
         let epoch = epoch.into();
         Self {
-            history: HistoryCache::new(epoch.clone()),
+            history: HistoryCache::default(),
             epoch,
             next_incarnation: 0,
             next_operation: 0,
@@ -427,16 +420,11 @@ impl SessionRegistry {
             permission_owners: HashMap::new(),
             elicitation_owners: HashMap::new(),
             url_owners: HashMap::new(),
-            overlay_bytes: 0,
-            retained_terminals: HashMap::new(),
-            retained_terminal_bytes: 0,
-            connection_revision: 0,
             request_elicitations: BTreeMap::new(),
             request_url_flows: BTreeMap::new(),
             resolved_request_elicitations: VecDeque::new(),
             resolved_request_url_flows: VecDeque::new(),
             effects: VecDeque::new(),
-            journal: RuntimeJournal::new(),
             scopes: ScopeOps::default(),
         }
     }
@@ -473,10 +461,8 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
 
-    use crate::bridge::{SessionViewError, SessionViewWaiter};
     use crate::runtime_state::SessionOperationKind;
     use crate::semantic::SessionUpdateSemanticState;
-    use crate::session_observation::ObservationLease;
     use crate::session_resources::{
         ElicitationResponder, MaterializationResources, PermissionResponder,
         ReplayValidationBackup, SessionUpdateOwner,
@@ -589,9 +575,7 @@ mod tests {
     struct WaitingResources {
         permission: oneshot::Receiver<RequestPermissionResponse>,
         elicitation: oneshot::Receiver<CreateElicitationResponse>,
-        view: oneshot::Receiver<Result<Value, SessionViewError>>,
         materialization: CancellationToken,
-        observer: ObservationLease,
         validation: Arc<()>,
     }
 
@@ -619,15 +603,11 @@ mod tests {
                 sender: elicitation_sender,
             },
         );
-        let (view_sender, view) = oneshot::channel();
         let materialization = CancellationToken::new();
         resources.materialization = Some(MaterializationResources {
             attempt_id: "materialization".to_string(),
-            waiters: vec![SessionViewWaiter::View(view_sender)],
             cancellation: materialization.clone(),
         });
-        let observer = ObservationLease::default();
-        resources.observers.observe(1, observer.clone());
         let validation = SessionUpdateSemanticState::default();
         let allocation = validation.allocation.clone();
         resources.validation = Some(validation);
@@ -661,9 +641,7 @@ mod tests {
         WaitingResources {
             permission,
             elicitation,
-            view,
             materialization,
-            observer,
             validation: allocation,
         }
     }
@@ -677,15 +655,10 @@ mod tests {
             waiting.elicitation.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
-        assert!(matches!(
-            waiting.view.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
         assert!(!waiting.materialization.is_cancelled());
-        assert!(!waiting.observer.is_cancelled());
     }
 
-    fn assert_cancelled(waiting: &mut WaitingResources, reason: &str) {
+    fn assert_cancelled(waiting: &mut WaitingResources) {
         assert_eq!(
             serde_json::to_value(waiting.permission.try_recv().unwrap()).unwrap(),
             serde_json::to_value(RequestPermissionResponse::new(
@@ -698,11 +671,7 @@ mod tests {
             serde_json::to_value(CreateElicitationResponse::new(ElicitationAction::Cancel))
                 .unwrap()
         );
-        assert!(
-            matches!(waiting.view.try_recv().unwrap(), Err(SessionViewError::Unavailable(message)) if message.contains(reason))
-        );
         assert!(waiting.materialization.is_cancelled());
-        assert!(waiting.observer.is_cancelled());
     }
 
     #[test]
@@ -749,13 +718,13 @@ mod tests {
             registry.state("session").is_some(),
             "materialization retains its owner until its specific result is delivered"
         );
-        registry.cancel_resources("session", 1, "session was removed");
+        registry.cancel_resources("session", 1);
         registry.remove("session", 1);
         assert!(registry.state("session").is_none());
         assert!(registry.permission_owners.is_empty());
         assert!(registry.elicitation_owners.is_empty());
         assert!(registry.url_owners.is_empty());
-        assert_cancelled(&mut waiting, "removed");
+        assert_cancelled(&mut waiting);
     }
 
     #[test]
@@ -773,7 +742,7 @@ mod tests {
             )
             .unwrap();
         assert!(incarnation > 1);
-        assert_cancelled(&mut old, "replaced");
+        assert_cancelled(&mut old);
         assert!(
             registry
                 .resources("session", incarnation)
@@ -818,9 +787,9 @@ mod tests {
         assert_waiting(&mut waiting);
         registry.remove("session", incarnation);
         assert_waiting(&mut waiting);
-        registry.cancel_resources("session", incarnation, "session was removed");
+        registry.cancel_resources("session", incarnation);
         registry.remove("session", incarnation);
-        assert_cancelled(&mut waiting, "removed");
+        assert_cancelled(&mut waiting);
     }
 
     #[test]
@@ -829,6 +798,6 @@ mod tests {
         registry.register_new("session", 1);
         let mut waiting = populate(&mut registry, "session", 1);
         drop(registry);
-        assert_cancelled(&mut waiting, "dropped");
+        assert_cancelled(&mut waiting);
     }
 }

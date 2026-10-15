@@ -1060,7 +1060,6 @@ export class Workspace {
     return {
       ...initialState,
       phase: agent?.phase ?? "starting",
-      socketOpen: global != null,
       transport: agent?.launch.transport ?? "stdio",
       command: agent?.launch.command ?? [],
       defaultCwd: agent?.launch.cwd ?? "",
@@ -1100,10 +1099,6 @@ export class Workspace {
       sessionTransition: this.#transition == null || this.#transition.navigation !== this.#navigation ? undefined : {
         kind: this.#transition.kind,
         requestId: `transition:${this.#transition.kind}`,
-        backup: {
-          cwd: "", availableCommands: [], configOptions: null, timeline: [], permissions: [], elicitations: [],
-          running: false, terminalSnapshots: [],
-        },
       },
       pendingPrompt: running ? { requestId: op!.id, sessionId: live!.sessionId, blocks: [], cancelRequested: op!.cancelRequested } : undefined,
       availableCommands: controls?.commands ?? [],

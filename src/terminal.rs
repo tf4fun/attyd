@@ -14,9 +14,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::event_queue::EventSender;
 use crate::filesystem::WorkspaceFileSystem;
 
 #[derive(Debug, Clone)]
@@ -31,7 +31,8 @@ const TERMINAL_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::
 pub struct TerminalManager {
     filesystem: Arc<WorkspaceFileSystem>,
     terminals: Arc<Mutex<HashMap<String, Arc<Terminal>>>>,
-    events: EventSender,
+    /// The generation a lost snapshot delivery cancels.
+    generation: CancellationToken,
     snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
 }
 
@@ -100,18 +101,15 @@ struct TerminalState {
 }
 
 impl TerminalManager {
-    pub fn new_with_snapshots<E>(
+    pub fn new_with_snapshots(
         filesystem: Arc<WorkspaceFileSystem>,
-        events: E,
+        generation: CancellationToken,
         snapshots: Option<mpsc::UnboundedSender<TerminalSnapshot>>,
-    ) -> Self
-    where
-        E: Into<EventSender>,
-    {
+    ) -> Self {
         Self {
             filesystem,
             terminals: Arc::new(Mutex::new(HashMap::new())),
-            events: events.into(),
+            generation,
             snapshots,
         }
     }
@@ -459,7 +457,7 @@ impl TerminalManager {
                 })
                 .is_err()
         {
-            self.events.cancel_generation();
+            self.generation.cancel();
         }
     }
 }
@@ -582,10 +580,10 @@ mod tests {
 
     fn manager(root: &Path) -> (TerminalManager, mpsc::UnboundedReceiver<TerminalSnapshot>) {
         let filesystem = Arc::new(WorkspaceFileSystem::new(root, false, &[]).unwrap());
-        let (events, _) = mpsc::unbounded_channel::<String>();
+        let generation = CancellationToken::new();
         let (snapshots, receiver) = mpsc::unbounded_channel();
         (
-            TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots)),
+            TerminalManager::new_with_snapshots(filesystem, generation, Some(snapshots)),
             receiver,
         )
     }
@@ -674,7 +672,7 @@ mod tests {
     async fn snapshot_backlog_does_not_consume_or_reorder_output() {
         let root = tempfile::tempdir().unwrap();
         let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
-        let (events, _) = mpsc::unbounded_channel::<String>();
+        let generation = CancellationToken::new();
         let (snapshots, mut snapshot_rx) = mpsc::unbounded_channel();
         snapshots
             .send(TerminalSnapshot {
@@ -682,7 +680,8 @@ mod tests {
                 value: json!({}),
             })
             .unwrap();
-        let terminals = TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots));
+        let terminals =
+            TerminalManager::new_with_snapshots(filesystem, generation, Some(snapshots));
         let terminal = Terminal {
             id: "ordered-terminal".to_string(),
             session_id: "session".to_string(),
@@ -721,15 +720,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lost_snapshot_delivery_cancels_the_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
+        let generation = CancellationToken::new();
+        let (snapshots, snapshot_rx) = mpsc::unbounded_channel();
+        drop(snapshot_rx);
+        let terminals =
+            TerminalManager::new_with_snapshots(filesystem, generation.clone(), Some(snapshots));
+        let terminal = Terminal {
+            id: "lost-terminal".to_string(),
+            session_id: "session".to_string(),
+            incarnation: 1,
+            output_limit: Some(1024),
+            state: Mutex::new(TerminalState {
+                output: b"output".to_vec(),
+                pending_output: b"output".to_vec(),
+                ..Default::default()
+            }),
+            changed: Notify::new(),
+            kill: Mutex::new(None),
+            readers_remaining: AtomicUsize::new(0),
+            reader_tasks: Mutex::new(Vec::new()),
+        };
+        assert!(!generation.is_cancelled());
+        terminals.emit_snapshot(&terminal).await;
+        assert!(generation.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn terminal_n_bytes_produce_linear_snapshot_bytes() {
         const CHUNK_COUNT: usize = 8;
         const CHUNK_BYTES: usize = 1_024;
 
         let root = tempfile::tempdir().unwrap();
         let filesystem = Arc::new(WorkspaceFileSystem::new(root.path(), false, &[]).unwrap());
-        let (events, _) = mpsc::unbounded_channel::<String>();
+        let generation = CancellationToken::new();
         let (snapshots, mut snapshot_rx) = mpsc::unbounded_channel();
-        let terminals = TerminalManager::new_with_snapshots(filesystem, events, Some(snapshots));
+        let terminals =
+            TerminalManager::new_with_snapshots(filesystem, generation, Some(snapshots));
         let terminal = Arc::new(Terminal {
             id: "linear-terminal".to_string(),
             session_id: "session".to_string(),

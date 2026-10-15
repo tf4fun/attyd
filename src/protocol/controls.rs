@@ -4,8 +4,6 @@
 //! or fork response, then later updates. The response overrides exactly the
 //! fields it provides; every update kind owns disjoint fields. A holder calls
 //! `settle` at each response, then `fold_update` for every later update.
-use std::collections::BTreeMap;
-
 use serde_json::Value;
 
 use super::{SessionControls, SessionModes, SessionUsage};
@@ -95,11 +93,10 @@ impl SessionControls {
     }
 
     /// The state at a setup response: `early` holds the control updates
-    /// that arrived before it, as the latest update of each kind. The kinds own
-    /// disjoint fields, so their arrival order does not matter.
-    pub(crate) fn settle(early: &BTreeMap<String, Value>, response: &Value) -> Self {
+    /// that arrived before it, in arrival order.
+    pub(crate) fn settle<'a>(early: impl IntoIterator<Item = &'a Value>, response: &Value) -> Self {
         let mut controls = Self::default();
-        for update in early.values() {
+        for update in early {
             controls.fold_update(update);
         }
         controls.apply_response(response);
@@ -109,6 +106,8 @@ impl SessionControls {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::*;
@@ -281,14 +280,14 @@ mod tests {
             let folded = crate::runtime_state::fold_control_update(early.get(&key), update);
             early.insert(key, folded);
         }
-        let controls = SessionControls::settle(&early, &response);
+        let controls = SessionControls::settle(early.values(), &response);
         assert_eq!(controls.modes.as_ref().unwrap().current_mode_id, "ask");
         assert_eq!(controls.modes.as_ref().unwrap().available_modes.len(), 2);
         assert_eq!(controls.config_options, Some(Vec::new()));
         assert_eq!(controls.info.title.as_deref(), Some("Title"));
         assert_eq!(controls.usage.as_ref().unwrap().size, 9);
         assert_eq!(
-            SessionControls::settle(&BTreeMap::new(), &json!({ "sessionId": "s" })),
+            SessionControls::settle([], &json!({ "sessionId": "s" })),
             SessionControls::default()
         );
     }

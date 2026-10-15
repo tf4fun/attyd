@@ -15,11 +15,10 @@ use crate::protocol::hub::{Publication, Subscribed, Subscription};
 /// publishes the start after the cut.
 pub(super) fn subscribe(
     state: &mut BridgeState,
-    sink: &EventSink,
     scopes: &[Subscribed],
 ) -> (Subscription, Option<Value>) {
     let subscription = register(state, scopes);
-    let command = serve(state, sink);
+    let command = serve(state);
     refresh_observer_timers(state);
     (subscription, command)
 }
@@ -42,7 +41,7 @@ pub(super) fn wake(state: &BridgeState) {
 /// Starts the next load the streams wait for: first a session the previous
 /// connection held, then an unheld session a subscription follows. Starts one
 /// load a pass, the command the caller runs, and wakes itself for the rest.
-pub(super) fn serve(state: &mut BridgeState, sink: &EventSink) -> Option<Value> {
+pub(super) fn serve(state: &mut BridgeState) -> Option<Value> {
     while let Some(session_id) = state.stream_reloads.pop_front() {
         let Some(cwd) = state
             .sessions
@@ -90,14 +89,7 @@ pub(super) fn serve(state: &mut BridgeState, sink: &EventSink) -> Option<Value> 
             end_waiting(state, &session_id, EndReason::LoadFailed, Some(error));
             continue;
         };
-        command = prepare_session_view_request_for_owner(
-            state,
-            sink,
-            session_id,
-            Some(cwd),
-            None,
-            SessionViewWaiter::Stream,
-        );
+        command = prepare_session_load(state, session_id, Some(cwd));
     }
     command
 }
@@ -141,7 +133,7 @@ pub(super) fn end_waiting(
 pub(super) fn finish_load(
     state: &mut BridgeState,
     session_id: &str,
-    result: Result<Value, SessionViewError>,
+    result: Result<(), SessionViewError>,
 ) {
     let Err(error) = result else {
         return;
@@ -161,9 +153,6 @@ pub(super) fn finish_load(
         }
         SessionViewError::Unavailable(message) => {
             ProtocolError::new(ErrorCode::Unavailable, message)
-        }
-        SessionViewError::Retired(_) | SessionViewError::ConnectionReplaced { .. } => {
-            ProtocolError::new(ErrorCode::Unavailable, "the session load was replaced")
         }
     };
     end_waiting(state, session_id, EndReason::LoadFailed, Some(error));
@@ -241,11 +230,7 @@ impl BridgeState {
                     .state(&session_id)
                     .map(|session| session.incarnation)
                 {
-                    self.sessions.retire_entry(
-                        &session_id,
-                        incarnation,
-                        "the Agent connection ended",
-                    );
+                    self.sessions.retire_entry(&session_id, incarnation);
                 }
             } else if !reloadable {
                 self.sessions.end_unloadable(&session_id);

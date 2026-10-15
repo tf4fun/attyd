@@ -11,7 +11,7 @@ use super::documents::{
     OperationSummary, PendingCounts, Scope, SessionLive, SessionSummary, Terminal, UrlFlow,
 };
 use super::op::OpSlot;
-use super::registry::{SessionLog, unanswered};
+use super::registry::SessionLog;
 use crate::runtime_state::{
     PendingInteraction, SessionLifecycle, SessionLiveState, SharedTurnUpdates, UrlFlowStatus,
 };
@@ -80,12 +80,14 @@ fn session_interactions(
 ) {
     let belongs = |pending: &&PendingInteraction| registry.belongs_to(&pending.interaction_id, op);
     into.extend(
-        unanswered(live.permissions.values())
+        live.permissions
+            .values()
             .filter(belongs)
             .map(|pending| interaction(pending, true)),
     );
     into.extend(
-        unanswered(live.elicitations.values())
+        live.elicitations
+            .values()
             .filter(belongs)
             .map(|pending| interaction(pending, false)),
     );
@@ -103,13 +105,17 @@ fn interactions(
     let joined =
         |pending: &&PendingInteraction| registry.scopes.joined.get(&pending.interaction_id);
     interactions.extend(
-        unanswered(registry.request_elicitations.values())
+        registry
+            .request_elicitations
+            .values()
             .filter(|pending| joined(pending).is_some_and(|joined| joined.op == op))
             .map(|pending| interaction(pending, false)),
     );
     match owner {
         Scope::Global => interactions.extend(
-            unanswered(registry.request_elicitations.values())
+            registry
+                .request_elicitations
+                .values()
                 .filter(|pending| joined(pending).is_none())
                 .map(|pending| interaction(pending, false)),
         ),

@@ -1,5 +1,7 @@
 # Session 隔离实施记录
 
+> **注（2026-10-15）。** 下文的 session 状态所有权仍是 bridge 内部现状（incarnation 清理属迁移第 9 步，尚未执行）；其中的 `/api/v1` 路由、事件流与快照已随 PR #46 删除，客户端合同见 [protocol.md](protocol.md)。
+
 目标是完整落实 [重构方案](session-isolation-proposal.md) 的三个阶段。以下记录区分已经落地的
 切片与仍需迁移的职责；前端解耦、共享 payload 或新增类型本身都不代表 session 隔离完成。
 

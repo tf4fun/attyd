@@ -1,5 +1,7 @@
 # Session 隔离与状态所有权重构讨论稿
 
+> **注（2026-10-15）。** 下文提到的 `/api/v1` 事件流与订阅已随 PR #46 删除，客户端合同见 [protocol.md](protocol.md)；bridge 内部的 session 隔离仍然适用。
+
 状态：三个阶段已完成并通过验收，架构分层与验证结果见 [实施记录](session-isolation-implementation.md)。本文不替代 [现有运行态契约](active-turn-runtime.md) 和
 [状态机测试要求](bridge-state-machine-tdd.md)。本轮讨论从权限／Elicitation 等待导致浏览器
 重连 `session/list` 超时的问题出发；已经完成的回调等待修复应独立保留。

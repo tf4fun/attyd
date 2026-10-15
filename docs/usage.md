@@ -11,16 +11,13 @@ the currently available history. Prompts and replies share a flat reading layout
 with clear role labels. Prompt actions sit beside the role label, leaving the full
 column for content; code blocks retain their monospace treatment.
 
-While a turn runs, its messages remain visible. Completed turns keep the last
-available Agent response visible and group earlier replies, thinking, tools, and
-file changes under **Execution process**. Expand it to inspect or search those
-details; Markdown export still includes the full available history. If you scroll up while a turn
-runs, automatic folding waits until you return to the bottom. Stop reasons and
-errors remain visible.
-
-The **Execution process** row shows the number of intermediate entries and an
-explicit **Show / Hide** action. Counts describe the available messages and events,
-not an estimate of the Agent's work or a complete audit log.
+While a turn runs, its replies, thinking, tools, plans and file changes stream
+directly into the conversation. Once the Agent answers the prompt, the turn keeps
+the prompt and the Agent's messages; thinking, tool calls, plans and their output
+end with the turn and are not shown again, also not after a reload. The whole
+reply is shown as one Agent message. Markdown export contains
+the prompts and messages, with their attachments. A failed prompt keeps its error
+and the prompt for Retry.
 
 ## Interface preferences
 
@@ -209,7 +206,7 @@ Place attyd options before `--` and the Agent command or endpoint after it.
 | `-t, --transport <transport>` | `stdio` (default), `http` (Streamable HTTP/SSE), or `ws`. |
 | `--add-dir <path>` | Additional stdio workspace root; repeatable and unavailable with remote transports. |
 | `--mcp-config <file>` | Static MCP configuration file; repeatable. |
-| `--session-unobserved-timeout <seconds>` | Retire an unobserved session after this interval; defaults to `300` (five minutes). Any negative value disables recycling; `0` retires immediately. The Agent is asked to `session/close` when it supports it; either way the local copy is released. |
+| `--session-unobserved-timeout <seconds>` | Release a session this long after nothing needs it any more; defaults to `300` (five minutes). Any negative value disables release; `0` releases immediately. Only a session the Agent can load or resume is released, with `session/close` when the Agent supports it. |
 | `--read-only` | Disable attyd's ACP `fs/write_text_file` capability and handler. |
 | `--allowed-origin <origin>` | Allow a browser origin and its hostname for a reverse proxy or custom domain; repeatable. Use `'*'` to allow any HTTP(S) origin and hostname. |
 | `--help`, `--version` | Show CLI help or the executable version. |
@@ -238,42 +235,35 @@ discovery is not filtered by attyd's startup directory. A known project/session
 link can load history even when the Agent does not provide a session list.
 
 Opening a cold session uses `session/load` when available, otherwise negotiated
-`session/resume`. History is best effort: Agent replay takes priority, followed by
-available memory context, then a visible missing-history notice. A successful
-empty replay remains authoritative. Resume and fork do not require load support;
-a failed history lookup after attachment does not undo a successful resume or fork.
-A branch may display a labelled source snapshot without changing the Agent's context.
+`session/resume`. The conversation shown is built from the Agent's replay; a
+successful empty replay shows an empty conversation. A session attaches only once
+its load or resume succeeds; a failure ends that attempt with its error, and
+**Retry** opens it again. A session attaches without load support through resume.
+A fork shows the history the Agent replays for it; without a replay it starts from
+the source session's conversation as attyd holds it.
 
 Projects and sessions are ordered by recent activity. Homepage search and counts
 cover loaded metadata; use **Load more** to discover additional projects.
 Project and conversation routes fetch further metadata pages as needed.
 
-**Close thread** asks for confirmation, including for idle sessions: closing may
-stop Agent tasks and managed terminal processes, including development servers.
-Only a successful Agent close clears local messages and terminal output. Detached
-services can outlive the session. Settings may be sent while a prompt runs; the
-Agent decides when a changed mode or configuration takes effect.
+**Close thread** only leaves the conversation; it sends nothing to the Agent.
+One operation runs in a session at a time: a mode or configuration change, a fork
+or a deletion waits until a running prompt ends, and the controls are disabled
+meanwhile.
 
-Leaving a conversation moves the session into the unobserved attention machine.
-Only that session's SSE observers count; project/home pages do not keep it open.
-The machine classifies each unobserved session by its work state: a running turn,
-an in-flight operation or materialization, a live managed terminal, or a pending
-permission/elicitation/URL interaction keeps the closing countdown disarmed —
-retirement must not cut work off or cancel an interaction Agent-side. Once
-nothing is in-flight the countdown arms for the full interval, and any arriving
-observer, turn, or interaction cancels it. Returning to the session always
-cancels the countdown. Newly materialized sessions with no observer also count;
-mere list entries do not. The Agent owns the session: when it supports
-`session/close` expiry sends that request first; without close support the local
-copy is still released and the Agent keeps whatever it retains. A session retired
-without Agent close may remain listed and may be re-materialized on the next open
-when the Agent supports `session/load`. A failed explicit close retains the
-projection.
+attyd holds a session while anything needs it: a browser following it, an
+operation running in or occupying it, a terminal the Agent has not released, or
+an accepted URL flow. Project and home pages do not follow a session. Once nothing
+needs it, attyd releases it after `--session-unobserved-timeout`, so release never
+cuts off running work or a pending interaction. Only a session the Agent can load
+or resume is released: attyd sends `session/close` when the Agent supports it and
+drops its own copy; opening the session again loads it from the Agent. A session
+the Agent can neither load nor resume stays held.
 
 ```bash
 attyd --session-unobserved-timeout 600 -- your-agent acp # ten minutes
-attyd --session-unobserved-timeout -1 -- your-agent acp # manual close only
-# omitted: sessions retire after five unobserved minutes by default
+attyd --session-unobserved-timeout -1 -- your-agent acp # never release
+# omitted: sessions are released five minutes after nothing needs them
 ```
 
 Browser reconnection uses the host's in-memory session state. Restarting attyd
@@ -281,8 +271,8 @@ loses that state; durable history and restoration support belong to the Agent.
 
 attyd does not provide a persistent conversation database, an editor with unsaved
 buffers, NES/document synchronization, model-provider credential management, or
-vendor-specific tool/history interpretation. Missing historical terminal output
-is shown as unavailable; old commands are never re-executed to reconstruct it.
+vendor-specific tool/history interpretation. Terminal output is shown while the
+Agent keeps the terminal; old commands are never re-executed to reconstruct it.
 
 ## Files and attachments
 
@@ -301,22 +291,23 @@ the tooltip. Tool outputs use borderless resource rows with the name, size, and
 file directory or web address. This presentation applies to every tool kind.
 File contents and media are never expanded inline.
 
-The host retains complete attachment content in its existing session memory cache.
-Normal HTTP views, process pages, and live events send attachment metadata and
-session-scoped references to the browser. Unsent drafts remain browser-local.
-Clicking a chip opens the host's attachment URL in a new tab, with no frontend
-Blob allocation, object URL cleanup, or format-specific preview library.
-The host serves text as UTF-8 and preserves binary MIME types and bytes.
-Active documents such as HTML/SVG receive a sandbox CSP with scripts disabled. The browser
-decides whether to display or download other formats according to their MIME type
-and browser settings; unsupported types normally trigger a download. There are
-no separate preview/download modes in the client.
-The host resolves attachment references back to the original ACP blocks on prompt
-reuse. Explicit exports request full content without installing it in browser
-conversation state. Attachment URLs are tied to the bridge epoch and session
-incarnation: closing/retiring a session or restarting the host invalidates old
-URLs, and loading Agent history supplies fresh references. Attachments introduce
-no separate disk store or cache lifetime. Responses use `Cache-Control: no-store`.
+The host keeps each image, audio and embedded-resource block of a held session in
+memory while the session's log or live state refers to it. Documents and events
+carry only an attachment reference: its ID, kind, MIME type and URI. Unsent drafts
+remain browser-local.
+The page reads the block a reference names, as ACP JSON, from
+`/api/v2/sessions/<id>/attachments/<attachmentId>`. It keeps a read block in a
+presentation cache only while a view shows it, and builds a Blob URL for the chip
+that is revoked when the view goes. Safe media open in a new tab: PNG, JPEG, GIF,
+WebP, AVIF and BMP images, audio and video, and text or JSON shown as plain text.
+Everything else, including HTML, SVG, XML, PDF and unknown types, is a download
+with the original bytes, so active documents never run in the page's origin.
+There is no format-specific preview library.
+The host resolves attachment references back to the blocks they name on prompt
+reuse. An attachment read works while its session is held and refers to it;
+releasing the session or restarting the host ends it, and loading the session
+again from the Agent supplies the references anew. Attachments introduce no
+separate disk store.
 Restoration requires the Agent to replay the original attachment content blocks.
 If an Agent flattens attachments into ordinary text, attyd displays that text;
 it does not reconstruct files from vendor-specific text markers.
@@ -329,11 +320,11 @@ three preview lines fade gently. Markdown is parsed in full, preserving formatti
 and links; reusing and exporting retain its complete original source.
 When editing a reused prompt, text fields and attachment chips follow the original
 content-block order. Editing changes only that text block, removing an attachment
-removes only that block, and new attachments append at the end. Block metadata is
-retained; separate text blocks are not combined or given extra separators.
-MIME parameters accept standard whitespace and quoted values. Text attachments
-are served with one UTF-8 charset parameter; binary attachment bytes and MIME
-parameters are preserved.
+removes only that block, and new attachments append at the end. A turn's content
+is kept as attyd normalizes it: `_meta` is dropped at every level, and adjacent
+text blocks that differ only in their text are merged; nothing else is combined or
+given extra separators.
+Text shown inline uses UTF-8; downloaded bytes are the block's own.
 Links without bytes open only on a user click; attyd does not fetch them to make
 previews. Downloads are exports, not a persistent conversation cache.
 

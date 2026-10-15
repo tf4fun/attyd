@@ -133,7 +133,7 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
         let epoch = state.sessions.epoch().to_string();
         let delivered = match delivery {
             Delivery::Permission(owner, response) => {
-                deliver_permission(state, sink, &owner, &id, response, |state| {
+                deliver_permission(state, &owner, &id, response, |state| {
                     state
                         .sessions
                         .resolve_permission(&epoch, &owner.session_id, owner.incarnation, &id)
@@ -151,7 +151,6 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
                     .map(|owner| (owner.session_id.as_str(), owner.incarnation));
                 deliver_elicitation(
                     state,
-                    sink,
                     &id,
                     owner.as_ref(),
                     response,
@@ -283,15 +282,9 @@ fn command(state: &BridgeState, scope: &OpScope, kind: OpKind, op: &str, input: 
     };
     let mut command = match kind {
         OpKind::Prompt => {
-            let session_id = session_id.expect("a prompt is a session's");
-            let revision = state
-                .sessions
-                .active_session(session_id)
-                .and_then(|session| session.state.history_revision.clone());
             json!({
                 "type": "session/prompt",
                 "clientIntentId": op,
-                "historyRevision": revision,
                 "prompt": input["prompt"],
             })
         }

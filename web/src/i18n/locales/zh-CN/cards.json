@@ -124,7 +124,6 @@
       "other": "其他"
     },
     "empty": {
-      "cancelled": "工具完成前已取消。",
       "completed": "已完成，没有输出。",
       "failed": "未提供错误详情。",
       "waitingOutput": "正在等待输出…",
@@ -134,8 +133,7 @@
       "pending": "待处理",
       "in_progress": "运行中",
       "completed": "已完成",
-      "failed": "失败",
-      "cancelled": "已取消"
+      "failed": "失败"
     },
     "statusLabel": "工具状态：{{status}}"
   },

@@ -33,8 +33,6 @@
   "signOutConfirm": "退出此 ACP Agent 的登录？现有会话的可用功能可能发生变化。",
   "capabilities": "能力",
   "initializeResponse": "初始化响应",
-  "backgroundEvents": "后台事件（{{count}}）",
-  "otherSessionEvents": "其他会话事件",
   "newSession": "新的 Agent 会话",
   "switchSession": "切换项目会话",
   "newThread": "新建会话",
@@ -81,13 +79,6 @@
     "promptNotReady": "ACP 会话尚未就绪，暂时无法接收此消息",
     "uncertainWrite": "{{operation}} 请求可能已生效；响应丢失，不会再次发送。",
     "refused": "{{operation}} 请求被拒绝：{{message}}"
-  },
-  "historyNotices": {
-    "resumePartial": "当前仅包含恢复会话时收到的上下文，可能缺少更早的历史消息。",
-    "forkSnapshot": "当前显示源会话的内存快照，分支中的历史消息可能有所不同。",
-    "forkPartial": "当前仅包含创建分支时收到的上下文，可能缺少更早的分支历史消息。",
-    "unavailable": "Agent 和内存缓存均无法提供更早的消息，你仍可继续此会话。",
-    "loadUnsupported": "历史消息不可用：此 Agent 不支持加载已保存的会话历史。"
   },
   "interfaceSettings": {
     "title": "界面设置",

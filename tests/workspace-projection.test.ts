@@ -77,6 +77,38 @@ describe("projected thread", () => {
     expect(timelineTurnStarts(timeline).filter((start) => start < timeline.length)).toEqual([0]);
   });
 
+  it("shows an unfinished plan above the composer and a finished one in its turn, never an empty card", () => {
+    const plan = (status: "in_progress" | "completed", entries = 1): ProcessUpdate => ({
+      sessionUpdate: "plan",
+      entries: Array.from({ length: entries }, () => ({ content: "Step", priority: "medium" as const, status })),
+    });
+    const plans = (items: readonly { type: string }[]) => items.filter((item) => item.type === "plan");
+    // The bridge folds each plan into the one before it, so every snapshot
+    // carries the turn's latest plan only.
+    const finished = projectProcess("s", "op-1", [plan("completed")]);
+    expect(finished.activePlan).toBeUndefined();
+    expect(plans(finished.items)).toMatchObject([{ update: plan("completed") }]);
+    const reopened = projectProcess("s", "op-1", [plan("in_progress")]);
+    expect(reopened.activePlan).toMatchObject({ update: plan("in_progress") });
+    expect(plans(reopened.items)).toEqual([]);
+    const empty = projectProcess("s", "op-1", [plan("completed", 0)]);
+    expect(empty.activePlan).toBeUndefined();
+    expect(plans(empty.items)).toEqual([]);
+    expect(plans(projectTimeline("s", [], operation({ process: [plan("completed", 0)] })))).toEqual([]);
+  });
+
+  it("keeps a compaction's summary when its later failure omits it", () => {
+    const process: ProcessUpdate[] = [
+      { sessionUpdate: "compaction_update", compactionId: "c", status: "in_progress", summary: [{ type: "text", text: "Summary" }] },
+      { sessionUpdate: "compaction_update", compactionId: "c", status: "failed", error: "compaction failed" },
+    ];
+    const compactions = projectProcess("s", "op-1", process).items.filter((item) => item.type === "compaction");
+    expect(compactions).toHaveLength(1);
+    expect(compactions[0]).toMatchObject({
+      status: "failed", error: "compaction failed", blocks: [{ type: "text", text: "Summary" }],
+    });
+  });
+
   it("shows only terminals no tool card shows", () => {
     const terminals = ["a", "b"].map((terminalId) => ({ sessionId: "s", terminalId, output: "", truncated: false, released: false }));
     const timeline = projectTimeline("s", [], operation({ process: [{

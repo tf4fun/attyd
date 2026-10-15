@@ -11,10 +11,14 @@ use std::io;
 const SESSION: &str = "ordered-interaction";
 const AGENT_REQUEST_ID: u64 = 17;
 
-fn setup() -> (AgentContext, Scheduling, mpsc::UnboundedReceiver<String>) {
+fn setup() -> (
+    AgentContext,
+    Scheduling,
+    mpsc::UnboundedReceiver<BridgeEvent>,
+) {
     let state = Arc::new(BridgeLock::new(BridgeState::default()));
     let (events, receiver) = mpsc::unbounded_channel();
-    let sink = EventSink { tx: events.into() };
+    let sink = EventSink { tx: events };
     let epoch = state.try_lock().unwrap().sessions.epoch().to_owned();
     let (scheduling, ingress) =
         Scheduling::new(epoch.clone(), sink.clone(), CancellationToken::new()).unwrap();
@@ -100,7 +104,6 @@ async fn assert_interaction_sequence(
     scheduling: &mut Scheduling,
     connection: &ConnectionTo<Agent>,
     services: &AgentContext,
-    events: &mut mpsc::UnboundedReceiver<String>,
 ) {
     let request = next_delivery(scheduling).await;
     assert!(matches!(
@@ -137,7 +140,7 @@ async fn assert_interaction_sequence(
     );
     assert_eq!(cancel.turn.handle().unwrap().incarnation(), incarnation);
     {
-        let mut state = services.state.lock().await;
+        let state = services.state.lock().await;
         let resources = state.sessions.resources(SESSION, incarnation).unwrap();
         assert!(
             if permission {
@@ -147,36 +150,20 @@ async fn assert_interaction_sequence(
             },
             "the SDK cancellation marker bypassed the captured local delivery"
         );
-        assert!(
-            state
-                .sessions
-                .view(SESSION, incarnation)
-                .unwrap()
-                .baseline
-                .updates()
-                .is_empty()
-        );
+        assert_eq!(accepted_updates(&state), 0);
     }
     coordinator::dispatch_ready(cancel, scheduling, connection, services, false)
         .await
         .unwrap();
     {
-        let mut state = services.state.lock().await;
+        let state = services.state.lock().await;
         let resources = state.sessions.resources(SESSION, incarnation).unwrap();
         assert!(resources.permissions.is_empty());
         assert!(resources.elicitations.is_empty());
         let runtime = state.sessions.session(SESSION).unwrap();
         assert!(runtime.permissions.is_empty());
         assert!(runtime.elicitations.is_empty());
-        assert!(
-            state
-                .sessions
-                .view(SESSION, incarnation)
-                .unwrap()
-                .baseline
-                .updates()
-                .is_empty()
-        );
+        assert_eq!(accepted_updates(&state), 0);
     }
 
     let update = next_delivery(scheduling).await;
@@ -187,40 +174,29 @@ async fn assert_interaction_sequence(
     coordinator::dispatch_ready(update, scheduling, connection, services, false)
         .await
         .unwrap();
-    let mut published = Vec::new();
-    loop {
-        let event: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
-        let updated = event["sessionId"] == SESSION
-            && (event["type"] == "bridge/session_view"
-                || (event["type"] == "bridge/session_delta"
-                    && event["change"]["kind"] == "turn_update"));
-        published.push(event);
-        if updated {
-            break;
+    // The connection runs the update's handler; wait until the session has it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                if accepted_updates(&*services.state.lock().await) > 0 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
-    let delta = |kind: &str| {
-        published.iter().position(|event| {
-            event["type"] == "bridge/session_delta"
-                && event["change"]["kind"] == kind
-                && (event["change"]["interaction"]["interactionId"] == allocation
-                    || event["change"]["interactionId"] == allocation)
-        })
-    };
-    let created = delta("interaction_upsert").unwrap();
-    let removed = delta("interaction_remove").unwrap();
-    assert!(created < removed && removed < published.len() - 1);
-    let mut state = services.state.lock().await;
-    let view = state.sessions.view(SESSION, incarnation).unwrap();
-    assert_eq!(view.baseline.updates().len(), 1);
-    assert_eq!(
-        view.baseline.updates()[0]["content"]["text"],
-        "After the cancellation."
-    );
+    })
+    .await
+    .expect("the session update was applied");
+    assert_eq!(accepted_updates(&*services.state.lock().await), 1);
+}
+
+/// The session updates the bridge accepted for the session.
+fn accepted_updates(state: &BridgeState) -> usize {
+    super::session_validation(state, SESSION).map_or(0, |validation| validation.update_count)
 }
 
 async fn run_wire_batch(permission: bool, creation_pending: bool) {
-    let (services, mut scheduling, mut events) = setup();
+    let (services, mut scheduling, _events) = setup();
     let mut coordinator = Coordinator::default();
     let incarnation = if creation_pending {
         services.state.lock().await.pending_creations = 1;
@@ -317,7 +293,6 @@ async fn run_wire_batch(permission: bool, creation_pending: bool) {
                 &mut scheduling,
                 &connection,
                 &services,
-                &mut events,
             )
             .await;
             host_done.send(()).unwrap();

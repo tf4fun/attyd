@@ -15,7 +15,6 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "../../i18n";
 import { safeHttpUrl } from "../../lib/safe-url";
-import { attachmentHref } from "../../lib/hosted-attachment";
 import { useAttachedBlock, useBlockUrl } from "../../lib/attachments";
 import type { AttachmentRef, PromptBlock } from "../../../../shared/protocol";
 import { validateContentBlockSemantics } from "../../../../shared/content-validation";
@@ -270,8 +269,7 @@ function Attachment({ block, tool, localHref, localDownload }: {
   localDownload?: boolean;
 }) {
   const { t, i18n } = useTranslation("cards");
-  const hostedHref = attachmentHref(block) ?? localHref;
-  const href = hostedHref ?? (block.type === "resource_link" ? safeHttpUrl(block.uri) : undefined);
+  const href = localHref ?? (block.type === "resource_link" ? safeHttpUrl(block.uri) : undefined);
   const resource = block.type === "resource" ? block.resource : block;
   const uri = "uri" in resource ? resource.uri ?? undefined : undefined;
   const text = "text" in resource ? resource.text : undefined;
@@ -290,7 +288,7 @@ function Attachment({ block, tool, localHref, localDownload }: {
     validateContentBlockSemantics(block);
   } catch { valid = false; }
   const Icon = !valid ? CircleAlert
-    : block.type === "resource_link" && !hostedHref && !(tool && uri?.startsWith("file:")) ? Link2
+    : block.type === "resource_link" && !localHref && !(tool && uri?.startsWith("file:")) ? Link2
     : tool ? File : Paperclip;
   const contents = (
     <>

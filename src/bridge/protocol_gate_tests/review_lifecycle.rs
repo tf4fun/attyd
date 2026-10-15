@@ -4,11 +4,10 @@ use super::*;
 #[tokio::test]
 async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"delete": {}}})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("hi")];
-    peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (_, request) = peer.prompt(CREATED, prompt).await;
     peer.agent_request(
         "sign-in",
         "elicitation/create",
@@ -20,11 +19,12 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     })
     .await;
     let interaction = interaction_ids(&peer.live(&scope)).remove(0);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer",
-        "elicitationId": interaction, "response": {"action": "accept"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &scope,
+        &interaction,
+        json!({"response": {"action": "accept"}}),
+    )
+    .await;
     assert_eq!(peer.response("sign-in").await["result"]["action"], "accept");
     peer.reply(&request, json!({"stopReason": "end_turn"}))
         .await;
@@ -34,18 +34,10 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     })
     .await;
 
-    peer.install(
-        "global",
-        OperationKind::Delete,
-        json!({"sessionId": CREATED}),
-    )
-    .await;
-    let deleted = peer.submit(json!({
-        "type": "session/delete", "requestId": "delete", "sessionId": CREATED,
-    }));
+    peer.start_op("global", "delete", json!({"sessionId": CREATED}))
+        .await;
     let request = peer.request("session/delete").await;
     peer.reply(&request, json!({})).await;
-    Peer::result(deleted).await.unwrap();
     peer.until("the delete completes", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -68,15 +60,9 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     // The Agent can now reuse the elicitationId for an unrelated operation.
     // This is externally visible: the new request must be answerable instead
     // of being refused as an already-outstanding URL elicitation.
-    peer.install(
-        "global",
-        OperationKind::Create,
-        json!({"cwd": "/workspace"}),
-    )
-    .await;
-    let creating = peer.submit(json!({
-        "type": "session/new", "requestId": "new-other", "cwd": "/workspace",
-    }));
+    let (_, creating) = peer
+        .start_op("global", "create", json!({"cwd": "/workspace"}))
+        .await;
     let new_request = peer.request("session/new").await;
     peer.agent_request(
         "new-sign-in",
@@ -90,18 +76,19 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     )
     .await;
     let replacement = interaction_ids(&peer.live("global")).remove(0);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer-new",
-        "elicitationId": replacement, "response": {"action": "accept"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        "global",
+        &replacement,
+        json!({"response": {"action": "accept"}}),
+    )
+    .await;
     assert_eq!(
         peer.response("new-sign-in").await["result"]["action"],
         "accept"
     );
     peer.reply(&new_request, json!({"sessionId": "other"}))
         .await;
-    Peer::result(creating).await.unwrap();
+    Peer::ended(creating).await.unwrap();
     peer.until("the replacement flow belongs to global", |peer| {
         peer.live("global")["urlFlows"].get(&replacement).is_some()
             && peer.live("global")["op"]["status"] == "completed"
@@ -123,16 +110,9 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
 #[tokio::test]
 async fn review_a_null_request_scope_interaction_ends_with_the_global_operation_it_joined() {
     let mut peer = Peer::start(json!({})).await;
-    let op = peer
-        .install(
-            "global",
-            OperationKind::Create,
-            json!({"cwd": "/workspace"}),
-        )
+    let (op, created) = peer
+        .start_op("global", "create", json!({"cwd": "/workspace"}))
         .await;
-    let created = peer.submit(json!({
-        "type": "session/new", "requestId": "new", "cwd": "/workspace",
-    }));
     let request = peer.request("session/new").await;
     peer.agent_request(
         "question",
@@ -146,7 +126,7 @@ async fn review_a_null_request_scope_interaction_ends_with_the_global_operation_
     .await;
     let interaction = interaction_ids(&peer.live("global")).remove(0);
     peer.reply(&request, json!({"sessionId": CREATED})).await;
-    Peer::result(created).await.unwrap();
+    Peer::ended(created).await.unwrap();
     peer.settled().await;
     let live = peer.live("global");
     assert_eq!(
@@ -188,12 +168,9 @@ async fn review_a_session_scoped_interaction_ends_with_its_control_operation() {
     )
     .await;
     let scope = format!("session/{CREATED}");
-    let op = peer
-        .install(&scope, OperationKind::SetMode, json!({"modeId": "plan"}))
+    let (op, _) = peer
+        .start_op(&scope, "set_mode", json!({"modeId": "plan"}))
         .await;
-    let done = peer.submit(json!({
-        "type": "session/set_mode", "requestId": "mode", "sessionId": CREATED, "modeId": "plan",
-    }));
     let request = peer.request("session/set_mode").await;
     peer.agent_request(
         "question",
@@ -206,7 +183,10 @@ async fn review_a_session_scoped_interaction_ends_with_its_control_operation() {
     })
     .await;
     peer.reply(&request, json!({})).await;
-    Peer::result(done).await.unwrap();
+    peer.until("the control operation completes", |peer| {
+        peer.live(&scope)["op"]["status"] == "completed"
+    })
+    .await;
     peer.settled().await;
     let live = peer.live(&scope);
     assert_eq!(
@@ -232,17 +212,10 @@ async fn review_natural_eof_fails_global_and_catalog_with_unavailable() {
         |_| {},
     )
     .await;
-    peer.install(
-        "global",
-        OperationKind::Authenticate,
-        json!({"methodId": "agent-login"}),
-    )
-    .await;
-    let _auth = peer.submit(json!({"type": "auth/authenticate", "requestId": "review-auth-eof", "methodId": "agent-login"}));
-    peer.request("authenticate").await;
-    peer.install("catalog", OperationKind::List, json!({}))
+    peer.start_op("global", "authenticate", json!({"methodId": "agent-login"}))
         .await;
-    let _list = peer.submit(json!({"type": "session/list", "requestId": "review-list-eof"}));
+    peer.request("authenticate").await;
+    let (_, _list) = peer.start_op("catalog", "list", json!({})).await;
     peer.request("session/list").await;
     peer.settled().await;
 
@@ -280,7 +253,7 @@ async fn review_filesystem_setup_failure_publishes_final_agent_error() {
             transport,
             Arc::new(configured),
             command_rx,
-            EventSink { tx: events.into() },
+            EventSink { tx: events },
             CancellationToken::new(),
         ),
     )
@@ -325,11 +298,10 @@ async fn assert_prompt_cancel_preserves_accepted_url_flow(request_scoped: bool) 
         "session scope"
     };
     let mut peer = Peer::start(json!({})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("hi")];
-    let op = peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (op, request) = peer.prompt(CREATED, prompt).await;
     let elicitation_scope = if request_scoped {
         json!({"requestId": request["id"]})
     } else {
@@ -346,11 +318,12 @@ async fn assert_prompt_cancel_preserves_accepted_url_flow(request_scoped: bool) 
     })
     .await;
     let interaction = interaction_ids(&peer.live(&scope)).remove(0);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer",
-        "elicitationId": interaction, "response": {"action": "accept"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &scope,
+        &interaction,
+        json!({"response": {"action": "accept"}}),
+    )
+    .await;
     assert_eq!(
         peer.response("sign-in").await["result"]["action"],
         "accept",
@@ -363,10 +336,9 @@ async fn assert_prompt_cancel_preserves_accepted_url_flow(request_scoped: bool) 
     .await;
     let accepted = peer.live(&scope)["urlFlows"][&interaction].clone();
 
-    let cancelled = peer.submit(json!({
-        "type": "session/cancel", "requestId": "cancel", "sessionId": CREATED,
-    }));
-    Peer::result(cancelled).await.unwrap();
+    peer.write(&scope, "cancel", json!({}))
+        .await
+        .expect("the running prompt takes a cancel");
     let cancellation = peer.request("session/cancel").await;
     assert_eq!(cancellation["params"]["sessionId"], CREATED);
     peer.until("the cancel intent is published", |peer| {

@@ -1,10 +1,7 @@
-use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::history_cache::HistoryCacheError;
 use crate::protocol::registry::SessionLog;
@@ -28,7 +25,6 @@ pub(crate) enum MirrorPhase {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TurnOverlay {
     pub operation_id: String,
-    pub client_intent_id: String,
     pub prompt: Arc<Vec<Value>>,
     pub updates: SharedTurnUpdates,
     pub terminal: Option<Value>,
@@ -44,56 +40,23 @@ pub(crate) struct TurnExecution {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CompletedTurnOutcome {
-    pub operation_id: String,
-    pub after_update: usize,
-    pub response: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct SessionState {
     pub session_id: String,
     pub incarnation: u64,
     #[serde(skip)]
     pub(crate) live: Option<SessionLiveState>,
-    pub view_revision: u64,
-    pub history_revision: Option<String>,
     pub phase: MirrorPhase,
     pub active_turn: Option<TurnOverlay>,
-    pub turn_outcomes: Vec<CompletedTurnOutcome>,
     pub sync_error: Option<String>,
-    #[serde(default)]
-    pub history_notice: Option<String>,
     #[serde(skip)]
     pub(crate) operation: Option<SessionOperationState>,
-    #[serde(skip)]
-    active_payload_digest: Option<[u8; 32]>,
-    #[serde(skip)]
-    consumed_intents: HashMap<String, LastConsumption>,
     #[serde(skip)]
     pub(crate) load_attempt: Option<String>,
     #[serde(skip)]
     pub(crate) load_origin: Option<MirrorPhase>,
-    #[serde(skip)]
-    pub(crate) active_overlay_bytes: usize,
     /// The protocol v2 turn log: unknown until a load or creation.
     #[serde(skip)]
     pub(crate) log: SessionLog,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LastConsumption {
-    operation_id: String,
-    payload_digest: [u8; 32],
-    consumed_revision: String,
-    successor_revision: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TurnAdmission {
-    Accepted { operation_id: String },
-    Duplicate { operation_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,8 +64,6 @@ pub(crate) enum MirrorError {
     UnknownSession,
     StaleIncarnation,
     WrongPhase,
-    StaleHistory,
-    IdempotencyConflict,
     OperationMismatch,
     InconsistentHistory,
     History(HistoryCacheError),
@@ -155,31 +116,19 @@ impl SessionState {
             session_id: session_id.into(),
             incarnation,
             live: None,
-            view_revision: 1,
-            history_revision: None,
             phase: MirrorPhase::Cold,
             active_turn: None,
-            turn_outcomes: Vec::new(),
             sync_error: None,
-            history_notice: None,
             operation: None,
-            active_payload_digest: None,
-            consumed_intents: HashMap::new(),
             load_attempt: None,
             load_origin: None,
-            active_overlay_bytes: 0,
             log: SessionLog::Unknown,
         }
     }
 
-    pub(crate) fn ready(
-        session_id: impl Into<String>,
-        incarnation: u64,
-        history_revision: String,
-    ) -> Self {
+    pub(crate) fn ready(session_id: impl Into<String>, incarnation: u64) -> Self {
         let mut session = Self::cold(session_id, incarnation);
         session.phase = MirrorPhase::Ready;
-        session.history_revision = Some(history_revision);
         session.log = SessionLog::empty();
         session
     }
@@ -265,59 +214,18 @@ impl SessionState {
         Ok(())
     }
 
-    pub(crate) fn check_turn_admission(
-        &self,
-        expected_history_revision: &str,
-        client_intent_id: &str,
-        prompt: &[Value],
-    ) -> Result<Option<TurnAdmission>, MirrorError> {
-        let digest = payload_digest(prompt);
-        if let Some(turn) = &self.active_turn
-            && turn.client_intent_id == client_intent_id
-        {
-            return if self.active_payload_digest == Some(digest) {
-                Ok(Some(TurnAdmission::Duplicate {
-                    operation_id: turn.operation_id.clone(),
-                }))
-            } else {
-                Err(MirrorError::IdempotencyConflict)
-            };
-        }
-        if let Some(last) = self.consumed_intents.get(client_intent_id) {
-            return if last.payload_digest == digest
-                && (last.consumed_revision == expected_history_revision
-                    || last.successor_revision == expected_history_revision)
-            {
-                Ok(Some(TurnAdmission::Duplicate {
-                    operation_id: last.operation_id.clone(),
-                }))
-            } else {
-                Err(MirrorError::IdempotencyConflict)
-            };
-        }
-        self.can_begin(SessionAdmission::Prompt)?;
-        if self.history_revision.as_deref() != Some(expected_history_revision) {
-            return Err(MirrorError::StaleHistory);
-        }
-        Ok(None)
-    }
-
+    /// Installs an admitted prompt's turn; the operation and the prompt's
+    /// RPC are its only correlation.
     pub(crate) fn admit_turn(
         &mut self,
         operation_id: String,
-        expected_history_revision: &str,
         client_intent_id: &str,
         prompt: Vec<Value>,
-    ) -> Result<TurnAdmission, MirrorError> {
-        if let Some(duplicate) =
-            self.check_turn_admission(expected_history_revision, client_intent_id, &prompt)?
-        {
-            return Ok(duplicate);
-        }
-        let digest = payload_digest(&prompt);
-        let overlay = TurnOverlay {
-            operation_id: operation_id.clone(),
-            client_intent_id: client_intent_id.to_string(),
+    ) -> Result<(), MirrorError> {
+        self.can_begin(SessionAdmission::Prompt)?;
+        self.phase = MirrorPhase::Running;
+        self.active_turn = Some(TurnOverlay {
+            operation_id,
             prompt: Arc::new(prompt),
             updates: Arc::new(Vec::new()),
             terminal: None,
@@ -325,14 +233,9 @@ impl SessionState {
                 rpc_operation_id: client_intent_id.to_string(),
                 cancel_requested: false,
             }),
-        };
-        self.active_overlay_bytes = serialized_len(&overlay);
-        self.phase = MirrorPhase::Running;
-        self.active_payload_digest = Some(digest);
-        self.active_turn = Some(overlay);
+        });
         self.sync_error = None;
-        self.advance_revision();
-        Ok(TurnAdmission::Accepted { operation_id })
+        Ok(())
     }
 
     pub(crate) fn append_turn_update(
@@ -365,14 +268,12 @@ impl SessionState {
             .active_turn
             .as_ref()
             .ok_or(MirrorError::OperationMismatch)?;
-        let mut candidate = turn.clone();
-        candidate.updates = Arc::new(
-            fold_shared_active_turn_update(&turn.updates, &update)
-                .map_err(|_| MirrorError::InconsistentHistory)?,
-        );
-        self.active_overlay_bytes = serialized_len(&candidate);
-        self.active_turn = Some(candidate);
-        self.advance_revision();
+        let updates = fold_shared_active_turn_update(&turn.updates, &update)
+            .map_err(|_| MirrorError::InconsistentHistory)?;
+        self.active_turn
+            .as_mut()
+            .expect("the turn was checked above")
+            .updates = Arc::new(updates);
         Ok(())
     }
 
@@ -396,13 +297,13 @@ impl SessionState {
         if self.live.is_some() && turn.execution.is_some() {
             return Err(MirrorError::OperationMismatch);
         }
-        let mut candidate = turn.clone();
-        candidate.execution = None;
-        candidate.terminal = Some(terminal);
-        self.active_overlay_bytes = serialized_len(&candidate);
-        self.active_turn = Some(candidate);
+        let turn = self
+            .active_turn
+            .as_mut()
+            .expect("the turn was checked above");
+        turn.execution = None;
+        turn.terminal = Some(terminal);
         self.phase = MirrorPhase::Reconciling;
-        self.advance_revision();
         Ok(())
     }
 
@@ -417,10 +318,7 @@ impl SessionState {
             return Err(MirrorError::OperationMismatch);
         }
         self.phase = MirrorPhase::Ready;
-        self.active_overlay_bytes = 0;
         self.active_turn = None;
-        self.active_payload_digest = None;
-        self.advance_revision();
         Ok(())
     }
 
@@ -441,91 +339,17 @@ impl SessionState {
         self.sync_error = Some(message.into());
         self.load_attempt = None;
         self.load_origin = None;
-        self.advance_revision();
         Ok(())
     }
 
-    // Check before changing HistoryCache: publication must not fail after its baseline swap.
-    pub(crate) fn validate_history_commit(&self) -> Result<(), MirrorError> {
-        if self.active_turn.is_some() && self.active_payload_digest.is_none() {
-            return Err(MirrorError::InconsistentHistory);
-        }
-        Ok(())
-    }
-
-    // Called only after a successful local history transaction, without an intervening await.
-    pub(crate) fn history_committed(
-        &mut self,
-        revision: String,
-        after_update: usize,
-        replace_outcomes: bool,
-    ) {
-        if replace_outcomes {
-            // Authoritative replay has no historical PromptResponse offsets.
-            self.turn_outcomes.clear();
-            self.history_notice = None;
-        } else if let Some(turn) = &self.active_turn
-            && let Some(response) = turn
-                .terminal
-                .as_ref()
-                .filter(|response| response.get("stopReason").and_then(Value::as_str).is_some())
-        {
-            self.turn_outcomes.push(CompletedTurnOutcome {
-                operation_id: turn.operation_id.clone(),
-                after_update,
-                response: response.clone(),
-            });
-        }
-        if let Some(turn) = self.active_turn.take()
-            && let Some(consumed_revision) = self.history_revision.as_ref()
-        {
-            self.consumed_intents.insert(
-                turn.client_intent_id,
-                LastConsumption {
-                    operation_id: turn.operation_id,
-                    payload_digest: self
-                        .active_payload_digest
-                        .expect("history commit was validated"),
-                    consumed_revision: consumed_revision.clone(),
-                    successor_revision: revision.clone(),
-                },
-            );
-        }
-        self.history_revision = Some(revision);
-        self.active_overlay_bytes = 0;
+    /// A turn or a load ended and the session's log holds the result: the
+    /// session is ready again.
+    pub(crate) fn history_settled(&mut self) {
         self.phase = MirrorPhase::Ready;
         self.active_turn = None;
-        self.active_payload_digest = None;
         self.load_attempt = None;
         self.load_origin = None;
         self.sync_error = None;
-        self.advance_revision();
-    }
-
-    fn advance_revision(&mut self) {
-        self.view_revision = self.view_revision.wrapping_add(1).max(1);
-    }
-}
-
-fn payload_digest(prompt: &[Value]) -> [u8; 32] {
-    Sha256::digest(serde_json::to_vec(prompt).expect("prompt values serialize")).into()
-}
-
-fn serialized_len(value: &impl Serialize) -> usize {
-    let mut counter = SerializedByteCounter(0);
-    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |_| counter.0)
-}
-
-struct SerializedByteCounter(usize);
-
-impl Write for SerializedByteCounter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.saturating_add(bytes.len());
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -535,7 +359,7 @@ mod tests {
     use serde_json::json;
 
     fn ready() -> SessionState {
-        SessionState::ready("session", 1, "history-1".to_string())
+        SessionState::ready("session", 1)
     }
 
     fn prompt(text: &str) -> Vec<Value> {
@@ -551,69 +375,33 @@ mod tests {
 
     fn start(session: &mut SessionState) {
         assert_eq!(
-            session.admit_turn("turn-1".into(), "history-1", "intent-1", prompt("hello")),
-            Ok(TurnAdmission::Accepted {
-                operation_id: "turn-1".into()
-            }),
+            session.admit_turn("turn-1".into(), "intent-1", prompt("hello")),
+            Ok(())
         );
     }
 
     #[test]
-    fn rejected_operation_and_stale_cas_do_not_consume_the_intent() {
+    fn an_occupied_session_refuses_a_prompt_without_changing() {
         let mut session = ready();
         session
             .begin_exclusive(SessionOperationKind::SetMode, "control")
             .unwrap();
         let before = session.clone();
         assert_eq!(
-            session.admit_turn("turn-1".into(), "history-1", "intent-1", prompt("hello")),
+            session.admit_turn("turn-1".into(), "intent-1", prompt("hello")),
             Err(MirrorError::WrongPhase),
         );
         assert_eq!(session, before);
         session
             .settle_exclusive(SessionAdmission::Control, "control")
             .unwrap();
+        start(&mut session);
         let before = session.clone();
         assert_eq!(
-            session.admit_turn(
-                "turn-1".into(),
-                "stale-history",
-                "intent-1",
-                prompt("hello")
-            ),
-            Err(MirrorError::StaleHistory),
-        );
-        assert_eq!(session, before);
-        start(&mut session);
-        assert_eq!(
-            session.admit_turn(
-                "another-operation".into(),
-                "history-1",
-                "intent-1",
-                prompt("hello")
-            ),
-            Ok(TurnAdmission::Duplicate {
-                operation_id: "turn-1".into()
-            }),
-        );
-        assert_eq!(
-            session.admit_turn(
-                "another-operation".into(),
-                "history-1",
-                "intent-1",
-                prompt("changed")
-            ),
-            Err(MirrorError::IdempotencyConflict),
-        );
-        assert_eq!(
-            session.admit_turn(
-                "another-operation".into(),
-                "history-1",
-                "different-intent",
-                prompt("hello")
-            ),
+            session.admit_turn("another-operation".into(), "intent-2", prompt("hello")),
             Err(MirrorError::WrongPhase),
         );
+        assert_eq!(session, before);
     }
 
     #[test]
@@ -666,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn history_commit_keeps_concurrent_control_and_idempotent_retries() {
+    fn a_settled_turn_keeps_a_concurrent_control() {
         let mut session = ready();
         start(&mut session);
         session
@@ -683,36 +471,20 @@ mod tests {
             &overlay,
             &session.active_turn.as_ref().unwrap().updates
         ));
-        session.validate_history_commit().unwrap();
-        session.history_committed("history-2".into(), 2, false);
+        session.history_settled();
         assert_eq!(session.phase, MirrorPhase::Ready);
         assert!(session.active_turn.is_none());
-        assert_eq!(session.active_overlay_bytes, 0);
-        assert_eq!(session.turn_outcomes[0].after_update, 2);
         assert_eq!(
             session.can_begin(SessionAdmission::Prompt),
             Err(MirrorError::WrongPhase)
         );
-        for revision in ["history-1", "history-2"] {
-            assert_eq!(
-                session.admit_turn(
-                    "new-operation".into(),
-                    revision,
-                    "intent-1",
-                    prompt("hello")
-                ),
-                Ok(TurnAdmission::Duplicate {
-                    operation_id: "turn-1".into()
-                }),
-            );
-        }
         session
             .settle_exclusive(SessionAdmission::Control, "control")
             .unwrap();
-        assert!(matches!(
-            session.admit_turn("turn-2".into(), "history-2", "intent-2", prompt("next")),
-            Ok(TurnAdmission::Accepted { .. }),
-        ));
+        assert_eq!(
+            session.admit_turn("turn-2".into(), "intent-2", prompt("next")),
+            Ok(())
+        );
     }
 
     #[test]
@@ -847,49 +619,7 @@ mod tests {
         );
         assert_eq!(session, before);
         session.abort_turn("turn-1").unwrap();
-        assert_eq!(session.history_revision.as_deref(), Some("history-1"));
         start(&mut session);
-    }
-
-    #[test]
-    fn completed_intents_remain_exactly_idempotent_after_many_turns() {
-        let mut session = ready();
-        start(&mut session);
-        session
-            .complete_turn("turn-1", json!({ "stopReason": "end_turn" }))
-            .unwrap();
-        session.validate_history_commit().unwrap();
-        session.history_committed("history-2".into(), 1, false);
-        for index in 2..200 {
-            let operation = format!("turn-{index}");
-            let current = format!("history-{index}");
-            session
-                .admit_turn(
-                    operation.clone(),
-                    &current,
-                    &format!("intent-{index}"),
-                    prompt("hello"),
-                )
-                .unwrap();
-            session
-                .complete_turn(&operation, json!({ "stopReason": "end_turn" }))
-                .unwrap();
-            session.validate_history_commit().unwrap();
-            session.history_committed(format!("history-{}", index + 1), 1, false);
-        }
-        assert_eq!(
-            session.admit_turn(
-                "another-operation".into(),
-                "history-2",
-                "intent-1",
-                prompt("hello")
-            ),
-            Ok(TurnAdmission::Duplicate {
-                operation_id: "turn-1".into()
-            }),
-        );
-        assert_eq!(session.phase, MirrorPhase::Ready);
-        assert!(session.active_turn.is_none());
     }
 }
 

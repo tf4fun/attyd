@@ -21,7 +21,6 @@ vi.mock("../web/src/lib/use-acp", async () => {
       state: {
         ...initialState,
         phase: "ready",
-        socketOpen: true,
         defaultCwd: "/workspace",
         cwd: "",
         elicitations: [{

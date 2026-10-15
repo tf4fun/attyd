@@ -26,32 +26,36 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
 - Compute actual changed lines from diff snapshots using the same bounded algorithm as Changes. Preserve unchanged context, label approximate counts and omitted rows, and recognize `oldText: null` as a new file. Empty `newText` does not establish file deletion.
 - Label embedded output **Terminal**; retain terminal IDs in Tool info. Tool status and process exit status remain independent.
 - Treat a present terminal `exitStatus` as finished, even without a code or signal. Show waiting text only while a process can still produce output; completed empty output and unavailable snapshots need distinct messages.
-- Preserve output after release and indicate truncation. See [ACP terminals](https://agentclientprotocol.com/protocol/v1/terminals).
-- Terminal output snapshots are display data held only in bridge memory while the session remains materialized. Closing the session or ending the bridge process clears them. Cold history restoration depends on the Agent; unavailable output is not reconstructed or written into Agent message fields.
+- Indicate truncation. See [ACP terminals](https://agentclientprotocol.com/protocol/v1/terminals).
+- Terminal output is display data in the session's `live.terminals` while the Agent keeps the terminal. Release removes it with its output, and a completed turn keeps no tool calls, so output is shown only while its turn runs or its terminal is unreleased ([protocol §4.6](protocol.md)). Unavailable output is not reconstructed or written into Agent message fields.
 
 ## Media and attachments
 
 - Native image/audio and embedded text/binary resources use the same compact attachment entry.
   Tool results use plain file rows; message attachments use compact chips. File names, available
   sizes, and tool-result locations remain readable, with MIME/address/description in the tooltip.
-- Open available attachments in a new browser page with one ordinary link. Browser behavior and
-  the response MIME type determine preview or download; do not add separate preview/download modes,
-  inline media players, or PDF/Office renderers.
-- Normal browser views contain references to content already held in the bridge's session memory.
-  The HTTP attachment endpoint resolves those references without a separate store, filesystem
-  lookup, or browser Blob cache. Session release or bridge restart ends that availability unless
-  the Agent supplies the content again during history restoration.
+- Open available attachments with one ordinary link to a Blob URL the page builds from the read
+  block and revokes when the view goes. Safe media (common images, audio, video, and text or JSON
+  as plain text) open in a new page; HTML, SVG, XML, PDF and unknown types are downloads with the
+  original bytes. Do not add inline media players or PDF/Office renderers.
+- Documents contain references to content already held in the bridge's session memory.
+  The attachment read resolves a reference while the session is held and its log or `live`
+  refers to it, without a separate store or filesystem lookup; the page caches a read block
+  only while a view shows it. Session
+  release or bridge restart ends that availability unless the Agent supplies the content again
+  during history restoration.
 - Resource links can open HTTP(S) URLs or attyd-hosted attachment references. Other URI schemes
   remain descriptive entries. Do not fetch remote bytes just to build a preview or download action.
   Invalid payloads have no enabled open action.
-- Keep protocol diagnostics in folded details. Inline payloads are omitted from ordinary browser
-  attachment views; explicit session export retains the original available protocol content.
+- Keep protocol diagnostics in folded details. Inline payloads are omitted from attachment views.
+  Markdown export is assembled from the log and its attachments, as `canon` normalizes them:
+  `_meta` is dropped, and tool calls are not part of it.
 
 ## Technical details
 
 Keep IDs, file locations, content annotations, and raw message events in **Tool info**. These remain available for diagnosis without appearing as ordinary task results. Hiding an annotation never removes its associated content.
 
 Permission cards reuse tool-content rendering, including diffs and terminal snapshots, and apply
-the same null/omission semantics to inherited input. Cancellation intent comes from the bridge's
-active-turn projection before the final prompt response. See the
+the same null/omission semantics to inherited input. Cancellation intent comes from the running
+operation's `cancelRequested` before the final prompt response. See the
 [2026-09-26 display audit](acp-display-audit-2026-09-26.md) for the original findings and follow-up.

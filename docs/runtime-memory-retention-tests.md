@@ -1,5 +1,8 @@
 # 运行期内存优化：TDD 验收记录
 
+> **历史记录（2026-10-15）。** 下文的浏览器内存门槛和 v1 交付相关用例已随 v1 删除（PR #46）。
+> `npm run test:memory:rust` 仍运行 `bridge::memory_retention_tests`。下文保留为当时的 TDD 记录。
+
 方案与实机证据见 [运行时内存过度保留](runtime-memory-retention.md)。
 最初 Red 基线：`0857250`（历史 workflow 生命周期修复），测试提交为 `40e1c0a`。
 2026-09-22 已拉取生产修复 `802c20b`，既有 35 项 Rust 内存门槛和 10 项浏览器门槛全部通过。

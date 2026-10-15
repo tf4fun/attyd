@@ -14,7 +14,6 @@ vi.mock("../web/src/lib/use-acp", async () => {
       state: {
         ...initialState,
         phase: "ready",
-        socketOpen: true,
         defaultCwd: "/workspace/attyd",
         cwd: "/workspace/attyd",
         ...(authScenario.logoutOnly ? {

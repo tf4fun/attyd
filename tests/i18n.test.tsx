@@ -11,7 +11,6 @@ import i18n, {
   setLanguagePreference,
 } from "../web/src/i18n";
 import { LanguageSelector } from "../web/src/components/language-selector";
-import { translateHistoryNotice } from "../web/src/i18n/history-notice";
 import { PromptComposer } from "../web/src/components/acp/prompt-composer";
 import { PromptAttachmentError, promptAttachmentErrorMessage } from "../web/src/lib/prompt-attachments";
 import { contentBlocksToMarkdown } from "../web/src/lib/thread-markdown";
@@ -130,17 +129,6 @@ describe("interface languages", () => {
     await setLanguagePreference("zh-CN");
     expect(promptAttachmentErrorMessage(error)).not.toBe(english);
     expect(promptAttachmentErrorMessage(new Error("Agent said: denied"))).toBe("Agent said: denied");
-  });
-
-  it("translates known host history notices while leaving unknown diagnostics intact", async () => {
-    await setLanguagePreference("zh-CN");
-    const t = i18n.getFixedT(null, "app");
-    expect(translateHistoryNotice(resources.en.app.historyNotices.unavailable, t))
-      .toBe(resources["zh-CN"].app.historyNotices.unavailable);
-    expect(translateHistoryNotice("An unfamiliar host notice", t)).toBe("An unfamiliar host notice");
-    await setLanguagePreference("en");
-    expect(translateHistoryNotice(resources.en.app.historyNotices.unavailable, t))
-      .toBe(resources.en.app.historyNotices.unavailable);
   });
 });
 

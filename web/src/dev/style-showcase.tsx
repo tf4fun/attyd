@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { CreateElicitationRequest, RequestPermissionRequest, SessionConfigOption, SessionModeState, SessionUpdate, ToolCall } from "@agentclientprotocol/sdk";
+import type { AvailableCommand, CreateElicitationRequest, RequestPermissionRequest, SessionConfigOption, SessionModeState, SessionUpdate, ToolCall } from "@agentclientprotocol/sdk";
 import type { TerminalSnapshot } from "../../../shared/bridge";
+import type { Operation, ProcessUpdate } from "../../../shared/protocol";
 import { Conversation } from "../components/acp/conversation";
 import { PermissionCard } from "../components/acp/permission";
 import { ElicitationCard } from "../components/acp/elicitation";
 import { PromptComposer } from "../components/acp/prompt-composer";
 import { SessionControls } from "../components/acp/session-controls";
 import { InterfaceSettings } from "../components/interface-settings";
-import { appReducer, initialState, type AppState } from "../lib/state";
+import type { AppState, AssistantMessageChunk, TimelineItem } from "../lib/state";
+import { projectProcess, projectTimeline } from "../lib/workspace-projection";
 import { initializeTheme } from "../lib/theme";
 import "../styles.css";
 import "./style-showcase.css";
@@ -44,16 +46,7 @@ function StyleShowcase() {
       });
     return () => controller.abort();
   }, []);
-  const projection = useMemo(() => {
-    if (!session) return initialState;
-    let state: AppState = { ...initialState, session: { sessionId: session.sessionId } };
-    for (const update of session.updates) {
-      state = appReducer(state, {
-        type: "session/turn_update", notification: { sessionId: session.sessionId, update },
-      });
-    }
-    return state;
-  }, [session]);
+  const projection = useMemo(() => session ? showcaseProjection(session) : undefined, [session]);
   return (
     <main className="main-panel">
       <header className="session-header">
@@ -66,7 +59,7 @@ function StyleShowcase() {
       </nav>
       <div className="thread-body"><div className="scroll-region" role="region" aria-label="样式检查会话">
         <div className="conversation-wrap">
-          {error ? <p role="alert">{error}</p> : session ? (
+          {error ? <p role="alert">{error}</p> : session && projection ? (
             panel === "conversation"
               ? <Conversation timeline={projection.timeline} terminalSnapshots={session.terminals} settled />
               : <InteractionExamples session={session} projection={projection} />
@@ -77,7 +70,60 @@ function StyleShowcase() {
   );
 }
 
-function InteractionExamples({ session, projection }: { session: MockSession; projection: AppState }) {
+/**
+ * The sample as the thread shows it: each prompt and what follows it is one
+ * turn's process (§4.4), and the controls updates are what the session shows
+ * beside the thread.
+ */
+function showcaseProjection(session: MockSession): ShowcaseProjection {
+  const turns: ProcessUpdate[][] = [];
+  let availableCommands: AvailableCommand[] = [];
+  let usage: AppState["usage"];
+  let previous: SessionUpdate | undefined;
+  for (const update of session.updates) {
+    if (update.sessionUpdate === "usage_update") usage = { used: update.used, size: update.size, cost: update.cost };
+    else if (update.sessionUpdate === "available_commands_update") availableCommands = update.availableCommands;
+    else {
+      if (turns.length === 0 || (update.sessionUpdate === "user_message_chunk" && previous?.sessionUpdate !== "user_message_chunk")) {
+        turns.push([]);
+      }
+      turns.at(-1)!.push(update as ProcessUpdate);
+    }
+    previous = update;
+  }
+  const timeline = turns.flatMap((process, index) => {
+    // A plan with unfinished entries is shown above the composer on the page;
+    // the sample shows it in its own turn.
+    const { items, activePlan } = projectProcess(session.sessionId, `showcase-${index}`, process);
+    return joinMessageBlocks(activePlan != null ? [...items, activePlan] : items);
+  });
+  return { timeline, availableCommands, usage };
+}
+
+/** One entry per message: the sample spreads a message's blocks over chunks. */
+function joinMessageBlocks(items: TimelineItem[]): TimelineItem[] {
+  const joined: TimelineItem[] = [];
+  for (const item of items) {
+    const last = joined.at(-1);
+    if (item.type === "message" && last?.type === "message" && item.messageId != null && item.messageId === last.messageId) {
+      joined[joined.length - 1] = { ...last, blocks: [...last.blocks, ...item.blocks] };
+    } else if (item.type === "assistant") {
+      const chunks: AssistantMessageChunk[] = [];
+      for (const chunk of item.chunks) {
+        const previous = chunks.at(-1);
+        if (previous != null && chunk.messageId != null && chunk.messageId === previous.messageId && chunk.role === previous.role) {
+          chunks[chunks.length - 1] = { ...previous, blocks: [...previous.blocks, ...chunk.blocks] };
+        } else chunks.push(chunk);
+      }
+      joined.push({ ...item, chunks });
+    } else joined.push(item);
+  }
+  return joined;
+}
+
+type ShowcaseProjection = Pick<AppState, "availableCommands" | "usage"> & { timeline: TimelineItem[] };
+
+function InteractionExamples({ session, projection }: { session: MockSession; projection: ShowcaseProjection }) {
   const [example, setExample] = useState("permission-0");
   return <section className="showcase-interactions">
     <label className="showcase-selector">检查场景
@@ -92,25 +138,22 @@ function InteractionExamples({ session, projection }: { session: MockSession; pr
   </section>;
 }
 
-function InteractionExample({ example, session, projection }: { example: string; session: MockSession; projection: AppState }) {
+function InteractionExample({ example, session, projection }: { example: string; session: MockSession; projection: ShowcaseProjection }) {
   const [result, setResult] = useState("");
   const [options, setOptions] = useState(session.examples.configOptions);
   const [mode, setMode] = useState(session.examples.modes.currentModeId);
   const [stage, setStage] = useState<"running" | "cancelling" | "late">("running");
-  const running = useMemo(() => appReducer(initialState, { type: "bridge/session_hydrate", view: {
-    bridgeEpoch: "showcase", sessionId: session.sessionId, sessionIncarnation: 1, viewRevision: 1,
-    historyRevision: "showcase", phase: "running", syncError: null, timeline: [], controls: {},
-    workspace: { cwd: "/workspace", session: {} }, operation: null, terminals: {},
-    interactions: { permissions: {}, elicitations: {}, urlFlows: {} },
-    activeTurn: { operationId: "showcase-turn", clientIntentId: "showcase-intent", terminal: null,
-      prompt: [{ type: "text", text: "检查运行中工具，点击停止后再模拟迟到结果。" }],
-      cancelRequested: stage !== "running",
-      updates: [...session.examples.runningUpdates, ...(stage === "late" ? [{
-        sessionUpdate: "tool_call_update" as const, toolCallId: "running-tool", status: "completed" as const,
+  // A cancel request does not end the turn or its tools (§4.4): only the
+  // Agent's later result does, folded into its call like the bridge folds it.
+  const running = useMemo((): Operation => ({
+    id: "showcase-turn", kind: "prompt", status: "running", cancelRequested: stage !== "running", interactions: {},
+    input: { prompt: [{ type: "text", text: "检查运行中工具，点击停止后再模拟迟到结果。" }] },
+    process: session.examples.runningUpdates.map((update) => (stage === "late" &&
+      update.sessionUpdate === "tool_call" && update.toolCallId === "running-tool" ? {
+        ...update, status: "completed" as const,
         content: [{ type: "content" as const, content: { type: "text" as const, text: "工具返回了最终结果。" } }],
-      }] : [])],
-    },
-  } }), [session, stage]);
+      } : update) as ProcessUpdate),
+  }), [session, stage]);
   const permission = example.startsWith("permission-") ? session.examples.permissions[Number(example.slice(11))] : undefined;
   const elicitation = example.startsWith("form-") ? session.examples.elicitations[Number(example.slice(5))] : undefined;
   const settings = <SessionControls options={options} modes={null} disabled={false} onMode={() => {}}
@@ -135,8 +178,8 @@ function InteractionExample({ example, session, projection }: { example: string;
         <button type="button" onClick={() => setStage("running")}>恢复运行</button>
         <button type="button" disabled={stage !== "cancelling"} onClick={() => setStage("late")}>模拟工具返回结果</button>
       </div>
-      <Conversation timeline={running.timeline} />
-      <PromptComposer disabled={false} running cancelling={running.pendingPrompt?.cancelRequested} commands={[]}
+      <Conversation timeline={projectTimeline(session.sessionId, [], running)} />
+      <PromptComposer disabled={false} running cancelling={running.cancelRequested} commands={[]}
         onSubmit={() => false} onCancel={() => setStage("cancelling")} />
     </> : null}
     {result ? <p className="showcase-result" role="status">示例响应：<code>{result}</code></p> : null}

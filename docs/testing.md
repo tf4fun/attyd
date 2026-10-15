@@ -5,10 +5,12 @@ The bridge-first state-machine migration and its executable acceptance ledger ar
 lifecycle, reconnect, concurrency, and subscriber correctness; browser tests validate only the
 projection after the bridge gates pass.
 
-Completed-turn transfer, on-demand process pagination, and the collapsible task bar have a
-separate [design and acceptance ledger](lazy-turn-process.md).
-Ordinary API deadlines, timeout messages, and explicit retry behavior are covered by the
-[HTTP timeout ledger](http-request-timeouts.md).
+The browser talks to the host only through [protocol v2](protocol.md) under `/api/v2`; its
+invariants and gates are listed in the [implementation plan](state-sync.md#4-invariants-and-gates).
+A completed turn arrives as a log entry without its process, and writes wait for their HTTP
+answer without a short deadline. The earlier
+[process pagination](lazy-turn-process.md) and [HTTP timeout](http-request-timeouts.md) ledgers
+describe the removed `/api/v1` API and are kept as history.
 
 The production host and every host-level integration harness run the Rust backend. TypeScript is
 used only for the browser application, shared browser protocol types, test Agents, and test
@@ -18,24 +20,23 @@ drivers; there is no second backend implementation.
 
 | Layer | Command | Purpose |
 | --- | --- | --- |
-| Frontend and browser contract | `npm test` | Reducer, event-envelope, content, prompt-history, search, interaction, accessibility, load-replacement, and adversarial-state cases |
+| Frontend and browser contract | `npm test` | Replica alignment and patches, operation writes, protocol validation and coverage, the page projection, content, prompt history, search, interaction, and accessibility cases |
 | Rust backend | `npm run test:rust` | Native cases for active-turn folding/retirement, 10,000-turn zero-history regression, same-session reload success/rollback, multi-subscriber isolation, lossless event queues and burst/slow-subscriber delivery, semantic validation, CLI/MCP configuration, filesystem confinement, terminal/auth lifecycle, Agent process I/O, and MCP boundaries |
-| Idle-retirement TDD gate | `npm run test:idle-retirement` | Paused-clock ACP regressions for refused-close retries, resume/fork idle intervals, history workflow backoff/cleanup/handoff, cross-session progress, late retired-session updates and recovery guards; see the [Red/Green contract](bridge-state-machine-tdd.md#idle-retirement-regression-gate) and [workflow Red baseline](bridge-state-machine-tdd.md#history-workflow-red-baseline) |
-| Remote ACP transports | `npm run test:remote` | Connects the Rust binary to SDK HTTP/SSE and WebSocket ACP servers; verifies remote capability boundaries and Agent-owned absolute cwd |
-| Rust-hosted black box | `npm run test:ui` | Exercises the production binary's embedded bundle and REST/session-SSE API with a real stdio ACP fixture, revision-guarded prompt completion, history reload, and deletion |
-| MCP-over-ACP protocol | `node --import tsx scripts/acp-protocol-smoke.ts` | Verifies bidirectional requests and notifications, error preservation, cancellation, cleanup, and reconnect using SDK fixtures |
-| HTTP and process boundaries | `node --import tsx scripts/server-boundary-smoke.ts` | Rejects cross-origin and untrusted Host requests; verifies graceful shutdown with an open SSE subscription and Agent process cleanup |
-| Rust coverage gate | `npm run test:coverage` | Combines native tests, instrumented API/protocol suites, and browser interactions; requires at least 85% Rust line coverage and `cargo-llvm-cov` |
+| Remote ACP transports | `npm run test:remote` | Connects the Rust binary to SDK HTTP/SSE and WebSocket ACP servers and drives it over protocol v2; verifies remote capability boundaries, cancellation, and Agent-owned absolute cwd |
+| Rust-hosted black box | `npm run test:ui` | Exercises the production binary's embedded bundle and the protocol v2 stream and writes with a real stdio ACP fixture: prompts bound to their operation, interactions, history reload, and deletion |
+| MCP-over-ACP protocol | `node --import tsx scripts/acp-protocol-smoke.ts` | Through protocol v2 prompts, verifies session filesystem and terminal services, elicitation, and MCP-over-ACP requests, notifications, errors, cancellation, and reconnect using SDK fixtures |
+| HTTP and process boundaries | `node --import tsx scripts/server-boundary-smoke.ts` | Rejects cross-origin and untrusted Host requests on the v2 routes while same-origin, CLI and proxy writes succeed; verifies graceful shutdown with an open stream and Agent process cleanup |
+| Rust coverage gate | `npm run test:coverage` | Combines native tests, the four backend smokes above on an instrumented host, and the browser suite; requires at least 85% Rust line coverage and `cargo-llvm-cov` |
+| Rust memory gates | `npm run test:memory:rust`, `npm run test:memory:efficiency:rust` | Subsets of `npm run test:rust`: retained turn versions, and allocations independent of unrelated retained content |
 | Standalone artifact | `npm run test:binary` | Copies only the release executable to an empty directory and verifies embedded HTML, JavaScript, health metadata, and static MIME types |
 | Release metadata | `python3 tests/release-metadata.test.py` | Validates tag-derived versions, prerelease classification, branch fallback, and rejection of invalid or injected workflow values; requires Python 3.11+ and runs in CI before artifact builds |
 | Release packaging | `python3 tests/package-release.test.py` | Verifies all seven target filenames, tar/zip contents, executable permissions, checksums, and failure on missing release inputs; runs on every binary runner |
 | Browser interaction | `npm run test:browser` | Runs the production Rust host with the fake Agent and verifies Zed-style Agent interaction and mobile behavior in Chromium |
 | Frontend development proxy | `npx playwright test dev-server.pw.ts` | Uses the built Rust host with Vite; verifies same-origin HMR, React/CSS updates, preserved drafts and sessions, API/SSE routing, and upstream failure handling |
-| Optional backend example | `npm run test:goose` | Diagnostic smoke for a separately installed Goose executable at `bin/goose`; not a protocol conformance gate |
 
 `npm run check` runs type checking, frontend/shared tests, and the production client build. CI
 runs the frontend, Rust backend, and Chromium browser suites as independent parallel jobs. Rust
-unit, remote-transport, REST/SSE host-smoke, release-build, and standalone-binary checks remain
+unit, remote-transport, protocol v2 host-smoke, release-build, and standalone-binary checks remain
 separate steps so failures identify their layer directly. See the workflow for CI gates.
 Linux CI jobs pin `ubuntu-26.04`, with `ubuntu-26.04-arm` for native ARM64 binaries.
 This adopts Ubuntu 26.04 explicitly ahead of the
@@ -45,7 +46,7 @@ image; future image upgrades also require an explicit workflow change.
 GNU binary smoke tests verify the build image, not compatibility with older glibc versions;
 the musl archives avoid a host glibc dependency.
 Conformance follows the [ACP compatibility contract](acp-coverage.md#compatibility-contract);
-backend-specific smoke tests remain optional.
+no test depends on a particular Agent's behavior.
 
 The remote-transport smoke uses a local SDK mock Agent. Its first prompt deliberately
 waits for cancellation; the second session's prompt returns immediately. On failure,
@@ -57,9 +58,9 @@ stalled delivery, not model inference latency.
 
 The smoke starts the normal Rust executable and uses the official TypeScript SDK's
 HTTP/SSE server over real local TCP connections. Only Agent business responses are
-mocked. Like the browser, it continuously consumes global and active-session SSE,
-switches the session subscription when opening another thread, and re-subscribes
-when returning to the running thread. Holding one prompt while another session
+mocked. Like the browser, it keeps one protocol v2 stream following `global` and the
+open session, follows another session when opening another thread, and follows the
+running thread again when returning to it. Holding one prompt while another session
 progresses represents a running Agent turn; the smoke does not inject scheduler
 yields or modify Hyper. Failure timelines include connection IDs and peer ports
 to distinguish requests on different sockets. Loopback
@@ -151,33 +152,31 @@ Type `/` for advertised commands or `@` for workspace context. Browser tests use
 isolated instances of this SDK fixture. Local Playwright runs require installed
 Chrome; CI installs Chromium. The coverage command uses the same browser setup.
 Set `CI=1` when running Playwright locally to use its installed Chromium headless shell
-and reproduce CI browser behavior. The attachment case checks the PDF's MIME type,
-inline disposition, and original bytes, then follows `navigator.pdfViewerEnabled`:
-full Chrome may open its PDF viewer, while the headless shell downloads the file.
-Both are expected outcomes of handing the link to the browser.
+and reproduce CI browser behavior. The attachment case opens text, Markdown and audio
+attachments in a new tab, and checks that HTML, PDF and Word files are downloads
+(`download="report.pdf"` and so on) whose bytes equal the original, with no script run
+and no popup.
 CI retains one diagnostic retry but fails on flaky tests, so a retry cannot turn a
 first-attempt failure into a successful browser or coverage gate.
 
-Browser assertions follow the current projection contract. Completed process bodies are absent
-after reload until the user expands their turn; locate that turn through its visible prompt or final
-answer before checking a historical tool or terminal. Diagnostic panels retain one latest source
-event, while the current business content remains complete.
+Browser assertions follow the current projection contract. A completed turn shows its prompt and
+final messages; its process ended with the turn and is not shown again after a reload. Check a tool
+call while its turn runs. A session terminal is a resource, not process (protocol S7): it stays in
+`live.terminals` after its operation ends until the Agent releases it, as
+`keeps a session terminal after its operation ends and drops its output once released` checks.
 
-`tests/browser/browser-errors.ts` permits the initial retained-session probe's expected 404 with
-either no query or only `presentation=compact`. Directory lookups, owner-fenced reads, process pages,
-other resources, and other HTTP errors remain visible. `tests/browser-errors.test.ts` guards that
-boundary. The ordinary browser job and instrumented coverage job use these same checks.
-The two deliberate Agent-exit cases also allow a 503 from the same-origin current-session
-view endpoint while the Agent is unavailable: an in-flight refresh can race the exit.
-That exception ends when the composer recovers; unrelated endpoints and page errors
-remain failures. The classifier tests cover the endpoint, origin, and status boundaries.
+`tests/browser/browser-errors.ts` fails a case on any console error or page error. A case may
+allow only an HTTP status it causes deliberately, on one same-origin path: the session list
+failure case allows its injected 503 on `catalog/ops`, and the terminal-login case allows a
+stale catalog refresh's 409 there. `tests/browser-errors.test.ts` guards the status, origin and
+path boundaries. The ordinary browser job and instrumented coverage job use these same checks.
 
 Terminal authentication input is sent in keystroke order, waiting for each PTY write's
 HTTP response before sending the next input. The browser authentication case holds the
 first keystroke in transit while typing the remaining access code and Enter, then checks
-that authentication completes after releasing it. `tests/use-acp.test.ts` also covers
-discarding unsent input on cancellation, terminal exit, unmount, or a failed write, and
-isolating a new authentication attempt from late replies. A failed write is never replayed.
+that authentication completes after releasing it. `tests/protocol-client.test.ts` covers one
+input at a time per terminal, in order, independent terminals, and input whose response was lost:
+it is never resent.
 The native `auth_terminal::tests` gate verifies PTY input and lifecycle behavior first.
 
 ## Backend behavior
@@ -188,9 +187,14 @@ capability gates, Agent-owned cwd selection, early/late update isolation, large 
 complete structured errors, large HTTP/stdio/WebSocket payloads, delayed admission, cyclic pagination, session races, complete ContentBlock validation,
 prompt/usage coherence, configuration and mode references, transactional session updates,
 permission and elicitation semantics, and MCP process/request races.
+Protocol v2 has its own gates: `protocol::convergence_tests` compares replicas with the
+published documents after every event, `protocol::hub_tests` covers cuts, queues and coalescing,
+`bridge::protocol_gate_tests` runs the coordinator over a real ACP transport, and
+`server::stream_tests` adds real HTTP for the stream, writes, resource actions and reads.
 
-The deterministic cross-session reducer corpus remains TypeScript because the browser state
-machine is TypeScript. Test Agents and HTTP/WebSocket ACP fixtures also remain TypeScript test
+The replica engine and the page projection remain TypeScript because the browser runs them;
+their tests are `tests/replica.test.ts`, `tests/protocol-client.test.ts` and
+`tests/workspace-projection.test.ts`. Test Agents and HTTP/WebSocket ACP fixtures also remain TypeScript test
 infrastructure; they are upstream peers or drivers, not an attyd backend.
 
 ## Zed-derived cases
@@ -218,7 +222,7 @@ Selected behavior cases:
 - Zed's missing-thread handling maps to the Rust early/late routing test: updates are buffered only
   while a matching session can still be allocated, and late unknown/closed-session updates never
   leak into the visible thread.
-- Zed's session-list work-directory tests map to the REST/SSE black-box assertion that an
+- Zed's session-list work-directory tests map to the protocol v2 black-box assertion that an
   Agent-owned cwd returned by `session/list` is retained when history is loaded.
 
 The source reference is Zed's

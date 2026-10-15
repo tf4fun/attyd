@@ -81,13 +81,14 @@ test("shows ACP approval, choice descriptions and cancellation states from stati
     await expect(page.locator('[data-tool-status="in_progress"]')).toHaveCount(1);
     await page.getByRole("button", { name: "Stop current turn", exact: true }).click();
     await expect(page.getByRole("button", { name: "Cancelling the current turn…", exact: true })).toBeDisabled();
-    await expect(page.locator('[data-tool-status="cancelled"]')).toHaveCount(2);
+    // A cancel request ends no tool; the Agent's result does.
+    await expect(page.locator('[data-tool-status="in_progress"]')).toHaveCount(1);
     await page.getByRole("button", { name: "模拟工具返回结果" }).click();
     await expect(page.locator('[data-tool-status="completed"]')).toHaveCount(2);
-    await expect(page.locator('[data-tool-status="cancelled"]')).toHaveCount(1);
+    await expect(page.locator('[data-tool-status="in_progress"]')).toHaveCount(0);
     await page.getByRole("button", { name: "恢复运行" }).click();
     await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeEnabled();
-    await expect(page.locator('[data-tool-status="cancelled"]')).toHaveCount(0);
+    await expect(page.locator('[data-tool-status="in_progress"]')).toHaveCount(1);
     await expectNoHorizontalOverflow(page);
     expect(apiRequests).toEqual([]);
     expect(browserErrors).toEqual([]);

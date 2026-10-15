@@ -15,7 +15,6 @@ use crate::semantic::{SessionUpdateSemanticState, validate_history_update};
 #[derive(Default)]
 struct HistoryBuilder {
     updates: Vec<Value>,
-    bytes: usize,
     turn_start: usize,
     tools: HashMap<String, usize>,
 }
@@ -56,7 +55,6 @@ impl HistoryBuilder {
             .unwrap_or(&[]);
         let mut folded = fold_active_turn_update(retained, &update)?;
         if let Some(position) = position {
-            self.bytes -= value_bytes(&self.updates[position]);
             if folded.is_empty() {
                 self.updates.remove(position);
                 for slot in self.tools.values_mut() {
@@ -64,22 +62,11 @@ impl HistoryBuilder {
                         *slot -= 1;
                     }
                 }
-                self.bytes = self
-                    .bytes
-                    .saturating_sub(usize::from(!self.updates.is_empty()));
             } else {
-                let replacement = folded.remove(0);
-                self.bytes += value_bytes(&replacement);
-                self.updates[position] = replacement;
+                self.updates[position] = folded.remove(0);
             }
         }
         for entry in folded {
-            if self.updates.is_empty() {
-                self.bytes = 2;
-            } else {
-                self.bytes += 1;
-            }
-            self.bytes += value_bytes(&entry);
             let position = self.updates.len();
             if matches!(
                 entry["sessionUpdate"].as_str(),
@@ -98,18 +85,11 @@ impl HistoryBuilder {
     }
 }
 
-fn value_bytes(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .expect("JSON value serializes")
-        .len()
-}
-
 #[derive(Default)]
 pub(crate) struct ReplayData {
     history: HistoryBuilder,
     validation: SessionUpdateSemanticState,
     controls: Vec<Value>,
-    control_bytes: usize,
     invalid: Option<HistoryCacheError>,
     sealed: bool,
 }
@@ -163,13 +143,7 @@ impl ReplayCandidate {
                     .iter()
                     .position(|previous| previous["sessionUpdate"] == update["sessionUpdate"]);
                 let previous = position.map(|position| &data.controls[position]);
-                let previous_bytes = previous.map_or(0, value_bytes);
                 let update = fold_control_update(previous, update);
-                let bytes = data
-                    .control_bytes
-                    .saturating_sub(previous_bytes)
-                    .saturating_add(value_bytes(&update));
-                data.control_bytes = bytes;
                 if let Some(position) = position {
                     data.controls[position] = update;
                 } else {
@@ -201,19 +175,17 @@ impl ReplayCandidate {
 
     pub(crate) fn take_controls(&self) -> (SessionUpdateSemanticState, Vec<Value>) {
         let mut data = self.lock();
-        data.control_bytes = 0;
         (
             std::mem::take(&mut data.validation),
             std::mem::take(&mut data.controls),
         )
     }
 
-    pub(crate) fn take_history(&self) -> Result<(Vec<Value>, usize), HistoryCacheError> {
+    pub(crate) fn take_history(&self) -> Result<Vec<Value>, HistoryCacheError> {
         let mut data = self.lock();
         data.updates()?;
         data.sealed = true;
-        let history = std::mem::take(&mut data.history);
-        Ok((history.updates, history.bytes.max(2)))
+        Ok(std::mem::take(&mut data.history).updates)
     }
 
     pub(crate) fn discard(&self) {
@@ -227,10 +199,11 @@ impl ReplayCandidate {
         };
     }
 
+    /// The updates and controls the candidate still holds.
     #[cfg(test)]
-    pub(crate) fn bytes(&self) -> usize {
+    pub(crate) fn retained(&self) -> usize {
         let data = self.lock();
-        data.history.bytes + data.control_bytes
+        data.history.updates.len() + data.controls.len()
     }
 }
 
@@ -241,7 +214,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn incremental_fold_matches_history_semantics_and_byte_accounting() {
+    fn incremental_fold_matches_history_semantics() {
         let updates = vec![
             json!({"sessionUpdate":"user_message_chunk","messageId":"u","content":{"type":"text","text":"start"}}),
             json!({"sessionUpdate":"agent_message_chunk","messageId":"a","content":{"type":"text","text":"hello"}}),
@@ -262,15 +235,13 @@ mod tests {
             expected = fold_history_update(&expected, &update).unwrap();
             actual.append(update).unwrap();
             assert_eq!(actual.updates, expected);
-            assert_eq!(actual.bytes, serde_json::to_vec(&expected).unwrap().len());
         }
     }
 
     #[test]
     fn invalid_replay_cannot_publish_a_valid_prefix() {
-        let mut cache = HistoryCache::new("epoch");
+        let mut cache = HistoryCache::default();
         let key = SessionKey::new("s", 1);
-        let baseline = cache.install_empty(key.clone());
         cache.begin_candidate(key.clone(), "load").unwrap();
         let replay = cache.candidate(&key, "load").unwrap();
         replay.ingest(json!({"sessionUpdate":"tool_call","toolCallId":"tool","title":"Run","status":"completed"}), true).unwrap();
@@ -280,14 +251,13 @@ mod tests {
             cache.commit_candidate(&key, "load"),
             Err(HistoryCacheError::InvalidReplay)
         ));
-        assert!(Arc::ptr_eq(cache.peek(&key).unwrap(), &baseline));
         cache.abort_candidate(&key, "load").unwrap();
-        assert_eq!(replay.bytes(), 0);
+        assert_eq!(replay.retained(), 0);
     }
 
     #[test]
     fn retired_candidate_cannot_contaminate_replacement_load() {
-        let mut cache = HistoryCache::new("epoch");
+        let mut cache = HistoryCache::default();
         let key = SessionKey::new("s", 1);
         cache.begin_candidate(key.clone(), "old").unwrap();
         let old = cache.candidate(&key, "old").unwrap();
@@ -298,7 +268,7 @@ mod tests {
             Err(HistoryCacheError::InvalidReplay)
         ));
         cache.remove(&key);
-        assert_eq!(old.bytes(), 0);
+        assert_eq!(old.retained(), 0);
         cache.begin_candidate(key.clone(), "new").unwrap();
         assert!(old.append(json!({"message":"late"})).is_err());
         old.ingest(
@@ -306,13 +276,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(
-            cache
-                .commit_candidate(&key, "new")
-                .unwrap()
-                .updates()
-                .is_empty()
-        );
+        assert!(cache.commit_candidate(&key, "new").unwrap().is_empty());
     }
 
     #[test]
@@ -337,6 +301,6 @@ mod tests {
         assert_eq!(controls.len(), 1);
         assert_eq!(controls[0]["title"], "title-10049");
         assert_eq!(controls[0]["updatedAt"], "2026-09-14T00:00:00Z");
-        assert_eq!(replay.bytes(), 0);
+        assert_eq!(replay.retained(), 0);
     }
 }

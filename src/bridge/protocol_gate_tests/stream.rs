@@ -191,17 +191,6 @@ impl Peer {
         .unwrap_or_else(|_| panic!("{session_id} did not reach {count} subscribers"));
     }
 
-    /// The session's current history revision, for a v1 turn.
-    async fn revision(&self, session_id: &str) -> String {
-        let lock = self.lock();
-        let state = lock.lock().await;
-        state
-            .sessions
-            .state(session_id)
-            .and_then(|session| session.history_revision.clone())
-            .expect("a history revision")
-    }
-
     /// Answers the `session/load` the bridge sends for `session_id` with
     /// `replay`; returns the request.
     async fn serve_load(&mut self, session_id: &str, replay: &[Value]) -> Value {
@@ -214,13 +203,11 @@ impl Peer {
         load
     }
 
-    /// Runs one whole v1 turn of `session_id` with `reply`.
+    /// Runs one whole turn of `session_id` with `reply`.
     async fn whole_turn(&mut self, session_id: &str, prompt: &str, reply: &str) {
         let scope = session(session_id);
         let prompt = vec![text(prompt)];
-        let revision = self.revision(session_id).await;
-        let op = self.install_prompt(session_id, &prompt).await;
-        let request = self.turn(session_id, &revision, prompt).await;
+        let (op, request) = self.prompt(session_id, prompt).await;
         self.update(session_id, chunk(&Uuid::new_v4().to_string(), text(reply)))
             .await;
         self.reply(&request, json!({"stopReason": "end_turn"}))
@@ -236,19 +223,16 @@ impl Peer {
     }
 }
 
-/// The log a v1 load of `replay` gives `saved`: a client's cache from an
+/// The log a load of `replay` gives `saved`: a client's cache from an
 /// earlier run.
 async fn history(replay: &[Value]) -> Vec<Value> {
     let mut peer = Peer::start(json!({"loadSession": true})).await;
-    let loaded = peer.submit(json!({
-        "type": "session/load", "requestId": "load", "sessionId": SAVED, "cwd": CWD,
-    }));
+    let _stream = Stream::open(&peer, &[session(SAVED).as_str()], Some(CWD)).await;
     let request = peer.request("session/load").await;
     for update in replay {
         peer.update(SAVED, update.clone()).await;
     }
     peer.reply(&request, json!({})).await;
-    Peer::result(loaded).await.unwrap();
     peer.until("the load completes", |peer| {
         peer.live(&session(SAVED))["op"]["status"] == "completed"
     })
@@ -304,7 +288,7 @@ fn assert_committed_once(stream: &Stream, scope: &str, op: &str, entry: &str) {
 #[tokio::test]
 async fn a_stream_aligns_each_scope_at_once_and_follows_a_prompt_through_its_commit() {
     let mut peer = Peer::start(json!({})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = session(CREATED);
     let scopes = ["global", "catalog", scope.as_str()];
     let mut before = Stream::open(&peer, &scopes, None).await;
@@ -324,8 +308,7 @@ async fn a_stream_aligns_each_scope_at_once_and_follows_a_prompt_through_its_com
     assert_eq!(before.reader.received.len(), 3, "one alignment per scope");
 
     let prompt = vec![text("hi")];
-    let op = peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (op, request) = peer.prompt(CREATED, prompt).await;
     peer.update(CREATED, chunk("answer", text("hel"))).await;
     before
         .until(&mut peer, "the first chunk", |reader| {
@@ -346,11 +329,12 @@ async fn a_stream_aligns_each_scope_at_once_and_follows_a_prompt_through_its_com
         })
         .await;
     let interaction = interaction_ids(&before.live(&scope)).remove(0);
-    let answered = peer.submit(json!({
-        "type": "permission/respond", "requestId": "answer", "sessionId": CREATED,
-        "permissionId": interaction, "outcome": {"outcome": "selected", "optionId": "allow"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &session(CREATED),
+        &interaction,
+        json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
+    )
+    .await;
     peer.response("permission").await;
     peer.update(CREATED, chunk("answer", text("lo"))).await;
     peer.reply(&request, json!({"stopReason": "end_turn"}))
@@ -445,11 +429,12 @@ async fn a_cold_reopen_keeps_the_client_log_and_confirms_it_when_the_load_ends()
         })
         .await;
     let interaction = interaction_ids(&stream.live(&scope)).remove(0);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer", "sessionId": SAVED,
-        "elicitationId": interaction, "response": {"action": "accept", "content": {}},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &session(SAVED),
+        &interaction,
+        json!({"response": {"action": "accept", "content": {}}}),
+    )
+    .await;
     assert_eq!(
         peer.response("question").await["result"]["action"],
         "accept"
@@ -614,11 +599,12 @@ async fn reconnecting_before_during_and_after_a_load_keeps_one_load_and_converge
         })
         .await;
     let barrier = interaction_ids(&stream.live(&scope)).remove(0);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer", "sessionId": SAVED,
-        "elicitationId": barrier, "response": {"action": "accept", "content": {}},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &session(SAVED),
+        &barrier,
+        json!({"response": {"action": "accept", "content": {}}}),
+    )
+    .await;
     peer.response("barrier").await;
     for update in &replay[2..] {
         peer.update(SAVED, update.clone()).await;
@@ -738,10 +724,8 @@ async fn a_paused_stream_follows_its_tail_and_is_coalesced_past_its_budget() {
     let delivered = paused.reader.head(&scope);
 
     // Past the budget: the queue is coalesced from the baseline.
-    let revision = peer.revision(CREATED).await;
     let prompt = vec![text("flood")];
-    peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (_, request) = peer.prompt(CREATED, prompt).await;
     for fill in ['a', 'b'] {
         peer.update(CREATED, flood_update(fill)).await;
         peer.until("the flood is published", |peer| {
@@ -1004,10 +988,8 @@ async fn an_accepted_url_flow_alone_keeps_the_session_needed() {
     for request_scoped in [false, true] {
         let (mut peer, mut stream) = followed(loadable()).await;
         let scope = session(CREATED);
-        let revision = peer.revision(CREATED).await;
         let prompt = vec![text("hi")];
-        peer.install_prompt(CREATED, &prompt).await;
-        let request = peer.turn(CREATED, &revision, prompt).await;
+        let (_, request) = peer.prompt(CREATED, prompt).await;
         let elicitation_scope = if request_scoped {
             json!({"requestId": request["id"]})
         } else {
@@ -1025,11 +1007,12 @@ async fn an_accepted_url_flow_alone_keeps_the_session_needed() {
             })
             .await;
         let interaction = interaction_ids(&stream.live(&scope)).remove(0);
-        let answered = peer.submit(json!({
-            "type": "elicitation/respond", "requestId": "answer",
-            "elicitationId": interaction, "response": {"action": "accept"},
-        }));
-        Peer::result(answered).await.unwrap();
+        peer.answer(
+            &session(CREATED),
+            &interaction,
+            json!({"response": {"action": "accept"}}),
+        )
+        .await;
         peer.response("sign-in").await;
         peer.reply(&request, json!({"stopReason": "end_turn"}))
             .await;
@@ -1080,10 +1063,8 @@ async fn an_exited_terminal_not_yet_released_keeps_the_session_needed() {
             reader.replicas.contains_key(&session(CREATED))
         })
         .await;
-    let revision = peer.revision(CREATED).await;
     let prompt = vec![text("run")];
-    peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (_, request) = peer.prompt(CREATED, prompt).await;
     peer.agent_request(
         "terminal",
         "terminal/create",
@@ -1194,28 +1175,23 @@ async fn review_a_sessions_own_admitted_operation_keeps_it_held_before_dispatch(
 }
 
 #[tokio::test]
-async fn review_a_subscription_waits_from_delete_admission_before_its_rpc_starts() {
+async fn review_a_subscription_after_delete_admission_waits_for_its_end() {
     let caps = json!({"loadSession": true, "sessionCapabilities": {"delete": {}}});
     let mut peer = Peer::start(caps).await;
     let scope = session(SAVED);
-    peer.install("global", OperationKind::Delete, json!({"sessionId": SAVED}))
+    peer.start_op("global", "delete", json!({"sessionId": SAVED}))
         .await;
 
-    // Occupation begins at admission, before the ACP request is dispatched.
-    // A subscription must not steal that interval to start a load.
+    // An admitted delete that has not ended occupies the session: a
+    // subscription opened meanwhile starts no load and waits for its end.
     let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
+    let delete = peer.request("session/delete").await;
     peer.quiet(Duration::from_millis(200)).await;
     assert!(
         stream.take_all(&mut peer).is_empty(),
         "the occupied scope waits"
     );
-
-    let deleted = peer.submit(json!({
-        "type": "session/delete", "requestId": "delete", "sessionId": SAVED,
-    }));
-    let delete = peer.request("session/delete").await;
     peer.reply(&delete, json!({})).await;
-    Peer::result(deleted).await.unwrap();
     stream
         .until(&mut peer, "the admitted delete ends", |reader| {
             reader.ended.contains_key(&session(SAVED))
@@ -1231,17 +1207,13 @@ async fn a_subscription_waits_for_a_cold_delete_and_ends_with_deleted() {
     let caps = json!({"loadSession": true, "sessionCapabilities": {"delete": {}}});
     let mut peer = Peer::start(caps).await;
     let scope = session(SAVED);
-    peer.install("global", OperationKind::Delete, json!({"sessionId": SAVED}))
+    peer.start_op("global", "delete", json!({"sessionId": SAVED}))
         .await;
-    let deleted = peer.submit(json!({
-        "type": "session/delete", "requestId": "delete", "sessionId": SAVED,
-    }));
     let delete = peer.request("session/delete").await;
     let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
     peer.quiet(Duration::from_millis(200)).await;
     assert!(stream.take_all(&mut peer).is_empty(), "the stream waits");
     peer.reply(&delete, json!({})).await;
-    Peer::result(deleted).await.unwrap();
     stream
         .until(&mut peer, "the end", |reader| {
             reader.ended.contains_key(&session(SAVED))
@@ -1261,15 +1233,11 @@ async fn a_subscription_waiting_for_a_failed_cold_delete_loads_the_session() {
     let caps = json!({"loadSession": true, "sessionCapabilities": {"delete": {}}});
     let mut peer = Peer::start(caps).await;
     let scope = session(SAVED);
-    peer.install("global", OperationKind::Delete, json!({"sessionId": SAVED}))
+    peer.start_op("global", "delete", json!({"sessionId": SAVED}))
         .await;
-    let deleted = peer.submit(json!({
-        "type": "session/delete", "requestId": "delete", "sessionId": SAVED,
-    }));
     let delete = peer.request("session/delete").await;
     let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
     peer.refuse(&delete).await;
-    Peer::result(deleted).await.unwrap_err();
     peer.serve_load(SAVED, &turns(&[("one", "1")])).await;
     stream
         .until(&mut peer, "the load ends", |reader| {
@@ -1448,10 +1416,8 @@ async fn four_consumers_converge_one_by_one_lagging_reconnecting_and_paused() {
     let mut paused = false;
 
     for round in 0..4 {
-        let revision = peer.revision(CREATED).await;
         let prompt = vec![text(&format!("turn {round}"))];
-        let op = peer.install_prompt(CREATED, &prompt).await;
-        let request = peer.turn(CREATED, &revision, prompt).await;
+        let (op, request) = peer.prompt(CREATED, prompt).await;
         if round == 2 {
             paused = true;
         }
@@ -1499,12 +1465,12 @@ async fn four_consumers_converge_one_by_one_lagging_reconnecting_and_paused() {
             })
             .await;
             let interaction = interaction_ids(&peer.live(&scope)).remove(0);
-            let answered = peer.submit(json!({
-                "type": "permission/respond", "requestId": "answer", "sessionId": CREATED,
-                "permissionId": interaction,
-                "outcome": {"outcome": "selected", "optionId": "allow"},
-            }));
-            Peer::result(answered).await.unwrap();
+            peer.answer(
+                &session(CREATED),
+                &interaction,
+                json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
+            )
+            .await;
             peer.response("permission").await;
             reconnector.reopen(&peer, None).await;
         }
@@ -1649,77 +1615,140 @@ async fn review_waiting_session_uses_the_new_connections_resume_capability() {
     review_resume_on_next_connection_keeps_known_log(&mut old, &mut stream, SAVED, &cached).await;
 }
 
-#[tokio::test]
-async fn review_a_pre_dispatch_config_refusal_restarts_the_idle_release_timer() {
-    let mut peer = Peer::start_with(loadable(), json!([]), |options| {
-        options.session_unobserved_timeout = 1;
-    })
-    .await;
-    peer.create(
-        CREATED,
-        json!({"configOptions": [{
-            "id": "verbose", "name": "Verbose", "type": "boolean", "currentValue": false,
-        }]}),
-    )
-    .await;
-    let scope = session(CREATED);
-    let mut stream = Stream::open(&peer, &[scope.as_str()], None).await;
-    stream
-        .until(&mut peer, "the offered config option", |reader| {
-            reader.live(&session(CREATED))["controls"]["configOptions"][0]["id"] == "verbose"
+/// Automatic release is still an ordinary ACP close: a refusal keeps the
+/// session usable and must not turn an idle timer into a retry loop.
+#[tokio::test(start_paused = true)]
+async fn review_refused_automatic_close_waits_for_a_new_subscription_cycle() {
+    for timeout_seconds in [0, 1] {
+        let mut peer = Peer::start_with(loadable(), json!([]), |options| {
+            options.session_unobserved_timeout = timeout_seconds;
         })
         .await;
-    // This request is valid when admitted. As in the other step-5 tests,
-    // install uses the future admission entry, before the shared ACP executor.
-    let op = peer
-        .install(
-            &scope,
-            OperationKind::SetConfig,
-            json!({"configId": "verbose", "value": true}),
-        )
-        .await;
-    // The Agent changes its offered options before this admitted command is
-    // dispatched. Wait for the actual notification's published projection.
-    peer.update(
-        CREATED,
-        json!({"sessionUpdate": "config_option_update", "configOptions": []}),
-    )
-    .await;
-    stream
-        .until(&mut peer, "the Agent's removal of verbose", |reader| {
-            reader.live(&session(CREATED))["controls"]["configOptions"] == json!([])
+        let scope = session(SAVED);
+        let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
+        peer.serve_load(SAVED, &turns(&[("before close", "kept reply")]))
+            .await;
+        stream
+            .until(&mut peer, "the initial load", |reader| {
+                reader.live(&session(SAVED))["op"]["status"] == "completed"
+            })
+            .await;
+        let history = stream.log(&scope);
+        let before_reopen = stream.events_of(&scope).len();
+
+        stream.close();
+        peer.until_subscribers(SAVED, 0).await;
+        let refused = peer.request("session/close").await;
+        assert_eq!(refused["params"]["sessionId"], SAVED);
+        peer.refuse(&refused).await;
+        // Cross several full intervals, including the immediate-release case.
+        // No other command or subscription may reset the timer during this wait.
+        let several_intervals = Duration::from_secs(timeout_seconds.max(1) as u64 * 3);
+        peer.quiet(several_intervals).await;
+        peer.settled().await;
+        assert!(!peer.released(&scope), "a refused close keeps the session");
+
+        stream.reopen(&peer, None).await;
+        stream
+            .until(&mut peer, "the returning subscription", |reader| {
+                reader.events_of(&session(SAVED)).len() > before_reopen
+            })
+            .await;
+        assert_eq!(stream.log(&scope), history);
+        peer.quiet(several_intervals).await;
+        let (op, prompt) = peer.prompt(SAVED, vec![text("still usable")]).await;
+        peer.update(SAVED, chunk("after-refusal", text("still here")))
+            .await;
+        peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+        stream
+            .until(&mut peer, "the new prompt completes", |reader| {
+                reader.live(&session(SAVED))["op"]["id"] == op
+                    && reader.live(&session(SAVED))["op"]["status"] == "completed"
+            })
+            .await;
+        assert_eq!(stream.log(&scope).len(), history.len() + 1);
+        assert_eq!(
+            stream.log(&scope).last().unwrap()["turn"],
+            json!({"prompt": [text("still usable")], "reply": [text("still here")]})
+        );
+        peer.settled().await;
+        stream.converged(&peer);
+
+        stream.close();
+        peer.until_subscribers(SAVED, 0).await;
+        let close = peer.request("session/close").await;
+        assert_eq!(close["params"]["sessionId"], SAVED);
+        assert_ne!(close["id"], refused["id"]);
+        peer.reply(&close, json!({})).await;
+        peer.until("the next close releases the session", |peer| {
+            peer.released(&session(SAVED))
         })
         .await;
-    assert_eq!(stream.live(&scope)["op"]["id"], op);
-    assert_eq!(stream.live(&scope)["op"]["status"], "running");
+        peer.quiet(several_intervals).await;
+        peer.settled().await;
+    }
+}
 
-    stream.close();
-    peer.until_subscribers(CREATED, 0).await;
-    // The last observer's departure is processed while the admitted op still
-    // owns the session. A whole idle interval must pass without any close.
-    peer.quiet(BEYOND_TIMER).await;
-    peer.settled().await;
-    assert!(!peer.released(&scope));
-    assert_eq!(peer.live(&scope)["op"]["status"], "running");
+/// A locally released session still exists at the Agent. Its late update is
+/// not early replay for the unrelated create currently awaiting a response.
+#[tokio::test(start_paused = true)]
+async fn review_released_session_updates_do_not_displace_a_new_sessions_early_controls() {
+    for late_old_update in [false, true] {
+        let mut peer = Peer::start_with(json!({"loadSession": true}), json!([]), |options| {
+            options.session_unobserved_timeout = 1;
+        })
+        .await;
+        peer.create("old", json!({})).await;
+        peer.until("the old session is locally released", |peer| {
+            peer.released(&session("old"))
+        })
+        .await;
 
-    let refused = peer.submit(json!({
-        "type": "session/set_config_option", "requestId": "removed-config-option",
-        "sessionId": CREATED, "configId": "verbose", "value": true,
-    }));
-    Peer::result(refused).await.unwrap_err();
-    peer.until("the admitted operation fails before ACP dispatch", |peer| {
-        peer.live(&scope)["op"]["id"] == op && peer.live(&scope)["op"]["status"] == "failed"
-    })
-    .await;
-    // No Agent set_config_option request is permitted for the removed option;
-    // once failure releases the operation, the ordinary timer must close it.
-    let close = peer.request("session/close").await;
-    assert_eq!(close["params"]["sessionId"], CREATED);
-    peer.reply(&close, json!({})).await;
-    peer.until("the idle session is released after the refusal", |peer| {
-        peer.released(&scope)
-    })
-    .await;
-    peer.settled().await;
-    assert!(peer.publication.lock().publisher.document(&scope).is_none());
+        let (_, created) = peer.start_op("global", "create", json!({"cwd": CWD})).await;
+        let request = peer.request("session/new").await;
+        let commands = json!([{"name": "new-command", "description": "For the new session"}]);
+        let mut batch = Vec::new();
+        if late_old_update {
+            batch.push(json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "old", "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{"name": "old-command", "description": "Old session"}],
+                }},
+            }));
+        }
+        batch.push(json!({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "new", "update": {
+                "sessionUpdate": "available_commands_update", "availableCommands": commands,
+            }},
+        }));
+        batch.push(json!({
+            "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": "new"},
+        }));
+        peer.send(Value::Array(batch)).await;
+        assert_eq!(
+            Peer::ended(created).await.unwrap(),
+            json!({"sessionId": "new"})
+        );
+
+        let scope = session("new");
+        let mut stream = Stream::open(&peer, &[scope.as_str()], None).await;
+        stream
+            .until(
+                &mut peer,
+                "the newly created session's alignment",
+                |reader| reader.replicas.contains_key(&session("new")),
+            )
+            .await;
+        assert_eq!(
+            stream.live(&scope)["controls"]["commands"],
+            commands,
+            "late_old_update={late_old_update}: the new session keeps its own early controls"
+        );
+        assert!(peer.live("global")["sessions"].get("old").is_none());
+        peer.quiet(Duration::from_secs(2)).await;
+        peer.settled().await;
+        stream.converged(&peer);
+    }
 }

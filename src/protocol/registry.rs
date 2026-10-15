@@ -28,13 +28,13 @@ pub(crate) enum SessionLog {
 }
 
 /// A held session the next Agent connection loads again: bridge memory
-/// that outlives the connection (protocol S6, §5.4). It keeps the log the
-/// session had, with its attachments, and the waiting `load`.
+/// that outlives the connection (protocol S6, §5.4). It keeps the controls
+/// and the log the session had, with its attachments, and the waiting `load`.
 #[derive(Debug, Clone)]
 pub(crate) struct WaitingSession {
     pub session_id: String,
     pub cwd: std::path::PathBuf,
-    pub session: Value,
+    pub controls: SessionControls,
     pub log: SessionLog,
     pub op: OpSlot,
 }
@@ -113,15 +113,6 @@ fn session_kind(kind: SessionOperationKind) -> Option<OperationKind> {
 /// A v1 operation error `{ code?, message, data? }`.
 pub(crate) fn agent_error(error: &Value) -> ProtocolError {
     ProtocolError::agent(error)
-}
-
-/// The pending interactions of a scope that no answer is on its way to.
-pub(crate) fn unanswered<'a>(
-    interactions: impl IntoIterator<Item = &'a PendingInteraction>,
-) -> impl Iterator<Item = &'a PendingInteraction> {
-    interactions
-        .into_iter()
-        .filter(|interaction| interaction.responding_operation_id.is_none())
 }
 
 fn held(live: &SessionLiveState) -> bool {
@@ -293,10 +284,12 @@ impl SessionRegistry {
     // -----------------------------------------------------------------------
     // Transitions, called by the registry's v1 transitions.
 
-    /// Every unanswered interaction: request-scoped ones, and each held
+    /// Every pending interaction: request-scoped ones, and each held
     /// session's, with the session they wait in.
     fn pending_interactions(&self) -> impl Iterator<Item = (&PendingInteraction, Pending)> {
-        let requests = unanswered(self.request_elicitations.values())
+        let requests = self
+            .request_elicitations
+            .values()
             .map(|pending| (pending, Pending::Request));
         let sessions = self.sessions.iter().flat_map(|(session_id, entry)| {
             entry
@@ -305,9 +298,10 @@ impl SessionRegistry {
                 .iter()
                 .filter(|live| held(live))
                 .flat_map(move |live| {
-                    unanswered(live.permissions.values())
+                    live.permissions
+                        .values()
                         .map(move |pending| (pending, Pending::Permission(session_id.clone())))
-                        .chain(unanswered(live.elicitations.values()).map(move |pending| {
+                        .chain(live.elicitations.values().map(move |pending| {
                             (pending, Pending::Elicitation(session_id.clone()))
                         }))
                 })
@@ -315,7 +309,7 @@ impl SessionRegistry {
         requests.chain(sessions)
     }
 
-    /// Whether an unanswered interaction joined `op`.
+    /// Whether a pending interaction joined `op`.
     fn has_joined(&self, op: &str) -> bool {
         self.pending_interactions().any(|(pending, _)| {
             self.scopes
@@ -343,7 +337,10 @@ impl SessionRegistry {
             return;
         };
         let op = &live.op.id;
-        let own = unanswered(live.permissions.values().chain(live.elicitations.values()))
+        let own = live
+            .permissions
+            .values()
+            .chain(live.elicitations.values())
             .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id));
         let joined = self.has_joined(op);
         let live = self.held_live_mut(session_id).expect("held session");
@@ -354,7 +351,9 @@ impl SessionRegistry {
     /// `global` (its own interactions are those that joined no operation) and
     /// of every scope a request-scoped interaction joined.
     pub(crate) fn settle_global_ops(&mut self) {
-        let unjoined = unanswered(self.request_elicitations.values())
+        let unjoined = self
+            .request_elicitations
+            .values()
             .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id));
         let joined = self.has_joined(&self.scopes.global.id);
         settle_agent_request(&mut self.scopes.global, unjoined, joined);
@@ -626,7 +625,7 @@ impl SessionRegistry {
         Some(WaitingSession {
             session_id: session_id.to_string(),
             cwd: live.cwd.clone(),
-            session: live.session.clone(),
+            controls: live.controls.clone(),
             log: entry.state.log.clone(),
             op: live.op.clone(),
         })
@@ -854,15 +853,8 @@ impl SessionRegistry {
         })
     }
 
-    /// A setup response arrived: controls settle from the earlier updates and
-    /// the response (protocol §4.5).
-    pub(crate) fn settle_session_controls(&mut self, session_id: &str) {
-        if let Some(live) = self.held_live_mut(session_id) {
-            live.controls = SessionControls::settle(&live.control_state, &live.session);
-        }
-    }
-
-    /// A control update or a control operation's acknowledgement arrived.
+    /// A test's control update of a held session.
+    #[cfg(test)]
     pub(crate) fn fold_session_controls(&mut self, session_id: &str, update: &Value) {
         if let Some(live) = self.held_live_mut(session_id) {
             live.controls.fold_update(update);
@@ -870,7 +862,7 @@ impl SessionRegistry {
     }
 }
 
-/// Where an unanswered interaction waits.
+/// Where a pending interaction waits.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Pending {
     /// A request-scoped elicitation, kept by the connection.
