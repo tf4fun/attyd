@@ -191,17 +191,14 @@ pub(crate) enum TerminalUpsert {
 pub(crate) enum RuntimeEffect {
     CancelPermissionResponder {
         session_id: String,
-        incarnation: u64,
         interaction_id: String,
     },
     CancelElicitationResponder {
         session_id: Option<String>,
-        incarnation: Option<u64>,
         interaction_id: String,
     },
     AbortUrlFlow {
         session_id: Option<String>,
-        incarnation: Option<u64>,
         elicitation_id: String,
         registration_id: String,
     },
@@ -608,7 +605,7 @@ impl SessionRegistry {
         let mut session = self
             .take_live_for_retirement(session_id, incarnation)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        let effects = drain_session_liveness(session_id, incarnation, &mut session);
+        let effects = drain_session_liveness(session_id, &mut session);
 
         self.effects.extend(effects);
         self.fail_session_load(session_id, &error);
@@ -628,7 +625,11 @@ impl SessionRegistry {
         self.require_epoch(expected_epoch)?;
         let (source_session_id, source_incarnation) = source;
         {
-            let source = self.require_live(source_session_id, source_incarnation)?;
+            let source = self
+                .require_live_owner(source_session_id, source_incarnation)?
+                .live
+                .as_ref()
+                .expect("live owner checked");
             if source.lifecycle != SessionLifecycle::Active {
                 return Err(RuntimeStateError::SessionNotActive);
             }
@@ -769,7 +770,11 @@ impl SessionRegistry {
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_live_mut(session_id, incarnation)?;
+        let session = self
+            .require_live_owner_mut(session_id, incarnation)?
+            .live
+            .as_mut()
+            .expect("live owner checked");
         if !matches!(
             session.lifecycle,
             SessionLifecycle::Active
@@ -903,7 +908,6 @@ impl SessionRegistry {
             .extend(retired.permissions.into_iter().map(|interaction_id| {
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: session_id.to_string(),
-                    incarnation: incarnation,
                     interaction_id,
                 }
             }));
@@ -911,7 +915,6 @@ impl SessionRegistry {
             .extend(retired.elicitations.into_iter().map(|interaction_id| {
                 RuntimeEffect::CancelElicitationResponder {
                     session_id: Some(session_id.to_string()),
-                    incarnation: Some(incarnation),
                     interaction_id,
                 }
             }));
@@ -923,12 +926,11 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         interaction_id: impl Into<String>,
         request: Value,
     ) -> Result<InteractionUpsert, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let active_operation = owner
             .turn_execution()
             .map(|execution| execution.rpc_operation_id.clone());
@@ -949,11 +951,10 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         interaction_id: &str,
     ) -> Result<InteractionResolution, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_live_mut(session_id, incarnation)?;
+        let session = self.require_live_mut(session_id)?;
         let outcome = session_live::resolve_permission(session, interaction_id)?;
         if outcome == InteractionResolution::Applied {
             self.settle_session_ops(session_id);
@@ -964,15 +965,15 @@ impl SessionRegistry {
     pub(crate) fn upsert_elicitation(
         &mut self,
         expected_epoch: &str,
-        scope: Option<(&str, u64)>,
+        scope: Option<&str>,
         interaction_id: impl Into<String>,
         request: Value,
     ) -> Result<InteractionUpsert, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let interaction_id = interaction_id.into();
         match scope {
-            Some((session_id, incarnation)) => {
-                let owner = self.require_live_owner_mut(session_id, incarnation)?;
+            Some(session_id) => {
+                let owner = self.live_owner_mut(session_id)?;
                 let session = owner.live.as_mut().expect("live owner checked");
                 if session
                     .resolved_elicitations
@@ -1037,15 +1038,15 @@ impl SessionRegistry {
     pub(crate) fn resolve_elicitation(
         &mut self,
         expected_epoch: &str,
-        scope: Option<(&str, u64)>,
+        scope: Option<&str>,
         interaction_id: &str,
         accepted_url_id: Option<&str>,
     ) -> Result<InteractionResolution, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         match scope {
-            Some((session_id, incarnation)) => {
+            Some(session_id) => {
                 if self
-                    .require_live(session_id, incarnation)?
+                    .require_live(session_id)?
                     .resolved_elicitations
                     .iter()
                     .any(|resolved| resolved == interaction_id)
@@ -1057,7 +1058,7 @@ impl SessionRegistry {
                 {
                     return Err(RuntimeStateError::InteractionCollision);
                 }
-                let session = self.require_live_mut(session_id, incarnation)?;
+                let session = self.require_live_mut(session_id)?;
                 let pending = session
                     .elicitations
                     .remove(interaction_id)
@@ -1124,17 +1125,14 @@ impl SessionRegistry {
     pub(crate) fn settle_url_registration(
         &mut self,
         expected_epoch: &str,
-        scope: Option<(&str, u64)>,
+        scope: Option<&str>,
         elicitation_id: &str,
         registration_id: &str,
         status: UrlFlowStatus,
     ) -> Result<UrlFlowResolution, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let flow = match scope {
-            Some((session_id, incarnation)) => self
-                .require_live(session_id, incarnation)?
-                .url_flows
-                .get(elicitation_id),
+            Some(session_id) => self.require_live(session_id)?.url_flows.get(elicitation_id),
             None => self.request_url_flows.get(elicitation_id),
         };
         if flow.is_some_and(|flow| flow.registration_id != registration_id) {
@@ -1146,7 +1144,7 @@ impl SessionRegistry {
     fn settle_url_flow(
         &mut self,
         expected_epoch: &str,
-        scope: Option<(&str, u64)>,
+        scope: Option<&str>,
         elicitation_id: &str,
         status: UrlFlowStatus,
     ) -> Result<UrlFlowResolution, RuntimeStateError> {
@@ -1155,8 +1153,8 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         match scope {
-            Some((session_id, incarnation)) => {
-                let session = self.require_live_mut(session_id, incarnation)?;
+            Some(session_id) => {
+                let session = self.require_live_mut(session_id)?;
                 if session
                     .resolved_url_flows
                     .iter()
@@ -1200,12 +1198,11 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         terminal_id: impl Into<String>,
         terminal: Value,
     ) -> Result<TerminalUpsert, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let session = self.require_live_mut(session_id, incarnation)?;
+        let session = self.require_live_mut(session_id)?;
         let terminal_id = terminal_id.into();
         if session
             .released_terminals
@@ -1258,7 +1255,7 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
-        let stage = match self.require_live(session_id, incarnation)?.lifecycle {
+        let stage = match self.require_live(session_id)?.lifecycle {
             SessionLifecycle::Active => "closing",
             SessionLifecycle::Closed => "deleting",
             _ => return Err(RuntimeStateError::SessionNotActive),
@@ -1280,7 +1277,7 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
-        if self.require_live(session_id, incarnation)?.lifecycle != SessionLifecycle::Active {
+        if self.require_live(session_id)?.lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive);
         }
         self.start_operation(
@@ -1319,7 +1316,7 @@ impl SessionRegistry {
             if let Some(turn) = owner.active_turn.as_mut() {
                 turn.execution = None;
             }
-            drain_session_liveness(session_id, incarnation, session)
+            drain_session_liveness(session_id, session)
         };
 
         self.effects.extend(effects);
@@ -1360,7 +1357,7 @@ impl SessionRegistry {
         let mut session = self
             .take_live_for_retirement(session_id, incarnation)
             .ok_or(RuntimeStateError::UnknownSession)?;
-        let effects = drain_session_liveness(session_id, incarnation, &mut session);
+        let effects = drain_session_liveness(session_id, &mut session);
 
         self.effects.extend(effects);
         self.complete_session_delete(session_id);
@@ -1390,7 +1387,7 @@ impl SessionRegistry {
             operation.stage = "uncertain".to_string();
             operation.uncertainty_reason = Some(reason.clone());
             session.lifecycle = SessionLifecycle::Uncertain;
-            drain_session_liveness(session_id, incarnation, session)
+            drain_session_liveness(session_id, session)
         };
 
         self.effects.extend(effects);
@@ -1519,7 +1516,7 @@ impl SessionRegistry {
         }
         let live = owner.live.as_mut().expect("live owner checked");
         live.lifecycle = SessionLifecycle::Closed;
-        let effects = drain_session_liveness(session_id, incarnation, live);
+        let effects = drain_session_liveness(session_id, live);
         self.effects.extend(effects);
         Ok(())
     }
@@ -1610,25 +1607,37 @@ impl SessionRegistry {
         Ok(owner)
     }
 
+    /// A held session that is not in its final cleanup.
+    fn live_owner(&self, session_id: &str) -> Result<&SessionState, RuntimeStateError> {
+        self.sessions
+            .get(session_id)
+            .map(|entry| &entry.state)
+            .filter(|owner| owner.live.is_some() && !in_cleanup(owner))
+            .ok_or(RuntimeStateError::UnknownSession)
+    }
+
+    fn live_owner_mut(&mut self, session_id: &str) -> Result<&mut SessionState, RuntimeStateError> {
+        self.sessions
+            .get_mut(session_id)
+            .map(|entry| &mut entry.state)
+            .filter(|owner| owner.live.is_some() && !in_cleanup(owner))
+            .ok_or(RuntimeStateError::UnknownSession)
+    }
+
     fn require_live_mut(
         &mut self,
         session_id: &str,
-        incarnation: u64,
     ) -> Result<&mut SessionLiveState, RuntimeStateError> {
         Ok(self
-            .require_live_owner_mut(session_id, incarnation)?
+            .live_owner_mut(session_id)?
             .live
             .as_mut()
             .expect("live owner checked"))
     }
 
-    fn require_live(
-        &self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<&SessionLiveState, RuntimeStateError> {
+    fn require_live(&self, session_id: &str) -> Result<&SessionLiveState, RuntimeStateError> {
         Ok(self
-            .require_live_owner(session_id, incarnation)?
+            .live_owner(session_id)?
             .live
             .as_ref()
             .expect("live owner checked"))
@@ -2004,21 +2013,23 @@ fn remember_resolved_permission(session: &mut SessionLiveState, interaction_id: 
     remember_resolved_interaction(&mut session.resolved_permissions, interaction_id);
 }
 
+fn in_cleanup(owner: &SessionState) -> bool {
+    owner
+        .operation
+        .as_ref()
+        .is_some_and(|operation| operation.stage == "cleanup")
+}
+
 fn remember_resolved_interaction(resolved: &mut VecDeque<String>, interaction_id: &str) {
     resolved.push_back(interaction_id.to_string());
 }
 
-fn drain_session_liveness(
-    session_id: &str,
-    incarnation: u64,
-    session: &mut SessionLiveState,
-) -> Vec<RuntimeEffect> {
+fn drain_session_liveness(session_id: &str, session: &mut SessionLiveState) -> Vec<RuntimeEffect> {
     let permissions = std::mem::take(&mut session.permissions);
     let mut effects = permissions
         .into_keys()
         .map(|interaction_id| RuntimeEffect::CancelPermissionResponder {
             session_id: session_id.to_string(),
-            incarnation: incarnation,
             interaction_id,
         })
         .collect::<Vec<_>>();
@@ -2026,7 +2037,6 @@ fn drain_session_liveness(
     effects.extend(elicitations.into_keys().map(|interaction_id| {
         RuntimeEffect::CancelElicitationResponder {
             session_id: Some(session_id.to_string()),
-            incarnation: Some(incarnation),
             interaction_id,
         }
     }));
@@ -2036,7 +2046,6 @@ fn drain_session_liveness(
             .filter(|(_, flow)| flow.status == UrlFlowStatus::Waiting)
             .map(|(elicitation_id, flow)| RuntimeEffect::AbortUrlFlow {
                 session_id: Some(session_id.to_string()),
-                incarnation: Some(incarnation),
                 elicitation_id,
                 registration_id: flow.registration_id,
             }),
@@ -2357,21 +2366,15 @@ mod tests {
         let before = state.state("session").unwrap().clone();
         let published = state.live_snapshot();
         assert_eq!(
-            state.upsert_permission("epoch", "session", incarnation, "late", json!({})),
+            state.upsert_permission("epoch", "session", "late", json!({})),
             Err(RuntimeStateError::UnknownSession)
         );
         assert_eq!(
-            state.upsert_elicitation("epoch", Some(("session", incarnation)), "late", json!({})),
+            state.upsert_elicitation("epoch", Some("session"), "late", json!({})),
             Err(RuntimeStateError::UnknownSession)
         );
         assert_eq!(
-            state.upsert_terminal(
-                "epoch",
-                "session",
-                incarnation,
-                "late",
-                json!({ "output": "late" })
-            ),
+            state.upsert_terminal("epoch", "session", "late", json!({ "output": "late" })),
             Err(RuntimeStateError::UnknownSession)
         );
         assert_eq!(state.state("session").unwrap(), &before);
@@ -2447,7 +2450,7 @@ mod tests {
             .admit_session_turn("epoch", "session", incarnation, "intent", vec![])
             .unwrap();
         state
-            .upsert_permission("epoch", "session", incarnation, "permission", json!({}))
+            .upsert_permission("epoch", "session", "permission", json!({}))
             .unwrap();
         let before = state.state("session").unwrap().clone();
         assert_eq!(
@@ -2471,7 +2474,6 @@ mod tests {
             state.take_effects(),
             vec![RuntimeEffect::CancelPermissionResponder {
                 session_id: "session".to_string(),
-                incarnation: incarnation,
                 interaction_id: "permission".to_string()
             }]
         );
@@ -2496,10 +2498,7 @@ mod tests {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state.register_new("session", incarnation);
-        state
-            .require_live_mut("session", incarnation)
-            .unwrap()
-            .lifecycle = SessionLifecycle::Closed;
+        state.require_live_mut("session").unwrap().lifecycle = SessionLifecycle::Closed;
         let before = state.state("session").unwrap().clone();
         let seq = state.live_snapshot();
         let next_operation = state.next_operation;
@@ -2516,10 +2515,7 @@ mod tests {
         assert_eq!(state.state("session").unwrap(), &before);
         assert_eq!(state.live_snapshot(), seq);
         assert_eq!(state.next_operation, next_operation);
-        state
-            .require_live_mut("session", incarnation)
-            .unwrap()
-            .lifecycle = SessionLifecycle::Active;
+        state.require_live_mut("session").unwrap().lifecycle = SessionLifecycle::Active;
         state
             .admit_session_turn(
                 "epoch",
@@ -3302,7 +3298,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "live-terminal",
                 json!({
                     "terminalId": "live-terminal",
@@ -3314,7 +3309,7 @@ mod tests {
         state
             .upsert_elicitation(
                 "epoch",
-                Some(("session", incarnation)),
+                Some("session"),
                 "url-elicitation",
                 json!({ "mode": "url", "url": "https://example.test/live" }),
             )
@@ -3322,7 +3317,7 @@ mod tests {
         state
             .resolve_elicitation(
                 "epoch",
-                Some(("session", incarnation)),
+                Some("session"),
                 "url-elicitation",
                 Some("live-url-flow"),
             )
@@ -3536,7 +3531,6 @@ mod tests {
             .upsert_permission(
                 "epoch",
                 "session",
-                incarnation,
                 "permission",
                 json!({ "question": "allow" }),
             )
@@ -3544,7 +3538,7 @@ mod tests {
         state
             .upsert_elicitation(
                 "epoch",
-                Some(("session", incarnation)),
+                Some("session"),
                 "elicitation",
                 json!({ "mode": "form" }),
             )
@@ -3553,7 +3547,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "terminal",
                 json!({ "output": "running" }),
             )
@@ -3837,7 +3830,6 @@ mod tests {
             .upsert_permission(
                 "epoch",
                 "session",
-                incarnation,
                 "permission",
                 json!({ "options": ["allow"] }),
             )
@@ -3845,14 +3837,14 @@ mod tests {
 
         assert_eq!(
             state
-                .resolve_permission("epoch", "session", incarnation, "permission")
+                .resolve_permission("epoch", "session", "permission")
                 .unwrap(),
             InteractionResolution::Applied,
         );
         let settled_seq = state.live_snapshot();
         assert_eq!(
             state
-                .resolve_permission("epoch", "session", incarnation, "permission")
+                .resolve_permission("epoch", "session", "permission")
                 .unwrap(),
             InteractionResolution::AlreadyResolved,
         );
@@ -4036,19 +4028,12 @@ mod tests {
             .upsert_permission(
                 "epoch",
                 "source",
-                source,
                 "permission",
                 json!({ "question": "allow" }),
             )
             .unwrap();
         state
-            .upsert_terminal(
-                "epoch",
-                "source",
-                source,
-                "terminal",
-                json!({ "output": "live" }),
-            )
+            .upsert_terminal("epoch", "source", "terminal", json!({ "output": "live" }))
             .unwrap();
 
         state
@@ -4187,7 +4172,6 @@ mod tests {
             .upsert_permission(
                 "epoch",
                 "session",
-                incarnation,
                 "permission",
                 json!({ "question": "allow" }),
             )
@@ -4195,7 +4179,7 @@ mod tests {
         state
             .upsert_elicitation(
                 "epoch",
-                Some(("session", incarnation)),
+                Some("session"),
                 "elicitation",
                 json!({ "mode": "form" }),
             )
@@ -4220,12 +4204,10 @@ mod tests {
             vec![
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: "session".to_string(),
-                    incarnation: incarnation,
                     interaction_id: "permission".to_string(),
                 },
                 RuntimeEffect::CancelElicitationResponder {
                     session_id: Some("session".to_string()),
-                    incarnation: Some(incarnation),
                     interaction_id: "elicitation".to_string(),
                 },
             ]
@@ -4239,38 +4221,20 @@ mod tests {
         let incarnation = open(&mut state, "session");
         assert_eq!(
             state
-                .upsert_permission(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    "permission",
-                    json!({ "question": "A" }),
-                )
+                .upsert_permission("epoch", "session", "permission", json!({ "question": "A" }),)
                 .unwrap(),
             InteractionUpsert::Inserted,
         );
         let inserted_seq = state.live_snapshot();
         assert_eq!(
             state
-                .upsert_permission(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    "permission",
-                    json!({ "question": "A" }),
-                )
+                .upsert_permission("epoch", "session", "permission", json!({ "question": "A" }),)
                 .unwrap(),
             InteractionUpsert::Duplicate,
         );
         assert_eq!(state.live_snapshot(), inserted_seq);
         assert_eq!(
-            state.upsert_permission(
-                "epoch",
-                "session",
-                incarnation,
-                "permission",
-                json!({ "question": "B" }),
-            ),
+            state.upsert_permission("epoch", "session", "permission", json!({ "question": "B" }),),
             Err(RuntimeStateError::InteractionCollision),
         );
         assert_eq!(
@@ -4287,7 +4251,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "terminal",
                 json!({ "output": "running", "released": false }),
             )
@@ -4296,7 +4259,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "terminal",
                 json!({ "output": "done", "released": true }),
             )
@@ -4308,7 +4270,6 @@ mod tests {
                 .upsert_terminal(
                     "epoch",
                     "session",
-                    incarnation,
                     "terminal",
                     json!({ "output": "late", "released": false }),
                 )
@@ -4335,13 +4296,7 @@ mod tests {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
-            .upsert_terminal(
-                "epoch",
-                "session",
-                incarnation,
-                "terminal",
-                json!({ "released": false }),
-            )
+            .upsert_terminal("epoch", "session", "terminal", json!({ "released": false }))
             .unwrap();
         state
             .start_operation(
@@ -4425,19 +4380,12 @@ mod tests {
             .upsert_permission(
                 "epoch",
                 "session",
-                incarnation,
                 "permission",
                 json!({ "question": "allow" }),
             )
             .unwrap();
         state
-            .upsert_terminal(
-                "epoch",
-                "session",
-                incarnation,
-                "terminal",
-                json!({ "released": false }),
-            )
+            .upsert_terminal("epoch", "session", "terminal", json!({ "released": false }))
             .unwrap();
         state
             .start_delete("epoch", "session", incarnation, "delete")
@@ -4455,7 +4403,6 @@ mod tests {
             vec![
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: "session".to_string(),
-                    incarnation: incarnation,
                     interaction_id: "permission".to_string(),
                 },
                 RuntimeEffect::ReleaseTerminal {
@@ -4941,7 +4888,6 @@ mod tests {
             .upsert_permission(
                 "epoch",
                 "session",
-                incarnation,
                 "permission",
                 json!({ "question": "allow" }),
             )
@@ -4949,27 +4895,16 @@ mod tests {
         state
             .upsert_elicitation(
                 "epoch",
-                Some(("session", incarnation)),
+                Some("session"),
                 "elicitation",
                 json!({ "mode": "url" }),
             )
             .unwrap();
         state
-            .resolve_elicitation(
-                "epoch",
-                Some(("session", incarnation)),
-                "elicitation",
-                Some("url"),
-            )
+            .resolve_elicitation("epoch", Some("session"), "elicitation", Some("url"))
             .unwrap();
         state
-            .upsert_terminal(
-                "epoch",
-                "session",
-                incarnation,
-                "terminal",
-                json!({ "released": false }),
-            )
+            .upsert_terminal("epoch", "session", "terminal", json!({ "released": false }))
             .unwrap();
 
         state
@@ -4989,12 +4924,10 @@ mod tests {
             vec![
                 RuntimeEffect::CancelPermissionResponder {
                     session_id: "session".to_string(),
-                    incarnation: incarnation,
                     interaction_id: "permission".to_string(),
                 },
                 RuntimeEffect::AbortUrlFlow {
                     session_id: Some("session".to_string()),
-                    incarnation: Some(incarnation),
                     elicitation_id: "url".to_string(),
                     registration_id: "elicitation".to_string(),
                 },
@@ -5016,28 +4949,18 @@ mod tests {
         state
             .upsert_elicitation(
                 "epoch",
-                Some(("session", incarnation)),
+                Some("session"),
                 "request-id",
                 json!({ "mode": "url", "elicitationId": "url-id" }),
             )
             .unwrap();
         state
-            .resolve_elicitation(
-                "epoch",
-                Some(("session", incarnation)),
-                "request-id",
-                Some("url-id"),
-            )
+            .resolve_elicitation("epoch", Some("session"), "request-id", Some("url-id"))
             .unwrap();
         let resolved_seq = state.live_snapshot();
         assert_eq!(
             state
-                .resolve_elicitation(
-                    "epoch",
-                    Some(("session", incarnation)),
-                    "request-id",
-                    Some("url-id"),
-                )
+                .resolve_elicitation("epoch", Some("session"), "request-id", Some("url-id"),)
                 .unwrap(),
             InteractionResolution::AlreadyResolved,
         );
@@ -5058,24 +4981,14 @@ mod tests {
         );
         assert_eq!(
             state
-                .settle_url_flow(
-                    "epoch",
-                    Some(("session", incarnation)),
-                    "url-id",
-                    UrlFlowStatus::Completed,
-                )
+                .settle_url_flow("epoch", Some("session"), "url-id", UrlFlowStatus::Completed,)
                 .unwrap(),
             UrlFlowResolution::Applied,
         );
         let completed_seq = state.live_snapshot();
         assert_eq!(
             state
-                .settle_url_flow(
-                    "epoch",
-                    Some(("session", incarnation)),
-                    "url-id",
-                    UrlFlowStatus::Cancelled,
-                )
+                .settle_url_flow("epoch", Some("session"), "url-id", UrlFlowStatus::Cancelled,)
                 .unwrap(),
             UrlFlowResolution::AlreadyTerminal,
         );
@@ -5430,7 +5343,6 @@ mod tests {
             .upsert_permission(
                 "epoch",
                 "permission",
-                permission,
                 "permission",
                 json!({ "question": "allow" }),
             )
@@ -5441,7 +5353,7 @@ mod tests {
         state
             .upsert_elicitation(
                 "epoch",
-                Some(("elicitation", elicitation)),
+                Some("elicitation"),
                 "elicitation",
                 json!({ "mode": "form" }),
             )
@@ -5450,15 +5362,10 @@ mod tests {
 
         let url = open(&mut state, "url");
         state
-            .upsert_elicitation(
-                "epoch",
-                Some(("url", url)),
-                "url-form",
-                json!({ "mode": "url" }),
-            )
+            .upsert_elicitation("epoch", Some("url"), "url-form", json!({ "mode": "url" }))
             .unwrap();
         state
-            .resolve_elicitation("epoch", Some(("url", url)), "url-form", Some("url-flow"))
+            .resolve_elicitation("epoch", Some("url"), "url-form", Some("url-flow"))
             .unwrap();
         assert_reload_busy(&mut state, "url", url);
 
@@ -5467,7 +5374,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "terminal",
-                terminal,
                 "terminal",
                 json!({ "released": false }),
             )
@@ -5572,25 +5478,15 @@ mod tests {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state
-            .upsert_elicitation(
-                "epoch",
-                Some(("session", incarnation)),
-                "form",
-                json!({ "mode": "url" }),
-            )
+            .upsert_elicitation("epoch", Some("session"), "form", json!({ "mode": "url" }))
             .unwrap();
         state
-            .resolve_elicitation("epoch", Some(("session", incarnation)), "form", Some("url"))
+            .resolve_elicitation("epoch", Some("session"), "form", Some("url"))
             .unwrap();
 
         assert_eq!(
             state
-                .settle_url_flow(
-                    "epoch",
-                    Some(("session", incarnation)),
-                    "url",
-                    UrlFlowStatus::Completed,
-                )
+                .settle_url_flow("epoch", Some("session"), "url", UrlFlowStatus::Completed,)
                 .unwrap(),
             UrlFlowResolution::Applied
         );
@@ -5604,12 +5500,7 @@ mod tests {
         let settled_seq = state.live_snapshot();
         assert_eq!(
             state
-                .settle_url_flow(
-                    "epoch",
-                    Some(("session", incarnation)),
-                    "url",
-                    UrlFlowStatus::Cancelled,
-                )
+                .settle_url_flow("epoch", Some("session"), "url", UrlFlowStatus::Cancelled,)
                 .unwrap(),
             UrlFlowResolution::AlreadyTerminal
         );
@@ -5646,7 +5537,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "terminal",
                 json!({ "output": "running", "released": false }),
             )
@@ -5655,7 +5545,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "terminal",
                 json!({ "output": "released-output", "released": true }),
             )
@@ -5679,7 +5568,6 @@ mod tests {
                 .upsert_terminal(
                     "epoch",
                     "session",
-                    incarnation,
                     "terminal",
                     json!({ "output": "late", "released": false }),
                 )
@@ -5699,7 +5587,6 @@ mod tests {
                 .upsert_terminal(
                     "epoch",
                     "session",
-                    incarnation,
                     "terminal",
                     json!({
                         "sessionId": "session", "terminalId": "terminal",
@@ -5730,7 +5617,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "terminal",
                 json!({
                     "output": "!", "outputBytes": BASE64_STANDARD.encode(b"!"),
@@ -5752,7 +5638,6 @@ mod tests {
             .upsert_terminal(
                 "epoch",
                 "session",
-                incarnation,
                 "terminal",
                 json!({ "output": "running", "released": false }),
             )

@@ -166,12 +166,8 @@ impl Coordinator {
                     })
                 };
                 if accepted {
-                    let installed_owner = state
-                        .lock()
-                        .await
-                        .sessions
-                        .resource_owner(target_id, incarnation.expect("accepted incarnation"))
-                        .ok();
+                    let installed_owner =
+                        state.lock().await.sessions.resource_owner(target_id).ok();
                     for mut following in claim.following.into_iter().rev() {
                         let mut bound = true;
                         if let Some(route) = &mut following.route {
@@ -316,7 +312,7 @@ impl Coordinator {
                     BridgeIngress::Terminal(snapshot) => Some(RequestOwner {
                         epoch: locked.sessions.epoch().to_string(),
                         session_id: requested_id.clone(),
-                        incarnation: Some(snapshot.incarnation),
+                        incarnation,
                         operation_id: "terminal-snapshot".to_string(),
                         attempt_id: None,
                     }),
@@ -335,17 +331,14 @@ impl Coordinator {
                     )?;
                     continue;
                 }
-                let owner =
-                    requested_id
-                        .as_deref()
-                        .zip(incarnation)
-                        .and_then(|(id, incarnation)| {
-                            locked.sessions.resource_owner(id, incarnation).ok()
-                        });
+                let owner = requested_id
+                    .as_deref()
+                    .zip(incarnation)
+                    .and_then(|(id, _)| locked.sessions.resource_owner(id).ok());
                 let dispatch_owner = expected.unwrap_or_else(|| RequestOwner {
                     epoch: locked.sessions.epoch().to_string(),
                     session_id: owner.as_ref().map(|owner| owner.session_id.clone()),
-                    incarnation: owner.as_ref().map(|owner| owner.incarnation),
+                    incarnation: owner.as_ref().and(incarnation),
                     operation_id: event_operation_id(&item.event),
                     attempt_id: Some(Uuid::new_v4().to_string()),
                 });
@@ -444,17 +437,14 @@ impl Coordinator {
                 }
                 continue;
             }
-            let handle = if let Some(owner) = &route.owner {
+            let handle = if let (Some(owner), Some(incarnation)) = (&route.owner, incarnation) {
                 match self.handles.get(&owner.session_id) {
-                    Some(handle) if handle.incarnation() == owner.incarnation => {
-                        Some(handle.clone())
-                    }
+                    Some(handle) if handle.incarnation() == incarnation => Some(handle.clone()),
                     _ => {
                         if let Some(previous) = self.handles.remove(&owner.session_id) {
                             scheduling.remove_session(&previous)?;
                         }
-                        let handle =
-                            scheduling.register_session(&owner.session_id, owner.incarnation)?;
+                        let handle = scheduling.register_session(&owner.session_id, incarnation)?;
                         self.handles
                             .insert(owner.session_id.clone(), handle.clone());
                         Some(handle)

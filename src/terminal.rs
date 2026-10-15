@@ -21,7 +21,6 @@ use crate::filesystem::WorkspaceFileSystem;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalSnapshot {
-    pub incarnation: u64,
     pub value: serde_json::Value,
 }
 
@@ -39,7 +38,6 @@ pub struct TerminalManager {
 struct Terminal {
     id: String,
     session_id: String,
-    incarnation: u64,
     output_limit: Option<usize>,
     state: Mutex<TerminalState>,
     changed: Notify,
@@ -121,10 +119,9 @@ impl TerminalManager {
         }
     }
 
-    pub(crate) async fn create_for_incarnation(
+    pub(crate) async fn create(
         &self,
         request: CreateTerminalRequest,
-        incarnation: u64,
     ) -> Result<CreateTerminalResponse, Error> {
         validate_create_request(&request)?;
         let cwd = self
@@ -147,7 +144,6 @@ impl TerminalManager {
         let terminal = Arc::new(Terminal {
             id: id.clone(),
             session_id: request.session_id.0.to_string(),
-            incarnation,
             output_limit,
             state: Mutex::new(TerminalState::default()),
             changed: Notify::new(),
@@ -236,7 +232,6 @@ impl TerminalManager {
             let state = terminal.state.lock().await;
             let (output, truncated) = output_text(&state, terminal.output_limit);
             TerminalSnapshot {
-                incarnation: terminal.incarnation,
                 value: json!({
                     "sessionId": terminal.session_id,
                     "terminalId": terminal.id,
@@ -451,10 +446,7 @@ impl TerminalManager {
         };
         if let Some(snapshots) = &self.snapshots
             && snapshots
-                .send(TerminalSnapshot {
-                    incarnation: terminal.incarnation,
-                    value: snapshot,
-                })
+                .send(TerminalSnapshot { value: snapshot })
                 .is_err()
         {
             self.generation.cancel();
@@ -592,7 +584,7 @@ mod tests {
         terminals: &TerminalManager,
         request: CreateTerminalRequest,
     ) -> Result<CreateTerminalResponse, Error> {
-        terminals.create_for_incarnation(request, 0).await
+        terminals.create(request).await
     }
 
     fn output_request(session_id: &str, terminal_id: &TerminalId) -> TerminalOutputRequest {
@@ -627,7 +619,6 @@ mod tests {
         let terminal = Arc::new(Terminal {
             id: "partial".to_string(),
             session_id: "session".to_string(),
-            incarnation: 1,
             output_limit: Some(1),
             state: Mutex::new(TerminalState {
                 output: vec![0xe4],
@@ -675,17 +666,13 @@ mod tests {
         let generation = CancellationToken::new();
         let (snapshots, mut snapshot_rx) = mpsc::unbounded_channel();
         snapshots
-            .send(TerminalSnapshot {
-                incarnation: 1,
-                value: json!({}),
-            })
+            .send(TerminalSnapshot { value: json!({}) })
             .unwrap();
         let terminals =
             TerminalManager::new_with_snapshots(filesystem, generation, Some(snapshots));
         let terminal = Terminal {
             id: "ordered-terminal".to_string(),
             session_id: "session".to_string(),
-            incarnation: 1,
             output_limit: Some(1024),
             state: Mutex::new(TerminalState {
                 output: b"first".to_vec(),
@@ -731,7 +718,6 @@ mod tests {
         let terminal = Terminal {
             id: "lost-terminal".to_string(),
             session_id: "session".to_string(),
-            incarnation: 1,
             output_limit: Some(1024),
             state: Mutex::new(TerminalState {
                 output: b"output".to_vec(),
@@ -762,7 +748,6 @@ mod tests {
         let terminal = Arc::new(Terminal {
             id: "linear-terminal".to_string(),
             session_id: "session".to_string(),
-            incarnation: 1,
             output_limit: Some(CHUNK_COUNT * CHUNK_BYTES),
             state: Mutex::new(TerminalState::default()),
             changed: Notify::new(),

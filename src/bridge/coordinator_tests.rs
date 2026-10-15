@@ -113,7 +113,7 @@ async fn assert_interaction_sequence(
     let route = request.route.as_ref().expect("request route captured");
     assert_eq!(route.dispatch_owner.session_id.as_deref(), Some(SESSION));
     assert_eq!(route.dispatch_owner.incarnation, Some(incarnation));
-    assert_eq!(route.owner.as_ref().unwrap().incarnation, incarnation);
+    assert_eq!(route.owner.as_ref().unwrap().session_id, SESSION);
     let allocation = route.dispatch_owner.attempt_id.clone().unwrap();
     assert_eq!(
         request.request_lease.as_ref().unwrap().allocation(),
@@ -134,14 +134,11 @@ async fn assert_interaction_sequence(
     };
     assert_eq!(capture.allocation, allocation);
     assert_eq!(capture.route.dispatch_owner.incarnation, Some(incarnation));
-    assert_eq!(
-        capture.route.owner.as_ref().unwrap().incarnation,
-        incarnation
-    );
+    assert_eq!(capture.route.owner.as_ref().unwrap().session_id, SESSION);
     assert_eq!(cancel.turn.handle().unwrap().incarnation(), incarnation);
     {
         let state = services.state.lock().await;
-        let resources = state.sessions.resources(SESSION, incarnation).unwrap();
+        let resources = state.sessions.resources(SESSION).unwrap();
         assert!(
             if permission {
                 resources.permissions.contains_key(&allocation)
@@ -157,7 +154,7 @@ async fn assert_interaction_sequence(
         .unwrap();
     {
         let state = services.state.lock().await;
-        let resources = state.sessions.resources(SESSION, incarnation).unwrap();
+        let resources = state.sessions.resources(SESSION).unwrap();
         assert!(resources.permissions.is_empty());
         assert!(resources.elicitations.is_empty());
         let runtime = state.sessions.session(SESSION).unwrap();

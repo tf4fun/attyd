@@ -136,7 +136,7 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
                 deliver_permission(state, &owner, &id, response, |state| {
                     state
                         .sessions
-                        .resolve_permission(&epoch, &owner.session_id, owner.incarnation, &id)
+                        .resolve_permission(&epoch, &owner.session_id, &id)
                         .map(drop)
                         .map_err(runtime_state_error)
                 })
@@ -146,9 +146,7 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
                 response,
                 accepted_url_id,
             } => {
-                let scope = owner
-                    .as_ref()
-                    .map(|owner| (owner.session_id.as_str(), owner.incarnation));
+                let scope = owner.as_ref().map(|owner| owner.session_id.as_str());
                 deliver_elicitation(
                     state,
                     &id,

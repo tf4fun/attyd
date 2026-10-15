@@ -964,7 +964,7 @@ fn measure_event(event: &BridgeIngress) -> Result<usize, Error> {
             Err(error) => bytes(error),
         },
         BridgeIngress::RpcCompleted(completion) => Ok(completion.response_bytes.max(1)),
-        BridgeIngress::Terminal(snapshot) => bytes(&(snapshot.incarnation, &snapshot.value)),
+        BridgeIngress::Terminal(snapshot) => bytes(&snapshot.value),
         BridgeIngress::InboundRequestCancelled(capture) => bytes(&(
             &capture.request_id,
             &capture.allocation,
@@ -1751,7 +1751,6 @@ mod tests {
         let captured = SessionResourceOwner {
             epoch: "epoch".into(),
             session_id: "created".into(),
-            incarnation: 7,
         };
         item.route = Some(CapturedRoute {
             owner: Some(captured.clone()),
@@ -1779,7 +1778,7 @@ mod tests {
         assert_eq!(target_id, "created");
         assert_eq!(incarnation, Some(7));
         let route = route.unwrap();
-        assert_eq!(route.owner.unwrap().incarnation, 7);
+        assert_eq!(route.owner.unwrap().session_id, "created");
         assert_eq!(route.dispatch_owner.operation_id, "new");
         assert_eq!(
             route.url_registration.unwrap().registration_id,

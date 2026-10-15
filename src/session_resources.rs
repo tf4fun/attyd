@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::semantic::SessionUpdateSemanticState;
 use crate::session_observers::SessionObservers;
 
-/// Non-cloneable handles and ingest buffers for one session incarnation.
+/// Non-cloneable handles and ingest buffers for one session.
 /// Business admission, lifecycle and turn execution remain in SessionState.
 #[derive(Default)]
 pub(crate) struct SessionResources {
@@ -115,12 +115,11 @@ impl Drop for SessionResources {
     }
 }
 
-/// A lightweight global route to one incarnation's real resource owner.
+/// A lightweight global route to one session's real resource owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionResourceOwner {
     pub(crate) epoch: String,
     pub(crate) session_id: String,
-    pub(crate) incarnation: u64,
 }
 
 /// One accepted URL registration, including request-scoped flows without a session owner.
@@ -132,15 +131,10 @@ pub(crate) struct UrlRegistration {
 }
 
 impl SessionResourceOwner {
-    pub(crate) fn new(
-        epoch: impl Into<String>,
-        session_id: impl Into<String>,
-        incarnation: u64,
-    ) -> Self {
+    pub(crate) fn new(epoch: impl Into<String>, session_id: impl Into<String>) -> Self {
         Self {
             epoch: epoch.into(),
             session_id: session_id.into(),
-            incarnation,
         }
     }
 }

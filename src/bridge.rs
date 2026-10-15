@@ -156,10 +156,10 @@ struct CreationStaging {
 
 impl SessionUpdateOwner {
     fn matches(&self, state: &BridgeState, session_id: &str) -> bool {
-        if let Some(incarnation) = self.incarnation {
+        if self.incarnation.is_some() {
             return state
                 .sessions
-                .resources(session_id, incarnation)
+                .resources(session_id)
                 .ok()
                 .and_then(|resources| resources.validation.as_ref())
                 .is_some_and(|validation| Arc::ptr_eq(&validation.allocation, &self.allocation));
@@ -208,16 +208,14 @@ struct BridgeState {
 }
 
 fn session_ingest<'a>(state: &'a BridgeState, session_id: &str) -> Option<&'a SessionResources> {
-    let incarnation = state.sessions.state(session_id)?.incarnation;
-    state.sessions.resources(session_id, incarnation).ok()
+    state.sessions.resources(session_id).ok()
 }
 
 fn session_ingest_mut<'a>(
     state: &'a mut BridgeState,
     session_id: &str,
 ) -> Option<&'a mut SessionResources> {
-    let incarnation = state.sessions.state(session_id)?.incarnation;
-    state.sessions.resources_mut(session_id, incarnation).ok()
+    state.sessions.resources_mut(session_id).ok()
 }
 
 fn session_validation<'a>(
@@ -237,11 +235,10 @@ fn session_validation_mut<'a>(
 fn ensure_session_validation<'a>(
     state: &'a mut BridgeState,
     session_id: &str,
-    incarnation: u64,
 ) -> Result<&'a mut SessionUpdateSemanticState, Error> {
     Ok(state
         .sessions
-        .resources_mut(session_id, incarnation)
+        .resources_mut(session_id)
         .map_err(mirror_error)?
         .validation
         .get_or_insert_with(SessionUpdateSemanticState::default))
@@ -276,14 +273,14 @@ fn replay_validation_backup<'a>(
         .as_ref()
 }
 
-fn clear_attachment_delivery(state: &mut BridgeState, session_id: &str, incarnation: u64) {
-    if let Ok(resources) = state.sessions.resources_mut(session_id, incarnation) {
+fn clear_attachment_delivery(state: &mut BridgeState, session_id: &str) {
+    if let Ok(resources) = state.sessions.resources_mut(session_id) {
         resources.attachment = AttachmentDelivery::default();
     }
 }
 
-fn clear_ingest_resources(state: &mut BridgeState, session_id: &str, incarnation: u64) {
-    if let Ok(resources) = state.sessions.resources_mut(session_id, incarnation) {
+fn clear_ingest_resources(state: &mut BridgeState, session_id: &str) {
+    if let Ok(resources) = state.sessions.resources_mut(session_id) {
         resources.validation = None;
         resources.replay_validation_backup = None;
         resources.attachment = AttachmentDelivery::default();
@@ -334,7 +331,7 @@ fn deliver_permission(
         .take_permission(permission_id, owner)
         .expect("exact permission owner checked under the same lock");
     // oneshot delivery is synchronous: keep owner retirement and canonical
-    // completion ordered before another request can replace this incarnation.
+    // completion ordered before another request can replace this session.
     let delivered = pending.sender.send(response).is_ok();
     resolve(locked)?;
     refresh_observer_timers(locked);
@@ -535,8 +532,7 @@ fn prepare_session_response(
     }
     let (modes, _) = response_controls(response)?;
     let validation = if attaching {
-        let incarnation = allowed_attachment.expect("attachment was checked").0;
-        ensure_session_validation(state, session_id, incarnation)?
+        ensure_session_validation(state, session_id)?
     } else {
         &mut state
             .creation_staging
@@ -602,10 +598,7 @@ fn promote_creation_validation(
         return Err(Error::invalid_request()
             .data("creation requires its newly installed active incarnation"));
     }
-    let resources = state
-        .sessions
-        .resources(session_id, incarnation)
-        .map_err(mirror_error)?;
+    let resources = state.sessions.resources(session_id).map_err(mirror_error)?;
     if resources.validation.is_some() {
         return Err(
             Error::invalid_request().data("creation cannot replace an existing validation owner")
@@ -621,7 +614,7 @@ fn promote_creation_validation(
     state.early_update_bytes = state.early_update_bytes.saturating_sub(staging.bytes);
     state
         .sessions
-        .resources_mut(session_id, incarnation)
+        .resources_mut(session_id)
         .map_err(mirror_error)?
         .validation = Some(staging.validation);
     Ok(())
@@ -851,8 +844,8 @@ fn clear_attachment_tracking(
         return;
     }
     settle_attachment(state, session_id);
-    if let Some(incarnation) = owner.incarnation {
-        clear_attachment_delivery(state, session_id, incarnation);
+    if owner.incarnation.is_some() {
+        clear_attachment_delivery(state, session_id);
     }
     if replay_validation_backup(state, session_id).is_some() {
         rollback_replay_validation(state, session_id, owner);
@@ -876,7 +869,7 @@ fn begin_replay_validation(state: &mut BridgeState, session_id: &str) -> Session
     };
     let resources = state
         .sessions
-        .resources_mut(session_id, incarnation)
+        .resources_mut(session_id)
         .expect("validated replay owner");
     let previous = resources.validation.replace(validation);
     resources.replay_validation_backup = Some(ReplayValidationBackup {
@@ -891,10 +884,7 @@ fn take_replay_validation_backup(
     session_id: &str,
     owner: &SessionUpdateOwner,
 ) -> Option<ReplayValidationBackup> {
-    let resources = state
-        .sessions
-        .resources_mut(session_id, owner.incarnation?)
-        .ok()?;
+    let resources = state.sessions.resources_mut(session_id).ok()?;
     let backup = resources.replay_validation_backup.as_ref()?;
     if !Arc::ptr_eq(&backup.owner.allocation, &owner.allocation) {
         return None;
@@ -984,7 +974,7 @@ fn refresh_observer_timers(state: &mut BridgeState) {
         })
         .collect::<Vec<_>>();
     for (is_followed, session_id, incarnation, lifecycle, work) in owners {
-        let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) else {
+        let Ok(resources) = state.sessions.resources_mut(&session_id) else {
             continue;
         };
         if state.observers_stopped || !releasable {
@@ -1101,7 +1091,7 @@ fn prepare_session_load(
     let materialization_id = Uuid::new_v4().to_string();
     state
         .sessions
-        .resources_mut(&session_id, incarnation)
+        .resources_mut(&session_id)
         .expect("registered materialization owner")
         .materialization = Some(crate::session_resources::MaterializationResources {
         attempt_id: materialization_id.clone(),
@@ -1130,7 +1120,7 @@ fn session_materialization<'a>(
     let incarnation = state.sessions.state(session_id)?.incarnation;
     state
         .sessions
-        .resources(session_id, incarnation)
+        .resources(session_id)
         .ok()?
         .materialization
         .as_ref()
@@ -1147,7 +1137,7 @@ fn take_session_materialization(
     let incarnation = state.sessions.state(session_id)?.incarnation;
     state
         .sessions
-        .resources_mut(session_id, incarnation)
+        .resources_mut(session_id)
         .ok()?
         .materialization
         .take()
@@ -1156,7 +1146,6 @@ fn take_session_materialization(
 fn validate_terminal_references(
     state: &BridgeState,
     session_id: &str,
-    incarnation: u64,
     tool_call: &Value,
 ) -> Result<(), Error> {
     let references = terminal_references(tool_call);
@@ -1166,7 +1155,6 @@ fn validate_terminal_references(
     let live = state
         .sessions
         .resource_session(session_id)
-        .filter(|session| session.state.incarnation == incarnation)
         .ok_or_else(|| Error::invalid_params().data("terminal reference owner was retired"))?
         .live;
     for terminal_id in references {
@@ -1185,7 +1173,7 @@ fn register_created_terminal_locked(
     terminal_id: &str,
 ) -> Result<(), Error> {
     if !state.sessions.owns_resources(owner)
-        || live_session_incarnation(state, &owner.session_id) != Some(owner.incarnation)
+        || state.sessions.resource_session(&owner.session_id).is_none()
     {
         return Err(Error::request_cancelled().data("terminal creation owner was retired"));
     }
@@ -1203,7 +1191,6 @@ fn register_created_terminal_locked(
     publish_terminal_snapshot(
         state,
         TerminalSnapshot {
-            incarnation: owner.incarnation,
             value: json!({
                 "sessionId": owner.session_id,
                 "terminalId": terminal_id,
@@ -1243,19 +1230,13 @@ fn apply_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) 
     else {
         return false;
     };
-    if live_session_incarnation(state, &session_id) != Some(snapshot.incarnation) {
+    if state.sessions.resource_session(&session_id).is_none() {
         return false;
     }
     let epoch = state.sessions.epoch().to_string();
     state
         .sessions
-        .upsert_terminal(
-            &epoch,
-            &session_id,
-            snapshot.incarnation,
-            terminal_id,
-            snapshot.value,
-        )
+        .upsert_terminal(&epoch, &session_id, terminal_id, snapshot.value)
         .is_ok_and(|result| {
             matches!(
                 result,
@@ -1437,7 +1418,6 @@ impl BridgeInput {
             Self::FinishHistorySync { owner } => serialized_value_len(&(
                 &owner.session.epoch,
                 &owner.session.session_id,
-                owner.session.incarnation,
                 &owner.flow_id,
             )),
             Self::Operation { write, .. } => serialized_value_len(&write.args),
@@ -1954,7 +1934,7 @@ where
                         let mut state = state.lock().await;
                         if !state
                             .sessions
-                            .resources(&session_id, incarnation)
+                            .resources(&session_id)
                             .is_ok_and(|resources| {
                                 resources.observers.matches_absence(absence_id, &permit)
                             })
@@ -1975,7 +1955,7 @@ where
                             || streams::needed(&state, &streams::followed(&state), &session_id)
                         {
                             if let Ok(resources) =
-                                state.sessions.resources_mut(&session_id, incarnation)
+                                state.sessions.resources_mut(&session_id)
                             {
                                 resources.observers.stop_absence();
                             }
@@ -2316,11 +2296,9 @@ fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
         match effect {
             RuntimeEffect::CancelPermissionResponder {
                 session_id,
-                incarnation,
                 interaction_id,
             } => {
-                let owner =
-                    SessionResourceOwner::new(state.sessions.epoch(), &session_id, incarnation);
+                let owner = SessionResourceOwner::new(state.sessions.epoch(), &session_id);
                 if let Some(pending) = state.sessions.take_permission(&interaction_id, &owner) {
                     let _ = pending.sender.send(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
@@ -2329,18 +2307,11 @@ fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
             }
             RuntimeEffect::CancelElicitationResponder {
                 session_id,
-                incarnation,
                 interaction_id,
             } => {
-                let owner = match (session_id, incarnation) {
-                    (Some(session_id), Some(incarnation)) => Some(SessionResourceOwner::new(
-                        state.sessions.epoch(),
-                        session_id,
-                        incarnation,
-                    )),
-                    (None, None) => None,
-                    _ => continue,
-                };
+                let owner = session_id.map(|session_id| {
+                    SessionResourceOwner::new(state.sessions.epoch(), session_id)
+                });
                 if let Some(pending) =
                     take_pending_elicitation(state, &interaction_id, owner.as_ref())
                 {
@@ -2351,19 +2322,12 @@ fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
             }
             RuntimeEffect::AbortUrlFlow {
                 session_id,
-                incarnation,
                 elicitation_id,
                 registration_id,
             } => {
-                let owner = match (session_id.clone(), incarnation) {
-                    (Some(session_id), Some(incarnation)) => Some(SessionResourceOwner::new(
-                        state.sessions.epoch(),
-                        session_id,
-                        incarnation,
-                    )),
-                    (None, None) => None,
-                    _ => continue,
-                };
+                let owner = session_id.map(|session_id| {
+                    SessionResourceOwner::new(state.sessions.epoch(), session_id)
+                });
                 let registration = UrlRegistration {
                     owner,
                     registration_id,
@@ -2441,7 +2405,7 @@ async fn handle_session_update(
     let owner = {
         let mut state = state.lock().await;
         if let Some(incarnation) = live_session_incarnation(&state, &session_id) {
-            let allocation = match ensure_session_validation(&mut state, &session_id, incarnation) {
+            let allocation = match ensure_session_validation(&mut state, &session_id) {
                 Ok(validation) => validation.allocation.clone(),
                 Err(error) => {
                     sink.acp_error(error, None, Some("session/update"));
@@ -2522,13 +2486,7 @@ async fn handle_session_update(
                 .map(str::to_string)
         });
         let reference_error = if tool_update && !attachment && mirror_replay_attempt.is_none() {
-            validate_terminal_references(
-                &state,
-                &session_id,
-                owner.incarnation.unwrap_or(0),
-                &update,
-            )
-            .err()
+            validate_terminal_references(&state, &session_id, &update).err()
         } else {
             None
         };
@@ -2721,13 +2679,13 @@ async fn cancel_prompts_on_shutdown(
         return;
     }
 
-    for (session_id, incarnation) in &session_ids {
+    for (session_id, _) in &session_ids {
         // Incoming EOF already failed pending RPCs. Writing a cancellation to
         // an exited Agent can break the transport before their results drain.
         if !connection.is_incoming_closed() {
             let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
         }
-        cancel_interactions(session_id, *incarnation, state, sink).await;
+        cancel_interactions(session_id, state, sink).await;
     }
 
     // ACP cancellation completes through the original session/prompt response.
@@ -3573,11 +3531,7 @@ async fn handle_command_inner(
             // releases: retirement must see continuous work across the handoff.
             let history_owner = if operation == "session/resume" {
                 let owner = HistorySyncOwner {
-                    session: SessionResourceOwner::new(
-                        epoch.clone(),
-                        session_id.clone(),
-                        attachment_incarnation,
-                    ),
+                    session: SessionResourceOwner::new(epoch.clone(), session_id.clone()),
                     flow_id: Uuid::new_v4().to_string(),
                     cancellation: CancellationToken::new(),
                 };
@@ -3598,7 +3552,7 @@ async fn handle_command_inner(
                 &request_id,
             );
             refresh_observer_timers(&mut state);
-            clear_attachment_delivery(&mut state, &session_id, attachment_incarnation);
+            clear_attachment_delivery(&mut state, &session_id);
             drop(state);
             if operation == "session/resume" {
                 synchronize_attached_history(
@@ -3669,9 +3623,7 @@ async fn handle_command_inner(
                 // The accepted fork owns the source's projection for its read;
                 // a parked optional history flow yields instead of replaying
                 // over the branched session later.
-                state
-                    .sessions
-                    .supersede_history_sync(&source_id, source_incarnation);
+                state.sessions.supersede_history_sync(&source_id);
                 refresh_observer_timers(&mut state);
                 state.pending_creations += 1;
                 (cwd, source_incarnation, source_log)
@@ -3866,7 +3818,7 @@ async fn handle_command_inner(
             // registering before publication and the runtime flush keeps the
             // unobserved target working through every retry wait.
             let history_owner = HistorySyncOwner {
-                session: SessionResourceOwner::new(epoch.clone(), session_id.clone(), incarnation),
+                session: SessionResourceOwner::new(epoch.clone(), session_id.clone()),
                 flow_id: Uuid::new_v4().to_string(),
                 cancellation: CancellationToken::new(),
             };
@@ -3975,7 +3927,7 @@ async fn handle_command_inner(
                     }
                     // A refused or failed automatic close stays settled: its own
                     // Running-to-Idle transition must not rearm the countdown.
-                    if let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) {
+                    if let Ok(resources) = state.sessions.resources_mut(&session_id) {
                         resources.observers.mark_close_attempted();
                     }
                 }
@@ -4020,8 +3972,8 @@ async fn handle_command_inner(
                     .sessions
                     .close_session(&epoch, &session_id, incarnation, &request_id)
                     .map_err(runtime_state_error)?;
-                clear_ingest_resources(&mut state, &session_id, incarnation);
-                cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
+                clear_ingest_resources(&mut state, &session_id);
+                cancel_interactions_locked(&session_id, &mut state, &sink);
                 refresh_observer_timers(&mut state);
                 drain_runtime_effects(&mut state)
             };
@@ -4118,7 +4070,7 @@ async fn handle_command_inner(
                         );
                         return Ok(());
                     }
-                    if let Ok(resources) = state.sessions.resources_mut(&session_id, incarnation) {
+                    if let Ok(resources) = state.sessions.resources_mut(&session_id) {
                         resources.observers.mark_close_attempted();
                     }
                 }
@@ -4133,8 +4085,8 @@ async fn handle_command_inner(
                     .sessions
                     .close_session(&epoch, &session_id, incarnation, &request_id)
                     .map_err(runtime_state_error)?;
-                clear_ingest_resources(&mut state, &session_id, incarnation);
-                cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
+                clear_ingest_resources(&mut state, &session_id);
+                cancel_interactions_locked(&session_id, &mut state, &sink);
                 refresh_observer_timers(&mut state);
                 drain_runtime_effects(&mut state)
             };
@@ -4253,11 +4205,11 @@ async fn handle_command_inner(
                         )?;
                     }
 
-                    clear_ingest_resources(&mut state, &session_id, incarnation);
+                    clear_ingest_resources(&mut state, &session_id);
                 }
                 let terminal_releases = {
                     let mut state = state.lock().await;
-                    cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
+                    cancel_interactions_locked(&session_id, &mut state, &sink);
                     refresh_observer_timers(&mut state);
                     drain_runtime_effects(&mut state)
                 };
@@ -4307,11 +4259,11 @@ async fn handle_command_inner(
                 {
                     let mut state = state.lock().await;
 
-                    clear_ingest_resources(&mut state, &session_id, incarnation);
+                    clear_ingest_resources(&mut state, &session_id);
                 }
                 let terminal_releases = {
                     let mut state = state.lock().await;
-                    cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
+                    cancel_interactions_locked(&session_id, &mut state, &sink);
                     refresh_observer_timers(&mut state);
                     drain_runtime_effects(&mut state)
                 };
@@ -4383,9 +4335,7 @@ async fn handle_command_inner(
                 // The accepted turn owns the projection now: an optional
                 // history workflow still parked in backoff yields instead of
                 // retrying over this turn's outcome.
-                state
-                    .sessions
-                    .supersede_history_sync(&session_id, incarnation);
+                state.sessions.supersede_history_sync(&session_id);
                 // A v2 prompt cancelled before its turn started is cancelled
                 // as soon as it is sent.
                 let cancelled = state.sessions.operation_cancel_requested(
@@ -4483,9 +4433,7 @@ async fn handle_command_inner(
                 // The admitted control owns the projection now; an optional
                 // history flow parked in backoff yields instead of replaying
                 // over this control's outcome.
-                state
-                    .sessions
-                    .supersede_history_sync(&session_id, incarnation);
+                state.sessions.supersede_history_sync(&session_id);
                 refresh_observer_timers(&mut state);
                 incarnation
             };
@@ -4628,9 +4576,7 @@ async fn handle_command_inner(
                     );
                     return Err(runtime_state_error(error));
                 }
-                state
-                    .sessions
-                    .supersede_history_sync(&session_id, incarnation);
+                state.sessions.supersede_history_sync(&session_id);
                 refresh_observer_timers(&mut state);
                 incarnation
             };
@@ -5570,9 +5516,7 @@ fn reserve_attachment_locked(
             }
             // The accepted reload owns the same incarnation's projection; a
             // parked optional history flow yields instead of replaying over it.
-            state
-                .sessions
-                .supersede_history_sync(session_id, incarnation);
+            state.sessions.supersede_history_sync(session_id);
             AttachmentReservation::Reload { cwd, incarnation }
         }
         None => {
@@ -5604,7 +5548,7 @@ fn reserve_attachment_locked(
                     if let Some(materialization) = materialization {
                         state
                             .sessions
-                            .resources_mut(session_id, incarnation)
+                            .resources_mut(session_id)
                             .expect("attachment installed its owner")
                             .materialization = Some(materialization);
                     }
@@ -5613,8 +5557,7 @@ fn reserve_attachment_locked(
                 Err(error) => {
                     if let Some(materialization) = materialization {
                         if let Some(incarnation) = previous_incarnation
-                            && let Ok(resources) =
-                                state.sessions.resources_mut(session_id, incarnation)
+                            && let Ok(resources) = state.sessions.resources_mut(session_id)
                         {
                             resources.materialization = Some(materialization);
                         } else {
@@ -5630,7 +5573,7 @@ fn reserve_attachment_locked(
         }
     };
     begin_replay_validation(state, session_id);
-    clear_attachment_delivery(state, session_id, reservation.incarnation());
+    clear_attachment_delivery(state, session_id);
     Ok(reservation)
 }
 
@@ -5705,7 +5648,7 @@ fn complete_session_retirement(
         .finish_session_cleanup(session_id, incarnation, operation, operation_id)
         .is_ok()
     {
-        state.sessions.cancel_resources(session_id, incarnation);
+        state.sessions.cancel_resources(session_id);
         state.sessions.remove(session_id, incarnation);
     }
 }
@@ -5905,25 +5848,20 @@ async fn require_session_workspace(
     session_id: &str,
     state: &Arc<BridgeLock>,
     filesystem: &WorkspaceFileSystem,
-) -> Result<(u64, WorkspaceFileSystem), Error> {
-    let (incarnation, cwd) = {
+) -> Result<WorkspaceFileSystem, Error> {
+    let cwd = {
         let state = state.lock().await;
         let session = state.sessions.resource_session(session_id).ok_or_else(|| {
             Error::invalid_params().data(format!("unknown or inactive session: {session_id}"))
         })?;
-        (session.state.incarnation, session.live.cwd.clone())
+        session.live.cwd.clone()
     };
-    Ok((incarnation, filesystem.for_workspace(&cwd)?))
+    filesystem.for_workspace(&cwd)
 }
 
-async fn cancel_interactions(
-    session_id: &str,
-    incarnation: u64,
-    state: &Arc<BridgeLock>,
-    sink: &EventSink,
-) {
+async fn cancel_interactions(session_id: &str, state: &Arc<BridgeLock>, sink: &EventSink) {
     let mut state = state.lock().await;
-    cancel_interactions_locked(session_id, incarnation, &mut state, sink);
+    cancel_interactions_locked(session_id, sink);
 }
 
 fn commit_session_cancel(
@@ -5938,33 +5876,24 @@ fn commit_session_cancel(
         .request_cancel(&epoch, session_id, incarnation)
         .map_err(runtime_state_error)?;
     // Select and retire this turn's current interactions before completion can
-    // admit a new turn in the same incarnation. Accepted URL flows belong to
-    // the session scope and survive the cancel (S7).
-    if let Some(owner) = owned_resources(state, session_id, incarnation) {
+    // admit a new turn. Accepted URL flows belong to the session scope and
+    // survive the cancel (S7).
+    if let Some(owner) = owned_resources(state, session_id) {
         cancel_pending_interactions(&owner, state, sink);
         refresh_observer_timers(state);
     }
     Ok(())
 }
 
-fn owned_resources(
-    state: &BridgeState,
-    session_id: &str,
-    incarnation: u64,
-) -> Option<SessionResourceOwner> {
-    let owner = SessionResourceOwner::new(state.sessions.epoch(), session_id, incarnation);
+fn owned_resources(state: &BridgeState, session_id: &str) -> Option<SessionResourceOwner> {
+    let owner = SessionResourceOwner::new(state.sessions.epoch(), session_id);
     state.sessions.owns_resources(&owner).then_some(owner)
 }
 
 /// Cancels the session's pending interactions and releases its scope's
 /// resources: the session ended or the connection is ending.
-fn cancel_interactions_locked(
-    session_id: &str,
-    incarnation: u64,
-    state: &mut BridgeState,
-    sink: &EventSink,
-) {
-    let Some(owner) = owned_resources(state, session_id, incarnation) else {
+fn cancel_interactions_locked(session_id: &str, state: &mut BridgeState, sink: &EventSink) {
+    let Some(owner) = owned_resources(state, session_id) else {
         return;
     };
     cancel_pending_interactions(&owner, state, sink);
@@ -5991,7 +5920,6 @@ fn cancel_pending_interactions(
     sink: &EventSink,
 ) {
     let session_id = owner.session_id.as_str();
-    let incarnation = owner.incarnation;
     let resolve_canonical = resolves_canonically(state, session_id);
     let permission_ids = state
         .sessions
@@ -6003,10 +5931,9 @@ fn cancel_pending_interactions(
     for id in permission_ids {
         if let Some(pending) = state.sessions.take_permission(&id, owner) {
             if resolve_canonical
-                && let Err(error) =
-                    state
-                        .sessions
-                        .resolve_permission(&owner.epoch, session_id, incarnation, &id)
+                && let Err(error) = state
+                    .sessions
+                    .resolve_permission(&owner.epoch, session_id, &id)
             {
                 sink.acp_error(runtime_state_error(error), None, Some("permission/cancel"));
             }
@@ -6025,12 +5952,10 @@ fn cancel_pending_interactions(
     for id in elicitation_ids {
         if let Some(pending) = state.sessions.take_elicitation(&id, owner) {
             if resolve_canonical
-                && let Err(error) = state.sessions.resolve_elicitation(
-                    &owner.epoch,
-                    Some((session_id, incarnation)),
-                    &id,
-                    None,
-                )
+                && let Err(error) =
+                    state
+                        .sessions
+                        .resolve_elicitation(&owner.epoch, Some(session_id), &id, None)
             {
                 sink.acp_error(runtime_state_error(error), None, Some("elicitation/cancel"));
             }
@@ -6045,7 +5970,6 @@ fn cancel_pending_interactions(
 /// ended (protocol §4.6), which also frees the Agent's elicitation IDs.
 fn release_url_flows(owner: &SessionResourceOwner, state: &mut BridgeState, sink: &EventSink) {
     let session_id = owner.session_id.as_str();
-    let incarnation = owner.incarnation;
     let resolve_canonical = resolves_canonically(state, session_id);
     let url_ids = state
         .sessions
@@ -6058,7 +5982,7 @@ fn release_url_flows(owner: &SessionResourceOwner, state: &mut BridgeState, sink
         if resolve_canonical {
             match state.sessions.settle_url_registration(
                 &owner.epoch,
-                Some((session_id, incarnation)),
+                Some(session_id),
                 &elicitation_id,
                 &registration.registration_id,
                 UrlFlowStatus::Cancelled,
@@ -7173,10 +7097,7 @@ mod tests {
                 TerminalManager::new_with_snapshots(filesystem, CancellationToken::new(), None);
             let mut bridge = BridgeState::default();
             let incarnation = register_test_session(&mut bridge, "session", "/workspace");
-            let owner = bridge
-                .sessions
-                .resource_owner("session", incarnation)
-                .unwrap();
+            let owner = bridge.sessions.resource_owner("session").unwrap();
             let (tx, _rx) = mpsc::unbounded_channel();
             let sink = EventSink { tx };
             if valid {
@@ -7207,14 +7128,13 @@ mod tests {
     }
 
     #[test]
-    fn terminal_creation_identity_preserves_output_and_rejects_retired_handles() {
+    fn terminal_creation_identity_preserves_output_and_rejects_released_handles() {
         let mut state = BridgeState::default();
-        let old = register_test_session(&mut state, "session", "/workspace");
-        let owner = state.sessions.resource_owner("session", old).unwrap();
+        register_test_session(&mut state, "session", "/workspace");
+        let owner = state.sessions.resource_owner("session").unwrap();
         publish_terminal_snapshot(
             &mut state,
             TerminalSnapshot {
-                incarnation: old,
                 value: json!({
                     "sessionId": "session", "terminalId": "terminal", "output": "already arrived",
                     "outputAppend": true, "retainedBytes": 15, "truncated": false,
@@ -7231,31 +7151,10 @@ mod tests {
         publish_terminal_snapshot(
             &mut state,
             TerminalSnapshot {
-                incarnation: old,
                 value: json!({ "sessionId": "session", "terminalId": "terminal", "released": true }),
             },
         );
         assert!(register_created_terminal_locked(&mut state, &owner, "terminal").is_err());
-        assert!(state.sessions.live("session").unwrap().terminals.is_empty());
-        state
-            .sessions
-            .start_operation(
-                &owner.epoch,
-                "session",
-                old,
-                "close",
-                RuntimeSessionOperationKind::Close,
-                "closing",
-            )
-            .unwrap();
-        state
-            .sessions
-            .close_session(&owner.epoch, "session", old, "close")
-            .unwrap();
-        complete_session_retirement(&mut state, "session", old, SessionAdmission::Close, "close");
-        let new = register_test_session(&mut state, "session", "/workspace");
-        assert_ne!(new, old);
-        assert!(register_created_terminal_locked(&mut state, &owner, "late-terminal").is_err());
         assert!(state.sessions.live("session").unwrap().terminals.is_empty());
     }
 
@@ -7274,8 +7173,7 @@ mod tests {
             .unwrap();
         session_mirror(&mut bridge_state).register_new("session", incarnation);
 
-        let validation =
-            ensure_session_validation(&mut bridge_state, "session", incarnation).unwrap();
+        let validation = ensure_session_validation(&mut bridge_state, "session").unwrap();
         validate_and_track_session_update(validation, &json!({ "sessionUpdate": "compaction_update", "compactionId": "original", "status": "in_progress" })).unwrap();
         let state = Arc::new(BridgeLock::new(bridge_state));
         reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
@@ -7406,7 +7304,7 @@ mod tests {
                 json!({ "sessionId": "session" }),
             )
             .unwrap();
-        let fresh = ensure_session_validation(&mut state, "session", second)
+        let fresh = ensure_session_validation(&mut state, "session")
             .unwrap()
             .allocation
             .clone();
@@ -7480,14 +7378,14 @@ mod tests {
         };
         bridge.sessions.register_cold("cold", 0);
         bridge.sessions.register_cold("another-cold", 0);
-        let cold_allocation = ensure_session_validation(&mut bridge, "cold", 0)
+        let cold_allocation = ensure_session_validation(&mut bridge, "cold")
             .unwrap()
             .allocation
             .clone();
         let cancellation = CancellationToken::new();
         bridge
             .sessions
-            .resources_mut("cold", 0)
+            .resources_mut("cold")
             .unwrap()
             .materialization = Some(crate::session_resources::MaterializationResources {
             attempt_id: "cold-load".to_string(),
@@ -7624,7 +7522,7 @@ mod tests {
         );
         let validation = state
             .sessions
-            .resources("session", incarnation)
+            .resources("session")
             .unwrap()
             .validation
             .as_ref()
@@ -7671,7 +7569,7 @@ mod tests {
             .sessions
             .begin_load("session", incarnation, "load")
             .unwrap();
-        clear_attachment_delivery(&mut bridge_state, "session", incarnation);
+        clear_attachment_delivery(&mut bridge_state, "session");
         let state = Arc::new(BridgeLock::new(bridge_state));
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx };
@@ -7695,7 +7593,6 @@ mod tests {
         assert!(apply_terminal_snapshot(
             &mut state,
             TerminalSnapshot {
-                incarnation,
                 value: json!({
                     "sessionId": "session",
                     "terminalId": "pre-response-terminal",
@@ -7923,10 +7820,9 @@ mod tests {
             )
             .unwrap();
         let state = Arc::new(BridgeLock::new(bridge));
-        let (owner, filesystem) = require_session_workspace("session", &state, &filesystem)
+        let filesystem = require_session_workspace("session", &state, &filesystem)
             .await
             .unwrap();
-        assert_eq!(owner, incarnation);
         assert_eq!(
             filesystem
                 .read(ReadTextFileRequest::new("session", path))
@@ -8245,10 +8141,7 @@ mod tests {
         assert!(!token.is_cancelled());
         {
             let state = state.lock().await;
-            let resources = state
-                .sessions
-                .resources("saved", reservation.incarnation())
-                .unwrap();
+            let resources = state.sessions.resources("saved").unwrap();
             assert_eq!(
                 resources.materialization.as_ref().unwrap().attempt_id,
                 owner
@@ -8295,7 +8188,7 @@ mod tests {
             state.sessions.register_cold("session", 0);
             state
                 .sessions
-                .resources_mut("session", 0)
+                .resources_mut("session")
                 .unwrap()
                 .materialization = Some(crate::session_resources::MaterializationResources {
                 attempt_id: "owner".into(),
@@ -8799,9 +8692,7 @@ mod tests {
         interaction: &str,
     ) -> UrlRegistration {
         let epoch = state.sessions.epoch().to_string();
-        let scope = owner
-            .as_ref()
-            .map(|owner| (owner.session_id.as_str(), owner.incarnation));
+        let scope = owner.as_ref().map(|owner| owner.session_id.as_str());
         state
             .sessions
             .upsert_elicitation(&epoch, scope, interaction, json!({ "mode": "url" }))
@@ -8822,17 +8713,11 @@ mod tests {
         for request_scoped in [false, true] {
             let mut state = BridgeState::default();
             let incarnation = register_test_session(&mut state, "session", "/workspace");
-            let owner = (!request_scoped).then(|| {
-                state
-                    .sessions
-                    .resource_owner("session", incarnation)
-                    .unwrap()
-            });
+            let owner =
+                (!request_scoped).then(|| state.sessions.resource_owner("session").unwrap());
             let old = register_test_url(&mut state, owner.clone(), "old-registration");
             let epoch = state.sessions.epoch().to_string();
-            let scope = owner
-                .as_ref()
-                .map(|owner| (owner.session_id.as_str(), owner.incarnation));
+            let scope = owner.as_ref().map(|owner| owner.session_id.as_str());
             state
                 .sessions
                 .settle_url_registration(
@@ -8850,7 +8735,6 @@ mod tests {
                     .owner
                     .as_ref()
                     .map(|owner| owner.session_id.clone()),
-                incarnation: registration.owner.as_ref().map(|owner| owner.incarnation),
                 elicitation_id: "reusable-url".to_string(),
                 registration_id: registration.registration_id.clone(),
             };
@@ -8897,13 +8781,7 @@ mod tests {
             let (elicitation_sender, elicitation) = oneshot::channel();
             state
                 .sessions
-                .upsert_permission(
-                    &owner.epoch,
-                    &owner.session_id,
-                    owner.incarnation,
-                    &permission_id,
-                    json!({}),
-                )
+                .upsert_permission(&owner.epoch, &owner.session_id, &permission_id, json!({}))
                 .unwrap();
             state
                 .sessions
@@ -8921,7 +8799,7 @@ mod tests {
                 .sessions
                 .upsert_elicitation(
                     &owner.epoch,
-                    Some((&owner.session_id, owner.incarnation)),
+                    Some(&owner.session_id),
                     &elicitation_id,
                     json!({ "mode": "form" }),
                 )
@@ -8946,10 +8824,7 @@ mod tests {
         let mut locked = state.lock().await;
         let incarnation = register_test_session(&mut locked, "session", "/workspace");
         let operation = start_test_turn(&mut locked, "session", "old-intent").unwrap();
-        let owner = locked
-            .sessions
-            .resource_owner("session", incarnation)
-            .unwrap();
+        let owner = locked.sessions.resource_owner("session").unwrap();
         let (mut old_permission, mut old_elicitation) = pending(&mut locked, &owner, "old");
         let old_url = register_test_url(&mut locked, Some(owner.clone()), "old-url");
         let competing_state = state.clone();
@@ -8988,7 +8863,7 @@ mod tests {
             .sessions
             .settle_url_registration(
                 &epoch,
-                Some(("session", incarnation)),
+                Some("session"),
                 "reusable-url",
                 &old_url.registration_id,
                 UrlFlowStatus::Completed,
@@ -9023,192 +8898,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_incarnation_effects_cannot_cancel_reused_interaction_or_url_routes() {
-        let state = Arc::new(BridgeLock::new(BridgeState::default()));
-        let (old_permission_sender, old_permission) = oneshot::channel();
-        let (old_elicitation_sender, old_elicitation) = oneshot::channel();
-        let (new_permission_sender, mut new_permission) = oneshot::channel();
-        let (new_elicitation_sender, mut new_elicitation) = oneshot::channel();
-        let (old_incarnation, current_owner) = {
-            let mut state = state.lock().await;
-            let epoch = state.sessions.epoch().to_string();
-            let incarnation = state
-                .sessions
-                .start_attachment(
-                    &epoch,
-                    "session",
-                    "/workspace",
-                    "load",
-                    RuntimeSessionOperationKind::Load,
-                )
-                .unwrap();
-            let owner = state
-                .sessions
-                .resource_owner("session", incarnation)
-                .unwrap();
-            state
-                .sessions
-                .upsert_permission(&epoch, "session", incarnation, "permission", json!({}))
-                .unwrap();
-            state
-                .sessions
-                .insert_permission(
-                    owner.clone(),
-                    "permission".to_string(),
-                    PermissionResponder {
-                        tool_call_id: "tool".to_string(),
-                        option_ids: HashSet::new(),
-                        sender: old_permission_sender,
-                    },
-                )
-                .unwrap();
-            state
-                .sessions
-                .upsert_elicitation(
-                    &epoch,
-                    Some(("session", incarnation)),
-                    "elicitation",
-                    json!({}),
-                )
-                .unwrap();
-            state
-                .sessions
-                .insert_elicitation(
-                    owner.clone(),
-                    "elicitation".to_string(),
-                    ElicitationResponder {
-                        url_elicitation_id: None,
-                        request: json!({}),
-                        sender: old_elicitation_sender,
-                    },
-                )
-                .unwrap();
-            state
-                .sessions
-                .upsert_elicitation(
-                    &epoch,
-                    Some(("session", incarnation)),
-                    "accepted-url",
-                    json!({}),
-                )
-                .unwrap();
-            state
-                .sessions
-                .resolve_elicitation(
-                    &epoch,
-                    Some(("session", incarnation)),
-                    "accepted-url",
-                    Some("url"),
-                )
-                .unwrap();
-            state
-                .sessions
-                .register_url_route("url", Some(owner))
-                .unwrap();
-            // Failed attachment queues incarnation-scoped canonical effects; physical
-            // retirement also answers real resources before those effects are drained.
-            state
-                .sessions
-                .fail_attachment(
-                    &epoch,
-                    "session",
-                    incarnation,
-                    "load",
-                    RuntimeSessionOperationKind::Load,
-                    json!({}),
-                )
-                .unwrap();
-            state.sessions.remove("session", incarnation);
-            assert!(state.sessions.permission_owners.is_empty());
-            assert!(state.sessions.elicitation_owners.is_empty());
-            assert!(state.sessions.url_owners.is_empty());
-            let next = state
-                .sessions
-                .open_new(&epoch, "session", "/new", json!({}))
-                .unwrap();
-            let current = state.sessions.resource_owner("session", next).unwrap();
-            state
-                .sessions
-                .insert_permission(
-                    current.clone(),
-                    "permission".to_string(),
-                    PermissionResponder {
-                        tool_call_id: "tool".to_string(),
-                        option_ids: HashSet::new(),
-                        sender: new_permission_sender,
-                    },
-                )
-                .unwrap();
-            state
-                .sessions
-                .insert_elicitation(
-                    current.clone(),
-                    "elicitation".to_string(),
-                    ElicitationResponder {
-                        url_elicitation_id: None,
-                        request: json!({}),
-                        sender: new_elicitation_sender,
-                    },
-                )
-                .unwrap();
-            state
-                .sessions
-                .upsert_elicitation(&epoch, Some(("session", next)), "new-url", json!({}))
-                .unwrap();
-            state
-                .sessions
-                .resolve_elicitation(&epoch, Some(("session", next)), "new-url", Some("url"))
-                .unwrap();
-            state
-                .sessions
-                .register_url_route("url", Some(current.clone()))
-                .unwrap();
-            (incarnation, current)
-        };
-        assert!(matches!(
-            old_permission.await.unwrap().outcome,
-            RequestPermissionOutcome::Cancelled
-        ));
-        assert!(matches!(
-            old_elicitation.await.unwrap().action,
-            ElicitationAction::Cancel
-        ));
-        let (tx, mut events) = mpsc::unbounded_channel();
-        let sink = EventSink { tx };
-        apply_runtime_effects(&state, None).await;
-        cancel_interactions("session", old_incarnation, &state, &sink).await;
-        assert!(matches!(
-            new_permission.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            new_elicitation.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        let state = state.lock().await;
-        assert_eq!(
-            state.sessions.permission_owners.get("permission"),
-            Some(&current_owner)
-        );
-        assert_eq!(
-            state.sessions.elicitation_owners.get("elicitation"),
-            Some(&current_owner)
-        );
-        assert_eq!(
-            state
-                .sessions
-                .url_owners
-                .get("url")
-                .map(|route| &route.owner),
-            Some(&Some(current_owner))
-        );
-        assert!(
-            events.try_recv().is_err(),
-            "old effects must not publish terminal events for reused IDs"
-        );
-    }
-
-    #[tokio::test]
     async fn prompt_terminal_effects_cancel_owned_responders_in_the_adapter() {
         let (permission_sender, permission_receiver) = oneshot::channel();
         let (elicitation_sender, elicitation_receiver) = oneshot::channel();
@@ -9234,7 +8923,6 @@ mod tests {
                 .upsert_permission(
                     &epoch,
                     "session",
-                    incarnation,
                     "permission",
                     json!({ "sessionId": "session" }),
                 )
@@ -9243,15 +8931,12 @@ mod tests {
                 .sessions
                 .upsert_elicitation(
                     &epoch,
-                    Some(("session", incarnation)),
+                    Some("session"),
                     "elicitation",
                     json!({ "sessionId": "session", "mode": "form" }),
                 )
                 .unwrap();
-            let owner = state
-                .sessions
-                .resource_owner("session", incarnation)
-                .unwrap();
+            let owner = state.sessions.resource_owner("session").unwrap();
             state
                 .sessions
                 .insert_permission(
@@ -9446,98 +9131,6 @@ mod tests {
     }
 
     #[test]
-    fn late_terminal_snapshot_from_an_old_incarnation_is_ignored() {
-        let mut state = BridgeState::default();
-        let epoch = state.sessions.epoch().to_string();
-        let first = state
-            .sessions
-            .open_new(
-                &epoch,
-                "session",
-                "/workspace",
-                json!({ "sessionId": "session" }),
-            )
-            .unwrap();
-
-        assert!(apply_terminal_snapshot(
-            &mut state,
-            TerminalSnapshot {
-                incarnation: first,
-                value: json!({
-                    "sessionId": "session",
-                    "terminalId": "old-terminal",
-                    "released": false,
-                }),
-            },
-        ));
-        state
-            .sessions
-            .start_operation(
-                &epoch,
-                "session",
-                first,
-                "close",
-                RuntimeSessionOperationKind::Close,
-                "closing",
-            )
-            .unwrap();
-        state
-            .sessions
-            .close_session(&epoch, "session", first, "close")
-            .unwrap();
-
-        assert_eq!(
-            state
-                .sessions
-                .state("session")
-                .unwrap()
-                .operation
-                .as_ref()
-                .unwrap()
-                .stage,
-            "cleanup"
-        );
-        complete_session_retirement(
-            &mut state,
-            "session",
-            first,
-            SessionAdmission::Close,
-            "close",
-        );
-        assert!(state.sessions.state("session").is_none());
-        let second = state
-            .sessions
-            .open_new(
-                &epoch,
-                "session",
-                "/workspace",
-                json!({ "sessionId": "session" }),
-            )
-            .unwrap();
-
-        assert_ne!(first, second);
-        assert!(!apply_terminal_snapshot(
-            &mut state,
-            TerminalSnapshot {
-                incarnation: first,
-                value: json!({
-                    "sessionId": "session",
-                    "terminalId": "old-terminal",
-                    "released": true,
-                }),
-            },
-        ));
-        assert!(
-            state
-                .sessions
-                .session("session")
-                .unwrap()
-                .terminals
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn transport_eof_is_uncertain_but_an_agent_error_is_definite_failure() {
         let mut uncertain = BridgeState::default();
         let epoch = uncertain.sessions.epoch().to_string();
@@ -9628,7 +9221,6 @@ mod tests {
                 .upsert_permission(
                     &epoch,
                     "session",
-                    incarnation,
                     "permission",
                     json!({ "sessionId": "session" }),
                 )
@@ -9637,7 +9229,7 @@ mod tests {
                 .sessions
                 .upsert_elicitation(
                     &epoch,
-                    Some(("session", incarnation)),
+                    Some("session"),
                     "session-elicitation",
                     json!({ "sessionId": "session", "mode": "form" }),
                 )
@@ -9646,7 +9238,7 @@ mod tests {
                 .sessions
                 .upsert_elicitation(
                     &epoch,
-                    Some(("session", incarnation)),
+                    Some("session"),
                     "accepted-session-url",
                     json!({ "sessionId": "session", "mode": "url" }),
                 )
@@ -9655,7 +9247,7 @@ mod tests {
                 .sessions
                 .resolve_elicitation(
                     &epoch,
-                    Some(("session", incarnation)),
+                    Some("session"),
                     "accepted-session-url",
                     Some("session-url"),
                 )
@@ -9682,10 +9274,7 @@ mod tests {
                 .sessions
                 .resolve_elicitation(&epoch, None, "accepted-request-url", Some("request-url"))
                 .unwrap();
-            let owner = state
-                .sessions
-                .resource_owner("session", incarnation)
-                .unwrap();
+            let owner = state.sessions.resource_owner("session").unwrap();
             state
                 .sessions
                 .insert_permission(
@@ -9742,7 +9331,7 @@ mod tests {
             .state("session")
             .unwrap()
             .incarnation;
-        cancel_interactions("session", incarnation, &state, &sink).await;
+        cancel_interactions("session", &state, &sink).await;
 
         assert!(matches!(
             permission_receiver.await.unwrap().outcome,

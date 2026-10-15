@@ -118,7 +118,6 @@ impl InboundRequests {
         };
         if owner.epoch != route.dispatch_owner.epoch
             || Some(owner.session_id.as_str()) != route.dispatch_owner.session_id.as_deref()
-            || Some(owner.incarnation) != route.dispatch_owner.incarnation
         {
             return false;
         }
@@ -190,10 +189,9 @@ mod tests {
 
     fn route(allocation: &str, incarnation: Option<u64>) -> CapturedRoute {
         CapturedRoute {
-            owner: incarnation.map(|incarnation| SessionResourceOwner {
+            owner: incarnation.map(|_| SessionResourceOwner {
                 epoch: "epoch".to_owned(),
                 session_id: "session".to_owned(),
-                incarnation,
             }),
             dispatch_owner: RequestOwner {
                 epoch: "epoch".to_owned(),
@@ -251,11 +249,11 @@ mod tests {
             )
             .unwrap();
         assert!(!requests.finish(&cancelled.request_id, &cancelled.allocation));
-        assert_eq!(cancelled.route.owner.unwrap().incarnation, 1);
+        assert_eq!(cancelled.route.dispatch_owner.incarnation, Some(1));
         let current = requests.capture_cancel(&id).unwrap();
         assert_eq!(current.allocation, "new");
         assert_eq!(current.kind, InboundRequestKind::Elicitation);
-        assert_eq!(current.route.owner.unwrap().incarnation, 2);
+        assert_eq!(current.route.dispatch_owner.incarnation, Some(2));
     }
 
     #[tokio::test]
@@ -337,6 +335,6 @@ mod tests {
         assert!(!requests.rebind(&id, "allocation", route("allocation", None)));
         let rebound = requests.capture_cancel(&id).unwrap();
         assert_eq!(rebound.allocation, early_cancel.allocation);
-        assert_eq!(rebound.route.owner.unwrap().incarnation, 1);
+        assert_eq!(rebound.route.dispatch_owner.incarnation, Some(1));
     }
 }

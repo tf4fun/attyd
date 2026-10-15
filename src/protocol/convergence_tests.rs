@@ -578,7 +578,7 @@ fn interactions_and_controls_change_in_live_while_the_log_stays() {
     let request = json!({ "sessionId": "s", "toolCall": { "toolCallId": "t" }, "options": [] });
 
     gate.registry
-        .upsert_permission(EPOCH, "s", incarnation, "p1", request.clone())
+        .upsert_permission(EPOCH, "s", "p1", request.clone())
         .unwrap();
     let asked = single(&gate.commit(), "session/s");
     assert!(asked.get("log").is_none());
@@ -611,9 +611,7 @@ fn interactions_and_controls_change_in_live_while_the_log_stays() {
     );
     assert_eq!(gate.live("global")["sessions"]["s"]["title"], "Renamed");
 
-    gate.registry
-        .resolve_permission(EPOCH, "s", incarnation, "p1")
-        .unwrap();
+    gate.registry.resolve_permission(EPOCH, "s", "p1").unwrap();
     let answered = single(&gate.commit(), "session/s");
     assert!(answered.get("log").is_none());
     let live = gate.live("session/s");
@@ -634,7 +632,7 @@ fn an_interaction_joins_the_running_prompt() {
     let op = gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
     gate.commit();
     gate.registry
-        .upsert_permission(EPOCH, "s", incarnation, "p1", json!({ "sessionId": "s" }))
+        .upsert_permission(EPOCH, "s", "p1", json!({ "sessionId": "s" }))
         .unwrap();
     gate.commit();
     let live = gate.live("session/s");
@@ -1071,12 +1069,12 @@ fn terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release()
     let incarnation = gate.open("s", json!({ "sessionId": "s" }));
     let chunk = |text: &str| json!({ "output": text, "outputAppend": true, "retainedBytes": 6, "released": false });
     gate.registry
-        .upsert_terminal(EPOCH, "s", incarnation, "t", chunk("abcd"))
+        .upsert_terminal(EPOCH, "s", "t", chunk("abcd"))
         .unwrap();
     gate.commit();
     assert_eq!(gate.live("session/s")["terminals"]["t"]["output"], "abcd");
     gate.registry
-        .upsert_terminal(EPOCH, "s", incarnation, "t", chunk("efgh"))
+        .upsert_terminal(EPOCH, "s", "t", chunk("efgh"))
         .unwrap();
     let rolled = single(&gate.commit(), "session/s");
     let kinds: Vec<_> = rolled["live"]["patch"]
@@ -1091,7 +1089,6 @@ fn terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release()
         .upsert_terminal(
             EPOCH,
             "s",
-            incarnation,
             "t",
             json!({ "output": "", "outputAppend": true, "released": true }),
         )
@@ -1106,7 +1103,7 @@ fn url_flows_appear_on_accept_and_leave_on_completion() {
     let incarnation = gate.open("s", json!({ "sessionId": "s" }));
     let request = json!({ "mode": "url", "elicitationId": "e", "url": "https://example.test" });
     gate.registry
-        .upsert_elicitation(EPOCH, Some(("s", incarnation)), "i1", request.clone())
+        .upsert_elicitation(EPOCH, Some("s"), "i1", request.clone())
         .unwrap();
     gate.commit();
     assert_eq!(
@@ -1114,7 +1111,7 @@ fn url_flows_appear_on_accept_and_leave_on_completion() {
         "elicitation"
     );
     gate.registry
-        .resolve_elicitation(EPOCH, Some(("s", incarnation)), "i1", Some("e"))
+        .resolve_elicitation(EPOCH, Some("s"), "i1", Some("e"))
         .unwrap();
     gate.commit();
     let live = gate.live("session/s");
@@ -1130,7 +1127,7 @@ fn url_flows_appear_on_accept_and_leave_on_completion() {
     gate.registry
         .settle_url_registration(
             EPOCH,
-            Some(("s", incarnation)),
+            Some("s"),
             "e",
             "i1",
             crate::runtime_state::UrlFlowStatus::Completed,
