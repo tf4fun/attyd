@@ -850,7 +850,6 @@ mod tests {
                 dispatch_owner: RequestOwner {
                     epoch,
                     session_id: None,
-                    incarnation: None,
                     operation_id: "incoming-test".to_owned(),
                     attempt_id: Some("allocation".to_owned()),
                 },
@@ -871,7 +870,7 @@ mod tests {
             (InboundRequestKind::Elicitation, false),
         ] {
             let (context, _scheduling, mut events) = context();
-            let (owner, incarnation) = if scoped {
+            let owner = if scoped {
                 let mut state = context.state.lock().await;
                 let epoch = state.sessions.epoch().to_owned();
                 let incarnation = state
@@ -884,12 +883,9 @@ mod tests {
                     )
                     .unwrap();
                 session_mirror(&mut state).register_new("session", incarnation);
-                (
-                    Some(state.sessions.resource_owner("session").unwrap()),
-                    Some(incarnation),
-                )
+                Some(state.sessions.resource_owner("session").unwrap())
             } else {
-                (None, None)
+                None
             };
             let mut route = CapturedRoute {
                 owner: owner.clone(),
@@ -898,7 +894,6 @@ mod tests {
                 request_scope: None,
             };
             route.dispatch_owner.session_id = owner.as_ref().map(|owner| owner.session_id.clone());
-            route.dispatch_owner.incarnation = incarnation;
             route.dispatch_owner.attempt_id = Some("old".to_owned());
             let method = if kind == InboundRequestKind::Permission {
                 "session/request_permission"

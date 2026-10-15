@@ -48,7 +48,7 @@ pub(super) enum BridgeIngress {
     CreationFinished {
         owner: RequestOwner,
         target_id: String,
-        incarnation: Option<u64>,
+        committed: bool,
     },
     InboundRequestCancelled(CapturedInboundRequest),
     InboundRequestFinished {
@@ -58,7 +58,7 @@ pub(super) enum BridgeIngress {
 }
 
 /// Captured by the coordinator at the original ingress boundary. Handlers must
-/// use this route instead of resolving an interaction against a later incarnation.
+/// use this route instead of resolving an interaction against later state.
 #[derive(Clone)]
 pub(super) struct CapturedRoute {
     pub owner: Option<SessionResourceOwner>,
@@ -166,11 +166,8 @@ impl ExecutionScope {
             Self::Session(handle) => {
                 owner.epoch == handle.epoch()
                     && owner.session_id.as_deref() == Some(handle.session_id())
-                    && owner.incarnation == Some(handle.incarnation())
             }
-            Self::Global(epoch) => {
-                owner.epoch == *epoch && owner.session_id.is_none() && owner.incarnation.is_none()
-            }
+            Self::Global(epoch) => owner.epoch == *epoch && owner.session_id.is_none(),
         }
     }
 }
@@ -236,9 +233,7 @@ impl Scheduling {
             .map_err(scheduling_error)?;
         let sessions = SessionDispatch::new(epoch.clone()).map_err(scheduling_error)?;
         let global = SessionDispatch::new(epoch.clone()).map_err(scheduling_error)?;
-        let global_handle = global
-            .register(COORDINATOR_ID, 1)
-            .map_err(scheduling_error)?;
+        let global_handle = global.register(COORDINATOR_ID).map_err(scheduling_error)?;
         let sender = IngressSender {
             inner: Arc::new(SenderInner {
                 epoch,
@@ -269,20 +264,9 @@ impl Scheduling {
         ))
     }
 
-    /// Call only after the coordinator has verified this canonical incarnation.
-    pub(super) fn register_session(
-        &self,
-        id: &str,
-        incarnation: u64,
-    ) -> Result<SessionHandle, Error> {
-        if incarnation == 0 {
-            return Err(ownership_error(
-                "a cold placeholder cannot own an execution queue",
-            ));
-        }
-        self.sessions
-            .register(id, incarnation)
-            .map_err(scheduling_error)
+    /// Call only after the coordinator has found this session in canonical state.
+    pub(super) fn register_session(&self, id: &str) -> Result<SessionHandle, Error> {
+        self.sessions.register(id).map_err(scheduling_error)
     }
 
     pub(super) fn remove_session(&self, handle: &SessionHandle) -> Result<(), Error> {
@@ -291,7 +275,7 @@ impl Scheduling {
         self.sender
             .inner
             .handoff
-            .discard_session(handle.epoch(), handle.session_id(), handle.incarnation())
+            .discard_session(handle.epoch(), handle.session_id())
             .map_err(scheduling_error)?;
         Ok(())
     }
@@ -491,13 +475,13 @@ impl IngressSender {
         &self,
         owner: RequestOwner,
         target_id: String,
-        incarnation: Option<u64>,
+        committed: bool,
     ) -> Result<(), Error> {
         self.submit(
             BridgeIngress::CreationFinished {
                 owner,
                 target_id,
-                incarnation,
+                committed,
             },
             TrafficClass::Reserved,
             EventOrigin::RequiredInbound,
@@ -978,22 +962,20 @@ fn measure_event(event: &BridgeIngress) -> Result<usize, Error> {
         BridgeIngress::Continuation { owner, .. } => bytes(&(
             &owner.epoch,
             &owner.session_id,
-            owner.incarnation,
             &owner.operation_id,
             &owner.attempt_id,
         )),
         BridgeIngress::CreationFinished {
             owner,
             target_id,
-            incarnation,
+            committed,
         } => bytes(&(
             &owner.epoch,
             &owner.session_id,
-            owner.incarnation,
             &owner.operation_id,
             &owner.attempt_id,
             target_id,
-            incarnation,
+            committed,
         )),
     }
 }
@@ -1024,7 +1006,6 @@ mod tests {
         RequestOwner {
             epoch: "epoch".into(),
             session_id: id.map(str::to_string),
-            incarnation: id.map(|_| 1),
             operation_id: operation.into(),
             attempt_id: None,
         }
@@ -1047,7 +1028,7 @@ mod tests {
     #[test]
     fn local_drain_counts_delivery_guards_but_not_remote_response_reservations() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
-        let handle = scheduling.register_session("a", 1).unwrap();
+        let handle = scheduling.register_session("a").unwrap();
         let _waiting = sender
             .prepare_rpc(
                 RequestClass::LongRunning,
@@ -1114,8 +1095,8 @@ mod tests {
     #[tokio::test]
     async fn busy_session_does_not_hide_global_or_other_session_work_and_preserves_fifo() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
-        let a = scheduling.register_session("a", 1).unwrap();
-        let b = scheduling.register_session("b", 1).unwrap();
+        let a = scheduling.register_session("a").unwrap();
+        let b = scheduling.register_session("b").unwrap();
         for handle in [&a, &a, &b] {
             browser(&sender);
             let item = scheduling.ingress_rx.try_recv().unwrap();
@@ -1150,19 +1131,19 @@ mod tests {
     #[test]
     fn stale_routes_return_the_original_command_for_coordinator_rollback() {
         let (mut scheduling, sender, cancellation, _errors) = setup();
-        let old = scheduling.register_session("a", 1).unwrap();
+        let old = scheduling.register_session("a").unwrap();
         scheduling.remove_session(&old).unwrap();
-        let new = scheduling.register_session("a", 2).unwrap();
         browser(&sender);
         let item = scheduling.ingress_rx.try_recv().unwrap();
         let rejected = match scheduling.route_session(&old, item) {
             Err(rejected) => rejected,
-            Ok(()) => panic!("stale route accepted"),
+            Ok(()) => panic!("removed route accepted"),
         };
         assert!(matches!(rejected.item.event, BridgeIngress::Browser(_)));
         assert!(!cancellation.is_cancelled());
         assert!(scheduling.pump().unwrap().is_none());
         drop(rejected);
+        let new = scheduling.register_session("a").unwrap();
         browser(&sender);
         let item = scheduling.ingress_rx.try_recv().unwrap();
         scheduling
@@ -1177,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn continuation_rejoins_the_fifo_and_waits_without_an_execution_ticket() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
-        let handle = scheduling.register_session("a", 1).unwrap();
+        let handle = scheduling.register_session("a").unwrap();
         browser(&sender);
         let item = scheduling.ingress_rx.try_recv().unwrap();
         scheduling
@@ -1231,7 +1212,7 @@ mod tests {
         assert!(reply.send(Ok(turn)).is_ok());
         drop(cleanup.await.unwrap());
         sender
-            .finish_creation(owner(None, "new"), "created".into(), None)
+            .finish_creation(owner(None, "new"), "created".into(), false)
             .unwrap();
         let mut abandoned = Box::pin(sender.continue_owner(owner(None, "last-cleanup")));
         assert!(futures::poll!(&mut abandoned).is_pending());
@@ -1239,7 +1220,7 @@ mod tests {
         assert!(abandoned.await.is_err());
         assert!(
             sender
-                .finish_creation(owner(None, "new"), "created".into(), None)
+                .finish_creation(owner(None, "new"), "created".into(), false)
                 .is_err()
         );
     }
@@ -1293,8 +1274,8 @@ mod tests {
     #[tokio::test]
     async fn replay_response_seals_history_before_following_live_data() {
         let (mut scheduling, sender, _cancellation, mut errors) = setup();
-        let a = scheduling.register_session("a", 1).unwrap();
-        let b = scheduling.register_session("b", 1).unwrap();
+        let a = scheduling.register_session("a").unwrap();
+        let b = scheduling.register_session("b").unwrap();
         let (outgoing, mut requests) = futures::channel::mpsc::channel::<String>(4);
         let (mut responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(4);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -1395,8 +1376,8 @@ mod tests {
     #[tokio::test]
     async fn real_sdk_updates_and_response_share_fifo_and_result_ticket_blocks_only_its_session() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
-        let a = scheduling.register_session("a", 1).unwrap();
-        let b = scheduling.register_session("b", 1).unwrap();
+        let a = scheduling.register_session("a").unwrap();
+        let b = scheduling.register_session("b").unwrap();
         let (outgoing, mut peer_requests) = futures::channel::mpsc::channel::<String>(4);
         let (mut peer_responses, incoming) =
             futures::channel::mpsc::channel::<io::Result<String>>(4);
@@ -1503,7 +1484,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_eof_enters_the_shared_queue_and_reacquires_its_local_result_ticket() {
         let (mut scheduling, sender, cancellation, _errors) = setup();
-        let handle = scheduling.register_session("a", 1).unwrap();
+        let handle = scheduling.register_session("a").unwrap();
         let (outgoing, mut peer_requests) = futures::channel::mpsc::channel::<String>(4);
         let (peer_responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(4);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -1629,7 +1610,7 @@ mod tests {
     async fn coordinator_rejection_or_retirement_overrides_an_already_routed_sdk_success() {
         for mode in 0..3 {
             let (mut scheduling, sender, cancellation, _errors) = setup();
-            let handle = scheduling.register_session("a", 1).unwrap();
+            let handle = scheduling.register_session("a").unwrap();
             let (outgoing, mut peer_requests) = futures::channel::mpsc::channel::<String>(4);
             let (mut peer_responses, incoming) =
                 futures::channel::mpsc::channel::<io::Result<String>>(4);
@@ -1744,7 +1725,7 @@ mod tests {
     fn creation_marker_and_captured_route_survive_the_shared_global_fifo() {
         let (mut scheduling, sender, _cancellation, _errors) = setup();
         sender
-            .finish_creation(owner(None, "new"), "created".into(), Some(7))
+            .finish_creation(owner(None, "new"), "created".into(), true)
             .unwrap();
         let mut item = scheduling.ingress_rx.try_recv().unwrap();
         assert!(item.route.is_none());
@@ -1769,14 +1750,14 @@ mod tests {
         } = scheduling.pump().unwrap().unwrap();
         let BridgeIngress::CreationFinished {
             target_id,
-            incarnation,
+            committed,
             ..
         } = event
         else {
             panic!("marker changed")
         };
         assert_eq!(target_id, "created");
-        assert_eq!(incarnation, Some(7));
+        assert!(committed);
         let route = route.unwrap();
         assert_eq!(route.owner.unwrap().session_id, "created");
         assert_eq!(route.dispatch_owner.operation_id, "new");

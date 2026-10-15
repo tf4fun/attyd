@@ -1,4 +1,4 @@
-//! Connection-level allocation before a session has a routable incarnation.
+//! Connection-level allocation before a session is in canonical state.
 //!
 //! Existing owners are reduced by their session queue.
 
@@ -145,7 +145,7 @@ impl Coordinator {
             if let BridgeIngress::CreationFinished {
                 owner,
                 target_id,
-                incarnation,
+                committed,
             } = &item.event
             {
                 let Some(claim) = self.creations.get(target_id) else {
@@ -155,28 +155,19 @@ impl Coordinator {
                     continue;
                 }
                 let claim = self.creations.remove(target_id).expect("claim checked");
-                let accepted = {
-                    let locked = state.lock().await;
-                    incarnation.is_some_and(|expected| {
-                        expected != 0
-                            && locked
-                                .sessions
-                                .state(target_id)
-                                .is_some_and(|session| session.incarnation == expected)
-                    })
+                let installed_owner = if *committed {
+                    state.lock().await.sessions.resource_owner(target_id).ok()
+                } else {
+                    None
                 };
-                if accepted {
-                    let installed_owner =
-                        state.lock().await.sessions.resource_owner(target_id).ok();
+                if let Some(installed_owner) = installed_owner {
                     for mut following in claim.following.into_iter().rev() {
                         let mut bound = true;
                         if let Some(route) = &mut following.route {
                             if route.owner.is_none()
                                 && route.dispatch_owner.session_id.as_deref() == Some(target_id)
-                                && route.dispatch_owner.incarnation.is_none()
                             {
-                                route.owner = installed_owner.clone();
-                                route.dispatch_owner.incarnation = *incarnation;
+                                route.owner = Some(installed_owner.clone());
                                 match &mut following.event {
                                     BridgeIngress::Acp(Dispatch::Request(_, responder)) => {
                                         bound = self.inbound.rebind(
@@ -289,9 +280,8 @@ impl Coordinator {
                 }
             }
 
-            let (mut route, mut incarnation) = if let Some(route) = item.route.clone() {
-                let incarnation = route.dispatch_owner.incarnation;
-                (route, incarnation)
+            let mut route = if let Some(route) = item.route.clone() {
+                route
             } else {
                 let locked = state.lock().await;
                 // A request-scoped elicitation of a session's request runs in
@@ -301,18 +291,15 @@ impl Coordinator {
                         Some(OpScope::Session(session_id)) => Some(session_id.clone()),
                         _ => None,
                     });
-                let incarnation = requested_id
+                let owner = requested_id
                     .as_deref()
-                    .and_then(|id| locked.sessions.state(id))
-                    .map(|session| session.incarnation)
-                    .filter(|incarnation| *incarnation != 0);
+                    .and_then(|id| locked.sessions.resource_owner(id).ok());
                 let expected = match &item.event {
                     BridgeIngress::RpcCompleted(completion) => Some(completion.owner.clone()),
                     BridgeIngress::Continuation { owner, .. } => Some(owner.clone()),
                     BridgeIngress::Terminal(_) => Some(RequestOwner {
                         epoch: locked.sessions.epoch().to_string(),
                         session_id: requested_id.clone(),
-                        incarnation,
                         operation_id: "terminal-snapshot".to_string(),
                         attempt_id: None,
                     }),
@@ -326,19 +313,14 @@ impl Coordinator {
                     reject_unrouted(
                         item,
                         ingress,
-                        &Error::request_cancelled().data("session owner was replaced"),
+                        &Error::request_cancelled().data("session owner was removed"),
                         sink,
                     )?;
                     continue;
                 }
-                let owner = requested_id
-                    .as_deref()
-                    .zip(incarnation)
-                    .and_then(|(id, _)| locked.sessions.resource_owner(id).ok());
                 let dispatch_owner = expected.unwrap_or_else(|| RequestOwner {
                     epoch: locked.sessions.epoch().to_string(),
                     session_id: owner.as_ref().map(|owner| owner.session_id.clone()),
-                    incarnation: owner.as_ref().and(incarnation),
                     operation_id: event_operation_id(&item.event),
                     attempt_id: Some(Uuid::new_v4().to_string()),
                 });
@@ -355,15 +337,12 @@ impl Coordinator {
                     }
                     _ => None,
                 };
-                (
-                    CapturedRoute {
-                        owner,
-                        dispatch_owner,
-                        url_registration,
-                        request_scope: item.request_scope.clone(),
-                    },
-                    incarnation,
-                )
+                CapturedRoute {
+                    owner,
+                    dispatch_owner,
+                    url_registration,
+                    request_scope: item.request_scope.clone(),
+                }
             };
 
             if matches!(item.event, BridgeIngress::Acp(Dispatch::Request(..)))
@@ -375,8 +354,6 @@ impl Coordinator {
                 {
                     route.owner = None;
                     route.dispatch_owner.session_id = Some(target_id.to_owned());
-                    route.dispatch_owner.incarnation = None;
-                    incarnation = None;
                 }
                 if let BridgeIngress::Acp(Dispatch::Request(message, responder)) = &item.event {
                     match self.inbound.register(
@@ -421,7 +398,7 @@ impl Coordinator {
 
             // Before an ID is returned, replay is a connection allocation
             // concern. Reduce this prefix now, before reading the next response.
-            if incarnation.is_none()
+            if route.owner.is_none()
                 && matches!(&item.event,
                 BridgeIngress::Acp(Dispatch::Notification(message)) if SessionNotification::matches_method(message.method()))
             {
@@ -437,14 +414,11 @@ impl Coordinator {
                 }
                 continue;
             }
-            let handle = if let (Some(owner), Some(incarnation)) = (&route.owner, incarnation) {
+            let handle = if let Some(owner) = &route.owner {
                 match self.handles.get(&owner.session_id) {
-                    Some(handle) if handle.incarnation() == incarnation => Some(handle.clone()),
-                    _ => {
-                        if let Some(previous) = self.handles.remove(&owner.session_id) {
-                            scheduling.remove_session(&previous)?;
-                        }
-                        let handle = scheduling.register_session(&owner.session_id, incarnation)?;
+                    Some(handle) => Some(handle.clone()),
+                    None => {
+                        let handle = scheduling.register_session(&owner.session_id)?;
                         self.handles
                             .insert(owner.session_id.clone(), handle.clone());
                         Some(handle)
@@ -474,14 +448,13 @@ impl Coordinator {
         let mut retired = Vec::new();
         for (id, handle) in &self.handles {
             let session = state.sessions.state(id);
-            let replaced =
-                session.is_none_or(|session| session.incarnation != handle.incarnation());
+            let removed = session.is_none();
             // Failed cold materialization keeps a queryable Blocked entry, but
             // an idle history-only entry must not permanently occupy a queue.
             let dormant = session
                 .is_some_and(|session| session.live.is_none() && session.operation.is_none())
                 && scheduling.session_is_idle(handle)?;
-            if replaced || dormant {
+            if removed || dormant {
                 retired.push((id.clone(), handle.clone()));
             }
         }
@@ -509,14 +482,10 @@ impl Coordinator {
 
 fn owns_request(state: &BridgeState, owner: &RequestOwner) -> bool {
     owner.epoch == state.sessions.epoch()
-        && match (&owner.session_id, owner.incarnation) {
-            (Some(id), Some(incarnation)) => state
-                .sessions
-                .state(id)
-                .is_some_and(|session| session.incarnation == incarnation),
-            (None, None) => true,
-            _ => false,
-        }
+        && owner
+            .session_id
+            .as_deref()
+            .is_none_or(|id| state.sessions.state(id).is_some())
 }
 
 fn event_operation_id(event: &BridgeIngress) -> String {

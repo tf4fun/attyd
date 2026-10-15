@@ -41,7 +41,7 @@ fn setup() -> (
     )
 }
 
-fn install_session(state: &mut BridgeState) -> u64 {
+fn install_session(state: &mut BridgeState) {
     let epoch = state.sessions.epoch().to_owned();
     let incarnation = state
         .sessions
@@ -53,7 +53,6 @@ fn install_session(state: &mut BridgeState) -> u64 {
         )
         .unwrap();
     state.sessions.register_new(SESSION, incarnation);
-    incarnation
 }
 
 fn interaction_batch(permission: bool) -> Vec<Value> {
@@ -100,7 +99,6 @@ async fn next_delivery(scheduling: &mut Scheduling) -> ScheduledInput {
 
 async fn assert_interaction_sequence(
     permission: bool,
-    incarnation: u64,
     scheduling: &mut Scheduling,
     connection: &ConnectionTo<Agent>,
     services: &AgentContext,
@@ -112,7 +110,6 @@ async fn assert_interaction_sequence(
     ));
     let route = request.route.as_ref().expect("request route captured");
     assert_eq!(route.dispatch_owner.session_id.as_deref(), Some(SESSION));
-    assert_eq!(route.dispatch_owner.incarnation, Some(incarnation));
     assert_eq!(route.owner.as_ref().unwrap().session_id, SESSION);
     let allocation = route.dispatch_owner.attempt_id.clone().unwrap();
     assert_eq!(
@@ -133,9 +130,8 @@ async fn assert_interaction_sequence(
         panic!("the later update overtook the wire cancellation");
     };
     assert_eq!(capture.allocation, allocation);
-    assert_eq!(capture.route.dispatch_owner.incarnation, Some(incarnation));
     assert_eq!(capture.route.owner.as_ref().unwrap().session_id, SESSION);
-    assert_eq!(cancel.turn.handle().unwrap().incarnation(), incarnation);
+    assert_eq!(cancel.turn.handle().unwrap().session_id(), SESSION);
     {
         let state = services.state.lock().await;
         let resources = state.sessions.resources(SESSION).unwrap();
@@ -195,12 +191,11 @@ fn accepted_updates(state: &BridgeState) -> usize {
 async fn run_wire_batch(permission: bool, creation_pending: bool) {
     let (services, mut scheduling, _events) = setup();
     let mut coordinator = Coordinator::default();
-    let incarnation = if creation_pending {
+    if creation_pending {
         services.state.lock().await.pending_creations = 1;
-        None
     } else {
-        Some(install_session(&mut *services.state.lock().await))
-    };
+        install_session(&mut *services.state.lock().await);
+    }
     let (outgoing, mut peer_responses) = futures::channel::mpsc::channel::<String>(8);
     let (mut peer_requests, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(8);
     let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
@@ -242,7 +237,7 @@ async fn run_wire_batch(permission: bool, creation_pending: bool) {
                     .await
                     .unwrap();
             }
-            let incarnation = if let Some(pending) = pending {
+            if let Some(pending) = pending {
                 let ScheduledInput { event, turn, .. } = scheduling.pump().unwrap().unwrap();
                 let BridgeIngress::RpcCompleted(completion) = event else {
                     panic!("creation response lost its position")
@@ -254,15 +249,14 @@ async fn run_wire_batch(permission: bool, creation_pending: bool) {
                 scheduling.handoff_completion(completion, turn).unwrap();
                 let (response, turn) = pending.wait().await.unwrap();
                 assert_eq!(response.unwrap().session_id.0.as_ref(), SESSION);
-                let incarnation = {
+                {
                     let mut state = services.state.lock().await;
-                    let incarnation = install_session(&mut state);
+                    install_session(&mut state);
                     state.pending_creations = 0;
-                    incarnation
-                };
+                }
                 services
                     .ingress
-                    .finish_creation(new_owner, SESSION.into(), Some(incarnation))
+                    .finish_creation(new_owner, SESSION.into(), true)
                     .unwrap();
                 drop(turn);
                 let installed = scheduling.ingress_rx.recv().await.unwrap();
@@ -280,18 +274,8 @@ async fn run_wire_batch(permission: bool, creation_pending: bool) {
                     )
                     .await
                     .unwrap();
-                incarnation
-            } else {
-                incarnation.unwrap()
-            };
-            assert_interaction_sequence(
-                permission,
-                incarnation,
-                &mut scheduling,
-                &connection,
-                &services,
-            )
-            .await;
+            }
+            assert_interaction_sequence(permission, &mut scheduling, &connection, &services).await;
             host_done.send(()).unwrap();
             peer_finished.await.unwrap();
             Ok(())
@@ -348,6 +332,6 @@ async fn wire_permission_and_elicitation_cancel_precede_the_following_session_up
 }
 
 #[tokio::test]
-async fn creation_staged_request_and_cancel_bind_the_same_installed_incarnation() {
+async fn creation_staged_request_and_cancel_bind_the_installed_session() {
     run_wire_batch(true, true).await;
 }

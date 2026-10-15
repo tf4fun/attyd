@@ -1765,7 +1765,6 @@ where
         dispatch_owner: RequestOwner {
             epoch,
             session_id: None,
-            incarnation: None,
             operation_id: "connection".to_string(),
             attempt_id: None,
         },
@@ -2124,12 +2123,12 @@ where
                                     let owner = {
                                         let locked = context.state.lock().await;
                                         let session_id = intent_session_id.as_deref().expect("materialization session");
-                                        let Some(incarnation) = locked.sessions.state(session_id).map(|session| session.incarnation) else {
+                                        if locked.sessions.state(session_id).is_none() {
                                             break Err(Error::request_cancelled().data("materialization owner retired"));
-                                        };
+                                        }
                                         RequestOwner {
                                             epoch: locked.sessions.epoch().to_string(), session_id: Some(session_id.to_string()),
-                                            incarnation: Some(incarnation), operation_id: command["requestId"].as_str().unwrap().to_string(),
+                                            operation_id: command["requestId"].as_str().unwrap().to_string(),
                                             attempt_id: bridge_materialization_id.clone(),
                                         }
                                     };
@@ -2717,14 +2716,13 @@ fn reserve_command_request_id(state: &mut BridgeState, request_id: &str) -> Resu
 
 fn rpc_owner(
     epoch: &str,
-    session: Option<(&str, u64)>,
+    session_id: Option<&str>,
     operation_id: &str,
     attempt_id: Option<&str>,
 ) -> RequestOwner {
     RequestOwner {
         epoch: epoch.to_string(),
-        session_id: session.map(|(id, _)| id.to_string()),
-        incarnation: session.map(|(_, incarnation)| incarnation),
+        session_id: session_id.map(ToOwned::to_owned),
         operation_id: operation_id.to_string(),
         attempt_id: attempt_id.map(ToOwned::to_owned),
     }
@@ -2923,9 +2921,9 @@ impl CreationFinish {
         }
     }
 
-    fn committed(&mut self, incarnation: u64) -> Result<(), Error> {
+    fn committed(&mut self) -> Result<(), Error> {
         if let (Some(ingress), Some(target_id)) = (&self.ingress, self.target_id.take()) {
-            ingress.finish_creation(self.owner.clone(), target_id, Some(incarnation))?;
+            ingress.finish_creation(self.owner.clone(), target_id, true)?;
         }
         Ok(())
     }
@@ -2934,7 +2932,7 @@ impl CreationFinish {
 impl Drop for CreationFinish {
     fn drop(&mut self) {
         if let (Some(ingress), Some(target_id)) = (&self.ingress, self.target_id.take()) {
-            let _ = ingress.finish_creation(self.owner.clone(), target_id, None);
+            let _ = ingress.finish_creation(self.owner.clone(), target_id, false);
         }
     }
 }
@@ -3189,7 +3187,7 @@ async fn handle_command_inner(
                     );
                     advance_catalog_revision(&mut state);
                     refresh_observer_timers(&mut state);
-                    creation_finish.committed(incarnation)?;
+                    creation_finish.committed()?;
                 }
                 Err(error) => {
                     if state.pending_creations == 0 {
@@ -3332,12 +3330,7 @@ async fn handle_command_inner(
                 refresh_observer_timers(&mut state);
                 incarnation
             };
-            let owner = rpc_owner(
-                &epoch,
-                Some((&session_id, attachment_incarnation)),
-                &request_id,
-                Some(&request_id),
-            );
+            let owner = rpc_owner(&epoch, Some(&session_id), &request_id, Some(&request_id));
             let result = if operation == "session/load" {
                 send_history(
                     &connection,
@@ -3623,12 +3616,7 @@ async fn handle_command_inner(
                 state.pending_creations += 1;
                 (cwd, source_incarnation, source_log)
             };
-            let owner = rpc_owner(
-                &epoch,
-                Some((&source_id, source_incarnation)),
-                &request_id,
-                None,
-            );
+            let owner = rpc_owner(&epoch, Some(&source_id), &request_id, None);
             let result = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -3824,10 +3812,9 @@ async fn handle_command_inner(
             history_flow.register(history_owner.clone());
             advance_catalog_revision(&mut state);
             refresh_observer_timers(&mut state);
-            creation_finish.committed(incarnation)?;
+            creation_finish.committed()?;
             drop(state);
-            let target_owner =
-                rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
+            let target_owner = rpc_owner(&epoch, Some(&session_id), &request_id, None);
             continue_execution(ingress.as_ref(), execution, &target_owner).await?;
             synchronize_attached_history(
                 &connection,
@@ -3929,7 +3916,7 @@ async fn handle_command_inner(
                 refresh_observer_timers(&mut state);
                 incarnation
             };
-            let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
+            let owner = rpc_owner(&epoch, Some(&session_id), &request_id, None);
             let result = send_ordered(
                 &connection,
                 ingress.as_ref(),
@@ -4090,7 +4077,7 @@ async fn handle_command_inner(
             if let Some(terminals) = &terminals {
                 terminals.release_session(&session_id).await;
             }
-            let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
+            let owner = rpc_owner(&epoch, Some(&session_id), &request_id, None);
             continue_execution(ingress.as_ref(), execution, &owner).await?;
             {
                 let mut state = state.lock().await;
@@ -4160,7 +4147,7 @@ async fn handle_command_inner(
                 }
                 (close_before_delete, runtime_incarnation)
             };
-            let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
+            let owner = rpc_owner(&epoch, Some(&session_id), &request_id, None);
             if close_before_delete {
                 let mut close_owner = owner.clone();
                 close_owner.attempt_id = Some(format!("delete-close-{}", Uuid::new_v4()));
@@ -4343,7 +4330,7 @@ async fn handle_command_inner(
                 refresh_observer_timers(&mut state);
                 (incarnation, mirror_operation_id, cancelled)
             };
-            let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
+            let owner = rpc_owner(&epoch, Some(&session_id), &request_id, None);
             let result = send_ordered_then(
                 &connection,
                 ingress.as_ref(),
@@ -4436,7 +4423,7 @@ async fn handle_command_inner(
                 &connection,
                 ingress.as_ref(),
                 execution,
-                rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None),
+                rpc_owner(&epoch, Some(&session_id), &request_id, None),
                 RequestClass::Control,
                 SetSessionModeRequest::new(session_id.clone(), mode_id.clone()),
             )
@@ -4579,7 +4566,7 @@ async fn handle_command_inner(
                 &connection,
                 ingress.as_ref(),
                 execution,
-                rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None),
+                rpc_owner(&epoch, Some(&session_id), &request_id, None),
                 RequestClass::Control,
                 request,
             )
@@ -4929,7 +4916,7 @@ async fn synchronize_attached_history(
     operation_id: &str,
 ) -> Result<(), Error> {
     let epoch = state.lock().await.sessions.epoch().to_string();
-    let owner = rpc_owner(&epoch, Some((session_id, incarnation)), operation_id, None);
+    let owner = rpc_owner(&epoch, Some(session_id), operation_id, None);
     if ingress.is_some()
         && execution
             .as_ref()
@@ -5078,12 +5065,7 @@ async fn synchronize_authoritative_history(
             validation_owner
         };
 
-        let owner = rpc_owner(
-            &epoch,
-            Some((session_id, incarnation)),
-            operation_id,
-            Some(&attempt_id),
-        );
+        let owner = rpc_owner(&epoch, Some(session_id), operation_id, Some(&attempt_id));
         let result = match send_history(
             connection,
             ingress,
@@ -9602,7 +9584,7 @@ mod ordered_command_tests {
             CancellationToken::new(),
         )
         .unwrap();
-        let handle = scheduling.register_session("session", 1).unwrap();
+        let handle = scheduling.register_session("session").unwrap();
         for _ in 0..2 {
             ingress
                 .try_browser(BridgeInput::ServeStreams, TrafficClass::Ordinary)
@@ -9619,12 +9601,7 @@ mod ordered_command_tests {
                 ingress
                     .prepare_rpc(
                         RequestClass::LongRunning,
-                        rpc_owner(
-                            "epoch",
-                            Some(("session", 1)),
-                            &format!("occupied-{index}"),
-                            None,
-                        ),
+                        rpc_owner("epoch", Some("session"), &format!("occupied-{index}"), None),
                         Some(handle.clone()),
                     )
                     .unwrap(),
@@ -9646,7 +9623,7 @@ mod ordered_command_tests {
                 agent_client_protocol::on_receive_dispatch!(),
             )
             .connect_with(transport, async move |connection| {
-                let owner = rpc_owner("epoch", Some(("session", 1)), "prompt", None);
+                let owner = rpc_owner("epoch", Some("session"), "prompt", None);
                 let mut waiting = Box::pin(send_ordered(
                     &connection,
                     Some(&ingress),
@@ -9806,14 +9783,14 @@ mod ordered_command_tests {
                 let BridgeIngress::CreationFinished {
                     owner: finished_owner,
                     target_id,
-                    incarnation,
+                    committed,
                 } = item.event
                 else {
                     panic!("raw target claim was not released")
                 };
                 assert_eq!(finished_owner, owner);
                 assert_eq!(target_id, "target");
-                assert_eq!(incarnation, None);
+                assert!(!committed);
                 assert!(
                     scheduling.ingress_rx.try_recv().is_err(),
                     "claim resolves once"
