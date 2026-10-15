@@ -220,9 +220,12 @@ tests, not checks of an internal identity:
   `failed_attachment_releases_every_pre_response_live_resource`,
   `releases_only_terminals_owned_by_closed_session`.
 
-A late notification names only a `sessionId`: one for an ID with no running
-session is dropped, and one for an ID that a new session has taken applies to that
-session. No test claims to tell the two sessions apart.
+A late notification names only a `sessionId`. One for an ID with no running
+session is dropped when no creation is pending; while a creation is pending it may
+be staged, bounded by the number of pending creations, and is replayed only into
+the session whose ID the creation response returns. One for an ID that a new
+session has taken applies to that session. No test claims to tell where a
+notification came from, such as a session closed earlier under the same ID.
 
 The replica engine and the page projection remain TypeScript because the browser runs them;
 their tests are `tests/replica.test.ts`, `tests/protocol-client.test.ts` and
@@ -253,8 +256,9 @@ Selected behavior cases:
   test: form and URL elicitation are advertised without editor/NES support.
 - Zed's missing-thread handling maps to the Rust early/late routing test
   (`buffers_pre_response_updates_and_drops_late_unknown_sessions`): updates are buffered only
-  while a matching session can still be allocated, and late updates for an ID with no running
-  session never leak into the visible thread.
+  while a creation is pending (bounded by the number of pending creations) and replayed only into
+  the session whose ID the creation response returns; with no creation pending, updates for an ID
+  with no running session are dropped and never reach the visible thread.
 - Zed's session-list work-directory tests map to the protocol v2 black-box assertion that an
   Agent-owned cwd returned by `session/list` is retained when history is loaded.
 

@@ -30,6 +30,7 @@ use crate::mcp_config::{server_name, server_type};
 use crate::options::{Options, Transport};
 use crate::ordered_ingress::{RequestClass, RequestOwner};
 use crate::protocol::documents::{OperationKind as OpKind, Scope as OpScope};
+use crate::protocol::wire;
 use crate::runtime_state::{
     RuntimeEffect, SessionLifecycle, SessionOperationKind as RuntimeSessionOperationKind,
     SessionTurnError, UrlFlowResolution, UrlFlowStatus,
@@ -2866,7 +2867,7 @@ async fn handle_command_inner(
                 state.sessions.complete_scope_operation(
                     &OpScope::Global,
                     OpKind::Authenticate,
-                    json!({}),
+                    wire::value(&wire::Empty {}),
                 );
             }
         }
@@ -2889,7 +2890,7 @@ async fn handle_command_inner(
                 state.sessions.complete_scope_operation(
                     &OpScope::Global,
                     OpKind::Logout,
-                    json!({}),
+                    wire::value(&wire::Empty {}),
                 );
             }
         }
@@ -2982,7 +2983,9 @@ async fn handle_command_inner(
                     state.sessions.complete_scope_operation(
                         &OpScope::Global,
                         OpKind::Create,
-                        json!({ "sessionId": session_id }),
+                        wire::value(&wire::SessionCreated {
+                            session_id: session_id.clone(),
+                        }),
                     );
                     advance_catalog_revision(&mut state);
                     refresh_observer_timers(&mut state);
@@ -3052,11 +3055,14 @@ async fn handle_command_inner(
                     .listed_sessions
                     .insert(session.session_id.0.to_string(), session.clone());
             }
-            let page = serde_json::to_value(&response)?;
-            let result = json!({
-                "revision": state.catalog_revision.to_string(),
-                "sessions": page["sessions"],
-                "nextCursor": page["nextCursor"],
+            let result = wire::value(&wire::CatalogPage {
+                revision: state.catalog_revision.to_string(),
+                sessions: response
+                    .sessions
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()?,
+                next_cursor: response.next_cursor.clone(),
             });
             state
                 .sessions

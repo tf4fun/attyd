@@ -1,4 +1,4 @@
-import type { ContentBlock, TerminalExitStatus } from "@agentclientprotocol/sdk";
+import type { TerminalExitStatus } from "@agentclientprotocol/sdk";
 
 export interface TerminalSnapshot {
   sessionId: string;
@@ -7,20 +7,6 @@ export interface TerminalSnapshot {
   truncated: boolean;
   exitStatus?: TerminalExitStatus | null;
   released: boolean;
-}
-
-export interface WorkspaceContextMatch {
-  path: string;
-  name: string;
-  relativePath: string;
-  rootName: string;
-  size: number;
-}
-
-export interface WorkspaceContextAttachment {
-  name: string;
-  size: number;
-  block: Extract<ContentBlock, { type: "resource" }>;
 }
 
 export type ConnectionPhase =
