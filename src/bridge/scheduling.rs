@@ -1287,7 +1287,7 @@ mod tests {
             .unwrap();
         scheduling.close();
         assert_eq!(
-            replay.bytes(),
+            replay.retained(),
             0,
             "shutdown must release even a retained replay writer"
         );
