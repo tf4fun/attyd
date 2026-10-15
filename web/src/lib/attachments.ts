@@ -1,6 +1,7 @@
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { createContext, useContext, useEffect, useState } from "react";
-import type { AttachmentRef } from "../../../shared/protocol";
+import type { AttachmentRef, PromptBlock } from "../../../shared/protocol";
+import type { TimelineItem } from "./state";
 
 export type AttachedBlock = Extract<ContentBlock, { type: "image" | "audio" | "resource" }>;
 
@@ -61,6 +62,54 @@ export function createAttachmentReader(
 }
 
 export const AttachmentReaderContext = createContext<AttachmentReader | undefined>(undefined);
+
+/**
+ * `timeline` with each attachment it names replaced by the block read for it,
+ * for an export with full content. A reference that cannot be read stays.
+ */
+export async function withAttachedBlocks(reader: AttachmentReader | undefined, timeline: TimelineItem[]): Promise<TimelineItem[]> {
+  if (reader == null) return timeline;
+  const references = new Map<string, AttachmentRef>();
+  const collect = (blocks: PromptBlock[]) => {
+    for (const block of blocks) if (block.type === "attachment") references.set(block.id, block);
+    return blocks;
+  };
+  mapBlocks(timeline, collect);
+  const read = new Map<string, AttachedBlock>();
+  await Promise.all([...references.values()].map(async (reference) => {
+    const { read: block, release } = reader.acquire(reference);
+    try {
+      read.set(reference.id, await block);
+    } catch {
+      // Left as its reference.
+    } finally {
+      release();
+    }
+  }));
+  return mapBlocks(timeline, (blocks) => blocks.map((block) => block.type === "attachment" ? read.get(block.id) ?? block : block));
+}
+
+function mapBlocks(timeline: TimelineItem[], map: (blocks: PromptBlock[]) => PromptBlock[]): TimelineItem[] {
+  return timeline.map((item) => {
+    switch (item.type) {
+      case "message":
+      case "compaction":
+        return { ...item, blocks: map(item.blocks) };
+      case "assistant":
+        return { ...item, chunks: item.chunks.map((chunk) => ({ ...chunk, blocks: map(chunk.blocks) })) };
+      case "tool":
+        return item.call.content == null ? item : {
+          ...item,
+          call: {
+            ...item.call,
+            content: item.call.content.map((content) => content.type === "content" ? { ...content, content: map([content.content])[0] } : content),
+          },
+        };
+      default:
+        return item;
+    }
+  });
+}
 
 /** The block `reference` names, once read; `undefined` while it is read or unavailable. */
 export function useAttachedBlock(reference: AttachmentRef): AttachedBlock | undefined {

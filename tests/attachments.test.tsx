@@ -7,8 +7,10 @@ import {
   createAttachmentReader,
   inertType,
   useBlockUrl,
+  withAttachedBlocks,
   type AttachedBlock,
 } from "../web/src/lib/attachments";
+import { timelineToMarkdown } from "../web/src/lib/thread-markdown";
 import type { AttachmentRef } from "../shared/protocol";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -139,5 +141,27 @@ describe("attachment reader", () => {
     flush();
     await attachments.acquire(reference).read;
     expect(fetches).toBe(2);
+  });
+});
+
+describe("full-content export", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("exports the text of the attachments the thread names, and keeps an unreadable one as a reference", async () => {
+    const text: AttachedBlock = { type: "resource", resource: { uri: "file:///notes.md", mimeType: "text/markdown", text: "# Notes\n" } };
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) =>
+      String(input).endsWith("/attachments/a1")
+        ? new Response(JSON.stringify(text), { status: 200 })
+        : new Response("", { status: 404 }));
+    const reader = createAttachmentReader("s");
+    const ref = (id: string): AttachmentRef => ({ type: "attachment", id, block: "resource", mimeType: "text/markdown", uri: "file:///notes.md" });
+    const timeline = await withAttachedBlocks(reader, [
+      { id: "m", type: "message", role: "user", blocks: [{ type: "text", text: "see" }, ref("a1")], raw: [] },
+      { id: "a", type: "assistant", chunks: [{ id: "c", role: "agent", blocks: [ref("gone")], raw: [] }] },
+    ]);
+    const markdown = timelineToMarkdown(timeline, { title: "T" });
+    expect(markdown).toContain("# Notes");
+    expect(markdown.indexOf("see")).toBeLessThan(markdown.indexOf("# Notes"));
+    expect(timeline[1]).toMatchObject({ chunks: [{ blocks: [ref("gone")] }] });
   });
 });

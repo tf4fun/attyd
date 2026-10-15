@@ -50,7 +50,7 @@ import { randomId } from "./lib/id";
 import { collectPromptHistory } from "./lib/prompt-history";
 import { timelineToMarkdown } from "./lib/thread-markdown";
 import type { AgentActivity, AuthTerminalState, TimelineItem, ViewToolCall } from "./lib/state";
-import { AttachmentReaderContext } from "./lib/attachments";
+import { AttachmentReaderContext, withAttachedBlocks } from "./lib/attachments";
 import { useAcp } from "./lib/use-acp";
 
 const AuthTerminalCard = lazy(() => import("./components/acp/auth-terminal").then(
@@ -565,17 +565,22 @@ export default function App() {
     ))}
   </>;
   const openActiveThreadMarkdown = useCallback(() => {
-    // The thread as shown: the log's turns and the current operation.
-    openThreadMarkdown(timelineToMarkdown(state.timeline, {
+    // The thread as shown: the log's turns and the current operation, with
+    // the content of the attachments they name (protocol §8).
+    const options = {
       title: state.title ?? t("agentThread"),
       agentName: agent?.title ?? agent?.name,
       sessionId: state.session?.sessionId,
       cwd: state.cwd,
       terminalSnapshots: state.terminalSnapshots,
-    }));
+    };
+    // The local reads finish well within the click's transient activation.
+    void withAttachedBlocks(state.attachments, state.timeline).then((timeline) =>
+      openThreadMarkdown(timelineToMarkdown(timeline, options)));
   }, [
     agent?.name,
     agent?.title,
+    state.attachments,
     state.cwd,
     state.session?.sessionId,
     state.terminalSnapshots,

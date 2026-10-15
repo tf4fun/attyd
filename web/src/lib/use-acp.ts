@@ -123,7 +123,7 @@ interface AnswerState {
   /** Answers the user gave, by interaction, not yet sent. */
   drafts: Map<string, Answer>;
   /** The answer write in flight or sent, and the interactions it covered. */
-  sent?: { op: string; ids: string[]; state: "sending" | "sent" | "uncertain" };
+  sent?: { ids: string[]; state: "sending" | "sent" | "uncertain" };
   errors: Map<string, string>;
 }
 
@@ -169,6 +169,7 @@ export class Workspace {
   readonly #mine = new Set<string>();
   #errors: Array<Extract<TimelineItem, { type: "error" }>> = [];
   #transition: { kind: "new" | "fork"; navigation: number } | undefined;
+  /** Answer state by `op.id`: a global and a session scope may show the same operation. */
   readonly #answers = new Map<string, AnswerState>();
   readonly #held = new Map<string, HeldPrompt[]>();
   readonly #paused = new Set<string>();
@@ -757,11 +758,24 @@ export class Workspace {
   // -------------------------------------------------------------------------
   // Answers (§6.2: one write answers every pending interaction)
 
-  #interactionScope(interactionId: string): string | undefined {
-    for (const scope of [this.#shown()?.scope, GLOBAL, CATALOG]) {
-      if (scope == null) continue;
+  /** The scopes whose running `op` asks; one operation may occupy several (§6.4). */
+  #answerScopes(): string[] {
+    const shown = this.#shown()?.scope;
+    return [...(shown == null ? [] : [shown]), GLOBAL, CATALOG];
+  }
+
+  /** A scope showing the running operation `opId`; any of them takes its answers. */
+  #opScope(opId: string): string | undefined {
+    return this.#answerScopes().find((scope) => {
       const op = this.#scopeOp(scope);
-      if (op?.status === "running" && Object.hasOwn(op.interactions ?? {}, interactionId)) return scope;
+      return op?.status === "running" && op.id === opId;
+    });
+  }
+
+  #interactionOp(interactionId: string): Operation | undefined {
+    for (const scope of this.#answerScopes()) {
+      const op = this.#scopeOp(scope);
+      if (op?.status === "running" && Object.hasOwn(op.interactions ?? {}, interactionId)) return op;
     }
     return undefined;
   }
@@ -771,22 +785,18 @@ export class Workspace {
     return isRecord(live) && isRecord(live.op) ? live.op as unknown as Operation : undefined;
   }
 
-  #answerState(scope: string): AnswerState {
-    let state = this.#answers.get(scope);
+  #respond(interactionId: string, answer: Answer): void {
+    const op = this.#interactionOp(interactionId);
+    if (op == null) return;
+    // Answers belong to the operation, whichever scope shows it.
+    let state = this.#answers.get(op.id);
     if (state == null) {
       state = { drafts: new Map(), errors: new Map() };
-      this.#answers.set(scope, state);
+      this.#answers.set(op.id, state);
     }
-    return state;
-  }
-
-  #respond(interactionId: string, answer: Answer): void {
-    const scope = this.#interactionScope(interactionId);
-    if (scope == null) return;
-    const state = this.#answerState(scope);
     state.drafts.set(interactionId, answer);
     state.errors.delete(interactionId);
-    this.#sendAnswers(scope);
+    this.#sendAnswers(op.id);
     this.#changed();
   }
 
@@ -796,14 +806,15 @@ export class Workspace {
   respondElicitation = (elicitationId: string, response: CreateElicitationResponse): void =>
     this.#respond(elicitationId, { response });
 
-  #sendAnswers(scope: string): void {
-    const op = this.#scopeOp(scope);
-    const state = this.#answers.get(scope);
-    if (op == null || state == null || op.status !== "running" || state.sent?.op === op.id) return;
+  #sendAnswers(opId: string): void {
+    const scope = this.#opScope(opId);
+    const op = scope == null ? undefined : this.#scopeOp(scope);
+    const state = this.#answers.get(opId);
+    if (scope == null || op == null || state == null || state.sent != null) return;
     const pending = Object.keys(op.interactions ?? {});
     if (pending.length === 0 || !pending.every((id) => state.drafts.has(id))) return;
     const answers = Object.fromEntries(pending.map((id) => [id, state.drafts.get(id)!]));
-    const sent = { op: op.id, ids: pending, state: "sending" as "sending" | "sent" | "uncertain" };
+    const sent = { ids: pending, state: "sending" as "sending" | "sent" | "uncertain" };
     state.sent = sent;
     void this.#ops.answer(scope, answers).then((outcome) => {
       if (state.sent !== sent) return;
@@ -835,26 +846,29 @@ export class Workspace {
 
   /** Drops answers to interactions the replica no longer shows pending. */
   #settleAnswers(): void {
-    for (const [scope, state] of this.#answers) {
-      const op = this.#scopeOp(scope);
-      const pending = new Set(op?.status === "running" ? Object.keys(op.interactions ?? {}) : []);
+    for (const [opId, state] of this.#answers) {
+      const scope = this.#opScope(opId);
+      const op = scope == null ? undefined : this.#scopeOp(scope);
+      if (op == null) {
+        this.#answers.delete(opId);
+        continue;
+      }
+      const pending = new Set(Object.keys(op.interactions ?? {}));
       for (const id of [...state.drafts.keys()]) if (!pending.has(id)) state.drafts.delete(id);
       for (const id of [...state.errors.keys()]) if (!pending.has(id)) state.errors.delete(id);
-      if (state.sent != null && (state.sent.op !== op?.id || !state.sent.ids.some((id) => pending.has(id)))) {
-        state.sent = undefined;
-      }
+      if (state.sent != null && !state.sent.ids.some((id) => pending.has(id))) state.sent = undefined;
       // The pending set may have shrunk to what the user answered already.
-      this.#sendAnswers(scope);
+      this.#sendAnswers(opId);
     }
   }
 
-  #interactionStatus(scope: string, interactionId: string): Pick<PendingPermission, "responseRequestId" | "responseStatus" | "responseError"> {
-    const state = this.#answers.get(scope);
+  #interactionStatus(opId: string, interactionId: string): Pick<PendingPermission, "responseRequestId" | "responseStatus" | "responseError"> {
+    const state = this.#answers.get(opId);
     if (state == null) return {};
     const error = state.errors.get(interactionId);
     if (state.sent?.ids.includes(interactionId)) {
       return {
-        responseRequestId: state.sent.op,
+        responseRequestId: opId,
         ...(state.sent.state === "uncertain" ? { responseStatus: i18n.t("interaction.uncertain", { ns: "cards" }) } : {}),
       };
     }
@@ -996,11 +1010,11 @@ export class Workspace {
     ];
     // One operation occupying several scopes is the `op` of each (§6.4): show its interactions once.
     const projectedOps = new Set<string>();
-    for (const [owner, ownerOp] of interactionScopes) {
+    for (const [, ownerOp] of interactionScopes) {
       if (projectedOps.has(ownerOp.id)) continue;
       projectedOps.add(ownerOp.id);
       for (const interaction of pendingInteractions(ownerOp)) {
-        const status = this.#interactionStatus(owner, interaction.interactionId);
+        const status = this.#interactionStatus(ownerOp.id, interaction.interactionId);
         pushInteraction(interaction, status, permissions, elicitations);
       }
     }
