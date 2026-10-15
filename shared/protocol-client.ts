@@ -296,16 +296,18 @@ export class WriteQueue {
     const queue = this.#scopes.get(scope);
     if (queue === undefined || queue.sending !== undefined) return;
     const op = shownOp(this.#replicas, scope);
-    // One write per ended `op`: until the replica shows another, a second
-    // one against it could only be refused as stale.
-    if (op === undefined || op.status === "running" || op.id === queue.expect) return;
-    const index = queue.items.findIndex(({ state }) => state === "queued" || state === "refused");
+    // Once a write against an ended `op` may have been admitted, a second one
+    // against it could only be refused as stale: wait for the replica to show another.
+    if (op === undefined || op.status === "running" || op.id === queue.admitted) return;
+    // Uncertain writes stay with the user and hold nothing back; the first
+    // other write goes next, a refused one only against a later `op`.
+    const index = queue.items.findIndex(({ state }) => state !== "uncertain");
     if (index < 0) return;
-    const item: QueuedWrite = { id: queue.items[index].id, write: queue.items[index].write, state: "sending" };
-    queue.items = replaced(queue.items, index, item);
-    queue.sending = item.id;
-    queue.expect = op.id;
-    void this.#ops.write(scope, item.write).then((outcome) => this.#answered(scope, item.id, outcome));
+    const { id, write, state } = queue.items[index];
+    if (state === "refused" && queue.refused.get(id) === op.id) return;
+    queue.items = replaced(queue.items, index, { id, write, state: "sending" });
+    queue.sending = { id, expect: op.id };
+    void this.#ops.write(scope, write).then((outcome) => this.#answered(scope, id, outcome));
   }
 
   /** The user sends `id` again, as new input. */
@@ -314,22 +316,24 @@ export class WriteQueue {
     const item = queue?.items.find((candidate) => candidate.id === id);
     if (queue === undefined || item === undefined || item.state === "queued" || item.state === "sending") return;
     queue.items = [...queue.items.filter((candidate) => candidate.id !== id), { id, write: item.write, state: "queued" }];
+    queue.refused.delete(id);
     // New input is sent against the `op` the replica shows, whichever it is.
-    queue.expect = undefined;
+    queue.admitted = undefined;
     this.update(scope);
   }
 
   /** The user takes `id` back. */
   remove(scope: string, id: number): void {
     const queue = this.#scopes.get(scope);
-    if (queue === undefined || queue.sending === id) return;
+    if (queue === undefined || queue.sending?.id === id) return;
     queue.items = queue.items.filter((item) => item.id !== id);
+    queue.refused.delete(id);
   }
 
   #queue(scope: string): ScopeQueue {
     let queue = this.#scopes.get(scope);
     if (queue === undefined) {
-      queue = { items: [] };
+      queue = { items: [], refused: new Map() };
       this.#scopes.set(scope, queue);
     }
     return queue;
@@ -337,6 +341,7 @@ export class WriteQueue {
 
   #answered(scope: string, id: number, outcome: WriteOutcome): void {
     const queue = this.#queue(scope);
+    const expect = queue.sending?.expect;
     queue.sending = undefined;
     const index = queue.items.findIndex((item) => item.id === id);
     const { write } = queue.items[index];
@@ -344,16 +349,19 @@ export class WriteQueue {
       case "accepted":
       case "ended":
         queue.items = queue.items.filter((item) => item.id !== id);
+        queue.admitted = expect;
         break;
       case "refused":
+        // A refusal changed nothing (§6.4): the `op` stays free for other input.
         queue.items = replaced(queue.items, index, { id, write, state: "refused", error: outcome.error });
+        if (expect !== undefined) queue.refused.set(id, expect);
         break;
       case "uncertain":
         queue.items = replaced(queue.items, index, { id, write, state: "uncertain" });
+        queue.admitted = expect;
         break;
       case "blocked":
         queue.items = replaced(queue.items, index, { id, write, state: "queued" });
-        queue.expect = undefined;
         break;
     }
     // The stream may already show a later `op` ended.
@@ -363,10 +371,12 @@ export class WriteQueue {
 
 interface ScopeQueue {
   items: readonly QueuedWrite[];
-  /** The write waiting for its HTTP answer. */
-  sending?: number;
-  /** The `op.id` the last write was sent against. */
-  expect?: string;
+  /** The write waiting for its HTTP answer, and the `op.id` it was sent against. */
+  sending?: { readonly id: number; readonly expect: string };
+  /** The `op.id` of the last write that was, or may have been, admitted. */
+  admitted?: string;
+  /** The `op.id` each refused write was refused against. */
+  refused: Map<number, string>;
 }
 
 function replaced<T>(items: readonly T[], index: number, item: T): readonly T[] {
