@@ -335,3 +335,150 @@ async fn wire_permission_and_elicitation_cancel_precede_the_following_session_up
 async fn creation_staged_request_and_cancel_bind_the_installed_session() {
     run_wire_batch(true, true).await;
 }
+
+#[tokio::test]
+async fn a_cold_placeholder_keeps_wire_replay_before_the_creation_response() {
+    let (services, mut scheduling, _events) = setup();
+    let mut coordinator = Coordinator::default();
+    {
+        let mut state = services.state.lock().await;
+        state.pending_creations = 1;
+        state.sessions.register_cold(SESSION, 0);
+    }
+    let (outgoing, mut peer_responses) = futures::channel::mpsc::channel::<String>(8);
+    let (mut peer_requests, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(8);
+    let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
+    let (update_checked, update_finished) = oneshot::channel();
+    let (host_done, host_finished) = oneshot::channel();
+    let (peer_done, peer_finished) = oneshot::channel();
+    let ingress = services.ingress.clone();
+    let connection = Client
+        .builder()
+        .on_receive_dispatch(
+            async move |dispatch: Dispatch, _connection| ingress.receive_dispatch(dispatch).await,
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_with(transport, async move |connection| {
+            let pending = services
+                .ingress
+                .prepare_rpc(RequestClass::Control, services.dispatch_owner.clone(), None)
+                .unwrap()
+                .send(&connection, NewSessionRequest::new("/workspace"))
+                .unwrap();
+            let update = scheduling.ingress_rx.recv().await.unwrap();
+            coordinator
+                .route(
+                    update,
+                    &scheduling,
+                    &services.ingress,
+                    &services.state,
+                    &services.sink,
+                )
+                .await
+                .unwrap();
+            // Support both inline reduction and queued dispatch. Wait for the
+            // real delivery guard to drop before inspecting the replay outcome.
+            while scheduling.has_local_work() {
+                if let Some(delivery) = scheduling.pump().unwrap() {
+                    assert!(
+                        coordinator::dispatch_ready(
+                            delivery,
+                            &scheduling,
+                            &connection,
+                            &services,
+                            false,
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                    );
+                } else {
+                    scheduling.wake.notified().await;
+                }
+            }
+            {
+                let state = services.state.lock().await;
+                let staged = state.creation_staging.get(SESSION);
+                assert_eq!(
+                    staged.map_or(0, |staging| staging.early_notifications.len()),
+                    1,
+                    "a pre-response update for a cold placeholder must survive as creation replay"
+                );
+                assert_eq!(state.early_update_count, 1);
+            }
+            update_checked.send(()).unwrap();
+
+            let response = scheduling.ingress_rx.recv().await.unwrap();
+            coordinator
+                .route(
+                    response,
+                    &scheduling,
+                    &services.ingress,
+                    &services.state,
+                    &services.sink,
+                )
+                .await
+                .unwrap();
+            let ScheduledInput { event, turn, .. } = next_delivery(&mut scheduling).await;
+            let BridgeIngress::RpcCompleted(completion) = event else {
+                panic!("expected the creation response");
+            };
+            scheduling.handoff_completion(completion, turn).unwrap();
+            let (response, turn) = pending.wait().await.unwrap();
+            let response = serde_json::to_value(response.unwrap()).unwrap();
+            let replay = {
+                let mut state = services.state.lock().await;
+                state.pending_creations = 0;
+                prepare_session_response(
+                    &mut state,
+                    SESSION,
+                    PathBuf::from("/workspace"),
+                    &response,
+                    None,
+                )
+                .unwrap()
+            };
+            assert_eq!(replay.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&replay[0]).unwrap()["update"]["content"]["text"],
+                "before response"
+            );
+            drop(turn);
+            host_done.send(()).unwrap();
+            peer_finished.await.unwrap();
+            Ok(())
+        });
+    let peer = async move {
+        let request: Value = serde_json::from_str(&peer_responses.next().await.unwrap()).unwrap();
+        assert_eq!(request["method"], "session/new");
+        peer_requests
+            .send(Ok(json!({
+                "jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": SESSION, "update": {
+                        "sessionUpdate": "agent_message_chunk", "messageId": "early-message",
+                        "content": {"type": "text", "text": "before response"}
+                    }
+                }
+            })
+            .to_string()))
+            .await
+            .unwrap();
+        update_finished.await.unwrap();
+        peer_requests
+            .send(Ok(json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": SESSION}
+            })
+            .to_string()))
+            .await
+            .unwrap();
+        host_finished.await.unwrap();
+        peer_done.send(()).unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(
+        Duration::from_secs(3),
+        futures::future::join(connection, peer),
+    )
+    .await
+    .expect("cold creation replay or its response remained parked");
+    result.unwrap();
+}
