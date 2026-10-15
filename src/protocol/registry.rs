@@ -674,17 +674,18 @@ impl SessionRegistry {
         let Some(kind) = session_kind(kind) else {
             return;
         };
-        let result = match kind {
-            OperationKind::Fork => wire::value(&SessionCreated {
-                // The Agent's `ForkSessionResponse` always names it.
-                session_id: result["sessionId"].as_str().unwrap_or_default().to_string(),
-            }),
-            _ => wire::value(&Empty {}),
-        };
         if let Some(live) = self.held_live_mut(session_id)
             && live.op.is_running_kind(kind)
         {
-            live.op.complete(result);
+            live.op.complete(match kind {
+                OperationKind::Fork => wire::value(&SessionCreated {
+                    session_id: result["sessionId"]
+                        .as_str()
+                        .expect("a fork result is the Agent's ForkSessionResponse")
+                        .to_string(),
+                }),
+                _ => wire::value(&Empty {}),
+            });
         }
     }
 
