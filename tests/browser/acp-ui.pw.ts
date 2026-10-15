@@ -795,11 +795,20 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   });
   expect(accepted.status()).toBe(202);
   await expect(page.getByText("Received prompt blocks: text,image,text,resource.", { exact: true })).toBeVisible();
+  // The reply can precede the commit, which replaces the live prompt's URLs.
+  await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
   const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow First image:" });
-  const attachmentUrl = await prompt.getByRole("link", { name: "Open note.txt in a new tab" }).getAttribute("href");
-  const attachment = await page.request.get(attachmentUrl!);
-  expect(attachment.headers()["content-type"]).toBe("text/plain;charset=utf-8");
-  expect(await attachment.text()).toBe("中文 context");
+  const attachmentLink = prompt.getByRole("link", { name: "Open note.txt in a new tab" });
+  await expect(attachmentLink).toHaveAttribute("href", /^blob:/u);
+  const attachmentUrl = (await attachmentLink.getAttribute("href"))!;
+  // The v2 read returns an ACP block; the page owns the URL of its decoded bytes.
+  const attachment = await page.evaluate(async (url) => {
+    const blob = await (await fetch(url)).blob();
+    return { type: blob.type, bytes: [...new Uint8Array(await blob.arrayBuffer())] };
+  }, attachmentUrl);
+  expect(attachment.type).toBe("text/plain;charset=utf-8");
+  expect(Buffer.from(attachment.bytes)).toEqual(Buffer.from("中文 context", "utf8"));
   await prompt.getByRole("button", { name: "Edit and resend user message" }).click();
   const composerDocument = page.locator(".composer-document");
   const fields = composerDocument.locator("textarea");
@@ -857,7 +866,9 @@ test("opens attachment chips with native browser viewing and automatic downloads
   const editor = page.locator('textarea[role="combobox"]');
   await expect(editor).toBeEnabled();
   const markdown = "# 完整的中文附件 📝\n".repeat(200);
+  const html = '<h1>中文页面 Native HTML</h1><script>document.body.dataset.executed="true"</script>';
   const word = Buffer.from("Original DOC bytes\0\x01");
+  const wordName = `${"long-filename-".repeat(12)}.doc`;
   const wave = Buffer.alloc(8_044, 128);
   wave.write("RIFF", 0);
   wave.writeUInt32LE(wave.length - 8, 4);
@@ -888,10 +899,10 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await page.locator('input[type="file"]').setInputFiles([
     { name: "context.md", mimeType: "text/markdown", buffer: Buffer.from(markdown) },
     { name: "note.txt", mimeType: "text/plain", buffer: Buffer.from("原生文本 Native text") },
-    { name: "page.html", mimeType: "text/html", buffer: Buffer.from('<h1>中文页面 Native HTML</h1><script>document.body.dataset.executed="true"</script>') },
+    { name: "page.html", mimeType: "text/html", buffer: Buffer.from(html) },
     { name: "voice.wav", mimeType: "audio/wav", buffer: wave },
     { name: "report.pdf", mimeType: "application/pdf", buffer: Buffer.from(pdf) },
-    { name: `${"long-filename-".repeat(12)}.doc`, mimeType: "application/msword", buffer: word },
+    { name: wordName, mimeType: "application/msword", buffer: word },
   ]);
   await expect(page.locator(".attachment-list > span")).toHaveCount(6);
   const request = page.waitForRequest((request) => request.method() === "POST" &&
@@ -907,7 +918,7 @@ test("opens attachment chips with native browser viewing and automatic downloads
   const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow" });
   const content = prompt.locator(".message-content");
   await expect(content.locator("a.attachment-chip")).toHaveCount(6);
-  await expect(content.locator("pre, img, audio, iframe, object, embed, [download]")).toHaveCount(0);
+  await expect(content.locator("pre, img, audio, iframe, object, embed")).toHaveCount(0);
   await expect(content).not.toContainText("# 完整的中文附件");
   // The log names each attachment by reference; its content is not in the document.
   const view = await (await page.request.get("/api/v2/scopes/session%2Fsaved-session")).json();
@@ -922,17 +933,20 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await page.screenshot({ path: testInfo.outputPath("attachment-chips-mobile.png") });
 
   const openCard = async (name: string) => {
+    const link = content.getByRole("link", { name: `Open ${name} in a new tab`, exact: true });
+    await expect(link).toHaveAttribute("href", /^blob:/u);
+    const href = (await link.getAttribute("href"))!;
     const [tab] = await Promise.all([
       page.waitForEvent("popup"),
-      content.getByRole("link", { name: `Open ${name} in a new tab`, exact: true }).click(),
+      link.click(),
     ]);
+    await expect(tab).toHaveURL(href);
+    expect(await tab.evaluate(() => window.opener)).toBeNull();
     return tab;
   };
   const textTab = await openCard("note.txt");
-  await expect(textTab).toHaveURL(/\/attachments\//);
   await expect(textTab.locator("pre")).toHaveText("原生文本 Native text");
   expect(await textTab.evaluate(() => document.characterSet)).toBe("UTF-8");
-  expect(await textTab.evaluate(() => window.opener)).toBeNull();
   await textTab.reload();
   await expect(textTab.locator("pre")).toHaveText("原生文本 Native text");
   await textTab.close();
@@ -942,10 +956,23 @@ test("opens attachment chips with native browser viewing and automatic downloads
   expect(await markdownTab.evaluate(() => document.characterSet)).toBe("UTF-8");
   await markdownTab.close();
 
-  const htmlTab = await openCard("page.html");
-  await expect(htmlTab.getByRole("heading", { name: "中文页面 Native HTML" })).toBeVisible();
-  await expect(htmlTab.locator("[data-executed]")).toHaveCount(0);
-  await htmlTab.close();
+  // Active documents are opaque downloads, never same-origin executable tabs.
+  const htmlLink = content.getByRole("link", { name: "Open page.html in a new tab", exact: true });
+  await expect(htmlLink).toHaveAttribute("download", "page.html");
+  const pageUrl = page.url();
+  let htmlPopups = 0;
+  const noteHtmlPopup = () => { htmlPopups += 1; };
+  page.on("popup", noteHtmlPopup);
+  try {
+    const [htmlDownload] = await Promise.all([page.waitForEvent("download"), htmlLink.click()]);
+    expect(htmlDownload.suggestedFilename()).toBe("page.html");
+    expect(await readFile((await htmlDownload.path())!)).toEqual(Buffer.from(html));
+    await expect(page).toHaveURL(pageUrl);
+    await expect(page.locator("[data-executed]")).toHaveCount(0);
+    expect(htmlPopups).toBe(0);
+  } finally {
+    page.off("popup", noteHtmlPopup);
+  }
 
   const audioTab = await openCard("attachment.wav");
   const player = audioTab.locator("audio, video");
@@ -954,28 +981,16 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await audioTab.close();
 
   const pdfLink = content.getByRole("link", { name: "Open report.pdf in a new tab", exact: true });
-  const pdfHref = (await pdfLink.getAttribute("href"))!;
-  const pdfResponse = await page.request.get(pdfHref);
-  expect(pdfResponse.status()).toBe(200);
-  expect(pdfResponse.headers()["content-type"]).toBe("application/pdf");
-  expect(pdfResponse.headers()["content-disposition"]).toMatch(/^inline;/u);
-  expect(await pdfResponse.body()).toEqual(Buffer.from(pdf));
-  // Full Chrome can preview PDFs; the CI headless shell downloads them instead.
-  // Both are browser-native outcomes of the same link and unchanged file bytes.
-  if (await page.evaluate(() => navigator.pdfViewerEnabled)) {
-    const pdfTab = await openCard("report.pdf");
-    await expect(pdfTab).toHaveURL(new URL(pdfHref, page.url()).href);
-    await pdfTab.close();
-  } else {
-    const [pdfDownload] = await Promise.all([page.waitForEvent("download"), pdfLink.click()]);
-    expect(pdfDownload.suggestedFilename()).toBe("report.pdf");
-    expect(await readFile((await pdfDownload.path())!)).toEqual(Buffer.from(pdf));
-  }
+  await expect(pdfLink).toHaveAttribute("download", "report.pdf");
+  const [pdfDownload] = await Promise.all([page.waitForEvent("download"), pdfLink.click()]);
+  expect(pdfDownload.suggestedFilename()).toBe("report.pdf");
+  expect(await readFile((await pdfDownload.path())!)).toEqual(Buffer.from(pdf));
 
-  const download = page.waitForEvent("download");
-  await content.getByRole("link", { name: new RegExp("Open long-filename-") }).click();
-  const path = await (await download).path();
-  expect(await readFile(path!)).toEqual(word);
+  const wordLink = content.getByRole("link", { name: `Open ${wordName} in a new tab`, exact: true });
+  await expect(wordLink).toHaveAttribute("download", wordName);
+  const [wordDownload] = await Promise.all([page.waitForEvent("download"), wordLink.click()]);
+  expect(wordDownload.suggestedFilename()).toBe(wordName);
+  expect(await readFile((await wordDownload.path())!)).toEqual(word);
   await expect(content.locator('[role="status"]')).toHaveCount(0);
   await page.setViewportSize({ width: 1280, height: 900 });
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
@@ -987,12 +1002,10 @@ test("opens attachment chips with native browser viewing and automatic downloads
   expect(second!.x).toBeGreaterThan(first!.x + first!.width);
   await page.screenshot({ path: testInfo.outputPath("attachment-chips-desktop.png") });
   await page.getByRole("button", { name: "Thread actions" }).click();
-  const exportRequest = page.waitForRequest((request) => new URL(request.url()).searchParams.get("includeAttachmentContent") === "true");
   const [exported] = await Promise.all([
     page.waitForEvent("popup"),
     page.getByRole("button", { name: "Open as Markdown" }).click(),
   ]);
-  await exportRequest;
   await expect(exported.locator("body")).toContainText("# 完整的中文附件 📝");
   await expect(exported.locator("body")).toContainText("Binary · application/msword · 20 bytes");
   await exported.close();
