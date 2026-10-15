@@ -2922,16 +2922,16 @@ where
                         action,
                         reply,
                     }) => {
-                        let mut state = state.lock().await;
-                        let acted = resources::act(
-                            &mut state,
-                            &sink,
-                            &auth_terminal,
-                            &scope,
-                            &resource,
-                            action,
-                        );
-                        let _ = reply.send(acted);
+                        let acted = {
+                            let mut state = state.lock().await;
+                            resources::act(&mut state, &sink, &scope, &resource, action)
+                        };
+                        match acted {
+                            Ok(Some(io)) => resources::perform(&auth_terminal, io, reply),
+                            acted => {
+                                let _ = reply.send(acted.map(drop));
+                            }
+                        }
                         continue;
                     }
                     Some(BridgeInput::Workspace { session_id, reply }) => {

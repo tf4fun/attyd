@@ -1,8 +1,11 @@
 //! Resource actions in the bridge actor (protocol §7, migration step 6).
 //!
 //! An action takes no `expect` and installs no operation. Its resource is
-//! found by the full scope and resource ID in the current state, and it is
-//! checked and applied under one bridge guard; the commit publishes it.
+//! found by the full scope and resource ID in the current state and checked
+//! under one bridge guard; a dismissal is applied there too, and the commit
+//! publishes it. Terminal I/O runs after the guard is released, in the order
+//! the actor receives it, so a stdin under backpressure never holds the lock
+//! the terminal's output needs.
 use super::*;
 use crate::protocol::documents::{ErrorCode, ProtocolError};
 
@@ -12,6 +15,12 @@ pub(crate) enum ResourceAction {
     Input { data: String },
     Resize { cols: u16, rows: u16 },
     Dismiss,
+}
+
+/// The terminal I/O of a checked action, run after the guard is released.
+pub(super) struct TerminalIo {
+    terminal: String,
+    action: ResourceAction,
 }
 
 fn not_found(scope: &OpScope, resource: &str) -> ProtocolError {
@@ -25,17 +34,18 @@ fn not_allowed(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ErrorCode::NotAllowed, message)
 }
 
-/// Applies `action` to `resource` in `scope`.
+/// Checks `action` on `resource` in `scope` under the guard, and applies a
+/// dismissal; the terminal I/O of an input or resize is returned to run
+/// once the guard is released.
 pub(super) fn act(
     state: &mut BridgeState,
     sink: &EventSink,
-    auth_terminal: &AuthTerminalManager,
     scope: &OpScope,
     resource: &str,
     action: ResourceAction,
-) -> Result<(), ProtocolError> {
+) -> Result<Option<TerminalIo>, ProtocolError> {
     if action == ResourceAction::Dismiss && dismiss_url_flow(state, sink, scope, resource) {
-        return Ok(());
+        return Ok(None);
     }
     // A login terminal is `global`'s, by its operation's ID (§4.6).
     let exited = match scope {
@@ -54,16 +64,52 @@ pub(super) fn act(
         ))),
         ResourceAction::Dismiss => {
             state.sessions.discard_login_terminal(resource);
-            Ok(())
+            Ok(None)
         }
         _ if exited => Err(not_allowed(format!("login terminal {resource} has exited"))),
-        // Written each time, in the order the bridge receives it (C3).
-        ResourceAction::Input { data } => auth_terminal
-            .write(resource, &data)
-            .map_err(|error| not_allowed(error_message(error))),
-        ResourceAction::Resize { cols, rows } => auth_terminal
-            .resize(resource, cols, rows)
-            .map_err(|error| not_allowed(error_message(error))),
+        action => Ok(Some(TerminalIo {
+            terminal: resource.to_string(),
+            action,
+        })),
+    }
+}
+
+/// Runs a checked action's terminal I/O, without the bridge guard, and
+/// answers `reply` when it ends. Input is queued on the terminal's own
+/// blocking writer in the order the actor receives it (C3), written each
+/// time; the actor does not wait for the write.
+pub(super) fn perform(
+    auth_terminal: &AuthTerminalManager,
+    io: TerminalIo,
+    reply: oneshot::Sender<Result<(), ProtocolError>>,
+) {
+    let refused = |error: Error| not_allowed(error_message(error));
+    match io.action {
+        ResourceAction::Input { data } => match auth_terminal.queue_input(&io.terminal, data) {
+            Err(error) => {
+                let _ = reply.send(Err(refused(error)));
+            }
+            Ok(written) => {
+                tokio::spawn(async move {
+                    let result = match written.await {
+                        Ok(result) => result.map_err(refused),
+                        Err(_) => Err(not_allowed(format!(
+                            "login terminal {} ended before its input was written",
+                            io.terminal
+                        ))),
+                    };
+                    let _ = reply.send(result);
+                });
+            }
+        },
+        ResourceAction::Resize { cols, rows } => {
+            let _ = reply.send(
+                auth_terminal
+                    .resize(&io.terminal, cols, rows)
+                    .map_err(refused),
+            );
+        }
+        ResourceAction::Dismiss => unreachable!("a dismissal is applied under the guard"),
     }
 }
 

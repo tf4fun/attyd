@@ -28,6 +28,12 @@ pub(crate) enum AuthTerminalEvent {
 /// Called from the terminal's blocking reader and waiter threads.
 pub(crate) type AuthTerminalObserver = Arc<dyn Fn(AuthTerminalEvent) + Send + Sync>;
 
+/// Writes one input to the login's stdin, in queue order; the sender learns
+/// how the write ended.
+type QueuedInput = (String, tokio::sync::oneshot::Sender<Result<(), Error>>);
+
+type TerminalWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
 #[derive(Clone)]
 pub struct AuthTerminalManager {
     active: Arc<Mutex<Option<Arc<ActiveAuthTerminal>>>>,
@@ -46,7 +52,9 @@ struct ActiveAuthTerminal {
     request_id: String,
     method_id: String,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: TerminalWriter,
+    /// The input queue of the terminal's own blocking writer.
+    input: std::sync::mpsc::Sender<QueuedInput>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     cancelled: AtomicBool,
     settled: AtomicBool,
@@ -107,7 +115,10 @@ impl AuthTerminalManager {
             })
             .map_err(internal_error)?;
         let reader = pair.master.try_clone_reader().map_err(internal_error)?;
-        let writer = pair.master.take_writer().map_err(internal_error)?;
+        let writer: TerminalWriter = Arc::new(Mutex::new(
+            pair.master.take_writer().map_err(internal_error)?,
+        ));
+        let (input, queued) = std::sync::mpsc::channel();
         let mut command = CommandBuilder::new(program);
         command.args(agent_command.iter().skip(1));
         command.args(&method.args);
@@ -121,7 +132,8 @@ impl AuthTerminalManager {
             request_id: request_id.clone(),
             method_id: method.id.0.to_string(),
             master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            writer: writer.clone(),
+            input,
             killer: Mutex::new(child.clone_killer()),
             cancelled: AtomicBool::new(false),
             settled: AtomicBool::new(false),
@@ -138,6 +150,7 @@ impl AuthTerminalManager {
         }));
         let (drained, reader_done) = std::sync::mpsc::channel();
         self.spawn_reader(active.clone(), reader, drained);
+        spawn_writer(writer, queued);
         self.spawn_waiter(active, child, reader_done);
         Ok(())
     }
@@ -149,6 +162,24 @@ impl AuthTerminalManager {
             .write_all(data.as_bytes())
             .map_err(Error::into_internal_error)?;
         writer.flush().map_err(Error::into_internal_error)
+    }
+
+    /// Queues `data` for the login's stdin behind the input queued before it.
+    /// The write runs on the terminal's own blocking writer, so a stdin that
+    /// applies backpressure holds no caller's lock or async worker; the
+    /// returned receiver resolves when the bytes are written.
+    pub(crate) fn queue_input(
+        &self,
+        request_id: &str,
+        data: String,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), Error>>, Error> {
+        let active = self.require_active(request_id)?;
+        let (written, done) = tokio::sync::oneshot::channel();
+        active.input.send((data, written)).map_err(|_| {
+            Error::invalid_request()
+                .data("Agent terminal authentication request is no longer active")
+        })?;
+        Ok(done)
     }
 
     pub fn resize(&self, request_id: &str, cols: u16, rows: u16) -> Result<(), Error> {
@@ -353,6 +384,22 @@ pub(crate) fn validate_size(cols: u16, rows: u16) -> Result<(), Error> {
         return Err(Error::invalid_params().data("terminal dimensions must be positive"));
     }
     Ok(())
+}
+
+/// The terminal's blocking writer: it writes the queued input in order and
+/// ends when the terminal, which holds the queue, is gone.
+fn spawn_writer(writer: TerminalWriter, queued: std::sync::mpsc::Receiver<QueuedInput>) {
+    tokio::task::spawn_blocking(move || {
+        while let Ok((data, written)) = queued.recv() {
+            let result = writer.lock().map_err(lock_error).and_then(|mut writer| {
+                writer
+                    .write_all(data.as_bytes())
+                    .and_then(|()| writer.flush())
+                    .map_err(Error::into_internal_error)
+            });
+            let _ = written.send(result);
+        }
+    });
 }
 
 fn lock_error<T>(error: std::sync::PoisonError<T>) -> Error {
