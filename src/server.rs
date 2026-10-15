@@ -2200,14 +2200,15 @@ async fn read_session(
     {
         return invalid_request(format!("{attachment_id} is not an attachment ID"));
     }
-    let scope = Scope::Session(session_id.to_string()).to_string();
+    let session = Scope::Session(session_id.to_string());
     let held = state
         .bridge
         .publication
         .lock()
         .publisher
-        .document(&scope)
+        .live(&session)
         .is_some();
+    let scope = session.to_string();
     let unheld = || {
         refused(ProtocolError::new(
             ErrorCode::NotFound,
