@@ -26,10 +26,13 @@ const QUIET: Duration = Duration::from_millis(300);
 // The published timeline
 
 /// The documents the bridge published, after each commit of its first
-/// generation, from a cut taken before that generation's first commit.
+/// generation (and of the next ones it is told to follow), from a cut taken
+/// before that generation's first commit.
 struct Timeline {
     documents: Vec<Documents>,
     commits: mpsc::UnboundedReceiver<PublishedCommit>,
+    /// The sender every followed generation taps.
+    tap: mpsc::UnboundedSender<PublishedCommit>,
 }
 
 impl Timeline {
@@ -37,11 +40,12 @@ impl Timeline {
     fn arm(hub: &BridgeHub) -> Arc<Mutex<Self>> {
         let (tap, commits) = mpsc::unbounded_channel();
         let mut published = hub.publication.lock();
-        published.next_tap = Some(tap);
+        published.next_tap = Some(tap.clone());
         let cut = documents(&published.publisher);
         Arc::new(Mutex::new(Self {
             documents: vec![cut],
             commits,
+            tap,
         }))
     }
 
@@ -164,6 +168,19 @@ impl Bench {
 
     fn accepted(&self) -> usize {
         self.agents.as_ref().unwrap().accepted()
+    }
+
+    /// Taps the next generation into the same timeline, from its first
+    /// commit on, so a stream crossing into it is checked against both. The
+    /// current generation must have taken its own tap already.
+    async fn follow_next_generation(&self) {
+        let tap = self.timeline.lock().await.tap.clone();
+        let mut published = self.hub.publication.lock();
+        assert!(
+            published.next_tap.is_none(),
+            "the current generation has not taken its tap"
+        );
+        published.next_tap = Some(tap);
     }
 
     // -- HTTP -----------------------------------------------------------------
