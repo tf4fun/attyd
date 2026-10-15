@@ -28,13 +28,13 @@ pub(crate) enum SessionLog {
 }
 
 /// A held session the next Agent connection loads again: bridge memory
-/// that outlives the connection (protocol S6, §5.4). It keeps the log the
-/// session had, with its attachments, and the waiting `load`.
+/// that outlives the connection (protocol S6, §5.4). It keeps the controls
+/// and the log the session had, with its attachments, and the waiting `load`.
 #[derive(Debug, Clone)]
 pub(crate) struct WaitingSession {
     pub session_id: String,
     pub cwd: std::path::PathBuf,
-    pub session: Value,
+    pub controls: SessionControls,
     pub log: SessionLog,
     pub op: OpSlot,
 }
@@ -626,7 +626,7 @@ impl SessionRegistry {
         Some(WaitingSession {
             session_id: session_id.to_string(),
             cwd: live.cwd.clone(),
-            session: live.session.clone(),
+            controls: live.controls.clone(),
             log: entry.state.log.clone(),
             op: live.op.clone(),
         })
@@ -854,15 +854,8 @@ impl SessionRegistry {
         })
     }
 
-    /// A setup response arrived: controls settle from the earlier updates and
-    /// the response (protocol §4.5).
-    pub(crate) fn settle_session_controls(&mut self, session_id: &str) {
-        if let Some(live) = self.held_live_mut(session_id) {
-            live.controls = SessionControls::settle(&live.control_state, &live.session);
-        }
-    }
-
-    /// A control update or a control operation's acknowledgement arrived.
+    /// A test's control update of a held session.
+    #[cfg(test)]
     pub(crate) fn fold_session_controls(&mut self, session_id: &str, update: &Value) {
         if let Some(live) = self.held_live_mut(session_id) {
             live.controls.fold_update(update);

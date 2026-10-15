@@ -600,7 +600,6 @@ fn interactions_and_controls_change_in_live_while_the_log_stays() {
             EPOCH,
             "s",
             incarnation,
-            "session_info_update",
             json!({ "sessionUpdate": "session_info_update", "title": "Renamed" }),
         )
         .unwrap();
@@ -772,9 +771,7 @@ fn a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_end
             incarnation,
             "rpc",
             SessionOperationKind::SetMode,
-            "current_mode_update",
             json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
-            json!({}),
         )
         .unwrap();
     let ended = single(&gate.commit(), "session/s");
@@ -835,9 +832,7 @@ fn a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options(
             incarnation,
             "rpc",
             SessionOperationKind::SetConfig,
-            "config_option_update",
             json!({ "sessionUpdate": "config_option_update", "configOptions": confirmed }),
-            json!({}),
         )
         .unwrap();
     gate.commit();
@@ -895,25 +890,17 @@ fn control_updates_fold_after_the_response() {
             EPOCH,
             "s",
             incarnation,
-            "current_mode_update",
             json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
         )
         .unwrap();
     gate.registry
-        .update_control_state(
-            EPOCH,
-            "s",
-            incarnation,
-            "usage_update",
-            json!({ "sessionUpdate": "usage_update", "used": 1, "size": 9, "cost": { "amount": 1, "currency": "USD" } }),
-        )
+        .update_control_state(EPOCH, "s", incarnation, json!({ "sessionUpdate": "usage_update", "used": 1, "size": 9, "cost": { "amount": 1, "currency": "USD" } }))
         .unwrap();
     gate.registry
         .update_control_state(
             EPOCH,
             "s",
             incarnation,
-            "usage_update",
             json!({ "sessionUpdate": "usage_update", "used": 2, "size": 9 }),
         )
         .unwrap();
@@ -1187,7 +1174,6 @@ fn the_gate_reports_a_transition_that_was_not_committed() {
             EPOCH,
             "s",
             incarnation,
-            "current_mode_update",
             json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
         )
         .unwrap();
@@ -1258,7 +1244,7 @@ fn later_identical_mode_notification_overrides_setup_response() {
         "response"
     );
     gate.registry
-        .update_control_state(EPOCH, "s", incarnation, "current_mode_update", update)
+        .update_control_state(EPOCH, "s", incarnation, update)
         .unwrap();
     let events = gate.commit();
     assert_eq!(
@@ -1294,7 +1280,7 @@ fn later_identical_config_notification_overrides_setup_response() {
         "response"
     );
     gate.registry
-        .update_control_state(EPOCH, "s", incarnation, "config_option_update", update)
+        .update_control_state(EPOCH, "s", incarnation, update)
         .unwrap();
     let events = gate.commit();
     assert_eq!(gate.live("session/s")["controls"]["configOptions"], early);

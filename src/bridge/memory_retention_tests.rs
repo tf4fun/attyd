@@ -152,7 +152,7 @@ fn append_unpublished_usage(
     let epoch = state.sessions.epoch().to_string();
     state
         .sessions
-        .update_control_state(&epoch, SESSION, incarnation, "usage_update", update)
+        .update_control_state(&epoch, SESSION, incarnation, update)
         .unwrap();
 }
 

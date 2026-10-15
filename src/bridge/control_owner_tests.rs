@@ -69,25 +69,19 @@ fn controls_from_old_owners_are_refused_without_mutation() {
     let epoch = turn.state.sessions.epoch().to_string();
     let before = turn.state.sessions.session(SESSION);
     for update in controls() {
-        let key = update["sessionUpdate"].as_str().unwrap().to_string();
         assert_eq!(
             turn.state.sessions.update_control_state(
                 "old-epoch",
                 SESSION,
                 turn.incarnation,
-                &key,
                 update.clone()
             ),
             Err(RuntimeStateError::EpochMismatch)
         );
         assert_eq!(
-            turn.state.sessions.update_control_state(
-                &epoch,
-                SESSION,
-                turn.incarnation + 1,
-                &key,
-                update
-            ),
+            turn.state
+                .sessions
+                .update_control_state(&epoch, SESSION, turn.incarnation + 1, update),
             Err(RuntimeStateError::StaleIncarnation)
         );
         assert_eq!(turn.state.sessions.session(SESSION), before);
@@ -121,15 +115,10 @@ fn controls_from_old_owners_are_refused_without_mutation() {
     assert_ne!(reopened, turn.incarnation);
     let reopened_session = turn.state.sessions.session(SESSION);
     for update in controls() {
-        let key = update["sessionUpdate"].as_str().unwrap().to_string();
         assert_eq!(
-            turn.state.sessions.update_control_state(
-                &epoch,
-                SESSION,
-                turn.incarnation,
-                &key,
-                update
-            ),
+            turn.state
+                .sessions
+                .update_control_state(&epoch, SESSION, turn.incarnation, update),
             Err(RuntimeStateError::StaleIncarnation)
         );
         assert_eq!(turn.state.sessions.session(SESSION), reopened_session);

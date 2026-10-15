@@ -1128,7 +1128,10 @@ fn prepare_session_load(
         .sessions
         .session_ref(&session_id)
         .filter(|session| {
-            session.live.session.is_object() && session.live.lifecycle != SessionLifecycle::Closed
+            !matches!(
+                session.live.lifecycle,
+                SessionLifecycle::Attaching | SessionLifecycle::Closed
+            )
         })
         .map(|session| session.state.incarnation)
         .or_else(|| {
@@ -2730,13 +2733,9 @@ async fn handle_session_update(
                         Ok(())
                     }
                 } else {
-                    let key = update
-                        .get("sessionUpdate")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
                     state
                         .sessions
-                        .update_control_state(&epoch, &session_id, incarnation, key, update.clone())
+                        .update_control_state(&epoch, &session_id, incarnation, update.clone())
                         .map_err(runtime_state_error)
                 }
             } else {
@@ -4543,7 +4542,8 @@ async fn handle_command_inner(
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {session_id}"))
                 })?;
-                validate_session_mode_reference(session.live.modes(), &mode_id)
+                let modes = serde_json::to_value(&session.live.controls.modes)?;
+                validate_session_mode_reference((!modes.is_null()).then_some(&modes), &mode_id)
                     .map_err(semantic_error)?;
                 let incarnation = session.state.incarnation;
                 reserve_session_operation(
@@ -4647,12 +4647,10 @@ async fn handle_command_inner(
                         incarnation,
                         &request_id,
                         RuntimeSessionOperationKind::SetMode,
-                        "current_mode_update",
                         json!({
                             "sessionUpdate": "current_mode_update",
                             "currentModeId": mode_id,
                         }),
-                        serde_json::to_value(&response)?,
                     )
                     .map_err(runtime_state_error)?;
                 release_session_operation(
@@ -4690,7 +4688,7 @@ async fn handle_command_inner(
                         .data(format!("unknown or inactive session: {session_id}"))
                 })?;
                 validate_session_config_reference(
-                    session.live.config_options(),
+                    &Value::from(session.live.controls.config_options.clone()),
                     &config_id,
                     &value,
                 )
@@ -4824,12 +4822,10 @@ async fn handle_command_inner(
                         incarnation,
                         &request_id,
                         RuntimeSessionOperationKind::SetConfig,
-                        "config_option_update",
                         json!({
                             "sessionUpdate": "config_option_update",
                             "configOptions": config_options,
                         }),
-                        response_value,
                     )
                     .map_err(runtime_state_error)?;
                 release_session_operation(
@@ -7252,7 +7248,10 @@ mod tests {
             .live
             .as_mut()
             .unwrap()
-            .session["modes"] = json!({ "currentModeId": "build" });
+            .controls
+            .fold_update(
+                &json!({ "sessionUpdate": "current_mode_update", "currentModeId": "build" }),
+            );
         let state = Arc::new(BridgeLock::new(bridge_state));
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
@@ -7286,16 +7285,7 @@ mod tests {
             &owner.active_turn.as_ref().unwrap().updates,
         ));
         assert_eq!(
-            runtime.control_state["current_mode_update"]["currentModeId"],
-            "plan",
-        );
-        assert_eq!(
-            state
-                .sessions
-                .live("session")
-                .unwrap()
-                .current_mode_id()
-                .unwrap(),
+            runtime.controls.modes.as_ref().unwrap().current_mode_id,
             "plan",
         );
     }

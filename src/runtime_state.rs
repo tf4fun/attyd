@@ -6,7 +6,7 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::protocol::SessionControls;
 use crate::protocol::documents::OperationKind;
@@ -26,8 +26,7 @@ pub(crate) struct SessionRuntime {
     pub session_id: String,
     pub incarnation: u64,
     pub cwd: String,
-    pub session: Value,
-    pub control_state: BTreeMap<String, Value>,
+    pub controls: SessionControls,
     pub lifecycle: SessionLifecycle,
     pub active_turn: Option<ActiveTurn>,
     pub operation: Option<SessionOperationState>,
@@ -41,8 +40,6 @@ pub(crate) struct SessionRuntime {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SessionLiveState {
     pub cwd: PathBuf,
-    pub session: Value,
-    pub control_state: BTreeMap<String, Value>,
     pub lifecycle: SessionLifecycle,
     pub permissions: BTreeMap<String, PendingInteraction>,
     pub elicitations: BTreeMap<String, PendingInteraction>,
@@ -58,31 +55,6 @@ pub(crate) struct SessionLiveState {
     pub(crate) op: OpSlot,
     /// The reduced controls (protocol §4.5).
     pub(crate) controls: SessionControls,
-}
-
-impl SessionLiveState {
-    pub(crate) fn modes(&self) -> Option<&Value> {
-        self.session.get("modes").filter(|value| !value.is_null())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn current_mode_id(&self) -> Option<&str> {
-        self.control_state
-            .get("current_mode_update")
-            .and_then(|update| update.get("currentModeId"))
-            .or_else(|| self.modes().and_then(|modes| modes.get("currentModeId")))
-            .and_then(Value::as_str)
-    }
-
-    pub(crate) fn config_options(&self) -> &Value {
-        static EMPTY: Value = Value::Array(Vec::new());
-        self.control_state
-            .get("config_option_update")
-            .and_then(|update| update.get("configOptions"))
-            .or_else(|| self.session.get("configOptions"))
-            .filter(|value| value.is_array())
-            .unwrap_or(&EMPTY)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,8 +256,7 @@ impl SessionRegistry {
             session_id: state.session_id.clone(),
             incarnation: state.incarnation,
             cwd: live.cwd.to_string_lossy().into_owned(),
-            session: live.session.clone(),
-            control_state: live.control_state.clone(),
+            controls: live.controls.clone(),
             lifecycle: live.lifecycle.clone(),
             active_turn: state.active_turn.as_ref().and_then(|turn| {
                 turn.execution.as_ref().map(|execution| ActiveTurn {
@@ -326,8 +297,7 @@ impl SessionRegistry {
             &epoch,
             waiting.session_id.clone(),
             waiting.cwd,
-            waiting.session,
-            BTreeMap::new(),
+            waiting.controls,
         )?;
         self.register_new(waiting.session_id.clone(), incarnation);
         let entry = self
@@ -352,14 +322,8 @@ impl SessionRegistry {
         session: Value,
         replay: Vec<Value>,
     ) -> Result<u64, RuntimeStateError> {
-        let control_state = extract_control_state(replay);
-        self.open_session(
-            expected_epoch,
-            session_id.into(),
-            cwd.into(),
-            session,
-            control_state,
-        )
+        let controls = settle_controls(replay, &session);
+        self.open_session(expected_epoch, session_id.into(), cwd.into(), controls)
     }
 
     pub(crate) fn start_attachment(
@@ -404,8 +368,6 @@ impl SessionRegistry {
             incarnation,
             SessionLiveState {
                 cwd,
-                session: Value::Null,
-                control_state: BTreeMap::new(),
                 lifecycle: SessionLifecycle::Attaching,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
@@ -545,7 +507,6 @@ impl SessionRegistry {
         response: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let response = retain_session_metadata(session_id, response);
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
         let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active
@@ -562,10 +523,8 @@ impl SessionRegistry {
         }
         let candidate = std::mem::take(&mut session.attachment_candidate);
         session.attachment_candidate_bytes = 0;
-        session.control_state = extract_control_state(candidate);
-        session.session = response;
+        session.controls = settle_controls(candidate, &response);
         owner.operation = None;
-        self.settle_session_controls(session_id);
         self.complete_session_operation(session_id, SessionOperationKind::Load, &Value::Null);
 
         self.settle_session_ops(session_id);
@@ -615,7 +574,6 @@ impl SessionRegistry {
         response: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let response = retain_session_metadata(session_id, response);
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
         let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Attaching
@@ -630,13 +588,10 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let candidate = std::mem::take(&mut session.attachment_candidate);
-        let controls = extract_control_state(candidate);
         session.attachment_candidate_bytes = 0;
-        session.control_state.extend(controls);
-        session.session = response;
+        session.controls = settle_controls(candidate, &response);
         session.lifecycle = SessionLifecycle::Active;
         owner.operation = None;
-        self.settle_session_controls(session_id);
         self.complete_session_operation(session_id, kind, &Value::Null);
 
         self.settle_session_ops(session_id);
@@ -695,14 +650,8 @@ impl SessionRegistry {
                 return Err(RuntimeStateError::SessionNotActive);
             }
         }
-        let control_state = target_replay.map_or_else(BTreeMap::new, extract_control_state);
-        self.open_session(
-            expected_epoch,
-            session_id.into(),
-            cwd.into(),
-            session,
-            control_state,
-        )
+        let controls = settle_controls(target_replay.unwrap_or_default(), &session);
+        self.open_session(expected_epoch, session_id.into(), cwd.into(), controls)
     }
 
     fn open_session(
@@ -710,8 +659,7 @@ impl SessionRegistry {
         expected_epoch: &str,
         session_id: String,
         cwd: PathBuf,
-        session: Value,
-        control_state: BTreeMap<String, Value>,
+        controls: SessionControls,
     ) -> Result<u64, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         if self.sessions.get(&session_id).is_some_and(|entry| {
@@ -726,15 +674,11 @@ impl SessionRegistry {
         }
         self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
         let incarnation = self.next_incarnation;
-        let session = retain_session_metadata(&session_id, session);
-        let controls = SessionControls::settle(&control_state, &session);
         self.install_live(
             &session_id,
             incarnation,
             SessionLiveState {
                 cwd,
-                session,
-                control_state,
                 lifecycle: SessionLifecycle::Active,
                 permissions: BTreeMap::new(),
                 elicitations: BTreeMap::new(),
@@ -834,12 +778,12 @@ impl SessionRegistry {
         Ok(())
     }
 
+    /// A later control update (protocol §4.5).
     pub(crate) fn update_control_state(
         &mut self,
         expected_epoch: &str,
         session_id: &str,
         incarnation: u64,
-        key: impl Into<String>,
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
@@ -852,19 +796,7 @@ impl SessionRegistry {
         ) {
             return Err(RuntimeStateError::SessionNotActive);
         }
-        let key = key.into();
-        let incoming = update.clone();
-        let update = fold_control_update(session.control_state.get(&key), update);
-        let unchanged = session.control_state.get(&key) == Some(&update);
-        // A later notification overrides the setup response even when it
-        // repeats an earlier one (protocol §4.5), so the documents' controls
-        // fold it before the v1 store drops it as a duplicate.
-        self.fold_session_controls(session_id, &incoming);
-        if unchanged {
-            return Ok(());
-        }
-        let session = self.require_live_mut(session_id, incarnation)?;
-        session.control_state.insert(key.clone(), update.clone());
+        session.controls.fold_update(&update);
         Ok(())
     }
 
@@ -877,8 +809,7 @@ impl SessionRegistry {
         replay: Vec<Value>,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let response = retain_session_metadata(session_id, response);
-        let controls = extract_control_state(replay);
+        let controls = settle_controls(replay, &response);
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
         let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active
@@ -889,9 +820,7 @@ impl SessionRegistry {
         {
             return Err(RuntimeStateError::BusySession);
         }
-        session.session = response;
-        session.control_state = controls;
-        self.settle_session_controls(session_id);
+        session.controls = controls;
         self.settle_session_ops(session_id);
         Ok(())
     }
@@ -1665,9 +1594,7 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
-        control_key: impl Into<String>,
         control_update: Value,
-        _result: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         if !matches!(
@@ -1677,18 +1604,19 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let owner = self.require_live_owner_mut(session_id, incarnation)?;
-        let session = owner.live.as_mut().expect("live owner checked");
         if owner.operation.as_ref().is_none_or(|operation| {
             operation.operation_id != operation_id || operation.kind != kind
         }) {
             return Err(RuntimeStateError::OperationMismatch);
         }
-        session
-            .control_state
-            .insert(control_key.into(), control_update.clone());
         owner.operation = None;
         // The acknowledgement folds after every earlier notification (§4.5).
-        self.fold_session_controls(session_id, &control_update);
+        owner
+            .live
+            .as_mut()
+            .expect("live owner checked")
+            .controls
+            .fold_update(&control_update);
         self.complete_session_operation(session_id, kind, &Value::Null);
 
         self.settle_session_ops(session_id);
@@ -2239,19 +2167,14 @@ pub(crate) fn fold_terminal_snapshot(previous: Option<&Value>, incoming: &Value)
     snapshot
 }
 
-fn extract_control_state(entries: Vec<Value>) -> BTreeMap<String, Value> {
-    let mut controls = BTreeMap::new();
-    for entry in entries {
-        if let Some(update) = retain_control_update(entry) {
-            let kind = update["sessionUpdate"]
-                .as_str()
-                .expect("retained control update has a kind")
-                .to_string();
-            let update = fold_control_update(controls.get(&kind), update);
-            controls.insert(kind, update);
-        }
-    }
-    controls
+/// The controls at a setup response: the early control updates, then the
+/// fields the response provides (protocol §4.5).
+fn settle_controls(early: Vec<Value>, response: &Value) -> SessionControls {
+    let early = early
+        .into_iter()
+        .filter_map(retain_control_update)
+        .collect::<Vec<_>>();
+    SessionControls::settle(&early, response)
 }
 
 pub(crate) fn fold_control_update(previous: Option<&Value>, update: Value) -> Value {
@@ -2273,20 +2196,6 @@ pub(crate) fn fold_control_update(previous: Option<&Value>, update: Value) -> Va
         }
     }
     Value::Object(merged)
-}
-
-fn retain_session_metadata(session_id: &str, response: Value) -> Value {
-    let mut retained = Map::new();
-    retained.insert(
-        "sessionId".to_string(),
-        Value::String(session_id.to_string()),
-    );
-    for key in ["modes", "configOptions"] {
-        if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
-            retained.insert(key.to_string(), value.clone());
-        }
-    }
-    Value::Object(retained)
 }
 
 fn retain_control_update(entry: Value) -> Option<Value> {
@@ -2625,13 +2534,9 @@ impl SessionRegistry {
         session: Value,
     ) -> Result<u64, RuntimeStateError> {
         let session_id = session_id.into();
-        let incarnation = self.open_session(
-            expected_epoch,
-            session_id.clone(),
-            cwd.into(),
-            session,
-            BTreeMap::new(),
-        )?;
+        let controls = SessionControls::settle([], &session);
+        let incarnation =
+            self.open_session(expected_epoch, session_id.clone(), cwd.into(), controls)?;
         self.register_new(session_id, incarnation);
         Ok(incarnation)
     }
@@ -3850,10 +3755,9 @@ mod tests {
 
         let session = state.session("session").unwrap();
         assert_eq!(
-            session.control_state["current_mode_update"]["currentModeId"],
+            session.controls.modes.as_ref().unwrap().current_mode_id,
             "plan"
         );
-        assert_eq!(session.session["modes"]["currentModeId"], "plan");
         assert!(
             !serde_json::to_string(&session)
                 .unwrap()
@@ -4402,13 +4306,22 @@ mod tests {
                 json!({ "modes": modes, "configOptions": options }),
             )
             .unwrap();
-        assert_eq!(state.live("session").unwrap().config_options(), &options);
+        assert_eq!(
+            Value::from(
+                state
+                    .live("session")
+                    .unwrap()
+                    .controls
+                    .config_options
+                    .clone()
+            ),
+            options
+        );
         state
             .update_control_state(
                 "epoch",
                 "session",
                 incarnation,
-                "current_mode_update",
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
             )
             .unwrap();
@@ -4417,19 +4330,19 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                "config_option_update",
                 json!({ "sessionUpdate": "config_option_update", "configOptions": [] }),
             )
             .unwrap();
         let live = state.live("session").unwrap();
-        assert_eq!(live.modes(), Some(&modes));
-        assert_eq!(live.current_mode_id(), Some("plan"));
-        assert_eq!(live.config_options(), &json!([]));
-        crate::semantic::validate_session_mode_reference(live.modes(), "build").unwrap();
-        crate::semantic::validate_session_mode_reference(live.modes(), "plan").unwrap();
+        let live_modes = serde_json::to_value(&live.controls.modes).unwrap();
+        assert_eq!(live_modes["availableModes"], modes["availableModes"]);
+        assert_eq!(live_modes["currentModeId"], "plan");
+        assert_eq!(live.controls.config_options, Some(Vec::new()));
+        crate::semantic::validate_session_mode_reference(Some(&live_modes), "build").unwrap();
+        crate::semantic::validate_session_mode_reference(Some(&live_modes), "plan").unwrap();
         assert!(
             crate::semantic::validate_session_config_reference(
-                live.config_options(),
+                &Value::from(live.controls.config_options.clone()),
                 "verbose",
                 &json!(true)
             )
@@ -4455,8 +4368,11 @@ mod tests {
             )
             .unwrap();
         let live = state.live("session").unwrap();
-        assert_eq!(live.current_mode_id(), Some("build"));
-        assert_eq!(live.config_options(), &options);
+        assert_eq!(
+            live.controls.modes.as_ref().unwrap().current_mode_id,
+            "build"
+        );
+        assert_eq!(Value::from(live.controls.config_options.clone()), options);
     }
 
     #[test]
@@ -4536,7 +4452,7 @@ mod tests {
             .unwrap();
         let replayed = state.session("replayed").unwrap();
         assert_eq!(
-            replayed.control_state["current_mode_update"]["currentModeId"],
+            replayed.controls.modes.as_ref().unwrap().current_mode_id,
             "plan"
         );
         assert!(
@@ -5163,9 +5079,7 @@ mod tests {
                 incarnation,
                 "mode",
                 SessionOperationKind::SetMode,
-                "current_mode_update",
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
-                json!({ "ok": true }),
             )
             .unwrap();
 
@@ -5173,7 +5087,7 @@ mod tests {
         let session = state.session("session").unwrap();
         assert!(session.operation.is_none());
         assert_eq!(
-            session.control_state["current_mode_update"]["currentModeId"],
+            session.controls.modes.as_ref().unwrap().current_mode_id,
             "plan",
         );
         assert!(!state.operation_in_use("mode"));
@@ -5247,7 +5161,7 @@ mod tests {
         assert_eq!(loaded.lifecycle, SessionLifecycle::Active);
         assert!(loaded.operation.is_none());
         assert_eq!(
-            loaded.control_state["current_mode_update"]["currentModeId"],
+            loaded.controls.modes.as_ref().unwrap().current_mode_id,
             "plan"
         );
         assert!(!serde_json::to_string(&loaded).unwrap().contains("partial"));
@@ -5294,7 +5208,7 @@ mod tests {
 
             let session = state.session(session_id).unwrap();
             assert_eq!(
-                session.control_state["current_mode_update"]["currentModeId"],
+                session.controls.modes.as_ref().unwrap().current_mode_id,
                 "plan"
             );
             assert!(!serde_json::to_string(&session).unwrap().contains("history"));
@@ -5673,7 +5587,6 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                "current_mode_update",
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "old" }),
             )
             .unwrap();
@@ -5682,7 +5595,6 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                "config_option_update",
                 json!({ "sessionUpdate": "config_option_update", "configId": "old-only" }),
             )
             .unwrap();
@@ -5719,9 +5631,8 @@ mod tests {
 
         let staging = state.session("session").unwrap();
         assert_eq!(staging.incarnation, incarnation);
-        assert_eq!(staging.session, json!({ "sessionId": "session" }));
         assert_eq!(
-            staging.control_state["current_mode_update"]["currentModeId"],
+            staging.controls.modes.as_ref().unwrap().current_mode_id,
             "old"
         );
         assert_eq!(state.live("session").unwrap().attachment_candidate.len(), 1);
@@ -5746,17 +5657,16 @@ mod tests {
         let reloaded = state.session("session").unwrap();
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(reloaded.incarnation, incarnation);
-        assert_eq!(reloaded.session["modes"]["currentModeId"], "new");
         assert!(
             !serde_json::to_string(&reloaded)
                 .unwrap()
                 .contains("must-not-survive-reload")
         );
         assert_eq!(
-            reloaded.control_state["current_mode_update"]["currentModeId"],
+            reloaded.controls.modes.as_ref().unwrap().current_mode_id,
             "new"
         );
-        assert!(!reloaded.control_state.contains_key("config_option_update"));
+        assert_eq!(reloaded.controls.config_options, None);
         assert!(reloaded.operation.is_none());
         assert!(
             state
@@ -5787,32 +5697,29 @@ mod tests {
         let incarnation = open(&mut state, "session");
         for update in &updates {
             state
-                .update_control_state(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    update["sessionUpdate"].as_str().unwrap(),
-                    update.clone(),
-                )
+                .update_control_state("epoch", "session", incarnation, update.clone())
                 .unwrap();
         }
-        let controls = &state.session("session").unwrap().control_state;
-        assert_eq!(controls["session_info_update"]["title"], "Keep");
-        assert_eq!(controls["session_info_update"]["updatedAt"], "after");
-        assert_eq!(controls["usage_update"]["cost"]["amount"], 2);
-        assert_eq!(&extract_control_state(updates), controls);
+        let controls = &state.session("session").unwrap().controls;
+        assert_eq!(controls.info.title.as_deref(), Some("Keep"));
+        assert_eq!(controls.info.updated_at.as_deref(), Some("after"));
+        let usage = controls.usage.as_ref().unwrap();
+        assert_eq!(
+            (usage.used, usage.cost.as_ref().unwrap()["amount"].clone()),
+            (3, json!(2))
+        );
+        assert_eq!(&settle_controls(updates, &json!({})), controls);
         state
             .update_control_state(
                 "epoch",
                 "session",
                 incarnation,
-                "session_info_update",
                 json!({ "sessionUpdate": "session_info_update", "title": null }),
             )
             .unwrap();
-        let controls = &state.session("session").unwrap().control_state;
-        assert_eq!(controls["session_info_update"]["title"], Value::Null);
-        assert_eq!(controls["session_info_update"]["updatedAt"], "after");
+        let controls = &state.session("session").unwrap().controls;
+        assert_eq!(controls.info.title, None);
+        assert_eq!(controls.info.updated_at.as_deref(), Some("after"));
     }
 
     #[test]
@@ -5824,12 +5731,10 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                "current_mode_update",
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "old" }),
             )
             .unwrap();
-        let old_session = state.session("session").unwrap().session.clone();
-        let old_controls = state.session("session").unwrap().control_state.clone();
+        let old_controls = state.session("session").unwrap().controls.clone();
 
         state
             .start_reload(
@@ -5861,8 +5766,7 @@ mod tests {
         let session = state.session("session").unwrap();
         assert_eq!(session.incarnation, incarnation);
         assert_eq!(session.lifecycle, SessionLifecycle::Active);
-        assert_eq!(session.session, old_session);
-        assert_eq!(session.control_state, old_controls);
+        assert_eq!(session.controls, old_controls);
         assert!(session.operation.is_none());
         assert!(
             state
@@ -6316,10 +6220,13 @@ mod tests {
             .unwrap();
 
         let session = state.session("session").unwrap();
-        assert!(
-            session
-                .control_state
-                .contains_key("available_commands_update")
+        assert_eq!(
+            session.controls.commands,
+            vec![json!({ "name": "inspect" })]
+        );
+        assert_eq!(
+            session.controls.modes.as_ref().unwrap().current_mode_id,
+            "plan"
         );
         assert!(session.terminals.contains_key("terminal"));
     }
