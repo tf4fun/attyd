@@ -291,9 +291,6 @@ impl Coordinator {
                         Some(OpScope::Session(session_id)) => Some(session_id.clone()),
                         _ => None,
                     });
-                let owner = requested_id
-                    .as_deref()
-                    .and_then(|id| locked.sessions.resource_owner(id).ok());
                 let expected = match &item.event {
                     BridgeIngress::RpcCompleted(completion) => Some(completion.owner.clone()),
                     BridgeIngress::Continuation { owner, .. } => Some(owner.clone()),
@@ -305,6 +302,20 @@ impl Coordinator {
                     }),
                     _ => None,
                 };
+                // A cold placeholder has resources but no runtime session yet:
+                // Agent input naming it stays connection-level, so an update
+                // before a creation response is kept as creation replay. An
+                // RPC, continuation or terminal it owns uses its session queue.
+                let owner = requested_id
+                    .as_deref()
+                    .filter(|id| {
+                        expected.is_some()
+                            || locked
+                                .sessions
+                                .state(id)
+                                .is_some_and(|session| session.live.is_some())
+                    })
+                    .and_then(|id| locked.sessions.resource_owner(id).ok());
                 if expected
                     .as_ref()
                     .is_some_and(|owner| !owns_request(&locked, owner))
