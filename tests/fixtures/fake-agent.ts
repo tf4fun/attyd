@@ -2019,6 +2019,7 @@ const agent = acp
           rawOutput: { ...output, exitStatus },
         },
       });
+      await holdPoint(params, "hold-release");
       await client.request(acp.methods.client.terminal.release, {
         sessionId: params.sessionId,
         terminalId: terminal.terminalId,
@@ -2438,20 +2439,25 @@ const stream = acp.ndJsonStream(
 const connection = agent.connect(stream);
 await connection.closed;
 
-// A prompt whose text contains `[hold:<name>]` ends only once the test writes
-// `<ATTYD_FAKE_TURN_END_GATE>/<name>`; the Agent writes `<name>.reached` when
-// the turn is ready to end.
-async function holdTurnEnd<T>(params: acp.PromptRequest, result: T): Promise<T> {
+// A prompt whose text contains `[<tag>:<name>]` stops at that point until the
+// test writes `<ATTYD_FAKE_TURN_END_GATE>/<name>`; the Agent writes
+// `<name>.reached` when it arrives. `hold` is the end of the turn;
+// `hold-release` is right before a flow releases its terminal.
+async function holdPoint(params: acp.PromptRequest, tag: "hold" | "hold-release"): Promise<void> {
   const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-  const name = /\[hold:([\w-]+)\]/u.exec(text)?.[1];
-  if (name == null) return result;
-  if (turnEndGate == null) throw new Error("[hold:…] prompts require ATTYD_FAKE_TURN_END_GATE");
+  const name = new RegExp(`\\[${tag}:([\\w-]+)\\]`, "u").exec(text)?.[1];
+  if (name == null) return;
+  if (turnEndGate == null) throw new Error(`[${tag}:…] prompts require ATTYD_FAKE_TURN_END_GATE`);
   writeFileSync(join(turnEndGate, `${name}.reached`), "");
   const deadline = Date.now() + 30_000;
   while (!existsSync(join(turnEndGate, name))) {
-    if (Date.now() >= deadline) throw new Error(`Timed out holding the end of turn ${name}`);
+    if (Date.now() >= deadline) throw new Error(`Timed out holding ${tag} ${name}`);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+async function holdTurnEnd<T>(params: acp.PromptRequest, result: T): Promise<T> {
+  await holdPoint(params, "hold");
   return result;
 }
 

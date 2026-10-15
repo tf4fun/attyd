@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { startRustTestServer, type RustTestServer } from "../../scripts/rust-test-server";
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
 import { opsOf, scopesOf, trackApi } from "./api-requests";
-import { collectBrowserErrors, type ExpectedHttpError } from "./browser-errors";
+import { collectBrowserErrors } from "./browser-errors";
 
 interface TurnEnd {
   /** Waits until a `[hold:<name>]` turn is ready to end. */
@@ -903,9 +903,10 @@ test("opens attachment chips with native browser viewing and automatic downloads
   expect(JSON.stringify(view.log)).toContain('"type":"attachment"');
   expect(JSON.stringify(view)).not.toContain("# 完整的中文附件");
   expect(JSON.stringify(view)).not.toContain(wave.toString("base64"));
-  const hosted = view.timeline.filter((update: { sessionUpdate: string; content?: { _meta?: Record<string, unknown> } }) =>
-    update.sessionUpdate === "user_message_chunk" && update.content?._meta?.["attyd/attachment"]);
-  expect(hosted).toHaveLength(6);
+  // The prompt's six attachments are `AttachmentRef`s in its log entry (§3.2).
+  const entry = (view.log as Array<{ turn: { prompt: Array<{ type: string; text?: string }> } }>)
+    .find(({ turn }) => turn.prompt.some((block) => block.type === "text" && block.text?.includes("attachment-input-flow")));
+  expect(entry?.turn.prompt.filter((block) => block.type === "attachment")).toHaveLength(6);
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("attachment-chips-mobile.png") });
 
@@ -2402,7 +2403,9 @@ test("preserves terminal content beside additional output and searches only expa
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
-  await composer.fill("terminal-flow [hold:terminal]");
+  // Held before the Agent releases its terminal: the terminal is still in
+  // `live` (protocol §4.6) while the tool card shows it.
+  await composer.fill("terminal-flow [hold-release:terminal]");
   await composer.press("Enter");
 
   const tool = page.locator(".tool-card").filter({ hasText: "Run terminal fixture" });
@@ -2443,8 +2446,11 @@ test("preserves terminal content beside additional output and searches only expa
   await expect(info).toContainText('"terminalId"');
   await expect(search.locator("output")).toHaveText("1/1");
   // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // Release, then the turn ends: the tool card was process and the released
+  // terminal keeps no output record.
   await turnEnd.release("terminal");
   await expectProcessRemoved(page, page.locator(".tool-card"));
+  await expect(page.getByText("TERMINAL_FLOW_OUTPUT")).toHaveCount(0);
   expect(browserErrors).toEqual([]);
 });
 
@@ -3365,9 +3371,13 @@ test("keeps turn boundaries across reload and shows only the current operation's
   expect(browserErrors).toEqual([]);
 });
 
-test("offers an explicit reconnect over the composer after the ACP connection stops", async ({ page }) => {
-  const expectedHttpErrors: ExpectedHttpError[] = [];
-  const browserErrors = collectBrowserErrors(page, expectedHttpErrors);
+// The bridge starts the next Agent connection itself while a stream follows the
+// session (state-sync §2.4), without backoff once the Agent is ready, so a
+// "connection unavailable" card may come and go before any assertion sees it.
+// What must hold is the outcome: the same stream and session continue.
+test("recovers the session automatically after the ACP connection stops", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  const api = trackApi(page);
   await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
@@ -3376,15 +3386,17 @@ test("offers an explicit reconnect over the composer after the ACP connection st
   // The stream stays open across the Agent connection (protocol §5.4): no
   // request is expected to fail.
   await composer.press("Enter");
+  await expect.poll(() => opsOf(api, "prompt")).toHaveLength(1);
 
-  const recovery = page.locator(".composer-reconnect");
-  await expect(recovery).toBeVisible();
-  await expect(recovery).toContainText("Agent connection unavailable");
-  await expect(composer).toBeDisabled();
-  await recovery.getByRole("button", { name: "Reconnect" }).click();
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
-  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
-  expectedHttpErrors.length = 0;
+  await expect(page.locator(".composer-reconnect")).toBeHidden();
+  await expect(composer).toBeEnabled();
+  await expect(page.getByText("Loaded history.", { exact: true })).toHaveCount(1);
+  await composer.fill("usage-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
+  expect(opsOf(api, "prompt")).toHaveLength(2);
+  expect(api.v1).toEqual([]);
   expect(browserErrors).toEqual([]);
 });
 
@@ -3440,9 +3452,9 @@ test("keeps an active stdio prompt alive across browser reconnect", async ({ bro
   }
 });
 
-test("reconnects a stale mobile-style socket after a focus liveness probe", async ({ page }) => {
-  const expectedHttpErrors: ExpectedHttpError[] = [];
-  const browserErrors = collectBrowserErrors(page, expectedHttpErrors);
+test("stays usable after a focus liveness probe following an Agent restart", async ({ page }) => {
+  const browserErrors = collectBrowserErrors(page);
+  const api = trackApi(page);
   await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
@@ -3450,12 +3462,15 @@ test("reconnects a stale mobile-style socket after a focus liveness probe", asyn
   await composer.fill("disconnect-flow");
   // The stream stays open across the Agent connection: no request is expected to fail.
   await composer.press("Enter");
-  await expect(page.locator(".composer-reconnect")).toBeVisible();
+  await expect.poll(() => opsOf(api, "prompt")).toHaveLength(1);
 
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
-  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
-  expectedHttpErrors.length = 0;
+  await expect(page.locator(".composer-reconnect")).toBeHidden();
+  await expect(composer).toBeEnabled();
+  await expect(page.getByText("Loaded history.", { exact: true })).toHaveCount(1);
+  expect(opsOf(api, "prompt")).toHaveLength(1);
+  expect(api.v1).toEqual([]);
   expect(browserErrors).toEqual([]);
 });
 

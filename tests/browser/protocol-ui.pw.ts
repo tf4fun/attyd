@@ -20,6 +20,7 @@ import {
   received,
   sessionLive,
   startProtocolFixture,
+  type Exchange,
   type ProtocolFixture,
   type StreamTap,
 } from "./protocol-harness";
@@ -32,7 +33,8 @@ const test = baseTest.extend<{
   serverArgs: string[];
   serverEnv: NodeJS.ProcessEnv;
   fixture: ProtocolFixture;
-  proxy: BarrierProxy;
+  // Not `proxy`: Playwright already has a `proxy` option.
+  pageProxy: BarrierProxy;
 }>({
   serverArgs: [[], { option: true }],
   serverEnv: [{}, { option: true }],
@@ -44,8 +46,8 @@ const test = baseTest.extend<{
       await fixture.close();
     }
   },
-  proxy: async ({ fixture }, use) => use(await fixture.proxy()),
-  baseURL: async ({ proxy }, use) => use(proxy.origin),
+  pageProxy: async ({ fixture }, use) => use(await fixture.proxy()),
+  baseURL: async ({ pageProxy }, use) => use(pageProxy.origin),
 });
 
 function composer(page: Page): Locator {
@@ -103,6 +105,15 @@ function opResponse(page: Page, scope: string): Promise<void> {
   });
 }
 
+/**
+ * The exchange once the server's whole response has been read. Its status is
+ * set when the headers arrive, so tests that parse the body wait for this.
+ */
+async function answered(exchange: () => Exchange | undefined): Promise<Exchange> {
+  await expect.poll(() => exchange()?.responseBody !== undefined).toBe(true);
+  return exchange()!;
+}
+
 /** What the page shows for a write whose outcome it cannot know (C3). */
 function uncertainNotice(page: Page): Locator {
   return page.getByRole("alert").or(page.getByRole("status"))
@@ -152,7 +163,7 @@ function logOf(tap: StreamTap, scope: string, held: readonly LogEntry[] = []): r
 // ---------------------------------------------------------------------------
 
 test.describe("protocol harness", () => {
-  test("forwards a v2 stream, records operation writes and ends a cancelled turn as cancelled", async ({ fixture, proxy }) => {
+  test("forwards a v2 stream, records operation writes and ends a cancelled turn as cancelled", async ({ fixture, pageProxy: proxy }) => {
     const { gates } = fixture;
     await gates.arm("load-alpha");
     const controller = new AbortController();
@@ -219,7 +230,7 @@ test.describe("protocol harness", () => {
     controller.abort();
   });
 
-  test("serves the current UI unchanged through the proxy", async ({ page, proxy }) => {
+  test("serves the current UI unchanged through the proxy", async ({ page, pageProxy: proxy }) => {
     await page.goto(sessionPath("alpha", cwd));
     await expect(page.locator("#root")).not.toBeEmpty();
     const failures = proxy.exchanges.filter((exchange) => (exchange.status ?? 0) === 403);
@@ -235,7 +246,7 @@ test.describe("protocol harness", () => {
 // ---------------------------------------------------------------------------
 
 test.describe("replica and reconnection", () => {
-  test("opens a session by subscribing with its cwd and shows the load's history", async ({ page, fixture, proxy }) => {
+  test("opens a session by subscribing with its cwd and shows the load's history", async ({ page, fixture, pageProxy: proxy }) => {
     await fixture.gates.arm("load-alpha");
     const stream = proxy.stream(follows(ALPHA));
     await page.goto(sessionPath("alpha", cwd));
@@ -254,7 +265,7 @@ test.describe("replica and reconnection", () => {
     expect(await fixture.gates.calls("session/load")).toHaveLength(1);
   });
 
-  test("answers an interaction the load asks for while it runs", async ({ page, fixture, proxy }) => {
+  test("answers an interaction the load asks for while it runs", async ({ page, fixture, pageProxy: proxy }) => {
     await fixture.gates.arm("load-permission-alpha");
     const stream = proxy.stream(follows(ALPHA));
     await page.goto(sessionPath("alpha", cwd));
@@ -278,7 +289,7 @@ test.describe("replica and reconnection", () => {
   test.describe("cold reopen", () => {
     test.use({ serverArgs: ["--session-unobserved-timeout", "0"] });
 
-    test("keeps the held log while a released session loads again and confirms it with the suffix", async ({ page, fixture, proxy }) => {
+    test("keeps the held log while a released session loads again and confirms it with the suffix", async ({ page, fixture, pageProxy: proxy }) => {
       const first = await openAlpha(page, proxy);
       await send(page, "echo kept");
       await expect(page.getByText("Echo: echo kept", { exact: true })).toBeVisible();
@@ -314,7 +325,7 @@ test.describe("replica and reconnection", () => {
     });
   });
 
-  test("subscribes again with the head it holds after the stream breaks, without reading the scope", async ({ page, fixture, proxy }) => {
+  test("subscribes again with the head it holds after the stream breaks, without reading the scope", async ({ page, fixture, pageProxy: proxy }) => {
     const first = await openAlpha(page, proxy);
     const held = logOf(first, ALPHA);
     const head = headParam(received(first, ALPHA));
@@ -336,7 +347,7 @@ test.describe("replica and reconnection", () => {
     ["a patch that does not apply", JSON.stringify({ scope: ALPHA, live: { patch: [{ op: "remove", path: "/missing" }] } })],
     ["an event that is not JSON", "{"],
   ] as const) {
-    test(`recovers from ${name} by closing the stream and subscribing with the current head`, async ({ page, proxy }) => {
+    test(`recovers from ${name} by closing the stream and subscribing with the current head`, async ({ page, pageProxy: proxy }) => {
       const first = await openAlpha(page, proxy);
       const head = headParam(received(first, ALPHA));
       const next = proxy.nextStream(follows(ALPHA));
@@ -350,7 +361,7 @@ test.describe("replica and reconnection", () => {
     });
   }
 
-  test("follows only the session it switches to and ignores the stream it replaced", async ({ page, proxy }) => {
+  test("follows only the session it switches to and ignores the stream it replaced", async ({ page, pageProxy: proxy }) => {
     const alpha = await openAlpha(page, proxy);
     const next = proxy.nextStream(follows(BETA));
     await switchTo(page, "Beta session");
@@ -369,7 +380,7 @@ test.describe("replica and reconnection", () => {
 // ---------------------------------------------------------------------------
 
 test.describe("operations and answers", () => {
-  test("lets one of two racing pages start the prompt and resubmits the refused input after the operation ends", async ({ browser, page, fixture, proxy }) => {
+  test("lets one of two racing pages start the prompt and resubmits the refused input after the operation ends", async ({ browser, page, fixture, pageProxy: proxy }) => {
     const first = await openAlpha(page, proxy);
     const other = await secondPage(browser, fixture);
     try {
@@ -381,9 +392,9 @@ test.describe("operations and answers", () => {
       await send(other.page, "echo race-b");
       await Promise.all([heldA.reached, heldB.reached]);
       heldA.open();
-      await expect.poll(() => heldA.exchange?.status).toBe(202);
+      expect((await answered(() => heldA.exchange)).status).toBe(202);
       heldB.open();
-      await expect.poll(() => heldB.exchange?.status).toBe(409);
+      expect((await answered(() => heldB.exchange)).status).toBe(409);
       expect(JSON.parse(heldB.exchange!.responseBody!)).toMatchObject({ error: { code: "stale" } });
       expect(bodies(proxy, ALPHA, "prompt").map((request) => request.expect)).toEqual([expected]);
       expect(bodies(other.proxy, ALPHA, "prompt").map((request) => request.expect)).toEqual([expected]);
@@ -410,7 +421,7 @@ test.describe("operations and answers", () => {
     }
   });
 
-  test("answers every pending interaction in one write", async ({ page, proxy }) => {
+  test("answers every pending interaction in one write", async ({ page, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "two-permissions");
     await expect(permissionCard(page, "Tool one")).toBeVisible();
@@ -421,8 +432,21 @@ test.describe("operations and answers", () => {
     const id = (title: string) => interactions.find((interaction) =>
       interaction.kind === "permission" && interaction.request.toolCall.title === title)!.interactionId;
     await permissionCard(page, "Tool one").getByRole("button", { name: "Allow once", exact: true }).click();
+    // The 202 arrives while the stream is held: it settles the page's write
+    // but does not remove the interactions; their removal comes from the stream.
+    tap.pause();
+    const accepted = opResponse(page, ALPHA);
     await permissionCard(page, "Tool two").getByRole("button", { name: "Reject", exact: true }).click();
+    await accepted;
+    expect(proxy.ops(ALPHA, "answer").map((post) => post.exchange.status)).toEqual([202]);
+    expect(Object.keys(sessionLive(received(tap, ALPHA)).op.interactions)).toHaveLength(2);
+    await expect(permissionCard(page, "Tool one")).toBeVisible();
+    await expect(permissionCard(page, "Tool two")).toBeVisible();
+    expect(proxy.ops(ALPHA, "answer")).toHaveLength(1);
+    tap.resume();
     await expect(page.getByText("Answers: allow, reject.", { exact: true })).toBeVisible();
+    await expect(permissionCard(page, "Tool one")).toBeHidden();
+    await expect(permissionCard(page, "Tool two")).toBeHidden();
     const answers = bodies(proxy, ALPHA, "answer");
     expect(answers).toHaveLength(1);
     expect(answers[0]).toEqual({
@@ -436,7 +460,7 @@ test.describe("operations and answers", () => {
     expect(proxy.ops(ALPHA, "answer").map((post) => post.exchange.status)).toEqual([202]);
   });
 
-  test("keeps a filled form when its answer is refused because another interaction joined", async ({ page, fixture, proxy }) => {
+  test("keeps a filled form when its answer is refused because another interaction joined", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "form-join");
     const form = page.getByRole("dialog", { name: "Agent input request" });
@@ -448,7 +472,7 @@ test.describe("operations and answers", () => {
     await fixture.gates.open("join");
     await expect.poll(() => Object.keys(sessionLive(received(tap, ALPHA)).op.interactions ?? {}).length).toBe(2);
     held.open();
-    await expect.poll(() => held.exchange?.status).toBe(409);
+    expect((await answered(() => held.exchange)).status).toBe(409);
     expect(JSON.parse(held.exchange!.responseBody!)).toMatchObject({ error: { code: "not_allowed" } });
     await expect(form).toBeVisible();
     await expect(form.getByLabel(/Note/)).toHaveValue("keep this note");
@@ -463,7 +487,7 @@ test.describe("operations and answers", () => {
     expect(complete?.kind === "answer" ? Object.keys(complete.args.answers).length : 0).toBe(2);
   });
 
-  test("keeps a surviving form when the pending set shrinks and the earlier full answer is refused", async ({ page, fixture, proxy }) => {
+  test("keeps a surviving form when the pending set shrinks and the earlier full answer is refused", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "form-shrink");
     const form = page.getByRole("dialog", { name: "Agent input request" });
@@ -482,7 +506,7 @@ test.describe("operations and answers", () => {
     await expect.poll(() => Object.keys(sessionLive(received(tap, ALPHA)).op.interactions ?? {}).length).toBe(1);
     const [formId] = Object.keys(sessionLive(received(tap, ALPHA)).op.interactions);
     held.open();
-    await expect.poll(() => stale.status).toBe(409);
+    expect((await answered(() => stale)).status).toBe(409);
     expect(JSON.parse(stale.responseBody!)).toMatchObject({ error: { code: "not_allowed" } });
     await expect(check).toBeHidden();
     await expect(form).toBeVisible();
@@ -495,7 +519,7 @@ test.describe("operations and answers", () => {
     expect(last?.kind === "answer" ? Object.keys(last.args.answers) : []).toEqual([formId]);
   });
 
-  test("settles a prompt whose stream events arrive before its HTTP response", async ({ page, proxy }) => {
+  test("settles a prompt whose stream events arrive before its HTTP response", async ({ page, pageProxy: proxy }) => {
     await openAlpha(page, proxy);
     const held = proxy.holdResponse(isOp(ALPHA, "prompt"));
     await send(page, "echo early stream");
@@ -509,7 +533,7 @@ test.describe("operations and answers", () => {
     await expect(page.getByRole("alert")).toHaveCount(0);
   });
 
-  test("settles a prompt whose HTTP response arrives before its stream events", async ({ page, fixture, proxy }) => {
+  test("settles a prompt whose HTTP response arrives before its stream events", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     tap.pause();
     const answered = opResponse(page, ALPHA);
@@ -528,7 +552,7 @@ test.describe("operations and answers", () => {
     await expect(page.getByRole("alert")).toHaveCount(0);
   });
 
-  test("navigates to a created session from its own create result after a successor operation replaced it", async ({ page, fixture, proxy }) => {
+  test("navigates to a created session from its own create result after a successor operation replaced it", async ({ page, fixture, pageProxy: proxy }) => {
     const opened = proxy.stream(follows("global"));
     await page.goto(projectPath(cwd));
     const global = await opened;
@@ -561,7 +585,7 @@ test.describe("operations and answers", () => {
     expect(proxy.v1()).toEqual([]);
   });
 
-  test("navigates to a fork from its own fork result after a successor operation on the source", async ({ page, fixture, proxy }) => {
+  test("navigates to a fork from its own fork result after a successor operation on the source", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     const source = page.url();
     const held = proxy.holdResponse(isOp(ALPHA, "fork"));
@@ -584,7 +608,7 @@ test.describe("operations and answers", () => {
     expect(proxy.v1()).toEqual([]);
   });
 
-  test("does not resend a prompt whose response was lost", async ({ page, fixture, proxy }) => {
+  test("does not resend a prompt whose response was lost", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     tap.pause();
     proxy.loseResponse(isOp(ALPHA, "prompt"));
@@ -601,7 +625,7 @@ test.describe("operations and answers", () => {
     expect((await fixture.gates.calls("session/prompt")).map((call) => call.text)).toEqual(["wait lost"]);
   });
 
-  test("does not resend an answer whose response was lost", async ({ page, fixture, proxy }) => {
+  test("does not resend an answer whose response was lost", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "permission once");
     const card = permissionCard(page, "Permission once");
@@ -624,7 +648,7 @@ test.describe("operations and answers", () => {
     expect(await fixture.gates.calls("session/prompt")).toHaveLength(2);
   });
 
-  test("shows a failed prompt's error without a history entry and retries the exact prompt on request", async ({ page, proxy }) => {
+  test("shows a failed prompt's error without a history entry and retries the exact prompt on request", async ({ page, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "fail now");
     await expect(page.getByText("Synthetic prompt failure", { exact: false })).toBeVisible();
@@ -636,7 +660,7 @@ test.describe("operations and answers", () => {
     expect(bodies(proxy, ALPHA, "prompt")[1]!.expect).not.toBe(bodies(proxy, ALPHA, "prompt")[0]!.expect);
   });
 
-  test("stops a running turn with a cancel write and keeps the queue paused until the turn ends", async ({ page, fixture, proxy }) => {
+  test("stops a running turn with a cancel write and keeps the queue paused until the turn ends", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "wait stop");
     await fixture.gates.reached("stop");
@@ -657,7 +681,7 @@ test.describe("operations and answers", () => {
     expect(bodies(proxy, ALPHA, "prompt").map(promptText)).toEqual(["wait stop"]);
   });
 
-  test("sends a queued message now by cancelling and submitting it once the turn actually ends", async ({ page, fixture, proxy }) => {
+  test("sends a queued message now by cancelling and submitting it once the turn actually ends", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "wait now");
     await fixture.gates.reached("now");
@@ -680,7 +704,7 @@ test.describe("operations and answers", () => {
 // ---------------------------------------------------------------------------
 
 test.describe("controls and summaries", () => {
-  test("shows mode, usage, commands and session info the Agent changes without a refresh (#16)", async ({ page, fixture, proxy }) => {
+  test("shows mode, usage, commands and session info the Agent changes without a refresh (#16)", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     const navigations: string[] = [];
     page.on("framenavigated", (frame) => { if (frame === page.mainFrame()) navigations.push(frame.url()); });
@@ -701,7 +725,7 @@ test.describe("controls and summaries", () => {
     expect(proxy.scopeReads()).toEqual([]);
   });
 
-  test("changes config with a set_config write and shows the Agent's own config updates (#16)", async ({ page, fixture, proxy }) => {
+  test("changes config with a set_config write and shows the Agent's own config updates (#16)", async ({ page, fixture, pageProxy: proxy }) => {
     const stream = proxy.stream(follows(BETA));
     await page.goto(sessionPath("beta", cwd));
     await expect(page.getByText("Beta history answer.", { exact: true })).toBeVisible();
@@ -722,7 +746,7 @@ test.describe("controls and summaries", () => {
     expect(await fixture.gates.calls("session/set_config_option")).toMatchObject([{ configId: "model", value: "fast" }]);
   });
 
-  test("disables new control writes while a prompt runs but shows the Agent's mode change at once", async ({ page, fixture, proxy }) => {
+  test("disables new control writes while a prompt runs but shows the Agent's mode change at once", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     const mode = page.locator(".config-trigger").filter({ hasText: "Mode" });
     await expect(mode).toBeEnabled();
@@ -741,7 +765,7 @@ test.describe("controls and summaries", () => {
     expect(proxy.ops(ALPHA, "set_mode")).toEqual([]);
   });
 
-  test("removes an accepted URL flow when the Agent completes it or the user dismisses it", async ({ page, context, fixture, proxy }) => {
+  test("removes an accepted URL flow when the Agent completes it or the user dismisses it", async ({ page, context, fixture, pageProxy: proxy }) => {
     context.on("page", (popup) => void popup.close());
     const tap = await openAlpha(page, proxy);
     for (const [flow, ending] of [["connect-one", "complete"], ["connect-two", "dismiss"]] as const) {
@@ -766,7 +790,7 @@ test.describe("controls and summaries", () => {
     expect(proxy.v1()).toEqual([]);
   });
 
-  test("shows Input needed for a background session from the global summary without following it (#17)", async ({ browser, page, fixture, proxy }) => {
+  test("shows Input needed for a background session from the global summary without following it (#17)", async ({ browser, page, fixture, pageProxy: proxy }) => {
     await openAlpha(page, proxy);
     const other = await secondPage(browser, fixture);
     try {
@@ -800,7 +824,7 @@ test.describe("controls and summaries", () => {
 // ---------------------------------------------------------------------------
 
 test.describe("resources and media", () => {
-  test("keeps a session terminal after its operation ends and drops its output once released", async ({ page, fixture, proxy }) => {
+  test("keeps a session terminal after its operation ends and drops its output once released", async ({ page, fixture, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "terminal t1");
     await expect(page.getByText("Terminal t1 started.", { exact: true })).toBeVisible();
@@ -815,7 +839,7 @@ test.describe("resources and media", () => {
     expect(proxy.v1()).toEqual([]);
   });
 
-  test("renders an attachment from the log through the v2 attachment read", async ({ page, proxy }) => {
+  test("renders an attachment from the log through the v2 attachment read", async ({ page, pageProxy: proxy }) => {
     const tap = await openAlpha(page, proxy);
     await send(page, "image");
     await expect(page.getByText("Image reply.", { exact: true })).toBeVisible();
@@ -836,7 +860,7 @@ test.describe("resources and media", () => {
   test.describe("terminal login", () => {
     test.use({ serverEnv: { ATTYD_UI_REQUIRE_AUTH: "1" } });
 
-    test("keeps each login terminal as its own resource with its methodId and sends its input serially", async ({ browser, page, fixture, proxy }) => {
+    test("keeps each login terminal as its own resource with its methodId and sends its input serially", async ({ browser, page, fixture, pageProxy: proxy }) => {
       const global = proxy.stream(follows("global"));
       await page.goto(sessionPath("alpha", cwd));
       await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeVisible();
@@ -898,7 +922,7 @@ test.describe("resources and media", () => {
       expect(proxy.v1()).toEqual([]);
     });
 
-    test("does not resend terminal input whose response was lost", async ({ page, proxy }) => {
+    test("does not resend terminal input whose response was lost", async ({ page, pageProxy: proxy }) => {
       const global = proxy.stream(follows("global"));
       await page.goto(sessionPath("alpha", cwd));
       await page.getByRole("button", { name: "Authenticate with Sign in with login-a" }).click();
