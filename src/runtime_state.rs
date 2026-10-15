@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -50,7 +49,6 @@ pub(crate) struct SessionLiveState {
     resolved_url_flows: VecDeque<String>,
     released_terminals: VecDeque<String>,
     attachment_candidate: Vec<Value>,
-    attachment_candidate_bytes: usize,
     /// The protocol v2 operation this session's `live.op` shows.
     pub(crate) op: OpSlot,
     /// The reduced controls (protocol §4.5).
@@ -378,7 +376,6 @@ impl SessionRegistry {
                 resolved_url_flows: VecDeque::new(),
                 released_terminals: VecDeque::new(),
                 attachment_candidate: Vec::new(),
-                attachment_candidate_bytes: 0,
                 op,
                 controls: SessionControls::default(),
             },
@@ -452,7 +449,6 @@ impl SessionRegistry {
             stage: "reloading".to_string(),
             uncertainty_reason: None,
         });
-        session.attachment_candidate_bytes = 0;
         self.begin_session_operation(session_id, kind);
 
         self.settle_session_ops(session_id);
@@ -491,10 +487,7 @@ impl SessionRegistry {
         let Some(update) = retain_control_update(update) else {
             return Ok(());
         };
-        let bytes = serialized_len(&update);
         session.attachment_candidate.push(update);
-        session.attachment_candidate_bytes =
-            session.attachment_candidate_bytes.saturating_add(bytes);
         Ok(())
     }
 
@@ -522,7 +515,6 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let candidate = std::mem::take(&mut session.attachment_candidate);
-        session.attachment_candidate_bytes = 0;
         session.controls = settle_controls(candidate, &response);
         owner.operation = None;
         self.complete_session_operation(session_id, SessionOperationKind::Load, &Value::Null);
@@ -555,7 +547,6 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         session.attachment_candidate.clear();
-        session.attachment_candidate_bytes = 0;
         owner.operation = None;
         self.fail_session_operation(session_id, SessionOperationKind::Load, &error);
 
@@ -588,7 +579,6 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let candidate = std::mem::take(&mut session.attachment_candidate);
-        session.attachment_candidate_bytes = 0;
         session.controls = settle_controls(candidate, &response);
         session.lifecycle = SessionLifecycle::Active;
         owner.operation = None;
@@ -689,7 +679,6 @@ impl SessionRegistry {
                 resolved_url_flows: VecDeque::new(),
                 released_terminals: VecDeque::new(),
                 attachment_candidate: Vec::new(),
-                attachment_candidate_bytes: 0,
                 op: OpSlot::completed(OperationKind::Open, serde_json::json!({})),
                 controls,
             },
@@ -2278,24 +2267,6 @@ fn drain_session_liveness(
             }),
     );
     effects
-}
-
-fn serialized_len(value: &impl Serialize) -> usize {
-    let mut counter = SerializedByteCounter(0);
-    serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |_| counter.0)
-}
-
-struct SerializedByteCounter(usize);
-
-impl Write for SerializedByteCounter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.saturating_add(bytes.len());
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 pub(crate) fn fold_active_turn_update(
@@ -5583,6 +5554,9 @@ mod tests {
     fn same_session_reload_success_does_not_create_a_second_business_session() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
+        let old_options = json!([{
+            "type": "boolean", "id": "old-only", "name": "Old", "currentValue": false,
+        }]);
         state
             .update_control_state(
                 "epoch",
@@ -5596,7 +5570,7 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                json!({ "sessionUpdate": "config_option_update", "configId": "old-only" }),
+                json!({ "sessionUpdate": "config_option_update", "configOptions": old_options.clone() }),
             )
             .unwrap();
         let operation_id = "reload-intent".to_string();
@@ -5635,6 +5609,10 @@ mod tests {
         assert_eq!(
             staging.controls.modes.as_ref().unwrap().current_mode_id,
             "old"
+        );
+        assert_eq!(
+            Value::from(staging.controls.config_options.clone()),
+            old_options
         );
         assert_eq!(state.live("session").unwrap().attachment_candidate.len(), 1);
         let before_complete = state.live_snapshot();
@@ -5676,7 +5654,6 @@ mod tests {
                 .attachment_candidate
                 .is_empty()
         );
-        assert_eq!(state.live("session").unwrap().attachment_candidate_bytes, 0);
         assert!(!state.operation_in_use(&operation_id));
         assert_ne!(state.live_snapshot(), before_complete);
         assert!(
@@ -5776,7 +5753,6 @@ mod tests {
                 .attachment_candidate
                 .is_empty()
         );
-        assert_eq!(state.live("session").unwrap().attachment_candidate_bytes, 0);
         assert!(!state.operation_in_use("reload"));
         assert!(
             !serde_json::to_string(&state.live_snapshot())
