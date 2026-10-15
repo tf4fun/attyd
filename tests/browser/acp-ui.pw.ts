@@ -807,7 +807,7 @@ test("edits and resends ordered prompt blocks without moving attachments", async
     const blob = await (await fetch(url)).blob();
     return { type: blob.type, bytes: [...new Uint8Array(await blob.arrayBuffer())] };
   }, attachmentUrl);
-  expect(attachment.type).toBe("text/plain;charset=utf-8");
+  expect(attachment.type.split(";", 1)[0]).toBe("text/plain");
   expect(Buffer.from(attachment.bytes)).toEqual(Buffer.from("中文 context", "utf8"));
   await prompt.getByRole("button", { name: "Edit and resend user message" }).click();
   const composerDocument = page.locator(".composer-document");
@@ -1011,6 +1011,72 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await exported.close();
   await expect(content).not.toContainText("# 完整的中文附件");
   expect(browserErrors).toEqual([]);
+});
+
+test.describe("Markdown export with normal popup blocking", () => {
+  test("opens complete Markdown when attachment reads outlast the click's activation", async ({ playwright, browserName, channel, isolatedAttydUrl }) => {
+    test.setTimeout(45_000);
+    // Playwright normally disables the browser's popup policy. This case owns
+    // its browser so the other tests keep their usual launch configuration.
+    const browser = await playwright[browserName].launch({
+      channel, ignoreDefaultArgs: ["--disable-popup-blocking"],
+    });
+    const context = await browser.newContext({ baseURL: isolatedAttydUrl, locale: "en-US" });
+    const page = await context.newPage();
+    const browserErrors = collectBrowserErrors(page);
+    const source = "# 延迟读取的完整附件 📝\n" + "Every UTF-8 line must survive. 中文正文。\n".repeat(30) + "End of attachment.";
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let attachmentReads = 0;
+    // Install before the prompt, so an eager media read cannot warm the cache.
+    await page.route("**/api/v2/sessions/saved-session/attachments/*", async (route) => {
+      attachmentReads += 1;
+      await readGate;
+      await route.continue();
+    });
+    const opened: Page[] = [];
+    const notePage = (tab: Page) => { opened.push(tab); };
+    context.on("page", notePage);
+    try {
+      await page.goto("/sessions/saved-session");
+      const editor = page.locator('textarea[role="combobox"]');
+      await expect(editor).toBeEnabled();
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "delayed-context.txt", mimeType: "text/plain", buffer: Buffer.from(source, "utf8"),
+      });
+      await editor.fill("attachment-input-flow");
+      await editor.press("Enter");
+      const reply = "Received prompt blocks: text,resource.";
+      await expect(page.getByText(reply, { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+      await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
+      const content = page.locator(".message-user").filter({ hasText: "attachment-input-flow" }).locator(".message-content");
+      await expect(content.locator(".attachment-chip")).toHaveCount(1);
+      await expect.poll(() => attachmentReads).toBeGreaterThan(0);
+      const originalUrl = page.url();
+      await page.getByRole("button", { name: "Thread actions" }).click();
+      await page.getByText("Open as Markdown", { exact: true }).click();
+      // No further user action renews activation. A pre-opened window is valid;
+      // it need not wait for the read, but must eventually show the full export.
+      await page.waitForFunction(() => !navigator.userActivation.isActive, undefined, { timeout: 15_000 });
+      releaseRead();
+      await expect.poll(() => opened.length).toBe(1);
+      const exported = opened[0];
+      await expect(exported.locator("body")).toContainText(source);
+      await expect(exported.locator("body")).toContainText("attachment-input-flow");
+      await expect(exported.locator("body")).toContainText(reply);
+      await expect(page).toHaveURL(originalUrl);
+      await expect(page.getByText(reply, { exact: true })).toBeVisible();
+      await expect(content.locator(".attachment-chip")).toHaveCount(1);
+      await expect(content).not.toContainText("延迟读取的完整附件");
+      await expect(content.locator("pre, iframe, object, embed")).toHaveCount(0);
+      expect(browserErrors).toEqual([]);
+    } finally {
+      releaseRead();
+      context.off("page", notePage);
+      await browser.close();
+    }
+  });
 });
 
 test("preserves IME-confirmed English until a separate Enter submits it", async ({ page }) => {

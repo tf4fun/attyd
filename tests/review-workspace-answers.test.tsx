@@ -316,4 +316,73 @@ describe("review: workspace answers follow the pending interaction set", () => {
       expect(calls).toHaveLength(1);
     },
   );
+
+  it.each(["draft", "sending", "uncertain"] as const)(
+    "keeps %s session answers while a replacement stream aligns global before the same session operation",
+    async (stage) => {
+      const op = operation({
+        id: "ask-across-reconnect", kind: "agent_request", status: "running",
+        interactions: { A: permission("A"), B: permission("B") },
+      });
+      const previous = await mount(op);
+      await act(async () => acp.respondPermission("A", selected));
+      expect(calls).toEqual([]);
+      if (stage !== "draft") {
+        await act(async () => acp.respondPermission("B", selected));
+        expect(calls).toHaveLength(1);
+        if (stage === "uncertain") {
+          await act(async () => calls[0].respond(502, { message: "Upstream response was lost" }));
+        }
+      }
+      const statusBefore = acp.state.permissions.find(({ permissionId }) => permissionId === "A")!;
+      expect(statusBefore.responseRequestId).toBeTruthy();
+      if (stage === "uncertain") expect(statusBefore.responseStatus).toBeTruthy();
+
+      await act(async () => acp.reconnect());
+      const source = Source.instances.at(-1)!;
+      expect(source).not.toBe(previous);
+      expect(previous.closed).toBe(true);
+      expect(new URL(source.url, window.location.href).searchParams.getAll("scope")).toContain(SCOPE);
+
+      // This operation belongs only to the session. The replacement stream
+      // may align global first; that says nothing about whether its answers ended.
+      await act(async () => source.emit(alignment("global", global(op))));
+      await act(async () => source.emit(alignment("catalog", catalog)));
+      expect(calls).toHaveLength(stage === "draft" ? 0 : 1);
+      await act(async () => source.emit(alignment(SCOPE, session(op))));
+
+      expect(acp.state.permissions.map(({ permissionId }) => permissionId)).toEqual(["A", "B"]);
+      const statusAfter = acp.state.permissions.find(({ permissionId }) => permissionId === "A")!;
+      expect(statusAfter.responseRequestId).toBeTruthy();
+      expect(statusAfter.responseStatus).toBe(statusBefore.responseStatus);
+      const aCard = [...container.querySelectorAll(".permission-card")]
+        .find((card) => card.textContent?.includes("Tool A"));
+      expect(aCard?.getAttribute("aria-busy")).toBe("true");
+
+      if (stage === "draft") {
+        expect(calls).toEqual([]);
+        await act(async () => acp.respondPermission("B", selected));
+      }
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ path: "/api/v2/scopes/session%2Fs/ops", method: "POST" });
+      expect(calls[0].body).toEqual({
+        expect: op.id, kind: "answer",
+        args: { answers: { A: { outcome: selected }, B: { outcome: selected } } },
+      });
+      if (stage !== "uncertain") {
+        await act(async () => calls[0].respond(202, { op: op.id }));
+      }
+      await act(async () => source.emit({ scope: SCOPE, live: { patch: [
+        { op: "set", path: "/cwd", value: CWD },
+      ] } }));
+      expect(calls).toHaveLength(1);
+
+      // Only the session's own pending-set update retires these answers.
+      await act(async () => source.emit({ scope: SCOPE, live: { patch: [
+        { op: "set", path: "/op/interactions", value: {} },
+      ] } }));
+      expect(acp.state.permissions).toEqual([]);
+      expect(calls).toHaveLength(1);
+    },
+  );
 });
