@@ -176,7 +176,6 @@ describe("ACP UI component contract", () => {
           operation: "session/prompt",
           code: -32_603,
           data: { retryAfterMs: 250 },
-          dataBytes: 20,
           retryBlocks: [{ type: "text", text: "Try this again" }],
         }]}
       />,

@@ -4,7 +4,6 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
-  CircleMinus,
   FilePenLine,
   FileSearch,
   Globe2,
@@ -47,7 +46,7 @@ export function ToolCallCard({
   const { t } = useTranslation("cards");
   const { call } = item;
   const Icon = kindIcons[call.kind ?? "other"] ?? Wrench;
-  const status = item.cancelled ? "cancelled" : call.status;
+  const status = call.status;
   const live = status == null || status === "pending" || status === "in_progress";
   const [open, setOpen] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
@@ -185,22 +184,19 @@ function toolKindLabel(kind: ToolKind | undefined, t: TFunction<"cards">): strin
   return t(`tool.kind.${kind}`);
 }
 
-function emptyOutputMessage(status: ToolCall["status"] | "cancelled", t: TFunction<"cards">): string {
-  if (status === "cancelled") return t("tool.empty.cancelled");
+function emptyOutputMessage(status: ToolCall["status"], t: TFunction<"cards">): string {
   if (status === "completed") return t("tool.empty.completed");
   if (status === "failed") return t("tool.empty.failed");
   return status === "in_progress" ? t("tool.empty.waitingOutput") : t("tool.empty.waitingTool");
 }
 
-function ToolStatus({ status }: { status: ToolCall["status"] | "cancelled" }) {
+function ToolStatus({ status }: { status: ToolCall["status"] }) {
   const { t } = useTranslation("cards");
   const state = status ?? "pending";
   const label = t(`tool.status.${state}`);
   return (
     <span className={`tool-status tool-status-${state}`} aria-label={t("tool.statusLabel", { status: label })}>
-      {state === "cancelled" ? (
-        <CircleMinus className="status-icon" size={14} aria-hidden="true" />
-      ) : state === "completed" ? (
+      {state === "completed" ? (
         <Check className="status-icon complete" size={14} aria-hidden="true" />
       ) : state === "failed" ? (
         <CircleAlert className="status-icon failed" size={14} aria-hidden="true" />

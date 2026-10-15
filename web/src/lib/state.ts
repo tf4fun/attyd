@@ -50,7 +50,6 @@ export type TimelineItem = (
       blocks: PromptBlock[];
       messageId?: string | null;
       turnOperationId?: string;
-      echoBlocks?: PromptBlock[];
       raw: unknown[];
     }
   | {
@@ -62,7 +61,6 @@ export type TimelineItem = (
       id: string;
       type: "tool";
       call: ViewToolCall;
-      cancelled?: boolean;
       raw: unknown[];
     }
   | { id: string; type: "plan"; update: SessionUpdate; raw: unknown[] }
@@ -85,8 +83,6 @@ export type TimelineItem = (
       operation?: string;
       code?: number;
       data?: unknown;
-      dataTruncated?: boolean;
-      dataBytes?: number;
       retryBlocks?: PromptBlock[];
     }
 ) & {
@@ -128,8 +124,6 @@ export interface BridgeError {
   operation?: string;
   code?: number;
   data?: unknown;
-  dataTruncated?: boolean;
-  dataBytes?: number;
 }
 
 export type AgentActivity =

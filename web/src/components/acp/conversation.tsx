@@ -338,13 +338,11 @@ function ErrorCard({
 }) {
   const { t } = useTranslation("conversation");
   const retryable = item.retryBlocks != null && item.retryBlocks.length > 0;
-  const details = item.code != null || item.data !== undefined || item.dataTruncated
+  const details = item.code != null || item.data !== undefined
     ? {
         ...(item.code != null ? { code: item.code } : {}),
         message: item.message,
         ...(item.data !== undefined ? { data: item.data } : {}),
-        ...(item.dataBytes != null ? { dataBytes: item.dataBytes } : {}),
-        ...(item.dataTruncated ? { dataTruncated: true } : {}),
       }
     : undefined;
   return (

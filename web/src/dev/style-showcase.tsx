@@ -91,8 +91,12 @@ function showcaseProjection(session: MockSession): ShowcaseProjection {
     }
     previous = update;
   }
-  const timeline = turns.flatMap((process, index) =>
-    joinMessageBlocks(projectProcess(session.sessionId, `showcase-${index}`, process).items));
+  const timeline = turns.flatMap((process, index) => {
+    // A plan with unfinished entries is shown above the composer on the page;
+    // the sample shows it in its own turn.
+    const { items, activePlan } = projectProcess(session.sessionId, `showcase-${index}`, process);
+    return joinMessageBlocks(activePlan != null ? [...items, activePlan] : items);
+  });
   return { timeline, availableCommands, usage };
 }
 
