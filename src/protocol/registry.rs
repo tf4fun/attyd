@@ -230,6 +230,47 @@ impl SessionRegistry {
         Ok(id)
     }
 
+    /// The held response of the running operation `op` in `scope` takes its
+    /// end (protocol §6.3).
+    pub(crate) fn hold_response(
+        &mut self,
+        scope: &Scope,
+        op: &str,
+        sender: tokio::sync::oneshot::Sender<super::op::OpEnd>,
+    ) {
+        if self.held_scope(scope) {
+            let slot = self.slot_mut(scope);
+            if slot.id == op && slot.is_running() {
+                slot.completion = super::op::Completion::new(sender);
+            }
+        }
+    }
+
+    /// The running operation `op`, wherever it is, failed: it frees the
+    /// sessions it occupies. Another operation is never touched, whatever its
+    /// kind.
+    pub(crate) fn fail_protocol_operation(&mut self, op: &str, error: ProtocolError) {
+        let scope = [Scope::Global, Scope::Catalog]
+            .into_iter()
+            .find(|scope| self.slot_mut(scope).id == op)
+            .or_else(|| {
+                self.sessions.iter().find_map(|(session_id, entry)| {
+                    let live = entry.state.live.as_ref()?;
+                    (live.op.id == op).then(|| Scope::Session(session_id.clone()))
+                })
+            });
+        let Some(scope) = scope else {
+            return;
+        };
+        if !self.slot_mut(&scope).is_running() {
+            return;
+        }
+        self.scopes
+            .occupied
+            .retain(|_, occupier| *occupier != scope);
+        self.slot_mut(&scope).fail(error);
+    }
+
     /// The slot a held scope shows: the occupying operation's, if any.
     pub(crate) fn shown_slot(&self, scope: &Scope) -> Option<&OpSlot> {
         match scope {

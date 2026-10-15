@@ -377,6 +377,17 @@ impl Publisher {
         events
     }
 
+    /// The published `live` of `scope`, without a prompt's `process`.
+    pub(crate) fn live(&self, scope: &Scope) -> Option<&Value> {
+        match scope {
+            Scope::Global => self.global.as_ref(),
+            Scope::Catalog => self.catalog.as_ref(),
+            Scope::Session(session_id) => {
+                self.sessions.get(session_id).map(|session| &session.live)
+            }
+        }
+    }
+
     /// The published document of `scope`.
     pub(crate) fn document(&self, scope: &str) -> Option<Document> {
         match Scope::parse(scope)? {

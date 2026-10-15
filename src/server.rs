@@ -34,6 +34,7 @@ use crate::bridge_event::{BridgeEvent, SessionEvent, SessionPosition};
 use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::options::{Options, normalize_origin};
+use crate::protocol::admission::{self, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
 use crate::protocol::hub::{HEARTBEAT, Publication, Subscribed, Subscription};
 #[cfg(test)]
@@ -619,7 +620,6 @@ struct BridgeHub {
 /// through `admitted` and waits for `resume` before its response takes the
 /// operation's result.
 #[cfg(test)]
-#[allow(dead_code)] // Taken by the ops route (migration step 6).
 struct ResponseHold {
     admitted: oneshot::Sender<String>,
     resume: oneshot::Receiver<()>,
@@ -1672,6 +1672,49 @@ impl BridgeHub {
             .map_err(|_| "bridge stopped before admitting the turn".to_string())?
     }
 
+    /// An operation write (protocol §6): the bridge admits it under one
+    /// guard. Without an Agent connection the same checks run on the published
+    /// documents, and an admissible write is `unavailable`; nothing starts a
+    /// connection.
+    async fn operate(
+        &self,
+        scope: Scope,
+        write: OpWrite,
+    ) -> Result<bridge::operations::OperationAdmission, ProtocolError> {
+        let input = self.state.lock().await.input.clone();
+        if let Some(input) = input {
+            let (reply, admitted) = oneshot::channel();
+            let sent = input.send(bridge::BridgeInput::Operation {
+                scope: scope.clone(),
+                write: write.clone(),
+                reply,
+            });
+            if sent.is_ok()
+                && let Ok(admitted) = admitted.await
+            {
+                return admitted;
+            }
+        }
+        admission::admit(&self.publication.lock().publisher, &scope, &write)?;
+        Err(ProtocolError::new(
+            ErrorCode::Unavailable,
+            "there is no Agent connection",
+        ))
+    }
+
+    /// The test barrier of the next held response, once admitted.
+    #[cfg(test)]
+    async fn before_op_response(&self, op: &str) {
+        let hold = self.before_op_response.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _ = hold.admitted.send(op.to_string());
+            let _ = hold.resume.await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn before_op_response(&self, _op: &str) {}
+
     async fn business_request(
         &self,
         command: serde_json::Value,
@@ -1921,7 +1964,9 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route_layer(middleware::from_fn(enforce_json_request_timeout))
         .route("/api/v1/events", get(global_events))
         .route("/api/v2/stream", get(protocol_stream))
-        .route("/api/v2/scopes/{*scope}", get(read_scope))
+        // Writes share the read's wildcard; held `create`, `fork` and `list`
+        // responses take no JSON deadline (protocol §6.3).
+        .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
@@ -2063,6 +2108,134 @@ async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) ->
     if let Some(log) = document.log {
         body["log"] = json!(log);
     }
+    axum::Json(body).into_response()
+}
+
+/// The status of a refusal (protocol §9).
+fn error_status(code: ErrorCode) -> StatusCode {
+    match code {
+        ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        ErrorCode::NotFound => StatusCode::NOT_FOUND,
+        ErrorCode::Stale | ErrorCode::NotAllowed | ErrorCode::CatalogChanged => {
+            StatusCode::CONFLICT
+        }
+        ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
+        ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::AgentError => StatusCode::BAD_GATEWAY,
+    }
+}
+
+fn refused(error: ProtocolError) -> Response {
+    protocol_error(error_status(error.code), error)
+}
+
+fn invalid_request(message: impl Into<String>) -> Response {
+    refused(ProtocolError::new(ErrorCode::InvalidRequest, message))
+}
+
+/// Percent-decodes one raw path segment, so an encoded `/` stays inside it.
+fn path_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// The operation write in a request body (protocol §6.1).
+fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if !json {
+        return Err(invalid_request("the body must be application/json"));
+    }
+    let body: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| invalid_request(format!("the body is not JSON: {error}")))?;
+    let field = |name: &str| {
+        body[name]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| invalid_request(format!("{name} must be a string")))
+    };
+    let args = match body.get("args") {
+        None => json!({}),
+        Some(args) if args.is_object() => args.clone(),
+        Some(_) => return Err(invalid_request("args must be an object")),
+    };
+    Ok(OpWrite {
+        expect: field("expect")?,
+        kind: field("kind")?,
+        args,
+    })
+}
+
+/// `POST /api/v2/scopes/{scope}/ops` (protocol §6) and the resource actions
+/// (§7). The raw path is split before decoding, so an encoded session ID
+/// keeps its `/`.
+async fn write_scope(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let segments: Option<Vec<String>> = uri
+        .path()
+        .strip_prefix("/api/v2/scopes/")
+        .unwrap_or_default()
+        .split('/')
+        .map(path_segment)
+        .collect();
+    let Some(segments) = segments else {
+        return invalid_request("the path is not valid percent-encoded UTF-8");
+    };
+    let Some(scope) = segments.first().and_then(|scope| Scope::parse(scope)) else {
+        return invalid_request(format!(
+            "no scope {}",
+            segments.first().map_or("", |scope| scope)
+        ));
+    };
+    match segments[1..].iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["ops"] => {}
+        _ => {
+            return refused(ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("no such write in {scope}"),
+            ));
+        }
+    }
+    let write = match op_write(&headers, &body) {
+        Ok(write) => write,
+        Err(response) => return response,
+    };
+    let admission = match state.bridge.operate(scope, write).await {
+        Ok(admission) => admission,
+        Err(error) => return refused(error),
+    };
+    let op = admission.op;
+    let Some(end) = admission.end else {
+        return (StatusCode::ACCEPTED, axum::Json(json!({ "op": op }))).into_response();
+    };
+    state.bridge.before_op_response(&op).await;
+    // A dropped response drops only this receiver; the operation runs on.
+    let body = match end.await {
+        Ok(Ok(result)) => json!({ "op": op, "result": result }),
+        Ok(Err(error)) => json!({ "op": op, "error": error }),
+        Err(_) => json!({
+            "op": op,
+            "error": ProtocolError::new(ErrorCode::Unavailable, "the operation ended without a result"),
+        }),
+    };
     axum::Json(body).into_response()
 }
 

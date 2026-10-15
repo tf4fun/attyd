@@ -64,6 +64,7 @@ mod inbound_requests;
 mod memory_efficiency_tests;
 #[cfg(test)]
 mod memory_retention_tests;
+pub(crate) mod operations;
 #[cfg(test)]
 mod protocol_gate_tests;
 pub(crate) mod publication;
@@ -1824,6 +1825,15 @@ pub(crate) enum BridgeInput {
     },
     /// Starts the next load v2 streams wait for.
     ServeStreams,
+    /// An operation write (protocol §6): admitted and installed under one
+    /// bridge guard, then run as the command of its kind.
+    Operation {
+        scope: OpScope,
+        write: crate::protocol::admission::OpWrite,
+        reply: oneshot::Sender<
+            Result<operations::OperationAdmission, crate::protocol::documents::ProtocolError>,
+        >,
+    },
 }
 
 impl BridgeInput {
@@ -1838,6 +1848,7 @@ impl BridgeInput {
             | Self::RetireUnobservedSession { session_id, .. }
             | Self::TurnRequest { session_id, .. } => Some(session_id),
             Self::FinishHistorySync { owner } => Some(&owner.session.session_id),
+            Self::Operation { scope, write, .. } => operations::write_session(scope, write),
             Self::BusinessRequest { command, .. } | Self::PreparedAttachment { command, .. } => {
                 match command.get("type").and_then(Value::as_str)? {
                     "permission/respond" => state
@@ -1905,6 +1916,7 @@ impl BridgeInput {
             Self::BusinessRequest { command, .. } | Self::PreparedAttachment { command, .. } => {
                 serialized_value_len(command)
             }
+            Self::Operation { write, .. } => serialized_value_len(&write.args),
         };
         payload.saturating_add(256)
     }
@@ -1939,6 +1951,12 @@ impl BridgeInput {
                     let _ = response.send(Err(BridgeRequestError::from_acp(&error)));
                 }
             }
+            Self::Operation { reply, .. } => {
+                let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
+                    crate::protocol::documents::ErrorCode::Unavailable,
+                    error_message(error),
+                )));
+            }
         }
     }
 }
@@ -1947,6 +1965,9 @@ fn browser_traffic_class(input: &BridgeInput) -> crate::session_dispatch::Traffi
     use crate::session_dispatch::TrafficClass;
     match input {
         BridgeInput::TurnRequest { .. } => TrafficClass::Ordinary,
+        BridgeInput::Operation { write, .. } if operations::ordinary(write) => {
+            TrafficClass::Ordinary
+        }
         BridgeInput::BusinessRequest { command, .. }
             if matches!(
                 command.get("type").and_then(Value::as_str),
@@ -2745,6 +2766,23 @@ where
                         prepared_attachment = Some(reservation);
                         (command, None, response.map(BusinessResponder::new))
                     }
+                    Some(BridgeInput::Operation { scope, write, reply }) => {
+                        let mut state = state.lock().await;
+                        match operations::admit(&mut state, &scope, &write) {
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                            Ok((admission, command)) => {
+                                let _ = reply.send(Ok(admission));
+                                // A prompt runs on the turn path; nothing waits
+                                // for its v1 admission reply.
+                                let turn = (command["type"] == "session/prompt")
+                                    .then(|| TurnResponder::new(oneshot::channel().0));
+                                (command, turn, None)
+                            }
+                        }
+                    }
                     None => break,
                 };
                 let operation = command
@@ -2781,6 +2819,10 @@ where
                         .get("sessionId")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
+                    let protocol_operation = command
+                        .get(operations::OPERATION_FIELD)
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
                     let bridge_managed_materialization = command
                         .get("bridgeManagedMaterialization")
                         .and_then(Value::as_bool)
@@ -2799,6 +2841,9 @@ where
                         ) {
                             if let Some(responder) = &business_responder {
                                 responder.error(&error);
+                            }
+                            if let Some(op) = &protocol_operation {
+                                state.sessions.fail_protocol_operation(op, operation_error(&error, false));
                             }
                             return Ok(());
                         }
@@ -2871,16 +2916,25 @@ where
                         .await
                     };
                     if let Err(error) = &result {
-                        fail_command_operation(
-                            &mut *context.state.lock().await,
-                            &operation,
-                            intent_session_id.as_deref(),
-                            error,
-                            // The Agent connection ending, by a cancel or by
-                            // the transport closing, is not the Agent's error.
-                            context.cancellation.is_cancelled()
-                                || is_incoming_transport_closed(error),
-                        );
+                        // The Agent connection ending, by a cancel or by the
+                        // transport closing, is not the Agent's error.
+                        let closing = context.cancellation.is_cancelled()
+                            || is_incoming_transport_closed(error);
+                        let mut state = context.state.lock().await;
+                        match &protocol_operation {
+                            // A write's command settles its own operation only.
+                            Some(op) => {
+                                state.sessions.fail_protocol_operation(op, operation_error(error, closing));
+                                refresh_observer_timers(&mut state);
+                            }
+                            None => fail_command_operation(
+                                &mut state,
+                                &operation,
+                                intent_session_id.as_deref(),
+                                error,
+                                closing,
+                            ),
+                        }
                     }
                     if let (Some(responder), Err(error)) = (&turn_responder, &result) {
                         responder.error(error);
@@ -4560,7 +4614,12 @@ async fn handle_command_inner(
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {source_id}"))
                 })?;
-                let cwd = source.live.cwd.clone();
+                // A fork's explicit `cwd` overrides the source's (protocol §6.2).
+                let cwd = command
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| source.live.cwd.clone());
                 let source_incarnation = source.state.incarnation;
                 let source_baseline = session_mirror(&mut state)
                     .view(&source_id, source_incarnation)
@@ -6767,7 +6826,7 @@ fn validate_session_list_page(
     Ok(())
 }
 
-fn valid_session_path(value: &str) -> bool {
+pub(crate) fn valid_session_path(value: &str) -> bool {
     !value.is_empty() && !value.contains('\0') && is_portable_absolute_path(value)
 }
 
