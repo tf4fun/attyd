@@ -1689,3 +1689,141 @@ async fn review_a_pre_dispatch_config_refusal_restarts_the_idle_release_timer() 
     peer.settled().await;
     assert!(peer.publication.lock().publisher.document(&scope).is_none());
 }
+
+/// Automatic release is still an ordinary ACP close: a refusal keeps the
+/// session usable and must not turn an idle timer into a retry loop.
+#[tokio::test(start_paused = true)]
+async fn review_refused_automatic_close_waits_for_a_new_subscription_cycle() {
+    for timeout_seconds in [0, 1] {
+        let mut peer = Peer::start_with(loadable(), json!([]), |options| {
+            options.session_unobserved_timeout = timeout_seconds;
+        })
+        .await;
+        let scope = session(SAVED);
+        let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD)).await;
+        peer.serve_load(SAVED, &turns(&[("before close", "kept reply")]))
+            .await;
+        stream
+            .until(&mut peer, "the initial load", |reader| {
+                reader.live(&session(SAVED))["op"]["status"] == "completed"
+            })
+            .await;
+        let history = stream.log(&scope);
+        let before_reopen = stream.events_of(&scope).len();
+
+        stream.close();
+        peer.until_subscribers(SAVED, 0).await;
+        let refused = peer.request("session/close").await;
+        assert_eq!(refused["params"]["sessionId"], SAVED);
+        peer.refuse(&refused).await;
+        // Cross several full intervals, including the immediate-release case.
+        // No other command or subscription may reset the timer during this wait.
+        let several_intervals = Duration::from_secs(timeout_seconds.max(1) as u64 * 3);
+        peer.quiet(several_intervals).await;
+        peer.settled().await;
+        assert!(!peer.released(&scope), "a refused close keeps the session");
+
+        stream.reopen(&peer, None).await;
+        stream
+            .until(&mut peer, "the returning subscription", |reader| {
+                reader.events_of(&session(SAVED)).len() > before_reopen
+            })
+            .await;
+        assert_eq!(stream.log(&scope), history);
+        peer.quiet(several_intervals).await;
+        let (op, prompt) = peer.prompt(SAVED, vec![text("still usable")]).await;
+        peer.update(SAVED, chunk("after-refusal", text("still here")))
+            .await;
+        peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+        stream
+            .until(&mut peer, "the new prompt completes", |reader| {
+                reader.live(&session(SAVED))["op"]["id"] == op
+                    && reader.live(&session(SAVED))["op"]["status"] == "completed"
+            })
+            .await;
+        assert_eq!(stream.log(&scope).len(), history.len() + 1);
+        assert_eq!(
+            stream.log(&scope).last().unwrap()["turn"],
+            json!({"prompt": [text("still usable")], "reply": [text("still here")]})
+        );
+        peer.settled().await;
+        stream.converged(&peer);
+
+        stream.close();
+        peer.until_subscribers(SAVED, 0).await;
+        let close = peer.request("session/close").await;
+        assert_eq!(close["params"]["sessionId"], SAVED);
+        assert_ne!(close["id"], refused["id"]);
+        peer.reply(&close, json!({})).await;
+        peer.until("the next close releases the session", |peer| {
+            peer.released(&session(SAVED))
+        })
+        .await;
+        peer.quiet(several_intervals).await;
+        peer.settled().await;
+    }
+}
+
+/// A locally released session still exists at the Agent. Its late update is
+/// not early replay for the unrelated create currently awaiting a response.
+#[tokio::test(start_paused = true)]
+async fn review_released_session_updates_do_not_displace_a_new_sessions_early_controls() {
+    for late_old_update in [false, true] {
+        let mut peer = Peer::start_with(json!({"loadSession": true}), json!([]), |options| {
+            options.session_unobserved_timeout = 1;
+        })
+        .await;
+        peer.create("old", json!({})).await;
+        peer.until("the old session is locally released", |peer| {
+            peer.released(&session("old"))
+        })
+        .await;
+
+        let (_, created) = peer.start_op("global", "create", json!({"cwd": CWD})).await;
+        let request = peer.request("session/new").await;
+        let commands = json!([{"name": "new-command", "description": "For the new session"}]);
+        let mut batch = Vec::new();
+        if late_old_update {
+            batch.push(json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "old", "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{"name": "old-command", "description": "Old session"}],
+                }},
+            }));
+        }
+        batch.push(json!({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "new", "update": {
+                "sessionUpdate": "available_commands_update", "availableCommands": commands,
+            }},
+        }));
+        batch.push(json!({
+            "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": "new"},
+        }));
+        peer.send(Value::Array(batch)).await;
+        assert_eq!(
+            Peer::ended(created).await.unwrap(),
+            json!({"sessionId": "new"})
+        );
+
+        let scope = session("new");
+        let mut stream = Stream::open(&peer, &[scope.as_str()], None).await;
+        stream
+            .until(
+                &mut peer,
+                "the newly created session's alignment",
+                |reader| reader.replicas.contains_key(&session("new")),
+            )
+            .await;
+        assert_eq!(
+            stream.live(&scope)["controls"]["commands"],
+            commands,
+            "late_old_update={late_old_update}: the new session keeps its own early controls"
+        );
+        assert!(peer.live("global")["sessions"].get("old").is_none());
+        peer.quiet(Duration::from_secs(2)).await;
+        peer.settled().await;
+        stream.converged(&peer);
+    }
+}
