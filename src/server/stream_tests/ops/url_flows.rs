@@ -55,12 +55,23 @@ async fn accept_flow(
     assert_eq!(status, StatusCode::ACCEPTED, "{scope}: {body}");
     assert_eq!(body["op"], op);
     assert_eq!(link.response(id).await["result"]["action"], "accept");
-    // The event that adds the flow is the step that removes the interaction.
-    watch
-        .until_live(scope, "the accepted flow", |live| {
-            live["urlFlows"].get(&interaction).is_some()
-        })
-        .await;
+    // Every published step shows the ID in exactly one place: pending, or
+    // the flow. Taking the events one by one, a step with both or neither
+    // (an interaction removed in one commit, the flow added in a later one)
+    // fails.
+    loop {
+        let live = watch.live(scope);
+        let pending = interaction_ids(&live).contains(&interaction);
+        let flowing = live["urlFlows"].get(&interaction).is_some();
+        assert!(
+            pending != flowing,
+            "{scope}: {interaction} is pending and a flow, or neither: {live}"
+        );
+        if flowing {
+            break;
+        }
+        watch.event().await;
+    }
     let live = watch.live(scope);
     assert!(
         !interaction_ids(&live).contains(&interaction),
@@ -242,6 +253,24 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
                 && live["sessions"]["s"]["pending"]["urlFlows"] == 1
         })
         .await;
+
+    // A new subscription aligns with the three kept flows.
+    let mut second = bench
+        .watch(&scopes(&["global", "catalog", "session/s"]))
+        .await;
+    second
+        .until("the second stream's alignments", |watch| {
+            watch.has("global") && watch.has("catalog") && watch.has("session/s")
+        })
+        .await;
+    for (scope, interaction, kept) in [
+        ("global", &global_flow, &kept),
+        ("catalog", &catalog_flow, &catalog_kept),
+        ("session/s", &prompt_flow, &prompt_kept),
+    ] {
+        assert_eq!(&flow(&second.live(scope), interaction), kept, "{scope}");
+    }
+    drop(second);
 
     // session: an Agent request with no running operation starts an
     // `agent_request`; its accepted flow outlives it, and the Agent's
