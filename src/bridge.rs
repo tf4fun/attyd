@@ -2826,15 +2826,13 @@ async fn send_history<Req: JsonRpcRequest>(
     execution: &mut Option<ExecutionTurn>,
     state: &Arc<BridgeLock>,
     owner: RequestOwner,
+    incarnation: u64,
     request: Req,
 ) -> Result<Result<Req::Response, Error>, Error> {
     let session_id = owner
         .session_id
         .as_deref()
         .ok_or_else(|| runtime_state_error("load has no session"))?;
-    let incarnation = owner
-        .incarnation
-        .ok_or_else(|| runtime_state_error("load has no incarnation"))?;
     let attempt_id = owner
         .attempt_id
         .as_deref()
@@ -3338,6 +3336,7 @@ async fn handle_command_inner(
                     execution,
                     &state,
                     owner.clone(),
+                    attachment_incarnation,
                     LoadSessionRequest::new(session_id.clone(), &cwd)
                         .additional_directories(local_additional_directories(&options))
                         .mcp_servers(options.mcp_servers.clone()),
@@ -3351,6 +3350,7 @@ async fn handle_command_inner(
                     execution,
                     &state,
                     owner.clone(),
+                    attachment_incarnation,
                     ResumeSessionRequest::new(session_id.clone(), &cwd)
                         .additional_directories(local_additional_directories(&options))
                         .mcp_servers(options.mcp_servers.clone()),
@@ -5072,6 +5072,7 @@ async fn synchronize_authoritative_history(
             execution,
             state,
             owner.clone(),
+            incarnation,
             LoadSessionRequest::new(session_id.to_string(), &cwd)
                 .additional_directories(local_additional_directories(options))
                 .mcp_servers(options.mcp_servers.clone()),
