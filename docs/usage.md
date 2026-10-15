@@ -14,10 +14,9 @@ column for content; code blocks retain their monospace treatment.
 While a turn runs, its replies, thinking, tools, plans and file changes stream
 directly into the conversation. Once the Agent answers the prompt, the turn keeps
 the prompt and the Agent's messages; thinking, tool calls, plans and their output
-end with the turn and are not shown again, also not after a reload. The last Agent
-message stays visible, and earlier ones fold under an **Execution process** row
-with their count and an explicit **Show / Hide** action. If you scroll up while a
-turn runs, folding waits until you return to the bottom. Markdown export contains
+end with the turn and are not shown again, also not after a reload. The whole
+reply is shown as one Agent message. If you scroll up while a turn runs, the
+process is removed only once you return to the bottom. Markdown export contains
 the prompts and messages, with their attachments. A failed prompt keeps its error
 and the prompt for Retry.
 

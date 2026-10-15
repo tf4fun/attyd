@@ -34,12 +34,14 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
 - Native image/audio and embedded text/binary resources use the same compact attachment entry.
   Tool results use plain file rows; message attachments use compact chips. File names, available
   sizes, and tool-result locations remain readable, with MIME/address/description in the tooltip.
-- Open available attachments in a new browser page with one ordinary link. Browser behavior and
-  the response MIME type determine preview or download; do not add separate preview/download modes,
-  inline media players, or PDF/Office renderers.
+- Open available attachments with one ordinary link to a Blob URL the page builds from the read
+  block and revokes when the view goes. Safe media (common images, audio, video, and text or JSON
+  as plain text) open in a new page; HTML, SVG, XML, PDF and unknown types are downloads with the
+  original bytes. Do not add inline media players or PDF/Office renderers.
 - Documents contain references to content already held in the bridge's session memory.
   The attachment read resolves a reference while the session is held and its log or `live`
-  refers to it, without a separate store, filesystem lookup, or browser Blob cache. Session
+  refers to it, without a separate store or filesystem lookup; the page caches a read block
+  only while a view shows it. Session
   release or bridge restart ends that availability unless the Agent supplies the content again
   during history restoration.
 - Resource links can open HTTP(S) URLs or attyd-hosted attachment references. Other URI schemes
