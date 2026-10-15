@@ -519,6 +519,41 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     expect(net.calls[1].body).toMatchObject({ expect: "op-B" });
   });
 
+  it("sends new corrected input against the same ended op after the user removes a refused write", async () => {
+    const { net, view, queue: q } = queue();
+    view.show({ id: "op-A", status: "completed" });
+    const missingAttachment: Extract<OpArgs, { kind: "prompt" }> = {
+      kind: "prompt", args: { prompt: [{ type: "attachment", id: "0".repeat(64), block: "image" }] },
+    };
+    const refused = q.enqueue(S, missingAttachment);
+    expect(net.calls).toHaveLength(1);
+    net.calls[0].respond(400, { error: { code: "invalid_request", message: "unknown attachment" } });
+    await flush();
+    expect(q.items(S)).toEqual([
+      { id: refused, write: missingAttachment, state: "refused", error: { code: "invalid_request", message: "unknown attachment" } },
+    ]);
+
+    // The rejected item is not automatically retried against the unchanged op.
+    q.update(S);
+    await flush();
+    expect(net.calls).toHaveLength(1);
+    expect(view.source.get(S)?.live).toEqual(sessionLive({ id: "op-A", status: "completed" }));
+
+    q.remove(S, refused);
+    expect(q.items(S)).toEqual([]);
+    // This is new user input, not a retry of the removed item. No SSE follows.
+    q.enqueue(S, prompt("corrected prompt"));
+    q.update(S);
+    await flush();
+    expect(net.calls).toHaveLength(2);
+    expect(net.calls[1].body).toEqual({
+      expect: "op-A", kind: "prompt", args: { prompt: [{ type: "text", text: "corrected prompt" }] },
+    });
+    net.calls[1].respond(202, { op: "op-B" });
+    await flush();
+    expect(q.items(S)).toEqual([]);
+  });
+
   it("never sends a write without a definite answer again, whatever is refused later", async () => {
     const { net, view, queue: q } = queue();
     const uncertain = q.enqueue(S, prompt("maybe"));
