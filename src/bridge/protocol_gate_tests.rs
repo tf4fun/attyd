@@ -5,8 +5,9 @@
 //! bridge state's protocol tap hands every commit to the test with the
 //! documents it published; one replica per scope applies each event at the
 //! wire level and is compared with the published document after every event.
-//! Operations are installed through the registry's internal entry points and
-//! then run on the existing v1 execution path; admission is step 6.
+//! Operations start through the bridge's admission of v2 writes (protocol
+//! §6); a test that only needs an occupied scope installs one through the
+//! registry's internal entry point.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::Weak;
@@ -17,10 +18,12 @@ use futures::{SinkExt, StreamExt};
 
 use super::*;
 use crate::protocol::Op;
+use crate::protocol::admission::OpWrite;
 use crate::protocol::canon::ChainHash;
 use crate::protocol::diff;
-use crate::protocol::documents::{OperationKind, Scope};
+use crate::protocol::documents::{OperationKind, ProtocolError, Scope};
 use crate::protocol::hub::{Publication, Subscribed, Subscription};
+use crate::protocol::op::OpEnd;
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -505,50 +508,113 @@ impl Peer {
             .unwrap()
     }
 
-    /// Creates `session_id` through `session/new` and returns its history
-    /// revision.
+    /// A v2 operation write in `scope` through the bridge's admission
+    /// (protocol §6), expecting the scope's published operation.
+    async fn write(
+        &self,
+        scope: &str,
+        kind: &str,
+        args: Value,
+    ) -> Result<operations::OperationAdmission, ProtocolError> {
+        let scope = Scope::parse(scope).unwrap();
+        let expect = {
+            let lock = self.lock();
+            let state = lock.lock().await;
+            let published = state.protocol.publication.lock();
+            published.publisher.live(&scope).expect("a published scope")["op"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let (reply, admitted) = oneshot::channel();
+        self.commands
+            .send(BridgeInput::Operation {
+                scope,
+                write: OpWrite {
+                    expect,
+                    kind: kind.to_string(),
+                    args,
+                },
+                reply,
+            })
+            .unwrap();
+        tokio::time::timeout(WAIT, admitted)
+            .await
+            .expect("the write was not admitted")
+            .expect("the bridge dropped the write")
+    }
+
+    /// Starts an operation of `kind` in `scope` and waits until it is
+    /// published: its ID, and for `create`, `fork` and `list` the end its
+    /// response waits for.
+    async fn start_op(
+        &mut self,
+        scope: &str,
+        kind: &str,
+        args: Value,
+    ) -> (String, Option<oneshot::Receiver<OpEnd>>) {
+        let admission = self
+            .write(scope, kind, args)
+            .await
+            .unwrap_or_else(|error| panic!("{kind} in {scope} was refused: {error:?}"));
+        let id = admission.op.clone();
+        self.until("the operation is published", |peer| {
+            peer.live(scope)["op"]["id"] == id.as_str()
+        })
+        .await;
+        (admission.op, admission.end)
+    }
+
+    /// The end a held `create`, `fork` or `list` response takes.
+    async fn ended(end: Option<oneshot::Receiver<OpEnd>>) -> OpEnd {
+        tokio::time::timeout(WAIT, end.expect("a held response"))
+            .await
+            .expect("the operation did not end")
+            .expect("the operation's end was dropped")
+    }
+
+    /// Answers `interaction`, the one pending interaction of the operation
+    /// running in `scope`.
+    async fn answer(&mut self, scope: &str, interaction: &str, answer: Value) {
+        self.write(scope, "answer", json!({"answers": {interaction: answer}}))
+            .await
+            .unwrap_or_else(|error| panic!("the answer in {scope} was refused: {error:?}"));
+    }
+
+    /// Creates `session_id` through a v2 `create` and returns the create's
+    /// operation.
     async fn create(&mut self, session_id: &str, response: Value) -> String {
         self.create_in(session_id, "/workspace", response).await
     }
 
     /// Creates `session_id` in `cwd`.
     async fn create_in(&mut self, session_id: &str, cwd: &str, response: Value) -> String {
-        let created = self.submit(json!({
-            "type": "session/new", "requestId": format!("new-{session_id}"), "cwd": cwd,
-        }));
+        let (op, end) = self.start_op("global", "create", json!({"cwd": cwd})).await;
         let new = self.request("session/new").await;
         let mut response = response;
         response["sessionId"] = json!(session_id);
         self.reply(&new, response).await;
-        let created = Self::result(created).await.unwrap();
+        assert_eq!(
+            Self::ended(end).await.unwrap(),
+            json!({"sessionId": session_id})
+        );
         let scope = format!("session/{session_id}");
         self.until("the created session is published", |peer| peer.has(&scope))
             .await;
-        created["view"]["session"]["historyRevision"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        op
     }
 
-    /// Starts a v1 turn of `session_id` and returns the Agent's
+    /// Starts a v2 prompt of `session_id`: its operation and the Agent's
     /// `session/prompt` request.
-    async fn turn(&mut self, session_id: &str, revision: &str, prompt: Vec<Value>) -> Value {
-        let (response, admitted) = oneshot::channel();
-        self.commands
-            .send(BridgeInput::TurnRequest {
-                session_id: session_id.into(),
-                history_revision: revision.into(),
-                client_intent_id: format!("turn-{}", Uuid::new_v4()),
-                prompt,
-                response,
-            })
-            .unwrap();
-        tokio::time::timeout(WAIT, admitted)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        self.request("session/prompt").await
+    async fn prompt(&mut self, session_id: &str, prompt: Vec<Value>) -> (String, Value) {
+        let (op, _) = self
+            .start_op(
+                &format!("session/{session_id}"),
+                "prompt",
+                json!({"prompt": prompt}),
+            )
+            .await;
+        (op, self.request("session/prompt").await)
     }
 
     // -- Bridge state ----------------------------------------------------------
@@ -570,20 +636,6 @@ impl Peer {
         };
         self.until("the installed operation is published", |peer| {
             peer.live(scope)["op"]["id"] == id
-        })
-        .await;
-        id
-    }
-
-    async fn install_prompt(&mut self, session_id: &str, prompt: &[Value]) -> String {
-        let id = {
-            let lock = self.lock();
-            let mut state = lock.lock().await;
-            state.sessions.install_prompt(session_id, prompt).unwrap()
-        };
-        let scope = format!("session/{session_id}");
-        self.until("the prompt is published", |peer| {
-            peer.live(&scope)["op"]["id"] == id
         })
         .await;
         id
@@ -1024,14 +1076,13 @@ fn the_atomic_check_rejects_a_prompt_that_ends_before_its_log() {
 #[tokio::test]
 async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
     let mut peer = Peer::start(json!({})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     assert_eq!(peer.live(&scope)["op"]["kind"], "open");
     assert_eq!(peer.log(&scope), Vec::<Value>::new());
 
     let prompt = vec![text("hi")];
-    let op = peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (op, request) = peer.prompt(CREATED, prompt).await;
     peer.update(CREATED, chunk("answer", text("hel"))).await;
     peer.until("the first chunk streams", |peer| {
         peer.live(&scope)["op"]["process"][0]["content"]["text"] == "hel"
@@ -1073,11 +1124,12 @@ async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
         peer.live("global")["sessions"][CREATED]["pending"]["interactions"],
         1
     );
-    let answered = peer.submit(json!({
-        "type": "permission/respond", "requestId": "answer", "sessionId": CREATED,
-        "permissionId": interaction, "outcome": {"outcome": "selected", "optionId": "allow"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &scope,
+        &interaction,
+        json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
+    )
+    .await;
     let response = peer.response("permission").await;
     assert_eq!(response["result"]["outcome"]["optionId"], "allow");
     peer.until("the answered permission leaves", |peer| {
@@ -1109,11 +1161,10 @@ async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
 #[tokio::test]
 async fn a_failed_prompt_appends_nothing_and_keeps_its_error() {
     let mut peer = Peer::start(json!({})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("hi")];
-    peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (_, request) = peer.prompt(CREATED, prompt).await;
     peer.update(CREATED, chunk("answer", text("partial"))).await;
     peer.until("the chunk streams", |peer| {
         peer.live(&scope)["op"]["process"][0]["content"]["text"] == "partial"
@@ -1142,11 +1193,10 @@ async fn a_failed_prompt_appends_nothing_and_keeps_its_error() {
 #[tokio::test]
 async fn a_cancelled_stop_reason_completes_the_prompt() {
     let mut peer = Peer::start(json!({})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("hi")];
-    peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (_, request) = peer.prompt(CREATED, prompt).await;
     peer.reply(&request, json!({"stopReason": "cancelled"}))
         .await;
     peer.until("the prompt ends", |peer| {
@@ -1162,11 +1212,10 @@ async fn a_cancelled_stop_reason_completes_the_prompt() {
 #[tokio::test]
 async fn attachments_follow_the_documents_that_reference_them() {
     let mut peer = Peer::start(json!({"promptCapabilities": {"image": true}})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("look"), image("cHJvbXB0")];
-    peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (_, request) = peer.prompt(CREATED, prompt).await;
     let input = peer.live(&scope)["op"]["input"]["prompt"][1].clone();
     assert_eq!(
         input["type"], "attachment",
@@ -1232,15 +1281,11 @@ async fn a_set_mode_folds_its_acknowledgement_when_it_completes() {
         peer.live(&scope)["controls"]["modes"]["currentModeId"],
         "ask"
     );
-    let op = peer
-        .install(&scope, OperationKind::SetMode, json!({"modeId": "plan"}))
+    let (op, _) = peer
+        .start_op(&scope, "set_mode", json!({"modeId": "plan"}))
         .await;
-    let done = peer.submit(json!({
-        "type": "session/set_mode", "requestId": "mode", "sessionId": CREATED, "modeId": "plan",
-    }));
     let request = peer.request("session/set_mode").await;
     peer.reply(&request, json!({})).await;
-    Peer::result(done).await.unwrap();
     peer.until("the set_mode completes", |peer| {
         peer.live(&scope)["op"]["status"] == "completed"
     })
@@ -1265,14 +1310,7 @@ async fn a_set_mode_folds_its_acknowledgement_when_it_completes() {
 async fn a_create_completes_with_its_session_and_advances_the_catalog() {
     let mut peer = Peer::start(json!({})).await;
     let revision = peer.live("catalog")["revision"].clone();
-    let op = peer
-        .install(
-            "global",
-            OperationKind::Create,
-            json!({"cwd": "/workspace"}),
-        )
-        .await;
-    peer.create(CREATED, json!({})).await;
+    let op = peer.create(CREATED, json!({})).await;
     peer.until("the create completes", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -1304,18 +1342,12 @@ async fn a_create_completes_with_its_session_and_advances_the_catalog() {
 #[tokio::test]
 async fn a_failed_create_fails_its_operation() {
     let mut peer = Peer::start(json!({})).await;
-    peer.install(
-        "global",
-        OperationKind::Create,
-        json!({"cwd": "/workspace"}),
-    )
-    .await;
-    let created = peer.submit(json!({
-        "type": "session/new", "requestId": "new", "cwd": "/workspace",
-    }));
+    let (_, created) = peer
+        .start_op("global", "create", json!({"cwd": "/workspace"}))
+        .await;
     let request = peer.request("session/new").await;
     peer.refuse(&request).await;
-    Peer::result(created).await.unwrap_err();
+    Peer::ended(created).await.unwrap_err();
     peer.until("the create fails", |peer| {
         peer.live("global")["op"]["status"] == "failed"
     })
@@ -1328,15 +1360,10 @@ async fn a_failed_create_fails_its_operation() {
 async fn a_fork_completes_on_its_source_and_its_target_appears() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
     peer.create("source", json!({})).await;
-    let op = peer
-        .install("session/source", OperationKind::Fork, json!({}))
-        .await;
-    let forked = peer.submit(json!({
-        "type": "session/fork", "requestId": "fork", "sessionId": "source",
-    }));
+    let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
     let request = peer.request("session/fork").await;
     peer.reply(&request, json!({"sessionId": "forked"})).await;
-    Peer::result(forked).await.unwrap();
+    Peer::ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
         peer.live("session/source")["op"]["status"] == "completed" && peer.has("session/forked")
     })
@@ -1356,20 +1383,13 @@ async fn a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted() 
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let revision = peer.live("catalog")["revision"].clone();
-    let op = peer
-        .install(
-            "global",
-            OperationKind::Delete,
-            json!({"sessionId": CREATED}),
-        )
+    let (op, _) = peer
+        .start_op("global", "delete", json!({"sessionId": CREATED}))
         .await;
     peer.until("the delete occupies the session", |peer| {
         peer.live(&scope)["op"]["id"] == op
     })
     .await;
-    let deleted = peer.submit(json!({
-        "type": "session/delete", "requestId": "delete", "sessionId": CREATED,
-    }));
     let close = peer.request("session/close").await;
     peer.agent_request(
         "close-question",
@@ -1387,11 +1407,12 @@ async fn a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted() 
         vec![interaction.clone()],
         "the occupied session shows the delete's interaction"
     );
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer", "sessionId": CREATED,
-        "elicitationId": interaction, "response": {"action": "accept", "content": {}},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        "global",
+        &interaction,
+        json!({"response": {"action": "accept", "content": {}}}),
+    )
+    .await;
     assert_eq!(
         peer.response("close-question").await["result"]["action"],
         "accept"
@@ -1399,7 +1420,6 @@ async fn a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted() 
     peer.reply(&close, json!({})).await;
     let delete = peer.request("session/delete").await;
     peer.reply(&delete, json!({})).await;
-    Peer::result(deleted).await.unwrap();
     peer.until("the delete completes", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -1424,19 +1444,11 @@ async fn a_failed_delete_frees_the_session_it_occupied() {
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let own = peer.live(&scope)["op"]["id"].clone();
-    let op = peer
-        .install(
-            "global",
-            OperationKind::Delete,
-            json!({"sessionId": CREATED}),
-        )
+    let (op, _) = peer
+        .start_op("global", "delete", json!({"sessionId": CREATED}))
         .await;
-    let deleted = peer.submit(json!({
-        "type": "session/delete", "requestId": "delete", "sessionId": CREATED,
-    }));
     let close = peer.request("session/close").await;
     peer.refuse(&close).await;
-    Peer::result(deleted).await.unwrap_err();
     peer.until("the delete fails", |peer| {
         peer.live("global")["op"]["status"] == "failed"
     })
@@ -1497,17 +1509,14 @@ async fn a_close_releases_the_session_without_an_end() {
 #[tokio::test]
 async fn a_list_completes_on_the_catalog_with_its_page() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"list": {}}})).await;
-    let op = peer
-        .install("catalog", OperationKind::List, json!({}))
-        .await;
-    let listed = peer.submit(json!({"type": "session/list", "requestId": "list"}));
+    let (op, listed) = peer.start_op("catalog", "list", json!({})).await;
     let request = peer.request("session/list").await;
     peer.reply(
         &request,
         json!({"sessions": [{"sessionId": "saved", "cwd": "/workspace"}], "nextCursor": null}),
     )
     .await;
-    Peer::result(listed).await.unwrap();
+    Peer::ended(listed).await.unwrap();
     peer.until("the list completes", |peer| {
         peer.live("catalog")["op"]["status"] == "completed"
     })
@@ -1528,18 +1537,10 @@ async fn authenticate_and_logout_settle_the_global_operation_and_the_agent() {
         |_| {},
     )
     .await;
-    peer.install(
-        "global",
-        OperationKind::Authenticate,
-        json!({"methodId": "agent-login"}),
-    )
-    .await;
-    let done = peer.submit(json!({
-        "type": "auth/authenticate", "requestId": "auth", "methodId": "agent-login",
-    }));
+    peer.start_op("global", "authenticate", json!({"methodId": "agent-login"}))
+        .await;
     let request = peer.request("authenticate").await;
     peer.reply(&request, json!({})).await;
-    Peer::result(done).await.unwrap();
     peer.until("the authentication completes", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -1549,12 +1550,9 @@ async fn authenticate_and_logout_settle_the_global_operation_and_the_agent() {
         "agent-login"
     );
 
-    peer.install("global", OperationKind::Logout, json!({}))
-        .await;
-    let done = peer.submit(json!({"type": "auth/logout", "requestId": "logout"}));
+    peer.start_op("global", "logout", json!({})).await;
     let request = peer.request("logout").await;
     peer.reply(&request, json!({})).await;
-    Peer::result(done).await.unwrap();
     peer.until("the logout completes", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -1572,10 +1570,7 @@ async fn authenticate_and_logout_settle_the_global_operation_and_the_agent() {
 #[tokio::test]
 async fn a_request_scoped_elicitation_followed_by_its_response_joins_the_catalog() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"list": {}}})).await;
-    let op = peer
-        .install("catalog", OperationKind::List, json!({}))
-        .await;
-    let listed = peer.submit(json!({"type": "session/list", "requestId": "list"}));
+    let (op, listed) = peer.start_op("catalog", "list", json!({})).await;
     let request = peer.request("session/list").await;
     // The parent's response clears its pending request before the
     // coordinator handles the interaction that names it.
@@ -1587,7 +1582,7 @@ async fn a_request_scoped_elicitation_followed_by_its_response_joins_the_catalog
         &request,
     )
     .await;
-    Peer::result(listed).await.unwrap();
+    Peer::ended(listed).await.unwrap();
     peer.until("the list completes", |peer| {
         peer.live("catalog")["op"]["status"] == "completed"
     })
@@ -1614,16 +1609,9 @@ async fn a_request_scoped_elicitation_followed_by_its_response_joins_the_catalog
 #[tokio::test]
 async fn a_request_scoped_url_flow_on_global_outlives_its_operation() {
     let mut peer = Peer::start(json!({})).await;
-    let op = peer
-        .install(
-            "global",
-            OperationKind::Create,
-            json!({"cwd": "/workspace"}),
-        )
+    let (op, created) = peer
+        .start_op("global", "create", json!({"cwd": "/workspace"}))
         .await;
-    let created = peer.submit(json!({
-        "type": "session/new", "requestId": "new", "cwd": "/workspace",
-    }));
     let request = peer.request("session/new").await;
     peer.agent_request(
         "sign-in",
@@ -1637,11 +1625,12 @@ async fn a_request_scoped_url_flow_on_global_outlives_its_operation() {
     .await;
     let interaction = interaction_ids(&peer.live("global")).remove(0);
     assert_eq!(peer.live("global")["op"]["id"], op);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer",
-        "elicitationId": interaction, "response": {"action": "accept"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        "global",
+        &interaction,
+        json!({"response": {"action": "accept"}}),
+    )
+    .await;
     assert_eq!(peer.response("sign-in").await["result"]["action"], "accept");
     peer.until("the accepted flow moves to urlFlows", |peer| {
         interaction_ids(&peer.live("global")).is_empty()
@@ -1649,7 +1638,7 @@ async fn a_request_scoped_url_flow_on_global_outlives_its_operation() {
     })
     .await;
     peer.reply(&request, json!({"sessionId": CREATED})).await;
-    Peer::result(created).await.unwrap();
+    Peer::ended(created).await.unwrap();
     peer.until("the create completes", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -1665,11 +1654,10 @@ async fn a_request_scoped_url_flow_on_global_outlives_its_operation() {
 #[tokio::test]
 async fn request_scoped_interactions_of_a_prompt_join_its_session() {
     let mut peer = Peer::start(json!({})).await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("hi")];
-    let op = peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (op, request) = peer.prompt(CREATED, prompt).await;
 
     peer.agent_request(
         "sign-in",
@@ -1684,11 +1672,12 @@ async fn request_scoped_interactions_of_a_prompt_join_its_session() {
     assert_eq!(peer.live(&scope)["op"]["id"], op);
     assert!(interaction_ids(&peer.live("global")).is_empty());
     let interaction = interaction_ids(&peer.live(&scope)).remove(0);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer",
-        "elicitationId": interaction, "response": {"action": "accept"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &scope,
+        &interaction,
+        json!({"response": {"action": "accept"}}),
+    )
+    .await;
     assert_eq!(peer.response("sign-in").await["result"]["action"], "accept");
     peer.until("the flow is the session's", |peer| {
         peer.live(&scope)["urlFlows"].get(&interaction).is_some()
@@ -1755,18 +1744,13 @@ async fn login_terminals_publish_output_and_exit_and_keep_their_method() {
         },
     )
     .await;
-    let a = peer
-        .install(
+    let (a, _) = peer
+        .start_op(
             "global",
-            OperationKind::TerminalLogin,
+            "terminal_login",
             json!({"methodId": "login-a", "cols": 80, "rows": 24}),
         )
         .await;
-    let started = peer.submit(json!({
-        "type": "auth/terminal_start", "requestId": "term-a", "methodId": "login-a",
-        "cols": 80, "rows": 24,
-    }));
-    Peer::result(started).await.unwrap();
     peer.until("login A exits", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -1790,18 +1774,13 @@ async fn login_terminals_publish_output_and_exit_and_keep_their_method() {
     );
 
     // B starts while A's terminal is still there.
-    let b = peer
-        .install(
+    let (b, _) = peer
+        .start_op(
             "global",
-            OperationKind::TerminalLogin,
+            "terminal_login",
             json!({"methodId": "login-b", "cols": 80, "rows": 24}),
         )
         .await;
-    let started = peer.submit(json!({
-        "type": "auth/terminal_start", "requestId": "term-b", "methodId": "login-b",
-        "cols": 80, "rows": 24,
-    }));
-    Peer::result(started).await.unwrap();
     peer.until("login B prints", |peer| {
         peer.live("global")["terminals"][&b]["output"]
             .as_str()
@@ -1812,10 +1791,22 @@ async fn login_terminals_publish_output_and_exit_and_keep_their_method() {
     assert_eq!(global["terminals"][&b]["exitStatus"], Value::Null);
     assert_eq!(global["terminals"][&b]["methodId"], "login-b");
     assert_eq!(global["terminals"][&a]["methodId"], "login-a");
-    let written = peer.submit(json!({
-        "type": "auth/terminal_input", "requestId": "term-b", "data": "done\n",
-    }));
-    Peer::result(written).await.unwrap();
+    let (reply, acted) = oneshot::channel();
+    peer.commands
+        .send(BridgeInput::Resource {
+            scope: Scope::Global,
+            resource: b.clone(),
+            action: resources::ResourceAction::Input {
+                data: "done\n".into(),
+            },
+            reply,
+        })
+        .unwrap();
+    tokio::time::timeout(WAIT, acted)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     peer.until("login B exits", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })
@@ -1833,22 +1824,22 @@ async fn login_terminals_publish_output_and_exit_and_keep_their_method() {
         "an operation's end removes no terminal"
     );
 
-    // A login that cannot start fails its operation.
-    peer.install(
-        "global",
-        OperationKind::TerminalLogin,
-        json!({"methodId": "missing", "cols": 80, "rows": 24}),
-    )
-    .await;
-    let started = peer.submit(json!({
-        "type": "auth/terminal_start", "requestId": "term-c", "methodId": "missing",
-        "cols": 80, "rows": 24,
-    }));
-    Peer::result(started).await.unwrap_err();
-    peer.until("the login fails", |peer| {
-        peer.live("global")["op"]["status"] == "failed"
-    })
-    .await;
+    // A login of a method the Agent did not advertise is refused before it
+    // starts anything.
+    let refused = peer
+        .write(
+            "global",
+            "terminal_login",
+            json!({"methodId": "missing", "cols": 80, "rows": 24}),
+        )
+        .await
+        .err()
+        .expect("an unknown login method is refused");
+    assert_eq!(
+        refused.code,
+        crate::protocol::documents::ErrorCode::InvalidRequest
+    );
+    assert_eq!(peer.live("global")["op"]["id"], b);
     assert_eq!(
         peer.live("global")["terminals"].as_object().unwrap().len(),
         2
@@ -1876,11 +1867,10 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
         |_| {},
     )
     .await;
-    let revision = peer.create(CREATED, json!({})).await;
+    peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("hi")];
-    peer.install_prompt(CREATED, &prompt).await;
-    let request = peer.turn(CREATED, &revision, prompt).await;
+    let (_, request) = peer.prompt(CREATED, prompt).await;
     peer.agent_request(
         "sign-in",
         "elicitation/create",
@@ -1892,11 +1882,12 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
     })
     .await;
     let interaction = interaction_ids(&peer.live(&scope)).remove(0);
-    let answered = peer.submit(json!({
-        "type": "elicitation/respond", "requestId": "answer",
-        "elicitationId": interaction, "response": {"action": "accept"},
-    }));
-    Peer::result(answered).await.unwrap();
+    peer.answer(
+        &scope,
+        &interaction,
+        json!({"response": {"action": "accept"}}),
+    )
+    .await;
     peer.agent_request(
         "permission",
         "session/request_permission",
@@ -1908,19 +1899,10 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
             && peer.live(&scope)["urlFlows"].get(&interaction).is_some()
     })
     .await;
-    peer.install(
-        "global",
-        OperationKind::Authenticate,
-        json!({"methodId": "agent-login"}),
-    )
-    .await;
-    let _authenticating = peer.submit(json!({
-        "type": "auth/authenticate", "requestId": "auth", "methodId": "agent-login",
-    }));
-    peer.request("authenticate").await;
-    peer.install("catalog", OperationKind::List, json!({}))
+    peer.start_op("global", "authenticate", json!({"methodId": "agent-login"}))
         .await;
-    let _listing = peer.submit(json!({"type": "session/list", "requestId": "list"}));
+    peer.request("authenticate").await;
+    let (_, _listing) = peer.start_op("catalog", "list", json!({})).await;
     peer.request("session/list").await;
     peer.settled().await;
 
@@ -1967,16 +1949,19 @@ async fn a_failed_connection_publishes_the_agent_error() {
 async fn the_same_history_gives_the_same_log_after_a_restart() {
     async fn load(replay: &[Value]) -> Vec<Value> {
         let mut peer = Peer::start(json!({"loadSession": true})).await;
-        let loaded = peer.submit(json!({
-            "type": "session/load", "requestId": "load", "sessionId": "saved",
-            "cwd": "/workspace",
-        }));
+        let _stream = peer
+            .subscribe(
+                crate::protocol::hub::parse_stream_query(
+                    "scope=session%2Fsaved&cwd=session%2Fsaved%3A%2Fworkspace",
+                )
+                .unwrap(),
+            )
+            .await;
         let request = peer.request("session/load").await;
         for update in replay {
             peer.update("saved", update.clone()).await;
         }
         peer.reply(&request, json!({})).await;
-        Peer::result(loaded).await.unwrap();
         peer.until("the load completes", |peer| {
             peer.live("session/saved")["op"]["status"] == "completed"
         })
