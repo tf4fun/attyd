@@ -3769,7 +3769,7 @@ mod tests {
                 "derived",
                 "/derived",
                 json!({ "sessionId": "derived" }),
-                ("source", source),
+                "source",
                 None,
             )
             .unwrap();
@@ -3788,7 +3788,7 @@ mod tests {
                 "replayed",
                 "/replayed",
                 json!({ "sessionId": "replayed" }),
-                ("source", source),
+                "source",
                 Some(vec![
                     json!({
                         "sessionUpdate": "agent_message_chunk",

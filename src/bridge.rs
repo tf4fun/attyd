@@ -2667,7 +2667,7 @@ async fn send_history<Req: JsonRpcRequest>(
             .sessions
             .load_candidate(session_id, attempt_id)
             .map_err(mirror_error)?;
-        let (mut validation, controls) = replay.take_controls();
+        let (validation, controls) = replay.take_controls();
         let current = session_validation_mut(&mut state, session_id)
             .ok_or_else(|| runtime_state_error("load lost its validation state"))?;
         *current = validation;
