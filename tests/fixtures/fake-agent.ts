@@ -42,6 +42,8 @@ const disconnectCancelFile = process.env.ATTYD_FAKE_DISCONNECT_CANCEL_FILE;
 const processMarkerFile = process.env.ATTYD_FAKE_PROCESS_MARKER_FILE;
 const turnCollapseGate = process.env.ATTYD_FAKE_TURN_COLLAPSE_GATE;
 const turnDesign = process.env.ATTYD_FAKE_TURN_DESIGN === "1";
+// A JSON array that replaces the advertised authentication methods.
+const authMethodsOverride = process.env.ATTYD_FAKE_AUTH_METHODS;
 
 if (processMarkerFile) writeFileSync(processMarkerFile, `${process.pid}\n`);
 
@@ -157,7 +159,9 @@ const agent = acp
             },
           },
       agentInfo: { name: "attyd-test-agent", version: "1.0.0" },
-      authMethods: invalidTerminalAuth
+      authMethods: authMethodsOverride
+        ? JSON.parse(authMethodsOverride)
+        : invalidTerminalAuth
         ? [{
             id: "terminal-login",
             name: "Terminal login",

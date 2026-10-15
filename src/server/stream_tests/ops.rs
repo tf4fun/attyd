@@ -16,6 +16,7 @@ use crate::protocol::stream_check::Documents;
 mod admission;
 mod execution;
 mod interactions;
+mod login_terminals;
 mod occupation;
 mod url_flows;
 
