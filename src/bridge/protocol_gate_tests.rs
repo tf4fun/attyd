@@ -1360,20 +1360,59 @@ async fn a_failed_create_fails_its_operation() {
 async fn a_fork_completes_on_its_source_and_its_target_appears() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
     peer.create("source", json!({})).await;
+    let (prompt_op, prompt) = peer.prompt("source", vec![text("source prompt")]).await;
+    peer.update("source", chunk("source-reply", text("source reply")))
+        .await;
+    peer.update(
+        "source",
+        json!({"sessionUpdate": "session_info_update", "title": "Source title"}),
+    )
+    .await;
+    peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+    peer.until("the source turn commits", |peer| {
+        peer.live("session/source")["op"]["id"] == prompt_op
+            && peer.live("session/source")["op"]["status"] == "completed"
+    })
+    .await;
+    let source_log = peer.log("session/source");
+    assert_eq!(source_log.len(), 1);
+    assert_eq!(
+        source_log[0]["turn"],
+        json!({"prompt": [text("source prompt")], "reply": [text("source reply")]})
+    );
     let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
     let request = peer.request("session/fork").await;
-    peer.reply(&request, json!({"sessionId": "forked"})).await;
+    // The target's update follows its response in one physical ACP batch.
+    // It must reach the new target after the response installs that session.
+    peer.send(json!([
+        {"jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": "forked"}},
+        {"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "forked", "update": {
+                "sessionUpdate": "session_info_update", "title": "Fork title",
+            },
+        }},
+    ]))
+    .await;
     Peer::ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
-        peer.live("session/source")["op"]["status"] == "completed" && peer.has("session/forked")
+        peer.live("session/source")["op"]["id"] == op
+            && peer.live("session/source")["op"]["status"] == "completed"
+            && peer.live("session/forked")["controls"]["info"]["title"] == "Fork title"
     })
     .await;
     let source = peer.live("session/source");
     assert_eq!(source["op"]["id"], op);
     assert_eq!(source["op"]["result"], json!({"sessionId": "forked"}));
+    assert_eq!(source["controls"]["info"]["title"], "Source title");
+    assert_eq!(peer.log("session/source"), source_log);
     let target = peer.live("session/forked");
     assert_eq!(target["op"]["kind"], "open");
     assert_eq!(target["op"]["status"], "completed");
+    assert_eq!(
+        peer.log("session/forked"),
+        source_log,
+        "without load support the target keeps the source's completed messages"
+    );
     peer.settled().await;
 }
 
