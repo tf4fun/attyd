@@ -27,9 +27,25 @@ pub(super) fn subscribe(
 /// Registers a subscription under the bridge guard, from the cut the guard
 /// sees, without starting a load: while the Agent initializes, its
 /// capabilities are not known yet. Its readiness serves the streams.
+///
+/// A session held at the cut ignores the subscription's directory (§5.1):
+/// the subscription keeps the bridge's own, so a later load of the session
+/// it follows runs where the session ran.
 pub(super) fn register(state: &BridgeState, scopes: &[Subscribed]) -> Subscription {
+    let scopes = scopes
+        .iter()
+        .map(|subscribed| {
+            let mut subscribed = subscribed.clone();
+            if let Scope::Session(session_id) = &subscribed.scope
+                && let Some(session) = state.sessions.active_session(session_id)
+            {
+                subscribed.cwd = Some(session.live.cwd.to_string_lossy().into_owned());
+            }
+            subscribed
+        })
+        .collect::<Vec<_>>();
     let published = &mut *state.protocol.publication.lock();
-    published.hub.subscribe(&published.publisher, scopes)
+    published.hub.subscribe(&published.publisher, &scopes)
 }
 
 /// Asks the actor to serve the streams again.
