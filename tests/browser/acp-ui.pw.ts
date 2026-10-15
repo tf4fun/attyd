@@ -3156,8 +3156,8 @@ test("creates a session in the selected project instead of the startup directory
   expect(browserErrors).toEqual([]);
 });
 
-test("canonicalizes a session link to its reported project and sends missing nested sessions home", async ({ page }) => {
-  // A missing session ends its scope (`load_failed`); no request fails.
+test("canonicalizes a session link to its reported project and shows a load error until the user returns home", async ({ page }) => {
+  // A failed load carries the Agent's error; leaving it is the user's navigation.
   const browserErrors = collectBrowserErrors(page);
   const cwd = process.cwd();
   await page.goto(sessionPath("saved-session", "/wrong-project"));
@@ -3165,6 +3165,11 @@ test("canonicalizes a session link to its reported project and sends missing nes
   await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
   await expect(page.getByRole("link", { name: "Project sessions", exact: true })).toHaveAttribute("title", cwd);
   await page.goto(sessionPath("nonexistent-session", cwd));
+  await expect(page.getByRole("heading", { name: "Could not load conversation", exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("Resource not found: nonexistent-session");
+  await expect(page.getByRole("button", { name: "Retry loading", exact: true })).toBeEnabled();
+  await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("nonexistent-session", cwd));
+  await page.getByRole("button", { name: "Back to projects", exact: true }).click();
   await expect(page).toHaveURL(/\/$/u);
   await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
   await expect(page.locator(".session-history")).toHaveCount(0);
@@ -3554,8 +3559,26 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
       "--terminal-auth-required",
     ],
   });
-  // Authentication is reported in `global.agent`, not by failing requests.
-  const browserErrors = collectBrowserErrors(page);
+  // A catalog refresh can race the login's Agent restart. Only its explicit
+  // stale refusal is allowed, and below it must recover using the newer op.
+  const catalogPath = "/api/v2/scopes/catalog/ops";
+  const browserErrors = collectBrowserErrors(page, [{ status: 409, pathname: catalogPath }]);
+  const catalogResponses: Array<{
+    method: string;
+    request: { kind: string; expect: string } | null;
+    status: number;
+    body: Promise<{ error?: { code?: string }; result?: unknown } | undefined>;
+  }> = [];
+  page.on("response", (response) => {
+    const request = response.request();
+    if (new URL(response.url()).pathname !== catalogPath) return;
+    catalogResponses.push({
+      method: request.method(),
+      request: request.postDataJSON() as { kind: string; expect: string } | null,
+      status: response.status(),
+      body: response.json().catch(() => undefined),
+    });
+  });
   let releaseFirstInput!: () => void;
   const firstInputGate = new Promise<void>((resolve) => { releaseFirstInput = resolve; });
   const inputChunks: string[] = [];
@@ -3595,6 +3618,18 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
     await expect(page.locator(".auth-terminal-card")).toBeHidden();
     await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
+    const catalog = await Promise.all(catalogResponses.map(async ({ body, ...response }) => ({
+      ...response, body: await body,
+    })));
+    for (const [index, response] of catalog.entries()) {
+      if (response.status !== 409) continue;
+      expect(response.method).toBe("POST");
+      expect(response.request?.kind).toBe("list");
+      expect(response.body?.error?.code).toBe("stale");
+      expect(catalog.slice(index + 1).some((later) => later.status === 200 && later.method === "POST" &&
+        later.request?.kind === "list" && later.request.expect !== response.request?.expect &&
+        later.body?.result != null)).toBe(true);
+    }
     expect(browserErrors).toEqual([]);
   } finally {
     releaseFirstInput();
