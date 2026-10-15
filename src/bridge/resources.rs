@@ -39,12 +39,11 @@ fn not_allowed(message: impl Into<String>) -> ProtocolError {
 /// once the guard is released.
 pub(super) fn act(
     state: &mut BridgeState,
-    sink: &EventSink,
     scope: &OpScope,
     resource: &str,
     action: ResourceAction,
 ) -> Result<Option<TerminalIo>, ProtocolError> {
-    if action == ResourceAction::Dismiss && dismiss_url_flow(state, sink, scope, resource) {
+    if action == ResourceAction::Dismiss && dismiss_url_flow(state, scope, resource) {
         return Ok(None);
     }
     // A login terminal is `global`'s, by its operation's ID (§4.6).
@@ -116,12 +115,7 @@ pub(super) fn perform(
 /// Dismisses the URL flow `scope` shows as `interaction_id`, if any. A flow
 /// is named by the interaction it was accepted from, so an old flow's late
 /// dismissal never reaches a new flow that reuses its `elicitationId`.
-fn dismiss_url_flow(
-    state: &mut BridgeState,
-    sink: &EventSink,
-    scope: &OpScope,
-    interaction_id: &str,
-) -> bool {
+fn dismiss_url_flow(state: &mut BridgeState, scope: &OpScope, interaction_id: &str) -> bool {
     let Some((elicitation_id, registration)) = state
         .sessions
         .url_owners
@@ -170,7 +164,7 @@ fn dismiss_url_flow(
         .sessions
         .take_url_route(&elicitation_id, &registration);
     state.sessions.scopes.flow_scopes.remove(interaction_id);
-    flush_runtime(state, sink);
+    refresh_observer_timers(state);
     true
 }
 

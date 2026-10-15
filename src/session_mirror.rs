@@ -986,7 +986,7 @@ mod tests {
             );
         }
         assert_eq!(registry.sessions.len(), 2);
-        assert_eq!(registry.snapshot().sessions.len(), 1);
+        assert_eq!(registry.live_snapshot().sessions.len(), 1);
         assert_eq!(registry.history.stats().snapshots, 2);
     }
 
@@ -1055,7 +1055,7 @@ mod tests {
             .unwrap();
         registry.remove("session", incarnation);
         assert!(registry.state("session").is_none());
-        assert!(registry.snapshot().sessions.is_empty());
+        assert!(registry.live_snapshot().sessions.is_empty());
     }
 
     #[test]

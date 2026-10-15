@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::history_cache::{HistoryCache, SessionKey};
 use crate::protocol::registry::ScopeOps;
 use crate::runtime_state::{
-    PendingInteraction, RuntimeEffect, RuntimeJournal, SessionLifecycle, SessionLiveState, UrlFlow,
+    PendingInteraction, RuntimeEffect, SessionLifecycle, SessionLiveState, UrlFlow,
 };
 use crate::session_observers::SessionWork;
 use crate::session_resources::{
@@ -36,8 +36,7 @@ impl SessionEntry {
     }
 }
 
-/// Owns each session once. History and live transitions operate on the same entry;
-/// the journal retains committed delivery records without a second session map.
+/// Owns each session once. History and live transitions operate on the same entry.
 pub(crate) struct SessionRegistry {
     pub(crate) epoch: String,
     pub(crate) next_incarnation: u64,
@@ -60,7 +59,6 @@ pub(crate) struct SessionRegistry {
     pub(crate) resolved_request_elicitations: VecDeque<String>,
     pub(crate) resolved_request_url_flows: VecDeque<String>,
     pub(crate) effects: VecDeque<RuntimeEffect>,
-    pub(crate) journal: RuntimeJournal,
     /// Protocol v2 operation slots of `global` and `catalog`, and occupation.
     pub(crate) scopes: ScopeOps,
 }
@@ -436,7 +434,6 @@ impl SessionRegistry {
             resolved_request_elicitations: VecDeque::new(),
             resolved_request_url_flows: VecDeque::new(),
             effects: VecDeque::new(),
-            journal: RuntimeJournal::new(),
             scopes: ScopeOps::default(),
         }
     }

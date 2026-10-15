@@ -377,9 +377,7 @@ impl BridgeHub {
     }
 
     async fn publish(&self, generation: u64, event: BridgeEvent) {
-        let BridgeEvent::Lifecycle(event) = event else {
-            return;
-        };
+        let BridgeEvent::Lifecycle(event) = event;
         let restart = terminal_auth_succeeded(&event);
         let restart_input = {
             let mut state = self.state.lock().await;

@@ -22,7 +22,6 @@ use self::publication::{BridgeLock, ProtocolState, agent_launch, operation_error
 use self::scheduling::{ExecutionTurn, IngressSender};
 use crate::agent_process::StdioAcpAgent;
 use crate::auth_terminal::{AuthTerminalManager, validate_method as validate_terminal_auth_method};
-use crate::bridge_event::BridgeEvent;
 use crate::elicitation_validation::validate_elicitation_request;
 use crate::event_queue::EventSender;
 use crate::filesystem::WorkspaceFileSystem;
@@ -53,12 +52,12 @@ use crate::session_state::SessionAdmission;
 use crate::terminal::{TerminalManager, TerminalSnapshot};
 
 mod agent_dispatch;
+#[cfg(test)]
+mod control_owner_tests;
 mod coordinator;
 #[cfg(test)]
 mod coordinator_tests;
 mod inbound_requests;
-#[cfg(test)]
-mod memory_efficiency_tests;
 #[cfg(test)]
 mod memory_retention_tests;
 pub(crate) mod operations;
@@ -92,11 +91,6 @@ impl EventSink {
                 None,
             ),
         }
-    }
-
-    /// Hand canonical runtime state to the Hub without serializing it.
-    fn runtime(&self, event: BridgeEvent) -> bool {
-        self.tx.send_event(event).is_ok()
     }
 
     fn error(&self, message: impl Into<String>, request_id: Option<&str>, operation: Option<&str>) {
@@ -260,7 +254,6 @@ struct BridgeState {
     request_elicitations: HashMap<String, ElicitationResponder>,
     in_flight_request_ids: HashSet<String>,
     sessions: SessionRegistry,
-    published_runtime_seq: u64,
     observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
     observer_timeout: Option<i64>,
     observers_stopped: bool,
@@ -387,11 +380,10 @@ fn pending_elicitation<'a>(
 }
 
 /// Delivers `response` to the pending permission `permission_id` of `owner`
-/// and publishes its removal; `resolve` retires the runtime interaction.
+/// and retires it; `resolve` retires the runtime interaction.
 /// Returns whether the Agent still waited for it.
 fn deliver_permission(
     locked: &mut BridgeState,
-    sink: &EventSink,
     owner: &SessionResourceOwner,
     permission_id: &str,
     response: RequestPermissionResponse,
@@ -401,32 +393,21 @@ fn deliver_permission(
         .sessions
         .take_permission(permission_id, owner)
         .expect("exact permission owner checked under the same lock");
-    flush_runtime(locked, sink);
     // oneshot delivery is synchronous: keep owner retirement and canonical
     // completion ordered before another request can replace this incarnation.
     let delivered = pending.sender.send(response).is_ok();
     resolve(locked)?;
-    let business_delta = advance_session_delta(
-        locked,
-        &owner.session_id,
-        owner.incarnation,
-        json!({
-            "kind": "interaction_remove", "interactionId": permission_id,
-        }),
-    )?;
-    flush_runtime(locked, sink);
-    sink.send(business_delta);
+    refresh_observer_timers(locked);
     Ok(delivered)
 }
 
 /// Delivers `response` to the pending elicitation `elicitation_id` (of
-/// `owner`, or request-scoped) and publishes its removal; `resolve` retires
+/// `owner`, or request-scoped) and retires it; `resolve` retires
 /// the runtime interaction, and a delivered accept of a URL elicitation
 /// becomes its flow with its route in the same step. Returns whether the
 /// Agent still waited for it.
 fn deliver_elicitation(
     locked: &mut BridgeState,
-    sink: &EventSink,
     elicitation_id: &str,
     owner: Option<&SessionResourceOwner>,
     response: CreateElicitationResponse,
@@ -435,7 +416,6 @@ fn deliver_elicitation(
 ) -> Result<bool, Error> {
     let pending = take_pending_elicitation(locked, elicitation_id, owner)
         .expect("exact elicitation owner checked under the same lock");
-    flush_runtime(locked, sink);
     let delivered = pending.sender.send(response).is_ok();
     // Immediate Agent completion/reuse cannot overtake accepted URL registration.
     let accepted_url_id = accepted_url_id.filter(|_| delivered);
@@ -449,22 +429,7 @@ fn deliver_elicitation(
             locked.sessions.accept_joined_flow(elicitation_id);
         }
     }
-    let business_delta = if let Some(owner) = owner {
-        Some(advance_session_delta(
-            locked,
-            &owner.session_id,
-            owner.incarnation,
-            json!({
-                "kind": "interaction_remove", "interactionId": elicitation_id,
-            }),
-        )?)
-    } else {
-        None
-    };
-    flush_runtime(locked, sink);
-    if let Some(delta) = business_delta {
-        sink.send(delta);
-    }
+    refresh_observer_timers(locked);
     Ok(delivered)
 }
 
@@ -494,114 +459,6 @@ fn pending_url_elicitation_in_use(state: &BridgeState, url_id: &str) -> bool {
 
 fn session_mirror(state: &mut BridgeState) -> &mut SessionRegistry {
     &mut state.sessions
-}
-
-fn session_view_value(
-    state: &mut BridgeState,
-    session_id: &str,
-    incarnation: u64,
-) -> Result<Value, Error> {
-    let mut cancel_requested = false;
-    let mut live = state
-        .sessions
-        .session(session_id)
-        .filter(|session| session.incarnation == incarnation)
-        // The live projection drops activeTurn below; do not serialize a
-        // potentially multi-megabyte turn payload just to discard it.
-        .map(|mut session| {
-            cancel_requested = session
-                .active_turn
-                .as_ref()
-                .is_some_and(|turn| turn.cancel_requested);
-            session.active_turn = None;
-            serde_json::to_value(session)
-        })
-        .transpose()?
-        .unwrap_or(Value::Null);
-    let mut view = session_mirror(state)
-        .view_value(session_id, incarnation)
-        .map_err(mirror_error)?;
-    if let Some(turn) = view
-        .pointer_mut("/session/activeTurn")
-        .and_then(Value::as_object_mut)
-    {
-        // Expose the existing execution intent without serializing its private
-        // state or another copy of the active turn's content.
-        turn.insert("cancelRequested".into(), json!(cancel_requested));
-    }
-    if let Some(live) = live.as_object_mut() {
-        live.remove("activeTurn");
-    }
-    view["live"] = live;
-    Ok(view)
-}
-
-fn session_delta_value(
-    state: &BridgeState,
-    session_id: &str,
-    incarnation: u64,
-    change: Value,
-) -> Result<Value, Error> {
-    let session = state
-        .sessions
-        .state(session_id)
-        .filter(|session| session.incarnation == incarnation)
-        .ok_or_else(|| runtime_state_error("missing authoritative session projection"))?;
-    Ok(json!({
-        "type": "bridge/session_delta",
-        "bridgeEpoch": state.sessions.epoch(),
-        "sessionId": session_id,
-        "sessionIncarnation": incarnation,
-        "fromRevision": session.view_revision.saturating_sub(1),
-        "viewRevision": session.view_revision,
-        "change": change,
-    }))
-}
-
-fn session_turn_outcome_value(
-    state: &mut BridgeState,
-    event_type: &str,
-    session_id: &str,
-    incarnation: u64,
-    operation_id: &str,
-    extra: Value,
-) -> Result<Value, Error> {
-    let bridge_epoch = state.sessions.epoch().to_string();
-    let session = state
-        .sessions
-        .state(session_id)
-        .filter(|session| session.incarnation == incarnation)
-        .ok_or_else(|| Error::internal_error().data("missing turn outcome projection"))?;
-    let mut event = json!({
-        "type": event_type,
-        "bridgeEpoch": bridge_epoch,
-        "sessionId": session_id,
-        "sessionIncarnation": session.incarnation,
-        "viewRevision": session.view_revision,
-        "historyRevision": session.history_revision,
-        "phase": session.phase,
-        "operationId": operation_id,
-    });
-    let Some(event_fields) = event.as_object_mut() else {
-        return Err(Error::internal_error().data("turn outcome must be an object"));
-    };
-    let Some(extra_fields) = extra.as_object() else {
-        return Err(Error::internal_error().data("turn outcome fields must be an object"));
-    };
-    event_fields.extend(extra_fields.clone());
-    Ok(event)
-}
-
-fn advance_session_delta(
-    state: &mut BridgeState,
-    session_id: &str,
-    incarnation: u64,
-    change: Value,
-) -> Result<Value, Error> {
-    session_mirror(state)
-        .touch(session_id, incarnation)
-        .map_err(mirror_error)?;
-    session_delta_value(state, session_id, incarnation, change)
 }
 
 fn mirror_error(error: MirrorError) -> Error {
@@ -1158,33 +1015,6 @@ fn fail_mirror_attachment(
     }
 }
 
-fn flush_runtime(state: &mut BridgeState, sink: &EventSink) {
-    match state.sessions.deltas_after(state.published_runtime_seq) {
-        Some(deltas) => {
-            for delta in deltas {
-                let seq = delta.seq;
-                if !sink.runtime(BridgeEvent::RuntimeDelta(Box::new(delta))) {
-                    break;
-                }
-                state.published_runtime_seq = seq;
-            }
-        }
-        None => {
-            let snapshot = state.sessions.snapshot();
-            let through = snapshot.through_seq;
-            if sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(snapshot))) {
-                state.published_runtime_seq = through;
-            }
-        }
-    }
-    // The journal is only a delivery buffer: handoffs that reached the sink
-    // release their payloads so covered overlay versions die immediately.
-    state
-        .sessions
-        .release_published_runtime(state.published_runtime_seq);
-    refresh_observer_timers(state);
-}
-
 fn refresh_observer_timers(state: &mut BridgeState) {
     let Some(events) = state.observer_events.clone() else {
         return;
@@ -1276,20 +1106,6 @@ fn session_blocks_unobserved_retire(state: &BridgeState, session_id: &str) -> bo
         .sessions
         .work(session_id)
         .is_some_and(|work| work != SessionWork::Idle)
-}
-
-fn retire_session_observation(
-    state: &mut BridgeState,
-    sink: &EventSink,
-    session_id: &str,
-    incarnation: u64,
-    reason: &str,
-) {
-    sink.send(json!({
-        "type": "bridge/session_retired", "sessionId": session_id,
-        "bridgeEpoch": state.sessions.epoch(), "sessionIncarnation": incarnation,
-        "reason": reason,
-    }));
 }
 
 /// Starts the load a v2 stream waits for (protocol §5.1); a session that
@@ -1426,7 +1242,6 @@ fn validate_terminal_references(
 /// ACP response lets the Agent send a tool update using that terminal ID.
 fn register_created_terminal_locked(
     state: &mut BridgeState,
-    sink: &EventSink,
     owner: &SessionResourceOwner,
     terminal_id: &str,
 ) -> Result<(), Error> {
@@ -1448,7 +1263,6 @@ fn register_created_terminal_locked(
     }
     publish_terminal_snapshot(
         state,
-        sink,
         TerminalSnapshot {
             incarnation: owner.incarnation,
             value: json!({
@@ -1532,51 +1346,9 @@ fn apply_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) 
     retained || updated
 }
 
-fn publish_terminal_snapshot(
-    state: &mut BridgeState,
-    sink: &EventSink,
-    snapshot: TerminalSnapshot,
-) {
-    let Some(session_id) = snapshot
-        .value
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return;
-    };
-    let prior_revision = state
-        .sessions
-        .state(&session_id)
-        .map(|session| session.view_revision);
-    let terminal = snapshot.value.clone();
-    let incarnation = snapshot.incarnation;
-    if !apply_terminal_snapshot(state, snapshot) {
-        return;
-    }
-    flush_runtime(state, sink);
-    let Some(current_revision) = state
-        .sessions
-        .state(&session_id)
-        .map(|session| session.view_revision)
-    else {
-        return;
-    };
-    if Some(current_revision) == prior_revision {
-        if session_mirror(state)
-            .touch(&session_id, incarnation)
-            .is_err()
-        {
-            return;
-        }
-    }
-    if let Ok(delta) = session_delta_value(
-        state,
-        &session_id,
-        incarnation,
-        json!({ "kind": "terminal_update", "terminal": terminal }),
-    ) {
-        sink.send(delta);
+fn publish_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) {
+    if apply_terminal_snapshot(state, snapshot) {
+        refresh_observer_timers(state);
     }
 }
 
@@ -2065,9 +1837,6 @@ where
     }
     // A closed v2 subscription may leave a session unneeded (S6).
     let mut stream_closes = state.lock().await.protocol.publication.lock().hub.closes();
-    sink.runtime(BridgeEvent::RuntimeSnapshot(Box::new(
-        state.lock().await.sessions.snapshot(),
-    )));
     let filesystem = (options.transport == Transport::Stdio)
         .then(|| {
             WorkspaceFileSystem::new(
@@ -2363,7 +2132,7 @@ where
                     }) => {
                         let acted = {
                             let mut state = state.lock().await;
-                            resources::act(&mut state, &sink, &scope, &resource, action)
+                            resources::act(&mut state, &scope, &resource, action)
                         };
                         match acted {
                             Ok(Some(io)) => resources::perform(&auth_terminal, io, reply),
@@ -2960,75 +2729,30 @@ async fn handle_session_update(
             let incarnation = attached_session_incarnation(&state, &session_id).unwrap_or(0);
             if incarnation != 0 {
                 let epoch = state.sessions.epoch().to_string();
-                let mut business_delta = None;
-                let runtime_result: Result<(), Error> = if is_conversation_update(&update) {
-                    let mirrored = if mirror_phase == Some(MirrorPhase::Running)
+                if is_conversation_update(&update) {
+                    if mirror_phase == Some(MirrorPhase::Running)
                         && let Some(operation_id) = session_mirror(&mut state)
                             .active_operation_id(&session_id, incarnation)
                             .map(str::to_string)
                     {
-                        let mirrored = session_mirror(&mut state)
+                        session_mirror(&mut state)
                             .append_turn_update(
                                 &session_id,
                                 incarnation,
                                 &operation_id,
                                 update.clone(),
                             )
-                            .map_err(mirror_error);
-                        if mirrored.is_ok() {
-                            business_delta = Some(
-                                session_delta_value(
-                                    &state,
-                                    &session_id,
-                                    incarnation,
-                                    json!({ "kind": "turn_update", "update": update }),
-                                )
-                                .expect("a mirrored turn update has a session identity"),
-                            );
-                        }
-                        mirrored
+                            .map_err(mirror_error)
                     } else if matches!(
                         mirror_phase,
                         Some(MirrorPhase::Ready | MirrorPhase::Reconciling)
                     ) {
-                        session_mirror(&mut state).append_session_update(&session_id, incarnation, update.clone())
+                        session_mirror(&mut state)
+                            .append_session_update(&session_id, incarnation, update.clone())
                             .map_err(mirror_error)
-                            .and_then(|()| {
-                                let view = session_view_value(&mut state, &session_id, incarnation)?;
-                                business_delta = Some(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": view }));
-                                Ok(())
-                            })
                     } else {
                         Ok(())
-                    };
-                    mirrored.and_then(|()| {
-                        if state
-                            .sessions
-                            .state(&session_id)
-                            .and_then(|session| session.active_turn.as_ref())
-                            .and_then(|turn| turn.execution.as_ref())
-                            .is_some()
-                        {
-                            let overlay = session_mirror(&mut state)
-                                .state(&session_id)
-                                .and_then(|session| session.active_turn.clone())
-                                .ok_or_else(|| {
-                                    runtime_state_error("missing authoritative turn overlay")
-                                })?;
-                            state
-                                .sessions
-                                .project_turn_update(
-                                    &epoch,
-                                    &session_id,
-                                    incarnation,
-                                    &overlay,
-                                    update.clone(),
-                                )
-                                .map_err(runtime_state_error)
-                        } else {
-                            Ok(())
-                        }
-                    })
+                    }
                 } else {
                     let key = update
                         .get("sessionUpdate")
@@ -3038,14 +2762,6 @@ async fn handle_session_update(
                         .sessions
                         .update_control_state(&epoch, &session_id, incarnation, key, update.clone())
                         .map_err(runtime_state_error)
-                };
-                if let Err(error) = runtime_result {
-                    Err(error)
-                } else {
-                    if let Some(delta) = business_delta {
-                        sink.send(delta);
-                    }
-                    Ok(())
                 }
             } else {
                 Ok(())
@@ -3075,7 +2791,7 @@ async fn handle_session_update(
             let _ =
                 session_mirror(&mut state).invalidate_load(&session_id, incarnation, &attempt_id);
         }
-        flush_runtime(&mut state, sink);
+        refresh_observer_timers(&mut state);
         // A failed replay attempt is reported through its load outcome.
         if let Err(error) = result
             && mirror_replay_attempt.is_none()
@@ -3395,14 +3111,14 @@ async fn handle_command(
     if let Some(flow) = context.history_flow.take() {
         let mut state = context.state.lock().await;
         state.sessions.finish_history_sync(&flow);
-        flush_runtime(&mut state, &context.sink);
+        refresh_observer_timers(&mut state);
         drop(state);
     }
     // Result publication, interaction retirement and the Observe materialization
     // cut are part of this local turn, including every early error path above.
     let terminal_releases = if context.ingress.is_none() || execution.is_some() {
         let mut state = context.state.lock().await;
-        flush_runtime(&mut state, &context.sink);
+        refresh_observer_timers(&mut state);
         let releases = drain_runtime_effects(&mut state);
         let final_attempt = command
             .get("bridgeMaterializationFinalAttempt")
@@ -3634,13 +3350,7 @@ async fn handle_command_inner(
                         json!({ "sessionId": session_id }),
                     );
                     advance_catalog_revision(&mut state, &sink);
-                    flush_runtime(&mut state, &sink);
-                    let mirror_view = session_view_value(&mut state, &session_id, incarnation)?;
-                    sink.send(json!({
-                        "type": "bridge/session_view",
-                        "sessionId": session_id,
-                        "view": mirror_view,
-                    }));
+                    refresh_observer_timers(&mut state);
                     creation_finish.committed(incarnation)?;
                 }
                 Err(error) => {
@@ -3781,7 +3491,7 @@ async fn handle_command_inner(
                         return Err(error);
                     }
                 }
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 incarnation
             };
             let owner = rpc_owner(
@@ -4005,25 +3715,14 @@ async fn handle_command_inner(
                 SessionAdmission::Attachment,
                 &request_id,
             );
-            flush_runtime(&mut state, &sink);
+            refresh_observer_timers(&mut state);
             clear_attachment_delivery(&mut state, &session_id, attachment_incarnation);
-            let mirror_view = (operation == "session/load")
-                .then(|| session_view_value(&mut state, &session_id, attachment_incarnation))
-                .transpose()?;
-            if let Some(view) = mirror_view {
-                sink.send(json!({
-                    "type": "bridge/session_view",
-                    "sessionId": session_id,
-                    "view": view,
-                }));
-            }
             drop(state);
             if operation == "session/resume" {
                 synchronize_attached_history(
                     &connection,
                     &options,
                     &bridge_state,
-                    &sink,
                     &cancellation,
                     &session_id,
                     attachment_incarnation,
@@ -4088,7 +3787,7 @@ async fn handle_command_inner(
                 state
                     .sessions
                     .supersede_history_sync(&source_id, source_incarnation);
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 state.pending_creations += 1;
                 (cwd, source_incarnation, source_baseline)
             };
@@ -4295,7 +3994,7 @@ async fn handle_command_inner(
                 .map_err(mirror_error)?;
             history_flow.register(history_owner.clone());
             advance_catalog_revision(&mut state, &sink);
-            flush_runtime(&mut state, &sink);
+            refresh_observer_timers(&mut state);
             creation_finish.committed(incarnation)?;
             drop(state);
             let target_owner =
@@ -4305,7 +4004,6 @@ async fn handle_command_inner(
                 &connection,
                 &options,
                 &bridge_state,
-                &sink,
                 &cancellation,
                 &session_id,
                 incarnation,
@@ -4399,7 +4097,7 @@ async fn handle_command_inner(
                         resources.observers.mark_close_attempted();
                     }
                 }
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 incarnation
             };
             let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
@@ -4442,7 +4140,7 @@ async fn handle_command_inner(
                     .map_err(runtime_state_error)?;
                 clear_ingest_resources(&mut state, &session_id, incarnation);
                 cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 drain_runtime_effects(&mut state)
             };
             drop(execution.take());
@@ -4455,12 +4153,10 @@ async fn handle_command_inner(
                 let mut state = state.lock().await;
                 complete_session_retirement(
                     &mut state,
-                    &sink,
                     &session_id,
                     incarnation,
                     SessionAdmission::Close,
                     &request_id,
-                    "closed",
                 );
             }
         }
@@ -4544,7 +4240,7 @@ async fn handle_command_inner(
                         resources.observers.mark_close_attempted();
                     }
                 }
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 incarnation
             };
             let terminal_releases = {
@@ -4557,7 +4253,7 @@ async fn handle_command_inner(
                     .map_err(runtime_state_error)?;
                 clear_ingest_resources(&mut state, &session_id, incarnation);
                 cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 drain_runtime_effects(&mut state)
             };
             drop(execution.take());
@@ -4571,12 +4267,10 @@ async fn handle_command_inner(
                 let mut state = state.lock().await;
                 complete_session_retirement(
                     &mut state,
-                    &sink,
                     &session_id,
                     incarnation,
                     SessionAdmission::Close,
                     &request_id,
-                    "unobserved",
                 );
             }
         }
@@ -4633,7 +4327,7 @@ async fn handle_command_inner(
                     }
                 };
                 if runtime_incarnation.is_some() {
-                    flush_runtime(&mut state, &sink);
+                    refresh_observer_timers(&mut state);
                 }
                 (close_before_delete, runtime_incarnation)
             };
@@ -4674,7 +4368,6 @@ async fn handle_command_inner(
                             &session_id,
                             incarnation,
                             &request_id,
-                            &sink,
                         )?;
                     }
 
@@ -4683,7 +4376,7 @@ async fn handle_command_inner(
                 let terminal_releases = {
                     let mut state = state.lock().await;
                     cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
-                    flush_runtime(&mut state, &sink);
+                    refresh_observer_timers(&mut state);
                     drain_runtime_effects(&mut state)
                 };
                 drop(execution.take());
@@ -4692,13 +4385,6 @@ async fn handle_command_inner(
                     terminals.release_session(&session_id).await;
                 }
                 continue_execution(ingress.as_ref(), execution, &owner).await?;
-                retire_session_observation(
-                    &mut *state.lock().await,
-                    &sink,
-                    &session_id,
-                    incarnation,
-                    "closed",
-                );
             }
             let mut delete_owner = owner.clone();
             delete_owner.attempt_id = Some(format!("delete-{}", Uuid::new_v4()));
@@ -4744,7 +4430,7 @@ async fn handle_command_inner(
                 let terminal_releases = {
                     let mut state = state.lock().await;
                     cancel_interactions_locked(&session_id, incarnation, &mut state, &sink);
-                    flush_runtime(&mut state, &sink);
+                    refresh_observer_timers(&mut state);
                     drain_runtime_effects(&mut state)
                 };
                 drop(execution.take());
@@ -4758,12 +4444,10 @@ async fn handle_command_inner(
                 let mut state = state.lock().await;
                 complete_session_retirement(
                     &mut state,
-                    &sink,
                     &session_id,
                     incarnation,
                     SessionAdmission::Delete,
                     &request_id,
-                    "deleted",
                 );
                 state.listed_sessions.remove(&session_id);
                 advance_catalog_revision(&mut state, &sink);
@@ -4834,14 +4518,9 @@ async fn handle_command_inner(
                 if cancelled {
                     commit_session_cancel(&mut state, &sink, &session_id, incarnation)?;
                 }
-                flush_runtime(&mut state, &sink);
-                let view = session_view_value(&mut state, &session_id, incarnation)?;
-                sink.send(json!({
-                    "type": "bridge/session_view", "sessionId": session_id, "view": view,
-                }));
+                refresh_observer_timers(&mut state);
                 (incarnation, mirror_operation_id, cancelled)
             };
-            let prompt_for_outcome = serde_json::to_value(&prompt)?;
             let owner = rpc_owner(&epoch, Some((&session_id, incarnation)), &request_id, None);
             let result = send_ordered_then(
                 &connection,
@@ -4865,14 +4544,11 @@ async fn handle_command_inner(
                 let mut state = state.lock().await;
                 let completion = commit_completed_turn_history(
                     &mut state,
-                    &sink,
                     PromptCompletion {
                         session_id: &session_id,
                         incarnation,
                         runtime_operation_id: &runtime_operation_id,
                         operation_id: &mirror_operation_id,
-                        client_intent_id: &client_intent_id,
-                        prompt: prompt_for_outcome,
                         result,
                     },
                 );
@@ -4932,7 +4608,7 @@ async fn handle_command_inner(
                 state
                     .sessions
                     .supersede_history_sync(&session_id, incarnation);
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 incarnation
             };
             let result = send_ordered(
@@ -5018,17 +4694,6 @@ async fn handle_command_inner(
                     SessionAdmission::Control,
                     &request_id,
                 );
-                let business_delta = advance_session_delta(
-                    &mut state,
-                    &session_id,
-                    incarnation,
-                    json!({
-                        "kind": "control_update",
-                        "control": "mode",
-                        "modeId": mode_id,
-                    }),
-                )?;
-                sink.send(business_delta);
             }
         }
         "session/set_config_option" => {
@@ -5090,7 +4755,7 @@ async fn handle_command_inner(
                 state
                     .sessions
                     .supersede_history_sync(&session_id, incarnation);
-                flush_runtime(&mut state, &sink);
+                refresh_observer_timers(&mut state);
                 incarnation
             };
             let result = send_ordered(
@@ -5206,19 +4871,6 @@ async fn handle_command_inner(
                     SessionAdmission::Control,
                     &request_id,
                 );
-                let business_delta = advance_session_delta(
-                    &mut state,
-                    &session_id,
-                    incarnation,
-                    json!({
-                        "kind": "control_update",
-                        "control": "configuration",
-                        "configId": config_id,
-                        "value": value,
-                        "configOptions": config_options,
-                    }),
-                )?;
-                sink.send(business_delta);
             }
         }
         "auth/terminal_start" => {
@@ -5308,8 +4960,6 @@ struct PromptCompletion<'a> {
     incarnation: u64,
     runtime_operation_id: &'a str,
     operation_id: &'a str,
-    client_intent_id: &'a str,
-    prompt: Value,
     result: Result<PromptResponse, Error>,
 }
 
@@ -5318,11 +4968,10 @@ struct PromptCommit {
     terminal_releases: Vec<(String, String)>,
 }
 
-/// Seal the exact RPC owner, commit history and enqueue its terminal projection
+/// Seal the exact RPC owner and commit its history and terminal releases
 /// without releasing admission between Ready and the old operation's outcome.
 fn commit_completed_turn_history(
     state: &mut BridgeState,
-    sink: &EventSink,
     completion: PromptCompletion<'_>,
 ) -> PromptCommit {
     let mut terminal_releases = Vec::new();
@@ -5332,8 +4981,6 @@ fn commit_completed_turn_history(
             incarnation,
             runtime_operation_id,
             operation_id,
-            client_intent_id,
-            prompt,
             result,
         } = completion;
         let owns_turn = state
@@ -5406,9 +5053,6 @@ fn commit_completed_turn_history(
             session_mirror(state)
                 .complete_turn(session_id, incarnation, operation_id, terminal)
                 .map_err(mirror_error)?;
-            flush_runtime(state, sink);
-            let reconciling = session_view_value(state, session_id, incarnation)?;
-            sink.send(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": reconciling }));
             let commit = session_mirror(state)
                 .commit_completed_turn_from_memory(session_id, incarnation, operation_id)
                 .map(|_| ())
@@ -5423,27 +5067,7 @@ fn commit_completed_turn_history(
         if let Some(validation) = session_validation_mut(state, session_id) {
             validation.retire_turn();
         }
-        flush_runtime(state, sink);
-        let view = session_view_value(state, session_id, incarnation)?;
-        let failure = error.as_ref().or(sync_error.as_ref());
-        let outcome = session_turn_outcome_value(
-            state,
-            if failure.is_some() {
-                "bridge/session_turn_failed"
-            } else {
-                "bridge/session_turn_complete"
-            },
-            session_id,
-            incarnation,
-            operation_id,
-            if let Some(error) = failure {
-                json!({ "clientIntentId": client_intent_id, "prompt": prompt, "error": agent_error_value(error) })
-            } else {
-                json!({ "clientIntentId": client_intent_id, "response": response })
-            },
-        )?;
-        sink.send(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": view }));
-        sink.send(outcome);
+        refresh_observer_timers(state);
         if let Some(error) = error.or(sync_error) {
             Err(error)
         } else {
@@ -5490,7 +5114,6 @@ async fn synchronize_attached_history(
     connection: &ConnectionTo<Agent>,
     options: &Options,
     state: &Arc<BridgeLock>,
-    sink: &EventSink,
     cancellation: &CancellationToken,
     session_id: &str,
     incarnation: u64,
@@ -5526,7 +5149,6 @@ async fn synchronize_attached_history(
         connection,
         options,
         state,
-        sink,
         cancellation,
         session_id,
         incarnation,
@@ -5611,8 +5233,6 @@ async fn synchronize_attached_history(
             }
         }
     }
-    let view = session_view_value(&mut state, session_id, incarnation)?;
-    sink.send(json!({ "type": "bridge/session_view", "sessionId": session_id, "view": view }));
     Ok(())
 }
 
@@ -5620,7 +5240,6 @@ async fn synchronize_authoritative_history(
     connection: &ConnectionTo<Agent>,
     options: &Options,
     state: &Arc<BridgeLock>,
-    sink: &EventSink,
     cancellation: &CancellationToken,
     session_id: &str,
     incarnation: u64,
@@ -5675,25 +5294,6 @@ async fn synchronize_authoritative_history(
             }
             let validation_owner = begin_replay_validation(&mut state, session_id);
             take_sync_control_candidate(&mut state, session_id);
-            let phase = match session_mirror(&mut state)
-                .state(session_id)
-                .map(|session| session.phase)
-            {
-                Some(MirrorPhase::Loading) => "loading",
-                _ => "reconciling",
-            };
-            let delta = match session_delta_value(
-                &state,
-                session_id,
-                incarnation,
-                json!({
-                    "kind": "sync_state", "phase": phase, "attemptId": attempt_id,
-                }),
-            ) {
-                Ok(delta) => delta,
-                Err(error) => return HistorySyncOutcome::Failed(error),
-            };
-            sink.send(delta);
             validation_owner
         };
 
@@ -5759,20 +5359,7 @@ async fn synchronize_authoritative_history(
                         ) {
                             return HistorySyncOutcome::Failed(mirror_error(mirror));
                         }
-                        let delta = match session_delta_value(
-                            &state,
-                            session_id,
-                            incarnation,
-                            json!({
-                                "kind": "sync_state",
-                                "phase": "blocked",
-                                "message": error.message,
-                            }),
-                        ) {
-                            Ok(delta) => delta,
-                            Err(error) => return HistorySyncOutcome::Failed(error),
-                        };
-                        Some((error, false, delta))
+                        Some((error, false))
                     } else {
                         match session_mirror(&mut state).commit_load(
                             session_id,
@@ -5796,19 +5383,7 @@ async fn synchronize_authoritative_history(
                                 {
                                     return HistorySyncOutcome::Failed(error);
                                 }
-                                let view =
-                                    match session_view_value(&mut state, session_id, incarnation) {
-                                        Ok(view) => view,
-                                        Err(error) => {
-                                            return HistorySyncOutcome::Failed(error);
-                                        }
-                                    };
                                 commit_replay_validation(&mut state, session_id, &validation_owner);
-                                sink.send(json!({
-                                    "type": "bridge/session_view",
-                                    "sessionId": session_id,
-                                    "view": view,
-                                }));
                                 return HistorySyncOutcome::Loaded;
                             }
                             Err(error) => {
@@ -5828,20 +5403,7 @@ async fn synchronize_authoritative_history(
                                 ) {
                                     return HistorySyncOutcome::Failed(mirror_error(mirror));
                                 }
-                                let delta = match session_delta_value(
-                                    &state,
-                                    session_id,
-                                    incarnation,
-                                    json!({
-                                        "kind": "sync_state",
-                                        "phase": "blocked",
-                                        "message": error.message,
-                                    }),
-                                ) {
-                                    Ok(delta) => delta,
-                                    Err(error) => return HistorySyncOutcome::Failed(error),
-                                };
-                                Some((error, false, delta))
+                                Some((error, false))
                             }
                         }
                     }
@@ -5859,25 +5421,10 @@ async fn synchronize_authoritative_history(
                     ) {
                         return HistorySyncOutcome::Failed(mirror_error(mirror));
                     }
-                    let mut change = json!({
-                        "kind": "sync_state",
-                        "phase": if retryable { "retrying" } else { "blocked" },
-                        "message": error.message,
-                    });
-                    if retryable {
-                        change["retryAfterMs"] = json!(backoff.as_millis());
-                    }
-                    let delta = match session_delta_value(&state, session_id, incarnation, change) {
-                        Ok(delta) => delta,
-                        Err(error) => return HistorySyncOutcome::Failed(error),
-                    };
-                    Some((error, retryable, delta))
+                    Some((error, retryable))
                 }
             };
-            failure.map(|(error, retryable, delta)| {
-                sink.send(delta);
-                (error, retryable)
-            })
+            failure
         };
 
         let Some((error, retryable)) = failure else {
@@ -6314,18 +5861,15 @@ fn reserve_session_operation(
 
 fn complete_session_retirement(
     state: &mut BridgeState,
-    sink: &EventSink,
     session_id: &str,
     incarnation: u64,
     operation: SessionAdmission,
     operation_id: &str,
-    reason: &str,
 ) {
     if session_mirror(state)
         .finish_session_cleanup(session_id, incarnation, operation, operation_id)
         .is_ok()
     {
-        retire_session_observation(state, sink, session_id, incarnation, reason);
         state.sessions.cancel_resources(session_id, incarnation);
         state.sessions.remove(session_id, incarnation);
     }
@@ -6502,14 +6046,13 @@ fn commit_runtime_delete_close_success(
     session_id: &str,
     incarnation: u64,
     operation_id: &str,
-    sink: &EventSink,
 ) -> Result<(), Error> {
     let epoch = state.sessions.epoch().to_string();
     state
         .sessions
         .delete_close_succeeded(&epoch, session_id, incarnation, operation_id)
         .map_err(runtime_state_error)?;
-    flush_runtime(state, sink);
+    refresh_observer_timers(state);
     Ok(())
 }
 
@@ -6564,7 +6107,7 @@ fn commit_session_cancel(
     // the session scope and survive the cancel (S7).
     if let Some(owner) = owned_resources(state, session_id, incarnation) {
         cancel_pending_interactions(&owner, state, sink);
-        flush_runtime(state, sink);
+        refresh_observer_timers(state);
     }
     Ok(())
 }
@@ -6591,7 +6134,7 @@ fn cancel_interactions_locked(
     };
     cancel_pending_interactions(&owner, state, sink);
     release_url_flows(&owner, state, sink);
-    flush_runtime(state, sink);
+    refresh_observer_timers(state);
 }
 
 fn resolves_canonically(state: &BridgeState, session_id: &str) -> bool {
@@ -6846,33 +6389,45 @@ mod tests {
         incarnation
     }
 
+    /// The turn a session runs, as the session state holds it.
+    fn running_turn(
+        state: &BridgeState,
+        session_id: &str,
+    ) -> Option<crate::session_state::TurnOverlay> {
+        state.sessions.state(session_id)?.active_turn.clone()
+    }
+
+    fn cancel_requested(state: &BridgeState, session_id: &str) -> bool {
+        running_turn(state, session_id)
+            .and_then(|turn| turn.execution)
+            .unwrap()
+            .cancel_requested
+    }
+
     #[test]
-    fn session_view_exposes_cancel_intent_before_completion_and_keeps_late_updates() {
+    fn a_cancel_intent_holds_until_completion_and_keeps_late_updates() {
         let mut state = BridgeState::default();
         let incarnation = register_test_session(&mut state, "session", "/workspace");
-        let other = register_test_session(&mut state, "other", "/workspace");
+        register_test_session(&mut state, "other", "/workspace");
         let operation = start_test_turn(&mut state, "session", "intent").unwrap();
         start_test_turn(&mut state, "other", "other-intent").unwrap();
         state.sessions.append_turn_update("session", incarnation, &operation, json!({
             "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run", "status": "in_progress"
         })).unwrap();
-        let before = session_view_value(&mut state, "session", incarnation).unwrap();
-        assert_eq!(before["session"]["activeTurn"]["cancelRequested"], false);
+        assert!(!cancel_requested(&state, "session"));
 
         let epoch = state.sessions.epoch().to_string();
         state
             .sessions
             .request_cancel(&epoch, "session", incarnation)
             .unwrap();
-        let cancelling = session_view_value(&mut state, "session", incarnation).unwrap();
-        assert_eq!(cancelling["session"]["phase"], "running");
-        assert_eq!(cancelling["session"]["activeTurn"]["cancelRequested"], true);
-        assert!(cancelling["session"]["activeTurn"]["terminal"].is_null());
-        assert_eq!(before["session"]["activeTurn"]["cancelRequested"], false);
         assert_eq!(
-            session_view_value(&mut state, "other", other).unwrap()["session"]["activeTurn"]["cancelRequested"],
-            false
+            state.sessions.state("session").unwrap().phase,
+            MirrorPhase::Running
         );
+        assert!(cancel_requested(&state, "session"));
+        assert!(running_turn(&state, "session").unwrap().terminal.is_none());
+        assert!(!cancel_requested(&state, "other"));
 
         state
             .sessions
@@ -6885,21 +6440,16 @@ mod tests {
                 }),
             )
             .unwrap();
-        let late = session_view_value(&mut state, "session", incarnation).unwrap();
-        assert_eq!(late["session"]["activeTurn"]["cancelRequested"], true);
+        assert!(cancel_requested(&state, "session"));
         assert_eq!(
-            late["session"]["activeTurn"]["updates"][0]["status"],
+            running_turn(&state, "session").unwrap().updates[0]["status"],
             "completed"
         );
 
         complete_test_turn(&mut state, "session", &operation);
-        assert!(session_view_value(&mut state, "session", incarnation).unwrap()["session"]["activeTurn"].is_null());
+        assert!(running_turn(&state, "session").is_none());
         start_test_turn(&mut state, "session", "next-intent").unwrap();
-        assert_eq!(
-            session_view_value(&mut state, "session", incarnation).unwrap()["session"]["activeTurn"]
-                ["cancelRequested"],
-            false
-        );
+        assert!(!cancel_requested(&state, "session"));
     }
 
     fn start_test_turn(
@@ -6962,118 +6512,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_completion_publishes_old_outcome_before_waiting_next_turn_can_admit() {
+    async fn a_waiting_turn_admits_after_completion_and_a_late_old_result_cannot_seal_it() {
         let state = Arc::new(BridgeLock::new(BridgeState::default()));
-        let (tx, mut events) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
         let mut locked = state.lock().await;
         let incarnation = register_test_session(&mut locked, "session", "/workspace");
         let operation = start_test_turn(&mut locked, "session", "old-intent").unwrap();
         let update = json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "last old update" } });
         locked
             .sessions
-            .append_turn_update("session", incarnation, &operation, update.clone())
+            .append_turn_update("session", incarnation, &operation, update)
             .unwrap();
-        sink.send(
-            session_delta_value(
-                &locked,
-                "session",
-                incarnation,
-                json!({ "kind": "turn_update", "update": update }),
-            )
-            .unwrap(),
-        );
         let (attempting, attempted) = oneshot::channel();
         let competing_state = state.clone();
-        let competing_sink = sink.clone();
         let next_turn = tokio::spawn(async move {
             attempting.send(()).unwrap();
             let mut state = competing_state.lock().await;
-            let next = start_test_turn(&mut state, "session", "next-intent").unwrap();
-            let view = session_view_value(&mut state, "session", incarnation).unwrap();
-            competing_sink.send(
-                json!({ "type": "bridge/session_view", "sessionId": "session", "view": view }),
-            );
-            (next, view)
+            start_test_turn(&mut state, "session", "next-intent").unwrap()
         });
         attempted.await.unwrap();
-        // The competing turn is already queued for this owner. Every completion
-        // event must enter the outbox before releasing this critical section.
-        let completed = commit_completed_turn_history(
-            &mut locked,
-            &sink,
-            PromptCompletion {
-                session_id: "session",
-                incarnation,
-                runtime_operation_id: "old-intent",
-                operation_id: &operation,
-                client_intent_id: "old-intent",
-                prompt: json!([]),
-                result: Ok(serde_json::from_value(json!({ "stopReason": "end_turn" })).unwrap()),
-            },
-        );
+        // The competing turn is already queued for this owner: the old turn
+        // completes before releasing this critical section.
+        let completion = |locked: &mut BridgeState| {
+            commit_completed_turn_history(
+                locked,
+                PromptCompletion {
+                    session_id: "session",
+                    incarnation,
+                    runtime_operation_id: "old-intent",
+                    operation_id: &operation,
+                    result: Ok(serde_json::from_value(json!({ "stopReason": "end_turn" })).unwrap()),
+                },
+            )
+        };
+        let completed = completion(&mut *locked);
         completed.result.unwrap();
         assert!(completed.terminal_releases.is_empty());
-        let ready = session_view_value(&mut locked, "session", incarnation).unwrap();
-        assert_eq!(ready["session"]["phase"], "ready");
-        drop(locked);
-        let (next_operation, next_view) = next_turn.await.unwrap();
-        let published = std::iter::from_fn(|| events.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-            .collect::<Vec<_>>();
-        let last_update = published
-            .iter()
-            .position(|event| event["type"] == "bridge/session_delta")
-            .unwrap();
-        let old_outcome = published
-            .iter()
-            .position(|event| event["type"] == "bridge/session_turn_complete")
-            .unwrap();
-        let new_running = published
-            .iter()
-            .position(|event| {
-                event["type"] == "bridge/session_view"
-                    && event["view"]["session"]["activeTurn"]["operationId"] == next_operation
-            })
-            .unwrap();
-        assert!(last_update < old_outcome && old_outcome < new_running);
-        let outcome = &published[old_outcome];
-        assert_eq!(outcome["operationId"], operation);
-        assert_eq!(outcome["phase"], "ready");
-        assert_eq!(outcome["viewRevision"], ready["session"]["viewRevision"]);
         assert_eq!(
-            outcome["historyRevision"],
-            ready["session"]["historyRevision"]
+            locked.sessions.state("session").unwrap().phase,
+            MirrorPhase::Ready
         );
-        assert!(
-            outcome["viewRevision"].as_u64().unwrap()
-                < next_view["session"]["viewRevision"].as_u64().unwrap()
-        );
+        assert!(running_turn(&locked, "session").is_none());
+        drop(locked);
+        let next_operation = next_turn.await.unwrap();
         // A late duplicate result from the old RPC must not seal the new turn.
         let mut locked = state.lock().await;
-        let stale = commit_completed_turn_history(
-            &mut locked,
-            &sink,
-            PromptCompletion {
-                session_id: "session",
-                incarnation,
-                runtime_operation_id: "old-intent",
-                operation_id: &operation,
-                client_intent_id: "old-intent",
-                prompt: json!([]),
-                result: Ok(serde_json::from_value(json!({ "stopReason": "end_turn" })).unwrap()),
-            },
-        );
-        stale.result.unwrap();
+        let running = running_turn(&locked, "session").unwrap();
+        assert_eq!(running.operation_id, next_operation);
+        completion(&mut *locked).result.unwrap();
+        assert_eq!(running_turn(&locked, "session"), Some(running));
         assert_eq!(
-            session_view_value(&mut locked, "session", incarnation).unwrap(),
-            next_view
+            locked.sessions.state("session").unwrap().phase,
+            MirrorPhase::Running
         );
-        assert!(events.try_recv().is_err());
     }
 
     #[test]
-    fn prompt_failure_outcome_keeps_its_terminal_revision_and_transport_uncertainty() {
+    fn a_prompt_failure_keeps_its_transport_uncertainty() {
         for uncertain in [false, true] {
             let mut state = BridgeState::default();
             let incarnation = register_test_session(&mut state, "session", "/workspace");
@@ -7085,43 +6579,32 @@ mod tests {
             } else {
                 Error::invalid_request().data("Agent rejected the prompt")
             };
-            let (tx, mut events) = mpsc::unbounded_channel();
-            let sink = EventSink { tx: tx.into() };
             let completed = commit_completed_turn_history(
                 &mut state,
-                &sink,
                 PromptCompletion {
                     session_id: "session",
                     incarnation,
                     runtime_operation_id: "failed-intent",
                     operation_id: &operation,
-                    client_intent_id: "failed-intent",
-                    prompt: json!([]),
                     result: Err(error),
                 },
             );
             assert!(completed.result.is_err());
-            let view = session_view_value(&mut state, "session", incarnation).unwrap();
-            let published = std::iter::from_fn(|| events.try_recv().ok())
-                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-                .collect::<Vec<_>>();
-            let outcome = published
-                .iter()
-                .find(|event| event["type"] == "bridge/session_turn_failed")
-                .unwrap();
-            assert_eq!(outcome["operationId"], operation);
-            assert_eq!(outcome["viewRevision"], view["session"]["viewRevision"]);
             assert_eq!(
-                outcome["historyRevision"],
-                view["session"]["historyRevision"]
+                state.sessions.state("session").unwrap().phase,
+                if uncertain {
+                    MirrorPhase::Blocked
+                } else {
+                    MirrorPhase::Ready
+                }
             );
             assert_eq!(
-                outcome["phase"],
-                if uncertain { "blocked" } else { "ready" }
-            );
-            assert_eq!(
-                view["live"]["lifecycle"],
-                if uncertain { "uncertain" } else { "active" }
+                state.sessions.live("session").unwrap().lifecycle,
+                if uncertain {
+                    SessionLifecycle::Uncertain
+                } else {
+                    SessionLifecycle::Active
+                }
             );
             assert_eq!(
                 start_test_turn(&mut state, "session", "after-failure").is_err(),
@@ -7162,13 +6645,21 @@ mod tests {
             .unwrap()
     }
 
-    /// The business publication of an accepted session update: a turn delta
-    /// while a turn runs, otherwise a refreshed session view.
-    fn is_relayed_update(event: &Value, session_id: &str) -> bool {
-        event["sessionId"] == session_id
-            && ((event["type"] == "bridge/session_delta"
-                && event["change"]["kind"] == "turn_update")
-                || event["type"] == "bridge/session_view")
+    /// The updates a session accepted: its history, then the running turn's.
+    async fn accepted_updates(state: &BridgeLock, session_id: &str) -> Vec<Value> {
+        let mut state = state.lock().await;
+        let incarnation = state.sessions.state(session_id).unwrap().incarnation;
+        let mut updates = state
+            .sessions
+            .view(session_id, incarnation)
+            .unwrap()
+            .baseline
+            .updates()
+            .to_vec();
+        if let Some(turn) = running_turn(&state, session_id) {
+            updates.extend(turn.updates.iter().map(|update| (**update).clone()));
+        }
+        updates
     }
 
     fn session_info(session_id: &str, cwd: &str) -> SessionInfo {
@@ -7766,14 +7257,10 @@ mod tests {
             assert!(state.creation_staging.is_empty());
 
             state.sessions.register_new("new-session", incarnation);
-            state.published_runtime_seq = state.sessions.seq();
         }
+        let before = accepted_updates(&state, "new-session").await;
         handle_session_update(notification, &state, &sink, None).await;
-        assert!(
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-                .any(|event| is_relayed_update(&event, "new-session"))
-        );
+        assert_ne!(accepted_updates(&state, "new-session").await, before);
     }
 
     #[tokio::test]
@@ -7781,9 +7268,8 @@ mod tests {
         let mut bridge = BridgeState::default();
         register_test_session(&mut bridge, "session", "/workspace");
         start_test_turn(&mut bridge, "session", "prompt").unwrap();
-        bridge.published_runtime_seq = bridge.sessions.seq();
         let state = Arc::new(BridgeLock::new(bridge));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let invalid: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
@@ -7794,12 +7280,12 @@ mod tests {
             }
         }))
         .unwrap();
+        let before = accepted_updates(&state, "session").await;
         handle_session_update(invalid, &state, &sink, None).await;
-        assert!(
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-                .all(|event| !is_relayed_update(&event, "session")),
-            "an invalid update must not be published"
+        assert_eq!(
+            accepted_updates(&state, "session").await,
+            before,
+            "an invalid update must not be accepted"
         );
         assert_eq!(
             session_validation(&*state.lock().await, "session")
@@ -7818,11 +7304,7 @@ mod tests {
         }))
         .unwrap();
         handle_session_update(recovery, &state, &sink, None).await;
-        assert!(
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-                .any(|event| is_relayed_update(&event, "session"))
-        );
+        assert_ne!(accepted_updates(&state, "session").await, before);
         assert_eq!(
             session_validation(&*state.lock().await, "session")
                 .unwrap()
@@ -7846,9 +7328,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .session["modes"] = json!({ "currentModeId": "build" });
-        bridge_state.published_runtime_seq = bridge_state.sessions.seq();
         let state = Arc::new(BridgeLock::new(bridge_state));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let answer: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
@@ -7892,18 +7373,6 @@ mod tests {
                 .unwrap(),
             "plan",
         );
-        drop(state);
-        let types = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap()["type"].clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            types,
-            vec![
-                json!("bridge/session_delta"),
-                json!("bridge/internal_runtime_delta"),
-                json!("bridge/internal_runtime_delta"),
-            ],
-        );
     }
 
     #[tokio::test]
@@ -7934,7 +7403,6 @@ mod tests {
             )
             .unwrap();
 
-        bridge_state.published_runtime_seq = bridge_state.sessions.seq();
         session_mirror(&mut bridge_state).register_new("session", incarnation);
         let previous_revision = session_mirror(&mut bridge_state)
             .view("session", incarnation)
@@ -7942,9 +7410,9 @@ mod tests {
             .baseline
             .revision()
             .to_string();
-        let before = bridge_state.sessions.snapshot();
+        let before = bridge_state.sessions.session("session");
         let state = Arc::new(BridgeLock::new(bridge_state));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let late: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
@@ -7959,7 +7427,7 @@ mod tests {
         handle_session_update(late, &state, &sink, None).await;
 
         let mut state = state.lock().await;
-        assert_eq!(state.sessions.snapshot(), before);
+        assert_eq!(state.sessions.session("session"), before);
         let view = session_mirror(&mut state)
             .view("session", incarnation)
             .unwrap();
@@ -7967,15 +7435,6 @@ mod tests {
         assert_eq!(view.baseline.updates()[0]["content"]["text"], "too late");
         assert_ne!(view.baseline.revision(), previous_revision);
         assert!(view.session.active_turn.is_none());
-        drop(state);
-        let events = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            events
-                .iter()
-                .any(|event| event["type"] == "bridge/session_view")
-        );
     }
 
     #[tokio::test]
@@ -7992,12 +7451,11 @@ mod tests {
                 .sessions
                 .resource_owner("session", incarnation)
                 .unwrap();
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, _rx) = mpsc::unbounded_channel();
             let sink = EventSink { tx: tx.into() };
             if valid {
-                register_created_terminal_locked(&mut bridge, &sink, &owner, "terminal").unwrap();
+                register_created_terminal_locked(&mut bridge, &owner, "terminal").unwrap();
             }
-            while rx.try_recv().is_ok() {}
             let state = Arc::new(BridgeLock::new(bridge));
             let notification = serde_json::from_value(json!({
                 "sessionId": "session",
@@ -8017,15 +7475,6 @@ mod tests {
             let mut locked = state.lock().await;
             let view = locked.sessions.view("session", incarnation).unwrap();
             assert_eq!(view.baseline.updates().len(), usize::from(valid));
-            let events = std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                events
-                    .iter()
-                    .any(|event| is_relayed_update(event, "session")),
-                valid
-            );
         }
     }
 
@@ -8034,11 +7483,8 @@ mod tests {
         let mut state = BridgeState::default();
         let old = register_test_session(&mut state, "session", "/workspace");
         let owner = state.sessions.resource_owner("session", old).unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
         publish_terminal_snapshot(
             &mut state,
-            &sink,
             TerminalSnapshot {
                 incarnation: old,
                 value: json!({
@@ -8049,20 +7495,19 @@ mod tests {
             },
         );
         let before = state.sessions.live("session").unwrap().terminals["terminal"].clone();
-        register_created_terminal_locked(&mut state, &sink, &owner, "terminal").unwrap();
+        register_created_terminal_locked(&mut state, &owner, "terminal").unwrap();
         assert_eq!(
             state.sessions.live("session").unwrap().terminals["terminal"],
             before
         );
         publish_terminal_snapshot(
             &mut state,
-            &sink,
             TerminalSnapshot {
                 incarnation: old,
                 value: json!({ "sessionId": "session", "terminalId": "terminal", "released": true }),
             },
         );
-        assert!(register_created_terminal_locked(&mut state, &sink, &owner, "terminal").is_err());
+        assert!(register_created_terminal_locked(&mut state, &owner, "terminal").is_err());
         assert!(state.sessions.live("session").unwrap().terminals.is_empty());
         state
             .sessions
@@ -8079,20 +7524,10 @@ mod tests {
             .sessions
             .close_session(&owner.epoch, "session", old, "close")
             .unwrap();
-        complete_session_retirement(
-            &mut state,
-            &sink,
-            "session",
-            old,
-            SessionAdmission::Close,
-            "close",
-            "closed",
-        );
+        complete_session_retirement(&mut state, "session", old, SessionAdmission::Close, "close");
         let new = register_test_session(&mut state, "session", "/workspace");
         assert_ne!(new, old);
-        assert!(
-            register_created_terminal_locked(&mut state, &sink, &owner, "late-terminal").is_err()
-        );
+        assert!(register_created_terminal_locked(&mut state, &owner, "late-terminal").is_err());
         assert!(state.sessions.live("session").unwrap().terminals.is_empty());
     }
 
@@ -8231,12 +7666,10 @@ mod tests {
         let sink = EventSink { tx: tx.into() };
         complete_session_retirement(
             &mut state,
-            &sink,
             "session",
             first,
             SessionAdmission::Close,
             "close",
-            "closed",
         );
         let second = state
             .sessions
@@ -8516,7 +7949,7 @@ mod tests {
             .unwrap();
         clear_attachment_delivery(&mut bridge_state, "session", incarnation);
         let state = Arc::new(BridgeLock::new(bridge_state));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let sink = EventSink { tx: tx.into() };
         let replay: SessionNotification = serde_json::from_value(json!({
             "sessionId": "session",
@@ -8547,7 +7980,7 @@ mod tests {
             },
         ));
         assert!(
-            !serde_json::to_string(&state.sessions.snapshot())
+            !serde_json::to_string(&state.sessions.session("session"))
                 .unwrap()
                 .contains("candidate")
         );
@@ -8568,10 +8001,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !serde_json::to_string(&state.sessions.snapshot())
+            !serde_json::to_string(&state.sessions.session("session"))
                 .unwrap()
                 .contains("candidate"),
-            "history payload belongs to the shared cache, not runtime snapshots",
+            "history payload belongs to the shared cache, not the live state",
         );
         assert!(
             state
@@ -8580,13 +8013,6 @@ mod tests {
                 .unwrap()
                 .terminals
                 .contains_key("pre-response-terminal")
-        );
-        drop(state);
-        assert!(
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-                .all(|event| event["type"] != "bridge/session_delta"),
-            "attachment replay stays staged until the load commits"
         );
     }
 
@@ -8635,10 +8061,8 @@ mod tests {
         assert!(
             std::iter::from_fn(|| rx.try_recv().ok())
                 .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-                .all(|event| {
-                    event["type"] != "bridge/error" && !is_relayed_update(&event, "session")
-                }),
-            "invalid reload input is reported through the load outcome, not published"
+                .all(|event| event["type"] != "bridge/error"),
+            "invalid reload input is reported through the load outcome"
         );
     }
 
@@ -10230,7 +9654,7 @@ mod tests {
     }
 
     #[test]
-    fn close_before_delete_publishes_deleting_before_the_delete_rpc_wait() {
+    fn close_before_delete_marks_the_session_deleting_before_the_delete_rpc_wait() {
         let mut state = BridgeState::default();
         let epoch = state.sessions.epoch().to_string();
         let incarnation = state
@@ -10246,18 +9670,13 @@ mod tests {
             .sessions
             .start_delete(&epoch, "session", incarnation, "delete")
             .unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
-        flush_runtime(&mut state, &sink);
-        while rx.try_recv().is_ok() {}
 
-        commit_runtime_delete_close_success(&mut state, "session", incarnation, "delete", &sink)
-            .unwrap();
+        commit_runtime_delete_close_success(&mut state, "session", incarnation, "delete").unwrap();
 
-        assert_eq!(state.published_runtime_seq, state.sessions.seq());
-        let event = serde_json::from_str::<Value>(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(event["type"], "bridge/internal_runtime_delta");
-        assert_eq!(event["value"]["change"]["session"]["lifecycle"], "deleting");
+        assert_eq!(
+            state.sessions.live("session").unwrap().lifecycle,
+            SessionLifecycle::Deleting
+        );
     }
 
     #[tokio::test]
@@ -10310,12 +9729,10 @@ mod tests {
             let mut state = state.lock().await;
             complete_session_retirement(
                 &mut state,
-                &sink,
                 "session",
                 incarnation,
                 SessionAdmission::Close,
                 "not-owner",
-                "closed",
             );
             assert!(session_operation_pending(
                 &state,
@@ -10324,92 +9741,16 @@ mod tests {
             ));
             complete_session_retirement(
                 &mut state,
-                &sink,
                 "session",
                 incarnation,
                 SessionAdmission::Close,
                 "close",
-                "closed",
             );
         }
         assert!(
             reserve_attachment("session", RuntimeSessionOperationKind::Load, &state)
                 .await
                 .is_ok()
-        );
-    }
-
-    #[test]
-    fn terminal_business_deltas_and_replacement_view_share_the_same_output() {
-        let mut state = BridgeState::default();
-        let epoch = state.sessions.epoch().to_string();
-        let incarnation = state
-            .sessions
-            .open_new(
-                &epoch,
-                "session",
-                "/workspace",
-                json!({ "sessionId": "session" }),
-            )
-            .unwrap();
-
-        let mirror = session_mirror(&mut state);
-        mirror.register_new("session", incarnation);
-        mirror.begin_load("session", incarnation, "load").unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                incarnation,
-                "load",
-                json!({
-                    "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "run",
-                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
-                    "rawOutput": { "agent": "original" },
-                }),
-            )
-            .unwrap();
-        mirror.commit_load("session", incarnation, "load").unwrap();
-        let revision = mirror.state("session").unwrap().view_revision;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
-        for (output, released) in [("hello", false), (" world", false), ("", true)] {
-            publish_terminal_snapshot(
-                &mut state,
-                &sink,
-                TerminalSnapshot {
-                    incarnation,
-                    value: json!({
-                        "sessionId": "session", "terminalId": "terminal", "output": output,
-                        "outputAppend": true, "truncated": false, "released": released,
-                        "exitStatus": if released { json!({ "exitCode": 0 }) } else { Value::Null },
-                    }),
-                },
-            );
-        }
-        let deltas = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-            .filter(|event| event["type"] == "bridge/session_delta")
-            .collect::<Vec<_>>();
-        assert_eq!(deltas.len(), 3);
-        for (index, delta) in deltas.iter().enumerate() {
-            assert_eq!(delta["fromRevision"], revision + index as u64);
-            assert_eq!(delta["viewRevision"], revision + index as u64 + 1);
-            assert_eq!(delta["change"]["kind"], "terminal_update");
-        }
-        assert!(
-            state
-                .sessions
-                .session("session")
-                .unwrap()
-                .terminals
-                .is_empty()
-        );
-        let view = session_view_value(&mut state, "session", incarnation).unwrap();
-        assert_eq!(view["terminals"]["terminal"]["output"], "hello world");
-        assert_eq!(view["terminals"]["terminal"]["exitStatus"]["exitCode"], 0);
-        assert_eq!(
-            view["baseline"]["updates"][0]["rawOutput"],
-            json!({ "agent": "original" })
         );
     }
 
@@ -10469,12 +9810,10 @@ mod tests {
         let sink = EventSink { tx: tx.into() };
         complete_session_retirement(
             &mut state,
-            &sink,
             "session",
             first,
             SessionAdmission::Close,
             "close",
-            "closed",
         );
         assert!(state.sessions.state("session").is_none());
         let second = state
@@ -10733,8 +10072,7 @@ mod tests {
         );
         assert!(!state.sessions.url_owners.contains_key("session-url"));
         assert!(state.sessions.url_owners.contains_key("request-url"));
-        let runtime = state.sessions.snapshot();
-        let runtime_session = runtime.sessions.get("session").unwrap();
+        let runtime_session = state.sessions.live("session").unwrap();
         assert!(runtime_session.permissions.is_empty());
         assert!(runtime_session.elicitations.is_empty());
         assert!(
@@ -10742,26 +10080,20 @@ mod tests {
             "a terminal URL flow must be removed instead of retained as completed state"
         );
         assert!(
-            runtime
+            state
+                .sessions
                 .request_elicitations
                 .contains_key("request-elicitation")
         );
         assert_eq!(
-            runtime.request_url_flows["request-url"].status,
+            state.sessions.request_url_flows["request-url"].status,
             UrlFlowStatus::Waiting
         );
         drop(state);
-        let events = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|event| serde_json::from_str::<Value>(&event).unwrap())
-            .filter(|event| {
-                !event["type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("bridge/internal_"))
-            })
-            .collect::<Vec<_>>();
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(
             events.is_empty(),
-            "cancellation is reflected in canonical state, not legacy events: {events:?}"
+            "cancellation is reflected in canonical state, not events: {events:?}"
         );
     }
 

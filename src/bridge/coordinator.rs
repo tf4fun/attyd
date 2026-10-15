@@ -61,7 +61,7 @@ pub(super) async fn dispatch_ready(
             let _ = reply.send(Ok(turn));
         }
         BridgeIngress::Terminal(snapshot) => {
-            publish_terminal_snapshot(&mut *services.state.lock().await, &services.sink, snapshot);
+            publish_terminal_snapshot(&mut *services.state.lock().await, snapshot);
         }
         BridgeIngress::Acp(Dispatch::Request(_, responder)) if stopping => {
             drop(request_lease);

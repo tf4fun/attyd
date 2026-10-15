@@ -133,7 +133,7 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
         let epoch = state.sessions.epoch().to_string();
         let delivered = match delivery {
             Delivery::Permission(owner, response) => {
-                deliver_permission(state, sink, &owner, &id, response, |state| {
+                deliver_permission(state, &owner, &id, response, |state| {
                     state
                         .sessions
                         .resolve_permission(&epoch, &owner.session_id, owner.incarnation, &id)
@@ -151,7 +151,6 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
                     .map(|owner| (owner.session_id.as_str(), owner.incarnation));
                 deliver_elicitation(
                     state,
-                    sink,
                     &id,
                     owner.as_ref(),
                     response,

@@ -343,14 +343,7 @@ async fn cancel_permission(
                     permission_id,
                 )
                 .map_err(runtime_state_error)?;
-            let delta = advance_session_delta(
-                &mut state,
-                &owner.session_id,
-                owner.incarnation,
-                json!({ "kind": "interaction_remove", "interactionId": permission_id }),
-            )?;
-            flush_runtime(&mut state, &context.sink);
-            context.sink.send(delta);
+            refresh_observer_timers(&mut state);
         }
         drop(state);
         drop(pending);
@@ -422,18 +415,7 @@ async fn permission(
                     },
                 )
                 .map_err(mirror_error)?;
-            let delta = advance_session_delta(
-                &mut state,
-                &session_id,
-                owner.incarnation,
-                json!({
-                    "kind": "interaction_upsert", "interaction": {
-                        "interactionId": permission_id, "type": "permission", "request": request_value,
-                    },
-                }),
-            )?;
-            flush_runtime(&mut state, &context.sink);
-            context.sink.send(delta);
+            refresh_observer_timers(&mut state);
             true
         }
     };
@@ -480,20 +462,7 @@ async fn cancel_elicitation(
                     None,
                 )
                 .map_err(runtime_state_error)?;
-            let delta = owner
-                .map(|owner| {
-                    advance_session_delta(
-                        &mut state,
-                        &owner.session_id,
-                        owner.incarnation,
-                        json!({ "kind": "interaction_remove", "interactionId": elicitation_id }),
-                    )
-                })
-                .transpose()?;
-            flush_runtime(&mut state, &context.sink);
-            if let Some(delta) = delta {
-                context.sink.send(delta);
-            }
+            refresh_observer_timers(&mut state);
         }
         drop(state);
         drop(pending);
@@ -577,16 +546,7 @@ async fn elicitation(
                     .request_elicitations
                     .insert(elicitation_id.clone(), pending);
             }
-            let delta = owner.as_ref().map(|owner| advance_session_delta(
-                &mut state, &owner.session_id, owner.incarnation,
-                json!({ "kind": "interaction_upsert", "interaction": {
-                    "interactionId": elicitation_id, "type": "elicitation", "request": request_value,
-                }}),
-            )).transpose()?;
-            flush_runtime(&mut state, &context.sink);
-            if let Some(delta) = delta {
-                context.sink.send(delta);
-            }
+            refresh_observer_timers(&mut state);
             (true, owner)
         }
     };
@@ -651,7 +611,7 @@ async fn complete_elicitation(
         return Err(Error::invalid_params().data("URL elicitation registration changed"));
     }
     state.sessions.take_url_route(&elicitation_id, registration);
-    flush_runtime(&mut state, &context.sink);
+    refresh_observer_timers(&mut state);
     Ok(())
 }
 
@@ -721,7 +681,6 @@ async fn create_terminal(
                     .and_then(|_| {
                         register_created_terminal_locked(
                             &mut state,
-                            &context.sink,
                             &owner,
                             &response.terminal_id.0,
                         )
@@ -814,7 +773,7 @@ async fn terminal_release(
         let (response, snapshot) = terminals.release_with_snapshot(request).await?;
         let _turn = context.continue_local().await?;
         let mut state = context.state.lock().await;
-        publish_terminal_snapshot(&mut state, &context.sink, snapshot);
+        publish_terminal_snapshot(&mut state, snapshot);
         Ok(response)
     })?;
     drop(turn);

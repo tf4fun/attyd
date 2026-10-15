@@ -26,37 +26,6 @@ enum EventSenderInner {
     },
     #[cfg(test)]
     Unbounded(mpsc::UnboundedSender<String>),
-    #[cfg(test)]
-    FaultInjected {
-        tx: mpsc::UnboundedSender<String>,
-        fault: TestEventFault,
-    },
-}
-
-/// Inject failures at the actual publication boundary without changing the
-/// production queue, serialization, or journal behavior.
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct TestEventFault {
-    attempts: Arc<AtomicUsize>,
-    delta_attempts: Arc<AtomicUsize>,
-    fail_after: usize,
-}
-
-#[cfg(test)]
-impl TestEventFault {
-    pub(crate) fn delta_attempts(&self) -> usize {
-        self.delta_attempts.load(Ordering::Acquire)
-    }
-
-    fn rejects(&self, event: &str) -> bool {
-        if serde_json::from_str::<serde_json::Value>(event)
-            .is_ok_and(|value| value["type"] == "bridge/internal_runtime_delta")
-        {
-            self.delta_attempts.fetch_add(1, Ordering::AcqRel);
-        }
-        self.attempts.fetch_add(1, Ordering::AcqRel) >= self.fail_after
-    }
 }
 
 pub(crate) struct EventReceiver {
@@ -100,14 +69,10 @@ impl QueuedEvent {
 }
 
 impl EventSender {
-    /// Queue a JSON event built by the Bridge. Production queues carry its
-    /// typed form; events no Hub subscriber can receive are dropped here.
+    /// Queue a JSON event built by the Bridge.
     pub(crate) fn send_value(&self, event: Value) -> Result<(), EventSendError> {
         match &self.inner {
-            EventSenderInner::Accounted { .. } => match BridgeEvent::from_value(event) {
-                Some(event) => self.send_event(event),
-                None => Ok(()),
-            },
+            EventSenderInner::Accounted { .. } => self.send_event(BridgeEvent::from_value(event)),
             #[cfg(test)]
             _ => self.send_json(event.to_string()),
         }
@@ -141,14 +106,6 @@ impl EventSender {
                 unreachable!("accounted queues carry typed events")
             }
             EventSenderInner::Unbounded(tx) => tx.send(event).map_err(|_| EventSendError::Closed),
-            #[cfg(test)]
-            EventSenderInner::FaultInjected { tx, fault } => {
-                if fault.rejects(&event) {
-                    Err(EventSendError::Closed)
-                } else {
-                    tx.send(event).map_err(|_| EventSendError::Closed)
-                }
-            }
         }
     }
 
@@ -157,8 +114,6 @@ impl EventSender {
             EventSenderInner::Accounted { cancellation, .. } => cancellation.cancel(),
             #[cfg(test)]
             EventSenderInner::Unbounded(_) => {}
-            #[cfg(test)]
-            EventSenderInner::FaultInjected { .. } => {}
         }
     }
 
@@ -169,30 +124,7 @@ impl EventSender {
                 queued_bytes.load(Ordering::Acquire)
             }
             EventSenderInner::Unbounded(_) => 0,
-            EventSenderInner::FaultInjected { .. } => 0,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_failing_after(successes: usize) -> (Self, EventReceiver, TestEventFault) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let fault = TestEventFault {
-            attempts: Arc::new(AtomicUsize::new(0)),
-            delta_attempts: Arc::new(AtomicUsize::new(0)),
-            fail_after: successes,
-        };
-        (
-            Self {
-                inner: EventSenderInner::FaultInjected {
-                    tx,
-                    fault: fault.clone(),
-                },
-            },
-            EventReceiver {
-                inner: EventReceiverInner::Unbounded(rx),
-            },
-            fault,
-        )
     }
 }
 
@@ -201,15 +133,10 @@ impl EventReceiver {
         match &mut self.inner {
             EventReceiverInner::Accounted(rx) => rx.recv().await,
             #[cfg(test)]
-            EventReceiverInner::Unbounded(rx) => loop {
-                let event = rx.recv().await?;
-                if let Some(event) = BridgeEvent::from_json(&event) {
-                    break Some(QueuedEvent {
-                        event,
-                        lease: EventByteLease::default(),
-                    });
-                }
-            },
+            EventReceiverInner::Unbounded(rx) => Some(QueuedEvent {
+                event: BridgeEvent::from_json(&rx.recv().await?),
+                lease: EventByteLease::default(),
+            }),
         }
     }
 
@@ -217,15 +144,10 @@ impl EventReceiver {
         match &mut self.inner {
             EventReceiverInner::Accounted(rx) => rx.try_recv(),
             #[cfg(test)]
-            EventReceiverInner::Unbounded(rx) => loop {
-                let event = rx.try_recv()?;
-                if let Some(event) = BridgeEvent::from_json(&event) {
-                    break Ok(QueuedEvent {
-                        event,
-                        lease: EventByteLease::default(),
-                    });
-                }
-            },
+            EventReceiverInner::Unbounded(rx) => Ok(QueuedEvent {
+                event: BridgeEvent::from_json(&rx.try_recv()?),
+                lease: EventByteLease::default(),
+            }),
         }
     }
 }
