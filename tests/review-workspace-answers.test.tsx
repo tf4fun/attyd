@@ -238,4 +238,82 @@ describe("review: workspace answers follow the pending interaction set", () => {
     expect(container.querySelectorAll(".elicitation-card")).toHaveLength(0);
     expect(calls).toHaveLength(1);
   });
+
+  it.each(["draft", "sending", "uncertain"] as const)(
+    "keeps %s answers when the same occupying operation aligns in its session later",
+    async (stage) => {
+      const deleting = operation({
+        id: "delete-late-session", kind: "delete", status: "running", input: { sessionId: SESSION },
+        interactions: { A: permission("A"), B: permission("B") },
+      });
+      const globalLive = global(deleting, deleting);
+      await act(async () => root.render(<Page />));
+      await act(async () => Source.instances.at(-1)!.emit(alignment("global", globalLive)));
+      const source = Source.instances.at(-1)!;
+      expect(new URL(source.url, window.location.href).searchParams.getAll("scope")).toContain(SCOPE);
+      await act(async () => {
+        source.emit(alignment("global", globalLive));
+        source.emit(alignment("catalog", catalog));
+      });
+      // The global operation can already be answered while the subscribed
+      // session's first event is still in transit.
+      expect(acp.state.session).toBeUndefined();
+      expect(acp.state.permissions.map(({ permissionId }) => permissionId)).toEqual(["A", "B"]);
+      await act(async () => acp.respondPermission("A", selected));
+      expect(calls).toEqual([]);
+
+      if (stage !== "draft") {
+        await act(async () => acp.respondPermission("B", selected));
+        expect(calls).toHaveLength(1);
+        expect(calls[0].path).toBe("/api/v2/scopes/global/ops");
+        if (stage === "uncertain") {
+          // A proxy response without a protocol error is not a definite
+          // refusal: the answer may already have reached the bridge (C3).
+          await act(async () => calls[0].respond(502, { message: "Upstream response was lost" }));
+        }
+      }
+      const statusBefore = acp.state.permissions.find(({ permissionId }) => permissionId === "A")!;
+      expect(statusBefore.responseRequestId).toBeTruthy();
+      if (stage === "uncertain") expect(statusBefore.responseStatus).toBeTruthy();
+
+      // The session shows that exact operation, not a new request. Its
+      // alignment must not discard A's draft or the in-flight/uncertain write.
+      await act(async () => source.emit(alignment(SCOPE, session(deleting))));
+      expect(acp.state.session?.sessionId).toBe(SESSION);
+      expect(acp.state.permissions.map(({ permissionId }) => permissionId)).toEqual(["A", "B"]);
+      const statusAfter = acp.state.permissions.find(({ permissionId }) => permissionId === "A")!;
+      expect(statusAfter.responseRequestId).toBeTruthy();
+      expect(statusAfter.responseStatus).toBe(statusBefore.responseStatus);
+      const aCard = [...container.querySelectorAll(".permission-card")]
+        .find((card) => card.textContent?.includes("Tool A"));
+      expect(aCard?.getAttribute("aria-busy")).toBe("true");
+
+      if (stage === "draft") {
+        expect(calls).toEqual([]);
+        await act(async () => acp.respondPermission("B", selected));
+      }
+      expect(calls).toHaveLength(1);
+      expect(["/api/v2/scopes/global/ops", "/api/v2/scopes/session%2Fs/ops"]).toContain(calls[0].path);
+      expect(calls[0].body).toEqual({
+        expect: deleting.id, kind: "answer",
+        args: { answers: { A: { outcome: selected }, B: { outcome: selected } } },
+      });
+      if (stage !== "uncertain") {
+        await act(async () => calls[0].respond(202, { op: deleting.id }));
+      }
+      // Another event must not replay an answer, including an uncertain one.
+      await act(async () => source.emit({ scope: SCOPE, live: { patch: [
+        { op: "set", path: "/cwd", value: CWD },
+      ] } }));
+      expect(calls).toHaveLength(1);
+      await act(async () => {
+        for (const scope of [SCOPE, "global"]) source.emit({ scope, live: { patch: [
+          { op: "set", path: "/op/interactions", value: {} },
+        ] } });
+      });
+      expect(acp.state.permissions).toEqual([]);
+      expect(container.querySelectorAll(".permission-card")).toHaveLength(0);
+      expect(calls).toHaveLength(1);
+    },
+  );
 });
