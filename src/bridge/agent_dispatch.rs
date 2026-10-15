@@ -260,9 +260,7 @@ async fn session_update(
         let session_id = notification.session_id.0.as_ref();
         if context.owner.is_some() {
             context.require_owner(&state, session_id)?;
-        } else if context.dispatch_owner.session_id.is_some()
-            || live_session_incarnation(&state, session_id).is_some()
-        {
+        } else if context.dispatch_owner.session_id.is_some() || live_session(&state, session_id) {
             // An unknown-ID creation event may use the global staging lane. It
             // may not silently become an update for an already replaced owner.
             return Err(Error::invalid_params().data("session update has no captured owner"));
@@ -873,7 +871,7 @@ mod tests {
             let owner = if scoped {
                 let mut state = context.state.lock().await;
                 let epoch = state.sessions.epoch().to_owned();
-                let incarnation = state
+                state
                     .sessions
                     .open_new(
                         &epoch,
@@ -882,7 +880,7 @@ mod tests {
                         json!({"sessionId":"session"}),
                     )
                     .unwrap();
-                session_mirror(&mut state).register_new("session", incarnation);
+                session_mirror(&mut state).register_new("session");
                 Some(state.sessions.resource_owner("session").unwrap())
             } else {
                 None

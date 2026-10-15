@@ -4,21 +4,6 @@ use serde_json::Value;
 
 use crate::history_replay::ReplayCandidate;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct SessionKey {
-    pub session_id: String,
-    pub incarnation: u64,
-}
-
-impl SessionKey {
-    pub(crate) fn new(session_id: impl Into<String>, incarnation: u64) -> Self {
-        Self {
-            session_id: session_id.into(),
-            incarnation,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HistoryCacheError {
     CandidateExists,
@@ -36,18 +21,18 @@ struct LoadCandidate {
 /// session's `TurnLog`; a candidate exists from the load's start to its end.
 #[derive(Default)]
 pub(crate) struct HistoryCache {
-    candidates: HashMap<SessionKey, LoadCandidate>,
+    candidates: HashMap<String, LoadCandidate>,
 }
 
 impl HistoryCache {
     pub(crate) fn candidate(
         &self,
-        key: &SessionKey,
+        session_id: &str,
         attempt_id: &str,
     ) -> Result<ReplayCandidate, HistoryCacheError> {
         let candidate = self
             .candidates
-            .get(key)
+            .get(session_id)
             .ok_or(HistoryCacheError::CandidateMissing)?;
         if candidate.attempt_id != attempt_id {
             return Err(HistoryCacheError::AttemptMismatch);
@@ -57,14 +42,15 @@ impl HistoryCache {
 
     pub(crate) fn begin_candidate(
         &mut self,
-        key: SessionKey,
+        session_id: impl Into<String>,
         attempt_id: impl Into<String>,
     ) -> Result<(), HistoryCacheError> {
-        if self.candidates.contains_key(&key) {
+        let session_id = session_id.into();
+        if self.candidates.contains_key(&session_id) {
             return Err(HistoryCacheError::CandidateExists);
         }
         self.candidates.insert(
-            key,
+            session_id,
             LoadCandidate {
                 attempt_id: attempt_id.into(),
                 replay: ReplayCandidate::default(),
@@ -75,20 +61,20 @@ impl HistoryCache {
 
     pub(crate) fn append_candidate(
         &mut self,
-        key: &SessionKey,
+        session_id: &str,
         attempt_id: &str,
         update: Value,
     ) -> Result<(), HistoryCacheError> {
-        self.candidate(key, attempt_id)?.append(update)
+        self.candidate(session_id, attempt_id)?.append(update)
     }
 
     pub(crate) fn poison_candidate(
         &mut self,
-        key: &SessionKey,
+        session_id: &str,
         attempt_id: &str,
         error: HistoryCacheError,
     ) -> Result<(), HistoryCacheError> {
-        self.candidate(key, attempt_id)?.poison(error);
+        self.candidate(session_id, attempt_id)?.poison(error);
         Ok(())
     }
 
@@ -96,27 +82,27 @@ impl HistoryCache {
     /// from.
     pub(crate) fn commit_candidate(
         &mut self,
-        key: &SessionKey,
+        session_id: &str,
         attempt_id: &str,
     ) -> Result<Vec<Value>, HistoryCacheError> {
-        let updates = self.candidate(key, attempt_id)?.take_history()?;
-        self.candidates.remove(key);
+        let updates = self.candidate(session_id, attempt_id)?.take_history()?;
+        self.candidates.remove(session_id);
         Ok(updates)
     }
 
     pub(crate) fn abort_candidate(
         &mut self,
-        key: &SessionKey,
+        session_id: &str,
         attempt_id: &str,
     ) -> Result<(), HistoryCacheError> {
-        let replay = self.candidate(key, attempt_id)?;
+        let replay = self.candidate(session_id, attempt_id)?;
         replay.discard();
-        self.candidates.remove(key);
+        self.candidates.remove(session_id);
         Ok(())
     }
 
-    pub(crate) fn remove(&mut self, key: &SessionKey) {
-        if let Some(candidate) = self.candidates.remove(key) {
+    pub(crate) fn remove(&mut self, session_id: &str) {
+        if let Some(candidate) = self.candidates.remove(session_id) {
             candidate.replay.discard();
         }
     }
@@ -180,15 +166,13 @@ mod tests {
             json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "next turn" } }),
             json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed" }),
         ];
-        let key = SessionKey::new("session", 1);
+        let key = "session";
         let mut cache = HistoryCache::default();
-        cache.begin_candidate(key.clone(), "load").unwrap();
+        cache.begin_candidate(key, "load").unwrap();
         for update in &updates {
-            cache
-                .append_candidate(&key, "load", update.clone())
-                .unwrap();
+            cache.append_candidate(key, "load", update.clone()).unwrap();
         }
-        let replay = cache.commit_candidate(&key, "load").unwrap();
+        let replay = cache.commit_candidate(key, "load").unwrap();
         assert_eq!(replay.len(), 4);
         assert_eq!(replay[0], updates[0]);
         assert_eq!(replay[1], updates[1]);
@@ -199,20 +183,20 @@ mod tests {
 
     #[test]
     fn wrong_attempt_cannot_append_commit_or_abort_a_candidate() {
-        let key = SessionKey::new("session", 1);
+        let key = "session";
         let mut cache = HistoryCache::default();
-        cache.begin_candidate(key.clone(), "current").unwrap();
+        cache.begin_candidate(key, "current").unwrap();
 
         assert_eq!(
-            cache.append_candidate(&key, "old", json!({})),
+            cache.append_candidate(key, "old", json!({})),
             Err(HistoryCacheError::AttemptMismatch)
         );
         assert!(matches!(
-            cache.commit_candidate(&key, "old"),
+            cache.commit_candidate(key, "old"),
             Err(HistoryCacheError::AttemptMismatch)
         ));
         assert_eq!(
-            cache.abort_candidate(&key, "old"),
+            cache.abort_candidate(key, "old"),
             Err(HistoryCacheError::AttemptMismatch)
         );
         assert_eq!(cache.candidates(), 1);

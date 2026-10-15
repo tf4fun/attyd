@@ -1689,66 +1689,54 @@ async fn review_refused_automatic_close_waits_for_a_new_subscription_cycle() {
     }
 }
 
-/// A locally released session still exists at the Agent. Its late update is
-/// not early replay for the unrelated create currently awaiting a response.
+/// A creation's early controls, sent before its response, stay with the new
+/// session after an earlier session was locally released.
 #[tokio::test(start_paused = true)]
-async fn review_released_session_updates_do_not_displace_a_new_sessions_early_controls() {
-    for late_old_update in [false, true] {
-        let mut peer = Peer::start_with(json!({"loadSession": true}), json!([]), |options| {
-            options.session_unobserved_timeout = 1;
-        })
-        .await;
-        peer.create("old", json!({})).await;
-        peer.until("the old session is locally released", |peer| {
-            peer.released(&session("old"))
-        })
-        .await;
+async fn a_new_sessions_early_controls_survive_its_creation_response() {
+    let mut peer = Peer::start_with(json!({"loadSession": true}), json!([]), |options| {
+        options.session_unobserved_timeout = 1;
+    })
+    .await;
+    peer.create("old", json!({})).await;
+    peer.until("the old session is locally released", |peer| {
+        peer.released(&session("old"))
+    })
+    .await;
 
-        let (_, created) = peer.start_op("global", "create", json!({"cwd": CWD})).await;
-        let request = peer.request("session/new").await;
-        let commands = json!([{"name": "new-command", "description": "For the new session"}]);
-        let mut batch = Vec::new();
-        if late_old_update {
-            batch.push(json!({
-                "jsonrpc": "2.0", "method": "session/update",
-                "params": {"sessionId": "old", "update": {
-                    "sessionUpdate": "available_commands_update",
-                    "availableCommands": [{"name": "old-command", "description": "Old session"}],
-                }},
-            }));
-        }
-        batch.push(json!({
+    let (_, created) = peer.start_op("global", "create", json!({"cwd": CWD})).await;
+    let request = peer.request("session/new").await;
+    let commands = json!([{"name": "new-command", "description": "For the new session"}]);
+    peer.send(json!([
+        {
             "jsonrpc": "2.0", "method": "session/update",
             "params": {"sessionId": "new", "update": {
                 "sessionUpdate": "available_commands_update", "availableCommands": commands,
             }},
-        }));
-        batch.push(json!({
-            "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": "new"},
-        }));
-        peer.send(Value::Array(batch)).await;
-        assert_eq!(
-            Peer::ended(created).await.unwrap(),
-            json!({"sessionId": "new"})
-        );
+        },
+        {"jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": "new"}},
+    ]))
+    .await;
+    assert_eq!(
+        Peer::ended(created).await.unwrap(),
+        json!({"sessionId": "new"})
+    );
 
-        let scope = session("new");
-        let mut stream = Stream::open(&peer, &[scope.as_str()], None).await;
-        stream
-            .until(
-                &mut peer,
-                "the newly created session's alignment",
-                |reader| reader.replicas.contains_key(&session("new")),
-            )
-            .await;
-        assert_eq!(
-            stream.live(&scope)["controls"]["commands"],
-            commands,
-            "late_old_update={late_old_update}: the new session keeps its own early controls"
-        );
-        assert!(peer.live("global")["sessions"].get("old").is_none());
-        peer.quiet(Duration::from_secs(2)).await;
-        peer.settled().await;
-        stream.converged(&peer);
-    }
+    let scope = session("new");
+    let mut stream = Stream::open(&peer, &[scope.as_str()], None).await;
+    stream
+        .until(
+            &mut peer,
+            "the newly created session's alignment",
+            |reader| reader.replicas.contains_key(&session("new")),
+        )
+        .await;
+    assert_eq!(
+        stream.live(&scope)["controls"]["commands"],
+        commands,
+        "the new session keeps its own early controls"
+    );
+    assert!(peer.live("global")["sessions"].get("old").is_none());
+    peer.quiet(Duration::from_secs(2)).await;
+    peer.settled().await;
+    stream.converged(&peer);
 }

@@ -241,13 +241,13 @@ fn cancel(
                 .and_then(|session| session.active_turn.as_ref())
                 .and_then(|turn| turn.execution.as_ref())
                 .is_some_and(|execution| execution.rpc_operation_id == op);
-            let Some(incarnation) = live_session_incarnation(state, session_id) else {
+            if !live_session(state, session_id) {
                 return;
-            };
+            }
             if started {
                 if let Err(error) = connection
                     .send_notification(CancelNotification::new(session_id.to_string()))
-                    .and_then(|()| commit_session_cancel(state, sink, session_id, incarnation))
+                    .and_then(|()| commit_session_cancel(state, sink, session_id))
                 {
                     report(sink, "session/cancel", error);
                 }

@@ -179,19 +179,16 @@ impl Gate {
     }
 
     /// Opens a new session, as `session/new` does.
-    fn open(&mut self, session_id: &str, response: Value) -> u64 {
-        let incarnation = self
-            .registry
+    fn open(&mut self, session_id: &str, response: Value) {
+        self.registry
             .open_new(EPOCH, session_id, format!("/{session_id}"), response)
             .unwrap();
         self.commit();
-        incarnation
     }
 
     /// Holds a session by loading it with `replay`, as a first load does.
-    fn load(&mut self, session_id: &str, replay: &[Value]) -> u64 {
-        let incarnation = self
-            .registry
+    fn load(&mut self, session_id: &str, replay: &[Value]) {
+        self.registry
             .start_attachment(
                 EPOCH,
                 session_id,
@@ -200,77 +197,55 @@ impl Gate {
                 SessionOperationKind::Load,
             )
             .unwrap();
-        self.registry.register_cold(session_id, incarnation);
+        self.registry.register_cold(session_id);
         self.commit();
-        self.registry
-            .begin_load(session_id, incarnation, "load")
-            .unwrap();
+        self.registry.begin_load(session_id, "load").unwrap();
         for update in replay {
             self.registry
-                .append_load_update(session_id, incarnation, "load", update.clone())
+                .append_load_update(session_id, "load", update.clone())
                 .unwrap();
         }
-        self.registry
-            .commit_load(session_id, incarnation, "load")
-            .unwrap();
+        self.registry.commit_load(session_id, "load").unwrap();
         self.registry
             .complete_attachment(
                 EPOCH,
                 session_id,
-                incarnation,
                 "load",
                 SessionOperationKind::Load,
                 json!({}),
             )
             .unwrap();
-        incarnation
     }
 
     /// Reloads a held session with `replay`, as after an Agent restart.
-    fn reload(&mut self, session_id: &str, incarnation: u64, replay: &[Value]) {
+    fn reload(&mut self, session_id: &str, replay: &[Value]) {
         self.registry
-            .start_reload(
-                EPOCH,
-                session_id,
-                incarnation,
-                "reload",
-                SessionOperationKind::Load,
-            )
+            .start_reload(EPOCH, session_id, "reload", SessionOperationKind::Load)
             .unwrap();
-        self.registry
-            .begin_load(session_id, incarnation, "reload")
-            .unwrap();
+        self.registry.begin_load(session_id, "reload").unwrap();
         for update in replay {
             self.registry
-                .append_load_update(session_id, incarnation, "reload", update.clone())
+                .append_load_update(session_id, "reload", update.clone())
                 .unwrap();
         }
+        self.registry.commit_load(session_id, "reload").unwrap();
         self.registry
-            .commit_load(session_id, incarnation, "reload")
-            .unwrap();
-        self.registry
-            .complete_reload(EPOCH, session_id, incarnation, "reload", json!({}))
+            .complete_reload(EPOCH, session_id, "reload", json!({}))
             .unwrap();
     }
 
     /// Installs a prompt operation and starts its turn.
-    fn prompt(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-        rpc: &str,
-        prompt: Vec<Value>,
-    ) -> String {
+    fn prompt(&mut self, session_id: &str, rpc: &str, prompt: Vec<Value>) -> String {
         let op = self.registry.install_prompt(session_id, &prompt).unwrap();
         self.registry
-            .start_prompt(EPOCH, session_id, incarnation, rpc, prompt)
+            .start_prompt(EPOCH, session_id, rpc, prompt)
             .unwrap();
         op
     }
 
-    fn update(&mut self, session_id: &str, incarnation: u64, update: Value) {
+    fn update(&mut self, session_id: &str, update: Value) {
         self.registry
-            .append_runtime_update_for_test(EPOCH, session_id, incarnation, update)
+            .append_runtime_update_for_test(EPOCH, session_id, update)
             .unwrap();
     }
 }
@@ -352,11 +327,10 @@ fn a_created_session_starts_with_a_completed_open_and_a_known_empty_log() {
 #[test]
 fn a_first_load_runs_with_an_unknown_log_and_ends_with_the_replayed_log() {
     let mut gate = Gate::new();
-    let incarnation = gate
-        .registry
+    gate.registry
         .start_attachment(EPOCH, "s", "/s", "load", SessionOperationKind::Load)
         .unwrap();
-    gate.registry.register_cold("s", incarnation);
+    gate.registry.register_cold("s");
     let events = gate.commit();
     let aligned = single(&events, "session/s");
     assert!(aligned.get("log").is_none(), "an unknown log is not sent");
@@ -368,22 +342,15 @@ fn a_first_load_runs_with_an_unknown_log_and_ends_with_the_replayed_log() {
     );
     assert_eq!(gate.log("session/s"), None);
 
-    gate.registry.begin_load("s", incarnation, "load").unwrap();
+    gate.registry.begin_load("s", "load").unwrap();
     for update in [user(text("hi")), agent_chunk(text("hello"))] {
         gate.registry
-            .append_load_update("s", incarnation, "load", update)
+            .append_load_update("s", "load", update)
             .unwrap();
     }
-    gate.registry.commit_load("s", incarnation, "load").unwrap();
+    gate.registry.commit_load("s", "load").unwrap();
     gate.registry
-        .complete_attachment(
-            EPOCH,
-            "s",
-            incarnation,
-            "load",
-            SessionOperationKind::Load,
-            json!({}),
-        )
+        .complete_attachment(EPOCH, "s", "load", SessionOperationKind::Load, json!({}))
         .unwrap();
     let events = gate.commit();
     let end = single(&events, "session/s");
@@ -399,17 +366,15 @@ fn a_first_load_runs_with_an_unknown_log_and_ends_with_the_replayed_log() {
 #[test]
 fn a_failed_first_load_ends_the_scope_with_load_failed() {
     let mut gate = Gate::new();
-    let incarnation = gate
-        .registry
+    gate.registry
         .start_attachment(EPOCH, "s", "/s", "load", SessionOperationKind::Load)
         .unwrap();
-    gate.registry.register_cold("s", incarnation);
+    gate.registry.register_cold("s");
     gate.commit();
     gate.registry
         .fail_attachment(
             EPOCH,
             "s",
-            incarnation,
             "load",
             SessionOperationKind::Load,
             json!({ "code": -32002, "message": "no such session" }),
@@ -429,8 +394,8 @@ fn a_failed_first_load_ends_the_scope_with_load_failed() {
 #[test]
 fn a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one_event() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
-    let op = gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
+    gate.open("s", json!({ "sessionId": "s" }));
+    let op = gate.prompt("s", "rpc", vec![text("hi")]);
     let events = gate.commit();
     let started = single(&events, "session/s");
     assert!(started.get("log").is_none());
@@ -441,11 +406,10 @@ fn a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one
     assert_eq!(live["op"]["input"], json!({ "prompt": [text("hi")] }));
     assert_eq!(live["op"]["process"], json!([]));
 
-    gate.update("s", incarnation, agent_chunk(text("hel")));
+    gate.update("s", agent_chunk(text("hel")));
     gate.commit();
     gate.update(
         "s",
-        incarnation,
         json!({
             "sessionUpdate": "tool_call", "toolCallId": "t", "title": "read", "status": "pending",
         }),
@@ -453,7 +417,6 @@ fn a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one
     gate.commit();
     gate.update(
         "s",
-        incarnation,
         json!({
             "sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "completed",
         }),
@@ -467,7 +430,7 @@ fn a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one
             .all(|op| op["path"].as_str().unwrap().starts_with("/op/process/")),
         "a folded update is set in place: {folded}"
     );
-    gate.update("s", incarnation, agent_chunk(text("lo")));
+    gate.update("s", agent_chunk(text("lo")));
     gate.commit();
     assert_eq!(
         gate.live("session/s")["op"]["process"]
@@ -478,13 +441,7 @@ fn a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one
     );
 
     gate.registry
-        .complete_prompt(
-            EPOCH,
-            "s",
-            incarnation,
-            "rpc",
-            json!({ "stopReason": "end_turn" }),
-        )
+        .complete_prompt(EPOCH, "s", "rpc", json!({ "stopReason": "end_turn" }))
         .unwrap();
     let events = gate.commit();
     let commit = single(&events, "session/s");
@@ -512,15 +469,14 @@ fn a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one
 #[test]
 fn a_failed_turn_appends_nothing_and_keeps_its_prompt_and_error_on_op() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
-    gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
-    gate.update("s", incarnation, agent_chunk(text("partial")));
+    gate.open("s", json!({ "sessionId": "s" }));
+    gate.prompt("s", "rpc", vec![text("hi")]);
+    gate.update("s", agent_chunk(text("partial")));
     gate.commit();
     gate.registry
         .fail_prompt(
             EPOCH,
             "s",
-            incarnation,
             "rpc",
             json!({ "code": -32603, "message": "boom" }),
         )
@@ -541,23 +497,15 @@ fn a_failed_turn_appends_nothing_and_keeps_its_prompt_and_error_on_op() {
 #[test]
 fn a_requested_cancel_shows_on_the_running_prompt_and_a_cancelled_stop_completes_it() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
-    gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
+    gate.open("s", json!({ "sessionId": "s" }));
+    gate.prompt("s", "rpc", vec![text("hi")]);
     gate.commit();
-    gate.registry
-        .request_cancel(EPOCH, "s", incarnation)
-        .unwrap();
+    gate.registry.request_cancel(EPOCH, "s").unwrap();
     gate.commit();
     assert_eq!(gate.live("session/s")["op"]["cancelRequested"], true);
     assert_eq!(gate.live("session/s")["op"]["status"], "running");
     gate.registry
-        .complete_prompt(
-            EPOCH,
-            "s",
-            incarnation,
-            "rpc",
-            json!({ "stopReason": "cancelled" }),
-        )
+        .complete_prompt(EPOCH, "s", "rpc", json!({ "stopReason": "cancelled" }))
         .unwrap();
     gate.commit();
     let live = gate.live("session/s");
@@ -572,7 +520,7 @@ fn a_requested_cancel_shows_on_the_running_prompt_and_a_cancelled_stop_completes
 #[test]
 fn interactions_and_controls_change_in_live_while_the_log_stays() {
     let mut gate = Gate::new();
-    let incarnation = gate.load("s", &[user(text("hi")), agent_chunk(text("hello"))]);
+    gate.load("s", &[user(text("hi")), agent_chunk(text("hello"))]);
     gate.commit();
     let head = gate.log("session/s").unwrap();
     let request = json!({ "sessionId": "s", "toolCall": { "toolCallId": "t" }, "options": [] });
@@ -599,7 +547,6 @@ fn interactions_and_controls_change_in_live_while_the_log_stays() {
         .update_control_state(
             EPOCH,
             "s",
-            incarnation,
             json!({ "sessionUpdate": "session_info_update", "title": "Renamed" }),
         )
         .unwrap();
@@ -628,8 +575,8 @@ fn interactions_and_controls_change_in_live_while_the_log_stays() {
 #[test]
 fn an_interaction_joins_the_running_prompt() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
-    let op = gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
+    gate.open("s", json!({ "sessionId": "s" }));
+    let op = gate.prompt("s", "rpc", vec![text("hi")]);
     gate.commit();
     gate.registry
         .upsert_permission(EPOCH, "s", "p1", json!({ "sessionId": "s" }))
@@ -639,13 +586,7 @@ fn an_interaction_joins_the_running_prompt() {
     assert_eq!(live["op"]["id"], op);
     assert!(live["op"]["interactions"].get("p1").is_some());
     gate.registry
-        .complete_prompt(
-            EPOCH,
-            "s",
-            incarnation,
-            "rpc",
-            json!({ "stopReason": "end_turn" }),
-        )
+        .complete_prompt(EPOCH, "s", "rpc", json!({ "stopReason": "end_turn" }))
         .unwrap();
     gate.commit();
     assert_eq!(gate.live("session/s")["op"]["interactions"], json!({}));
@@ -657,14 +598,14 @@ fn an_interaction_joins_the_running_prompt() {
 #[test]
 fn attachments_are_readable_while_log_or_live_references_them() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
+    gate.open("s", json!({ "sessionId": "s" }));
     let (sent, said, used) = (image("c2VudA"), image("c2FpZA"), image("dXNlZA"));
     let (sent_id, said_id, used_id) = (
         attachment_id(&sent),
         attachment_id(&said),
         attachment_id(&used),
     );
-    gate.prompt("s", incarnation, "rpc", vec![text("look"), sent.clone()]);
+    gate.prompt("s", "rpc", vec![text("look"), sent.clone()]);
     gate.commit();
     assert_eq!(
         gate.live("session/s")["op"]["input"]["prompt"][1]["type"],
@@ -672,10 +613,9 @@ fn attachments_are_readable_while_log_or_live_references_them() {
     );
     assert_eq!(gate.publisher.attachment("s", &sent_id), Some(sent.clone()));
 
-    gate.update("s", incarnation, agent_chunk(said.clone()));
+    gate.update("s", agent_chunk(said.clone()));
     gate.update(
         "s",
-        incarnation,
         json!({
             "sessionUpdate": "tool_call", "toolCallId": "t", "title": "shot",
             "content": [{ "type": "content", "content": used.clone() }],
@@ -690,13 +630,7 @@ fn attachments_are_readable_while_log_or_live_references_them() {
     assert_eq!(gate.publisher.attachment("s", &used_id), Some(used.clone()));
 
     gate.registry
-        .complete_prompt(
-            EPOCH,
-            "s",
-            incarnation,
-            "rpc",
-            json!({ "stopReason": "end_turn" }),
-        )
+        .complete_prompt(EPOCH, "s", "rpc", json!({ "stopReason": "end_turn" }))
         .unwrap();
     gate.commit();
     assert_eq!(
@@ -720,7 +654,7 @@ fn attachments_are_readable_while_log_or_live_references_them() {
 // ---------------------------------------------------------------------------
 // Acceptance 18: controls (§4.2)
 
-fn controlled(gate: &mut Gate) -> u64 {
+fn controlled(gate: &mut Gate) {
     gate.open(
         "s",
         json!({
@@ -731,13 +665,13 @@ fn controlled(gate: &mut Gate) -> u64 {
             },
             "configOptions": [{ "id": "model", "currentValue": "a" }],
         }),
-    )
+    );
 }
 
 #[test]
 fn a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_ends() {
     let mut gate = Gate::new();
-    let incarnation = controlled(&mut gate);
+    controlled(&mut gate);
     assert_eq!(
         gate.live("session/s")["controls"]["modes"]["currentModeId"],
         "ask"
@@ -751,14 +685,7 @@ fn a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_end
         )
         .unwrap();
     gate.registry
-        .start_operation(
-            EPOCH,
-            "s",
-            incarnation,
-            "rpc",
-            SessionOperationKind::SetMode,
-            "request",
-        )
+        .start_operation(EPOCH, "s", "rpc", SessionOperationKind::SetMode, "request")
         .unwrap();
     gate.commit();
     assert_eq!(gate.live("session/s")["op"]["status"], "running");
@@ -766,7 +693,6 @@ fn a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_end
         .complete_control_operation(
             EPOCH,
             "s",
-            incarnation,
             "rpc",
             SessionOperationKind::SetMode,
             json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
@@ -803,7 +729,7 @@ fn a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_end
 #[test]
 fn a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options() {
     let mut gate = Gate::new();
-    let incarnation = controlled(&mut gate);
+    controlled(&mut gate);
     gate.registry
         .install_operation(
             &Scope::Session("s".into()),
@@ -815,7 +741,6 @@ fn a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options(
         .start_operation(
             EPOCH,
             "s",
-            incarnation,
             "rpc",
             SessionOperationKind::SetConfig,
             "request",
@@ -827,7 +752,6 @@ fn a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options(
         .complete_control_operation(
             EPOCH,
             "s",
-            incarnation,
             "rpc",
             SessionOperationKind::SetConfig,
             json!({ "sessionUpdate": "config_option_update", "configOptions": confirmed }),
@@ -842,7 +766,7 @@ fn a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options(
 #[test]
 fn a_failed_set_mode_changes_no_control() {
     let mut gate = Gate::new();
-    let incarnation = controlled(&mut gate);
+    controlled(&mut gate);
     let before = gate.live("session/s")["controls"].clone();
     gate.registry
         .install_operation(
@@ -852,21 +776,13 @@ fn a_failed_set_mode_changes_no_control() {
         )
         .unwrap();
     gate.registry
-        .start_operation(
-            EPOCH,
-            "s",
-            incarnation,
-            "rpc",
-            SessionOperationKind::SetMode,
-            "request",
-        )
+        .start_operation(EPOCH, "s", "rpc", SessionOperationKind::SetMode, "request")
         .unwrap();
     gate.commit();
     gate.registry
         .fail_operation(
             EPOCH,
             "s",
-            incarnation,
             "rpc",
             SessionOperationKind::SetMode,
             json!({ "message": "refused" }),
@@ -882,23 +798,21 @@ fn a_failed_set_mode_changes_no_control() {
 #[test]
 fn control_updates_fold_after_the_response() {
     let mut gate = Gate::new();
-    let incarnation = controlled(&mut gate);
+    controlled(&mut gate);
     gate.registry
         .update_control_state(
             EPOCH,
             "s",
-            incarnation,
             json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
         )
         .unwrap();
     gate.registry
-        .update_control_state(EPOCH, "s", incarnation, json!({ "sessionUpdate": "usage_update", "used": 1, "size": 9, "cost": { "amount": 1, "currency": "USD" } }))
+        .update_control_state(EPOCH, "s", json!({ "sessionUpdate": "usage_update", "used": 1, "size": 9, "cost": { "amount": 1, "currency": "USD" } }))
         .unwrap();
     gate.registry
         .update_control_state(
             EPOCH,
             "s",
-            incarnation,
             json!({ "sessionUpdate": "usage_update", "used": 2, "size": 9 }),
         )
         .unwrap();
@@ -917,7 +831,7 @@ fn control_updates_fold_after_the_response() {
 #[test]
 fn a_delete_occupies_its_session_and_ends_it_with_deleted() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
+    gate.open("s", json!({ "sessionId": "s" }));
     let op = gate
         .registry
         .install_operation(
@@ -931,9 +845,7 @@ fn a_delete_occupies_its_session_and_ends_it_with_deleted() {
         Err(super::registry::InstallError::NotFree),
         "an occupied session is not free"
     );
-    gate.registry
-        .start_delete(EPOCH, "s", incarnation, "del")
-        .unwrap();
+    gate.registry.start_delete(EPOCH, "s", "del").unwrap();
     gate.commit();
     assert_eq!(gate.live("global")["op"]["id"], op);
     assert_eq!(gate.live("session/s")["op"]["id"], op, "the occupying op");
@@ -941,12 +853,10 @@ fn a_delete_occupies_its_session_and_ends_it_with_deleted() {
     assert_eq!(gate.live("global")["sessions"]["s"]["op"]["kind"], "delete");
 
     gate.registry
-        .delete_close_succeeded(EPOCH, "s", incarnation, "del")
+        .delete_close_succeeded(EPOCH, "s", "del")
         .unwrap();
     gate.commit();
-    gate.registry
-        .complete_delete(EPOCH, "s", incarnation, "del")
-        .unwrap();
+    gate.registry.complete_delete(EPOCH, "s", "del").unwrap();
     let events = gate.commit();
     assert_eq!(
         single(&events, "session/s")["end"],
@@ -961,7 +871,7 @@ fn a_delete_occupies_its_session_and_ends_it_with_deleted() {
 #[test]
 fn a_failed_delete_frees_its_session_and_keeps_its_error_on_global() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
+    gate.open("s", json!({ "sessionId": "s" }));
     let open = gate.live("session/s")["op"]["id"].clone();
     gate.registry
         .install_operation(
@@ -970,15 +880,12 @@ fn a_failed_delete_frees_its_session_and_keeps_its_error_on_global() {
             json!({ "sessionId": "s" }),
         )
         .unwrap();
-    gate.registry
-        .start_delete(EPOCH, "s", incarnation, "del")
-        .unwrap();
+    gate.registry.start_delete(EPOCH, "s", "del").unwrap();
     gate.commit();
     gate.registry
         .fail_operation(
             EPOCH,
             "s",
-            incarnation,
             "del",
             SessionOperationKind::Delete,
             json!({ "message": "busy" }),
@@ -994,8 +901,8 @@ fn a_failed_delete_frees_its_session_and_keeps_its_error_on_global() {
 #[test]
 fn a_running_operation_is_not_replaced() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
-    gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
+    gate.open("s", json!({ "sessionId": "s" }));
+    gate.prompt("s", "rpc", vec![text("hi")]);
     assert_eq!(
         gate.registry.install_operation(
             &Scope::Session("s".into()),
@@ -1027,7 +934,7 @@ fn reloads_with_an_equal_replay_change_no_log_and_a_diverging_one_rebuilds_from_
         agent_chunk(text("2")),
     ];
     let mut gate = Gate::new();
-    let incarnation = gate.load("s", &first);
+    gate.load("s", &first);
     gate.commit();
     let log = gate.log("session/s").unwrap();
     assert_eq!(log.as_array().unwrap().len(), 2);
@@ -1040,7 +947,7 @@ fn reloads_with_an_equal_replay_change_no_log_and_a_diverging_one_rebuilds_from_
         user(text("two")),
         agent_chunk(text("2")),
     ];
-    gate.reload("s", incarnation, &rechunked);
+    gate.reload("s", &rechunked);
     let events = gate.commit();
     assert!(
         single(&events, "session/s").get("log").is_none(),
@@ -1055,7 +962,7 @@ fn reloads_with_an_equal_replay_change_no_log_and_a_diverging_one_rebuilds_from_
         agent_chunk(text("3")),
         user(text("more")),
     ];
-    gate.reload("s", incarnation, &diverged);
+    gate.reload("s", &diverged);
     let events = gate.commit();
     let rebuilt = single(&events, "session/s");
     assert_eq!(rebuilt["log"]["from"], 1);
@@ -1066,7 +973,7 @@ fn reloads_with_an_equal_replay_change_no_log_and_a_diverging_one_rebuilds_from_
 #[test]
 fn terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
+    gate.open("s", json!({ "sessionId": "s" }));
     let chunk = |text: &str| json!({ "output": text, "outputAppend": true, "retainedBytes": 6, "released": false });
     gate.registry
         .upsert_terminal(EPOCH, "s", "t", chunk("abcd"))
@@ -1100,7 +1007,7 @@ fn terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release()
 #[test]
 fn url_flows_appear_on_accept_and_leave_on_completion() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
+    gate.open("s", json!({ "sessionId": "s" }));
     let request = json!({ "mode": "url", "elicitationId": "e", "url": "https://example.test" });
     gate.registry
         .upsert_elicitation(EPOCH, Some("s"), "i1", request.clone())
@@ -1160,7 +1067,7 @@ fn request_scoped_elicitations_run_as_an_agent_request_of_global() {
 #[test]
 fn the_gate_reports_a_transition_that_was_not_committed() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
+    gate.open("s", json!({ "sessionId": "s" }));
     assert!(
         !gate
             .publisher
@@ -1170,7 +1077,6 @@ fn the_gate_reports_a_transition_that_was_not_committed() {
         .update_control_state(
             EPOCH,
             "s",
-            incarnation,
             json!({ "sessionUpdate": "current_mode_update", "currentModeId": "code" }),
         )
         .unwrap();
@@ -1187,17 +1093,11 @@ fn the_gate_reports_a_transition_that_was_not_committed() {
 #[test]
 fn every_event_round_trips_its_documented_wire_shape() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
-    gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
-    gate.update("s", incarnation, agent_chunk(text("hey")));
+    gate.open("s", json!({ "sessionId": "s" }));
+    gate.prompt("s", "rpc", vec![text("hi")]);
+    gate.update("s", agent_chunk(text("hey")));
     gate.registry
-        .complete_prompt(
-            EPOCH,
-            "s",
-            incarnation,
-            "rpc",
-            json!({ "stopReason": "end_turn" }),
-        )
+        .complete_prompt(EPOCH, "s", "rpc", json!({ "stopReason": "end_turn" }))
         .unwrap();
     for event in gate.commit() {
         let mut keys: Vec<_> = event.as_object().unwrap().keys().cloned().collect();
@@ -1219,8 +1119,7 @@ fn every_event_round_trips_its_documented_wire_shape() {
 fn later_identical_mode_notification_overrides_setup_response() {
     let mut gate = Gate::new();
     let update = json!({ "sessionUpdate": "current_mode_update", "currentModeId": "early" });
-    let incarnation = gate
-        .registry
+    gate.registry
         .open_new_with_replay(
             EPOCH,
             "s",
@@ -1241,7 +1140,7 @@ fn later_identical_mode_notification_overrides_setup_response() {
         "response"
     );
     gate.registry
-        .update_control_state(EPOCH, "s", incarnation, update)
+        .update_control_state(EPOCH, "s", update)
         .unwrap();
     let events = gate.commit();
     assert_eq!(
@@ -1261,8 +1160,7 @@ fn later_identical_config_notification_overrides_setup_response() {
     let mut response = early.clone();
     response[0]["currentValue"] = json!("response");
     let update = json!({ "sessionUpdate": "config_option_update", "configOptions": early });
-    let incarnation = gate
-        .registry
+    gate.registry
         .open_new_with_replay(
             EPOCH,
             "s",
@@ -1277,7 +1175,7 @@ fn later_identical_config_notification_overrides_setup_response() {
         "response"
     );
     gate.registry
-        .update_control_state(EPOCH, "s", incarnation, update)
+        .update_control_state(EPOCH, "s", update)
         .unwrap();
     let events = gate.commit();
     assert_eq!(gate.live("session/s")["controls"]["configOptions"], early);
@@ -1287,11 +1185,11 @@ fn later_identical_config_notification_overrides_setup_response() {
 #[test]
 fn streamed_text_publishes_only_the_new_suffix() {
     let mut gate = Gate::new();
-    let incarnation = gate.open("s", json!({ "sessionId": "s" }));
-    gate.prompt("s", incarnation, "rpc", vec![text("hi")]);
-    gate.update("s", incarnation, agent_chunk(text("hel")));
+    gate.open("s", json!({ "sessionId": "s" }));
+    gate.prompt("s", "rpc", vec![text("hi")]);
+    gate.update("s", agent_chunk(text("hel")));
     gate.commit();
-    gate.update("s", incarnation, agent_chunk(text("lo")));
+    gate.update("s", agent_chunk(text("lo")));
     let event = single(&gate.commit(), "session/s");
     assert_eq!(
         event["live"]["patch"],

@@ -210,7 +210,7 @@ impl ReplayCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history_cache::{HistoryCache, SessionKey, fold_history_update};
+    use crate::history_cache::{HistoryCache, fold_history_update};
     use serde_json::json;
 
     #[test]
@@ -241,42 +241,42 @@ mod tests {
     #[test]
     fn invalid_replay_cannot_publish_a_valid_prefix() {
         let mut cache = HistoryCache::default();
-        let key = SessionKey::new("s", 1);
-        cache.begin_candidate(key.clone(), "load").unwrap();
-        let replay = cache.candidate(&key, "load").unwrap();
+        let key = "s";
+        cache.begin_candidate(key, "load").unwrap();
+        let replay = cache.candidate(key, "load").unwrap();
         replay.ingest(json!({"sessionUpdate":"tool_call","toolCallId":"tool","title":"Run","status":"completed"}), true).unwrap();
         assert!(replay.ingest(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"image","data":"AA==","mimeType":"text/html"}}), true).is_err());
         replay.seal();
         assert!(matches!(
-            cache.commit_candidate(&key, "load"),
+            cache.commit_candidate(key, "load"),
             Err(HistoryCacheError::InvalidReplay)
         ));
-        cache.abort_candidate(&key, "load").unwrap();
+        cache.abort_candidate(key, "load").unwrap();
         assert_eq!(replay.retained(), 0);
     }
 
     #[test]
     fn retired_candidate_cannot_contaminate_replacement_load() {
         let mut cache = HistoryCache::default();
-        let key = SessionKey::new("s", 1);
-        cache.begin_candidate(key.clone(), "old").unwrap();
-        let old = cache.candidate(&key, "old").unwrap();
+        let key = "s";
+        cache.begin_candidate(key, "old").unwrap();
+        let old = cache.candidate(key, "old").unwrap();
         old.append(json!({"message":"old"})).unwrap();
         old.discard();
         assert!(matches!(
-            cache.commit_candidate(&key, "old"),
+            cache.commit_candidate(key, "old"),
             Err(HistoryCacheError::InvalidReplay)
         ));
-        cache.remove(&key);
+        cache.remove(key);
         assert_eq!(old.retained(), 0);
-        cache.begin_candidate(key.clone(), "new").unwrap();
+        cache.begin_candidate(key, "new").unwrap();
         assert!(old.append(json!({"message":"late"})).is_err());
         old.ingest(
             json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late"}}),
             true,
         )
         .unwrap();
-        assert!(cache.commit_candidate(&key, "new").unwrap().is_empty());
+        assert!(cache.commit_candidate(key, "new").unwrap().is_empty());
     }
 
     #[test]

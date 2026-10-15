@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::history_cache::{HistoryCacheError, SessionKey};
+use crate::history_cache::HistoryCacheError;
 
 use crate::protocol::canon::TurnLog;
 use crate::protocol::registry::SessionLog;
@@ -16,30 +16,20 @@ pub(crate) use crate::session_state::{
 };
 
 impl SessionRegistry {
-    pub(crate) fn register_cold(&mut self, session_id: impl Into<String>, incarnation: u64) {
-        self.register_history(session_id.into(), incarnation, false);
+    pub(crate) fn register_cold(&mut self, session_id: impl Into<String>) {
+        self.register_history(session_id.into(), false);
     }
 
-    pub(crate) fn register_new(&mut self, session_id: impl Into<String>, incarnation: u64) {
-        self.register_history(session_id.into(), incarnation, true);
+    pub(crate) fn register_new(&mut self, session_id: impl Into<String>) {
+        self.register_history(session_id.into(), true);
     }
 
-    fn register_history(&mut self, session_id: String, incarnation: u64, ready: bool) {
-        self.next_incarnation = self.next_incarnation.max(incarnation);
-        if let Some(previous) = self
-            .sessions
-            .get(&session_id)
-            .map(|entry| entry.state.incarnation)
-        {
-            self.clear_history_for_replacement(&session_id, previous);
-            if previous != incarnation {
-                self.retire_entry(&session_id, previous);
-            }
-        }
+    fn register_history(&mut self, session_id: String, ready: bool) {
+        self.clear_history_for_replacement(&session_id);
         let mut state = if ready {
-            MirrorSessionState::ready(session_id.clone(), incarnation)
+            MirrorSessionState::ready(session_id.clone())
         } else {
-            MirrorSessionState::cold(session_id.clone(), incarnation)
+            MirrorSessionState::cold(session_id.clone())
         };
         if let Some(entry) = self.sessions.get_mut(&session_id) {
             state.live = entry.state.live.take();
@@ -53,11 +43,10 @@ impl SessionRegistry {
     pub(crate) fn begin_load(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: impl Into<String>,
     ) -> Result<(), MirrorError> {
         let attempt_id = attempt_id.into();
-        let session = self.require_state_mut(session_id, incarnation)?;
+        let session = self.require_state_mut(session_id)?;
         if !matches!(
             session.phase,
             MirrorPhase::Cold
@@ -77,8 +66,8 @@ impl SessionRegistry {
         {
             return Err(MirrorError::WrongPhase);
         }
-        let key = SessionKey::new(session_id, incarnation);
-        self.history.begin_candidate(key, attempt_id.clone())?;
+        self.history
+            .begin_candidate(session_id, attempt_id.clone())?;
         let entry = self
             .sessions
             .get_mut(session_id)
@@ -106,46 +95,35 @@ impl SessionRegistry {
     pub(crate) fn load_candidate(
         &self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: &str,
     ) -> Result<crate::history_replay::ReplayCandidate, MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
+        let session = self.require_state(session_id)?;
         if session.load_attempt.as_deref() != Some(attempt_id) {
             return Err(MirrorError::OperationMismatch);
         }
-        Ok(self
-            .history
-            .candidate(&SessionKey::new(session_id, incarnation), attempt_id)?)
+        Ok(self.history.candidate(session_id, attempt_id)?)
     }
 
     pub(crate) fn append_load_update(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: &str,
         update: Value,
     ) -> Result<(), MirrorError> {
-        self.require_load(session_id, incarnation, attempt_id)?;
-        self.history.append_candidate(
-            &SessionKey::new(session_id, incarnation),
-            attempt_id,
-            update,
-        )?;
+        self.require_load(session_id, attempt_id)?;
+        self.history
+            .append_candidate(session_id, attempt_id, update)?;
         Ok(())
     }
 
     pub(crate) fn invalidate_load(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
-        self.require_load(session_id, incarnation, attempt_id)?;
-        self.history.poison_candidate(
-            &SessionKey::new(session_id, incarnation),
-            attempt_id,
-            HistoryCacheError::InvalidReplay,
-        )?;
+        self.require_load(session_id, attempt_id)?;
+        self.history
+            .poison_candidate(session_id, attempt_id, HistoryCacheError::InvalidReplay)?;
         Ok(())
     }
 
@@ -153,10 +131,9 @@ impl SessionRegistry {
     pub(crate) fn commit_load(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
-        let replay = self.commit_history(session_id, incarnation, attempt_id)?;
+        let replay = self.commit_history(session_id, attempt_id)?;
         self.replace_session_log(session_id, &replay);
         Ok(())
     }
@@ -165,15 +142,11 @@ impl SessionRegistry {
     fn commit_history(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: &str,
     ) -> Result<Vec<Value>, MirrorError> {
-        self.require_load(session_id, incarnation, attempt_id)?;
-        let replay = self
-            .history
-            .commit_candidate(&SessionKey::new(session_id, incarnation), attempt_id)?;
-        self.require_state_mut(session_id, incarnation)?
-            .history_settled();
+        self.require_load(session_id, attempt_id)?;
+        let replay = self.history.commit_candidate(session_id, attempt_id)?;
+        self.require_state_mut(session_id)?.history_settled();
         Ok(replay)
     }
 
@@ -182,12 +155,11 @@ impl SessionRegistry {
     pub(crate) fn commit_attachment_cache(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
-        let replay = self.commit_history(session_id, incarnation, attempt_id)?;
+        let replay = self.commit_history(session_id, attempt_id)?;
         self.adopt_session_log(session_id, &replay);
-        self.require_state_mut(session_id, incarnation)?.phase = MirrorPhase::Cold;
+        self.require_state_mut(session_id)?.phase = MirrorPhase::Cold;
         Ok(())
     }
 
@@ -196,10 +168,9 @@ impl SessionRegistry {
     pub(crate) fn use_cached_history(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         log: Option<Arc<TurnLog>>,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state_mut(session_id, incarnation)?;
+        let session = self.require_state_mut(session_id)?;
         if session.active_turn.is_some() || session.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);
         }
@@ -213,18 +184,16 @@ impl SessionRegistry {
     pub(crate) fn fail_load(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         attempt_id: &str,
         message: impl Into<String>,
         retryable: bool,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
+        let session = self.require_state(session_id)?;
         if session.load_attempt.as_deref() != Some(attempt_id) {
             return Err(MirrorError::OperationMismatch);
         }
-        let key = SessionKey::new(session_id, incarnation);
-        self.history.abort_candidate(&key, attempt_id)?;
-        let session = self.require_state_mut(session_id, incarnation)?;
+        self.history.abort_candidate(session_id, attempt_id)?;
+        let session = self.require_state_mut(session_id)?;
         let origin = session.load_origin.take();
         session.load_attempt = None;
         session.sync_error = Some(message.into());
@@ -245,14 +214,16 @@ impl SessionRegistry {
     pub(crate) fn start_turn(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         client_intent_id: &str,
         prompt: Vec<Value>,
     ) -> Result<String, MirrorError> {
         let next_operation = self.next_operation.wrapping_add(1).max(1);
         let operation_id = format!("{}:{}", self.epoch, next_operation);
-        self.require_state_mut(session_id, incarnation)?
-            .admit_turn(operation_id.clone(), client_intent_id, prompt)?;
+        self.require_state_mut(session_id)?.admit_turn(
+            operation_id.clone(),
+            client_intent_id,
+            prompt,
+        )?;
         self.next_operation = next_operation;
         Ok(operation_id)
     }
@@ -260,11 +231,10 @@ impl SessionRegistry {
     pub(crate) fn append_turn_update(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         update: Value,
     ) -> Result<(), MirrorError> {
-        self.require_state_mut(session_id, incarnation)?
+        self.require_state_mut(session_id)?
             .append_turn_update(operation_id, update)
     }
 
@@ -274,10 +244,9 @@ impl SessionRegistry {
     pub(crate) fn append_session_update(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         update: Value,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state_mut(session_id, incarnation)?;
+        let session = self.require_state_mut(session_id)?;
         if session.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);
         }
@@ -291,11 +260,10 @@ impl SessionRegistry {
     pub(crate) fn complete_turn(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         terminal: Value,
     ) -> Result<(), MirrorError> {
-        self.require_state_mut(session_id, incarnation)?
+        self.require_state_mut(session_id)?
             .complete_turn(operation_id, terminal)
     }
 
@@ -303,10 +271,9 @@ impl SessionRegistry {
     pub(crate) fn commit_completed_turn(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state_mut(session_id, incarnation)?;
+        let session = self.require_state_mut(session_id)?;
         if session.phase != MirrorPhase::Reconciling {
             return Err(MirrorError::WrongPhase);
         }
@@ -332,47 +299,43 @@ impl SessionRegistry {
     pub(crate) fn can_begin(
         &self,
         session_id: &str,
-        incarnation: u64,
         admission: SessionAdmission,
     ) -> Result<(), MirrorError> {
-        self.require_state(session_id, incarnation)?
-            .can_begin(admission)
+        self.require_state(session_id)?.can_begin(admission)
     }
 
     pub(crate) fn begin_exclusive(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         kind: SessionOperationKind,
         operation_id: impl Into<String>,
     ) -> Result<(), MirrorError> {
         let operation_id = operation_id.into();
-        self.require_state(session_id, incarnation)?;
+        self.require_state(session_id)?;
         if self.operation_in_use(&operation_id) {
             return Err(MirrorError::OperationMismatch);
         }
-        self.require_state_mut(session_id, incarnation)?
+        self.require_state_mut(session_id)?
             .begin_exclusive(kind, operation_id)
     }
 
     pub(crate) fn settle_exclusive(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         kind: SessionAdmission,
         operation_id: &str,
     ) -> Result<(), MirrorError> {
-        self.require_state_mut(session_id, incarnation)?
+        self.require_state_mut(session_id)?
             .settle_exclusive(kind, operation_id)
     }
 
-    pub(crate) fn load_attempt(&self, session_id: &str, incarnation: u64) -> Option<&str> {
-        let session = self.require_state(session_id, incarnation).ok()?;
+    pub(crate) fn load_attempt(&self, session_id: &str) -> Option<&str> {
+        let session = self.require_state(session_id).ok()?;
         session.load_attempt.as_deref()
     }
 
-    pub(crate) fn active_operation_id(&self, session_id: &str, incarnation: u64) -> Option<&str> {
-        let session = self.require_state(session_id, incarnation).ok()?;
+    pub(crate) fn active_operation_id(&self, session_id: &str) -> Option<&str> {
+        let session = self.require_state(session_id).ok()?;
         session
             .active_turn
             .as_ref()
@@ -383,66 +346,54 @@ impl SessionRegistry {
     pub(crate) fn abort_turn(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
     ) -> Result<(), MirrorError> {
-        self.require_state_mut(session_id, incarnation)?
-            .abort_turn(operation_id)
+        self.require_state_mut(session_id)?.abort_turn(operation_id)
     }
 
     pub(crate) fn block_turn(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         message: impl Into<String>,
     ) -> Result<(), MirrorError> {
-        self.require_state_mut(session_id, incarnation)?
+        self.require_state_mut(session_id)?
             .block_turn(operation_id, message)
     }
 
-    pub(crate) fn remove(&mut self, session_id: &str, incarnation: u64) {
-        self.clear_history_for_replacement(session_id, incarnation);
+    pub(crate) fn remove(&mut self, session_id: &str) {
+        self.clear_history_for_replacement(session_id);
         if self.sessions.get(session_id).is_some_and(|entry| {
             let session = &entry.state;
-            session.incarnation == incarnation
-                && session.live.is_none()
+            session.live.is_none()
                 && session.operation.is_none()
                 && entry.resources.materialization.is_none()
         }) {
-            self.retire_entry(session_id, incarnation);
+            self.retire_entry(session_id);
         }
     }
 
-    /// Releases this incarnation's log, load candidate and turn. Live
-    /// lifecycle and the operation owner remain available until their own
-    /// transition completes; a stale cleanup cannot touch a new incarnation.
-    /// Runtime replacement calls this before installing its entry.
-    pub(crate) fn clear_history_for_replacement(&mut self, session_id: &str, incarnation: u64) {
+    /// Releases the session's log, load candidate and turn. Live lifecycle
+    /// and the operation owner remain available until their own transition
+    /// completes. Runtime replacement calls this before installing its entry.
+    pub(crate) fn clear_history_for_replacement(&mut self, session_id: &str) {
         let Some(session) = self
             .sessions
             .get_mut(session_id)
             .map(|entry| &mut entry.state)
-            .filter(|session| session.incarnation == incarnation)
         else {
             return;
         };
-        let mut cleared = MirrorSessionState::cold(session_id, incarnation);
+        let mut cleared = MirrorSessionState::cold(session_id);
         cleared.live = session.live.take();
         cleared.operation = session.operation.take();
         *session = cleared;
-        self.history
-            .remove(&SessionKey::new(session_id, incarnation));
+        self.history.remove(session_id);
     }
 
     /// The session's load `attempt_id` is in flight.
-    fn require_load(
-        &self,
-        session_id: &str,
-        incarnation: u64,
-        attempt_id: &str,
-    ) -> Result<(), MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
+    fn require_load(&self, session_id: &str, attempt_id: &str) -> Result<(), MirrorError> {
+        let session = self.require_state(session_id)?;
         if session.load_attempt.as_deref() != Some(attempt_id)
             || !matches!(
                 session.phase,
@@ -454,36 +405,21 @@ impl SessionRegistry {
         Ok(())
     }
 
-    fn require_state(
-        &self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<&MirrorSessionState, MirrorError> {
-        let session = self
-            .sessions
+    fn require_state(&self, session_id: &str) -> Result<&MirrorSessionState, MirrorError> {
+        self.sessions
             .get(session_id)
             .map(|entry| &entry.state)
-            .ok_or(MirrorError::UnknownSession)?;
-        if session.incarnation != incarnation {
-            return Err(MirrorError::StaleIncarnation);
-        }
-        Ok(session)
+            .ok_or(MirrorError::UnknownSession)
     }
 
     fn require_state_mut(
         &mut self,
         session_id: &str,
-        incarnation: u64,
     ) -> Result<&mut MirrorSessionState, MirrorError> {
-        let session = self
-            .sessions
+        self.sessions
             .get_mut(session_id)
             .map(|entry| &mut entry.state)
-            .ok_or(MirrorError::UnknownSession)?;
-        if session.incarnation != incarnation {
-            return Err(MirrorError::StaleIncarnation);
-        }
-        Ok(session)
+            .ok_or(MirrorError::UnknownSession)
     }
 }
 
@@ -496,8 +432,8 @@ mod tests {
     #[test]
     fn history_registration_preserves_the_live_attachment_and_its_owner() {
         let mut registry = mirror();
-        registry.register_cold("known", 40);
-        let incarnation = registry
+        registry.register_cold("known");
+        registry
             .start_attachment(
                 "epoch",
                 "session",
@@ -506,21 +442,20 @@ mod tests {
                 SessionOperationKind::Load,
             )
             .unwrap();
-        assert_eq!(incarnation, 41);
         let live = registry.session("session").unwrap().clone();
 
         for ready in [false, true] {
             if ready {
-                registry.register_new("session", incarnation);
+                registry.register_new("session");
             } else {
-                registry.register_cold("session", incarnation);
+                registry.register_cold("session");
             }
             assert_eq!(registry.session("session"), Some(live.clone()));
             let state = registry.state("session").unwrap();
             assert_eq!(state.live.as_ref().unwrap().lifecycle, live.lifecycle);
             assert_eq!(state.operation.as_ref().unwrap().operation_id, "load");
             assert_eq!(
-                registry.can_begin("session", incarnation, SessionAdmission::Prompt),
+                registry.can_begin("session", SessionAdmission::Prompt),
                 Err(MirrorError::WrongPhase)
             );
         }
@@ -531,7 +466,7 @@ mod tests {
     #[test]
     fn history_removal_preserves_live_state_and_the_cleanup_owner() {
         let mut registry = mirror();
-        let incarnation = registry
+        registry
             .open_new_with_replay(
                 "epoch",
                 "session",
@@ -540,15 +475,14 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        registry.register_new("session", incarnation);
+        registry.register_new("session");
         registry
-            .begin_exclusive("session", incarnation, SessionOperationKind::Close, "close")
+            .begin_exclusive("session", SessionOperationKind::Close, "close")
             .unwrap();
         registry
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
@@ -556,14 +490,12 @@ mod tests {
             .unwrap();
         let live = registry.session("session").unwrap().clone();
 
-        registry.remove("session", incarnation);
+        registry.remove("session");
 
         assert_eq!(registry.session("session"), Some(live.clone()));
         assert_eq!(registry.state("session").unwrap().log, SessionLog::Unknown);
-        registry
-            .close_session("epoch", "session", incarnation, "close")
-            .unwrap();
-        registry.remove("session", incarnation);
+        registry.close_session("epoch", "session", "close").unwrap();
+        registry.remove("session");
         assert!(registry.session("session").is_none());
         assert_eq!(
             registry
@@ -577,9 +509,9 @@ mod tests {
         );
 
         registry
-            .finish_session_cleanup("session", incarnation, SessionAdmission::Close, "close")
+            .finish_session_cleanup("session", SessionAdmission::Close, "close")
             .unwrap();
-        registry.remove("session", incarnation);
+        registry.remove("session");
         assert!(registry.state("session").is_none());
         assert!(registry.live_snapshot().sessions.is_empty());
     }
@@ -587,18 +519,17 @@ mod tests {
     #[test]
     fn history_replacement_releases_the_turn_and_load_without_retiring_the_live_owner() {
         let mut registry = mirror();
-        let incarnation = registry
+        registry
             .open_new_with_replay("epoch", "session", "/workspace", json!({}), vec![])
             .unwrap();
-        registry.register_new("session", incarnation);
+        registry.register_new("session");
         let operation_id = registry
-            .start_turn("session", incarnation, "intent", text_prompt("next"))
+            .start_turn("session", "intent", text_prompt("next"))
             .unwrap();
         registry
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 "intent",
                 json!({ "stopReason": "end_turn" }),
             )
@@ -606,56 +537,46 @@ mod tests {
         registry
             .complete_turn(
                 "session",
-                incarnation,
                 &operation_id,
                 json!({ "stopReason": "end_turn" }),
             )
             .unwrap();
+        registry.begin_load("session", "candidate").unwrap();
         registry
-            .begin_load("session", incarnation, "candidate")
-            .unwrap();
-        registry
-            .append_load_update(
-                "session",
-                incarnation,
-                "candidate",
-                user_update("candidate payload"),
-            )
+            .append_load_update("session", "candidate", user_update("candidate payload"))
             .unwrap();
         assert_eq!(registry.history.candidates(), 1);
 
         let live = registry.live("session").unwrap().clone();
-        registry.clear_history_for_replacement("session", incarnation);
+        registry.clear_history_for_replacement("session");
 
         assert_eq!(registry.history.candidates(), 0);
         let state = registry.state("session").unwrap();
-        assert_eq!(state.incarnation, incarnation);
         assert_eq!(registry.live("session"), Some(&live));
         assert!(state.active_turn.is_none());
         assert!(state.load_attempt.is_none());
         assert!(state.load_origin.is_none());
         assert_eq!(state.log, SessionLog::Unknown);
-        registry.clear_history_for_replacement("session", incarnation + 1);
+        registry.clear_history_for_replacement("session");
         assert_eq!(registry.live("session"), Some(&live));
     }
 
     #[test]
-    fn session_updates_preserve_reconciling_load_and_incarnation_boundaries() {
+    fn session_updates_preserve_reconciling_load_boundaries() {
         let mut mirror = mirror();
-        mirror.register_new("session", 1);
+        mirror.register_new("session");
         let operation_id = mirror
-            .start_turn("session", 1, "intent", text_prompt("Run"))
+            .start_turn("session", "intent", text_prompt("Run"))
             .unwrap();
-        mirror.append_turn_update("session", 1, &operation_id, json!({ "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run", "status": "in_progress" })).unwrap();
+        mirror.append_turn_update("session", &operation_id, json!({ "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run", "status": "in_progress" })).unwrap();
         mirror
             .complete_turn(
                 "session",
-                1,
                 &operation_id,
                 json!({ "stopReason": "cancelled" }),
             )
             .unwrap();
-        mirror.append_session_update("session", 1, json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed" })).unwrap();
+        mirror.append_session_update("session", json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed" })).unwrap();
         let turn = mirror
             .state("session")
             .unwrap()
@@ -665,17 +586,13 @@ mod tests {
         assert_eq!(turn.terminal, Some(json!({ "stopReason": "cancelled" })));
         assert_eq!(turn.updates[0]["status"], "completed");
         mirror
-            .commit_completed_turn("session", 1, &operation_id)
+            .commit_completed_turn("session", &operation_id)
             .unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
-        mirror.begin_load("session", 1, "load").unwrap();
+        mirror.begin_load("session", "load").unwrap();
         assert_eq!(
-            mirror.append_session_update("session", 1, json!({})),
+            mirror.append_session_update("session", json!({})),
             Err(MirrorError::WrongPhase)
-        );
-        assert_eq!(
-            mirror.append_session_update("session", 2, json!({})),
-            Err(MirrorError::StaleIncarnation)
         );
     }
 
@@ -683,25 +600,20 @@ mod tests {
         SessionMirror::new("epoch")
     }
 
-    fn load_initial(mirror: &mut SessionMirror, session_id: &str, incarnation: u64) {
-        mirror.register_cold(session_id, incarnation);
+    fn load_initial(mirror: &mut SessionMirror, session_id: &str) {
+        mirror.register_cold(session_id);
+        mirror.begin_load(session_id, "initial").unwrap();
         mirror
-            .begin_load(session_id, incarnation, "initial")
-            .unwrap();
-        mirror
-            .append_load_update(session_id, incarnation, "initial", user_update("old"))
+            .append_load_update(session_id, "initial", user_update("old"))
             .unwrap();
         mirror
             .append_load_update(
                 session_id,
-                incarnation,
                 "initial",
                 json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "old reply" } }),
             )
             .unwrap();
-        mirror
-            .commit_load(session_id, incarnation, "initial")
-            .unwrap();
+        mirror.commit_load(session_id, "initial").unwrap();
     }
 
     fn log(mirror: &SessionMirror) -> SessionLog {
@@ -722,7 +634,7 @@ mod tests {
     #[test]
     fn a_load_rebuilds_the_log_from_its_replay() {
         let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
+        load_initial(&mut mirror, "session");
         let SessionLog::Known(known) = log(&mirror) else {
             panic!("a committed load knows the log");
         };
@@ -734,25 +646,19 @@ mod tests {
     #[test]
     fn prompt_terminal_retains_the_turn_until_its_commit() {
         let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
+        load_initial(&mut mirror, "session");
         let operation = mirror
-            .start_turn("session", 1, "intent", text_prompt("next"))
+            .start_turn("session", "intent", text_prompt("next"))
             .unwrap();
         mirror
             .append_turn_update(
                 "session",
-                1,
                 &operation,
                 json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "answer" } }),
             )
             .unwrap();
         mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
+            .complete_turn("session", &operation, json!({ "stopReason": "end_turn" }))
             .unwrap();
 
         let state = mirror.state("session").unwrap();
@@ -763,17 +669,15 @@ mod tests {
             Some(json!({ "stopReason": "end_turn" }))
         );
         assert_eq!(
-            mirror.commit_completed_turn("session", 1, "stale-operation"),
+            mirror.commit_completed_turn("session", "stale-operation"),
             Err(MirrorError::OperationMismatch)
         );
-        mirror
-            .commit_completed_turn("session", 1, &operation)
-            .unwrap();
+        mirror.commit_completed_turn("session", &operation).unwrap();
         let state = mirror.state("session").unwrap();
         assert_eq!(state.phase, MirrorPhase::Ready);
         assert!(state.active_turn.is_none());
         assert_eq!(
-            mirror.can_begin("session", 1, SessionAdmission::Prompt),
+            mirror.can_begin("session", SessionAdmission::Prompt),
             Ok(())
         );
     }
@@ -781,22 +685,20 @@ mod tests {
     #[test]
     fn resumed_cache_does_not_enable_commands_between_automatic_load_attempts() {
         let mut mirror = mirror();
-        mirror.register_cold("session", 1);
-        mirror.begin_load("session", 1, "resume").unwrap();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "resume").unwrap();
         mirror
-            .append_load_update("session", 1, "resume", user_update("cached"))
+            .append_load_update("session", "resume", user_update("cached"))
             .unwrap();
-        mirror
-            .commit_attachment_cache("session", 1, "resume")
-            .unwrap();
+        mirror.commit_attachment_cache("session", "resume").unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Cold);
         let cached = log(&mirror);
         assert!(matches!(cached, SessionLog::Known(_)));
 
         for attempt in ["automatic-first", "automatic-retry"] {
-            mirror.begin_load("session", 1, attempt).unwrap();
+            mirror.begin_load("session", attempt).unwrap();
             mirror
-                .fail_load("session", 1, attempt, "temporary", true)
+                .fail_load("session", attempt, "temporary", true)
                 .unwrap();
             assert_eq!(log(&mirror), cached);
             assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Loading);
@@ -808,20 +710,18 @@ mod tests {
                 SessionAdmission::Attachment,
             ] {
                 assert_eq!(
-                    mirror.can_begin("session", 1, admission),
+                    mirror.can_begin("session", admission),
                     Err(MirrorError::WrongPhase)
                 );
             }
         }
-        mirror.begin_load("session", 1, "successful-retry").unwrap();
+        mirror.begin_load("session", "successful-retry").unwrap();
         mirror
-            .append_load_update("session", 1, "successful-retry", user_update("complete"))
+            .append_load_update("session", "successful-retry", user_update("complete"))
             .unwrap();
-        mirror
-            .commit_load("session", 1, "successful-retry")
-            .unwrap();
+        mirror.commit_load("session", "successful-retry").unwrap();
         assert_eq!(
-            mirror.can_begin("session", 1, SessionAdmission::Prompt),
+            mirror.can_begin("session", SessionAdmission::Prompt),
             Ok(())
         );
     }
@@ -829,19 +729,19 @@ mod tests {
     #[test]
     fn cached_history_keeps_a_known_log_and_installs_one_only_when_unknown() {
         let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
+        load_initial(&mut mirror, "session");
         let known = log(&mirror);
         mirror
-            .use_cached_history("session", 1, Some(Arc::new(TurnLog::default())))
+            .use_cached_history("session", Some(Arc::new(TurnLog::default())))
             .unwrap();
         assert_eq!(log(&mirror), known);
 
-        mirror.register_cold("fork", 2);
+        mirror.register_cold("fork");
         let SessionLog::Known(source) = known else {
             unreachable!()
         };
         mirror
-            .use_cached_history("fork", 2, Some(source.clone()))
+            .use_cached_history("fork", Some(source.clone()))
             .unwrap();
         let fork = mirror.state("fork").unwrap();
         assert_eq!(fork.phase, MirrorPhase::Ready);
@@ -852,34 +752,34 @@ mod tests {
     fn failed_explicit_load_restores_its_admission_phase() {
         for origin in [MirrorPhase::Ready, MirrorPhase::Blocked] {
             let mut mirror = mirror();
-            load_initial(&mut mirror, "session", 1);
+            load_initial(&mut mirror, "session");
             let old = log(&mirror);
             if origin == MirrorPhase::Blocked {
-                mirror.begin_load("session", 1, "fatal").unwrap();
+                mirror.begin_load("session", "fatal").unwrap();
                 mirror
-                    .fail_load("session", 1, "fatal", "unrecoverable", false)
+                    .fail_load("session", "fatal", "unrecoverable", false)
                     .unwrap();
             }
             mirror
-                .begin_exclusive("session", 1, SessionOperationKind::Load, "explicit")
+                .begin_exclusive("session", SessionOperationKind::Load, "explicit")
                 .unwrap();
-            mirror.begin_load("session", 1, "explicit").unwrap();
+            mirror.begin_load("session", "explicit").unwrap();
             mirror
-                .append_load_update("session", 1, "explicit", user_update("partial"))
+                .append_load_update("session", "explicit", user_update("partial"))
                 .unwrap();
             mirror
-                .fail_load("session", 1, "explicit", "temporary", true)
+                .fail_load("session", "explicit", "temporary", true)
                 .unwrap();
             assert_eq!(mirror.state("session").unwrap().phase, origin);
             assert_eq!(
-                mirror.can_begin("session", 1, SessionAdmission::Attachment),
+                mirror.can_begin("session", SessionAdmission::Attachment),
                 Err(MirrorError::WrongPhase)
             );
             mirror
-                .settle_exclusive("session", 1, SessionAdmission::Attachment, "explicit")
+                .settle_exclusive("session", SessionAdmission::Attachment, "explicit")
                 .unwrap();
             assert_eq!(
-                mirror.can_begin("session", 1, SessionAdmission::Attachment),
+                mirror.can_begin("session", SessionAdmission::Attachment),
                 Ok(())
             );
             assert_eq!(log(&mirror), old, "a failed load leaves the known log");
@@ -894,13 +794,13 @@ mod tests {
     #[test]
     fn a_second_turn_while_running_is_rejected() {
         let mut mirror = mirror();
-        mirror.register_new("session", 1);
+        mirror.register_new("session");
         mirror
-            .start_turn("session", 1, "first", vec![json!("one")])
+            .start_turn("session", "first", vec![json!("one")])
             .unwrap();
 
         assert_eq!(
-            mirror.start_turn("session", 1, "second", vec![json!("two")]),
+            mirror.start_turn("session", "second", vec![json!("two")]),
             Err(MirrorError::WrongPhase)
         );
     }
@@ -908,21 +808,21 @@ mod tests {
     #[test]
     fn retryable_initial_load_can_start_a_new_single_flight_attempt() {
         let mut mirror = mirror();
-        mirror.register_cold("session", 1);
-        mirror.begin_load("session", 1, "first").unwrap();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "first").unwrap();
         mirror
-            .append_load_update("session", 1, "first", user_update("partial"))
+            .append_load_update("session", "first", user_update("partial"))
             .unwrap();
         mirror
-            .fail_load("session", 1, "first", "temporary", true)
+            .fail_load("session", "first", "temporary", true)
             .unwrap();
         assert_eq!(log(&mirror), SessionLog::Unknown);
 
-        mirror.begin_load("session", 1, "second").unwrap();
+        mirror.begin_load("session", "second").unwrap();
         mirror
-            .append_load_update("session", 1, "second", user_update("complete"))
+            .append_load_update("session", "second", user_update("complete"))
             .unwrap();
-        mirror.commit_load("session", 1, "second").unwrap();
+        mirror.commit_load("session", "second").unwrap();
 
         let SessionLog::Known(known) = log(&mirror) else {
             panic!("a committed load knows the log");
@@ -940,24 +840,24 @@ mod tests {
     #[test]
     fn invalidated_load_attempt_cannot_commit_a_truncated_replay() {
         let mut mirror = mirror();
-        mirror.register_cold("session", 1);
-        mirror.begin_load("session", 1, "invalid").unwrap();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "invalid").unwrap();
         mirror
-            .append_load_update("session", 1, "invalid", user_update("retained"))
+            .append_load_update("session", "invalid", user_update("retained"))
             .unwrap();
-        mirror.invalidate_load("session", 1, "invalid").unwrap();
+        mirror.invalidate_load("session", "invalid").unwrap();
 
         assert!(matches!(
-            mirror.append_load_update("session", 1, "invalid", user_update("ignored")),
+            mirror.append_load_update("session", "invalid", user_update("ignored")),
             Err(MirrorError::History(HistoryCacheError::InvalidReplay))
         ));
         assert!(matches!(
-            mirror.commit_load("session", 1, "invalid"),
+            mirror.commit_load("session", "invalid"),
             Err(MirrorError::History(HistoryCacheError::InvalidReplay))
         ));
         assert_eq!(log(&mirror), SessionLog::Unknown);
         mirror
-            .fail_load("session", 1, "invalid", "invalid replay", false)
+            .fail_load("session", "invalid", "invalid replay", false)
             .unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Blocked);
         assert_eq!(log(&mirror), SessionLog::Unknown);
@@ -966,14 +866,13 @@ mod tests {
     #[test]
     fn a_large_valid_turn_is_kept_whole() {
         let mut mirror = mirror();
-        mirror.register_new("session", 1);
+        mirror.register_new("session");
         let operation = mirror
-            .start_turn("session", 1, "intent", text_prompt("prompt"))
+            .start_turn("session", "intent", text_prompt("prompt"))
             .unwrap();
         mirror
             .append_turn_update(
                 "session",
-                1,
                 &operation,
                 json!({
                     "sessionUpdate": "agent_message_chunk",
@@ -993,20 +892,7 @@ mod tests {
             1
         );
 
-        mirror.abort_turn("session", 1, &operation).unwrap();
+        mirror.abort_turn("session", &operation).unwrap();
         assert!(mirror.state("session").unwrap().active_turn.is_none());
-    }
-
-    #[test]
-    fn stale_incarnation_removal_cannot_drop_the_current_session() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 2);
-
-        mirror.remove("session", 1);
-
-        let state = mirror.state("session").unwrap();
-        assert_eq!(state.incarnation, 2);
-        assert_eq!(state.phase, MirrorPhase::Ready);
-        assert_eq!(state.log, SessionLog::empty());
     }
 }

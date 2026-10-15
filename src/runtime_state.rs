@@ -23,7 +23,6 @@ pub(crate) use crate::session_registry::SessionRegistry as RuntimeState;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionRuntime {
     pub session_id: String,
-    pub incarnation: u64,
     pub cwd: String,
     pub controls: SessionControls,
     pub lifecycle: SessionLifecycle,
@@ -212,7 +211,6 @@ pub(crate) enum RuntimeEffect {
 pub(crate) enum RuntimeStateError {
     EpochMismatch,
     UnknownSession,
-    StaleIncarnation,
     BusySession,
     NoActiveTurn,
     OperationMismatch,
@@ -242,7 +240,6 @@ impl SessionRegistry {
         }
         Some(SessionRuntime {
             session_id: state.session_id.clone(),
-            incarnation: state.incarnation,
             cwd: live.cwd.to_string_lossy().into_owned(),
             controls: live.controls.clone(),
             lifecycle: live.lifecycle.clone(),
@@ -279,15 +276,15 @@ impl SessionRegistry {
     pub(crate) fn seed_waiting(
         &mut self,
         waiting: crate::protocol::registry::WaitingSession,
-    ) -> Result<u64, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         let epoch = self.epoch.clone();
-        let incarnation = self.open_session(
+        self.open_session(
             &epoch,
             waiting.session_id.clone(),
             waiting.cwd,
             waiting.controls,
         )?;
-        self.register_new(waiting.session_id.clone(), incarnation);
+        self.register_new(waiting.session_id.clone());
         let entry = self
             .sessions
             .get_mut(&waiting.session_id)
@@ -299,7 +296,7 @@ impl SessionRegistry {
             .as_mut()
             .expect("an open session is live")
             .op = waiting.op;
-        Ok(incarnation)
+        Ok(())
     }
 
     pub(crate) fn open_new_with_replay(
@@ -309,7 +306,7 @@ impl SessionRegistry {
         cwd: impl Into<PathBuf>,
         session: Value,
         replay: Vec<Value>,
-    ) -> Result<u64, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         let controls = settle_controls(replay, &session);
         self.open_session(expected_epoch, session_id.into(), cwd.into(), controls)
     }
@@ -321,7 +318,7 @@ impl SessionRegistry {
         cwd: impl Into<PathBuf>,
         operation_id: impl Into<String>,
         kind: SessionOperationKind,
-    ) -> Result<u64, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         if !matches!(
             kind,
@@ -344,8 +341,6 @@ impl SessionRegistry {
         }) {
             return Err(RuntimeStateError::BusySession);
         }
-        self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
-        let incarnation = self.next_incarnation;
         let cwd: PathBuf = cwd.into();
         let op = OpSlot::running(
             OperationKind::Load,
@@ -353,7 +348,6 @@ impl SessionRegistry {
         );
         self.install_live(
             &session_id,
-            incarnation,
             SessionLiveState {
                 cwd,
                 lifecycle: SessionLifecycle::Attaching,
@@ -382,14 +376,13 @@ impl SessionRegistry {
         });
 
         self.settle_session_ops(&session_id);
-        Ok(incarnation)
+        Ok(())
     }
 
     pub(crate) fn start_reload(
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: impl Into<String>,
         kind: SessionOperationKind,
     ) -> Result<(), RuntimeStateError> {
@@ -401,12 +394,10 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationMismatch);
         }
         let operation_id = operation_id.into();
-        if self
-            .operation_in_use_except_reserved(&operation_id, Some((session_id, incarnation, kind)))
-        {
+        if self.operation_in_use_except_reserved(&operation_id, Some((session_id, kind))) {
             return Err(RuntimeStateError::OperationCollision);
         }
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         if owner.operation.is_none() {
             owner
                 .can_begin(SessionAdmission::Attachment)
@@ -449,11 +440,10 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let session = owner.live.as_mut().expect("live owner checked");
         let collecting_attachment = session.lifecycle == SessionLifecycle::Attaching
             && owner.operation.as_ref().is_some_and(|operation| {
@@ -485,12 +475,11 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         response: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active
             || owner.operation.as_ref().is_none_or(|operation| {
@@ -517,12 +506,11 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active
             || owner.operation.as_ref().is_none_or(|operation| {
@@ -549,13 +537,12 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
         response: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Attaching
             || owner.operation.as_ref().is_none_or(|operation| {
@@ -583,14 +570,13 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
         error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         {
-            let owner = self.require_live_owner(session_id, incarnation)?;
+            let owner = self.live_owner(session_id)?;
             let session = owner.live.as_ref().expect("live owner checked");
             if session.lifecycle != SessionLifecycle::Attaching
                 || owner.operation.as_ref().is_none_or(|operation| {
@@ -600,10 +586,9 @@ impl SessionRegistry {
                 return Err(RuntimeStateError::OperationMismatch);
             }
         }
-        self.require_live_owner_mut(session_id, incarnation)?
-            .operation = None;
+        self.live_owner_mut(session_id)?.operation = None;
         let mut session = self
-            .take_live_for_retirement(session_id, incarnation)
+            .take_live_for_retirement(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
         let effects = drain_session_liveness(session_id, &mut session);
 
@@ -619,14 +604,13 @@ impl SessionRegistry {
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
         session: Value,
-        source: (&str, u64),
+        source_session_id: &str,
         target_replay: Option<Vec<Value>>,
-    ) -> Result<u64, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let (source_session_id, source_incarnation) = source;
         {
             let source = self
-                .require_live_owner(source_session_id, source_incarnation)?
+                .live_owner(source_session_id)?
                 .live
                 .as_ref()
                 .expect("live owner checked");
@@ -644,7 +628,7 @@ impl SessionRegistry {
         session_id: String,
         cwd: PathBuf,
         controls: SessionControls,
-    ) -> Result<u64, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         if self.sessions.get(&session_id).is_some_and(|entry| {
             let state = &entry.state;
@@ -656,11 +640,8 @@ impl SessionRegistry {
         }) {
             return Err(RuntimeStateError::BusySession);
         }
-        self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
-        let incarnation = self.next_incarnation;
         self.install_live(
             &session_id,
-            incarnation,
             SessionLiveState {
                 cwd,
                 lifecycle: SessionLifecycle::Active,
@@ -678,7 +659,7 @@ impl SessionRegistry {
             },
         );
         self.settle_session_ops(&session_id);
-        Ok(incarnation)
+        Ok(())
     }
 
     /// Atomically admit a canonical turn and publish its live projection before Agent dispatch.
@@ -687,12 +668,11 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         client_intent_id: &str,
         prompt: Vec<Value>,
     ) -> Result<String, SessionTurnError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner(session_id, incarnation)?;
+        let owner = self.live_owner(session_id)?;
         owner.can_begin(SessionAdmission::Prompt)?;
         if owner.live.as_ref().expect("live owner checked").lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive.into());
@@ -703,7 +683,7 @@ impl SessionRegistry {
         if self.operation_in_use(client_intent_id) {
             return Err(RuntimeStateError::OperationCollision.into());
         }
-        let operation_id = self.start_turn(session_id, incarnation, client_intent_id, prompt)?;
+        let operation_id = self.start_turn(session_id, client_intent_id, prompt)?;
         self.settle_session_ops(session_id);
         Ok(operation_id)
     }
@@ -715,7 +695,6 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: impl Into<String>,
         prompt: Vec<Value>,
     ) -> Result<String, RuntimeStateError> {
@@ -724,7 +703,7 @@ impl SessionRegistry {
         if self.operation_in_use(&operation_id) {
             return Err(RuntimeStateError::OperationCollision);
         }
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         if owner.live.as_ref().expect("live owner checked").lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive);
         }
@@ -745,11 +724,10 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let turn = owner
             .active_turn
             .as_mut()
@@ -766,12 +744,11 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         update: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let session = self
-            .require_live_owner_mut(session_id, incarnation)?
+            .live_owner_mut(session_id)?
             .live
             .as_mut()
             .expect("live owner checked");
@@ -791,13 +768,12 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         response: Value,
         replay: Vec<Value>,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let controls = settle_controls(replay, &response);
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let session = owner.live.as_mut().expect("live owner checked");
         if session.lifecycle != SessionLifecycle::Active
             || owner
@@ -816,10 +792,9 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let execution = owner
             .active_turn
             .as_mut()
@@ -838,14 +813,12 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         response: Value,
     ) -> Result<(), RuntimeStateError> {
         self.seal_turn(
             expected_epoch,
             session_id,
-            incarnation,
             operation_id,
             TurnTerminal { lifecycle: None },
             TurnEnd::Completed(&response),
@@ -856,14 +829,12 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.seal_turn(
             expected_epoch,
             session_id,
-            incarnation,
             operation_id,
             TurnTerminal { lifecycle: None },
             TurnEnd::Failed(&error),
@@ -874,7 +845,6 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         reason: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
@@ -882,7 +852,6 @@ impl SessionRegistry {
         self.seal_turn(
             expected_epoch,
             session_id,
-            incarnation,
             operation_id,
             TurnTerminal {
                 lifecycle: Some(SessionLifecycle::Uncertain),
@@ -895,13 +864,12 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         terminal: TurnTerminal,
         end: TurnEnd<'_>,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let retired = session_live::seal_turn(owner, operation_id, terminal)?;
         self.end_session_turn(session_id, end);
         self.effects
@@ -1230,19 +1198,16 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: impl Into<String>,
         kind: SessionOperationKind,
         stage: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let operation_id = operation_id.into();
-        if self
-            .operation_in_use_except_reserved(&operation_id, Some((session_id, incarnation, kind)))
-        {
+        if self.operation_in_use_except_reserved(&operation_id, Some((session_id, kind))) {
             return Err(RuntimeStateError::OperationCollision);
         }
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         session_live::start_operation(owner, operation_id, kind, stage.into())?;
         self.settle_session_ops(session_id);
         Ok(())
@@ -1252,7 +1217,6 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
         let stage = match self.require_live(session_id)?.lifecycle {
@@ -1263,7 +1227,6 @@ impl SessionRegistry {
         self.start_operation(
             expected_epoch,
             session_id,
-            incarnation,
             operation_id,
             SessionOperationKind::Delete,
             stage,
@@ -1274,7 +1237,6 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
         if self.require_live(session_id)?.lifecycle != SessionLifecycle::Active {
@@ -1283,7 +1245,6 @@ impl SessionRegistry {
         self.start_operation(
             expected_epoch,
             session_id,
-            incarnation,
             operation_id,
             SessionOperationKind::Delete,
             "deleting_active",
@@ -1294,11 +1255,10 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let session = owner.live.as_mut().expect("live owner checked");
         let Some(operation) = owner.operation.as_mut() else {
             return Err(RuntimeStateError::OperationMismatch);
@@ -1328,12 +1288,11 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         {
-            let owner = self.require_live_owner(session_id, incarnation)?;
+            let owner = self.live_owner(session_id)?;
             let session = owner.live.as_ref().expect("live owner checked");
             if session.lifecycle != SessionLifecycle::Deleting
                 || owner.operation.as_ref().is_none_or(|operation| {
@@ -1345,7 +1304,7 @@ impl SessionRegistry {
                 return Err(RuntimeStateError::OperationMismatch);
             }
         }
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         owner
             .operation
             .as_mut()
@@ -1355,7 +1314,7 @@ impl SessionRegistry {
             turn.execution = None;
         }
         let mut session = self
-            .take_live_for_retirement(session_id, incarnation)
+            .take_live_for_retirement(session_id)
             .ok_or(RuntimeStateError::UnknownSession)?;
         let effects = drain_session_liveness(session_id, &mut session);
 
@@ -1369,14 +1328,13 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         reason: impl Into<String>,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let reason = reason.into();
         let effects = {
-            let owner = self.require_live_owner_mut(session_id, incarnation)?;
+            let owner = self.live_owner_mut(session_id)?;
             let session = owner.live.as_mut().expect("live owner checked");
             let Some(operation) = owner.operation.as_mut() else {
                 return Err(RuntimeStateError::OperationMismatch);
@@ -1400,13 +1358,12 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
         result: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         if matches!(
             kind,
             SessionOperationKind::Close | SessionOperationKind::Delete
@@ -1427,7 +1384,6 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
         control_update: Value,
@@ -1439,7 +1395,7 @@ impl SessionRegistry {
         ) {
             return Err(RuntimeStateError::OperationMismatch);
         }
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         if owner.operation.as_ref().is_none_or(|operation| {
             operation.operation_id != operation_id || operation.kind != kind
         }) {
@@ -1463,13 +1419,12 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         kind: SessionOperationKind,
         error: Value,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let session = owner.live.as_mut().expect("live owner checked");
         let Some(operation) = owner.operation.as_ref() else {
             return Err(RuntimeStateError::OperationMismatch);
@@ -1495,11 +1450,10 @@ impl SessionRegistry {
         &mut self,
         expected_epoch: &str,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
-        let owner = self.require_live_owner_mut(session_id, incarnation)?;
+        let owner = self.live_owner_mut(session_id)?;
         let operation = owner
             .operation
             .as_mut()
@@ -1525,7 +1479,6 @@ impl SessionRegistry {
     pub(crate) fn finish_session_cleanup(
         &mut self,
         session_id: &str,
-        incarnation: u64,
         kind: SessionAdmission,
         operation_id: &str,
     ) -> Result<(), MirrorError> {
@@ -1534,9 +1487,6 @@ impl SessionRegistry {
             .get_mut(session_id)
             .map(|entry| &mut entry.state)
             .ok_or(MirrorError::UnknownSession)?;
-        if owner.incarnation != incarnation {
-            return Err(MirrorError::StaleIncarnation);
-        }
         if owner.operation.as_ref().is_none_or(|operation| {
             operation.operation_id != operation_id || operation.kind.admission() != kind
         }) || owner
@@ -1557,54 +1507,6 @@ impl SessionRegistry {
         } else {
             Err(RuntimeStateError::EpochMismatch)
         }
-    }
-
-    fn require_live_owner(
-        &self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<&SessionState, RuntimeStateError> {
-        let owner = self
-            .sessions
-            .get(session_id)
-            .map(|entry| &entry.state)
-            .ok_or(RuntimeStateError::UnknownSession)?;
-        if owner.incarnation != incarnation {
-            return Err(RuntimeStateError::StaleIncarnation);
-        }
-        if owner.live.is_none()
-            || owner
-                .operation
-                .as_ref()
-                .is_some_and(|operation| operation.stage == "cleanup")
-        {
-            return Err(RuntimeStateError::UnknownSession);
-        }
-        Ok(owner)
-    }
-
-    fn require_live_owner_mut(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<&mut SessionState, RuntimeStateError> {
-        let owner = self
-            .sessions
-            .get_mut(session_id)
-            .map(|entry| &mut entry.state)
-            .ok_or(RuntimeStateError::UnknownSession)?;
-        if owner.incarnation != incarnation {
-            return Err(RuntimeStateError::StaleIncarnation);
-        }
-        if owner.live.is_none()
-            || owner
-                .operation
-                .as_ref()
-                .is_some_and(|operation| operation.stage == "cleanup")
-        {
-            return Err(RuntimeStateError::UnknownSession);
-        }
-        Ok(owner)
     }
 
     /// A held session that is not in its final cleanup.
@@ -1643,35 +1545,22 @@ impl SessionRegistry {
             .expect("live owner checked"))
     }
 
-    fn install_live(&mut self, session_id: &str, incarnation: u64, live: SessionLiveState) {
-        if let Some(previous) = self
-            .sessions
-            .get(session_id)
-            .map(|entry| entry.state.incarnation)
-            && previous != incarnation
-        {
-            self.clear_history_for_replacement(session_id, previous);
-            self.retire_entry(session_id, previous);
-        }
+    /// A newly installed session replaces any idle entry of the same ID: its
+    /// log, candidate and resources do not carry into the new attachment.
+    fn install_live(&mut self, session_id: &str, live: SessionLiveState) {
+        self.clear_history_for_replacement(session_id);
+        self.retire_entry(session_id);
         self.sessions
             .entry(session_id.to_string())
-            .or_insert_with(|| SessionEntry::new(SessionState::cold(session_id, incarnation)))
+            .or_insert_with(|| SessionEntry::new(SessionState::cold(session_id)))
             .state
             .live = Some(live);
     }
 
-    fn take_live_for_retirement(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Option<SessionLiveState> {
-        let entry = self.sessions.get_mut(session_id)?;
-        if entry.state.incarnation != incarnation {
-            return None;
-        }
+    fn take_live_for_retirement(&mut self, session_id: &str) -> Option<SessionLiveState> {
         // Resources may still own materialization waiters or cleanup handles.
-        // Only explicit final removal or incarnation replacement may retire them.
-        entry.state.live.take()
+        // Only explicit final removal or a new installation may retire them.
+        self.sessions.get_mut(session_id)?.state.live.take()
     }
 
     pub(crate) fn operation_in_use(&self, operation_id: &str) -> bool {
@@ -1681,7 +1570,7 @@ impl SessionRegistry {
     fn operation_in_use_except_reserved(
         &self,
         operation_id: &str,
-        reservation: Option<(&str, u64, SessionOperationKind)>,
+        reservation: Option<(&str, SessionOperationKind)>,
     ) -> bool {
         self.sessions.values().any(|entry| {
             let owner = &entry.state;
@@ -1690,9 +1579,8 @@ impl SessionRegistry {
                 .is_some_and(|execution| execution.rpc_operation_id == operation_id)
                 || owner.operation.as_ref().is_some_and(|operation| {
                     operation.operation_id == operation_id
-                        && !reservation.is_some_and(|(session_id, incarnation, kind)| {
+                        && !reservation.is_some_and(|(session_id, kind)| {
                             owner.session_id == session_id
-                                && owner.incarnation == incarnation
                                 && operation.kind == kind
                                 && operation.stage == "reserved"
                         })
@@ -2296,13 +2184,12 @@ impl SessionRegistry {
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
         session: Value,
-    ) -> Result<u64, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         let session_id = session_id.into();
         let controls = SessionControls::settle([], &session);
-        let incarnation =
-            self.open_session(expected_epoch, session_id.clone(), cwd.into(), controls)?;
-        self.register_new(session_id, incarnation);
-        Ok(incarnation)
+        self.open_session(expected_epoch, session_id.clone(), cwd.into(), controls)?;
+        self.register_new(session_id);
+        Ok(())
     }
 }
 
@@ -2315,7 +2202,7 @@ mod tests {
         RuntimeState::new("epoch")
     }
 
-    fn open(state: &mut RuntimeState, session_id: &str) -> u64 {
+    fn open(state: &mut RuntimeState, session_id: &str) {
         state
             .open_new(
                 "epoch",
@@ -2329,19 +2216,12 @@ mod tests {
     fn start_prompt_operation(
         state: &mut RuntimeState,
         session_id: &str,
-        incarnation: u64,
         operation_id: &str,
         prompt: Vec<Value>,
     ) -> String {
         let operation_id = operation_id.to_string();
         state
-            .start_prompt(
-                "epoch",
-                session_id,
-                incarnation,
-                operation_id.clone(),
-                prompt,
-            )
+            .start_prompt("epoch", session_id, operation_id.clone(), prompt)
             .unwrap();
         operation_id
     }
@@ -2349,20 +2229,17 @@ mod tests {
     #[test]
     fn close_cleanup_rejects_late_live_resources_without_publication_or_resurrection() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
             )
             .unwrap();
-        state
-            .close_session("epoch", "session", incarnation, "close")
-            .unwrap();
+        state.close_session("epoch", "session", "close").unwrap();
         let before = state.state("session").unwrap().clone();
         let published = state.live_snapshot();
         assert_eq!(
@@ -2385,17 +2262,16 @@ mod tests {
     #[test]
     fn direct_operation_entry_cannot_bypass_canonical_history_admission() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = state
-            .admit_session_turn("epoch", "session", incarnation, "prompt", vec![])
+            .admit_session_turn("epoch", "session", "prompt", vec![])
             .unwrap();
         state
-            .complete_prompt("epoch", "session", incarnation, "prompt", json!({}))
+            .complete_prompt("epoch", "session", "prompt", json!({}))
             .unwrap();
         state
             .complete_turn(
                 "session",
-                incarnation,
                 &operation_id,
                 json!({ "stopReason": "end_turn" }),
             )
@@ -2405,7 +2281,6 @@ mod tests {
             state.start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "control",
                 SessionOperationKind::SetMode,
                 "request"
@@ -2413,25 +2288,18 @@ mod tests {
             Err(RuntimeStateError::BusySession)
         );
         assert_eq!(
-            state.start_reload(
-                "epoch",
-                "session",
-                incarnation,
-                "load",
-                SessionOperationKind::Load
-            ),
+            state.start_reload("epoch", "session", "load", SessionOperationKind::Load),
             Err(RuntimeStateError::BusySession)
         );
         assert_eq!(state.live_snapshot(), before);
         state
-            .block_turn("session", incarnation, &operation_id, "history unavailable")
+            .block_turn("session", &operation_id, "history unavailable")
             .unwrap();
         let before = state.live_snapshot();
         assert_eq!(
             state.start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "fork",
                 SessionOperationKind::Fork,
                 "request"
@@ -2444,10 +2312,10 @@ mod tests {
     #[test]
     fn history_terminal_requires_live_retirement_and_dto_mutation_cannot_change_owner() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state.register_new("session", incarnation);
+        open(&mut state, "session");
+        state.register_new("session");
         let operation_id = state
-            .admit_session_turn("epoch", "session", incarnation, "intent", vec![])
+            .admit_session_turn("epoch", "session", "intent", vec![])
             .unwrap();
         state
             .upsert_permission("epoch", "session", "permission", json!({}))
@@ -2456,7 +2324,6 @@ mod tests {
         assert_eq!(
             state.complete_turn(
                 "session",
-                incarnation,
                 &operation_id,
                 json!({ "stopReason": "end_turn" })
             ),
@@ -2468,7 +2335,7 @@ mod tests {
         disposable.permissions.clear();
         assert_eq!(state.state("session").unwrap(), &before);
         state
-            .complete_prompt("epoch", "session", incarnation, "intent", json!({}))
+            .complete_prompt("epoch", "session", "intent", json!({}))
             .unwrap();
         assert_eq!(
             state.take_effects(),
@@ -2480,7 +2347,6 @@ mod tests {
         state
             .complete_turn(
                 "session",
-                incarnation,
                 &operation_id,
                 json!({ "stopReason": "end_turn" }),
             )
@@ -2496,20 +2362,14 @@ mod tests {
     #[test]
     fn unified_turn_admission_is_atomic_and_a_second_prompt_is_refused() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state.register_new("session", incarnation);
+        open(&mut state, "session");
+        state.register_new("session");
         state.require_live_mut("session").unwrap().lifecycle = SessionLifecycle::Closed;
         let before = state.state("session").unwrap().clone();
         let seq = state.live_snapshot();
         let next_operation = state.next_operation;
         assert_eq!(
-            state.admit_session_turn(
-                "epoch",
-                "session",
-                incarnation,
-                "intent",
-                vec![json!("hello")]
-            ),
+            state.admit_session_turn("epoch", "session", "intent", vec![json!("hello")]),
             Err(SessionTurnError::Live(RuntimeStateError::SessionNotActive))
         );
         assert_eq!(state.state("session").unwrap(), &before);
@@ -2517,13 +2377,7 @@ mod tests {
         assert_eq!(state.next_operation, next_operation);
         state.require_live_mut("session").unwrap().lifecycle = SessionLifecycle::Active;
         state
-            .admit_session_turn(
-                "epoch",
-                "session",
-                incarnation,
-                "intent",
-                vec![json!("hello")],
-            )
+            .admit_session_turn("epoch", "session", "intent", vec![json!("hello")])
             .unwrap();
         assert_eq!(
             state
@@ -2536,13 +2390,7 @@ mod tests {
         );
         let before = state.live_snapshot();
         assert_eq!(
-            state.admit_session_turn(
-                "epoch",
-                "session",
-                incarnation,
-                "intent",
-                vec![json!("hello")]
-            ),
+            state.admit_session_turn("epoch", "session", "intent", vec![json!("hello")]),
             Err(SessionTurnError::History(MirrorError::WrongPhase))
         );
         assert_eq!(state.live_snapshot(), before);
@@ -2552,12 +2400,12 @@ mod tests {
     fn a_reserved_operation_exempts_only_itself_from_global_identity_checks() {
         for kind in [SessionOperationKind::SetMode, SessionOperationKind::Load] {
             let mut state = state();
-            let first = open(&mut state, "first");
-            let second = open(&mut state, "second");
+            open(&mut state, "first");
+            open(&mut state, "second");
             state
-                .start_prompt("epoch", "first", first, "shared-id", vec![])
+                .start_prompt("epoch", "first", "shared-id", vec![])
                 .unwrap();
-            state.register_new("second", second);
+            state.register_new("second");
             state
                 .sessions
                 .get_mut("second")
@@ -2567,9 +2415,9 @@ mod tests {
                 .unwrap();
             let before = state.live_snapshot();
             let result = if kind == SessionOperationKind::Load {
-                state.start_reload("epoch", "second", second, "shared-id", kind)
+                state.start_reload("epoch", "second", "shared-id", kind)
             } else {
-                state.start_operation("epoch", "second", second, "shared-id", kind, "request")
+                state.start_operation("epoch", "second", "shared-id", kind, "request")
             };
             assert_eq!(result, Err(RuntimeStateError::OperationCollision));
             assert_eq!(state.live_snapshot(), before);
@@ -2589,16 +2437,15 @@ mod tests {
     #[test]
     fn close_confirmation_keeps_the_unique_owner_until_exact_cleanup_finishes() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state.register_new("session", incarnation);
+        open(&mut state, "session");
+        state.register_new("session");
         state
-            .begin_exclusive("session", incarnation, SessionOperationKind::Close, "close")
+            .begin_exclusive("session", SessionOperationKind::Close, "close")
             .unwrap();
         state
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
@@ -2614,9 +2461,7 @@ mod tests {
                 .stage,
             "closing"
         );
-        state
-            .close_session("epoch", "session", incarnation, "close")
-            .unwrap();
+        state.close_session("epoch", "session", "close").unwrap();
         assert_eq!(
             state.live("session").unwrap().lifecycle,
             SessionLifecycle::Closed
@@ -2648,48 +2493,34 @@ mod tests {
             Err(RuntimeStateError::BusySession)
         );
         assert_eq!(
-            state.finish_session_cleanup("session", incarnation, SessionAdmission::Close, "stale"),
+            state.finish_session_cleanup("session", SessionAdmission::Close, "stale"),
             Err(MirrorError::OperationMismatch)
         );
-        assert_eq!(
-            state.finish_session_cleanup(
-                "session",
-                incarnation + 1,
-                SessionAdmission::Close,
-                "close"
-            ),
-            Err(MirrorError::StaleIncarnation)
-        );
         state
-            .finish_session_cleanup("session", incarnation, SessionAdmission::Close, "close")
+            .finish_session_cleanup("session", SessionAdmission::Close, "close")
             .unwrap();
-        state.remove("session", incarnation);
+        state.remove("session");
         assert!(state.state("session").is_none());
-        assert!(open(&mut state, "session") > incarnation);
+        open(&mut state, "session");
+        assert!(state.session("session").is_some());
     }
 
     #[test]
     fn operation_and_prompt_uncertainty_retire_in_either_order_without_losing_owner() {
         for operation_first in [true, false] {
             let mut state = state();
-            let incarnation = open(&mut state, "session");
-            state.register_new("session", incarnation);
+            open(&mut state, "session");
+            state.register_new("session");
             let operation_id = state
-                .admit_session_turn("epoch", "session", incarnation, "prompt", vec![])
+                .admit_session_turn("epoch", "session", "prompt", vec![])
                 .unwrap();
             state
-                .begin_exclusive(
-                    "session",
-                    incarnation,
-                    SessionOperationKind::SetMode,
-                    "control",
-                )
+                .begin_exclusive("session", SessionOperationKind::SetMode, "control")
                 .unwrap();
             state
                 .start_operation(
                     "epoch",
                     "session",
-                    incarnation,
                     "control",
                     SessionOperationKind::SetMode,
                     "request",
@@ -2697,19 +2528,17 @@ mod tests {
                 .unwrap();
             if operation_first {
                 state
-                    .mark_operation_uncertain("epoch", "session", incarnation, "control", "EOF")
+                    .mark_operation_uncertain("epoch", "session", "control", "EOF")
                     .unwrap();
                 assert!(state.state("session").unwrap().turn_execution().is_some());
             }
             state
-                .mark_prompt_uncertain("epoch", "session", incarnation, "prompt", "EOF")
+                .mark_prompt_uncertain("epoch", "session", "prompt", "EOF")
                 .unwrap();
-            state
-                .block_turn("session", incarnation, &operation_id, "EOF")
-                .unwrap();
+            state.block_turn("session", &operation_id, "EOF").unwrap();
             if !operation_first {
                 state
-                    .mark_operation_uncertain("epoch", "session", incarnation, "control", "EOF")
+                    .mark_operation_uncertain("epoch", "session", "control", "EOF")
                     .unwrap();
             }
             let owner = state.state("session").unwrap();
@@ -2724,9 +2553,9 @@ mod tests {
     #[test]
     fn active_turn_folds_only_adjacent_compatible_text_chunks() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         let updates = [
             json!({
@@ -2762,7 +2591,7 @@ mod tests {
         ];
         for update in updates {
             state
-                .append_runtime_update_for_test("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", update)
                 .unwrap();
         }
 
@@ -2782,9 +2611,9 @@ mod tests {
     #[test]
     fn active_turn_replaces_tool_fields_at_the_first_position_without_changing_start_kind() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         let updates = [
             json!({
@@ -2817,7 +2646,7 @@ mod tests {
         ];
         for update in updates {
             state
-                .append_runtime_update_for_test("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", update)
                 .unwrap();
         }
 
@@ -2843,9 +2672,9 @@ mod tests {
     #[test]
     fn active_turn_replaces_plan_slots_in_place_and_removal_clears_only_its_slot() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         for update in [
             json!({
@@ -2867,7 +2696,7 @@ mod tests {
             }),
         ] {
             state
-                .append_runtime_update_for_test("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", update)
                 .unwrap();
         }
         let retained = state
@@ -2894,7 +2723,7 @@ mod tests {
             }),
         ] {
             state
-                .append_runtime_update_for_test("epoch", "session", incarnation, update)
+                .append_runtime_update_for_test("epoch", "session", update)
                 .unwrap();
         }
 
@@ -2922,15 +2751,14 @@ mod tests {
     #[test]
     fn invalid_fold_replacements_are_transactional_and_large_valid_merge_commits() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         state
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": "tool",
@@ -2943,7 +2771,6 @@ mod tests {
             state.append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "tool_call_update", "status": "invalid" }),
             ),
             Err(RuntimeStateError::OperationMismatch),
@@ -2954,7 +2781,6 @@ mod tests {
             state.append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "plan_update",
                     "plan": { "type": "markdown", "content": "missing ID" }
@@ -2969,7 +2795,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": "tool",
@@ -2983,18 +2808,17 @@ mod tests {
     #[test]
     fn ten_thousand_terminal_turns_leave_no_folded_updates() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
 
         for index in 0..10_000 {
             let operation_id = format!("turn-{index}");
             state
-                .start_prompt("epoch", "session", incarnation, &operation_id, Vec::new())
+                .start_prompt("epoch", "session", &operation_id, Vec::new())
                 .unwrap();
             state
                 .append_runtime_update_for_test(
                     "epoch",
                     "session",
-                    incarnation,
                     json!({
                         "sessionUpdate": "agent_message_chunk",
                         "messageId": operation_id,
@@ -3006,7 +2830,6 @@ mod tests {
                 .complete_prompt(
                     "epoch",
                     "session",
-                    incarnation,
                     &format!("turn-{index}"),
                     json!({ "stopReason": "end_turn" }),
                 )
@@ -3057,11 +2880,10 @@ mod tests {
     #[test]
     fn terminal_response_drops_prompt_updates_indices_and_operation_payload() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = start_prompt_operation(
             &mut state,
             "session",
-            incarnation,
             "success-client-intent",
             vec![json!({
                 "type": "text",
@@ -3072,7 +2894,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "agent_message_chunk",
                     "messageId": "success-message-id",
@@ -3084,7 +2905,6 @@ mod tests {
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 &operation_id,
                 json!({
                     "stopReason": "end_turn",
@@ -3108,11 +2928,10 @@ mod tests {
     #[test]
     fn prompt_error_drops_all_turn_payload_after_terminal_delivery() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = start_prompt_operation(
             &mut state,
             "session",
-            incarnation,
             "error-client-intent",
             vec![json!({ "type": "text", "text": "error-prompt-marker" })],
         );
@@ -3120,7 +2939,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "agent_thought_chunk",
                     "content": { "type": "text", "text": "error-update-marker" }
@@ -3131,7 +2949,6 @@ mod tests {
             .fail_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 &operation_id,
                 json!({ "message": "error-result-marker" }),
             )
@@ -3152,11 +2969,10 @@ mod tests {
     #[test]
     fn transport_loss_produces_one_uncertain_terminal_then_drops_the_turn() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = start_prompt_operation(
             &mut state,
             "session",
-            incarnation,
             "uncertain-client-intent",
             vec![json!({
                 "type": "text",
@@ -3167,7 +2983,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": "uncertain-tool-id",
@@ -3176,13 +2991,7 @@ mod tests {
             )
             .unwrap();
         state
-            .mark_prompt_uncertain(
-                "epoch",
-                "session",
-                incarnation,
-                &operation_id,
-                "uncertain-result-marker",
-            )
+            .mark_prompt_uncertain("epoch", "session", &operation_id, "uncertain-result-marker")
             .unwrap();
 
         assert_terminal_turn_payload_was_dropped(
@@ -3200,11 +3009,10 @@ mod tests {
     #[test]
     fn new_turn_can_reuse_prior_message_and_tool_ids() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let first_operation_id = start_prompt_operation(
             &mut state,
             "session",
-            incarnation,
             "first-client-intent",
             vec![json!("first-prompt-marker")],
         );
@@ -3212,7 +3020,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "agent_message_chunk",
                     "messageId": "reused-message-id",
@@ -3224,7 +3031,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": "reused-tool-id",
@@ -3236,7 +3042,6 @@ mod tests {
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 &first_operation_id,
                 json!({ "stopReason": "end_turn" }),
             )
@@ -3245,7 +3050,6 @@ mod tests {
         let second_operation_id = start_prompt_operation(
             &mut state,
             "session",
-            incarnation,
             "second-client-intent",
             vec![json!("second prompt")],
         );
@@ -3253,7 +3057,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "agent_message_chunk",
                     "messageId": "reused-message-id",
@@ -3265,7 +3068,6 @@ mod tests {
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": "reused-tool-id",
@@ -3286,11 +3088,10 @@ mod tests {
     #[test]
     fn turn_retirement_does_not_release_a_live_terminal() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = start_prompt_operation(
             &mut state,
             "session",
-            incarnation,
             "resource-client-intent",
             vec![json!("resource-prompt-marker")],
         );
@@ -3326,7 +3127,6 @@ mod tests {
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 &operation_id,
                 json!({
                     "stopReason": "end_turn",
@@ -3355,14 +3155,13 @@ mod tests {
     #[test]
     fn sequential_completed_turns_leave_active_and_completed_payload_bytes_at_zero() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
 
         for index in 0..32 {
             let marker = format!("sequential-turn-payload-{index}");
             let operation_id = start_prompt_operation(
                 &mut state,
                 "session",
-                incarnation,
                 &format!("sequential-intent-{index}"),
                 vec![json!({ "type": "text", "text": marker })],
             );
@@ -3370,7 +3169,6 @@ mod tests {
                 .append_runtime_update_for_test(
                     "epoch",
                     "session",
-                    incarnation,
                     json!({
                         "sessionUpdate": "agent_message_chunk",
                         "content": { "type": "text", "text": marker }
@@ -3381,7 +3179,6 @@ mod tests {
                 .complete_prompt(
                     "epoch",
                     "session",
-                    incarnation,
                     &operation_id,
                     json!({ "stopReason": "end_turn", "marker": marker }),
                 )
@@ -3402,24 +3199,17 @@ mod tests {
     #[test]
     fn turn_terminal_event_retires_active_exactly_once() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                "prompt",
-                vec![json!("hello")],
-            )
+            .start_prompt("epoch", "session", "prompt", vec![json!("hello")])
             .unwrap();
         state
-            .append_runtime_update_for_test("epoch", "session", incarnation, json!("answer"))
+            .append_runtime_update_for_test("epoch", "session", json!("answer"))
             .unwrap();
         state
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 "prompt",
                 json!({ "stopReason": "end_turn" }),
             )
@@ -3432,7 +3222,6 @@ mod tests {
             state.complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 "prompt",
                 json!({ "stopReason": "end_turn" }),
             ),
@@ -3492,15 +3281,13 @@ mod tests {
     #[test]
     fn cancel_request_is_nonterminal_until_prompt_settles() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
+        state.request_cancel("epoch", "session").unwrap();
         state
-            .request_cancel("epoch", "session", incarnation)
-            .unwrap();
-        state
-            .append_runtime_update_for_test("epoch", "session", incarnation, json!("after cancel"))
+            .append_runtime_update_for_test("epoch", "session", json!("after cancel"))
             .unwrap();
 
         let active = state.session("session").unwrap().active_turn.unwrap();
@@ -3509,16 +3296,12 @@ mod tests {
     }
 
     #[test]
-    fn epoch_and_incarnation_reject_stale_mutations() {
+    fn epoch_rejects_stale_mutations() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         assert_eq!(
-            state.start_prompt("old", "session", incarnation, "prompt", Vec::new()),
+            state.start_prompt("old", "session", "prompt", Vec::new()),
             Err(RuntimeStateError::EpochMismatch),
-        );
-        assert_eq!(
-            state.start_prompt("epoch", "session", incarnation + 1, "prompt", Vec::new(),),
-            Err(RuntimeStateError::StaleIncarnation),
         );
         assert!(state.session("session").unwrap().active_turn.is_none());
     }
@@ -3526,7 +3309,7 @@ mod tests {
     #[test]
     fn turn_retirement_never_changes_live_resources() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_permission(
                 "epoch",
@@ -3554,19 +3337,12 @@ mod tests {
         for index in 0..3 {
             let operation_id = format!("prompt-{index}");
             state
-                .start_prompt(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    &operation_id,
-                    vec![json!(index)],
-                )
+                .start_prompt("epoch", "session", &operation_id, vec![json!(index)])
                 .unwrap();
             state
                 .complete_prompt(
                     "epoch",
                     "session",
-                    incarnation,
                     &operation_id,
                     json!({ "stopReason": "end_turn" }),
                 )
@@ -3582,15 +3358,14 @@ mod tests {
     #[test]
     fn active_turn_accounting_does_not_reject_a_large_valid_update() {
         let mut state = RuntimeState::new("epoch");
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         state
             .append_runtime_update_for_test(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "content": "x".repeat(512) }),
             )
             .unwrap();
@@ -3605,9 +3380,7 @@ mod tests {
                 .len(),
             1
         );
-        state
-            .request_cancel("epoch", "session", incarnation)
-            .unwrap();
+        state.request_cancel("epoch", "session").unwrap();
         assert!(
             state
                 .session("session")
@@ -3622,23 +3395,22 @@ mod tests {
     #[test]
     fn controls_and_close_coexist_with_an_active_prompt() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         for kind in [
             SessionOperationKind::SetMode,
             SessionOperationKind::SetConfig,
         ] {
             state
-                .start_operation("epoch", "session", incarnation, "control", kind, "changing")
+                .start_operation("epoch", "session", "control", kind, "changing")
                 .unwrap();
             assert!(state.session("session").unwrap().active_turn.is_some());
             state
                 .fail_operation(
                     "epoch",
                     "session",
-                    incarnation,
                     "control",
                     kind,
                     json!({"message":"rejected"}),
@@ -3649,7 +3421,6 @@ mod tests {
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
@@ -3659,7 +3430,6 @@ mod tests {
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 "prompt",
                 json!({"stopReason":"cancelled"}),
             )
@@ -3668,28 +3438,25 @@ mod tests {
             state.session("session").unwrap().lifecycle,
             SessionLifecycle::Closing
         );
-        state
-            .close_session("epoch", "session", incarnation, "close")
-            .unwrap();
+        state.close_session("epoch", "session", "close").unwrap();
         assert!(state.session("session").is_none());
     }
 
     #[test]
     fn different_sessions_progress_independently() {
         let mut state = state();
-        let a = open(&mut state, "a");
-        let b = open(&mut state, "b");
+        open(&mut state, "a");
+        open(&mut state, "b");
         state
-            .start_prompt("epoch", "a", a, "prompt-a", Vec::new())
+            .start_prompt("epoch", "a", "prompt-a", Vec::new())
             .unwrap();
         state
-            .start_prompt("epoch", "b", b, "prompt-b", Vec::new())
+            .start_prompt("epoch", "b", "prompt-b", Vec::new())
             .unwrap();
         assert_eq!(
             state.start_operation(
                 "epoch",
                 "a",
-                a,
                 "close-a",
                 SessionOperationKind::Close,
                 "closing",
@@ -3700,7 +3467,6 @@ mod tests {
             .complete_prompt(
                 "epoch",
                 "b",
-                b,
                 "prompt-b",
                 json!({ "stopReason": "end_turn" }),
             )
@@ -3712,15 +3478,14 @@ mod tests {
     #[test]
     fn possible_agent_commit_is_reported_as_uncertain() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         state
             .mark_prompt_uncertain(
                 "epoch",
                 "session",
-                incarnation,
                 "prompt",
                 "transport lost after dispatch",
             )
@@ -3734,20 +3499,14 @@ mod tests {
     #[test]
     fn uncertain_prompt_terminal_retires_the_turn_in_one_transition() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         let before = state.live_snapshot();
 
         state
-            .mark_prompt_uncertain(
-                "epoch",
-                "session",
-                incarnation,
-                "prompt",
-                "response lost after dispatch",
-            )
+            .mark_prompt_uncertain("epoch", "session", "prompt", "response lost after dispatch")
             .unwrap();
 
         assert_ne!(state.live_snapshot(), before);
@@ -3764,35 +3523,23 @@ mod tests {
     #[test]
     fn prompt_failure_retires_partial_turn_and_operation_payload() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = "prompt".to_string();
         state
-            .start_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                &operation_id,
-                vec![json!("hello")],
-            )
+            .start_prompt("epoch", "session", &operation_id, vec![json!("hello")])
             .unwrap();
         state
-            .append_runtime_update_for_test("epoch", "session", incarnation, json!("partial"))
+            .append_runtime_update_for_test("epoch", "session", json!("partial"))
             .unwrap();
         state
-            .fail_prompt(
-                "epoch",
-                "session",
-                incarnation,
-                &operation_id,
-                json!({ "code": -32000 }),
-            )
+            .fail_prompt("epoch", "session", &operation_id, json!({ "code": -32000 }))
             .unwrap();
 
         assert!(!state.operation_in_use(&operation_id));
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
         assert_eq!(
-            state.append_runtime_update_for_test("epoch", "session", incarnation, json!("late")),
+            state.append_runtime_update_for_test("epoch", "session", json!("late")),
             Err(RuntimeStateError::NoActiveTurn),
         );
     }
@@ -3800,19 +3547,16 @@ mod tests {
     #[test]
     fn cancelled_prompt_response_retires_the_intent_outcome() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = "prompt".to_string();
         state
-            .start_prompt("epoch", "session", incarnation, &operation_id, Vec::new())
+            .start_prompt("epoch", "session", &operation_id, Vec::new())
             .unwrap();
-        state
-            .request_cancel("epoch", "session", incarnation)
-            .unwrap();
+        state.request_cancel("epoch", "session").unwrap();
         state
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 &operation_id,
                 json!({ "stopReason": "cancelled" }),
             )
@@ -3825,7 +3569,7 @@ mod tests {
     #[test]
     fn resolving_an_interaction_twice_is_idempotent() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_permission(
                 "epoch",
@@ -3854,9 +3598,9 @@ mod tests {
     #[test]
     fn close_then_delete_is_irreversible_and_partial_failure_stays_closed() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_delete("epoch", "session", incarnation, "delete-operation")
+            .start_delete("epoch", "session", "delete-operation")
             .unwrap();
         assert_eq!(
             state.session("session").unwrap().lifecycle,
@@ -3864,7 +3608,7 @@ mod tests {
         );
 
         state
-            .delete_close_succeeded("epoch", "session", incarnation, "delete-operation")
+            .delete_close_succeeded("epoch", "session", "delete-operation")
             .unwrap();
         assert_eq!(
             state.session("session").unwrap().lifecycle,
@@ -3875,7 +3619,6 @@ mod tests {
             .fail_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "delete-operation",
                 SessionOperationKind::Delete,
                 json!("delete failed"),
@@ -3886,39 +3629,33 @@ mod tests {
         assert!(session.operation.is_none());
         assert!(!state.operation_in_use("delete-operation"));
         assert_eq!(
-            state.start_prompt("epoch", "session", incarnation, "late", Vec::new()),
+            state.start_prompt("epoch", "session", "late", Vec::new()),
             Err(RuntimeStateError::SessionNotActive),
         );
     }
 
     #[test]
-    fn reopening_a_closed_session_uses_a_new_incarnation() {
+    fn reopening_a_closed_session_starts_without_its_old_turn() {
         let mut state = state();
-        let first = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .start_operation(
                 "epoch",
                 "session",
-                first,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
             )
             .unwrap();
+        state.close_session("epoch", "session", "close").unwrap();
         state
-            .close_session("epoch", "session", first, "close")
+            .finish_session_cleanup("session", SessionAdmission::Close, "close")
             .unwrap();
-        state
-            .finish_session_cleanup("session", first, SessionAdmission::Close, "close")
-            .unwrap();
-        let second = open(&mut state, "session");
+        open(&mut state, "session");
 
-        assert_ne!(first, second);
-        assert_eq!(
-            state.start_prompt("epoch", "session", first, "stale", Vec::new()),
-            Err(RuntimeStateError::StaleIncarnation),
-        );
-        assert!(state.session("session").unwrap().active_turn.is_none());
+        let reopened = state.session("session").unwrap();
+        assert_eq!(reopened.lifecycle, SessionLifecycle::Active);
+        assert!(reopened.active_turn.is_none());
     }
 
     #[test]
@@ -3928,7 +3665,7 @@ mod tests {
             { "id": "build", "name": "Build" }, { "id": "plan", "name": "Plan" }
         ] });
         let options = json!([{ "id": "verbose", "name": "Verbose", "type": "boolean", "currentValue": false }]);
-        let incarnation = state
+        state
             .open_new(
                 "epoch",
                 "session",
@@ -3951,7 +3688,6 @@ mod tests {
             .update_control_state(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
             )
             .unwrap();
@@ -3959,7 +3695,6 @@ mod tests {
             .update_control_state(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "config_option_update", "configOptions": [] }),
             )
             .unwrap();
@@ -3980,19 +3715,12 @@ mod tests {
         );
         // An authoritative response replaces both the baseline and its overlay.
         state
-            .start_reload(
-                "epoch",
-                "session",
-                incarnation,
-                "reload",
-                SessionOperationKind::Load,
-            )
+            .start_reload("epoch", "session", "reload", SessionOperationKind::Load)
             .unwrap();
         state
             .complete_reload(
                 "epoch",
                 "session",
-                incarnation,
                 "reload",
                 json!({ "modes": modes, "configOptions": options }),
             )
@@ -4008,18 +3736,17 @@ mod tests {
     #[test]
     fn fork_keeps_only_target_control_metadata() {
         let mut state = state();
-        let source = open(&mut state, "source");
+        open(&mut state, "source");
         state
-            .start_prompt("epoch", "source", source, "prompt", vec![json!("Q")])
+            .start_prompt("epoch", "source", "prompt", vec![json!("Q")])
             .unwrap();
         state
-            .append_runtime_update_for_test("epoch", "source", source, json!("A"))
+            .append_runtime_update_for_test("epoch", "source", json!("A"))
             .unwrap();
         state
             .complete_prompt(
                 "epoch",
                 "source",
-                source,
                 "prompt",
                 json!({ "stopReason": "end_turn" }),
             )
@@ -4089,14 +3816,14 @@ mod tests {
     #[test]
     fn operation_identity_cannot_be_active_in_two_sessions() {
         let mut state = state();
-        let a = open(&mut state, "a");
-        let b = open(&mut state, "b");
+        open(&mut state, "a");
+        open(&mut state, "b");
         state
-            .start_prompt("epoch", "a", a, "same-operation", Vec::new())
+            .start_prompt("epoch", "a", "same-operation", Vec::new())
             .unwrap();
 
         assert_eq!(
-            state.start_prompt("epoch", "b", b, "same-operation", Vec::new()),
+            state.start_prompt("epoch", "b", "same-operation", Vec::new()),
             Err(RuntimeStateError::OperationCollision),
         );
         assert!(state.session("a").unwrap().active_turn.is_some());
@@ -4106,23 +3833,22 @@ mod tests {
     #[test]
     fn retired_operation_identity_can_be_reused() {
         let mut state = state();
-        let a = open(&mut state, "a");
-        let b = open(&mut state, "b");
+        open(&mut state, "a");
+        open(&mut state, "b");
         state
-            .start_prompt("epoch", "a", a, "same-operation", Vec::new())
+            .start_prompt("epoch", "a", "same-operation", Vec::new())
             .unwrap();
         state
             .complete_prompt(
                 "epoch",
                 "a",
-                a,
                 "same-operation",
                 json!({ "stopReason": "end_turn" }),
             )
             .unwrap();
         assert_eq!(
             state
-                .start_prompt("epoch", "b", b, "same-operation", Vec::new())
+                .start_prompt("epoch", "b", "same-operation", Vec::new())
                 .unwrap(),
             "same-operation"
         );
@@ -4133,18 +3859,14 @@ mod tests {
     #[test]
     fn duplicate_cancel_request_is_idempotent() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
-        state
-            .request_cancel("epoch", "session", incarnation)
-            .unwrap();
+        state.request_cancel("epoch", "session").unwrap();
         let first_cancel_seq = state.live_snapshot();
 
-        state
-            .request_cancel("epoch", "session", incarnation)
-            .unwrap();
+        state.request_cancel("epoch", "session").unwrap();
 
         assert_eq!(state.live_snapshot(), first_cancel_seq);
         assert!(
@@ -4161,13 +3883,11 @@ mod tests {
     #[test]
     fn sealed_turn_drops_cancel_flag_and_cleans_owned_interactions() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
-        state
-            .request_cancel("epoch", "session", incarnation)
-            .unwrap();
+        state.request_cancel("epoch", "session").unwrap();
         state
             .upsert_permission(
                 "epoch",
@@ -4189,7 +3909,6 @@ mod tests {
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 "prompt",
                 json!({ "stopReason": "cancelled" }),
             )
@@ -4218,7 +3937,7 @@ mod tests {
     #[test]
     fn duplicate_permission_request_never_overwrites_the_original() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         assert_eq!(
             state
                 .upsert_permission("epoch", "session", "permission", json!({ "question": "A" }),)
@@ -4246,7 +3965,7 @@ mod tests {
     #[test]
     fn released_terminal_cannot_be_resurrected_by_late_state() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_terminal(
                 "epoch",
@@ -4294,7 +4013,7 @@ mod tests {
     #[test]
     fn closing_a_session_releases_resources_once() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_terminal("epoch", "session", "terminal", json!({ "released": false }))
             .unwrap();
@@ -4302,15 +4021,12 @@ mod tests {
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
             )
             .unwrap();
-        state
-            .close_session("epoch", "session", incarnation, "close")
-            .unwrap();
+        state.close_session("epoch", "session", "close").unwrap();
 
         assert!(state.operation_in_use("close"));
         assert!(state.session("session").is_none());
@@ -4323,7 +4039,7 @@ mod tests {
         );
         assert!(state.take_effects().is_empty());
         state
-            .finish_session_cleanup("session", incarnation, SessionAdmission::Close, "close")
+            .finish_session_cleanup("session", SessionAdmission::Close, "close")
             .unwrap();
         assert!(!state.operation_in_use("close"));
     }
@@ -4331,18 +4047,17 @@ mod tests {
     #[test]
     fn retrying_delete_from_closed_never_resurrects_the_session() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_delete("epoch", "session", incarnation, "first-delete")
+            .start_delete("epoch", "session", "first-delete")
             .unwrap();
         state
-            .delete_close_succeeded("epoch", "session", incarnation, "first-delete")
+            .delete_close_succeeded("epoch", "session", "first-delete")
             .unwrap();
         state
             .fail_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "first-delete",
                 SessionOperationKind::Delete,
                 json!("delete failed"),
@@ -4350,7 +4065,7 @@ mod tests {
             .unwrap();
 
         state
-            .start_delete("epoch", "session", incarnation, "retry-delete")
+            .start_delete("epoch", "session", "retry-delete")
             .unwrap();
         let retrying = state.session("session").unwrap();
         assert_eq!(retrying.lifecycle, SessionLifecycle::Deleting);
@@ -4359,7 +4074,6 @@ mod tests {
             .fail_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "retry-delete",
                 SessionOperationKind::Delete,
                 json!("delete failed"),
@@ -4375,7 +4089,7 @@ mod tests {
     #[test]
     fn delete_close_success_releases_resources_before_delete_response() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_permission(
                 "epoch",
@@ -4387,12 +4101,10 @@ mod tests {
         state
             .upsert_terminal("epoch", "session", "terminal", json!({ "released": false }))
             .unwrap();
-        state
-            .start_delete("epoch", "session", incarnation, "delete")
-            .unwrap();
+        state.start_delete("epoch", "session", "delete").unwrap();
 
         state
-            .delete_close_succeeded("epoch", "session", incarnation, "delete")
+            .delete_close_succeeded("epoch", "session", "delete")
             .unwrap();
 
         let session = state.session("session").unwrap();
@@ -4414,51 +4126,39 @@ mod tests {
     }
 
     #[test]
-    fn delete_success_removes_once_and_old_incarnation_stays_stale_after_reopen() {
+    fn delete_success_removes_once_and_a_late_completion_cannot_delete_a_reopened_session() {
         let mut state = state();
-        let first = open(&mut state, "session");
+        open(&mut state, "session");
+        state.start_delete("epoch", "session", "delete").unwrap();
         state
-            .start_delete("epoch", "session", first, "delete")
-            .unwrap();
-        state
-            .delete_close_succeeded("epoch", "session", first, "delete")
+            .delete_close_succeeded("epoch", "session", "delete")
             .unwrap();
         let before = state.live_snapshot();
 
-        state
-            .complete_delete("epoch", "session", first, "delete")
-            .unwrap();
+        state.complete_delete("epoch", "session", "delete").unwrap();
 
         assert_ne!(state.live_snapshot(), before);
         assert!(state.session("session").is_none());
         state
-            .finish_session_cleanup("session", first, SessionAdmission::Delete, "delete")
+            .finish_session_cleanup("session", SessionAdmission::Delete, "delete")
             .unwrap();
-        let second = open(&mut state, "session");
-        assert_ne!(first, second);
+        open(&mut state, "session");
         assert_eq!(
-            state.complete_delete("epoch", "session", first, "delete"),
-            Err(RuntimeStateError::StaleIncarnation),
+            state.complete_delete("epoch", "session", "delete"),
+            Err(RuntimeStateError::OperationMismatch),
         );
+        assert!(state.session("session").is_some());
     }
 
     #[test]
     fn uncertain_delete_is_one_terminal_transition_and_blocks_mutation() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
-        state
-            .start_delete("epoch", "session", incarnation, "delete")
-            .unwrap();
+        open(&mut state, "session");
+        state.start_delete("epoch", "session", "delete").unwrap();
         let before = state.live_snapshot();
 
         state
-            .mark_operation_uncertain(
-                "epoch",
-                "session",
-                incarnation,
-                "delete",
-                "close response was lost",
-            )
+            .mark_operation_uncertain("epoch", "session", "delete", "close response was lost")
             .unwrap();
 
         assert_ne!(state.live_snapshot(), before);
@@ -4466,7 +4166,7 @@ mod tests {
         assert_eq!(session.lifecycle, SessionLifecycle::Uncertain);
         assert_eq!(session.operation.as_ref().unwrap().stage, "uncertain");
         assert_eq!(
-            state.start_prompt("epoch", "session", incarnation, "prompt", Vec::new()),
+            state.start_prompt("epoch", "session", "prompt", Vec::new()),
             Err(RuntimeStateError::SessionNotActive),
         );
     }
@@ -4475,16 +4175,16 @@ mod tests {
     fn independent_session_transitions_commute() {
         fn run(a_first: bool) -> LiveSnapshot {
             let mut state = state();
-            let a = open(&mut state, "a");
-            let b = open(&mut state, "b");
+            open(&mut state, "a");
+            open(&mut state, "b");
             let update_a = |state: &mut RuntimeState| {
                 state
-                    .start_prompt("epoch", "a", a, "prompt-a", vec![json!("A")])
+                    .start_prompt("epoch", "a", "prompt-a", vec![json!("A")])
                     .unwrap();
             };
             let update_b = |state: &mut RuntimeState| {
                 state
-                    .start_prompt("epoch", "b", b, "prompt-b", vec![json!("B")])
+                    .start_prompt("epoch", "b", "prompt-b", vec![json!("B")])
                     .unwrap();
             };
             if a_first {
@@ -4503,17 +4203,16 @@ mod tests {
     #[test]
     fn terminal_result_is_not_retained_after_turn_retirement() {
         let mut state = RuntimeState::new("epoch");
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let operation_id = "prompt".to_string();
         state
-            .start_prompt("epoch", "session", incarnation, &operation_id, Vec::new())
+            .start_prompt("epoch", "session", &operation_id, Vec::new())
             .unwrap();
 
         state
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 &operation_id,
                 json!({ "stopReason": "end_turn" }),
             )
@@ -4531,14 +4230,14 @@ mod tests {
     #[test]
     fn rejected_transition_leaves_live_state_unchanged() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "active", Vec::new())
+            .start_prompt("epoch", "session", "active", Vec::new())
             .unwrap();
         let before = state.live_snapshot();
 
         assert_eq!(
-            state.start_prompt("epoch", "session", incarnation, "rejected", Vec::new()),
+            state.start_prompt("epoch", "session", "rejected", Vec::new()),
             Err(RuntimeStateError::BusySession),
         );
 
@@ -4548,12 +4247,11 @@ mod tests {
     #[test]
     fn definite_close_failure_restores_active_and_releases_operation_guard() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
@@ -4564,7 +4262,6 @@ mod tests {
             .fail_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 json!({ "message": "refused" }),
@@ -4576,7 +4273,7 @@ mod tests {
         assert!(session.operation.is_none());
         assert!(!state.operation_in_use("close"));
         state
-            .start_prompt("epoch", "session", incarnation, "next", Vec::new())
+            .start_prompt("epoch", "session", "next", Vec::new())
             .unwrap();
     }
 
@@ -4588,24 +4285,16 @@ mod tests {
             (SessionOperationKind::SetConfig, true),
         ] {
             let mut state = state();
-            let incarnation = open(&mut state, "session");
+            open(&mut state, "session");
             let operation_id = format!("{kind:?}");
             state
-                .start_operation(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    &operation_id,
-                    kind,
-                    "running",
-                )
+                .start_operation("epoch", "session", &operation_id, kind, "running")
                 .unwrap();
             if succeeds {
                 state
                     .complete_operation(
                         "epoch",
                         "session",
-                        incarnation,
                         &operation_id,
                         kind,
                         json!({ "ok": true }),
@@ -4616,7 +4305,6 @@ mod tests {
                     .fail_operation(
                         "epoch",
                         "session",
-                        incarnation,
                         &operation_id,
                         kind,
                         json!({ "message": "failed" }),
@@ -4629,14 +4317,7 @@ mod tests {
                 SessionLifecycle::Active
             );
             assert_eq!(
-                state.complete_operation(
-                    "epoch",
-                    "session",
-                    incarnation,
-                    &operation_id,
-                    kind,
-                    Value::Null,
-                ),
+                state.complete_operation("epoch", "session", &operation_id, kind, Value::Null,),
                 Err(RuntimeStateError::OperationMismatch),
             );
         }
@@ -4645,12 +4326,11 @@ mod tests {
     #[test]
     fn control_success_updates_value_and_retires_result_payload_atomically() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "mode",
                 SessionOperationKind::SetMode,
                 "setting",
@@ -4662,7 +4342,6 @@ mod tests {
             .complete_control_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "mode",
                 SessionOperationKind::SetMode,
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
@@ -4687,7 +4366,7 @@ mod tests {
     #[test]
     fn load_candidate_is_invisible_until_success_then_commits_atomically() {
         let mut state = state();
-        let incarnation = state
+        state
             .start_attachment(
                 "epoch",
                 "session",
@@ -4701,7 +4380,6 @@ mod tests {
             .append_attachment_candidate(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "agent_message_chunk", "content": "partial" }),
             )
             .unwrap();
@@ -4709,7 +4387,6 @@ mod tests {
             .append_attachment_candidate(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
             )
             .unwrap();
@@ -4735,7 +4412,6 @@ mod tests {
             .complete_attachment(
                 "epoch",
                 "session",
-                incarnation,
                 "load",
                 SessionOperationKind::Load,
                 json!({ "sessionId": "session" }),
@@ -4762,14 +4438,13 @@ mod tests {
             } else {
                 "resumed"
             };
-            let incarnation = state
+            state
                 .start_attachment("epoch", session_id, "/workspace", "attach", kind)
                 .unwrap();
             state
                 .append_attachment_candidate(
                     "epoch",
                     session_id,
-                    incarnation,
                     json!({ "sessionUpdate": "agent_message_chunk", "content": "history" }),
                 )
                 .unwrap();
@@ -4777,7 +4452,6 @@ mod tests {
                 .append_attachment_candidate(
                     "epoch",
                     session_id,
-                    incarnation,
                     json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
                 )
                 .unwrap();
@@ -4785,7 +4459,6 @@ mod tests {
                 .complete_attachment(
                     "epoch",
                     session_id,
-                    incarnation,
                     "attach",
                     kind,
                     json!({ "sessionId": session_id }),
@@ -4804,7 +4477,7 @@ mod tests {
     #[test]
     fn failed_load_discards_candidate_and_resume_never_claims_replayed_history() {
         let mut state = state();
-        let failed = state
+        state
             .start_attachment(
                 "epoch",
                 "failed",
@@ -4814,18 +4487,12 @@ mod tests {
             )
             .unwrap();
         state
-            .append_attachment_candidate(
-                "epoch",
-                "failed",
-                failed,
-                json!({ "content": "must disappear" }),
-            )
+            .append_attachment_candidate("epoch", "failed", json!({ "content": "must disappear" }))
             .unwrap();
         state
             .fail_attachment(
                 "epoch",
                 "failed",
-                failed,
                 "load-failed",
                 SessionOperationKind::Load,
                 json!({ "message": "not found" }),
@@ -4838,7 +4505,7 @@ mod tests {
                 .contains("must disappear")
         );
 
-        let resumed = state
+        state
             .start_attachment(
                 "epoch",
                 "resumed",
@@ -4851,7 +4518,6 @@ mod tests {
             .append_attachment_candidate(
                 "epoch",
                 "resumed",
-                resumed,
                 json!({ "content": "compatibility update" }),
             )
             .unwrap();
@@ -4859,7 +4525,6 @@ mod tests {
             .complete_attachment(
                 "epoch",
                 "resumed",
-                resumed,
                 "resume",
                 SessionOperationKind::Resume,
                 json!({ "sessionId": "resumed" }),
@@ -4875,7 +4540,7 @@ mod tests {
     #[test]
     fn failed_attachment_releases_every_pre_response_live_resource() {
         let mut state = state();
-        let incarnation = state
+        state
             .start_attachment(
                 "epoch",
                 "session",
@@ -4911,7 +4576,6 @@ mod tests {
             .fail_attachment(
                 "epoch",
                 "session",
-                incarnation,
                 "load",
                 SessionOperationKind::Load,
                 json!({ "message": "failed" }),
@@ -4942,9 +4606,9 @@ mod tests {
     #[test]
     fn accepted_url_elicitation_outlives_turn_and_has_a_monotonic_terminal_state() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
-            .start_prompt("epoch", "session", incarnation, "prompt", Vec::new())
+            .start_prompt("epoch", "session", "prompt", Vec::new())
             .unwrap();
         state
             .upsert_elicitation(
@@ -4969,7 +4633,6 @@ mod tests {
             .complete_prompt(
                 "epoch",
                 "session",
-                incarnation,
                 "prompt",
                 json!({ "stopReason": "end_turn" }),
             )
@@ -5005,7 +4668,7 @@ mod tests {
     #[test]
     fn request_scoped_elicitation_is_connection_state_not_session_state() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_elicitation("epoch", None, "request-scope", json!({ "mode": "form" }))
             .unwrap();
@@ -5020,15 +4683,12 @@ mod tests {
             .start_operation(
                 "epoch",
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
             )
             .unwrap();
-        state
-            .close_session("epoch", "session", incarnation, "close")
-            .unwrap();
+        state.close_session("epoch", "session", "close").unwrap();
         assert!(
             state
                 .live_snapshot()
@@ -5040,7 +4700,7 @@ mod tests {
     #[test]
     fn same_session_reload_success_does_not_create_a_second_business_session() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let old_options = json!([{
             "type": "boolean", "id": "old-only", "name": "Old", "currentValue": false,
         }]);
@@ -5048,7 +4708,6 @@ mod tests {
             .update_control_state(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "old" }),
             )
             .unwrap();
@@ -5056,7 +4715,6 @@ mod tests {
             .update_control_state(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "config_option_update", "configOptions": old_options.clone() }),
             )
             .unwrap();
@@ -5066,7 +4724,6 @@ mod tests {
             .start_reload(
                 "epoch",
                 "session",
-                incarnation,
                 &operation_id,
                 SessionOperationKind::Load,
             )
@@ -5075,7 +4732,6 @@ mod tests {
             .append_attachment_candidate(
                 "epoch",
                 "session",
-                incarnation,
                 json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": "replacement-history-must-not-be-retained"
@@ -5086,13 +4742,11 @@ mod tests {
             .append_attachment_candidate(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "new" }),
             )
             .unwrap();
 
         let staging = state.session("session").unwrap();
-        assert_eq!(staging.incarnation, incarnation);
         assert_eq!(
             staging.controls.modes.as_ref().unwrap().current_mode_id,
             "old"
@@ -5108,7 +4762,6 @@ mod tests {
             .complete_reload(
                 "epoch",
                 "session",
-                incarnation,
                 &operation_id,
                 json!({
                     "modes": {
@@ -5122,7 +4775,6 @@ mod tests {
 
         let reloaded = state.session("session").unwrap();
         assert_eq!(state.sessions.len(), 1);
-        assert_eq!(reloaded.incarnation, incarnation);
         assert!(
             !serde_json::to_string(&reloaded)
                 .unwrap()
@@ -5159,10 +4811,10 @@ mod tests {
             json!({ "sessionUpdate": "usage_update", "used": 3, "size": 100, "cost": null }),
         ];
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         for update in &updates {
             state
-                .update_control_state("epoch", "session", incarnation, update.clone())
+                .update_control_state("epoch", "session", update.clone())
                 .unwrap();
         }
         let controls = &state.session("session").unwrap().controls;
@@ -5178,7 +4830,6 @@ mod tests {
             .update_control_state(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "session_info_update", "title": null }),
             )
             .unwrap();
@@ -5190,31 +4841,23 @@ mod tests {
     #[test]
     fn same_session_reload_error_remains_actionable_and_does_not_loop() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .update_control_state(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "old" }),
             )
             .unwrap();
         let old_controls = state.session("session").unwrap().controls.clone();
 
         state
-            .start_reload(
-                "epoch",
-                "session",
-                incarnation,
-                "reload",
-                SessionOperationKind::Load,
-            )
+            .start_reload("epoch", "session", "reload", SessionOperationKind::Load)
             .unwrap();
         state
             .append_attachment_candidate(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "sessionUpdate": "current_mode_update", "currentModeId": "partial" }),
             )
             .unwrap();
@@ -5222,14 +4865,12 @@ mod tests {
             .fail_reload(
                 "epoch",
                 "session",
-                incarnation,
                 "reload",
                 json!({ "message": "load rejected" }),
             )
             .unwrap();
 
         let session = state.session("session").unwrap();
-        assert_eq!(session.incarnation, incarnation);
         assert_eq!(session.lifecycle, SessionLifecycle::Active);
         assert_eq!(session.controls, old_controls);
         assert!(session.operation.is_none());
@@ -5247,75 +4888,50 @@ mod tests {
                 .contains("load rejected")
         );
         state
-            .start_prompt("epoch", "session", incarnation, "next-turn", Vec::new())
+            .start_prompt("epoch", "session", "next-turn", Vec::new())
             .unwrap();
     }
 
     #[test]
     fn same_session_reload_rejects_wrong_kind_busy_collision_and_epoch() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
-        let other = open(&mut state, "other");
+        open(&mut state, "session");
+        open(&mut state, "other");
         let unchanged = state.live_snapshot();
 
         assert_eq!(
-            state.start_reload(
-                "old-epoch",
-                "session",
-                incarnation,
-                "reload",
-                SessionOperationKind::Load,
-            ),
+            state.start_reload("old-epoch", "session", "reload", SessionOperationKind::Load,),
             Err(RuntimeStateError::EpochMismatch)
         );
         assert_eq!(state.live_snapshot(), unchanged);
         assert_eq!(
-            state.start_reload(
-                "epoch",
-                "session",
-                incarnation,
-                "reload",
-                SessionOperationKind::Fork,
-            ),
+            state.start_reload("epoch", "session", "reload", SessionOperationKind::Fork,),
             Err(RuntimeStateError::OperationMismatch)
         );
 
         state
-            .start_prompt("epoch", "other", other, "collision", Vec::new())
+            .start_prompt("epoch", "other", "collision", Vec::new())
             .unwrap();
         assert_eq!(
-            state.start_reload(
-                "epoch",
-                "session",
-                incarnation,
-                "collision",
-                SessionOperationKind::Load,
-            ),
+            state.start_reload("epoch", "session", "collision", SessionOperationKind::Load,),
             Err(RuntimeStateError::OperationCollision)
         );
         state
-            .start_prompt("epoch", "session", incarnation, "active", Vec::new())
+            .start_prompt("epoch", "session", "active", Vec::new())
             .unwrap();
         assert_eq!(
-            state.start_reload(
-                "epoch",
-                "session",
-                incarnation,
-                "busy",
-                SessionOperationKind::Load,
-            ),
+            state.start_reload("epoch", "session", "busy", SessionOperationKind::Load,),
             Err(RuntimeStateError::BusySession)
         );
     }
 
     #[test]
     fn same_session_reload_requires_no_operation_interaction_or_live_resource() {
-        fn assert_reload_busy(state: &mut RuntimeState, session_id: &str, incarnation: u64) {
+        fn assert_reload_busy(state: &mut RuntimeState, session_id: &str) {
             assert_eq!(
                 state.start_reload(
                     "epoch",
                     session_id,
-                    incarnation,
                     format!("reload-{session_id}"),
                     SessionOperationKind::Load,
                 ),
@@ -5325,20 +4941,19 @@ mod tests {
 
         let mut state = state();
 
-        let operation = open(&mut state, "operation");
+        open(&mut state, "operation");
         state
             .start_operation(
                 "epoch",
                 "operation",
-                operation,
                 "mode",
                 SessionOperationKind::SetMode,
                 "setting",
             )
             .unwrap();
-        assert_reload_busy(&mut state, "operation", operation);
+        assert_reload_busy(&mut state, "operation");
 
-        let permission = open(&mut state, "permission");
+        open(&mut state, "permission");
         state
             .upsert_permission(
                 "epoch",
@@ -5347,9 +4962,9 @@ mod tests {
                 json!({ "question": "allow" }),
             )
             .unwrap();
-        assert_reload_busy(&mut state, "permission", permission);
+        assert_reload_busy(&mut state, "permission");
 
-        let elicitation = open(&mut state, "elicitation");
+        open(&mut state, "elicitation");
         state
             .upsert_elicitation(
                 "epoch",
@@ -5358,18 +4973,18 @@ mod tests {
                 json!({ "mode": "form" }),
             )
             .unwrap();
-        assert_reload_busy(&mut state, "elicitation", elicitation);
+        assert_reload_busy(&mut state, "elicitation");
 
-        let url = open(&mut state, "url");
+        open(&mut state, "url");
         state
             .upsert_elicitation("epoch", Some("url"), "url-form", json!({ "mode": "url" }))
             .unwrap();
         state
             .resolve_elicitation("epoch", Some("url"), "url-form", Some("url-flow"))
             .unwrap();
-        assert_reload_busy(&mut state, "url", url);
+        assert_reload_busy(&mut state, "url");
 
-        let terminal = open(&mut state, "terminal");
+        open(&mut state, "terminal");
         state
             .upsert_terminal(
                 "epoch",
@@ -5378,7 +4993,7 @@ mod tests {
                 json!({ "released": false }),
             )
             .unwrap();
-        assert_reload_busy(&mut state, "terminal", terminal);
+        assert_reload_busy(&mut state, "terminal");
     }
 
     #[test]
@@ -5476,7 +5091,7 @@ mod tests {
     #[test]
     fn settled_url_flows_are_removed_from_live_state_but_remain_idempotent() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_elicitation("epoch", Some("session"), "form", json!({ "mode": "url" }))
             .unwrap();
@@ -5532,7 +5147,7 @@ mod tests {
     #[test]
     fn released_terminal_is_not_retained_or_resurrected() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_terminal(
                 "epoch",
@@ -5580,7 +5195,7 @@ mod tests {
     #[test]
     fn terminal_output_reassembles_split_utf8_before_exit() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         let bytes = "中😀tail".as_bytes();
         for (index, byte) in bytes.iter().enumerate() {
             state
@@ -5633,7 +5248,7 @@ mod tests {
     #[test]
     fn authoritative_load_replaces_controls_without_retiring_live_resources() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
+        open(&mut state, "session");
         state
             .upsert_terminal(
                 "epoch",
@@ -5646,7 +5261,6 @@ mod tests {
             .synchronize_loaded_session(
                 "epoch",
                 "session",
-                incarnation,
                 json!({ "modes": { "currentModeId": "plan" } }),
                 vec![json!({
                     "sessionUpdate": "available_commands_update",

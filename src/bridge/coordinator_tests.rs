@@ -43,7 +43,7 @@ fn setup() -> (
 
 fn install_session(state: &mut BridgeState) {
     let epoch = state.sessions.epoch().to_owned();
-    let incarnation = state
+    state
         .sessions
         .open_new(
             &epoch,
@@ -52,7 +52,7 @@ fn install_session(state: &mut BridgeState) {
             json!({ "sessionId": SESSION }),
         )
         .unwrap();
-    state.sessions.register_new(SESSION, incarnation);
+    state.sessions.register_new(SESSION);
 }
 
 fn interaction_batch(permission: bool) -> Vec<Value> {
@@ -343,7 +343,7 @@ async fn a_cold_placeholder_keeps_wire_replay_before_the_creation_response() {
     {
         let mut state = services.state.lock().await;
         state.pending_creations = 1;
-        state.sessions.register_cold(SESSION, 0);
+        state.sessions.register_cold(SESSION);
     }
     let (outgoing, mut peer_responses) = futures::channel::mpsc::channel::<String>(8);
     let (mut peer_requests, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(8);

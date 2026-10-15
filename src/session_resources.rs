@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     CreateElicitationResponse, ElicitationAction, RequestPermissionOutcome,
@@ -37,15 +36,9 @@ pub(crate) struct SyncControlCandidate {
     pub(crate) bytes: usize,
 }
 
-/// An external continuation can retain this token without cloning the ingest state.
-#[derive(Clone)]
-pub(crate) struct SessionUpdateOwner {
-    pub(crate) incarnation: Option<u64>,
-    pub(crate) allocation: Arc<()>,
-}
-
+/// The validation state a load replaced, settled by that load's attempt.
 pub(crate) struct ReplayValidationBackup {
-    pub(crate) owner: SessionUpdateOwner,
+    pub(crate) attempt_id: String,
     pub(crate) previous: Option<SessionUpdateSemanticState>,
 }
 
