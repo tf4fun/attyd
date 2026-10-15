@@ -13,6 +13,9 @@ import { projectPath, sessionPath } from "../../web/src/lib/session-route";
 import { opsOf, scopesOf, trackApi } from "./api-requests";
 import { collectBrowserErrors } from "./browser-errors";
 
+/** The PID of the current Agent process, as the fake Agent writes it at start. */
+type AgentPid = () => Promise<string>;
+
 interface TurnEnd {
   /** Waits until a `[hold:<name>]` turn is ready to end. */
   reached(name: string): Promise<void>;
@@ -20,7 +23,7 @@ interface TurnEnd {
   release(name: string): Promise<void>;
 }
 
-const test = baseTest.extend<{ turnEndGate: string; turnEnd: TurnEnd; isolatedAttydUrl: string }>({
+const test = baseTest.extend<{ turnEndGate: string; turnEnd: TurnEnd; agentPid: AgentPid; isolatedAttydUrl: string }>({
   turnEndGate: async ({}, use) => {
     const directory = await mkdtemp(join(tmpdir(), "attyd-turn-end-"));
     try {
@@ -34,11 +37,16 @@ const test = baseTest.extend<{ turnEndGate: string; turnEnd: TurnEnd; isolatedAt
       .toBe(true),
     release: (name) => writeFile(join(turnEndGate, name), ""),
   }),
+  agentPid: async ({ turnEndGate }, use) => use(() => readMarker(join(turnEndGate, "agent.pid"))),
   isolatedAttydUrl: async ({ turnEndGate }, use) => {
     const cwd = process.cwd();
     const server = await startRustTestServer({
       cwd,
-      env: { ...process.env, ATTYD_FAKE_TURN_END_GATE: turnEndGate },
+      env: {
+        ...process.env,
+        ATTYD_FAKE_TURN_END_GATE: turnEndGate,
+        ATTYD_FAKE_PROCESS_MARKER_FILE: join(turnEndGate, "agent.pid"),
+      },
       command: [
         process.execPath,
         "--import",
@@ -893,6 +901,9 @@ test("opens attachment chips with native browser viewing and automatic downloads
   const sent = (await request).postDataJSON().args;
   expect(sent.prompt[1].resource.text).toBe(markdown);
   await expect(page.getByText("Received prompt blocks: text,resource,resource,resource,audio,resource,resource.", { exact: true })).toBeVisible();
+  // The reply streams before the turn commits (S2); read the log once it has.
+  await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
   const prompt = page.locator(".message-user").filter({ hasText: "attachment-input-flow" });
   const content = prompt.locator(".message-content");
   await expect(content.locator("a.attachment-chip")).toHaveCount(6);
@@ -3375,18 +3386,23 @@ test("keeps turn boundaries across reload and shows only the current operation's
 // session (state-sync §2.4), without backoff once the Agent is ready, so a
 // "connection unavailable" card may come and go before any assertion sees it.
 // What must hold is the outcome: the same stream and session continue.
-test("recovers the session automatically after the ACP connection stops", async ({ page }) => {
+test("recovers the session automatically after the ACP connection stops", async ({ page, agentPid }) => {
   const browserErrors = collectBrowserErrors(page);
   const api = trackApi(page);
   await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
+  await expect.poll(agentPid).not.toBe("");
+  const first = await agentPid();
   await composer.fill("disconnect-flow");
   // The stream stays open across the Agent connection (protocol §5.4): no
   // request is expected to fail.
   await composer.press("Enter");
   await expect.poll(() => opsOf(api, "prompt")).toHaveLength(1);
+  // The Agent exits and the bridge starts a new one: wait for that process.
+  await expect.poll(agentPid, { timeout: 15_000 }).not.toBe(first);
+  await expect.poll(agentPid).not.toBe("");
 
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
   await expect(page.locator(".composer-reconnect")).toBeHidden();
@@ -3452,17 +3468,21 @@ test("keeps an active stdio prompt alive across browser reconnect", async ({ bro
   }
 });
 
-test("stays usable after a focus liveness probe following an Agent restart", async ({ page }) => {
+test("stays usable after a focus liveness probe following an Agent restart", async ({ page, agentPid }) => {
   const browserErrors = collectBrowserErrors(page);
   const api = trackApi(page);
   await page.goto("/sessions/saved-session");
 
   const composer = page.locator('textarea[role="combobox"]');
   await expect(composer).toBeEnabled();
+  await expect.poll(agentPid).not.toBe("");
+  const first = await agentPid();
   await composer.fill("disconnect-flow");
   // The stream stays open across the Agent connection: no request is expected to fail.
   await composer.press("Enter");
   await expect.poll(() => opsOf(api, "prompt")).toHaveLength(1);
+  await expect.poll(agentPid, { timeout: 15_000 }).not.toBe(first);
+  await expect.poll(agentPid).not.toBe("");
 
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(page.getByRole("heading", { name: "Saved ACP session" })).toBeVisible();
@@ -3470,6 +3490,11 @@ test("stays usable after a focus liveness probe following an Agent restart", asy
   await expect(composer).toBeEnabled();
   await expect(page.getByText("Loaded history.", { exact: true })).toHaveCount(1);
   expect(opsOf(api, "prompt")).toHaveLength(1);
+  // Usable means the new Agent answers.
+  await composer.fill("usage-flow");
+  await composer.press("Enter");
+  await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
+  expect(opsOf(api, "prompt")).toHaveLength(2);
   expect(api.v1).toEqual([]);
   expect(browserErrors).toEqual([]);
 });
