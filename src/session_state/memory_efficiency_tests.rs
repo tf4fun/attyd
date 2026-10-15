@@ -1,10 +1,9 @@
 //! Allocation gates for the real registry -> canonical turn overlay fold path.
 //! Inputs, held views, test-side validation and serialization stay outside
-//! measurement; production folding and byte accounting are both measured.
+//! measurement; production folding is measured.
 //! These gates constrain allocation traffic, not CPU time or process RSS.
 
-use super::{MirrorError, MirrorPhase, TurnAdmission};
-use crate::session_mirror::SessionView;
+use super::{MirrorError, MirrorPhase, TurnOverlay};
 use crate::session_registry::SessionRegistry;
 use crate::test_allocations::{AllocationStats, measure_allocations};
 use serde_json::{Value, json};
@@ -20,7 +19,7 @@ const MESSAGE_PARTS: [&str; STEPS] = [" α", "\\", "\"", "\n", "five", "六", "�
 struct Fixture {
     registry: SessionRegistry,
     operation_id: String,
-    held_view: SessionView,
+    held_turn: TurnOverlay,
     held_wire: Value,
 }
 
@@ -47,26 +46,16 @@ fn message(text: &str) -> Value {
 fn fixture(body_size: usize) -> Fixture {
     let mut registry = SessionRegistry::new("allocation-epoch");
     registry.register_new(SESSION, INCARNATION);
-    let revision = registry
-        .state(SESSION)
-        .unwrap()
-        .history_revision
-        .clone()
-        .unwrap();
-    let TurnAdmission::Accepted { operation_id } = registry
+    let operation_id = registry
         .start_turn(
             SESSION,
             INCARNATION,
-            &revision,
             "allocation-intent",
             vec![json!({ "type": "text", "text": "keep the full output" })],
         )
-        .unwrap()
-    else {
-        panic!("a fresh turn must be admitted");
-    };
-    // Include UTF-8 and escaped characters so accounting cannot assume text byte
-    // length equals serialized length. Entity count is identical at every size.
+        .unwrap();
+    // Include UTF-8 and escaped characters. Entity count is identical at every
+    // size.
     let body = format!("start 界\\\"\n{}\nend", "x".repeat(body_size));
     for update in [
         tool("tool-a", "Unchanged large tool", &body),
@@ -77,57 +66,43 @@ fn fixture(body_size: usize) -> Fixture {
             .append_turn_update(SESSION, INCARNATION, &operation_id, update)
             .unwrap();
     }
-    let held_view = registry.view(SESSION, INCARNATION).unwrap();
-    let held_wire = serde_json::to_value(&held_view.session).unwrap();
+    let held_turn = registry
+        .state(SESSION)
+        .unwrap()
+        .active_turn
+        .clone()
+        .unwrap();
+    let held_wire = serde_json::to_value(&held_turn).unwrap();
     assert_eq!(
-        held_wire["activeTurn"]["updates"][0]["content"][0]["content"]["text"].as_str(),
+        held_wire["updates"][0]["content"][0]["content"]["text"].as_str(),
         Some(body.as_str())
     );
     Fixture {
         registry,
         operation_id,
-        held_view,
+        held_turn,
         held_wire,
     }
 }
 
-fn assert_views_and_accounting(fixture: &mut Fixture, expected_current: &Value) {
-    let current = fixture.registry.view(SESSION, INCARNATION).unwrap();
-    assert!(
-        serde_json::to_value(&current.session).unwrap() == *expected_current,
-        "latest view must preserve all bodies, identities, metadata and revisions"
-    );
-    assert!(
-        serde_json::to_value(&fixture.held_view.session).unwrap() == fixture.held_wire,
-        "a previously published view must remain complete and immutable"
-    );
-    assert_eq!(current.session.phase, MirrorPhase::Running);
-    assert_eq!(
-        current.baseline.revision(),
-        fixture.held_view.baseline.revision()
-    );
-    assert_eq!(
-        current.baseline.updates(),
-        fixture.held_view.baseline.updates()
-    );
-
+fn assert_turns(fixture: &Fixture, expected_current: &Value) {
     let state = fixture.registry.state(SESSION).unwrap();
+    assert_eq!(state.phase, MirrorPhase::Running);
     let overlay = state.active_turn.as_ref().unwrap();
+    assert!(
+        serde_json::to_value(overlay).unwrap() == *expected_current,
+        "the running turn must preserve all bodies, identities and metadata"
+    );
+    assert!(
+        serde_json::to_value(&fixture.held_turn).unwrap() == fixture.held_wire,
+        "a previously read turn must remain complete and immutable"
+    );
     assert_eq!(overlay.operation_id, fixture.operation_id);
     assert_eq!(
         overlay.execution.as_ref().unwrap().rpc_operation_id,
         "allocation-intent"
     );
     assert!(overlay.terminal.is_none());
-    let actual_bytes = serde_json::to_vec(overlay).unwrap().len();
-    assert_eq!(state.active_overlay_bytes, actual_bytes);
-    assert_eq!(fixture.registry.overlay_bytes, actual_bytes);
-}
-
-fn expected_after(fixture: &Fixture, update_count: usize) -> Value {
-    let mut expected = fixture.held_wire.clone();
-    expected["viewRevision"] = json!(fixture.held_view.session.view_revision + update_count as u64);
-    expected
 }
 
 fn assert_independent_of_unrelated_body(samples: &[(usize, AllocationStats)]) {
@@ -161,10 +136,10 @@ fn memory_efficiency_other_tool_updates_do_not_copy_unrelated_large_body() {
                 })
             })
             .collect();
-        let mut expected = expected_after(&fixture, STEPS);
+        let mut expected = fixture.held_wire.clone();
         let last = updates.last().unwrap();
         for field in ["title", "status", "content"] {
-            expected["activeTurn"]["updates"][1][field] = last[field].clone();
+            expected["updates"][1][field] = last[field].clone();
         }
 
         let (result, stats) = measure_allocations(|| {
@@ -178,7 +153,7 @@ fn memory_efficiency_other_tool_updates_do_not_copy_unrelated_large_body() {
             })
         });
         result.unwrap();
-        assert_views_and_accounting(&mut fixture, &expected);
+        assert_turns(&fixture, &expected);
         samples.push((body_size, stats));
     }
     assert_independent_of_unrelated_body(&samples);
@@ -190,8 +165,8 @@ fn memory_efficiency_small_message_appends_do_not_copy_unrelated_large_body() {
     for body_size in BODY_SIZES {
         let mut fixture = fixture(body_size);
         let updates: Vec<Value> = MESSAGE_PARTS.into_iter().map(message).collect();
-        let mut expected = expected_after(&fixture, STEPS);
-        expected["activeTurn"]["updates"][2]["content"]["text"] =
+        let mut expected = fixture.held_wire.clone();
+        expected["updates"][2]["content"]["text"] =
             json!(format!("{MESSAGE_PREFIX}{}", MESSAGE_PARTS.concat()));
 
         let (result, stats) = measure_allocations(|| {
@@ -205,17 +180,16 @@ fn memory_efficiency_small_message_appends_do_not_copy_unrelated_large_body() {
             })
         });
         result.unwrap();
-        assert_views_and_accounting(&mut fixture, &expected);
+        assert_turns(&fixture, &expected);
         samples.push((body_size, stats));
     }
     assert_independent_of_unrelated_body(&samples);
 }
 
 #[test]
-fn memory_efficiency_rejected_folds_preserve_snapshot_owner_revision_and_accounting() {
+fn memory_efficiency_rejected_folds_preserve_the_running_turn() {
     let mut fixture = fixture(BODY_SIZES[2]);
     let before = fixture.registry.state(SESSION).unwrap().clone();
-    let before_overlay_bytes = fixture.registry.overlay_bytes;
     let rejections = [
         (
             INCARNATION + 1,
@@ -255,14 +229,13 @@ fn memory_efficiency_rejected_folds_preserve_snapshot_owner_revision_and_account
         );
         assert!(
             fixture.registry.state(SESSION).unwrap() == &before,
-            "a rejected fold must not change owner, execution, contents or revision"
+            "a rejected fold must not change owner, execution or contents"
         );
-        assert_eq!(fixture.registry.overlay_bytes, before_overlay_bytes);
         let unchanged = fixture.held_wire.clone();
-        assert_views_and_accounting(&mut fixture, &unchanged);
+        assert_turns(&fixture, &unchanged);
     }
 
-    // Rejection must not poison the still-running owner or consume a revision.
+    // Rejection must not poison the still-running owner.
     fixture
         .registry
         .append_turn_update(
@@ -272,8 +245,7 @@ fn memory_efficiency_rejected_folds_preserve_snapshot_owner_revision_and_account
             message(" after rejection"),
         )
         .unwrap();
-    let mut expected = expected_after(&fixture, 1);
-    expected["activeTurn"]["updates"][2]["content"]["text"] =
-        json!(format!("{MESSAGE_PREFIX} after rejection"));
-    assert_views_and_accounting(&mut fixture, &expected);
+    let mut expected = fixture.held_wire.clone();
+    expected["updates"][2]["content"]["text"] = json!(format!("{MESSAGE_PREFIX} after rejection"));
+    assert_turns(&fixture, &expected);
 }

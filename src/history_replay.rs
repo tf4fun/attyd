@@ -208,12 +208,11 @@ impl ReplayCandidate {
         )
     }
 
-    pub(crate) fn take_history(&self) -> Result<(Vec<Value>, usize), HistoryCacheError> {
+    pub(crate) fn take_history(&self) -> Result<Vec<Value>, HistoryCacheError> {
         let mut data = self.lock();
         data.updates()?;
         data.sealed = true;
-        let history = std::mem::take(&mut data.history);
-        Ok((history.updates, history.bytes.max(2)))
+        Ok(std::mem::take(&mut data.history).updates)
     }
 
     pub(crate) fn discard(&self) {
@@ -268,9 +267,8 @@ mod tests {
 
     #[test]
     fn invalid_replay_cannot_publish_a_valid_prefix() {
-        let mut cache = HistoryCache::new("epoch");
+        let mut cache = HistoryCache::default();
         let key = SessionKey::new("s", 1);
-        let baseline = cache.install_empty(key.clone());
         cache.begin_candidate(key.clone(), "load").unwrap();
         let replay = cache.candidate(&key, "load").unwrap();
         replay.ingest(json!({"sessionUpdate":"tool_call","toolCallId":"tool","title":"Run","status":"completed"}), true).unwrap();
@@ -280,14 +278,13 @@ mod tests {
             cache.commit_candidate(&key, "load"),
             Err(HistoryCacheError::InvalidReplay)
         ));
-        assert!(Arc::ptr_eq(cache.peek(&key).unwrap(), &baseline));
         cache.abort_candidate(&key, "load").unwrap();
         assert_eq!(replay.bytes(), 0);
     }
 
     #[test]
     fn retired_candidate_cannot_contaminate_replacement_load() {
-        let mut cache = HistoryCache::new("epoch");
+        let mut cache = HistoryCache::default();
         let key = SessionKey::new("s", 1);
         cache.begin_candidate(key.clone(), "old").unwrap();
         let old = cache.candidate(&key, "old").unwrap();
@@ -306,13 +303,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(
-            cache
-                .commit_candidate(&key, "new")
-                .unwrap()
-                .updates()
-                .is_empty()
-        );
+        assert!(cache.commit_candidate(&key, "new").unwrap().is_empty());
     }
 
     #[test]

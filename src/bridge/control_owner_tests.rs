@@ -39,27 +39,16 @@ impl ControlTurn {
             .open_new_with_replay(&epoch, SESSION, "/workspace", metadata(), Vec::new())
             .unwrap();
         state.sessions.register_new(SESSION, incarnation);
-        let history = state
-            .sessions
-            .state(SESSION)
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let TurnAdmission::Accepted { operation_id } = state
+        let operation_id = state
             .sessions
             .admit_session_turn(
                 &epoch,
                 SESSION,
                 incarnation,
-                &history,
                 "control-owner-turn",
                 vec![json!({"type": "text", "text": "Keep this prompt"})],
             )
-            .unwrap()
-        else {
-            panic!("fresh turn must be admitted")
-        };
+            .unwrap();
         let update = json!({
             "sessionUpdate": "agent_message_chunk", "messageId": "answer",
             "content": {"type": "text", "text": "existing turn body"},

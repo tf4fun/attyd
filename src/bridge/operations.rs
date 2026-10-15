@@ -282,15 +282,9 @@ fn command(state: &BridgeState, scope: &OpScope, kind: OpKind, op: &str, input: 
     };
     let mut command = match kind {
         OpKind::Prompt => {
-            let session_id = session_id.expect("a prompt is a session's");
-            let revision = state
-                .sessions
-                .active_session(session_id)
-                .and_then(|session| session.state.history_revision.clone());
             json!({
                 "type": "session/prompt",
                 "clientIntentId": op,
-                "historyRevision": revision,
                 "prompt": input["prompt"],
             })
         }

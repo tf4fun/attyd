@@ -40,7 +40,7 @@ use crate::semantic::{
     validate_session_config_options, validate_session_config_reference, validate_session_controls,
     validate_session_metadata, validate_session_mode_reference,
 };
-use crate::session_mirror::{MirrorError, MirrorPhase, TurnAdmission};
+use crate::session_mirror::{MirrorError, MirrorPhase};
 use crate::session_observers::SessionWork;
 use crate::session_registry::{HistorySyncStatus, SessionRegistry};
 use crate::session_resources::{
@@ -463,10 +463,6 @@ fn session_mirror(state: &mut BridgeState) -> &mut SessionRegistry {
 
 fn mirror_error(error: MirrorError) -> Error {
     match error {
-        MirrorError::StaleHistory => Error::invalid_request().data("history revision is stale"),
-        MirrorError::IdempotencyConflict => {
-            Error::invalid_request().data("client intent ID was reused with a different turn")
-        }
         MirrorError::WrongPhase => {
             Error::invalid_request().data("session is not ready to accept this operation")
         }
@@ -1307,27 +1303,8 @@ fn apply_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) 
     if live_session_incarnation(state, &session_id) != Some(snapshot.incarnation) {
         return false;
     }
-    let retained = if snapshot
-        .value
-        .get("released")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let terminal = crate::runtime_state::fold_terminal_snapshot(
-            state
-                .sessions
-                .live(&session_id)
-                .and_then(|session| session.terminals.get(&terminal_id)),
-            &snapshot.value,
-        );
-        session_mirror(state)
-            .retain_terminal_output(&session_id, snapshot.incarnation, &terminal_id, &terminal)
-            .unwrap_or(false)
-    } else {
-        false
-    };
     let epoch = state.sessions.epoch().to_string();
-    let updated = state
+    state
         .sessions
         .upsert_terminal(
             &epoch,
@@ -1342,8 +1319,7 @@ fn apply_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) 
                 crate::runtime_state::TerminalUpsert::Inserted
                     | crate::runtime_state::TerminalUpsert::Updated
             )
-        });
-    retained || updated
+        })
 }
 
 fn publish_terminal_snapshot(state: &mut BridgeState, snapshot: TerminalSnapshot) {
@@ -2400,7 +2376,7 @@ fn finish_materialization(
             session.phase == MirrorPhase::Cold
                 && session.live.is_none()
                 && session.operation.is_none()
-                && session.history_revision.is_none()
+                && session.log == crate::protocol::registry::SessionLog::Unknown
         })
         .map(|session| session.incarnation)
     {
@@ -3652,18 +3628,15 @@ async fn handle_command_inner(
                 }
             };
             let epoch = state.sessions.epoch().to_string();
-            let resume_cache = if operation == "session/load" {
+            if operation == "session/load" {
                 session_mirror(&mut state)
                     .commit_load(&session_id, attachment_incarnation, &request_id)
                     .map_err(mirror_error)?;
-                None
             } else {
-                Some(
-                    session_mirror(&mut state)
-                        .commit_attachment_cache(&session_id, attachment_incarnation, &request_id)
-                        .map_err(mirror_error)?,
-                )
-            };
+                session_mirror(&mut state)
+                    .commit_attachment_cache(&session_id, attachment_incarnation, &request_id)
+                    .map_err(mirror_error)?;
+            }
             let completed = if reload {
                 state.sessions.complete_reload(
                     &epoch,
@@ -3726,12 +3699,13 @@ async fn handle_command_inner(
                     &cancellation,
                     &session_id,
                     attachment_incarnation,
-                    AttachmentHistoryFallback::Received {
-                        updates: resume_cache.as_ref().map(|snapshot| snapshot.updates()).unwrap_or(&[]),
-                        notice: "Only context received while resuming is available; earlier history may be missing.",
-                    },
-                    history_owner.as_ref().expect("resume registers its history flow"),
-                    ingress.as_ref(), execution, &request_id,
+                    AttachmentHistoryFallback::Received,
+                    history_owner
+                        .as_ref()
+                        .expect("resume registers its history flow"),
+                    ingress.as_ref(),
+                    execution,
+                    &request_id,
                 )
                 .await?;
             }
@@ -3740,7 +3714,7 @@ async fn handle_command_inner(
             let request_id = string_field(&command, "requestId")?.to_string();
             let source_id = string_field(&command, "sessionId")?.to_string();
             require_agent_method("session/fork", &state).await?;
-            let (cwd, source_incarnation, source_baseline) = {
+            let (cwd, source_incarnation, source_log) = {
                 let mut state = state.lock().await;
                 let source = state.sessions.active_session(&source_id).ok_or_else(|| {
                     Error::invalid_params()
@@ -3753,10 +3727,12 @@ async fn handle_command_inner(
                     .map(PathBuf::from)
                     .unwrap_or_else(|| source.live.cwd.clone());
                 let source_incarnation = source.state.incarnation;
-                let source_baseline = session_mirror(&mut state)
-                    .view(&source_id, source_incarnation)
-                    .map_err(mirror_error)?
-                    .baseline;
+                // Without a replay of its own, the target starts from the
+                // source's completed turns.
+                let source_log = match &source.state.log {
+                    crate::protocol::registry::SessionLog::Known(log) => Some(log.clone()),
+                    crate::protocol::registry::SessionLog::Unknown => None,
+                };
                 reserve_session_operation(
                     &mut state,
                     &source_id,
@@ -3789,7 +3765,7 @@ async fn handle_command_inner(
                     .supersede_history_sync(&source_id, source_incarnation);
                 refresh_observer_timers(&mut state);
                 state.pending_creations += 1;
-                (cwd, source_incarnation, source_baseline)
+                (cwd, source_incarnation, source_log)
             };
             let owner = rpc_owner(
                 &epoch,
@@ -3894,12 +3870,13 @@ async fn handle_command_inner(
                     return Err(error);
                 }
             };
-            let target_replay = conversation_notification_values(&early_updates);
-            let fork_cache = (!target_replay.is_empty()).then(|| target_replay.clone());
-            let cache_notice = if target_replay.is_empty() {
-                "Showing a snapshot of the source session from memory; branch history may differ."
+            let target_history = conversation_notification_values(&early_updates);
+            let target_log = if target_history.is_empty() {
+                source_log
             } else {
-                "Only context received while forking is available; earlier branch history may be missing."
+                Some(Arc::new(crate::protocol::canon::TurnLog::from_replay(
+                    &target_history,
+                )))
             };
             let target_replay = Some(notification_values(&early_updates));
             let epoch = state.sessions.epoch().to_string();
@@ -3954,13 +3931,9 @@ async fn handle_command_inner(
 
             session_mirror(&mut state).register_cold(session_id.clone(), incarnation);
             // The response claim is about to release subsequent target messages.
-            // Give those messages an installed baseline before making the target routable.
-            let cached_updates = fork_cache
-                .as_deref()
-                .unwrap_or_else(|| source_baseline.updates());
-            let notice = attachment_cache_notice(cached_updates, cache_notice);
+            // Give the target its log before making it routable.
             session_mirror(&mut state)
-                .use_cached_history(&session_id, incarnation, cached_updates, notice.to_string())
+                .use_cached_history(&session_id, incarnation, target_log)
                 .map_err(mirror_error)?;
             state
                 .sessions
@@ -4457,7 +4430,6 @@ async fn handle_command_inner(
             let request_id = string_field(&command, "requestId")?.to_string();
             let runtime_operation_id = request_id.clone();
             let client_intent_id = string_field(&command, "clientIntentId")?.to_string();
-            let expected_history_revision = string_field(&command, "historyRevision")?;
             let session_id = string_field(&command, "sessionId")?.to_string();
             let prompt_value = command
                 .get("prompt")
@@ -4486,23 +4458,19 @@ async fn handle_command_inner(
                             .data(format!("unknown or inactive session: {session_id}"))
                     })?;
                 let epoch = state.sessions.epoch().to_string();
-                let mirror_operation_id = match state
+                let mirror_operation_id = state
                     .sessions
                     .admit_session_turn(
                         &epoch,
                         &session_id,
                         incarnation,
-                        expected_history_revision,
                         &client_intent_id,
                         runtime_prompt,
                     )
                     .map_err(|error| match error {
                         SessionTurnError::History(error) => mirror_error(error),
                         SessionTurnError::Live(error) => runtime_state_error(error),
-                    })? {
-                    TurnAdmission::Accepted { operation_id } => operation_id,
-                    TurnAdmission::Duplicate { .. } => return Ok(()),
-                };
+                    })?;
                 // The accepted turn owns the projection now: an optional
                 // history workflow still parked in backoff yields instead of
                 // retrying over this turn's outcome.
@@ -5054,8 +5022,7 @@ fn commit_completed_turn_history(
                 .complete_turn(session_id, incarnation, operation_id, terminal)
                 .map_err(mirror_error)?;
             let commit = session_mirror(state)
-                .commit_completed_turn_from_memory(session_id, incarnation, operation_id)
-                .map(|_| ())
+                .commit_completed_turn(session_id, incarnation, operation_id)
                 .map_err(mirror_error);
             if let Err(error) = &commit {
                 session_mirror(state)
@@ -5080,23 +5047,14 @@ fn commit_completed_turn_history(
     }
 }
 
+/// Without a replay the session goes on with the log it has.
 #[derive(Clone, Copy)]
-enum AttachmentHistoryFallback<'a> {
-    Received {
-        updates: &'a [Value],
-        notice: &'a str,
-    },
+enum AttachmentHistoryFallback {
+    /// A resume gave its context.
+    Received,
     // The target accepted messages after its creation response; fallback must
-    // preserve its current baseline, never reinstall the pre-response snapshot.
+    // not take a turn or an operation that started since.
     Installed,
-}
-
-fn attachment_cache_notice<'a>(updates: &[Value], notice: &'a str) -> &'a str {
-    if updates.is_empty() {
-        "Earlier messages are unavailable from the Agent and memory cache. You can continue this session."
-    } else {
-        notice
-    }
 }
 
 /// The terminal state of one optional history workflow. Only `Failed` may
@@ -5117,7 +5075,7 @@ async fn synchronize_attached_history(
     cancellation: &CancellationToken,
     session_id: &str,
     incarnation: u64,
-    fallback: AttachmentHistoryFallback<'_>,
+    fallback: AttachmentHistoryFallback,
     flow: &HistorySyncOwner,
     ingress: Option<&IngressSender>,
     execution: &mut Option<ExecutionTurn>,
@@ -5199,39 +5157,15 @@ async fn synchronize_attached_history(
     {
         return Ok(());
     }
-    match fallback {
-        AttachmentHistoryFallback::Received { updates, notice } => {
-            session_mirror(&mut state)
-                .use_cached_history(
-                    session_id,
-                    incarnation,
-                    updates,
-                    attachment_cache_notice(updates, notice).to_string(),
-                )
-                .map_err(mirror_error)?;
-        }
-        AttachmentHistoryFallback::Installed => {
-            let current = session_mirror(&mut state)
-                .view(session_id, incarnation)
-                .map_err(mirror_error)?;
-            if current.session.phase != MirrorPhase::Ready {
-                // Failed optional replay never replaces the installed snapshot.
-                // Retain any idle messages accepted between the response and load.
-                let notice = current
-                    .session
-                    .history_notice
-                    .as_deref()
-                    .unwrap_or("Showing the branch context already received by the bridge.");
-                session_mirror(&mut state)
-                    .use_cached_history(
-                        session_id,
-                        incarnation,
-                        current.baseline.updates(),
-                        notice.to_string(),
-                    )
-                    .map_err(mirror_error)?;
-            }
-        }
+    // A failed optional replay never replaces the log the session has.
+    let ready = state
+        .sessions
+        .state(session_id)
+        .is_some_and(|session| session.phase == MirrorPhase::Ready);
+    if matches!(fallback, AttachmentHistoryFallback::Received) || !ready {
+        session_mirror(&mut state)
+            .use_cached_history(session_id, incarnation, None)
+            .map_err(mirror_error)?;
     }
     Ok(())
 }
@@ -6459,24 +6393,14 @@ mod tests {
     ) -> Result<String, MirrorError> {
         let incarnation = state.sessions.state(session_id).unwrap().incarnation;
         let mirror = session_mirror(state);
-        let revision = mirror
-            .state(session_id)
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
         let prompt = vec![json!({ "type": "text", "text": intent })];
         let epoch = mirror.epoch().to_string();
-        let admission = mirror
-            .admit_session_turn(&epoch, session_id, incarnation, &revision, intent, prompt)
+        mirror
+            .admit_session_turn(&epoch, session_id, incarnation, intent, prompt)
             .map_err(|error| match error {
                 SessionTurnError::History(error) => error,
                 SessionTurnError::Live(error) => panic!("test live admission failed: {error:?}"),
-            })?;
-        let TurnAdmission::Accepted { operation_id } = admission else {
-            panic!("test intent must be newly admitted");
-        };
-        Ok(operation_id)
+            })
     }
 
     fn complete_test_turn(state: &mut BridgeState, session_id: &str, operation_id: &str) {
@@ -6507,7 +6431,7 @@ mod tests {
             .complete_turn(session_id, incarnation, operation_id, terminal)
             .unwrap();
         mirror
-            .commit_completed_turn_from_memory(session_id, incarnation, operation_id)
+            .commit_completed_turn(session_id, incarnation, operation_id)
             .unwrap();
     }
 
@@ -6645,21 +6569,17 @@ mod tests {
             .unwrap()
     }
 
-    /// The updates a session accepted: its history, then the running turn's.
+    /// The updates the session's running turn accepted.
     async fn accepted_updates(state: &BridgeLock, session_id: &str) -> Vec<Value> {
-        let mut state = state.lock().await;
-        let incarnation = state.sessions.state(session_id).unwrap().incarnation;
-        let mut updates = state
-            .sessions
-            .view(session_id, incarnation)
-            .unwrap()
-            .baseline
-            .updates()
-            .to_vec();
-        if let Some(turn) = running_turn(&state, session_id) {
-            updates.extend(turn.updates.iter().map(|update| (**update).clone()));
-        }
-        updates
+        let state = state.lock().await;
+        running_turn(&state, session_id)
+            .map(|turn| {
+                turn.updates
+                    .iter()
+                    .map(|update| (**update).clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn session_info(session_id: &str, cwd: &str) -> SessionInfo {
@@ -7258,9 +7178,14 @@ mod tests {
 
             state.sessions.register_new("new-session", incarnation);
         }
-        let before = accepted_updates(&state, "new-session").await;
+        let accepted = |state: &BridgeState| {
+            session_validation(state, "new-session")
+                .unwrap()
+                .update_count
+        };
+        let before = accepted(&*state.lock().await);
         handle_session_update(notification, &state, &sink, None).await;
-        assert_ne!(accepted_updates(&state, "new-session").await, before);
+        assert_eq!(accepted(&*state.lock().await), before + 1);
     }
 
     #[tokio::test]
@@ -7376,68 +7301,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_session_updates_advance_the_memory_view_without_a_local_prompt() {
-        let mut bridge_state = BridgeState::default();
-        let epoch = bridge_state.sessions.epoch().to_string();
-        let incarnation = bridge_state
-            .sessions
-            .open_new(
-                &epoch,
-                "session",
-                "/workspace",
-                json!({ "sessionId": "session" }),
-            )
-            .unwrap();
-        bridge_state
-            .sessions
-            .start_prompt(&epoch, "session", incarnation, "finished", Vec::new())
-            .unwrap();
-        bridge_state
-            .sessions
-            .complete_prompt(
-                &epoch,
-                "session",
-                incarnation,
-                "finished",
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-
-        session_mirror(&mut bridge_state).register_new("session", incarnation);
-        let previous_revision = session_mirror(&mut bridge_state)
-            .view("session", incarnation)
-            .unwrap()
-            .baseline
-            .revision()
-            .to_string();
-        let before = bridge_state.sessions.session("session");
-        let state = Arc::new(BridgeLock::new(bridge_state));
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink { tx: tx.into() };
-        let late: SessionNotification = serde_json::from_value(json!({
-            "sessionId": "session",
-            "update": {
-                "sessionUpdate": "agent_message_chunk",
-                "messageId": "late-answer",
-                "content": { "type": "text", "text": "too late" }
-            }
-        }))
-        .unwrap();
-
-        handle_session_update(late, &state, &sink, None).await;
-
-        let mut state = state.lock().await;
-        assert_eq!(state.sessions.session("session"), before);
-        let view = session_mirror(&mut state)
-            .view("session", incarnation)
-            .unwrap();
-        assert_eq!(view.baseline.updates().len(), 1);
-        assert_eq!(view.baseline.updates()[0]["content"]["text"], "too late");
-        assert_ne!(view.baseline.revision(), previous_revision);
-        assert!(view.session.active_turn.is_none());
-    }
-
-    #[tokio::test]
     async fn terminal_reference_reduction_does_not_wait_for_the_physical_manager() {
         for valid in [true, false] {
             let workspace = tempfile::tempdir().unwrap();
@@ -7472,9 +7335,11 @@ mod tests {
                 futures::poll!(&mut update).is_ready(),
                 "local reduction cannot wait on terminal I/O"
             );
-            let mut locked = state.lock().await;
-            let view = locked.sessions.view("session", incarnation).unwrap();
-            assert_eq!(view.baseline.updates().len(), usize::from(valid));
+            let locked = state.lock().await;
+            assert_eq!(
+                session_validation(&locked, "session").unwrap().update_count,
+                usize::from(valid)
+            );
         }
     }
 
@@ -7982,11 +7847,19 @@ mod tests {
                 .unwrap()
                 .contains("candidate")
         );
-        let baseline = state
+        state
             .sessions
             .commit_load("session", incarnation, "load")
             .unwrap();
-        assert_eq!(baseline.updates()[0]["content"]["text"], "candidate");
+        let crate::protocol::registry::SessionLog::Known(log) =
+            &state.sessions.state("session").unwrap().log
+        else {
+            panic!("the committed load knows the log");
+        };
+        assert_eq!(
+            serde_json::to_value(&log.entries()[0].turn).unwrap()["reply"][0]["text"],
+            "candidate"
+        );
         state
             .sessions
             .complete_attachment(
@@ -8497,7 +8370,7 @@ mod tests {
                 .operation_id
                 .clone();
             mirror
-                .commit_completed_turn_from_memory("session", incarnation, &operation)
+                .commit_completed_turn("session", incarnation, &operation)
                 .unwrap();
         }
         assert!(

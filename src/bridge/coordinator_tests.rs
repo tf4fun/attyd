@@ -146,15 +146,7 @@ async fn assert_interaction_sequence(
             },
             "the SDK cancellation marker bypassed the captured local delivery"
         );
-        assert!(
-            state
-                .sessions
-                .view(SESSION, incarnation)
-                .unwrap()
-                .baseline
-                .updates()
-                .is_empty()
-        );
+        assert_eq!(accepted_updates(&state), 0);
     }
     coordinator::dispatch_ready(cancel, scheduling, connection, services, false)
         .await
@@ -167,15 +159,7 @@ async fn assert_interaction_sequence(
         let runtime = state.sessions.session(SESSION).unwrap();
         assert!(runtime.permissions.is_empty());
         assert!(runtime.elicitations.is_empty());
-        assert!(
-            state
-                .sessions
-                .view(SESSION, incarnation)
-                .unwrap()
-                .baseline
-                .updates()
-                .is_empty()
-        );
+        assert_eq!(accepted_updates(&state), 0);
     }
 
     let update = next_delivery(scheduling).await;
@@ -190,9 +174,7 @@ async fn assert_interaction_sequence(
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             {
-                let mut state = services.state.lock().await;
-                let view = state.sessions.view(SESSION, incarnation).unwrap();
-                if !view.baseline.updates().is_empty() {
+                if accepted_updates(&*services.state.lock().await) > 0 {
                     break;
                 }
             }
@@ -201,13 +183,12 @@ async fn assert_interaction_sequence(
     })
     .await
     .expect("the session update was applied");
-    let mut state = services.state.lock().await;
-    let view = state.sessions.view(SESSION, incarnation).unwrap();
-    assert_eq!(view.baseline.updates().len(), 1);
-    assert_eq!(
-        view.baseline.updates()[0]["content"]["text"],
-        "After the cancellation."
-    );
+    assert_eq!(accepted_updates(&*services.state.lock().await), 1);
+}
+
+/// The session updates the bridge accepted for the session.
+fn accepted_updates(state: &BridgeState) -> usize {
+    super::session_validation(state, SESSION).map_or(0, |validation| validation.update_count)
 }
 
 async fn run_wire_batch(permission: bool, creation_pending: bool) {

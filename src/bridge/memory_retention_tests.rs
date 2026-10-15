@@ -40,29 +40,17 @@ impl RetentionTurn {
 
     fn start_turn(&mut self, intent: &str) {
         let epoch = self.state.sessions.epoch().to_string();
-        let revision = self
-            .state
-            .sessions
-            .state(SESSION)
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let TurnAdmission::Accepted { operation_id } = self
+        let operation_id = self
             .state
             .sessions
             .admit_session_turn(
                 &epoch,
                 SESSION,
                 self.incarnation,
-                &revision,
                 intent,
                 vec![json!({"type": "text", "text": "Read output"})],
             )
-            .unwrap()
-        else {
-            panic!("a fresh valid turn must be admitted")
-        };
+            .unwrap();
         self.operation_id = operation_id;
     }
 

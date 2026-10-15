@@ -1,58 +1,19 @@
-use std::borrow::Borrow;
 use std::sync::Arc;
 
-use serde::Serialize;
 use serde_json::Value;
 
-use crate::history_cache::{
-    HistoryCacheError, HistorySnapshot, SessionKey, fold_history_update, normalize_history_updates,
-};
+use crate::history_cache::{HistoryCacheError, SessionKey};
 
+use crate::protocol::canon::TurnLog;
+use crate::protocol::registry::SessionLog;
 use crate::runtime_state::SessionOperationKind;
 #[cfg(test)]
 pub(crate) use crate::session_registry::SessionRegistry as SessionMirror;
 use crate::session_registry::{SessionEntry, SessionRegistry};
-use crate::session_state::{CompletedTurnOutcome, SessionAdmission};
+use crate::session_state::SessionAdmission;
 pub(crate) use crate::session_state::{
-    MirrorError, MirrorPhase, SessionState as MirrorSessionState, TurnAdmission, TurnOverlay,
+    MirrorError, MirrorPhase, SessionState as MirrorSessionState, TurnOverlay,
 };
-
-pub(crate) struct SessionView {
-    pub session: SessionHistoryView,
-    pub baseline: Arc<HistorySnapshot>,
-}
-
-/// The history view contains only published fields. In particular, taking a
-/// history snapshot never clones live resource registries or admission state.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionHistoryView {
-    pub session_id: String,
-    pub incarnation: u64,
-    pub view_revision: u64,
-    pub history_revision: Option<String>,
-    pub phase: MirrorPhase,
-    pub active_turn: Option<TurnOverlay>,
-    pub turn_outcomes: Vec<CompletedTurnOutcome>,
-    pub sync_error: Option<String>,
-    pub history_notice: Option<String>,
-}
-
-impl From<&MirrorSessionState> for SessionHistoryView {
-    fn from(state: &MirrorSessionState) -> Self {
-        Self {
-            session_id: state.session_id.clone(),
-            incarnation: state.incarnation,
-            view_revision: state.view_revision,
-            history_revision: state.history_revision.clone(),
-            phase: state.phase,
-            active_turn: state.active_turn.clone(),
-            turn_outcomes: state.turn_outcomes.clone(),
-            sync_error: state.sync_error.clone(),
-            history_notice: state.history_notice.clone(),
-        }
-    }
-}
 
 impl SessionRegistry {
     pub(crate) fn register_cold(&mut self, session_id: impl Into<String>, incarnation: u64) {
@@ -75,22 +36,14 @@ impl SessionRegistry {
                 self.retire_entry(&session_id, previous);
             }
         }
-        let snapshot = self
-            .history
-            .install_empty(SessionKey::new(session_id.clone(), incarnation));
         let mut state = if ready {
-            MirrorSessionState::ready(
-                session_id.clone(),
-                incarnation,
-                snapshot.revision().to_string(),
-            )
+            MirrorSessionState::ready(session_id.clone(), incarnation)
         } else {
             MirrorSessionState::cold(session_id.clone(), incarnation)
         };
         if let Some(entry) = self.sessions.get_mut(&session_id) {
             state.live = entry.state.live.take();
             state.operation = entry.state.operation.take();
-            state.view_revision = entry.state.view_revision;
             entry.state = state;
         } else {
             self.sessions.insert(session_id, SessionEntry::new(state));
@@ -147,7 +100,6 @@ impl SessionRegistry {
         }
         session.load_attempt = Some(attempt_id);
         session.sync_error = None;
-        session.view_revision = next_revision(session.view_revision);
         Ok(())
     }
 
@@ -173,15 +125,7 @@ impl SessionRegistry {
         attempt_id: &str,
         update: Value,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
-        if session.load_attempt.as_deref() != Some(attempt_id)
-            || !matches!(
-                session.phase,
-                MirrorPhase::Loading | MirrorPhase::Reconciling
-            )
-        {
-            return Err(MirrorError::OperationMismatch);
-        }
+        self.require_load(session_id, incarnation, attempt_id)?;
         self.history.append_candidate(
             &SessionKey::new(session_id, incarnation),
             attempt_id,
@@ -196,15 +140,7 @@ impl SessionRegistry {
         incarnation: u64,
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
-        if session.load_attempt.as_deref() != Some(attempt_id)
-            || !matches!(
-                session.phase,
-                MirrorPhase::Loading | MirrorPhase::Reconciling
-            )
-        {
-            return Err(MirrorError::OperationMismatch);
-        }
+        self.require_load(session_id, incarnation, attempt_id)?;
         self.history.poison_candidate(
             &SessionKey::new(session_id, incarnation),
             attempt_id,
@@ -219,69 +155,26 @@ impl SessionRegistry {
         session_id: &str,
         incarnation: u64,
         attempt_id: &str,
-    ) -> Result<Arc<HistorySnapshot>, MirrorError> {
-        let snapshot = self.commit_history(session_id, incarnation, attempt_id)?;
-        self.replace_session_log(session_id, snapshot.updates());
-        Ok(snapshot)
+    ) -> Result<(), MirrorError> {
+        let replay = self.commit_history(session_id, incarnation, attempt_id)?;
+        self.replace_session_log(session_id, &replay);
+        Ok(())
     }
 
+    /// Ends a load with its replay; a failed or stale load leaves the log.
     fn commit_history(
         &mut self,
         session_id: &str,
         incarnation: u64,
         attempt_id: &str,
-    ) -> Result<Arc<HistorySnapshot>, MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
-        if session.load_attempt.as_deref() != Some(attempt_id)
-            || !matches!(
-                session.phase,
-                MirrorPhase::Loading | MirrorPhase::Reconciling
-            )
-        {
-            return Err(MirrorError::OperationMismatch);
-        }
-        let load_phase = session.phase;
-        let key = SessionKey::new(session_id, incarnation);
-        if session.phase == MirrorPhase::Reconciling {
-            let prior = self
-                .history
-                .peek(&key)
-                .ok_or(MirrorError::InconsistentHistory)?;
-            let replay = self.history.candidate(&key, attempt_id)?;
-            let data = replay.lock();
-            let candidate = data.updates()?;
-            let Some(prefix_end) = history_prefix_end(candidate, prior.updates()) else {
-                return Err(MirrorError::InconsistentHistory);
-            };
-            let turn = session
-                .active_turn
-                .as_ref()
-                .ok_or(MirrorError::InconsistentHistory)?;
-            if prefix_end >= candidate.len()
-                || !replay_suffix_starts_with_prompt(&candidate[prefix_end..], &turn.prompt)
-            {
-                return Err(MirrorError::InconsistentHistory);
-            }
-            if !replay_contains_completed_turn(&candidate[prefix_end..], &turn.updates) {
-                return Err(MirrorError::InconsistentHistory);
-            }
-        }
-        session.validate_history_commit()?;
-        let old_bytes = session.active_overlay_bytes;
-        let snapshot = self.history.commit_candidate(&key, attempt_id)?;
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .map(|entry| &mut entry.state)
-            .expect("session was validated above");
-        session.history_committed(
-            snapshot.revision().to_string(),
-            snapshot.updates().len(),
-            load_phase == MirrorPhase::Loading,
-        );
-        self.overlay_bytes = self.overlay_bytes.saturating_sub(old_bytes);
-        self.prune_retained_terminals(&key, snapshot.updates());
-        Ok(snapshot)
+    ) -> Result<Vec<Value>, MirrorError> {
+        self.require_load(session_id, incarnation, attempt_id)?;
+        let replay = self
+            .history
+            .commit_candidate(&SessionKey::new(session_id, incarnation), attempt_id)?;
+        self.require_state_mut(session_id, incarnation)?
+            .history_settled();
+        Ok(replay)
     }
 
     // Resume notifications are useful context, but do not promise a full replay:
@@ -291,34 +184,29 @@ impl SessionRegistry {
         session_id: &str,
         incarnation: u64,
         attempt_id: &str,
-    ) -> Result<Arc<HistorySnapshot>, MirrorError> {
-        let snapshot = self.commit_history(session_id, incarnation, attempt_id)?;
-        self.adopt_session_log(session_id, snapshot.updates());
+    ) -> Result<(), MirrorError> {
+        let replay = self.commit_history(session_id, incarnation, attempt_id)?;
+        self.adopt_session_log(session_id, &replay);
         self.require_state_mut(session_id, incarnation)?.phase = MirrorPhase::Cold;
-        Ok(snapshot)
+        Ok(())
     }
 
+    /// The session goes on with the log it has, or with `log` if it knows
+    /// none: the Agent gave no replay (protocol S1).
     pub(crate) fn use_cached_history(
         &mut self,
         session_id: &str,
         incarnation: u64,
-        updates: &[Value],
-        notice: String,
+        log: Option<Arc<TurnLog>>,
     ) -> Result<(), MirrorError> {
         let session = self.require_state_mut(session_id, incarnation)?;
         if session.active_turn.is_some() || session.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);
         }
-        session.phase = MirrorPhase::Cold;
-        let attempt = "bridge-cache-fallback";
-        self.begin_load(session_id, incarnation, attempt)?;
-        for update in updates {
-            self.append_load_update(session_id, incarnation, attempt, update.clone())?;
+        if matches!(session.log, SessionLog::Unknown) {
+            session.log = SessionLog::Known(log.unwrap_or_default());
         }
-        let snapshot = self.commit_history(session_id, incarnation, attempt)?;
-        self.adopt_session_log(session_id, snapshot.updates());
-        self.require_state_mut(session_id, incarnation)?
-            .history_notice = Some(notice);
+        session.history_settled();
         Ok(())
     }
 
@@ -336,11 +224,7 @@ impl SessionRegistry {
         }
         let key = SessionKey::new(session_id, incarnation);
         self.history.abort_candidate(&key, attempt_id)?;
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .map(|entry| &mut entry.state)
-            .expect("session was validated above");
+        let session = self.require_state_mut(session_id, incarnation)?;
         let origin = session.load_origin.take();
         session.load_attempt = None;
         session.sync_error = Some(message.into());
@@ -354,37 +238,23 @@ impl SessionRegistry {
         } else {
             MirrorPhase::Blocked
         };
-        session.view_revision = next_revision(session.view_revision);
         Ok(())
     }
 
+    /// Admits a prompt's turn; returns its operation.
     pub(crate) fn start_turn(
         &mut self,
         session_id: &str,
         incarnation: u64,
-        expected_history_revision: &str,
         client_intent_id: &str,
         prompt: Vec<Value>,
-    ) -> Result<TurnAdmission, MirrorError> {
+    ) -> Result<String, MirrorError> {
         let next_operation = self.next_operation.wrapping_add(1).max(1);
         let operation_id = format!("{}:{}", self.epoch, next_operation);
-        let session = self.require_state_mut(session_id, incarnation)?;
-        let old_bytes = session.active_overlay_bytes;
-        let admission = session.admit_turn(
-            operation_id,
-            expected_history_revision,
-            client_intent_id,
-            prompt,
-        )?;
-        let new_bytes = session.active_overlay_bytes;
-        if matches!(admission, TurnAdmission::Accepted { .. }) {
-            self.next_operation = next_operation;
-        }
-        self.overlay_bytes = self
-            .overlay_bytes
-            .saturating_sub(old_bytes)
-            .saturating_add(new_bytes);
-        Ok(admission)
+        self.require_state_mut(session_id, incarnation)?
+            .admit_turn(operation_id.clone(), client_intent_id, prompt)?;
+        self.next_operation = next_operation;
+        Ok(operation_id)
     }
 
     pub(crate) fn append_turn_update(
@@ -394,110 +264,28 @@ impl SessionRegistry {
         operation_id: &str,
         update: Value,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state_mut(session_id, incarnation)?;
-        let old_bytes = session.active_overlay_bytes;
-        session.append_turn_update(operation_id, update)?;
-        let new_bytes = session.active_overlay_bytes;
-        self.overlay_bytes = self
-            .overlay_bytes
-            .saturating_sub(old_bytes)
-            .saturating_add(new_bytes);
-        Ok(())
+        self.require_state_mut(session_id, incarnation)?
+            .append_turn_update(operation_id, update)
     }
 
+    /// A conversation update outside a turn: a completed turn being
+    /// reconciled keeps it; otherwise no turn holds it, and the log is only
+    /// appended by turns and rebuilt by loads.
     pub(crate) fn append_session_update(
         &mut self,
         session_id: &str,
         incarnation: u64,
         update: Value,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
+        let session = self.require_state_mut(session_id, incarnation)?;
         if session.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);
         }
-        if session.phase == MirrorPhase::Reconciling {
-            let old_bytes = session.active_overlay_bytes;
-            let session = self.require_state_mut(session_id, incarnation)?;
-            session.append_reconciling_update(update)?;
-            let new_bytes = session.active_overlay_bytes;
-            self.overlay_bytes = self
-                .overlay_bytes
-                .saturating_sub(old_bytes)
-                .saturating_add(new_bytes);
-            return Ok(());
+        match session.phase {
+            MirrorPhase::Reconciling => session.append_reconciling_update(update),
+            MirrorPhase::Ready => Ok(()),
+            _ => Err(MirrorError::WrongPhase),
         }
-        if session.phase != MirrorPhase::Ready {
-            return Err(MirrorError::WrongPhase);
-        }
-        let snapshot = self
-            .history
-            .append_committed_updates(&SessionKey::new(session_id, incarnation), &[update])?;
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .map(|entry| &mut entry.state)
-            .expect("validated session");
-        session.history_revision = Some(snapshot.revision().to_string());
-        session.view_revision = next_revision(session.view_revision);
-        Ok(())
-    }
-
-    pub(crate) fn retain_terminal_output(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-        terminal_id: &str,
-        terminal: &Value,
-    ) -> Result<bool, MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
-        if terminal.get("released").and_then(Value::as_bool) != Some(true)
-            || terminal.get("outputAppend").and_then(Value::as_bool) == Some(true)
-        {
-            return Ok(false);
-        }
-        let key = SessionKey::new(session_id, incarnation);
-        if self
-            .retained_terminals
-            .get(&key)
-            .is_some_and(|terminals| terminals.contains_key(terminal_id))
-        {
-            return Ok(false);
-        }
-        let referenced = session.active_turn.as_ref().is_some_and(|turn| {
-            turn.updates
-                .iter()
-                .any(|update| references_terminal(update, terminal_id))
-        }) || self.history.peek(&key).is_some_and(|history| {
-            history
-                .updates()
-                .iter()
-                .any(|update| references_terminal(update, terminal_id))
-        });
-        if !referenced {
-            return Ok(false);
-        }
-        let retained = serde_json::json!({
-            "sessionId": session_id,
-            "terminalId": terminal_id,
-            "output": terminal.get("output").cloned().unwrap_or(Value::String(String::new())),
-            "truncated": terminal.get("truncated").cloned().unwrap_or(Value::Bool(false)),
-            "exitStatus": terminal.get("exitStatus").cloned().unwrap_or(Value::Null),
-            "released": true,
-        });
-        self.retained_terminal_bytes = self
-            .retained_terminal_bytes
-            .saturating_add(serialized_len(&retained));
-        self.retained_terminals
-            .entry(key)
-            .or_default()
-            .insert(terminal_id.to_string(), retained);
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .map(|entry| &mut entry.state)
-            .expect("session was validated above");
-        session.view_revision = next_revision(session.view_revision);
-        Ok(true)
     }
 
     pub(crate) fn complete_turn(
@@ -507,89 +295,30 @@ impl SessionRegistry {
         operation_id: &str,
         terminal: Value,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state_mut(session_id, incarnation)?;
-        let old_bytes = session.active_overlay_bytes;
-        session.complete_turn(operation_id, terminal)?;
-        let new_bytes = session.active_overlay_bytes;
-        self.overlay_bytes = self
-            .overlay_bytes
-            .saturating_sub(old_bytes)
-            .saturating_add(new_bytes);
-        Ok(())
+        self.require_state_mut(session_id, incarnation)?
+            .complete_turn(operation_id, terminal)
     }
 
-    pub(crate) fn commit_completed_turn_from_memory(
+    /// The completed turn is in the session's log: the session is ready.
+    pub(crate) fn commit_completed_turn(
         &mut self,
         session_id: &str,
         incarnation: u64,
         operation_id: &str,
-    ) -> Result<Arc<HistorySnapshot>, MirrorError> {
-        let session = self.require_state(session_id, incarnation)?;
+    ) -> Result<(), MirrorError> {
+        let session = self.require_state_mut(session_id, incarnation)?;
         if session.phase != MirrorPhase::Reconciling {
             return Err(MirrorError::WrongPhase);
         }
-        let turn = session
+        if session
             .active_turn
             .as_ref()
-            .filter(|turn| turn.operation_id == operation_id && turn.terminal.is_some())
-            .ok_or(MirrorError::OperationMismatch)?
-            .clone();
-        session
-            .history_revision
-            .as_ref()
-            .ok_or(MirrorError::InconsistentHistory)?;
-        session.validate_history_commit()?;
-        let active_overlay_bytes = session.active_overlay_bytes;
-        let mut suffix = if replay_suffix_starts_with_prompt(&turn.updates, &turn.prompt) {
-            // Prefer the Agent's echo, including message IDs and metadata. This
-            // comparison is scoped to this accepted prompt, never earlier turns.
-            Vec::new()
-        } else {
-            turn.prompt
-                .iter()
-                .cloned()
-                .map(|content| {
-                    serde_json::json!({
-                        "sessionUpdate": "user_message_chunk",
-                        "content": content,
-                        "_meta": {
-                            "attyd": {
-                                "turnOperationId": turn.operation_id,
-                            }
-                        },
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        suffix.extend(turn.updates.iter().map(|update| (**update).clone()));
-        let snapshot = self
-            .history
-            .append_committed_updates(&SessionKey::new(session_id, incarnation), &suffix)?;
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .map(|entry| &mut entry.state)
-            .expect("session was validated above");
-        session.history_committed(
-            snapshot.revision().to_string(),
-            snapshot.updates().len(),
-            false,
-        );
-        self.overlay_bytes = self.overlay_bytes.saturating_sub(active_overlay_bytes);
-        Ok(snapshot)
-    }
-
-    pub(crate) fn view(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<SessionView, MirrorError> {
-        let session = SessionHistoryView::from(self.require_state(session_id, incarnation)?);
-        let baseline = self
-            .history
-            .snapshot(&SessionKey::new(session_id, incarnation))
-            .ok_or(MirrorError::WrongPhase)?;
-        Ok(SessionView { session, baseline })
+            .is_none_or(|turn| turn.operation_id != operation_id || turn.terminal.is_none())
+        {
+            return Err(MirrorError::OperationMismatch);
+        }
+        session.history_settled();
+        Ok(())
     }
 
     pub(crate) fn state(&self, session_id: &str) -> Option<&MirrorSessionState> {
@@ -657,11 +386,8 @@ impl SessionRegistry {
         incarnation: u64,
         operation_id: &str,
     ) -> Result<(), MirrorError> {
-        let session = self.require_state_mut(session_id, incarnation)?;
-        let old_bytes = session.active_overlay_bytes;
-        session.abort_turn(operation_id)?;
-        self.overlay_bytes = self.overlay_bytes.saturating_sub(old_bytes);
-        Ok(())
+        self.require_state_mut(session_id, incarnation)?
+            .abort_turn(operation_id)
     }
 
     pub(crate) fn block_turn(
@@ -673,31 +399,6 @@ impl SessionRegistry {
     ) -> Result<(), MirrorError> {
         self.require_state_mut(session_id, incarnation)?
             .block_turn(operation_id, message)
-    }
-
-    pub(crate) fn view_value(
-        &mut self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<Value, MirrorError> {
-        let view = self.view(session_id, incarnation)?;
-        let digest = view
-            .baseline
-            .digest()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        Ok(serde_json::json!({
-            "bridgeEpoch": self.epoch,
-            "session": view.session,
-            "terminals": self.retained_terminals.get(&SessionKey::new(session_id, incarnation)).cloned().unwrap_or_default(),
-            "baseline": {
-                "revision": view.baseline.revision(),
-                "updates": view.baseline.updates(),
-                "bytes": view.baseline.bytes(),
-                "digest": digest,
-            }
-        }))
     }
 
     pub(crate) fn remove(&mut self, session_id: &str, incarnation: u64) {
@@ -713,62 +414,44 @@ impl SessionRegistry {
         }
     }
 
-    /// Releases this incarnation's baseline, load candidate, overlay, and retained
-    /// terminal output. Live lifecycle and the operation owner remain available
-    /// until their own transition completes; a stale cleanup cannot touch a new
-    /// incarnation. Runtime replacement calls this before installing its entry.
+    /// Releases this incarnation's log, load candidate and turn. Live
+    /// lifecycle and the operation owner remain available until their own
+    /// transition completes; a stale cleanup cannot touch a new incarnation.
+    /// Runtime replacement calls this before installing its entry.
     pub(crate) fn clear_history_for_replacement(&mut self, session_id: &str, incarnation: u64) {
-        if self
-            .sessions
-            .get(session_id)
-            .is_none_or(|entry| entry.state.incarnation != incarnation)
-        {
-            return;
-        }
-        let session = self
+        let Some(session) = self
             .sessions
             .get_mut(session_id)
             .map(|entry| &mut entry.state)
-            .expect("validated session");
-        self.overlay_bytes = self
-            .overlay_bytes
-            .saturating_sub(session.active_overlay_bytes);
+            .filter(|session| session.incarnation == incarnation)
+        else {
+            return;
+        };
         let mut cleared = MirrorSessionState::cold(session_id, incarnation);
         cleared.live = session.live.take();
         cleared.operation = session.operation.take();
-        cleared.view_revision = next_revision(session.view_revision);
         *session = cleared;
-        self.remove_retained_terminals(&SessionKey::new(session_id, incarnation));
         self.history
             .remove(&SessionKey::new(session_id, incarnation));
     }
 
-    fn remove_retained_terminals(&mut self, key: &SessionKey) {
-        if let Some(terminals) = self.retained_terminals.remove(key) {
-            for terminal in terminals.values() {
-                self.retained_terminal_bytes = self
-                    .retained_terminal_bytes
-                    .saturating_sub(serialized_len(terminal));
-            }
+    /// The session's load `attempt_id` is in flight.
+    fn require_load(
+        &self,
+        session_id: &str,
+        incarnation: u64,
+        attempt_id: &str,
+    ) -> Result<(), MirrorError> {
+        let session = self.require_state(session_id, incarnation)?;
+        if session.load_attempt.as_deref() != Some(attempt_id)
+            || !matches!(
+                session.phase,
+                MirrorPhase::Loading | MirrorPhase::Reconciling
+            )
+        {
+            return Err(MirrorError::OperationMismatch);
         }
-    }
-
-    fn prune_retained_terminals(&mut self, key: &SessionKey, updates: &[Value]) {
-        if let Some(terminals) = self.retained_terminals.get_mut(key) {
-            terminals.retain(|terminal_id, terminal| {
-                if updates
-                    .iter()
-                    .any(|update| references_terminal(update, terminal_id))
-                {
-                    true
-                } else {
-                    self.retained_terminal_bytes = self
-                        .retained_terminal_bytes
-                        .saturating_sub(serialized_len(terminal));
-                    false
-                }
-            });
-        }
+        Ok(())
     }
 
     fn require_state(
@@ -802,139 +485,6 @@ impl SessionRegistry {
         }
         Ok(session)
     }
-}
-
-fn serialized_len(value: &impl Serialize) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |value| value.len())
-}
-
-fn next_revision(current: u64) -> u64 {
-    current.wrapping_add(1).max(1)
-}
-
-fn references_terminal(update: &Value, terminal_id: &str) -> bool {
-    update
-        .get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|content| {
-            content.iter().any(|item| {
-                item.get("type").and_then(Value::as_str) == Some("terminal")
-                    && item.get("terminalId").and_then(Value::as_str) == Some(terminal_id)
-            })
-        })
-}
-
-fn replay_suffix_starts_with_prompt<T: Borrow<Value>>(updates: &[T], prompt: &[Value]) -> bool {
-    let replay_prompt = updates
-        .iter()
-        .take_while(|update| {
-            (*update)
-                .borrow()
-                .get("sessionUpdate")
-                .and_then(Value::as_str)
-                == Some("user_message_chunk")
-        })
-        .filter_map(|update| Borrow::<Value>::borrow(update).get("content").cloned())
-        .collect::<Vec<_>>();
-    normalize_prompt_blocks(&replay_prompt) == normalize_prompt_blocks(prompt)
-}
-
-fn history_prefix_end(candidate: &[Value], prior: &[Value]) -> Option<usize> {
-    // IDs/chunk boundaries may change on load. Normalize only this comparison;
-    // never discard identities from the snapshot installed for the browser.
-    let prior = normalize_history_updates(
-        &prior
-            .iter()
-            .map(history_update_identity)
-            .collect::<Vec<_>>(),
-    )
-    .ok()?;
-    if prior.is_empty() {
-        return Some(0);
-    }
-    let mut prefix = Vec::new();
-    for (index, update) in candidate.iter().enumerate() {
-        prefix = fold_history_update(&prefix, &history_update_identity(update)).ok()?;
-        if prefix == prior {
-            return Some(index + 1);
-        }
-    }
-    None
-}
-
-fn replay_contains_completed_turn<T: Borrow<Value>>(replay: &[Value], live_updates: &[T]) -> bool {
-    fn durable(update: &Value) -> bool {
-        matches!(
-            update.get("sessionUpdate").and_then(Value::as_str),
-            Some("agent_message_chunk" | "tool_call" | "tool_call_update")
-        )
-    }
-
-    let replay = replay
-        .iter()
-        .filter(|update| durable(update))
-        .map(history_update_identity)
-        .collect::<Vec<_>>();
-    let live = live_updates
-        .iter()
-        .map(Borrow::borrow)
-        .filter(|update| durable(update))
-        .map(history_update_identity)
-        .collect::<Vec<_>>();
-    let Ok(replay) = normalize_history_updates(&replay) else {
-        return false;
-    };
-    let Ok(live) = normalize_history_updates(&live) else {
-        return false;
-    };
-    let replay = replay
-        .iter()
-        .map(history_update_identity)
-        .collect::<Vec<_>>();
-    let live = live.iter().map(history_update_identity).collect::<Vec<_>>();
-    let mut replay = replay.iter();
-    live.iter()
-        .all(|expected| replay.by_ref().any(|candidate| candidate == expected))
-}
-
-fn history_update_identity(update: &Value) -> Value {
-    let mut update = update.clone();
-    if let Some(update) = update.as_object_mut() {
-        // ACP message IDs correlate streamed chunks within one connection. They are
-        // optional and are not a durable history identity across session/load.
-        update.remove("messageId");
-    }
-    update
-}
-
-fn normalize_prompt_blocks(blocks: &[Value]) -> Vec<Value> {
-    let mut normalized: Vec<Value> = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let Some(text) = block
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|_| block.get("type").and_then(Value::as_str) == Some("text"))
-        else {
-            normalized.push(block.clone());
-            continue;
-        };
-        if let Some(previous) = normalized.last_mut()
-            && previous.get("type").and_then(Value::as_str) == Some("text")
-            && {
-                let mut shape = block.clone();
-                shape["text"] = Value::Null;
-                let mut previous_shape = previous.clone();
-                previous_shape["text"] = Value::Null;
-                shape == previous_shape
-            }
-        {
-            let previous_text = previous.get("text").and_then(Value::as_str).unwrap_or("");
-            previous["text"] = Value::String(format!("{previous_text}{text}"));
-        } else {
-            normalized.push(block.clone());
-        }
-    }
-    normalized
 }
 
 #[cfg(test)]
@@ -973,15 +523,9 @@ mod tests {
                 registry.can_begin("session", incarnation, SessionAdmission::Prompt),
                 Err(MirrorError::WrongPhase)
             );
-            assert!(
-                registry.view_value("session", incarnation).unwrap()["session"]
-                    .get("live")
-                    .is_none()
-            );
         }
         assert_eq!(registry.sessions.len(), 2);
         assert_eq!(registry.live_snapshot().sessions.len(), 1);
-        assert_eq!(registry.history.stats().snapshots, 2);
     }
 
     #[test]
@@ -1015,19 +559,7 @@ mod tests {
         registry.remove("session", incarnation);
 
         assert_eq!(registry.session("session"), Some(live.clone()));
-        assert!(
-            registry
-                .state("session")
-                .unwrap()
-                .history_revision
-                .is_none()
-        );
-        assert!(
-            registry
-                .history
-                .peek(&SessionKey::new("session", incarnation))
-                .is_none()
-        );
+        assert_eq!(registry.state("session").unwrap().log, SessionLog::Unknown);
         registry
             .close_session("epoch", "session", incarnation, "close")
             .unwrap();
@@ -1053,50 +585,15 @@ mod tests {
     }
 
     #[test]
-    fn history_replacement_releases_every_allocation_without_retiring_the_live_owner() {
+    fn history_replacement_releases_the_turn_and_load_without_retiring_the_live_owner() {
         let mut registry = mirror();
         let incarnation = registry
             .open_new_with_replay("epoch", "session", "/workspace", json!({}), vec![])
             .unwrap();
         registry.register_new("session", incarnation);
-        registry
-            .append_session_update(
-                "session",
-                incarnation,
-                json!({
-                    "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "run",
-                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
-                }),
-            )
+        let operation_id = registry
+            .start_turn("session", incarnation, "intent", text_prompt("next"))
             .unwrap();
-        registry
-            .retain_terminal_output(
-                "session",
-                incarnation,
-                "terminal",
-                &json!({
-                    "output": "retained output", "released": true,
-                }),
-            )
-            .unwrap();
-        let revision = registry
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let TurnAdmission::Accepted { operation_id } = registry
-            .start_turn(
-                "session",
-                incarnation,
-                &revision,
-                "intent",
-                text_prompt("next"),
-            )
-            .unwrap()
-        else {
-            panic!("turn must be admitted");
-        };
         registry
             .complete_prompt(
                 "epoch",
@@ -1125,27 +622,19 @@ mod tests {
                 user_update("candidate payload"),
             )
             .unwrap();
-        let old_key = SessionKey::new("session", incarnation);
-        assert!(registry.history.stats().snapshot_bytes > 0);
-        assert!(registry.history.stats().candidate_bytes > 0);
-        assert!(registry.overlay_bytes > 0);
-        assert!(registry.retained_terminal_bytes > 0);
+        assert_eq!(registry.history.candidates(), 1);
 
         let live = registry.live("session").unwrap().clone();
         registry.clear_history_for_replacement("session", incarnation);
 
-        assert!(registry.history.peek(&old_key).is_none());
-        assert_eq!(registry.history.stats().candidates, 0);
-        assert_eq!(registry.history.stats().snapshot_bytes, 0);
-        assert_eq!(registry.history.stats().candidate_bytes, 0);
-        assert_eq!(registry.overlay_bytes, 0);
-        assert_eq!(registry.retained_terminal_bytes, 0);
-        assert!(registry.retained_terminals.is_empty());
-        assert_eq!(registry.state("session").unwrap().incarnation, incarnation);
+        assert_eq!(registry.history.candidates(), 0);
+        let state = registry.state("session").unwrap();
+        assert_eq!(state.incarnation, incarnation);
         assert_eq!(registry.live("session"), Some(&live));
-        assert!(registry.state("session").unwrap().active_turn.is_none());
-        assert!(registry.state("session").unwrap().load_attempt.is_none());
-        assert!(registry.state("session").unwrap().load_origin.is_none());
+        assert!(state.active_turn.is_none());
+        assert!(state.load_attempt.is_none());
+        assert!(state.load_origin.is_none());
+        assert_eq!(state.log, SessionLog::Unknown);
         registry.clear_history_for_replacement("session", incarnation + 1);
         assert_eq!(registry.live("session"), Some(&live));
     }
@@ -1154,18 +643,9 @@ mod tests {
     fn session_updates_preserve_reconciling_load_and_incarnation_boundaries() {
         let mut mirror = mirror();
         mirror.register_new("session", 1);
-        let revision = mirror
-            .view("session", 1)
-            .unwrap()
-            .baseline
-            .revision()
-            .to_string();
-        let TurnAdmission::Accepted { operation_id } = mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("Run"))
-            .unwrap()
-        else {
-            panic!("new intent")
-        };
+        let operation_id = mirror
+            .start_turn("session", 1, "intent", text_prompt("Run"))
+            .unwrap();
         mirror.append_turn_update("session", 1, &operation_id, json!({ "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run", "status": "in_progress" })).unwrap();
         mirror
             .complete_turn(
@@ -1176,16 +656,18 @@ mod tests {
             )
             .unwrap();
         mirror.append_session_update("session", 1, json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed" })).unwrap();
-        let reconciling = mirror.view("session", 1).unwrap();
-        assert!(reconciling.baseline.updates().is_empty());
-        assert_eq!(
-            reconciling.session.active_turn.unwrap().terminal,
-            Some(json!({ "stopReason": "cancelled" }))
-        );
-        let baseline = mirror
-            .commit_completed_turn_from_memory("session", 1, &operation_id)
+        let turn = mirror
+            .state("session")
+            .unwrap()
+            .active_turn
+            .clone()
             .unwrap();
-        assert_eq!(baseline.updates()[1]["status"], "completed");
+        assert_eq!(turn.terminal, Some(json!({ "stopReason": "cancelled" })));
+        assert_eq!(turn.updates[0]["status"], "completed");
+        mirror
+            .commit_completed_turn("session", 1, &operation_id)
+            .unwrap();
+        assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
         mirror.begin_load("session", 1, "load").unwrap();
         assert_eq!(
             mirror.append_session_update("session", 1, json!({})),
@@ -1194,61 +676,6 @@ mod tests {
         assert_eq!(
             mirror.append_session_update("session", 2, json!({})),
             Err(MirrorError::StaleIncarnation)
-        );
-        assert_eq!(
-            mirror.view("session", 1).unwrap().baseline.revision(),
-            baseline.revision()
-        );
-    }
-
-    #[test]
-    fn completed_turn_uses_agent_prompt_echo_once_and_keeps_its_identity() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        for intent in ["first", "second"] {
-            let revision = mirror
-                .view("session", 1)
-                .unwrap()
-                .baseline
-                .revision()
-                .to_string();
-            let prompt = vec![
-                json!({ "type": "text", "text": "repeat" }),
-                json!({ "type": "resource_link", "uri": "file:///file", "name": "file" }),
-            ];
-            let TurnAdmission::Accepted { operation_id } = mirror
-                .start_turn("session", 1, &revision, intent, prompt.clone())
-                .unwrap()
-            else {
-                panic!("new intent")
-            };
-            for content in prompt {
-                mirror.append_turn_update("session", 1, &operation_id, json!({ "sessionUpdate": "user_message_chunk", "messageId": intent, "content": content })).unwrap();
-            }
-            mirror.append_turn_update("session", 1, &operation_id, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "done" } })).unwrap();
-            mirror
-                .complete_turn(
-                    "session",
-                    1,
-                    &operation_id,
-                    json!({ "stopReason": "end_turn" }),
-                )
-                .unwrap();
-            mirror
-                .commit_completed_turn_from_memory("session", 1, &operation_id)
-                .unwrap();
-        }
-        let view = mirror.view("session", 1).unwrap();
-        assert_eq!(view.baseline.updates().len(), 6);
-        assert_eq!(view.baseline.updates()[0]["messageId"], "first");
-        assert_eq!(view.baseline.updates()[3]["messageId"], "second");
-        assert_eq!(
-            view.session
-                .turn_outcomes
-                .iter()
-                .map(|outcome| outcome.after_update)
-                .collect::<Vec<_>>(),
-            vec![3, 6]
         );
     }
 
@@ -1262,16 +689,23 @@ mod tests {
             .begin_load(session_id, incarnation, "initial")
             .unwrap();
         mirror
+            .append_load_update(session_id, incarnation, "initial", user_update("old"))
+            .unwrap();
+        mirror
             .append_load_update(
                 session_id,
                 incarnation,
                 "initial",
-                json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "old" } }),
+                json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "old reply" } }),
             )
             .unwrap();
         mirror
             .commit_load(session_id, incarnation, "initial")
             .unwrap();
+    }
+
+    fn log(mirror: &SessionMirror) -> SessionLog {
+        mirror.state("session").unwrap().log.clone()
     }
 
     fn text_prompt(text: &str) -> Vec<Value> {
@@ -1286,28 +720,24 @@ mod tests {
     }
 
     #[test]
-    fn prompt_terminal_retains_overlay_until_authoritative_load_commits() {
+    fn a_load_rebuilds_the_log_from_its_replay() {
         let mut mirror = mirror();
         load_initial(&mut mirror, "session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let operation = match mirror
-            .start_turn(
-                "session",
-                1,
-                &revision,
-                "intent",
-                vec![json!({ "type": "text", "text": "next" })],
-            )
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
+        let SessionLog::Known(known) = log(&mirror) else {
+            panic!("a committed load knows the log");
         };
+        assert_eq!(known.entries().len(), 1);
+        assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
+        assert_eq!(mirror.history.candidates(), 0);
+    }
+
+    #[test]
+    fn prompt_terminal_retains_the_turn_until_its_commit() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session", 1);
+        let operation = mirror
+            .start_turn("session", 1, "intent", text_prompt("next"))
+            .unwrap();
         mirror
             .append_turn_update(
                 "session",
@@ -1332,539 +762,20 @@ mod tests {
             state.active_turn.as_ref().unwrap().terminal,
             Some(json!({ "stopReason": "end_turn" }))
         );
-    }
-
-    #[test]
-    fn observer_during_running_or_reconciling_reads_same_baseline_plus_overlay() {
-        let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("prompt"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        let running = mirror.view("session", 1).unwrap();
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        let reconciling = mirror.view("session", 1).unwrap();
-
-        assert!(Arc::ptr_eq(&running.baseline, &reconciling.baseline));
-        assert!(running.session.active_turn.is_some());
-        assert!(reconciling.session.active_turn.is_some());
-    }
-
-    #[test]
-    fn successful_reconcile_atomically_advances_baseline_and_drops_overlay() {
-        let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
-        let old = mirror.view("session", 1).unwrap().baseline;
-        let revision = old.revision().to_string();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .append_turn_update(
-                "session",
-                1,
-                &operation,
-                json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "new" } }),
-            )
-            .unwrap();
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "reconcile").unwrap();
-        for update in old.updates() {
-            mirror
-                .append_load_update("session", 1, "reconcile", update.clone())
-                .unwrap();
-        }
-        mirror
-            .append_load_update("session", 1, "reconcile", user_update("next"))
-            .unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "reconcile",
-                json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "new" } }),
-            )
-            .unwrap();
-        let next = mirror.commit_load("session", 1, "reconcile").unwrap();
-
-        let state = mirror.state("session").unwrap();
-        assert_eq!(state.phase, MirrorPhase::Ready);
-        assert!(state.active_turn.is_none());
-        assert_ne!(next.revision(), revision);
-        assert!(!Arc::ptr_eq(&old, &next));
-    }
-
-    #[test]
-    fn completed_turn_can_atomically_advance_the_in_memory_baseline_without_load() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        let old = mirror.view("session", 1).unwrap().baseline;
-        let revision = old.revision().to_string();
-        let prompt = text_prompt("next");
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", prompt.clone())
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        for text in ["new ", "answer"] {
-            mirror
-                .append_turn_update(
-                    "session",
-                    1,
-                    &operation,
-                    json!({
-                        "sessionUpdate": "agent_message_chunk",
-                        "messageId": "answer",
-                        "content": { "type": "text", "text": text }
-                    }),
-                )
-                .unwrap();
-        }
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-
-        let next = mirror
-            .commit_completed_turn_from_memory("session", 1, &operation)
-            .unwrap();
-
         assert_eq!(
-            next.updates(),
-            &[
-                json!({
-                    "sessionUpdate": "user_message_chunk",
-                    "content": { "type": "text", "text": "next" },
-                    "_meta": {
-                        "attyd": {
-                            "turnOperationId": operation,
-                        }
-                    },
-                }),
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "messageId": "answer",
-                    "content": { "type": "text", "text": "new answer" }
-                }),
-            ]
-        );
-        assert_ne!(next.revision(), revision);
-        let state = mirror.state("session").unwrap();
-        assert_eq!(state.phase, MirrorPhase::Ready);
-        assert!(state.active_turn.is_none());
-        assert_eq!(state.history_revision.as_deref(), Some(next.revision()));
-        assert_eq!(state.turn_outcomes.len(), 1);
-        assert_eq!(state.turn_outcomes[0].operation_id, operation);
-        assert_eq!(state.turn_outcomes[0].after_update, 2);
-        assert_eq!(
-            state.turn_outcomes[0].response,
-            json!({ "stopReason": "end_turn" })
-        );
-        assert!(matches!(
-            mirror.start_turn("session", 1, next.revision(), "intent", prompt),
-            Ok(TurnAdmission::Duplicate { operation_id }) if operation_id == operation
-        ));
-
-        let second_operation = match mirror
-            .start_turn(
-                "session",
-                1,
-                next.revision(),
-                "second-intent",
-                text_prompt("again"),
-            )
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .append_turn_update(
-                "session",
-                1,
-                &second_operation,
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "messageId": "second-answer",
-                    "content": { "type": "text", "text": "done" }
-                }),
-            )
-            .unwrap();
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &second_operation,
-                json!({ "stopReason": "max_tokens" }),
-            )
-            .unwrap();
-        let final_snapshot = mirror
-            .commit_completed_turn_from_memory("session", 1, &second_operation)
-            .unwrap();
-        let state = mirror.state("session").unwrap();
-        assert_eq!(state.turn_outcomes.len(), 2);
-        assert_eq!(state.turn_outcomes[0].after_update, 2);
-        assert_eq!(state.turn_outcomes[1].after_update, 4);
-        assert_eq!(final_snapshot.updates().len(), 4);
-        let view = mirror.view_value("session", 1).unwrap();
-        assert_eq!(view["session"]["turnOutcomes"].as_array().unwrap().len(), 2);
-
-        mirror.begin_load("session", 1, "fresh-load").unwrap();
-        for update in final_snapshot.updates() {
-            mirror
-                .append_load_update("session", 1, "fresh-load", update.clone())
-                .unwrap();
-        }
-        mirror.commit_load("session", 1, "fresh-load").unwrap();
-        assert!(mirror.state("session").unwrap().turn_outcomes.is_empty());
-    }
-
-    #[test]
-    fn released_terminal_output_survives_commit_without_rewriting_agent_fields() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        let revision = mirror
-            .view("session", 1)
-            .unwrap()
-            .baseline
-            .revision()
-            .to_string();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("run"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .append_turn_update(
-                "session",
-                1,
-                &operation,
-                json!({
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "tool",
-                    "title": "shell",
-                    "status": "completed",
-                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
-                    "rawOutput": { "agent": "original output" },
-                }),
-            )
-            .unwrap();
-
-        assert!(
-            mirror
-                .retain_terminal_output(
-                    "session",
-                    1,
-                    "terminal",
-                    &json!({
-                        "output": "tool output",
-                        "truncated": false,
-                        "exitStatus": { "exitCode": 0 },
-                        "released": true,
-                    }),
-                )
-                .unwrap()
-        );
-        assert!(
-            !mirror
-                .retain_terminal_output(
-                    "session",
-                    1,
-                    "terminal",
-                    &json!({ "output": "must not overwrite Agent output" }),
-                )
-                .unwrap()
-        );
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        let committed = mirror
-            .commit_completed_turn_from_memory("session", 1, &operation)
-            .unwrap();
-        let tool = committed
-            .updates()
-            .iter()
-            .find(|update| update["sessionUpdate"] == "tool_call")
-            .unwrap();
-        assert_eq!(tool["rawOutput"], json!({ "agent": "original output" }));
-        let view = mirror.view_value("session", 1).unwrap();
-        assert_eq!(view["terminals"]["terminal"]["output"], "tool output");
-        assert_eq!(view["terminals"]["terminal"]["exitStatus"]["exitCode"], 0);
-        assert_eq!(view["terminals"]["terminal"]["sessionId"], "session");
-        assert_eq!(view["terminals"]["terminal"]["terminalId"], "terminal");
-        assert!(view["session"].get("terminals").is_none());
-        assert_eq!(mirror.overlay_bytes, 0);
-    }
-
-    #[test]
-    fn terminal_released_after_its_turn_is_retained_only_for_matching_history() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        mirror.begin_load("session", 1, "history").unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "history",
-                json!({
-                    "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "run",
-                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
-                }),
-            )
-            .unwrap();
-        mirror.commit_load("session", 1, "history").unwrap();
-        let output = json!({ "output": "retained", "released": true });
-        assert!(
-            !mirror
-                .retain_terminal_output("session", 1, "unreferenced", &output)
-                .unwrap()
-        );
-        assert!(
-            !mirror
-                .retain_terminal_output(
-                    "session",
-                    1,
-                    "terminal",
-                    &json!({
-                        "output": "", "outputAppend": true, "released": true,
-                    })
-                )
-                .unwrap()
-        );
-        assert!(
-            mirror
-                .retain_terminal_output("session", 1, "terminal", &output)
-                .unwrap()
-        );
-        let view = mirror.view_value("session", 1).unwrap();
-        assert_eq!(view["terminals"]["terminal"]["output"], "retained");
-        assert!(view["baseline"]["updates"][0].get("rawOutput").is_none());
-        assert_eq!(view["terminals"].as_object().unwrap().len(), 1);
-
-        mirror.begin_load("session", 1, "replacement").unwrap();
-        mirror.commit_load("session", 1, "replacement").unwrap();
-        assert_eq!(
-            mirror.view_value("session", 1).unwrap()["terminals"],
-            json!({})
-        );
-        assert_eq!(mirror.retained_terminal_bytes, 0);
-    }
-
-    #[test]
-    fn retained_terminal_output_is_accounted_and_removed_with_its_incarnation() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        mirror.begin_load("session", 1, "history").unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "history",
-                json!({
-                    "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "run",
-                    "content": [{ "type": "terminal", "terminalId": "terminal" }],
-                }),
-            )
-            .unwrap();
-        mirror.commit_load("session", 1, "history").unwrap();
-        mirror
-            .retain_terminal_output(
-                "session",
-                1,
-                "terminal",
-                &json!({
-                    "output": "retained", "released": true,
-                }),
-            )
-            .unwrap();
-        assert!(mirror.retained_terminal_bytes >= "retained".len());
-        mirror.remove("session", 2);
-        assert!(mirror.retained_terminal_bytes > 0);
-        mirror.register_new("session", 2);
-        assert_eq!(mirror.retained_terminal_bytes, 0);
-        assert!(mirror.retained_terminals.is_empty());
-        assert_eq!(
-            mirror.view_value("session", 2).unwrap()["terminals"],
-            json!({})
-        );
-        assert_eq!(
-            mirror.retain_terminal_output("session", 1, "terminal", &json!({})),
-            Err(MirrorError::StaleIncarnation)
-        );
-    }
-
-    #[test]
-    fn rejected_in_memory_commit_preserves_the_completed_overlay_and_old_baseline() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        let old = mirror.view("session", 1).unwrap().baseline;
-        let operation = match mirror
-            .start_turn("session", 1, old.revision(), "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-
-        assert!(matches!(
-            mirror.commit_completed_turn_from_memory("session", 1, "stale-operation"),
+            mirror.commit_completed_turn("session", 1, "stale-operation"),
             Err(MirrorError::OperationMismatch)
-        ));
-        let retained = mirror.view("session", 1).unwrap();
-        assert!(Arc::ptr_eq(&retained.baseline, &old));
-        assert_eq!(retained.session.phase, MirrorPhase::Reconciling);
-        assert_eq!(
-            retained
-                .session
-                .active_turn
-                .as_ref()
-                .map(|turn| turn.operation_id.as_str()),
-            Some(operation.as_str())
         );
-    }
-
-    #[test]
-    fn reconciliation_cannot_drop_a_completed_agent_answer() {
-        let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
         mirror
-            .append_turn_update(
-                "session",
-                1,
-                &operation,
-                json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "answer" } }),
-            )
+            .commit_completed_turn("session", 1, &operation)
             .unwrap();
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "reconcile").unwrap();
-        mirror
-            .append_load_update("session", 1, "reconcile", user_update("next"))
-            .unwrap();
-
-        assert!(matches!(
-            mirror.commit_load("session", 1, "reconcile"),
-            Err(MirrorError::InconsistentHistory)
-        ));
-        assert!(mirror.state("session").unwrap().active_turn.is_some());
-    }
-
-    #[test]
-    fn reconciliation_cannot_drop_a_completed_tool_result() {
-        let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .append_turn_update(
-                "session",
-                1,
-                &operation,
-                json!({
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "tool-1",
-                    "title": "read",
-                    "status": "completed",
-                    "content": [{ "type": "content", "content": { "type": "text", "text": "result" } }]
-                }),
-            )
-            .unwrap();
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "reconcile").unwrap();
-        mirror
-            .append_load_update("session", 1, "reconcile", user_update("next"))
-            .unwrap();
-
-        assert!(matches!(
-            mirror.commit_load("session", 1, "reconcile"),
-            Err(MirrorError::InconsistentHistory)
-        ));
+        let state = mirror.state("session").unwrap();
+        assert_eq!(state.phase, MirrorPhase::Ready);
+        assert!(state.active_turn.is_none());
+        assert_eq!(
+            mirror.can_begin("session", 1, SessionAdmission::Prompt),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1875,20 +786,20 @@ mod tests {
         mirror
             .append_load_update("session", 1, "resume", user_update("cached"))
             .unwrap();
-        let cached = mirror
+        mirror
             .commit_attachment_cache("session", 1, "resume")
             .unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Cold);
+        let cached = log(&mirror);
+        assert!(matches!(cached, SessionLog::Known(_)));
 
         for attempt in ["automatic-first", "automatic-retry"] {
             mirror.begin_load("session", 1, attempt).unwrap();
             mirror
                 .fail_load("session", 1, attempt, "temporary", true)
                 .unwrap();
-            let view = mirror.view("session", 1).unwrap();
-            assert!(Arc::ptr_eq(&cached, &view.baseline));
-            assert!(view.session.history_revision.is_some());
-            assert_eq!(view.session.phase, MirrorPhase::Loading);
+            assert_eq!(log(&mirror), cached);
+            assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Loading);
             for admission in [
                 SessionAdmission::Prompt,
                 SessionAdmission::Control,
@@ -1916,11 +827,33 @@ mod tests {
     }
 
     #[test]
+    fn cached_history_keeps_a_known_log_and_installs_one_only_when_unknown() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session", 1);
+        let known = log(&mirror);
+        mirror
+            .use_cached_history("session", 1, Some(Arc::new(TurnLog::default())))
+            .unwrap();
+        assert_eq!(log(&mirror), known);
+
+        mirror.register_cold("fork", 2);
+        let SessionLog::Known(source) = known else {
+            unreachable!()
+        };
+        mirror
+            .use_cached_history("fork", 2, Some(source.clone()))
+            .unwrap();
+        let fork = mirror.state("fork").unwrap();
+        assert_eq!(fork.phase, MirrorPhase::Ready);
+        assert!(matches!(&fork.log, SessionLog::Known(log) if Arc::ptr_eq(log, &source)));
+    }
+
+    #[test]
     fn failed_explicit_load_restores_its_admission_phase() {
         for origin in [MirrorPhase::Ready, MirrorPhase::Blocked] {
             let mut mirror = mirror();
             load_initial(&mut mirror, "session", 1);
-            let old = mirror.view("session", 1).unwrap().baseline;
+            let old = log(&mirror);
             if origin == MirrorPhase::Blocked {
                 mirror.begin_load("session", 1, "fatal").unwrap();
                 mirror
@@ -1931,6 +864,9 @@ mod tests {
                 .begin_exclusive("session", 1, SessionOperationKind::Load, "explicit")
                 .unwrap();
             mirror.begin_load("session", 1, "explicit").unwrap();
+            mirror
+                .append_load_update("session", 1, "explicit", user_update("partial"))
+                .unwrap();
             mirror
                 .fail_load("session", 1, "explicit", "temporary", true)
                 .unwrap();
@@ -1946,291 +882,26 @@ mod tests {
                 mirror.can_begin("session", 1, SessionAdmission::Attachment),
                 Ok(())
             );
-            assert!(Arc::ptr_eq(
-                &old,
-                &mirror.view("session", 1).unwrap().baseline
-            ));
+            assert_eq!(log(&mirror), old, "a failed load leaves the known log");
             assert!(mirror.state("session").unwrap().load_origin.is_none());
+            assert_eq!(
+                mirror.state("session").unwrap().sync_error.as_deref(),
+                Some("temporary")
+            );
         }
     }
 
     #[test]
-    fn reconcile_failure_keeps_old_baseline_and_completed_overlay() {
-        let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
-        let old = mirror.view("session", 1).unwrap().baseline;
-        let revision = old.revision().to_string();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "failed").unwrap();
-        mirror
-            .append_load_update("session", 1, "failed", json!({ "partial": true }))
-            .unwrap();
-        mirror
-            .fail_load("session", 1, "failed", "temporary", true)
-            .unwrap();
-
-        let view = mirror.view("session", 1).unwrap();
-        assert!(Arc::ptr_eq(&old, &view.baseline));
-        assert_eq!(view.session.phase, MirrorPhase::Reconciling);
-        assert!(view.session.active_turn.is_some());
-        assert_eq!(view.session.sync_error.as_deref(), Some("temporary"));
-    }
-
-    #[test]
-    fn explicit_blocked_recovery_preserves_the_completed_turn_until_full_replay_commits() {
-        let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
-        let old = mirror.view("session", 1).unwrap().baseline;
-        let operation = match mirror
-            .start_turn("session", 1, old.revision(), "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        let answer = json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "answer" } });
-        mirror
-            .append_turn_update("session", 1, &operation, answer.clone())
-            .unwrap();
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror
-            .block_turn("session", 1, &operation, "commit failed")
-            .unwrap();
-        let retained = mirror.state("session").unwrap().active_turn.clone();
-
-        mirror
-            .begin_exclusive("session", 1, SessionOperationKind::Load, "recover")
-            .unwrap();
-        assert_eq!(
-            mirror.begin_load("session", 1, "wrong-attempt"),
-            Err(MirrorError::WrongPhase)
-        );
-        mirror.begin_load("session", 1, "recover").unwrap();
-        for update in old.updates() {
-            mirror
-                .append_load_update("session", 1, "recover", update.clone())
-                .unwrap();
-        }
-        mirror
-            .append_load_update("session", 1, "recover", user_update("next"))
-            .unwrap();
-        assert_eq!(
-            mirror.commit_load("session", 1, "recover").unwrap_err(),
-            MirrorError::InconsistentHistory
-        );
-        let incomplete = mirror.view("session", 1).unwrap();
-        assert!(Arc::ptr_eq(&old, &incomplete.baseline));
-        assert_eq!(incomplete.session.active_turn, retained);
-
-        mirror
-            .append_load_update("session", 1, "recover", answer)
-            .unwrap();
-        mirror.commit_load("session", 1, "recover").unwrap();
-        assert_eq!(
-            mirror.can_begin("session", 1, SessionAdmission::Prompt),
-            Err(MirrorError::WrongPhase)
-        );
-        mirror
-            .settle_exclusive("session", 1, SessionAdmission::Attachment, "recover")
-            .unwrap();
-        assert_eq!(
-            mirror.can_begin("session", 1, SessionAdmission::Prompt),
-            Ok(())
-        );
-        let recovered = mirror.view("session", 1).unwrap();
-        assert_ne!(recovered.baseline.revision(), old.revision());
-        assert!(recovered.session.active_turn.is_none());
-        assert_eq!(recovered.baseline.updates().len(), 3);
-    }
-
-    #[test]
-    fn stale_base_and_second_turn_while_running_are_rejected() {
+    fn a_second_turn_while_running_is_rejected() {
         let mut mirror = mirror();
         mirror.register_new("session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
         mirror
-            .start_turn("session", 1, &revision, "first", vec![json!("one")])
+            .start_turn("session", 1, "first", vec![json!("one")])
             .unwrap();
 
         assert_eq!(
-            mirror.start_turn("session", 1, &revision, "second", vec![json!("two")]),
+            mirror.start_turn("session", 1, "second", vec![json!("two")]),
             Err(MirrorError::WrongPhase)
-        );
-        assert_eq!(
-            mirror.start_turn("session", 1, "old", "third", vec![json!("three")]),
-            Err(MirrorError::WrongPhase)
-        );
-    }
-
-    #[test]
-    fn duplicate_intent_never_dispatches_twice_before_or_after_fast_reconcile() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let prompt = vec![json!({ "type": "text", "text": "same" })];
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", prompt.clone())
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            mirror.start_turn("session", 1, &revision, "intent", prompt.clone()),
-            Ok(TurnAdmission::Duplicate {
-                operation_id: operation.clone()
-            })
-        );
-        assert_eq!(
-            mirror.start_turn("session", 1, &revision, "intent", text_prompt("changed")),
-            Err(MirrorError::IdempotencyConflict)
-        );
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "load").unwrap();
-        mirror
-            .append_load_update("session", 1, "load", user_update("same"))
-            .unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "load",
-                json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "done" } }),
-            )
-            .unwrap();
-        let successor = mirror.commit_load("session", 1, "load").unwrap();
-
-        assert!(matches!(
-            mirror.start_turn("session", 1, successor.revision(), "intent", prompt),
-            Ok(TurnAdmission::Duplicate { .. })
-        ));
-        assert_eq!(
-            mirror.start_turn(
-                "session",
-                1,
-                successor.revision(),
-                "intent",
-                text_prompt("changed")
-            ),
-            Err(MirrorError::IdempotencyConflict)
-        );
-    }
-
-    #[test]
-    fn consumed_intent_returns_its_original_operation_after_reconcile() {
-        let mut mirror = mirror();
-        mirror.register_new("session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let prompt = text_prompt("same");
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "old-intent", prompt.clone())
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "load").unwrap();
-        mirror
-            .append_load_update("session", 1, "load", user_update("same"))
-            .unwrap();
-        let successor = mirror.commit_load("session", 1, "load").unwrap();
-
-        assert_eq!(
-            mirror.start_turn("session", 1, successor.revision(), "old-intent", prompt,),
-            Ok(TurnAdmission::Duplicate {
-                operation_id: operation
-            })
-        );
-    }
-
-    #[test]
-    fn candidate_missing_the_previous_baseline_never_commits() {
-        let mut mirror = mirror();
-        load_initial(&mut mirror, "session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("prompt"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "stale").unwrap();
-        mirror
-            .append_load_update("session", 1, "stale", json!({ "different": true }))
-            .unwrap();
-
-        assert!(matches!(
-            mirror.commit_load("session", 1, "stale"),
-            Err(MirrorError::InconsistentHistory)
-        ));
-        assert_eq!(
-            mirror.state("session").unwrap().phase,
-            MirrorPhase::Reconciling
         );
     }
 
@@ -2245,14 +916,24 @@ mod tests {
         mirror
             .fail_load("session", 1, "first", "temporary", true)
             .unwrap();
+        assert_eq!(log(&mirror), SessionLog::Unknown);
 
         mirror.begin_load("session", 1, "second").unwrap();
         mirror
             .append_load_update("session", 1, "second", user_update("complete"))
             .unwrap();
-        let snapshot = mirror.commit_load("session", 1, "second").unwrap();
+        mirror.commit_load("session", 1, "second").unwrap();
 
-        assert_eq!(snapshot.updates(), &[user_update("complete")]);
+        let SessionLog::Known(known) = log(&mirror) else {
+            panic!("a committed load knows the log");
+        };
+        assert_eq!(known.entries().len(), 1);
+        assert_eq!(
+            known.entries()[0].turn.prompt,
+            TurnLog::from_replay(&[user_update("complete")]).entries()[0]
+                .turn
+                .prompt
+        );
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
     }
 
@@ -2274,194 +955,21 @@ mod tests {
             mirror.commit_load("session", 1, "invalid"),
             Err(MirrorError::History(HistoryCacheError::InvalidReplay))
         ));
+        assert_eq!(log(&mirror), SessionLog::Unknown);
         mirror
             .fail_load("session", 1, "invalid", "invalid replay", false)
             .unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Blocked);
+        assert_eq!(log(&mirror), SessionLog::Unknown);
     }
 
     #[test]
-    fn reconciliation_compares_normalized_history_not_text_chunk_boundaries() {
-        let mut mirror = mirror();
-        mirror.register_cold("session", 1);
-        mirror.begin_load("session", 1, "initial").unwrap();
-        for text in ["old ", "answer"] {
-            mirror
-                .append_load_update(
-                    "session",
-                    1,
-                    "initial",
-                    json!({
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": { "type": "text", "text": text }
-                    }),
-                )
-                .unwrap();
-        }
-        let old = mirror.commit_load("session", 1, "initial").unwrap();
-        assert_eq!(old.updates().len(), 1);
-        let operation = match mirror
-            .start_turn("session", 1, old.revision(), "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "reconcile").unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "reconcile",
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": "old answer" }
-                }),
-            )
-            .unwrap();
-        mirror
-            .append_load_update("session", 1, "reconcile", user_update("next"))
-            .unwrap();
-
-        assert!(mirror.commit_load("session", 1, "reconcile").is_ok());
-    }
-
-    #[test]
-    fn reconciliation_does_not_require_optional_message_ids_to_survive_reload() {
-        let mut mirror = mirror();
-        mirror.register_cold("session", 1);
-        mirror.begin_load("session", 1, "initial").unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "initial",
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "messageId": "connection-one",
-                    "content": { "type": "text", "text": "old answer" }
-                }),
-            )
-            .unwrap();
-        let old = mirror.commit_load("session", 1, "initial").unwrap();
-        let operation = match mirror
-            .start_turn("session", 1, old.revision(), "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "reconcile").unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "reconcile",
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "messageId": "connection-two",
-                    "content": { "type": "text", "text": "old answer" }
-                }),
-            )
-            .unwrap();
-        mirror
-            .append_load_update("session", 1, "reconcile", user_update("next"))
-            .unwrap();
-
-        assert!(mirror.commit_load("session", 1, "reconcile").is_ok());
-    }
-
-    #[test]
-    fn reconciliation_allows_repartitioned_text_with_reassigned_message_ids() {
-        let mut mirror = mirror();
-        mirror.register_cold("session", 1);
-        mirror.begin_load("session", 1, "initial").unwrap();
-        for (message_id, text) in [("old-a", "old "), ("old-b", "answer")] {
-            mirror
-                .append_load_update(
-                    "session",
-                    1,
-                    "initial",
-                    json!({
-                        "sessionUpdate": "agent_message_chunk",
-                        "messageId": message_id,
-                        "content": { "type": "text", "text": text }
-                    }),
-                )
-                .unwrap();
-        }
-        let old = mirror.commit_load("session", 1, "initial").unwrap();
-        assert_eq!(old.updates().len(), 2);
-        assert_eq!(old.updates()[0]["messageId"], "old-a");
-        assert_eq!(old.updates()[1]["messageId"], "old-b");
-        let operation = match mirror
-            .start_turn("session", 1, old.revision(), "intent", text_prompt("next"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
-        mirror
-            .complete_turn(
-                "session",
-                1,
-                &operation,
-                json!({ "stopReason": "end_turn" }),
-            )
-            .unwrap();
-        mirror.begin_load("session", 1, "reconcile").unwrap();
-        mirror
-            .append_load_update(
-                "session",
-                1,
-                "reconcile",
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "messageId": "new-id",
-                    "content": { "type": "text", "text": "old answer" }
-                }),
-            )
-            .unwrap();
-        mirror
-            .append_load_update("session", 1, "reconcile", user_update("next"))
-            .unwrap();
-
-        assert!(mirror.commit_load("session", 1, "reconcile").is_ok());
-    }
-
-    #[test]
-    fn overlay_accounting_does_not_reject_a_large_valid_turn() {
+    fn a_large_valid_turn_is_kept_whole() {
         let mut mirror = mirror();
         mirror.register_new("session", 1);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
+        let operation = mirror
+            .start_turn("session", 1, "intent", text_prompt("prompt"))
             .unwrap();
-        let operation = match mirror
-            .start_turn("session", 1, &revision, "intent", text_prompt("prompt"))
-            .unwrap()
-        {
-            TurnAdmission::Accepted { operation_id } => operation_id,
-            _ => unreachable!(),
-        };
         mirror
             .append_turn_update(
                 "session",
@@ -2473,7 +981,6 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(mirror.overlay_bytes > 8_192);
         assert_eq!(
             mirror
                 .state("session")
@@ -2487,26 +994,19 @@ mod tests {
         );
 
         mirror.abort_turn("session", 1, &operation).unwrap();
-        assert_eq!(mirror.overlay_bytes, 0);
+        assert!(mirror.state("session").unwrap().active_turn.is_none());
     }
 
     #[test]
     fn stale_incarnation_removal_cannot_drop_the_current_session() {
         let mut mirror = mirror();
         mirror.register_new("session", 2);
-        let revision = mirror
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
 
         mirror.remove("session", 1);
 
-        assert_eq!(
-            mirror.state("session").unwrap().history_revision.as_deref(),
-            Some(revision.as_str())
-        );
-        assert!(mirror.view("session", 2).is_ok());
+        let state = mirror.state("session").unwrap();
+        assert_eq!(state.incarnation, 2);
+        assert_eq!(state.phase, MirrorPhase::Ready);
+        assert_eq!(state.log, SessionLog::empty());
     }
 }

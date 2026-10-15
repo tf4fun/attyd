@@ -13,7 +13,7 @@ use crate::protocol::documents::OperationKind;
 use crate::protocol::op::OpSlot;
 use crate::protocol::registry::TurnEnd;
 use crate::session_registry::{SessionEntry, SessionRegistry};
-use crate::session_state::{MirrorError, SessionAdmission, SessionState, TurnAdmission};
+use crate::session_state::{MirrorError, SessionAdmission, SessionState};
 
 #[cfg(test)]
 pub(crate) use crate::session_registry::SessionRegistry as RuntimeState;
@@ -761,17 +761,12 @@ impl SessionRegistry {
         expected_epoch: &str,
         session_id: &str,
         incarnation: u64,
-        expected_history_revision: &str,
         client_intent_id: &str,
         prompt: Vec<Value>,
-    ) -> Result<TurnAdmission, SessionTurnError> {
+    ) -> Result<String, SessionTurnError> {
         self.require_epoch(expected_epoch)?;
         let owner = self.require_live_owner(session_id, incarnation)?;
-        if let Some(duplicate) =
-            owner.check_turn_admission(expected_history_revision, client_intent_id, &prompt)?
-        {
-            return Ok(duplicate);
-        }
+        owner.can_begin(SessionAdmission::Prompt)?;
         if owner.live.as_ref().expect("live owner checked").lifecycle != SessionLifecycle::Active {
             return Err(RuntimeStateError::SessionNotActive.into());
         }
@@ -781,19 +776,13 @@ impl SessionRegistry {
         if self.operation_in_use(client_intent_id) {
             return Err(RuntimeStateError::OperationCollision.into());
         }
-        let admission = self.start_turn(
-            session_id,
-            incarnation,
-            expected_history_revision,
-            client_intent_id,
-            prompt,
-        )?;
+        let operation_id = self.start_turn(session_id, incarnation, client_intent_id, prompt)?;
         self.settle_session_ops(session_id);
-        Ok(admission)
+        Ok(operation_id)
     }
 
     /// A runtime reducer fixture: installs a turn in the same canonical overlay,
-    /// without inventing a second runtime tail or requiring a history baseline.
+    /// without inventing a second runtime tail.
     #[cfg(test)]
     pub(crate) fn start_prompt(
         &mut self,
@@ -815,21 +804,11 @@ impl SessionRegistry {
         if owner.turn_execution().is_some() || owner.operation.is_some() {
             return Err(RuntimeStateError::BusySession);
         }
-        let old_bytes = owner.active_overlay_bytes;
         owner.active_turn = None;
         owner.phase = crate::session_state::MirrorPhase::Ready;
-        let revision = owner
-            .history_revision
-            .get_or_insert_with(|| "runtime-fixture".to_string())
-            .clone();
         owner
-            .admit_turn(operation_id.clone(), &revision, &operation_id, prompt)
+            .admit_turn(operation_id.clone(), &operation_id, prompt)
             .map_err(|_| RuntimeStateError::BusySession)?;
-        let new_bytes = owner.active_overlay_bytes;
-        self.overlay_bytes = self
-            .overlay_bytes
-            .saturating_sub(old_bytes)
-            .saturating_add(new_bytes);
         self.settle_session_ops(session_id);
         Ok(operation_id)
     }
@@ -2744,18 +2723,9 @@ mod tests {
     fn direct_operation_entry_cannot_bypass_canonical_history_admission() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
-        let revision = state
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
+        let operation_id = state
+            .admit_session_turn("epoch", "session", incarnation, "prompt", vec![])
             .unwrap();
-        let TurnAdmission::Accepted { operation_id } = state
-            .admit_session_turn("epoch", "session", incarnation, &revision, "prompt", vec![])
-            .unwrap()
-        else {
-            panic!("accepted");
-        };
         state
             .complete_prompt("epoch", "session", incarnation, "prompt", json!({}))
             .unwrap();
@@ -2813,18 +2783,9 @@ mod tests {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state.register_new("session", incarnation);
-        let revision = state
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
+        let operation_id = state
+            .admit_session_turn("epoch", "session", incarnation, "intent", vec![])
             .unwrap();
-        let TurnAdmission::Accepted { operation_id } = state
-            .admit_session_turn("epoch", "session", incarnation, &revision, "intent", vec![])
-            .unwrap()
-        else {
-            panic!("accepted");
-        };
         state
             .upsert_permission("epoch", "session", incarnation, "permission", json!({}))
             .unwrap();
@@ -2871,16 +2832,10 @@ mod tests {
     }
 
     #[test]
-    fn unified_turn_admission_is_atomic_and_duplicate_publication_is_neutral() {
+    fn unified_turn_admission_is_atomic_and_a_second_prompt_is_refused() {
         let mut state = state();
         let incarnation = open(&mut state, "session");
         state.register_new("session", incarnation);
-        let revision = state
-            .state("session")
-            .unwrap()
-            .history_revision
-            .clone()
-            .unwrap();
         state
             .require_live_mut("session", incarnation)
             .unwrap()
@@ -2893,7 +2848,6 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                &revision,
                 "intent",
                 vec![json!("hello")]
             ),
@@ -2906,19 +2860,15 @@ mod tests {
             .require_live_mut("session", incarnation)
             .unwrap()
             .lifecycle = SessionLifecycle::Active;
-        let accepted = state
+        state
             .admit_session_turn(
                 "epoch",
                 "session",
                 incarnation,
-                &revision,
                 "intent",
                 vec![json!("hello")],
             )
             .unwrap();
-        let TurnAdmission::Accepted { operation_id } = accepted else {
-            panic!("first intent is accepted");
-        };
         assert_eq!(
             state
                 .state("session")
@@ -2934,11 +2884,10 @@ mod tests {
                 "epoch",
                 "session",
                 incarnation,
-                &revision,
                 "intent",
                 vec![json!("hello")]
             ),
-            Ok(TurnAdmission::Duplicate { operation_id })
+            Err(SessionTurnError::History(MirrorError::WrongPhase))
         );
         assert_eq!(state.live_snapshot(), before);
     }
@@ -3100,18 +3049,9 @@ mod tests {
             let mut state = state();
             let incarnation = open(&mut state, "session");
             state.register_new("session", incarnation);
-            let revision = state
-                .state("session")
-                .unwrap()
-                .history_revision
-                .clone()
+            let operation_id = state
+                .admit_session_turn("epoch", "session", incarnation, "prompt", vec![])
                 .unwrap();
-            let TurnAdmission::Accepted { operation_id } = state
-                .admit_session_turn("epoch", "session", incarnation, &revision, "prompt", vec![])
-                .unwrap()
-            else {
-                panic!("accepted");
-            };
             state
                 .begin_exclusive(
                     "session",

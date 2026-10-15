@@ -22,7 +22,6 @@ mod server;
 mod session_dispatch;
 mod session_mirror;
 mod session_observers;
-mod session_presentation;
 mod session_registry;
 mod session_resources;
 mod session_state;

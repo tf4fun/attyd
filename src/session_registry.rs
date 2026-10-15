@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use serde_json::Value;
 use uuid::Uuid;
 
-use crate::history_cache::{HistoryCache, SessionKey};
+use crate::history_cache::HistoryCache;
 use crate::protocol::registry::ScopeOps;
 use crate::runtime_state::{
     PendingInteraction, RuntimeEffect, SessionLifecycle, SessionLiveState, UrlFlow,
@@ -50,9 +49,6 @@ pub(crate) struct SessionRegistry {
     pub(crate) elicitation_owners: HashMap<String, SessionResourceOwner>,
     pub(crate) url_owners: HashMap<String, UrlRegistration>,
     pub(crate) history: HistoryCache,
-    pub(crate) overlay_bytes: usize,
-    pub(crate) retained_terminals: HashMap<SessionKey, BTreeMap<String, Value>>,
-    pub(crate) retained_terminal_bytes: usize,
     pub(crate) request_elicitations: BTreeMap<String, PendingInteraction>,
     pub(crate) request_url_flows: BTreeMap<String, UrlFlow>,
     pub(crate) resolved_request_elicitations: VecDeque<String>,
@@ -415,7 +411,7 @@ impl SessionRegistry {
     pub(crate) fn new(epoch: impl Into<String>) -> Self {
         let epoch = epoch.into();
         Self {
-            history: HistoryCache::new(epoch.clone()),
+            history: HistoryCache::default(),
             epoch,
             next_incarnation: 0,
             next_operation: 0,
@@ -424,9 +420,6 @@ impl SessionRegistry {
             permission_owners: HashMap::new(),
             elicitation_owners: HashMap::new(),
             url_owners: HashMap::new(),
-            overlay_bytes: 0,
-            retained_terminals: HashMap::new(),
-            retained_terminal_bytes: 0,
             request_elicitations: BTreeMap::new(),
             request_url_flows: BTreeMap::new(),
             resolved_request_elicitations: VecDeque::new(),
