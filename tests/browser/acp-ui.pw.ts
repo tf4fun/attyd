@@ -2676,8 +2676,8 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
   await menu.getByRole("menuitem", { name: "Open Thread as Markdown" }).click();
   const markdown = await popupPromise;
   await markdown.waitForLoadState();
-  await expect(markdown.locator("body")).toContainText("Context menu response.");
-  await expect(markdown.locator("body")).toContainText("message-actions-answer");
+  await expect(markdown.locator("body")).toContainText("**Context menu response.**\n\n- first item\n- second item");
+  await expect(markdown.locator("body")).not.toContainText("Considering possible follow-up work.");
   await markdown.close();
 
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
@@ -2756,12 +2756,7 @@ for (const storedSessionId of ["stale-session", "earlier-session"]) {
     await page.addInitScript((sessionId) => {
       localStorage.setItem("attyd:last-session-id", sessionId);
     }, storedSessionId);
-    const sessionRequests: string[] = [];
-    page.on("request", (request) => {
-      if (/^\/api\/v1\/sessions\/[^/]+(?:\/events)?$/u.test(new URL(request.url()).pathname)) {
-        sessionRequests.push(request.url());
-      }
-    });
+    const api = trackApi(page);
 
     await page.goto("/");
     await expect(page.locator(".project-card")).toHaveCount(1);
@@ -2770,7 +2765,9 @@ for (const storedSessionId of ["stale-session", "earlier-session"]) {
     await expect(page.getByRole("button", { name: /^(?:New thread|New project)$/u })).toBeEnabled();
     await expect(page.locator('.session-history [aria-current="page"]')).toHaveCount(0);
     await expect(page).toHaveURL(/\/$/u);
-    expect(sessionRequests).toEqual([]);
+    expect(api.streams.length).toBeGreaterThan(0);
+    expect(api.streams.flatMap(scopesOf).filter((scope) => scope.startsWith("session/"))).toEqual([]);
+    expect(api.v1).toEqual([]);
     expect(browserErrors).toEqual([]);
   });
 }
