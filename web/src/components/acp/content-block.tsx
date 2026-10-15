@@ -261,7 +261,7 @@ function AttachmentReference({ reference, presentation }: {
   );
 }
 
-function Attachment({ block, tool, localHref }: {
+function Attachment({ block, tool, localHref, localDownload }: {
   block: Extract<ContentBlock, { type: "image" | "audio" | "resource" | "resource_link" }>;
   tool: boolean;
   /** An object URL with the bytes of a block read by reference. */

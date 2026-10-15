@@ -80,7 +80,7 @@ export function useAttachedBlock(reference: AttachmentRef): AttachedBlock | unde
     };
     // The reference is content-addressed: its ID, in `key`, names the block.
   }, [reader, key]);
-  return read?.key === key ? read.block : undefined;
+  return read != null && read.key === key ? read.block : undefined;
 }
 
 /**
