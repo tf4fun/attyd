@@ -539,14 +539,37 @@ async fn refusals_follow_the_admission_order() {
         "logout",
     );
 
-    // Arguments.
+    // A known content capability is checked before the content's arguments.
+    let (status, body) = bench
+        .op(
+            "session/s",
+            &running,
+            "prompt",
+            json!({"prompt": [{"type": "image", "data": "!", "mimeType": "image/png"}]}),
+        )
+        .await;
+    assert_refused(
+        status,
+        &body,
+        StatusCode::NOT_IMPLEMENTED,
+        "unsupported",
+        "image support before malformed image data",
+    );
+
+    // Arguments, including ACP block structure and offered config value types.
     for (kind, args) in [
         ("prompt", json!({})),
         ("prompt", json!({"prompt": [{"type": "nope"}]})),
+        ("prompt", json!({"prompt": [{"type": "text"}]})),
+        ("prompt", json!({"prompt": [{"type": "text", "text": 7}]})),
         ("set_mode", json!({"modeId": 1})),
         ("set_mode", json!({"modeId": "missing"})),
         ("set_config", json!({"configId": "missing", "value": true})),
         ("set_config", json!({"configId": "verbose"})),
+        (
+            "set_config",
+            json!({"configId": "verbose", "value": "true"}),
+        ),
     ] {
         let (status, body) = bench.op("session/s", &running, kind, args.clone()).await;
         invalid(status, &body, &format!("{kind} {args}"));
@@ -554,6 +577,8 @@ async fn refusals_follow_the_admission_order() {
     for (kind, args) in [
         ("create", json!({})),
         ("create", json!({"cwd": 5})),
+        ("create", json!({"cwd": "relative"})),
+        ("create", json!({"cwd": "/workspace/\u{0}bad"})),
         ("authenticate", json!({"methodId": "unknown"})),
         (
             "terminal_login",
