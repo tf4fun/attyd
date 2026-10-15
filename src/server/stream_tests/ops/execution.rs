@@ -224,6 +224,69 @@ async fn a_fork_response_survives_its_replacement_by_an_agent_request() {
     watch.converged(&bench).await;
 }
 
+/// A create returns its own session even after a successor replaced it;
+/// a client that first reads those events after the replacement converges.
+#[tokio::test]
+async fn a_create_response_survives_its_replacement_and_a_late_reader_converges() {
+    let (bench, mut link) = Bench::ws_initialized(json!({
+        "protocolVersion": 1,
+        "agentCapabilities": {},
+        "authMethods": [{"id": "agent-login", "name": "Login"}],
+    }))
+    .await;
+    let mut watch = bench.watch(&scopes(&["global"])).await;
+    watch
+        .until("the control stream aligns", |watch| watch.has("global"))
+        .await;
+    let mut late = bench.watch(&scopes(&["global"])).await;
+    late.until("the late reader aligns", |watch| watch.has("global"))
+        .await;
+    let none = late.live("global")["op"]["id"].clone();
+
+    let mut held = bench.hold();
+    let created = bench.spawn_op("global", &none, "create", json!({"cwd": CWD}));
+    let create = held.admitted().await;
+    let request = link.request("session/new").await;
+    watch.until_op("global", &create, "running").await;
+    link.reply(&request, json!({"sessionId": "created"})).await;
+    watch.until_op("global", &create, "completed").await;
+
+    let (status, body) = bench
+        .op(
+            "global",
+            &create,
+            "authenticate",
+            json!({"methodId": "agent-login"}),
+        )
+        .await;
+    let successor = assert_accepted(status, &body, "the create's successor");
+    let authenticate = link.request("authenticate").await;
+    watch.until_op("global", &successor, "running").await;
+    assert_ne!(successor, create);
+    assert_eq!(
+        late.live("global")["op"]["id"],
+        none,
+        "the late reader has consumed neither the create nor its successor"
+    );
+    assert!(!created.is_finished(), "the create response is still held");
+
+    held.resume();
+    let (status, body) = created.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["op"], create, "the response names its own operation");
+    assert_eq!(body["result"], json!({"sessionId": "created"}));
+    assert!(watch.live("global")["sessions"].get("created").is_some());
+
+    link.reply(&authenticate, json!({})).await;
+    watch.until_op("global", &successor, "completed").await;
+    late.until_op("global", &successor, "completed").await;
+    assert_eq!(late.live("global"), watch.live("global"));
+    watch.quiet(QUIET).await;
+    late.quiet(QUIET).await;
+    watch.converged(&bench).await;
+    late.converged(&bench).await;
+}
+
 /// A dropped HTTP connection drops only the response: the admitted create
 /// still runs to its end.
 #[tokio::test]

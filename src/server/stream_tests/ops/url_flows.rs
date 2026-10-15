@@ -273,8 +273,8 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
     drop(second);
 
     // session: an Agent request with no running operation starts an
-    // `agent_request`; its accepted flow outlives it, and the Agent's
-    // `elicitation/complete` for its elicitationId ends that one flow.
+    // `agent_request`; its accepted flow outlives it and the next prompt.
+    // The Agent's `elicitation/complete` ends that one flow.
     let asked = accept_flow(
         &bench,
         &mut link,
@@ -289,12 +289,41 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
     watch
         .until_op("session/s", &asking["id"], "completed")
         .await;
-    assert!(watch.live("session/s")["urlFlows"].get(&asked).is_some());
+    let asked_kept = flow(&watch.live("session/s"), &asked);
+    assert!(!asked_kept.is_null());
     watch
         .until_live("global", "the summary counts both flows", |live| {
             live["sessions"]["s"]["pending"]["urlFlows"] == 2
         })
         .await;
+
+    let (status, body) = bench
+        .op(
+            "session/s",
+            &asking["id"],
+            "prompt",
+            json!({"prompt": [text("after the agent request")]}),
+        )
+        .await;
+    let successor = assert_accepted(status, &body, "the agent request's successor");
+    let turn = link.request("session/prompt").await;
+    watch.until_op("session/s", &successor, "running").await;
+    assert_ne!(successor, asking["id"]);
+    assert_eq!(flow(&watch.live("session/s"), &asked), asked_kept);
+    link.reply(&turn, json!({"stopReason": "end_turn"})).await;
+    watch.until_op("session/s", &successor, "completed").await;
+    assert_eq!(
+        flow(&watch.live("session/s"), &asked),
+        asked_kept,
+        "replacing the agent request and completing its successor end no flow"
+    );
+    watch
+        .until_live("global", "the successor keeps both flows", |live| {
+            live["sessions"]["s"]["op"] == json!({"kind": "prompt", "status": "completed"})
+                && live["sessions"]["s"]["pending"]["urlFlows"] == 2
+        })
+        .await;
+
     link.notify(
         "elicitation/complete",
         json!({"elicitationId": "asked-flow"}),
@@ -310,7 +339,7 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
         prompt_kept,
         "the completion ends the one flow with its elicitationId"
     );
-    assert_eq!(watch.live("session/s")["op"]["id"], asking["id"]);
+    assert_eq!(watch.live("session/s")["op"]["id"], successor);
     watch
         .until_live("global", "the summary drops the completed flow", |live| {
             live["sessions"]["s"]["pending"]["urlFlows"] == 1
@@ -339,7 +368,7 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
     }
     // A dismissal is a resource action: it replaces no operation.
     assert_eq!(watch.live("global")["op"]["id"], again);
-    assert_eq!(watch.live("session/s")["op"]["id"], asking["id"]);
+    assert_eq!(watch.live("session/s")["op"]["id"], successor);
     watch.quiet(QUIET).await;
     watch.converged(&bench).await;
 }
