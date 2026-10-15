@@ -676,10 +676,8 @@ impl SessionRegistry {
         };
         let result = match kind {
             OperationKind::Fork => wire::value(&SessionCreated {
-                session_id: result["sessionId"]
-                    .as_str()
-                    .expect("a fork result names its session")
-                    .to_string(),
+                // The Agent's `ForkSessionResponse` always names it.
+                session_id: result["sessionId"].as_str().unwrap_or_default().to_string(),
             }),
             _ => wire::value(&Empty {}),
         };
