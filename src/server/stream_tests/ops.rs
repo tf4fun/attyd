@@ -17,7 +17,9 @@ mod admission;
 mod execution;
 mod interactions;
 mod login_terminals;
+mod long_requests;
 mod occupation;
+mod reads;
 mod url_flows;
 
 const QUIET: Duration = Duration::from_millis(300);
