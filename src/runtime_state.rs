@@ -5384,8 +5384,8 @@ mod tests {
     #[test]
     fn completed_url_identifiers_can_be_reused_in_session_and_request_scopes() {
         let mut state = state();
-        let incarnation = open(&mut state, "session");
-        for scope in [Some(("session", incarnation)), None] {
+        open(&mut state, "session");
+        for scope in [Some("session"), None] {
             for index in 0..2 {
                 let interaction = format!("{scope:?}-{index}");
                 state
@@ -5408,8 +5408,8 @@ mod tests {
     fn url_registration_fences_reuse_without_exposing_internal_identity() {
         for request_scoped in [false, true] {
             let mut state = state();
-            let incarnation = open(&mut state, "session");
-            let scope = (!request_scoped).then_some(("session", incarnation));
+            open(&mut state, "session");
+            let scope = (!request_scoped).then_some("session");
             for interaction in ["old-registration", "new-registration"] {
                 state
                     .upsert_elicitation("epoch", scope, interaction, json!({ "mode": "url" }))
