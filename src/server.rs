@@ -1702,6 +1702,59 @@ impl BridgeHub {
         ))
     }
 
+    /// A resource action (protocol §7), applied under one bridge guard.
+    /// Without an Agent connection its resources are gone with it.
+    async fn act(
+        &self,
+        scope: Scope,
+        resource: String,
+        action: bridge::resources::ResourceAction,
+    ) -> Result<(), ProtocolError> {
+        let input = self.state.lock().await.input.clone();
+        if let Some(input) = input {
+            let (reply, acted) = oneshot::channel();
+            let sent = input.send(bridge::BridgeInput::Resource {
+                scope: scope.clone(),
+                resource: resource.clone(),
+                action,
+                reply,
+            });
+            if sent.is_ok()
+                && let Ok(acted) = acted.await
+            {
+                return acted;
+            }
+        }
+        Err(ProtocolError::new(
+            ErrorCode::NotFound,
+            format!("{scope} has no resource {resource}"),
+        ))
+    }
+
+    /// The workspace of a held session's context reads (protocol §8).
+    async fn workspace(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::filesystem::WorkspaceFileSystem, ProtocolError> {
+        let input = self.state.lock().await.input.clone();
+        if let Some(input) = input {
+            let (reply, workspace) = oneshot::channel();
+            let sent = input.send(bridge::BridgeInput::Workspace {
+                session_id: session_id.to_string(),
+                reply,
+            });
+            if sent.is_ok()
+                && let Ok(workspace) = workspace.await
+            {
+                return workspace;
+            }
+        }
+        Err(ProtocolError::new(
+            ErrorCode::Unavailable,
+            "there is no Agent connection",
+        ))
+    }
+
     /// The test barrier of the next held response, once admitted.
     #[cfg(test)]
     async fn before_op_response(&self, op: &str) {
@@ -1967,6 +2020,7 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         // Writes share the read's wildcard; held `create`, `fork` and `list`
         // responses take no JSON deadline (protocol §6.3).
         .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
+        .route("/api/v2/sessions/{*read}", get(read_session))
         .route("/api/v1/sessions/{session_id}/events", get(session_events))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
@@ -2111,6 +2165,105 @@ async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) ->
     axum::Json(body).into_response()
 }
 
+/// The reads of a held session (protocol §8): an attachment its published
+/// `log` or `live` references, and its workspace context. A read holds,
+/// loads and renews nothing; an unheld session is `not_found`. The raw path
+/// is split before decoding, so an encoded session ID keeps its `/`.
+async fn read_session(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let segments: Option<Vec<String>> = uri
+        .path()
+        .strip_prefix("/api/v2/sessions/")
+        .unwrap_or_default()
+        .split('/')
+        .map(path_segment)
+        .collect();
+    let Some(segments) = segments else {
+        return invalid_request("the path is not valid percent-encoded UTF-8");
+    };
+    let segments = segments.iter().map(String::as_str).collect::<Vec<_>>();
+    let (session_id, read) = match segments[..] {
+        [session_id, ref read @ ..] if !session_id.is_empty() => (session_id, read),
+        _ => return invalid_request("no session"),
+    };
+    let scope = Scope::Session(session_id.to_string()).to_string();
+    let held = state
+        .bridge
+        .publication
+        .lock()
+        .publisher
+        .document(&scope)
+        .is_some();
+    let unheld = || {
+        refused(ProtocolError::new(
+            ErrorCode::NotFound,
+            format!("{scope} is not held"),
+        ))
+    };
+    if !held {
+        return unheld();
+    }
+    let parameter = |name: &str| {
+        url::form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes())
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| invalid_request(format!("{name} is required")))
+    };
+    match read {
+        ["attachments", attachment_id] => {
+            let block = state
+                .bridge
+                .publication
+                .lock()
+                .publisher
+                .attachment(session_id, attachment_id);
+            match block {
+                Some(block) => axum::Json(block).into_response(),
+                None => refused(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!("{scope} references no attachment {attachment_id}"),
+                )),
+            }
+        }
+        ["files"] => {
+            let query = match parameter("query") {
+                Ok(query) => query,
+                Err(response) => return response,
+            };
+            let workspace = match state.bridge.workspace(session_id).await {
+                Ok(workspace) => workspace,
+                Err(error) => return refused(error),
+            };
+            match workspace.search_context(&query).await {
+                Ok(matches) => axum::Json(json!({ "matches": matches })).into_response(),
+                Err(error) => refused(bridge::resources::refusal(error)),
+            }
+        }
+        ["files", "content"] => {
+            let path = match parameter("path") {
+                Ok(path) if !path.is_empty() => path,
+                Ok(_) => return invalid_request("path is required"),
+                Err(response) => return response,
+            };
+            let workspace = match state.bridge.workspace(session_id).await {
+                Ok(workspace) => workspace,
+                Err(error) => return refused(error),
+            };
+            match workspace.read_context(std::path::Path::new(&path)).await {
+                Ok(attachment) => axum::Json(json!({ "attachment": attachment })).into_response(),
+                Err(error) => refused(bridge::resources::refusal(error)),
+            }
+        }
+        _ => refused(ProtocolError::new(
+            ErrorCode::NotFound,
+            format!("no such read of {scope}"),
+        )),
+    }
+}
+
 /// The status of a refusal (protocol §9).
 fn error_status(code: ErrorCode) -> StatusCode {
     match code {
@@ -2151,17 +2304,54 @@ fn path_segment(segment: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// The operation write in a request body (protocol §6.1).
-fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
+/// A write's JSON body. Its media type is exactly `application/json`, in
+/// any case, with optional parameters.
+fn json_body(headers: &HeaderMap, body: &[u8]) -> Result<serde_json::Value, Response> {
     let json = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/json"));
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| {
+            media
+                .trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("application/json")
+        });
     if !json {
         return Err(invalid_request("the body must be application/json"));
     }
-    let body: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|error| invalid_request(format!("the body is not JSON: {error}")))?;
+    serde_json::from_slice(body)
+        .map_err(|error| invalid_request(format!("the body is not JSON: {error}")))
+}
+
+/// A resource action's body (protocol §7).
+fn resource_action(
+    action: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<bridge::resources::ResourceAction, Response> {
+    use crate::protocol::wire::{TerminalInput, TerminalResize};
+    use bridge::resources::ResourceAction;
+    let body = json_body(headers, body)?;
+    let invalid = |error: serde_json::Error| invalid_request(format!("{action}: {error}"));
+    match action {
+        "input" => {
+            let TerminalInput { data } = serde_json::from_value(body).map_err(invalid)?;
+            Ok(ResourceAction::Input { data })
+        }
+        "resize" => {
+            let TerminalResize { cols, rows } = serde_json::from_value(body).map_err(invalid)?;
+            crate::auth_terminal::validate_size(cols, rows)
+                .map_err(|error| refused(bridge::resources::refusal(error)))?;
+            Ok(ResourceAction::Resize { cols, rows })
+        }
+        _ if body.is_object() => Ok(ResourceAction::Dismiss),
+        _ => Err(invalid_request("dismiss: the body must be an object")),
+    }
+}
+
+/// The operation write in a request body (protocol §6.1).
+fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
+    let body = json_body(headers, body)?;
     let field = |name: &str| {
         body[name]
             .as_str()
@@ -2207,6 +2397,20 @@ async fn write_scope(
     };
     match segments[1..].iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["ops"] => {}
+        [
+            "resources",
+            resource,
+            action @ ("input" | "resize" | "dismiss"),
+        ] => {
+            let action = match resource_action(action, &headers, &body) {
+                Ok(action) => action,
+                Err(response) => return response,
+            };
+            return match state.bridge.act(scope, resource.to_string(), action).await {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(error) => refused(error),
+            };
+        }
         _ => {
             return refused(ProtocolError::new(
                 ErrorCode::NotFound,

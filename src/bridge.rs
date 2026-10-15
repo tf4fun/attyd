@@ -68,6 +68,7 @@ pub(crate) mod operations;
 #[cfg(test)]
 mod protocol_gate_tests;
 pub(crate) mod publication;
+pub(crate) mod resources;
 mod scheduling;
 mod streams;
 #[cfg(test)]
@@ -1916,6 +1917,21 @@ pub(crate) enum BridgeInput {
             Result<operations::OperationAdmission, crate::protocol::documents::ProtocolError>,
         >,
     },
+    /// A resource action (protocol §7): found and applied under one bridge
+    /// guard; it installs no operation.
+    Resource {
+        scope: OpScope,
+        resource: String,
+        action: resources::ResourceAction,
+        reply: oneshot::Sender<Result<(), crate::protocol::documents::ProtocolError>>,
+    },
+    /// The workspace of a held session, for its context reads (protocol §8);
+    /// it holds, loads and renews nothing.
+    Workspace {
+        session_id: String,
+        reply:
+            oneshot::Sender<Result<WorkspaceFileSystem, crate::protocol::documents::ProtocolError>>,
+    },
 }
 
 impl BridgeInput {
@@ -1923,7 +1939,11 @@ impl BridgeInput {
     /// session ID is validated by the reducer, never used to redirect a reply.
     fn session_id<'a>(&'a self, state: &'a BridgeState) -> Option<&'a str> {
         match self {
-            Self::RuntimeSnapshotRequest | Self::Subscribe { .. } | Self::ServeStreams => None,
+            Self::RuntimeSnapshotRequest
+            | Self::Subscribe { .. }
+            | Self::ServeStreams
+            | Self::Resource { .. }
+            | Self::Workspace { .. } => None,
             Self::SessionViewRequest { session_id, .. }
             | Self::ObserveSession { session_id, .. }
             | Self::UnobserveSession { session_id, .. }
@@ -1999,6 +2019,13 @@ impl BridgeInput {
                 serialized_value_len(command)
             }
             Self::Operation { write, .. } => serialized_value_len(&write.args),
+            Self::Resource {
+                resource, action, ..
+            } => serialized_value_len(resource).saturating_add(match action {
+                resources::ResourceAction::Input { data } => data.len(),
+                _ => 0,
+            }),
+            Self::Workspace { session_id, .. } => serialized_value_len(session_id),
         };
         payload.saturating_add(256)
     }
@@ -2034,6 +2061,18 @@ impl BridgeInput {
                 }
             }
             Self::Operation { reply, .. } => {
+                let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
+                    crate::protocol::documents::ErrorCode::Unavailable,
+                    error_message(error),
+                )));
+            }
+            Self::Resource { reply, .. } => {
+                let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
+                    crate::protocol::documents::ErrorCode::Unavailable,
+                    error_message(error),
+                )));
+            }
+            Self::Workspace { reply, .. } => {
                 let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
                     crate::protocol::documents::ErrorCode::Unavailable,
                     error_message(error),
@@ -2876,6 +2915,32 @@ where
                                 (command, turn, None)
                             }
                         }
+                    }
+                    Some(BridgeInput::Resource {
+                        scope,
+                        resource,
+                        action,
+                        reply,
+                    }) => {
+                        let mut state = state.lock().await;
+                        let acted = resources::act(
+                            &mut state,
+                            &sink,
+                            &auth_terminal,
+                            &scope,
+                            &resource,
+                            action,
+                        );
+                        let _ = reply.send(acted);
+                        continue;
+                    }
+                    Some(BridgeInput::Workspace { session_id, reply }) => {
+                        let workspace = {
+                            let state = state.lock().await;
+                            resources::workspace(&state, filesystem.as_deref(), &session_id)
+                        };
+                        let _ = reply.send(workspace);
+                        continue;
                     }
                     None => break,
                 };

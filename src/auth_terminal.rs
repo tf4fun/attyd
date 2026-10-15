@@ -348,7 +348,7 @@ pub(crate) fn validate_method(method: &AuthMethodTerminal) -> Result<(), Error> 
     Ok(())
 }
 
-fn validate_size(cols: u16, rows: u16) -> Result<(), Error> {
+pub(crate) fn validate_size(cols: u16, rows: u16) -> Result<(), Error> {
     if cols == 0 || rows == 0 {
         return Err(Error::invalid_params().data("terminal dimensions must be positive"));
     }

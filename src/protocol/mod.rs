@@ -30,6 +30,7 @@ pub(crate) mod registry;
 pub(crate) mod stream_check;
 #[cfg(test)]
 mod typescript;
+pub(crate) mod wire;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
