@@ -1,5 +1,5 @@
 //! Operations across scopes (protocol S5, §6.2 Delete, §6.4; acceptance 10,
-//! 11): a delete occupies `global` and its session, is the `op` of both with
+//! 14): a delete occupies `global` and its session, is the `op` of both with
 //! one ID until it ends, and holds back the load of an unheld session.
 use super::*;
 

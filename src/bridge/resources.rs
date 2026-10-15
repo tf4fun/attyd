@@ -152,7 +152,7 @@ fn dismiss_url_flow(state: &mut BridgeState, scope: &OpScope, interaction_id: &s
         registration
             .owner
             .as_ref()
-            .map(|owner| (owner.session_id.as_str(), owner.incarnation)),
+            .map(|owner| owner.session_id.as_str()),
         &elicitation_id,
         &registration.registration_id,
         UrlFlowStatus::Cancelled,

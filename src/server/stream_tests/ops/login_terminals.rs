@@ -1,4 +1,4 @@
-//! Login terminals (protocol §4.3, §4.6, §6.2, §7; acceptance 9): a
+//! Login terminals (protocol §4.3, §4.6, §6.2, §7; acceptance 16, 17): a
 //! `terminal_login` operation runs the method's login in a real terminal
 //! that `global.terminals` shows by the operation's ID. Input, resize and
 //! dismiss are resource actions; the terminal outlives its operation until
@@ -7,7 +7,7 @@
 //! The Agent is the stdio fake Agent; its launch script runs a login method
 //! instead when the bridge appends that method's arguments. Only the last
 //! test's login exits `0`: a successful login refreshes the connection, and
-//! that test follows the stream into the next one.
+//! that test follows a global stream into the next connection.
 //!
 //! PTY output arrives in arbitrary chunks, so the tests wait for complete
 //! lines only.

@@ -9,7 +9,6 @@ use crate::test_allocations::{AllocationStats, measure_allocations};
 use serde_json::{Value, json};
 
 const SESSION: &str = "allocation-session";
-const INCARNATION: u64 = 1;
 const STEPS: usize = 8;
 const BODY_SIZES: [usize; 3] = [8 * 1024, 256 * 1024, 1024 * 1024];
 const ALLOCATION_SLACK: usize = 64 * 1024;
@@ -45,11 +44,10 @@ fn message(text: &str) -> Value {
 
 fn fixture(body_size: usize) -> Fixture {
     let mut registry = SessionRegistry::new("allocation-epoch");
-    registry.register_new(SESSION, INCARNATION);
+    registry.register_new(SESSION);
     let operation_id = registry
         .start_turn(
             SESSION,
-            INCARNATION,
             "allocation-intent",
             vec![json!({ "type": "text", "text": "keep the full output" })],
         )
@@ -63,7 +61,7 @@ fn fixture(body_size: usize) -> Fixture {
         message(MESSAGE_PREFIX),
     ] {
         registry
-            .append_turn_update(SESSION, INCARNATION, &operation_id, update)
+            .append_turn_update(SESSION, &operation_id, update)
             .unwrap();
     }
     let held_turn = registry
@@ -144,12 +142,9 @@ fn memory_efficiency_other_tool_updates_do_not_copy_unrelated_large_body() {
 
         let (result, stats) = measure_allocations(|| {
             updates.into_iter().try_for_each(|update| {
-                fixture.registry.append_turn_update(
-                    SESSION,
-                    INCARNATION,
-                    &fixture.operation_id,
-                    update,
-                )
+                fixture
+                    .registry
+                    .append_turn_update(SESSION, &fixture.operation_id, update)
             })
         });
         result.unwrap();
@@ -171,12 +166,9 @@ fn memory_efficiency_small_message_appends_do_not_copy_unrelated_large_body() {
 
         let (result, stats) = measure_allocations(|| {
             updates.into_iter().try_for_each(|update| {
-                fixture.registry.append_turn_update(
-                    SESSION,
-                    INCARNATION,
-                    &fixture.operation_id,
-                    update,
-                )
+                fixture
+                    .registry
+                    .append_turn_update(SESSION, &fixture.operation_id, update)
             })
         });
         result.unwrap();
@@ -192,25 +184,16 @@ fn memory_efficiency_rejected_folds_preserve_the_running_turn() {
     let before = fixture.registry.state(SESSION).unwrap().clone();
     let rejections = [
         (
-            INCARNATION + 1,
-            fixture.operation_id.clone(),
-            message("stale incarnation"),
-            MirrorError::StaleIncarnation,
-        ),
-        (
-            INCARNATION,
             "wrong-operation".to_string(),
             message("wrong owner"),
             MirrorError::OperationMismatch,
         ),
         (
-            INCARNATION,
             fixture.operation_id.clone(),
             json!({ "sessionUpdate": "plan", "entries": 7 }),
             MirrorError::InconsistentHistory,
         ),
         (
-            INCARNATION,
             fixture.operation_id.clone(),
             json!({
                 "sessionUpdate": "agent_message_chunk",
@@ -220,11 +203,11 @@ fn memory_efficiency_rejected_folds_preserve_the_running_turn() {
             MirrorError::InconsistentHistory,
         ),
     ];
-    for (incarnation, operation, update, error) in rejections {
+    for (operation, update, error) in rejections {
         assert_eq!(
             fixture
                 .registry
-                .append_turn_update(SESSION, incarnation, &operation, update),
+                .append_turn_update(SESSION, &operation, update),
             Err(error)
         );
         assert!(
@@ -238,12 +221,7 @@ fn memory_efficiency_rejected_folds_preserve_the_running_turn() {
     // Rejection must not poison the still-running owner.
     fixture
         .registry
-        .append_turn_update(
-            SESSION,
-            INCARNATION,
-            &fixture.operation_id,
-            message(" after rejection"),
-        )
+        .append_turn_update(SESSION, &fixture.operation_id, message(" after rejection"))
         .unwrap();
     let mut expected = fixture.held_wire.clone();
     expected["updates"][2]["content"]["text"] = json!(format!("{MESSAGE_PREFIX} after rejection"));

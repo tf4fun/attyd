@@ -258,13 +258,10 @@ impl BridgeState {
                     let responder = owner
                         .as_ref()
                         .and_then(|owner| self.sessions.take_permission(&interaction_id, owner));
-                    if let Some(owner) = &owner {
-                        let _ = self.sessions.resolve_permission(
-                            &epoch,
-                            &session_id,
-                            owner.incarnation,
-                            &interaction_id,
-                        );
+                    if owner.is_some() {
+                        let _ =
+                            self.sessions
+                                .resolve_permission(&epoch, &session_id, &interaction_id);
                     }
                     if let Some(responder) = responder {
                         let _ = responder.sender.send(RequestPermissionResponse::new(
@@ -281,10 +278,10 @@ impl BridgeState {
                     let responder = owner
                         .as_ref()
                         .and_then(|owner| self.sessions.take_elicitation(&interaction_id, owner));
-                    if let Some(owner) = &owner {
+                    if owner.is_some() {
                         let _ = self.sessions.resolve_elicitation(
                             &epoch,
-                            Some((session_id.as_str(), owner.incarnation)),
+                            Some(session_id.as_str()),
                             &interaction_id,
                             None,
                         );

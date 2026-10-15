@@ -16,6 +16,7 @@ use super::documents::{
     End, EndReason, ErrorCode, ExitStatus, LoginTerminal, OperationKind, ProtocolError, Scope,
 };
 use super::op::OpSlot;
+use super::wire::{self, Empty, PromptResult, SessionCreated};
 use crate::runtime_state::{PendingInteraction, SessionLiveState, SessionOperationKind};
 use crate::session_registry::SessionRegistry;
 
@@ -139,7 +140,7 @@ fn settle_agent_request(slot: &mut OpSlot, unjoined: bool, joined: bool) {
         if slot.cancel_requested {
             slot.status = super::documents::OperationStatus::Cancelled;
         } else {
-            slot.complete(json!({}));
+            slot.complete(wire::value(&Empty {}));
         }
     }
 }
@@ -510,7 +511,7 @@ impl SessionRegistry {
     /// A delete of a session the bridge does not hold completed.
     pub(crate) fn complete_catalog_delete(&mut self, session_id: &str) {
         if let Some(occupier) = self.free_occupation(session_id) {
-            self.slot_mut(&occupier).complete(json!({}));
+            self.slot_mut(&occupier).complete(wire::value(&Empty {}));
         }
     }
 
@@ -577,7 +578,10 @@ impl SessionRegistry {
         } else if exit.cancelled {
             slot.status = super::documents::OperationStatus::Cancelled;
         } else {
-            slot.complete(json!({ "exitCode": exit.exit_code, "signal": exit.signal }));
+            slot.complete(wire::value(&ExitStatus {
+                exit_code: exit.exit_code,
+                signal: exit.signal,
+            }));
         }
     }
 
@@ -670,14 +674,18 @@ impl SessionRegistry {
         let Some(kind) = session_kind(kind) else {
             return;
         };
-        let result = match kind {
-            OperationKind::Fork => json!({ "sessionId": result["sessionId"] }),
-            _ => json!({}),
-        };
         if let Some(live) = self.held_live_mut(session_id)
             && live.op.is_running_kind(kind)
         {
-            live.op.complete(result);
+            live.op.complete(match kind {
+                OperationKind::Fork => wire::value(&SessionCreated {
+                    session_id: result["sessionId"]
+                        .as_str()
+                        .expect("a fork result is the Agent's ForkSessionResponse")
+                        .to_string(),
+                }),
+                _ => wire::value(&Empty {}),
+            });
         }
     }
 
@@ -709,7 +717,7 @@ impl SessionRegistry {
     /// occupying delete completes.
     pub(crate) fn complete_session_delete(&mut self, session_id: &str) {
         if let Some(occupier) = self.free_occupation(session_id) {
-            self.slot_mut(&occupier).complete(json!({}));
+            self.slot_mut(&occupier).complete(wire::value(&Empty {}));
         }
         self.scopes.ended.push((
             session_id.to_string(),
@@ -769,11 +777,13 @@ impl SessionRegistry {
         }
         match outcome {
             TurnEnd::Completed(response) => {
-                let mut result = json!({ "stopReason": response["stopReason"] });
-                if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
-                    result["usage"] = usage.clone();
-                }
-                live.op.complete(result);
+                live.op.complete(wire::value(&PromptResult {
+                    stop_reason: response["stopReason"].clone(),
+                    usage: response
+                        .get("usage")
+                        .filter(|usage| !usage.is_null())
+                        .cloned(),
+                }));
             }
             TurnEnd::Failed(error) => live.op.fail(agent_error(error)),
             TurnEnd::Uncertain(reason) => live

@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,10 +46,15 @@ pub(crate) enum OpArgs {
     Answer(AnswerArgs),
 }
 
-/// An empty body or `args`.
+/// An empty body, `args` or result.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub(crate) struct Empty {}
+
+/// `dto` as the JSON an operation slot keeps as its result.
+pub(crate) fn value<T: Serialize>(dto: &T) -> Value {
+    serde_json::to_value(dto).expect("a protocol DTO serializes")
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -251,7 +257,7 @@ pub(crate) struct ScopeRead {
     pub live: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
-    pub log: Option<Vec<LogEntry>>,
+    pub log: Option<Vec<Arc<LogEntry>>>,
 }
 
 /// `GET /api/v2/sessions/{id}/files?query=`.
@@ -297,4 +303,25 @@ pub(crate) struct ContextAttachment {
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub(crate) struct ErrorBody {
     pub error: ProtocolError,
+}
+
+/// The body of a request refused before any route: a disallowed Host or
+/// Origin (`403`) and an unknown `/api` path (`404`). It is not the protocol
+/// error body.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub(crate) struct HostError {
+    pub error: String,
+}
+
+// ---------------------------------------------------------------------------
+// Host
+
+/// `GET /api/health`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub(crate) struct Health {
+    pub ok: bool,
+    pub protocol: String,
+    pub backend: String,
 }

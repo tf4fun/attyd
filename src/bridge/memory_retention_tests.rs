@@ -8,7 +8,6 @@ const SESSION: &str = "publication-memory-session";
 
 struct RetentionTurn {
     state: BridgeState,
-    incarnation: u64,
     operation_id: String,
     validation: SessionUpdateSemanticState,
 }
@@ -17,7 +16,7 @@ impl RetentionTurn {
     fn new() -> Self {
         let mut state = BridgeState::default();
         let epoch = state.sessions.epoch().to_string();
-        let incarnation = state
+        state
             .sessions
             .open_new_with_replay(
                 &epoch,
@@ -27,10 +26,9 @@ impl RetentionTurn {
                 Vec::new(),
             )
             .unwrap();
-        state.sessions.register_new(SESSION, incarnation);
+        state.sessions.register_new(SESSION);
         let mut fixture = Self {
             state,
-            incarnation,
             operation_id: String::new(),
             validation: SessionUpdateSemanticState::default(),
         };
@@ -46,7 +44,6 @@ impl RetentionTurn {
             .admit_session_turn(
                 &epoch,
                 SESSION,
-                self.incarnation,
                 intent,
                 vec![json!({"type": "text", "text": "Read output"})],
             )
@@ -58,19 +55,13 @@ impl RetentionTurn {
         append_unpublished_update(
             &mut self.state,
             &mut self.validation,
-            self.incarnation,
             &self.operation_id,
             update,
         )
     }
 
     fn usage(&mut self, used: usize) {
-        append_unpublished_usage(
-            &mut self.state,
-            &mut self.validation,
-            self.incarnation,
-            used,
-        );
+        append_unpublished_usage(&mut self.state, &mut self.validation, used);
     }
 
     fn current_updates(&self) -> &crate::runtime_state::SharedTurnUpdates {
@@ -128,14 +119,13 @@ pub(super) fn probe_retained_coordinator_state() -> oneshot::Receiver<Arc<Bridge
 fn append_unpublished_update(
     state: &mut BridgeState,
     validation: &mut SessionUpdateSemanticState,
-    incarnation: u64,
     operation_id: &str,
     update: Value,
 ) -> Weak<Vec<Arc<Value>>> {
     validate_and_track_session_update(validation, &update).unwrap();
     state
         .sessions
-        .append_turn_update(SESSION, incarnation, operation_id, update.clone())
+        .append_turn_update(SESSION, operation_id, update.clone())
         .unwrap();
     let overlay = state.sessions.state(SESSION).unwrap().active_turn.as_ref();
     Arc::downgrade(&overlay.unwrap().updates)
@@ -144,7 +134,6 @@ fn append_unpublished_update(
 fn append_unpublished_usage(
     state: &mut BridgeState,
     validation: &mut SessionUpdateSemanticState,
-    incarnation: u64,
     used: usize,
 ) {
     let update = json!({"sessionUpdate": "usage_update", "used": used, "size": 100_000});
@@ -152,7 +141,7 @@ fn append_unpublished_usage(
     let epoch = state.sessions.epoch().to_string();
     state
         .sessions
-        .update_control_state(&epoch, SESSION, incarnation, update)
+        .update_control_state(&epoch, SESSION, update)
         .unwrap();
 }
 

@@ -20,8 +20,7 @@ pub(super) struct AgentContext {
     pub(super) filesystem: Option<Arc<WorkspaceFileSystem>>,
     pub(super) mcp: McpManager,
     pub(super) ingress: IngressSender,
-    // Captured by the coordinator before queueing; never recapture a replacement
-    // incarnation merely because an external operation completed late.
+    // Captured by the coordinator before queueing.
     pub(super) owner: Option<SessionResourceOwner>,
     pub(super) dispatch_owner: RequestOwner,
     pub(super) url_registration: Option<UrlRegistration>,
@@ -40,7 +39,7 @@ impl AgentContext {
             .as_ref()
             .filter(|owner| owner.session_id == session_id)
             .filter(|owner| state.sessions.owns_resources(owner))
-            .filter(|owner| live_session_incarnation(state, session_id) == Some(owner.incarnation))
+            .filter(|_| state.sessions.resource_session(session_id).is_some())
             .cloned()
             .ok_or_else(|| {
                 Error::invalid_params().data(format!(
@@ -64,11 +63,7 @@ impl AgentContext {
                 .data("filesystem methods are unavailable for remote transports")
         })?;
         let owner = self.require_owner(&*self.state.lock().await, session_id)?;
-        let (incarnation, workspace) =
-            require_session_workspace(session_id, &self.state, filesystem).await?;
-        if incarnation != owner.incarnation {
-            return Err(Error::request_cancelled().data("session workspace owner changed"));
-        }
+        let workspace = require_session_workspace(session_id, &self.state, filesystem).await?;
         Ok((owner, workspace))
     }
 }
@@ -265,9 +260,7 @@ async fn session_update(
         let session_id = notification.session_id.0.as_ref();
         if context.owner.is_some() {
             context.require_owner(&state, session_id)?;
-        } else if context.dispatch_owner.session_id.is_some()
-            || live_session_incarnation(&state, session_id).is_some()
-        {
+        } else if context.dispatch_owner.session_id.is_some() || live_session(&state, session_id) {
             // An unknown-ID creation event may use the global staging lane. It
             // may not silently become an update for an already replaced owner.
             return Err(Error::invalid_params().data("session update has no captured owner"));
@@ -336,12 +329,7 @@ async fn cancel_permission(
         if interaction_owner_is_live(&state, owner) {
             state
                 .sessions
-                .resolve_permission(
-                    &owner.epoch,
-                    &owner.session_id,
-                    owner.incarnation,
-                    permission_id,
-                )
+                .resolve_permission(&owner.epoch, &owner.session_id, permission_id)
                 .map_err(runtime_state_error)?;
             refresh_observer_timers(&mut state);
         }
@@ -371,16 +359,16 @@ async fn permission(
     let registered = {
         let mut state = context.state.lock().await;
         context.require_owner(&state, &session_id)?;
-        validate_terminal_references(&state, &session_id, owner.incarnation, tool_call)?;
+        validate_terminal_references(&state, &session_id, tool_call)?;
         let option_ids = validate_permission_request(
-            ensure_session_validation(&mut state, &session_id, owner.incarnation)?,
+            ensure_session_validation(&mut state, &session_id)?,
             &request,
         )
         .map_err(semantic_error)?;
         {
             if state
                 .sessions
-                .resources(&session_id, owner.incarnation)
+                .resources(&session_id)
                 .map_err(mirror_error)?
                 .permissions
                 .values()
@@ -398,7 +386,6 @@ async fn permission(
                 .upsert_permission(
                     &owner.epoch,
                     &session_id,
-                    owner.incarnation,
                     permission_id.clone(),
                     request_value.clone(),
                 )
@@ -457,7 +444,7 @@ async fn cancel_elicitation(
                 .sessions
                 .resolve_elicitation(
                     &epoch,
-                    owner.map(|owner| (owner.session_id.as_str(), owner.incarnation)),
+                    owner.map(|owner| owner.session_id.as_str()),
                     elicitation_id,
                     None,
                 )
@@ -524,9 +511,7 @@ async fn elicitation(
                 .sessions
                 .upsert_elicitation(
                     &epoch,
-                    owner
-                        .as_ref()
-                        .map(|owner| (owner.session_id.as_str(), owner.incarnation)),
+                    owner.as_ref().map(|owner| owner.session_id.as_str()),
                     elicitation_id.clone(),
                     request_value.clone(),
                 )
@@ -601,7 +586,7 @@ async fn complete_elicitation(
             registration
                 .owner
                 .as_ref()
-                .map(|owner| (owner.session_id.as_str(), owner.incarnation)),
+                .map(|owner| owner.session_id.as_str()),
             &elicitation_id,
             &registration.registration_id,
             UrlFlowStatus::Completed,
@@ -664,10 +649,7 @@ async fn create_terminal(
     let session_id = request.session_id.0.to_string();
     let (owner, filesystem) = context.workspace(&session_id).await?;
     let transfer = prepare_response_task(&connection, async move {
-        let response = terminals
-            .in_workspace(filesystem)
-            .create_for_incarnation(request, owner.incarnation)
-            .await?;
+        let response = terminals.in_workspace(filesystem).create(request).await?;
         let local_turn = context.continue_local().await;
         let validation = match &local_turn {
             Ok(_) => {
@@ -866,7 +848,6 @@ mod tests {
                 dispatch_owner: RequestOwner {
                     epoch,
                     session_id: None,
-                    incarnation: None,
                     operation_id: "incoming-test".to_owned(),
                     attempt_id: Some("allocation".to_owned()),
                 },
@@ -890,7 +871,7 @@ mod tests {
             let owner = if scoped {
                 let mut state = context.state.lock().await;
                 let epoch = state.sessions.epoch().to_owned();
-                let incarnation = state
+                state
                     .sessions
                     .open_new(
                         &epoch,
@@ -899,13 +880,8 @@ mod tests {
                         json!({"sessionId":"session"}),
                     )
                     .unwrap();
-                session_mirror(&mut state).register_new("session", incarnation);
-                Some(
-                    state
-                        .sessions
-                        .resource_owner("session", incarnation)
-                        .unwrap(),
-                )
+                session_mirror(&mut state).register_new("session");
+                Some(state.sessions.resource_owner("session").unwrap())
             } else {
                 None
             };
@@ -916,7 +892,6 @@ mod tests {
                 request_scope: None,
             };
             route.dispatch_owner.session_id = owner.as_ref().map(|owner| owner.session_id.clone());
-            route.dispatch_owner.incarnation = owner.as_ref().map(|owner| owner.incarnation);
             route.dispatch_owner.attempt_id = Some("old".to_owned());
             let method = if kind == InboundRequestKind::Permission {
                 "session/request_permission"
@@ -946,13 +921,7 @@ mod tests {
                     let (sender, receiver) = oneshot::channel();
                     state
                         .sessions
-                        .upsert_permission(
-                            &epoch,
-                            &owner.session_id,
-                            owner.incarnation,
-                            allocation,
-                            json!({}),
-                        )
+                        .upsert_permission(&epoch, &owner.session_id, allocation, json!({}))
                         .unwrap();
                     state
                         .sessions
@@ -973,7 +942,7 @@ mod tests {
                         .sessions
                         .upsert_elicitation(
                             &epoch,
-                            owner.map(|owner| (owner.session_id.as_str(), owner.incarnation)),
+                            owner.map(|owner| owner.session_id.as_str()),
                             allocation,
                             json!({"mode":"form"}),
                         )

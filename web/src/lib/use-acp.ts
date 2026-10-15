@@ -15,10 +15,14 @@ import type {
   RequestPermissionResponse,
   SessionInfo,
 } from "@agentclientprotocol/sdk";
-import type { TerminalSnapshot, WorkspaceContextAttachment, WorkspaceContextMatch } from "../../../shared/bridge";
+import type { TerminalSnapshot } from "../../../shared/bridge";
 import type {
   Answer,
   CatalogPage,
+  ContextAttachment,
+  ContextMatch,
+  ContextMatches,
+  ContextRead,
   End,
   GlobalLive,
   Interaction,
@@ -929,19 +933,19 @@ export class Workspace {
   // -------------------------------------------------------------------------
   // Reads (§8)
 
-  searchWorkspaceContext = async (query: string): Promise<WorkspaceContextMatch[]> => {
+  searchWorkspaceContext = async (query: string): Promise<ContextMatch[]> => {
     const shown = this.#shown();
     if (shown == null) throw new Error(i18n.t("errors.searchNotReady"));
     const body = await readJson(`/api/v2/sessions/${encodeURIComponent(shown.live.sessionId)}/files?${new URLSearchParams({ query })}`);
-    return isRecord(body) && Array.isArray(body.matches) ? body.matches as WorkspaceContextMatch[] : [];
+    return isRecord(body) && Array.isArray(body.matches) ? (body as unknown as ContextMatches).matches : [];
   };
 
-  readWorkspaceContext = async (path: string): Promise<WorkspaceContextAttachment> => {
+  readWorkspaceContext = async (path: string): Promise<ContextAttachment> => {
     const shown = this.#shown();
     if (shown == null) throw new Error(i18n.t("errors.contextNotReady"));
     const body = await readJson(`/api/v2/sessions/${encodeURIComponent(shown.live.sessionId)}/files/content?${new URLSearchParams({ path })}`);
     if (!isRecord(body) || !isRecord(body.attachment)) throw new Error(i18n.t("errors.contextNotReady"));
-    return body.attachment as unknown as WorkspaceContextAttachment;
+    return (body as unknown as ContextRead).attachment;
   };
 
   // -------------------------------------------------------------------------

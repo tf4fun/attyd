@@ -91,7 +91,7 @@ impl OpSlot {
     pub(crate) fn completed(kind: OperationKind, input: Value) -> Self {
         Self {
             status: OperationStatus::Completed,
-            result: Some(json!({})),
+            result: Some(super::wire::value(&super::wire::Empty {})),
             ..Self::running(kind, input)
         }
     }

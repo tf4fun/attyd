@@ -112,6 +112,8 @@ fn declarations(cfg: &Config) -> Vec<String> {
         ContextRead,
         ContextAttachment,
         ErrorBody,
+        HostError,
+        Health,
     ]
 }
 

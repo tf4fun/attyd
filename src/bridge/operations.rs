@@ -136,7 +136,7 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
                 deliver_permission(state, &owner, &id, response, |state| {
                     state
                         .sessions
-                        .resolve_permission(&epoch, &owner.session_id, owner.incarnation, &id)
+                        .resolve_permission(&epoch, &owner.session_id, &id)
                         .map(drop)
                         .map_err(runtime_state_error)
                 })
@@ -146,9 +146,7 @@ fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, D
                 response,
                 accepted_url_id,
             } => {
-                let scope = owner
-                    .as_ref()
-                    .map(|owner| (owner.session_id.as_str(), owner.incarnation));
+                let scope = owner.as_ref().map(|owner| owner.session_id.as_str());
                 deliver_elicitation(
                     state,
                     &id,
@@ -243,13 +241,13 @@ fn cancel(
                 .and_then(|session| session.active_turn.as_ref())
                 .and_then(|turn| turn.execution.as_ref())
                 .is_some_and(|execution| execution.rpc_operation_id == op);
-            let Some(incarnation) = live_session_incarnation(state, session_id) else {
+            if !live_session(state, session_id) {
                 return;
-            };
+            }
             if started {
                 if let Err(error) = connection
                     .send_notification(CancelNotification::new(session_id.to_string()))
-                    .and_then(|()| commit_session_cancel(state, sink, session_id, incarnation))
+                    .and_then(|()| commit_session_cancel(state, sink, session_id))
                 {
                     report(sink, "session/cancel", error);
                 }

@@ -183,7 +183,7 @@ The native `auth_terminal::tests` gate verifies PTY input and lifecycle behavior
 
 The Rust suite covers CLI and MCP configuration boundaries,
 filesystem roots/read/write/context behavior, terminal and terminal-auth lifecycle, optional
-capability gates, Agent-owned cwd selection, early/late update isolation, large lossless relay values,
+capability gates, Agent-owned cwd selection, early/late update routing, large lossless relay values,
 complete structured errors, large HTTP/stdio/WebSocket payloads, delayed admission, cyclic pagination, session races, complete ContentBlock validation,
 prompt/usage coherence, configuration and mode references, transactional session updates,
 permission and elicitation semantics, and MCP process/request races.
@@ -191,6 +191,41 @@ Protocol v2 has its own gates: `protocol::convergence_tests` compares replicas w
 published documents after every event, `protocol::hub_tests` covers cuts, queues and coalescing,
 `bridge::protocol_gate_tests` runs the coordinator over a real ACP transport, and
 `server::stream_tests` adds real HTTP for the stream, writes, resource actions and reads.
+
+The bridge identifies a session by its ID only (migration step 9,
+[plan §5](state-sync.md#5-migration)). Its session-lifecycle gates are behaviour
+tests, not checks of an internal identity:
+
+- updates before a creation response: `preserves_early_update_bursts_until_creation_completes`,
+  `a_new_sessions_early_controls_survive_its_creation_response`,
+  `an_early_compaction_continues_its_summary_after_creation`,
+  `invalid_early_updates_prevent_session_commit_and_clear_cleanly`;
+- the response as the cut between replay and live data:
+  `replay_response_seals_history_before_following_live_data`;
+- a cold placeholder: `a_cold_placeholder_keeps_wire_replay_before_the_creation_response`
+  (real ACP transport and coordinator),
+  `creation_staging_keeps_cold_resources_separate_and_counts_every_unknown_id`;
+- a load committed atomically or rolled back:
+  `load_candidate_is_invisible_until_success_then_commits_atomically`,
+  `failed_load_discards_candidate_and_resume_never_claims_replayed_history`,
+  `invalid_replay_cannot_publish_a_valid_prefix`,
+  `invalidated_load_attempt_cannot_commit_a_truncated_replay`,
+  `replay_validation_rollback_settles_only_its_own_attempt`;
+- close and delete cleanup:
+  `close_cleanup_rejects_late_live_resources_without_publication_or_resurrection`,
+  `close_then_delete_is_irreversible_and_partial_failure_stays_closed`,
+  `delete_close_success_releases_resources_before_delete_response`;
+- resource release: `closing_a_session_releases_resources_once`,
+  `replacement_retires_old_resources_and_history_removal_preserves_live_ones`,
+  `failed_attachment_releases_every_pre_response_live_resource`,
+  `releases_only_terminals_owned_by_closed_session`.
+
+A late notification names only a `sessionId`. One for an ID with no running
+session is dropped when no creation is pending; while a creation is pending it may
+be staged, bounded by the number of pending creations, and is replayed only into
+the session whose ID the creation response returns. One for an ID that a new
+session has taken applies to that session. No test claims to tell where a
+notification came from, such as a session closed earlier under the same ID.
 
 The replica engine and the page projection remain TypeScript because the browser runs them;
 their tests are `tests/replica.test.ts`, `tests/protocol-client.test.ts` and
@@ -219,9 +254,11 @@ Selected behavior cases:
   thread.
 - Zed's `client_capabilities_include_elicitation_without_acp_beta` maps to the Rust capability
   test: form and URL elicitation are advertised without editor/NES support.
-- Zed's missing-thread handling maps to the Rust early/late routing test: updates are buffered only
-  while a matching session can still be allocated, and late unknown/closed-session updates never
-  leak into the visible thread.
+- Zed's missing-thread handling maps to the Rust early/late routing test
+  (`buffers_pre_response_updates_and_drops_late_unknown_sessions`): updates are buffered only
+  while a creation is pending (bounded by the number of pending creations) and replayed only into
+  the session whose ID the creation response returns; with no creation pending, updates for an ID
+  with no running session are dropped and never reach the visible thread.
 - Zed's session-list work-directory tests map to the protocol v2 black-box assertion that an
   Agent-owned cwd returned by `session/list` is retained when history is loaded.
 

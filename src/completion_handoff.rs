@@ -287,13 +287,12 @@ impl CompletionHandoff {
         Ok(disposition)
     }
 
-    /// Retire registrations belonging to exactly this canonical incarnation.
-    /// Already transferred turns and any replacement incarnation are untouched.
+    /// Retire the registrations of this session's removed queue. Already
+    /// transferred turns are untouched.
     pub(crate) fn discard_session(
         &self,
         epoch: &str,
         session_id: &str,
-        incarnation: u64,
     ) -> Result<usize, HandoffError> {
         let removed = {
             let mut state = self
@@ -305,9 +304,7 @@ impl CompletionHandoff {
                 .entries
                 .keys()
                 .filter(|owner| {
-                    owner.epoch == epoch
-                        && owner.session_id.as_deref() == Some(session_id)
-                        && owner.incarnation == Some(incarnation)
+                    owner.epoch == epoch && owner.session_id.as_deref() == Some(session_id)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -476,7 +473,6 @@ mod tests {
         RequestOwner {
             epoch: "epoch".to_owned(),
             session_id: Some("a".to_owned()),
-            incarnation: Some(1),
             operation_id: "operation".to_owned(),
             attempt_id: Some("attempt".to_owned()),
         }
@@ -562,7 +558,7 @@ mod tests {
     // pump receives no fresh ingress; only the turn's drop may wake it to take A2.
     fn queued_delivery() -> (SessionDispatch<&'static str>, DeliveryGuard) {
         let dispatch = SessionDispatch::new("epoch").unwrap();
-        let session = dispatch.register("a", 1).unwrap();
+        let session = dispatch.register("a").unwrap();
         for event in ["completion", "A2"] {
             dispatch
                 .try_route(&session, TrafficClass::Reserved, 1, event)
@@ -648,13 +644,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retiring_one_incarnation_preserves_other_sessions_and_epochs() {
+    async fn retiring_one_session_preserves_other_sessions_and_epochs() {
         let handoff = CompletionHandoff::new(Arc::new(Notify::new())).unwrap();
         let mut registrations = Vec::new();
         for index in 0..4 {
             let mut identity = owner();
             match index {
-                1 => identity.incarnation = Some(2),
+                1 => identity.operation_id = "other-operation".into(),
                 2 => identity.session_id = Some("b".into()),
                 3 => identity.epoch = "other-epoch".into(),
                 _ => {}
@@ -665,11 +661,13 @@ mod tests {
                 .unwrap();
             registrations.push(registration);
         }
-        assert_eq!(handoff.discard_session("epoch", "a", 1), Ok(1));
-        assert_eq!(
-            registrations.remove(0).wait().await.unwrap_err(),
-            HandoffError::CompletionUnavailable
-        );
+        assert_eq!(handoff.discard_session("epoch", "a"), Ok(2));
+        for registration in registrations.drain(..2) {
+            assert_eq!(
+                registration.wait().await.unwrap_err(),
+                HandoffError::CompletionUnavailable
+            );
+        }
         for registration in registrations {
             assert!(futures::poll!(Box::pin(registration.wait())).is_pending());
         }
@@ -819,21 +817,20 @@ mod tests {
         registration
             .bind(RequestId::from("expected".to_owned()))
             .unwrap();
-        for mismatch in 0..6 {
+        for mismatch in 0..5 {
             let mut foreign = owner();
             match mismatch {
                 0 => foreign.epoch = "old-epoch".to_owned(),
                 1 => foreign.session_id = Some("other-session".to_owned()),
-                2 => foreign.incarnation = Some(2),
-                3 => foreign.operation_id = "other-operation".to_owned(),
-                4 => foreign.attempt_id = Some("old-attempt".to_owned()),
+                2 => foreign.operation_id = "other-operation".to_owned(),
+                3 => foreign.attempt_id = Some("old-attempt".to_owned()),
                 _ => {}
             }
             let fixture = response(foreign).await;
             let (dispatch, guard) = queued_delivery();
             assert_eq!(
                 handoff.handoff(fixture.completion, guard),
-                Ok(if mismatch == 5 {
+                Ok(if mismatch == 4 {
                     HandoffDisposition::StaleRequestId
                 } else {
                     HandoffDisposition::Unregistered
@@ -841,11 +838,10 @@ mod tests {
             );
             assert_woken(&wake, &dispatch).await;
         }
-        // None/None is a distinct, supported owner for creation/global RPC paths.
+        // A sessionless owner is distinct and supported for creation/global RPC paths.
         drop(registration);
         let mut global = owner();
         global.session_id = None;
-        global.incarnation = None;
         let _global_registration = handoff.register(global).unwrap();
     }
 

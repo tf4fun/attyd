@@ -21,7 +21,6 @@ use tokio::sync::mpsc;
 pub(crate) struct RequestOwner {
     pub epoch: String,
     pub session_id: Option<String>,
-    pub incarnation: Option<u64>,
     pub operation_id: String,
     pub attempt_id: Option<String>,
 }
@@ -368,7 +367,6 @@ mod tests {
         RequestOwner {
             epoch: "epoch".into(),
             session_id: Some("session".into()),
-            incarnation: Some(7),
             operation_id: operation_id.into(),
             attempt_id: None,
         }
@@ -653,7 +651,6 @@ mod tests {
             .connect_with(transport, async move |connection| {
                 let mut creation_owner = owner("new-session");
                 creation_owner.session_id = None;
-                creation_owner.incarnation = None;
                 let reservation = ingress
                     .try_reserve(RequestClass::Control, creation_owner)
                     .unwrap();

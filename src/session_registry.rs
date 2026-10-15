@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use uuid::Uuid;
 
@@ -15,7 +15,7 @@ use crate::session_resources::{
 use crate::session_state::{MirrorError, SessionState};
 
 /// The only map entry for a session: cloneable business data and non-cloneable
-/// external handles have the same incarnation and lifetime, without another map.
+/// external handles have the same lifetime, without another map.
 pub(crate) struct SessionEntry {
     pub(crate) state: SessionState,
     pub(crate) resources: SessionResources,
@@ -38,13 +38,8 @@ impl SessionEntry {
 /// Owns each session once. History and live transitions operate on the same entry.
 pub(crate) struct SessionRegistry {
     pub(crate) epoch: String,
-    pub(crate) next_incarnation: u64,
     pub(crate) next_operation: u64,
     pub(crate) sessions: BTreeMap<String, SessionEntry>,
-    /// Fully removed session IDs. The Agent may still own them (local
-    /// retirement) or may report them again later, so late updates must not be
-    /// mistaken for a pending creation's early replay.
-    retired_ids: HashSet<String>,
     pub(crate) permission_owners: HashMap<String, SessionResourceOwner>,
     pub(crate) elicitation_owners: HashMap<String, SessionResourceOwner>,
     pub(crate) url_owners: HashMap<String, UrlRegistration>,
@@ -95,22 +90,13 @@ impl SessionRegistry {
     pub(crate) fn resource_owner(
         &self,
         session_id: &str,
-        incarnation: u64,
     ) -> Result<SessionResourceOwner, MirrorError> {
-        self.resources(session_id, incarnation)?;
-        Ok(SessionResourceOwner::new(
-            self.epoch.clone(),
-            session_id,
-            incarnation,
-        ))
+        self.resources(session_id)?;
+        Ok(SessionResourceOwner::new(self.epoch.clone(), session_id))
     }
 
     pub(crate) fn owns_resources(&self, owner: &SessionResourceOwner) -> bool {
-        owner.epoch == self.epoch
-            && self
-                .sessions
-                .get(&owner.session_id)
-                .is_some_and(|entry| entry.state.incarnation == owner.incarnation)
+        owner.epoch == self.epoch && self.sessions.contains_key(&owner.session_id)
     }
 
     /// Build the lightweight route from the canonical accepted flow's identity.
@@ -125,7 +111,7 @@ impl SessionRegistry {
         let flow = match &owner {
             Some(owner) => {
                 if !self.owns_resources(owner) {
-                    return Err(MirrorError::StaleIncarnation);
+                    return Err(MirrorError::UnknownSession);
                 }
                 self.sessions
                     .get(&owner.session_id)
@@ -166,7 +152,7 @@ impl SessionRegistry {
             return None;
         }
         let pending = self
-            .resources(&owner.session_id, owner.incarnation)
+            .resources(&owner.session_id)
             .ok()?
             .permissions
             .get(interaction_id)?;
@@ -180,12 +166,12 @@ impl SessionRegistry {
         pending: PermissionResponder,
     ) -> Result<(), MirrorError> {
         if !self.owns_resources(&owner) {
-            return Err(MirrorError::StaleIncarnation);
+            return Err(MirrorError::UnknownSession);
         }
         if self.permission_owners.contains_key(&interaction_id) {
             return Err(MirrorError::OperationMismatch);
         }
-        self.resources_mut(&owner.session_id, owner.incarnation)?
+        self.resources_mut(&owner.session_id)?
             .permissions
             .insert(interaction_id.clone(), pending);
         self.permission_owners.insert(interaction_id, owner);
@@ -204,7 +190,7 @@ impl SessionRegistry {
         if !self.owns_resources(expected) {
             return None;
         }
-        self.resources_mut(&expected.session_id, expected.incarnation)
+        self.resources_mut(&expected.session_id)
             .ok()?
             .permissions
             .remove(interaction_id)
@@ -219,7 +205,7 @@ impl SessionRegistry {
             return None;
         }
         let pending = self
-            .resources(&owner.session_id, owner.incarnation)
+            .resources(&owner.session_id)
             .ok()?
             .elicitations
             .get(interaction_id)?;
@@ -233,12 +219,12 @@ impl SessionRegistry {
         pending: ElicitationResponder,
     ) -> Result<(), MirrorError> {
         if !self.owns_resources(&owner) {
-            return Err(MirrorError::StaleIncarnation);
+            return Err(MirrorError::UnknownSession);
         }
         if self.elicitation_owners.contains_key(&interaction_id) {
             return Err(MirrorError::OperationMismatch);
         }
-        self.resources_mut(&owner.session_id, owner.incarnation)?
+        self.resources_mut(&owner.session_id)?
             .elicitations
             .insert(interaction_id.clone(), pending);
         self.elicitation_owners.insert(interaction_id, owner);
@@ -257,40 +243,27 @@ impl SessionRegistry {
         if !self.owns_resources(expected) {
             return None;
         }
-        self.resources_mut(&expected.session_id, expected.incarnation)
+        self.resources_mut(&expected.session_id)
             .ok()?
             .elicitations
             .remove(interaction_id)
     }
 
-    pub(crate) fn resources(
-        &self,
-        session_id: &str,
-        incarnation: u64,
-    ) -> Result<&SessionResources, MirrorError> {
-        let entry = self
-            .sessions
+    pub(crate) fn resources(&self, session_id: &str) -> Result<&SessionResources, MirrorError> {
+        self.sessions
             .get(session_id)
-            .ok_or(MirrorError::UnknownSession)?;
-        if entry.state.incarnation != incarnation {
-            return Err(MirrorError::StaleIncarnation);
-        }
-        Ok(&entry.resources)
+            .map(|entry| &entry.resources)
+            .ok_or(MirrorError::UnknownSession)
     }
 
     pub(crate) fn resources_mut(
         &mut self,
         session_id: &str,
-        incarnation: u64,
     ) -> Result<&mut SessionResources, MirrorError> {
-        let entry = self
-            .sessions
+        self.sessions
             .get_mut(session_id)
-            .ok_or(MirrorError::UnknownSession)?;
-        if entry.state.incarnation != incarnation {
-            return Err(MirrorError::StaleIncarnation);
-        }
-        Ok(&mut entry.resources)
+            .map(|entry| &mut entry.resources)
+            .ok_or(MirrorError::UnknownSession)
     }
 
     /// One history workflow owns the session's optional sync slot for its whole
@@ -303,7 +276,7 @@ impl SessionRegistry {
         if owner.session.epoch != self.epoch {
             return Err(MirrorError::OperationMismatch);
         }
-        let resources = self.resources_mut(&owner.session.session_id, owner.session.incarnation)?;
+        let resources = self.resources_mut(&owner.session.session_id)?;
         if resources.history_sync.is_some() {
             return Err(MirrorError::OperationMismatch);
         }
@@ -320,8 +293,8 @@ impl SessionRegistry {
     /// idle interval from its own settle — but the parked continuation's token
     /// is not fired: it still wakes at its own deadline, sees `Superseded`, and
     /// reports the projection exactly as the successor left it.
-    pub(crate) fn supersede_history_sync(&mut self, session_id: &str, incarnation: u64) {
-        if let Ok(resources) = self.resources_mut(session_id, incarnation) {
+    pub(crate) fn supersede_history_sync(&mut self, session_id: &str) {
+        if let Ok(resources) = self.resources_mut(session_id) {
             resources.history_sync = None;
         }
     }
@@ -329,8 +302,7 @@ impl SessionRegistry {
     /// Only the exact flow identity may release the slot: a stale owner's late
     /// finish must not strip a replacement workflow's protection.
     pub(crate) fn finish_history_sync(&mut self, owner: &HistorySyncOwner) {
-        if let Ok(resources) =
-            self.resources_mut(&owner.session.session_id, owner.session.incarnation)
+        if let Ok(resources) = self.resources_mut(&owner.session.session_id)
             && resources
                 .history_sync
                 .as_ref()
@@ -343,10 +315,7 @@ impl SessionRegistry {
     /// How a waking continuation's flow identity compares to the live slot.
     pub(crate) fn history_sync_status(&self, owner: &HistorySyncOwner) -> HistorySyncStatus {
         match self.sessions.get(&owner.session.session_id) {
-            Some(entry)
-                if owner.session.epoch == self.epoch
-                    && entry.state.incarnation == owner.session.incarnation =>
-            {
+            Some(entry) if owner.session.epoch == self.epoch => {
                 match &entry.resources.history_sync {
                     Some(sync) if sync.flow_id == owner.flow_id => HistorySyncStatus::Owned,
                     _ => HistorySyncStatus::Superseded,
@@ -368,44 +337,21 @@ impl SessionRegistry {
 
     /// Final physical removal is centralized so pending senders are answered and
     /// observer/materialization cancellation tokens are never silently discarded.
-    pub(crate) fn cancel_resources(&mut self, session_id: &str, incarnation: u64) {
-        if self
-            .sessions
-            .get(session_id)
-            .is_none_or(|entry| entry.state.incarnation != incarnation)
-        {
+    pub(crate) fn cancel_resources(&mut self, session_id: &str) {
+        let Some(entry) = self.sessions.get_mut(session_id) else {
             return;
-        }
-        let owner = SessionResourceOwner::new(self.epoch.clone(), session_id, incarnation);
+        };
+        entry.resources.cancel();
+        let owner = SessionResourceOwner::new(self.epoch.clone(), session_id);
         self.permission_owners.retain(|_, route| route != &owner);
         self.elicitation_owners.retain(|_, route| route != &owner);
         self.url_owners
             .retain(|_, route| route.owner.as_ref() != Some(&owner));
-        self.sessions
-            .get_mut(session_id)
-            .expect("validated resource owner")
-            .resources
-            .cancel();
     }
 
-    /// A session ID the bridge once owned and fully released. Retirement
-    /// filtering uses it to keep late Agent updates out of other sessions'
-    /// creation replay; it never bans the ID from rematerializing.
-    pub(crate) fn is_retired(&self, session_id: &str) -> bool {
-        self.retired_ids.contains(session_id)
-    }
-
-    pub(crate) fn retire_entry(&mut self, session_id: &str, incarnation: u64) {
-        if self
-            .sessions
-            .get(session_id)
-            .is_none_or(|entry| entry.state.incarnation != incarnation)
-        {
-            return;
-        }
-        self.cancel_resources(session_id, incarnation);
+    pub(crate) fn retire_entry(&mut self, session_id: &str) {
+        self.cancel_resources(session_id);
         self.sessions.remove(session_id);
-        self.retired_ids.insert(session_id.to_string());
     }
 
     pub(crate) fn new(epoch: impl Into<String>) -> Self {
@@ -413,10 +359,8 @@ impl SessionRegistry {
         Self {
             history: HistoryCache::default(),
             epoch,
-            next_incarnation: 0,
             next_operation: 0,
             sessions: BTreeMap::new(),
-            retired_ids: HashSet::new(),
             permission_owners: HashMap::new(),
             elicitation_owners: HashMap::new(),
             url_owners: HashMap::new(),
@@ -440,10 +384,10 @@ impl Default for SessionRegistry {
 pub(crate) enum HistorySyncStatus {
     /// The slot still belongs to this flow: the next attempt may proceed.
     Owned,
-    /// The same incarnation lost the slot to an admitted business operation or
-    /// a successor flow: yield without another attempt or fallback write.
+    /// The session lost the slot to an admitted business operation or a
+    /// successor flow: yield without another attempt or fallback write.
     Superseded,
-    /// The session, incarnation, or epoch is gone: finish as cancelled.
+    /// The session or epoch is gone: finish as cancelled.
     Gone,
 }
 
@@ -451,7 +395,6 @@ pub(crate) enum HistorySyncStatus {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Arc;
 
     use agent_client_protocol::schema::v1::{
         CreateElicitationResponse, ElicitationAction, RequestPermissionOutcome,
@@ -464,15 +407,14 @@ mod tests {
     use crate::runtime_state::SessionOperationKind;
     use crate::semantic::SessionUpdateSemanticState;
     use crate::session_resources::{
-        ElicitationResponder, MaterializationResources, PermissionResponder,
-        ReplayValidationBackup, SessionUpdateOwner,
+        ElicitationResponder, MaterializationResources, PermissionResponder, ReplayValidationBackup,
     };
 
     #[test]
     fn canonical_access_distinguishes_attachment_active_and_cleanup_owners() {
         let mut registry = SessionRegistry::default();
         let epoch = registry.epoch().to_string();
-        let incarnation = registry
+        registry
             .start_attachment(
                 &epoch,
                 "session",
@@ -490,29 +432,15 @@ mod tests {
             .complete_attachment(
                 &epoch,
                 "session",
-                incarnation,
                 "load",
                 SessionOperationKind::Load,
                 json!({}),
             )
             .unwrap();
-        registry.register_new("session", incarnation);
-        assert_eq!(
-            registry
-                .active_session("session")
-                .unwrap()
-                .state
-                .incarnation,
-            incarnation
-        );
+        registry.register_new("session");
+        assert!(registry.active_session("session").is_some());
         registry
-            .start_reload(
-                &epoch,
-                "session",
-                incarnation,
-                "reload",
-                SessionOperationKind::Load,
-            )
+            .start_reload(&epoch, "session", "reload", SessionOperationKind::Load)
             .unwrap();
         assert_eq!(
             registry.allocated_session_count(),
@@ -520,13 +448,12 @@ mod tests {
             "reload reuses its existing allocation"
         );
         registry
-            .fail_reload(&epoch, "session", incarnation, "reload", json!({}))
+            .fail_reload(&epoch, "session", "reload", json!({}))
             .unwrap();
         registry
             .start_operation(
                 &epoch,
                 "session",
-                incarnation,
                 "close",
                 SessionOperationKind::Close,
                 "closing",
@@ -534,9 +461,7 @@ mod tests {
             .unwrap();
         assert!(registry.active_session("session").is_none());
         assert!(registry.resource_session("session").is_some());
-        registry
-            .close_session(&epoch, "session", incarnation, "close")
-            .unwrap();
+        registry.close_session(&epoch, "session", "close").unwrap();
         assert!(registry.resource_session("session").is_none());
         assert_eq!(
             registry.allocated_session_count(),
@@ -546,7 +471,6 @@ mod tests {
         registry
             .finish_session_cleanup(
                 "session",
-                incarnation,
                 crate::session_state::SessionAdmission::Close,
                 "close",
             )
@@ -576,15 +500,10 @@ mod tests {
         permission: oneshot::Receiver<RequestPermissionResponse>,
         elicitation: oneshot::Receiver<CreateElicitationResponse>,
         materialization: CancellationToken,
-        validation: Arc<()>,
     }
 
-    fn populate(
-        registry: &mut SessionRegistry,
-        session_id: &str,
-        incarnation: u64,
-    ) -> WaitingResources {
-        let resources = registry.resources_mut(session_id, incarnation).unwrap();
+    fn populate(registry: &mut SessionRegistry, session_id: &str) -> WaitingResources {
+        let resources = registry.resources_mut(session_id).unwrap();
         let (permission_sender, permission) = oneshot::channel();
         resources.permissions.insert(
             "permission".to_string(),
@@ -608,14 +527,9 @@ mod tests {
             attempt_id: "materialization".to_string(),
             cancellation: materialization.clone(),
         });
-        let validation = SessionUpdateSemanticState::default();
-        let allocation = validation.allocation.clone();
-        resources.validation = Some(validation);
+        resources.validation = Some(SessionUpdateSemanticState::default());
         resources.replay_validation_backup = Some(ReplayValidationBackup {
-            owner: SessionUpdateOwner {
-                incarnation: Some(incarnation),
-                allocation: allocation.clone(),
-            },
+            attempt_id: "populated".to_string(),
             previous: Some(SessionUpdateSemanticState::default()),
         });
         resources
@@ -624,7 +538,7 @@ mod tests {
             .updates
             .push(json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }));
         resources.attachment.control_candidate.bytes = 12;
-        let owner = registry.resource_owner(session_id, incarnation).unwrap();
+        let owner = registry.resource_owner(session_id).unwrap();
         registry
             .permission_owners
             .insert("permission".to_string(), owner.clone());
@@ -642,7 +556,6 @@ mod tests {
             permission,
             elicitation,
             materialization,
-            validation: allocation,
         }
     }
 
@@ -675,28 +588,24 @@ mod tests {
     }
 
     #[test]
-    fn same_incarnation_history_reset_keeps_all_non_cloneable_resources() {
+    fn history_reset_keeps_all_non_cloneable_resources() {
         let mut registry = SessionRegistry::new("epoch");
-        registry.register_new("session", 1);
-        let mut waiting = populate(&mut registry, "session", 1);
-        registry.register_cold("session", 1);
-        registry.clear_history_for_replacement("session", 1);
-        registry.register_new("session", 1);
+        registry.register_new("session");
+        let mut waiting = populate(&mut registry, "session");
+        registry.register_cold("session");
+        registry.clear_history_for_replacement("session");
+        registry.register_new("session");
         assert_waiting(&mut waiting);
-        let resources = registry.resources("session", 1).unwrap();
-        assert!(Arc::ptr_eq(
-            &resources.validation.as_ref().unwrap().allocation,
-            &waiting.validation
-        ));
-        assert!(Arc::ptr_eq(
-            &resources
+        let resources = registry.resources("session").unwrap();
+        assert!(resources.validation.is_some());
+        assert_eq!(
+            resources
                 .replay_validation_backup
                 .as_ref()
                 .unwrap()
-                .owner
-                .allocation,
-            &waiting.validation
-        ));
+                .attempt_id,
+            "populated"
+        );
         assert_eq!(resources.attachment.control_candidate.updates.len(), 1);
         assert_eq!(resources.attachment.control_candidate.bytes, 12);
         assert_eq!(
@@ -708,18 +617,18 @@ mod tests {
     #[test]
     fn physical_removal_answers_waiters_and_responders_and_cancels_leases() {
         let mut registry = SessionRegistry::new("epoch");
-        registry.register_new("session", 1);
-        let mut waiting = populate(&mut registry, "session", 1);
-        registry.remove("session", 2);
+        registry.register_new("session");
+        let mut waiting = populate(&mut registry, "session");
+        registry.remove("session");
         assert_waiting(&mut waiting);
-        registry.remove("session", 1);
+        registry.remove("session");
         assert_waiting(&mut waiting);
         assert!(
             registry.state("session").is_some(),
             "materialization retains its owner until its specific result is delivered"
         );
-        registry.cancel_resources("session", 1);
-        registry.remove("session", 1);
+        registry.cancel_resources("session");
+        registry.remove("session");
         assert!(registry.state("session").is_none());
         assert!(registry.permission_owners.is_empty());
         assert!(registry.elicitation_owners.is_empty());
@@ -728,11 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn replacement_retires_old_resources_and_stale_cleanup_preserves_new_resources() {
+    fn replacement_retires_old_resources_and_history_removal_preserves_live_ones() {
         let mut registry = SessionRegistry::new("epoch");
-        registry.register_new("session", 1);
-        let mut old = populate(&mut registry, "session", 1);
-        let incarnation = registry
+        registry.register_new("session");
+        let mut old = populate(&mut registry, "session");
+        registry
             .start_attachment(
                 "epoch",
                 "session",
@@ -741,28 +650,17 @@ mod tests {
                 SessionOperationKind::Load,
             )
             .unwrap();
-        assert!(incarnation > 1);
         assert_cancelled(&mut old);
-        assert!(
-            registry
-                .resources("session", incarnation)
-                .unwrap()
-                .validation
-                .is_none()
-        );
-        let mut current = populate(&mut registry, "session", incarnation);
-        registry.remove("session", 1);
+        assert!(registry.resources("session").unwrap().validation.is_none());
+        let mut current = populate(&mut registry, "session");
+        registry.remove("session");
         assert_waiting(&mut current);
-        assert!(matches!(
-            registry.resources("session", 1),
-            Err(MirrorError::StaleIncarnation)
-        ));
     }
 
     #[test]
     fn failed_live_attachment_preserves_waiters_until_explicit_owner_removal() {
         let mut registry = SessionRegistry::new("epoch");
-        let incarnation = registry
+        registry
             .start_attachment(
                 "epoch",
                 "session",
@@ -771,12 +669,11 @@ mod tests {
                 SessionOperationKind::Load,
             )
             .unwrap();
-        let mut waiting = populate(&mut registry, "session", incarnation);
+        let mut waiting = populate(&mut registry, "session");
         registry
             .fail_attachment(
                 "epoch",
                 "session",
-                incarnation,
                 "load",
                 SessionOperationKind::Load,
                 json!({}),
@@ -785,18 +682,18 @@ mod tests {
         assert!(registry.live("session").is_none());
         assert!(registry.state("session").is_some());
         assert_waiting(&mut waiting);
-        registry.remove("session", incarnation);
+        registry.remove("session");
         assert_waiting(&mut waiting);
-        registry.cancel_resources("session", incarnation);
-        registry.remove("session", incarnation);
+        registry.cancel_resources("session");
+        registry.remove("session");
         assert_cancelled(&mut waiting);
     }
 
     #[test]
     fn registry_drop_answers_outstanding_work_instead_of_dropping_senders() {
         let mut registry = SessionRegistry::new("epoch");
-        registry.register_new("session", 1);
-        let mut waiting = populate(&mut registry, "session", 1);
+        registry.register_new("session");
+        let mut waiting = populate(&mut registry, "session");
         drop(registry);
         assert_cancelled(&mut waiting);
     }

@@ -110,7 +110,7 @@ impl InboundRequests {
         {
             return false;
         }
-        if before.owner.is_some() || before.dispatch_owner.incarnation.is_some() {
+        if before.owner.is_some() {
             return before.owner == route.owner && before.dispatch_owner == route.dispatch_owner;
         }
         let Some(owner) = &route.owner else {
@@ -118,7 +118,6 @@ impl InboundRequests {
         };
         if owner.epoch != route.dispatch_owner.epoch
             || Some(owner.session_id.as_str()) != route.dispatch_owner.session_id.as_deref()
-            || Some(owner.incarnation) != route.dispatch_owner.incarnation
         {
             return false;
         }
@@ -188,17 +187,15 @@ mod tests {
         .unwrap()
     }
 
-    fn route(allocation: &str, incarnation: Option<u64>) -> CapturedRoute {
+    fn route(allocation: &str, bound: bool) -> CapturedRoute {
         CapturedRoute {
-            owner: incarnation.map(|incarnation| SessionResourceOwner {
+            owner: bound.then(|| SessionResourceOwner {
                 epoch: "epoch".to_owned(),
                 session_id: "session".to_owned(),
-                incarnation,
             }),
             dispatch_owner: RequestOwner {
                 epoch: "epoch".to_owned(),
                 session_id: Some("session".to_owned()),
-                incarnation,
                 operation_id: "agent-request-1".to_owned(),
                 attempt_id: Some(allocation.to_owned()),
             },
@@ -216,7 +213,7 @@ mod tests {
             .register(
                 id.clone(),
                 "session/request_permission",
-                &route("old", Some(1)),
+                &route("old", true),
                 ingress.clone(),
             )
             .unwrap();
@@ -246,16 +243,14 @@ mod tests {
             .register(
                 id.clone(),
                 "elicitation/create",
-                &route("new", Some(2)),
+                &route("new", true),
                 ingress,
             )
             .unwrap();
         assert!(!requests.finish(&cancelled.request_id, &cancelled.allocation));
-        assert_eq!(cancelled.route.owner.unwrap().incarnation, 1);
         let current = requests.capture_cancel(&id).unwrap();
         assert_eq!(current.allocation, "new");
         assert_eq!(current.kind, InboundRequestKind::Elicitation);
-        assert_eq!(current.route.owner.unwrap().incarnation, 2);
     }
 
     #[tokio::test]
@@ -268,7 +263,7 @@ mod tests {
             .register(
                 number.clone(),
                 "fs/read_text_file",
-                &route("number", Some(1)),
+                &route("number", true),
                 ingress.clone(),
             )
             .unwrap();
@@ -277,7 +272,7 @@ mod tests {
                 .register(
                     number.clone(),
                     "test",
-                    &route("duplicate", Some(1)),
+                    &route("duplicate", true),
                     ingress.clone()
                 )
                 .is_err()
@@ -286,7 +281,7 @@ mod tests {
             .register(
                 string.clone(),
                 "fs/write_text_file",
-                &route("string", Some(1)),
+                &route("string", true),
                 ingress.clone(),
             )
             .unwrap();
@@ -307,7 +302,7 @@ mod tests {
                 .register(
                     RequestId::from(2),
                     "test",
-                    &route("overflow", Some(1)),
+                    &route("overflow", true),
                     ingress
                 )
                 .is_ok()
@@ -316,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_binding_is_once_and_cannot_recapture_a_replacement_owner() {
+    async fn creation_binding_is_once_and_allocation_exact() {
         let (_scheduling, ingress) = scheduling();
         let mut requests = InboundRequests::new();
         let id = RequestId::from(1);
@@ -324,19 +319,18 @@ mod tests {
             .register(
                 id.clone(),
                 "elicitation/create",
-                &route("allocation", None),
+                &route("allocation", false),
                 ingress,
             )
             .unwrap();
         let early_cancel = requests.capture_cancel(&id).unwrap();
         assert!(early_cancel.route.owner.is_none());
-        assert!(!requests.rebind(&id, "wrong", route("allocation", Some(1))));
-        assert!(requests.rebind(&id, "allocation", route("allocation", Some(1))));
-        assert!(requests.rebind(&id, "allocation", route("allocation", Some(1))));
-        assert!(!requests.rebind(&id, "allocation", route("allocation", Some(2))));
-        assert!(!requests.rebind(&id, "allocation", route("allocation", None)));
+        assert!(!requests.rebind(&id, "wrong", route("allocation", true)));
+        assert!(requests.rebind(&id, "allocation", route("allocation", true)));
+        assert!(requests.rebind(&id, "allocation", route("allocation", true)));
+        assert!(!requests.rebind(&id, "allocation", route("allocation", false)));
         let rebound = requests.capture_cancel(&id).unwrap();
         assert_eq!(rebound.allocation, early_cancel.allocation);
-        assert_eq!(rebound.route.owner.unwrap().incarnation, 1);
+        assert!(rebound.route.owner.is_some());
     }
 }

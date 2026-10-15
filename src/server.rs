@@ -113,7 +113,9 @@ async fn enforce_origin(
     if !policy.allows(&request) {
         return (
             StatusCode::FORBIDDEN,
-            axum::Json(json!({ "error": "Request Host or Origin is not allowed" })),
+            axum::Json(wire::HostError {
+                error: "Request Host or Origin is not allowed".to_string(),
+            }),
         )
             .into_response();
     }
@@ -690,7 +692,11 @@ async fn shutdown_signal() {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let _ = &state.bridge;
-    axum::Json(json!({ "ok": true, "protocol": "acp/v1", "backend": "rust" }))
+    axum::Json(wire::Health {
+        ok: true,
+        protocol: "acp/v1".to_string(),
+        backend: "rust".to_string(),
+    })
 }
 
 /// A protocol error body `{ error: { code, message } }` (protocol §9).
@@ -714,11 +720,11 @@ async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) ->
             ProtocolError::new(ErrorCode::NotFound, format!("{scope} is not held")),
         );
     };
-    let mut body = json!({ "live": document.live });
-    if let Some(log) = document.log {
-        body["log"] = json!(log);
-    }
-    axum::Json(body).into_response()
+    axum::Json(wire::ScopeRead {
+        live: document.live,
+        log: document.log,
+    })
+    .into_response()
 }
 
 /// The reads of a held session (protocol §8): an attachment its published
@@ -805,7 +811,7 @@ async fn read_session(
                 Err(error) => return refused(error),
             };
             match workspace.search_context(&query).await {
-                Ok(matches) => axum::Json(json!({ "matches": matches })).into_response(),
+                Ok(matches) => axum::Json(wire::ContextMatches { matches }).into_response(),
                 Err(error) => refused(bridge::resources::refusal(error)),
             }
         }
@@ -820,7 +826,7 @@ async fn read_session(
                 Err(error) => return refused(error),
             };
             match workspace.read_context(std::path::Path::new(&path)).await {
-                Ok(attachment) => axum::Json(json!({ "attachment": attachment })).into_response(),
+                Ok(attachment) => axum::Json(wire::ContextRead { attachment }).into_response(),
                 Err(error) => refused(bridge::resources::refusal(error)),
             }
         }
@@ -1043,7 +1049,9 @@ async fn frontend(proxy: Option<DevProxy>, request: Request) -> Response {
     if request.uri().path() == "/api" || request.uri().path().starts_with("/api/") {
         return (
             StatusCode::NOT_FOUND,
-            axum::Json(json!({ "error": "API route not found" })),
+            axum::Json(wire::HostError {
+                error: "API route not found".to_string(),
+            }),
         )
             .into_response();
     }

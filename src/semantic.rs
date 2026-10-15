@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -27,7 +27,6 @@ pub type ValidationResult<T = ()> = Result<T, String>;
 
 #[derive(Clone, Default)]
 pub struct SessionUpdateSemanticState {
-    pub(crate) allocation: Arc<()>,
     compactions: HashMap<String, TrackedCompaction>,
     tool_calls: HashMap<String, Option<String>>,
     messages: HashMap<String, String>,

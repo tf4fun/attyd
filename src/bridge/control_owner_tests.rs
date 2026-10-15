@@ -1,5 +1,5 @@
-//! A control update from an old epoch or incarnation is refused and changes
-//! nothing, beside a running turn.
+//! A control update from an old epoch is refused and changes nothing, beside
+//! a running turn.
 use super::*;
 use crate::runtime_state::RuntimeStateError;
 
@@ -27,24 +27,22 @@ fn controls() -> Vec<Value> {
 
 struct ControlTurn {
     state: BridgeState,
-    incarnation: u64,
 }
 
 impl ControlTurn {
     fn new() -> Self {
         let mut state = BridgeState::default();
         let epoch = state.sessions.epoch().to_string();
-        let incarnation = state
+        state
             .sessions
             .open_new_with_replay(&epoch, SESSION, "/workspace", metadata(), Vec::new())
             .unwrap();
-        state.sessions.register_new(SESSION, incarnation);
+        state.sessions.register_new(SESSION);
         let operation_id = state
             .sessions
             .admit_session_turn(
                 &epoch,
                 SESSION,
-                incarnation,
                 "control-owner-turn",
                 vec![json!({"type": "text", "text": "Keep this prompt"})],
             )
@@ -57,70 +55,23 @@ impl ControlTurn {
         validate_and_track_session_update(&mut validation, &update).unwrap();
         state
             .sessions
-            .append_turn_update(SESSION, incarnation, &operation_id, update)
+            .append_turn_update(SESSION, &operation_id, update)
             .unwrap();
-        Self { state, incarnation }
+        Self { state }
     }
 }
 
 #[test]
 fn controls_from_old_owners_are_refused_without_mutation() {
     let mut turn = ControlTurn::new();
-    let epoch = turn.state.sessions.epoch().to_string();
     let before = turn.state.sessions.session(SESSION);
     for update in controls() {
         assert_eq!(
-            turn.state.sessions.update_control_state(
-                "old-epoch",
-                SESSION,
-                turn.incarnation,
-                update.clone()
-            ),
+            turn.state
+                .sessions
+                .update_control_state("old-epoch", SESSION, update),
             Err(RuntimeStateError::EpochMismatch)
         );
-        assert_eq!(
-            turn.state
-                .sessions
-                .update_control_state(&epoch, SESSION, turn.incarnation + 1, update),
-            Err(RuntimeStateError::StaleIncarnation)
-        );
         assert_eq!(turn.state.sessions.session(SESSION), before);
-    }
-
-    turn.state
-        .sessions
-        .start_operation(
-            &epoch,
-            SESSION,
-            turn.incarnation,
-            "close",
-            RuntimeSessionOperationKind::Close,
-            "closing",
-        )
-        .unwrap();
-    turn.state
-        .sessions
-        .close_session(&epoch, SESSION, turn.incarnation, "close")
-        .unwrap();
-    turn.state
-        .sessions
-        .finish_session_cleanup(SESSION, turn.incarnation, SessionAdmission::Close, "close")
-        .unwrap();
-    let reopened = turn
-        .state
-        .sessions
-        .open_new_with_replay(&epoch, SESSION, "/workspace", metadata(), Vec::new())
-        .unwrap();
-    turn.state.sessions.register_new(SESSION, reopened);
-    assert_ne!(reopened, turn.incarnation);
-    let reopened_session = turn.state.sessions.session(SESSION);
-    for update in controls() {
-        assert_eq!(
-            turn.state
-                .sessions
-                .update_control_state(&epoch, SESSION, turn.incarnation, update),
-            Err(RuntimeStateError::StaleIncarnation)
-        );
-        assert_eq!(turn.state.sessions.session(SESSION), reopened_session);
     }
 }

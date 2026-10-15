@@ -5,9 +5,11 @@ use agent_client_protocol::schema::v1::{
     ReadTextFileRequest, ReadTextFileResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Error, RequestCancellation};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use walkdir::WalkDir;
+
+use crate::protocol::wire::{ContextAttachment, ContextMatch};
 
 #[derive(Clone)]
 pub struct WorkspaceFileSystem {
@@ -198,7 +200,7 @@ impl WorkspaceFileSystem {
         Ok(canonical)
     }
 
-    pub async fn search_context(&self, query: &str) -> Result<Vec<Value>, Error> {
+    pub async fn search_context(&self, query: &str) -> Result<Vec<ContextMatch>, Error> {
         if query.contains('\0') {
             return Err(Error::invalid_params()
                 .data(format!("context search query must contain no NUL bytes")));
@@ -264,14 +266,19 @@ impl WorkspaceFileSystem {
             });
             Ok(candidates
                 .into_iter()
-                .map(|(_, relative_path, root_name, path, size)| {
-                    json!({
-                        "path": path,
-                        "name": path.file_name().and_then(|name| name.to_str()).unwrap_or(""),
-                        "relativePath": relative_path,
-                        "rootName": root_name,
-                        "size": size,
-                    })
+                .map(|(_, relative_path, root_name, path, size)| ContextMatch {
+                    name: path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    path: path
+                        .to_str()
+                        .expect("path contains invalid UTF-8 characters")
+                        .to_string(),
+                    relative_path,
+                    root_name,
+                    size,
                 })
                 .collect())
         })
@@ -279,7 +286,7 @@ impl WorkspaceFileSystem {
         .map_err(|error| Error::internal_error().data(error.to_string()))?
     }
 
-    pub async fn read_context(&self, path: &Path) -> Result<Value, Error> {
+    pub async fn read_context(&self, path: &Path) -> Result<ContextAttachment, Error> {
         let target = self.checked_existing_path(path).await?;
         if !is_context_text_path(&target) {
             return Err(
@@ -311,18 +318,18 @@ impl WorkspaceFileSystem {
             .to_string();
         let uri = url::Url::from_file_path(&target)
             .map_err(|_| Error::internal_error().data("failed to create file URL"))?;
-        Ok(json!({
-            "name": name,
-            "size": text.len(),
-            "block": {
+        Ok(ContextAttachment {
+            name,
+            size: text.len() as u64,
+            block: json!({
                 "type": "resource",
                 "resource": {
                     "uri": uri.as_str(),
                     "mimeType": context_mime_type(&target),
                     "text": text,
                 }
-            }
-        }))
+            }),
+        })
     }
 
     async fn checked_existing_path(&self, path: &Path) -> Result<PathBuf, Error> {
@@ -929,20 +936,17 @@ mod tests {
 
         let matches = fs.search_context("safe con").await.unwrap();
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0]["name"], "safe-context.ts");
-        assert_eq!(matches[0]["relativePath"], "src/safe-context.ts");
+        assert_eq!(matches[0].name, "safe-context.ts");
+        assert_eq!(matches[0].relative_path, "src/safe-context.ts");
         assert!(fs.search_context("hidden").await.unwrap().is_empty());
         assert_eq!(fs.search_context("extra").await.unwrap().len(), 1);
 
         let attachment = fs.read_context(&source).await.unwrap();
-        assert_eq!(attachment["name"], "src/safe-context.ts");
-        assert_eq!(attachment["block"]["type"], "resource");
+        assert_eq!(attachment.name, "src/safe-context.ts");
+        assert_eq!(attachment.block["type"], "resource");
+        assert_eq!(attachment.block["resource"]["mimeType"], "text/typescript");
         assert_eq!(
-            attachment["block"]["resource"]["mimeType"],
-            "text/typescript"
-        );
-        assert_eq!(
-            attachment["block"]["resource"]["text"],
+            attachment.block["resource"]["text"],
             "export const safe = true;\n"
         );
     }

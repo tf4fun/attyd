@@ -149,9 +149,8 @@ impl World {
         )
     }
 
-    fn open(&mut self, session_id: &str) -> u64 {
-        let incarnation = self
-            .registry
+    fn open(&mut self, session_id: &str) {
+        self.registry
             .open_new(
                 EPOCH,
                 session_id,
@@ -160,13 +159,11 @@ impl World {
             )
             .unwrap();
         self.commit();
-        incarnation
     }
 
     /// Starts a first load: the session is held with an unknown log.
-    fn start_load(&mut self, session_id: &str) -> u64 {
-        let incarnation = self
-            .registry
+    fn start_load(&mut self, session_id: &str) {
+        self.registry
             .start_attachment(
                 EPOCH,
                 session_id,
@@ -175,29 +172,23 @@ impl World {
                 SessionOperationKind::Load,
             )
             .unwrap();
-        self.registry.register_cold(session_id, incarnation);
+        self.registry.register_cold(session_id);
         self.commit();
-        incarnation
     }
 
     /// Ends a first load with `replay`.
-    fn finish_load(&mut self, session_id: &str, incarnation: u64, replay: &[Value]) {
-        self.registry
-            .begin_load(session_id, incarnation, "load")
-            .unwrap();
+    fn finish_load(&mut self, session_id: &str, replay: &[Value]) {
+        self.registry.begin_load(session_id, "load").unwrap();
         for update in replay {
             self.registry
-                .append_load_update(session_id, incarnation, "load", update.clone())
+                .append_load_update(session_id, "load", update.clone())
                 .unwrap();
         }
-        self.registry
-            .commit_load(session_id, incarnation, "load")
-            .unwrap();
+        self.registry.commit_load(session_id, "load").unwrap();
         self.registry
             .complete_attachment(
                 EPOCH,
                 session_id,
-                incarnation,
                 "load",
                 SessionOperationKind::Load,
                 json!({}),
@@ -206,89 +197,72 @@ impl World {
         self.commit();
     }
 
-    fn load(&mut self, session_id: &str, replay: &[Value]) -> u64 {
-        let incarnation = self.start_load(session_id);
-        self.finish_load(session_id, incarnation, replay);
-        incarnation
+    fn load(&mut self, session_id: &str, replay: &[Value]) {
+        self.start_load(session_id);
+        self.finish_load(session_id, replay);
     }
 
     /// Reloads a held session with `replay`, as after an Agent restart.
-    fn reload(&mut self, session_id: &str, incarnation: u64, replay: &[Value]) {
+    fn reload(&mut self, session_id: &str, replay: &[Value]) {
         self.registry
-            .start_reload(
-                EPOCH,
-                session_id,
-                incarnation,
-                "reload",
-                SessionOperationKind::Load,
-            )
+            .start_reload(EPOCH, session_id, "reload", SessionOperationKind::Load)
             .unwrap();
         self.commit();
-        self.registry
-            .begin_load(session_id, incarnation, "reload")
-            .unwrap();
+        self.registry.begin_load(session_id, "reload").unwrap();
         for update in replay {
             self.registry
-                .append_load_update(session_id, incarnation, "reload", update.clone())
+                .append_load_update(session_id, "reload", update.clone())
                 .unwrap();
         }
+        self.registry.commit_load(session_id, "reload").unwrap();
         self.registry
-            .commit_load(session_id, incarnation, "reload")
-            .unwrap();
-        self.registry
-            .complete_reload(EPOCH, session_id, incarnation, "reload", json!({}))
+            .complete_reload(EPOCH, session_id, "reload", json!({}))
             .unwrap();
         self.commit();
     }
 
     /// Starts a prompt; returns its RPC ID.
-    fn prompt(&mut self, session_id: &str, incarnation: u64, prompt: &str) -> String {
+    fn prompt(&mut self, session_id: &str, prompt: &str) -> String {
         self.rpc += 1;
         let rpc = format!("rpc-{}", self.rpc);
         self.registry
             .install_prompt(session_id, &[text(prompt)])
             .unwrap();
         self.registry
-            .start_prompt(EPOCH, session_id, incarnation, &rpc, vec![text(prompt)])
+            .start_prompt(EPOCH, session_id, &rpc, vec![text(prompt)])
             .unwrap();
         self.commit();
         rpc
     }
 
     /// Streams `reply` into the running prompt; returns the commit's events.
-    fn reply(&mut self, session_id: &str, incarnation: u64, reply: &str) -> Vec<Value> {
-        self.send(session_id, incarnation, agent_chunk(text(reply)))
+    fn reply(&mut self, session_id: &str, reply: &str) -> Vec<Value> {
+        self.send(session_id, agent_chunk(text(reply)))
     }
 
     /// One update of the running prompt; returns the commit's events.
-    fn send(&mut self, session_id: &str, incarnation: u64, update: Value) -> Vec<Value> {
+    fn send(&mut self, session_id: &str, update: Value) -> Vec<Value> {
         self.registry
-            .append_runtime_update_for_test(EPOCH, session_id, incarnation, update)
+            .append_runtime_update_for_test(EPOCH, session_id, update)
             .unwrap();
         self.commit()
     }
 
-    fn complete(&mut self, session_id: &str, incarnation: u64, rpc: &str) {
+    fn complete(&mut self, session_id: &str, rpc: &str) {
         self.registry
-            .complete_prompt(
-                EPOCH,
-                session_id,
-                incarnation,
-                rpc,
-                json!({ "stopReason": "end_turn" }),
-            )
+            .complete_prompt(EPOCH, session_id, rpc, json!({ "stopReason": "end_turn" }))
             .unwrap();
         self.commit();
     }
 
     /// One whole turn, committed to the log.
-    fn turn(&mut self, session_id: &str, incarnation: u64, prompt: &str, reply: &str) {
-        let rpc = self.prompt(session_id, incarnation, prompt);
-        self.reply(session_id, incarnation, reply);
-        self.complete(session_id, incarnation, &rpc);
+    fn turn(&mut self, session_id: &str, prompt: &str, reply: &str) {
+        let rpc = self.prompt(session_id, prompt);
+        self.reply(session_id, reply);
+        self.complete(session_id, &rpc);
     }
 
-    fn delete(&mut self, session_id: &str, incarnation: u64) {
+    fn delete(&mut self, session_id: &str) {
         self.registry
             .install_operation(
                 &Scope::Global,
@@ -297,14 +271,14 @@ impl World {
             )
             .unwrap();
         self.registry
-            .start_delete(EPOCH, session_id, incarnation, "del")
+            .start_delete(EPOCH, session_id, "del")
             .unwrap();
         self.commit();
         self.registry
-            .delete_close_succeeded(EPOCH, session_id, incarnation, "del")
+            .delete_close_succeeded(EPOCH, session_id, "del")
             .unwrap();
         self.registry
-            .complete_delete(EPOCH, session_id, incarnation, "del")
+            .complete_delete(EPOCH, session_id, "del")
             .unwrap();
         self.commit();
         // The real bridge completes external cleanup before the same ID
@@ -312,7 +286,6 @@ impl World {
         self.registry
             .finish_session_cleanup(
                 session_id,
-                incarnation,
                 crate::session_state::SessionAdmission::Delete,
                 "del",
             )
@@ -472,7 +445,7 @@ fn a_first_load_sends_each_subscription_its_log_from_its_own_baseline() {
         .collect();
     assert_eq!(world.hub.subscribers("s"), caches.len());
 
-    let incarnation = world.start_load("s");
+    world.start_load("s");
     for (name, reader, subscription, _, _) in &mut clients {
         let events = world.drain(reader, subscription);
         let aligned = single(&events, "session/s");
@@ -483,7 +456,7 @@ fn a_first_load_sends_each_subscription_its_log_from_its_own_baseline() {
         assert_eq!(aligned["live"]["replace"]["op"]["kind"], "load");
     }
 
-    world.finish_load("s", incarnation, &replay(&turns));
+    world.finish_load("s", &replay(&turns));
     for (name, reader, subscription, from, appended) in &mut clients {
         let events = world.drain(reader, subscription);
         let end = single(&events, "session/s");
@@ -509,7 +482,7 @@ fn an_unknown_log_keeps_the_declared_baseline_through_live_only_changes() {
     let mut world = World::new();
     let mut reader = Reader::new(&["session/s"]).cache("session/s", entries.clone());
     let subscription = world.subscribe(&mut reader);
-    let incarnation = world.start_load("s");
+    world.start_load("s");
     world.drain(&mut reader, &subscription);
     world.registry.fold_session_controls(
         "s",
@@ -528,7 +501,7 @@ fn an_unknown_log_keeps_the_declared_baseline_through_live_only_changes() {
         ),
         "live-only changes leave the declared baseline"
     );
-    world.finish_load("s", incarnation, &replay(&[("one", "1")]));
+    world.finish_load("s", &replay(&[("one", "1")]));
     let events = world.drain(&mut reader, &subscription);
     let end = single(&events, "session/s");
     assert_eq!(end["log"]["from"], 1);
@@ -542,16 +515,16 @@ fn an_unknown_log_keeps_the_declared_baseline_through_live_only_changes() {
 #[test]
 fn queued_log_changes_follow_the_tail_and_only_the_output_advances_the_baseline() {
     let mut world = World::new();
-    let incarnation = world.open("s");
+    world.open("s");
     let mut reader = Reader::new(&["session/s"]);
     let subscription = world.subscribe(&mut reader);
     world.drain(&mut reader, &subscription);
 
-    world.turn("s", incarnation, "one", "1");
+    world.turn("s", "one", "1");
     let first = world.head("s");
     assert_eq!(subscription.tail("session/s"), Some(first.clone()));
     assert_eq!(subscription.baseline("session/s"), Some(Head::zero()));
-    world.turn("s", incarnation, "two", "2");
+    world.turn("s", "two", "2");
     assert_eq!(subscription.tail("session/s"), Some(world.head("s")));
     assert_eq!(
         subscription.baseline("session/s"),
@@ -577,19 +550,19 @@ fn queued_log_changes_follow_the_tail_and_only_the_output_advances_the_baseline(
 #[test]
 fn an_undelivered_reload_to_the_same_length_is_followed_by_the_next_append() {
     let mut world = World::new();
-    let incarnation = world.load("s", &replay(&[("one", "1"), ("two", "2")]));
+    world.load("s", &replay(&[("one", "1"), ("two", "2")]));
     let mut reader = Reader::new(&["session/s"]);
     let subscription = world.subscribe(&mut reader);
     world.drain(&mut reader, &subscription);
     let delivered = world.head("s");
 
-    world.reload("s", incarnation, &replay(&[("one", "1"), ("other", "3")]));
+    world.reload("s", &replay(&[("one", "1"), ("other", "3")]));
     let reloaded = world.head("s");
     assert_eq!(reloaded.n, delivered.n, "[A,B] became [A,C]");
     assert_ne!(reloaded.hash, delivered.hash);
     assert_eq!(subscription.tail("session/s"), Some(reloaded.clone()));
     assert_eq!(subscription.baseline("session/s"), Some(delivered));
-    world.turn("s", incarnation, "more", "4");
+    world.turn("s", "more", "4");
 
     let events = world.drain(&mut reader, &subscription);
     let logs: Vec<&Value> = events
@@ -606,16 +579,16 @@ fn an_undelivered_reload_to_the_same_length_is_followed_by_the_next_append() {
 #[test]
 fn an_undelivered_shrink_is_followed_by_the_next_append() {
     let mut world = World::new();
-    let incarnation = world.load("s", &replay(&[("one", "1"), ("two", "2")]));
+    world.load("s", &replay(&[("one", "1"), ("two", "2")]));
     let mut reader = Reader::new(&["session/s"]);
     let subscription = world.subscribe(&mut reader);
     world.drain(&mut reader, &subscription);
 
-    world.reload("s", incarnation, &replay(&[("one", "1")]));
+    world.reload("s", &replay(&[("one", "1")]));
     let shrunk = world.head("s");
     assert_eq!(shrunk.n, 1);
     assert_eq!(subscription.tail("session/s"), Some(shrunk.clone()));
-    world.turn("s", incarnation, "other", "3");
+    world.turn("s", "other", "3");
 
     let events = world.drain(&mut reader, &subscription);
     let logs: Vec<&Value> = events
@@ -638,11 +611,11 @@ fn an_undelivered_shrink_is_followed_by_the_next_append() {
 fn an_equal_reload_of_a_known_log_changes_no_log() {
     let turns = [("one", "1"), ("two", "2")];
     let mut world = World::new();
-    let incarnation = world.load("s", &replay(&turns));
+    world.load("s", &replay(&turns));
     let mut reader = Reader::new(&["session/s"]);
     let subscription = world.subscribe(&mut reader);
     world.drain(&mut reader, &subscription);
-    world.reload("s", incarnation, &replay(&turns));
+    world.reload("s", &replay(&turns));
     let events = world.drain(&mut reader, &subscription);
     assert!(
         events.iter().all(|event| event.get("log").is_none()),
@@ -656,25 +629,25 @@ fn an_equal_reload_of_a_known_log_changes_no_log() {
 
 /// Starts a prompt and sends two big updates into it, past the queue's
 /// budget; returns the prompt's RPC and the bytes of those commits' events.
-fn flood(world: &mut World, session_id: &str, incarnation: u64) -> (String, usize) {
-    let rpc = world.prompt(session_id, incarnation, "flood");
-    let mut events = world.send(session_id, incarnation, flood_update('a'));
-    events.extend(world.send(session_id, incarnation, flood_update('b')));
+fn flood(world: &mut World, session_id: &str) -> (String, usize) {
+    let rpc = world.prompt(session_id, "flood");
+    let mut events = world.send(session_id, flood_update('a'));
+    events.extend(world.send(session_id, flood_update('b')));
     (rpc, bytes(&events))
 }
 
 #[test]
 fn a_coalesced_queue_aligns_an_unsent_log_from_the_baseline_and_applies_directly() {
     let mut world = World::new();
-    let incarnation = world.load("s", &replay(&[("one", "1"), ("two", "2")]));
+    world.load("s", &replay(&[("one", "1"), ("two", "2")]));
     let mut reader = Reader::new(&["global", "session/s"]);
     let subscription = world.subscribe(&mut reader);
     world.drain(&mut reader, &subscription);
     let baseline = world.head("s");
 
-    world.reload("s", incarnation, &replay(&[("one", "1"), ("other", "3")]));
+    world.reload("s", &replay(&[("one", "1"), ("other", "3")]));
     assert_eq!(subscription.coalesced(), 0);
-    let (rpc, flooded) = flood(&mut world, "s", incarnation);
+    let (rpc, flooded) = flood(&mut world, "s");
     assert!(flooded > QUEUE_BUDGET, "the budget was exceeded: {flooded}");
     assert!(subscription.coalesced() >= 1, "the queue was coalesced");
     assert_eq!(
@@ -701,7 +674,7 @@ fn a_coalesced_queue_aligns_an_unsent_log_from_the_baseline_and_applies_directly
     reader.converged(&world.documents());
 
     // The queue continues from the alignment's target.
-    world.complete("s", incarnation, &rpc);
+    world.complete("s", &rpc);
     let events = world.drain(&mut reader, &subscription);
     let commit = single(&events, "session/s");
     assert_eq!(commit["log"]["from"], 2);
@@ -711,20 +684,20 @@ fn a_coalesced_queue_aligns_an_unsent_log_from_the_baseline_and_applies_directly
 #[test]
 fn a_coalesce_after_a_partial_delivery_aligns_from_the_advanced_baseline() {
     let mut world = World::new();
-    let incarnation = world.open("s");
+    world.open("s");
     let mut reader = Reader::new(&["session/s"]);
     let subscription = world.subscribe(&mut reader);
     world.drain(&mut reader, &subscription);
 
-    world.turn("s", incarnation, "one", "1");
+    world.turn("s", "one", "1");
     let first = world.head("s");
-    world.turn("s", incarnation, "two", "2");
+    world.turn("s", "two", "2");
     while subscription.baseline("session/s") != Some(first.clone()) {
         world
             .take(&mut reader, &subscription)
             .expect("the first turn's commit is queued");
     }
-    let (_, flooded) = flood(&mut world, "s", incarnation);
+    let (_, flooded) = flood(&mut world, "s");
     assert!(flooded > QUEUE_BUDGET);
     assert!(subscription.coalesced() >= 1);
     assert_eq!(subscription.baseline("session/s"), Some(first));
@@ -740,17 +713,17 @@ fn a_coalesce_after_a_partial_delivery_aligns_from_the_advanced_baseline() {
 #[test]
 fn a_coalesce_keeps_a_queued_end_and_nothing_of_its_scope_follows() {
     let mut world = World::new();
-    let first = world.open("s1");
-    let second = world.open("s2");
+    world.open("s1");
+    world.open("s2");
     let mut reader = Reader::new(&["global", "session/s1", "session/s2"]);
     let subscription = world.subscribe(&mut reader);
     world.drain(&mut reader, &subscription);
 
-    world.delete("s2", second);
-    let (rpc, _) = flood(&mut world, "s1", first);
+    world.delete("s2");
+    let (rpc, _) = flood(&mut world, "s1");
     assert!(subscription.coalesced() >= 1);
-    world.complete("s1", first, &rpc);
-    world.turn("s1", first, "after", "end");
+    world.complete("s1", &rpc);
+    world.turn("s1", "after", "end");
 
     let events = world.drain(&mut reader, &subscription);
     let ended = single(&events, "session/s2");
@@ -771,7 +744,7 @@ fn a_turn_completion_and_a_reload_coalesce_to_the_same_cut_a_follower_reaches() 
     let mut world = World::new();
     // The registry admits a reload only on a settled turn, as the bridge's
     // history sync leaves it; the committed turn is the flood's prompt below.
-    let incarnation = world.load("s", &replay(&[("one", "1"), ("two", "2")]));
+    world.load("s", &replay(&[("one", "1"), ("two", "2")]));
     let mut follower = Reader::new(&["global", "session/s"]);
     let following = world.subscribe(&mut follower);
     let mut lagging = Reader::new(&["global", "session/s"]);
@@ -779,16 +752,16 @@ fn a_turn_completion_and_a_reload_coalesce_to_the_same_cut_a_follower_reaches() 
     world.drain(&mut follower, &following);
     world.drain(&mut lagging, &lagged);
 
-    world.reload("s", incarnation, &replay(&[("one", "1"), ("other", "3")]));
+    world.reload("s", &replay(&[("one", "1"), ("other", "3")]));
     world.drain(&mut follower, &following);
     // The follower takes every commit as it comes; the lagger stays paused.
-    let rpc = world.prompt("s", incarnation, "flood");
+    let rpc = world.prompt("s", "flood");
     world.drain(&mut follower, &following);
     for fill in ['a', 'b'] {
-        world.send("s", incarnation, flood_update(fill));
+        world.send("s", flood_update(fill));
         world.drain(&mut follower, &following);
     }
-    world.complete("s", incarnation, &rpc);
+    world.complete("s", &rpc);
     world.drain(&mut follower, &following);
     assert!(lagged.coalesced() >= 1);
     assert_eq!(following.coalesced(), 0, "a follower is never coalesced");
@@ -915,15 +888,15 @@ fn a_stream_query_names_scopes_heads_and_load_directories() {
 #[test]
 fn review_an_uncoalesced_first_event_is_the_subscription_cut_before_later_commits() {
     let mut world = World::new();
-    let incarnation = world.open("s");
-    world.turn("s", incarnation, "before subscribe", "first reply");
+    world.open("s");
+    world.turn("s", "before subscribe", "first reply");
     let cut = world.publisher.document("session/s").unwrap();
     let mut reader = Reader::new(&["session/s"]);
     let subscription = world.subscribe(&mut reader);
 
     // The initial alignment stays queued while a later complete turn is
     // published. With no coalescing, that later cut cannot replace the first.
-    world.turn("s", incarnation, "after subscribe", "second reply");
+    world.turn("s", "after subscribe", "second reply");
     assert_eq!(subscription.coalesced(), 0);
     let first = world.take(&mut reader, &subscription).unwrap();
     assert_eq!(first["live"]["replace"], cut.live);
@@ -941,16 +914,16 @@ fn review_an_uncoalesced_first_event_is_the_subscription_cut_before_later_commit
 #[test]
 fn review_end_filters_later_same_scope_events_before_and_after_delivery() {
     let mut world = World::new();
-    let incarnation = world.open("s");
+    world.open("s");
     let mut old_reader = Reader::new(&["session/s"]);
     let old = world.subscribe(&mut old_reader);
     world.drain(&mut old_reader, &old);
 
-    world.delete("s", incarnation);
+    world.delete("s");
     // The same scope can exist again, but its old stream has already been
     // ended. This also covers changes arriving while End is still queued.
-    let reopened = world.open("s");
-    world.turn("s", reopened, "new session", "new reply");
+    world.open("s");
+    world.turn("s", "new session", "new reply");
     let delivered = world.drain(&mut old_reader, &old);
     let end_index = delivered
         .iter()
@@ -967,7 +940,7 @@ fn review_end_filters_later_same_scope_events_before_and_after_delivery() {
     let new = world.subscribe(&mut new_reader);
     world.drain(&mut new_reader, &new);
     new_reader.converged(&world.documents());
-    world.turn("s", reopened, "another turn", "another reply");
+    world.turn("s", "another turn", "another reply");
     assert!(
         world.drain(&mut old_reader, &old).is_empty(),
         "a delivered End stays final"

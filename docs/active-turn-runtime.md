@@ -6,7 +6,8 @@
 > The current client contract is [protocol v2](protocol.md) and its
 > [implementation plan](state-sync.md). What still holds is the ACP side: the Agent is the only
 > persistent authority, the bridge keeps sessions in memory and attaches a cold session with
-> `session/load` or `session/resume`. Session incarnations stay internal until migration step 9.
+> `session/load` or `session/resume`. Migration step 9 (PR #47) removed the session incarnation
+> from the bridge; a session is identified by its ID ([state-sync §5](state-sync.md#5-migration)).
 > The text below is kept as the record of that design.
 
 This document defines attyd's runtime and recovery contract. It supersedes the earlier

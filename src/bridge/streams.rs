@@ -225,13 +225,7 @@ impl BridgeState {
         let followed = followed(self);
         for session_id in crate::protocol::project::held_sessions(&self.sessions) {
             if !followed.contains(&session_id) {
-                if let Some(incarnation) = self
-                    .sessions
-                    .state(&session_id)
-                    .map(|session| session.incarnation)
-                {
-                    self.sessions.retire_entry(&session_id, incarnation);
-                }
+                self.sessions.retire_entry(&session_id);
             } else if !reloadable {
                 self.sessions.end_unloadable(&session_id);
             } else if let Some(waiting) = self.sessions.wait_for_next_connection(&session_id) {

@@ -42,7 +42,6 @@ pub(crate) struct TurnExecution {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionState {
     pub session_id: String,
-    pub incarnation: u64,
     #[serde(skip)]
     pub(crate) live: Option<SessionLiveState>,
     pub phase: MirrorPhase,
@@ -62,7 +61,6 @@ pub(crate) struct SessionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MirrorError {
     UnknownSession,
-    StaleIncarnation,
     WrongPhase,
     OperationMismatch,
     InconsistentHistory,
@@ -111,10 +109,9 @@ impl SessionState {
             .and_then(|turn| turn.execution.as_ref())
     }
 
-    pub(crate) fn cold(session_id: impl Into<String>, incarnation: u64) -> Self {
+    pub(crate) fn cold(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
-            incarnation,
             live: None,
             phase: MirrorPhase::Cold,
             active_turn: None,
@@ -126,8 +123,8 @@ impl SessionState {
         }
     }
 
-    pub(crate) fn ready(session_id: impl Into<String>, incarnation: u64) -> Self {
-        let mut session = Self::cold(session_id, incarnation);
+    pub(crate) fn ready(session_id: impl Into<String>) -> Self {
+        let mut session = Self::cold(session_id);
         session.phase = MirrorPhase::Ready;
         session.log = SessionLog::empty();
         session
@@ -359,7 +356,7 @@ mod tests {
     use serde_json::json;
 
     fn ready() -> SessionState {
-        SessionState::ready("session", 1)
+        SessionState::ready("session")
     }
 
     fn prompt(text: &str) -> Vec<Value> {
@@ -540,7 +537,7 @@ mod tests {
             session.can_begin(SessionAdmission::Attachment),
             Err(MirrorError::WrongPhase)
         );
-        let cold = SessionState::cold("cold", 1);
+        let cold = SessionState::cold("cold");
         assert_eq!(cold.can_begin(SessionAdmission::Attachment), Ok(()));
         assert_eq!(
             cold.can_begin(SessionAdmission::Prompt),

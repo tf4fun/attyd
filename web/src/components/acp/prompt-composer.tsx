@@ -31,10 +31,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import type {
-  WorkspaceContextAttachment,
-  WorkspaceContextMatch,
-} from "../../../../shared/bridge";
+import type { ContextAttachment, ContextMatch } from "../../../../shared/protocol";
 import i18n, { useTranslation } from "../../i18n";
 import { randomId } from "../../lib/id";
 import { createPromptAttachments, PromptAttachmentError, promptAttachmentErrorMessage, type PromptAttachment } from "../../lib/prompt-attachments";
@@ -101,8 +98,8 @@ export function PromptComposer({
   ) => boolean | void;
   onCancel: () => void;
   onNavigateThread?: (target: ThreadNavigationTarget) => void;
-  onSearchWorkspaceContext?: (query: string) => Promise<WorkspaceContextMatch[]>;
-  onReadWorkspaceContext?: (path: string) => Promise<WorkspaceContextAttachment>;
+  onSearchWorkspaceContext?: (query: string) => Promise<ContextMatch[]>;
+  onReadWorkspaceContext?: (path: string) => Promise<ContextAttachment>;
 }) {
   const { t } = useTranslation("conversation");
   // Autocomplete follows the focused text field; restoredParts owns the whole prompt.
@@ -118,7 +115,7 @@ export function PromptComposer({
   const [activeCommandIndex, setActiveCommandIndex] = useState(0);
   const [caret, setCaret] = useState(0);
   const [contextMenuDismissed, setContextMenuDismissed] = useState(false);
-  const [contextMatches, setContextMatches] = useState<WorkspaceContextMatch[]>([]);
+  const [contextMatches, setContextMatches] = useState<ContextMatch[]>([]);
   const [contextLoading, setContextLoading] = useState(false);
   const [activeContextIndex, setActiveContextIndex] = useState(0);
   const [expanded, setExpanded] = useState(false);
@@ -417,7 +414,7 @@ export function PromptComposer({
     }
   };
 
-  const attachWorkspaceContext = async (match: WorkspaceContextMatch) => {
+  const attachWorkspaceContext = async (match: ContextMatch) => {
     if (!onReadWorkspaceContext) return;
     const incomingBytes = match.size;
     let reservedBytes = 0;
@@ -454,7 +451,7 @@ export function PromptComposer({
     }
   };
 
-  const selectWorkspaceContext = (match: WorkspaceContextMatch) => {
+  const selectWorkspaceContext = (match: ContextMatch) => {
     const mention = contextMention;
     if (!mention) return;
     const nextValue = `${value.slice(0, mention.start)}${value.slice(mention.end)}`;
