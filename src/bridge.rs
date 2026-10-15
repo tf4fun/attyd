@@ -1082,12 +1082,9 @@ fn prepare_session_load(
     if session_materialization(state, &session_id).is_some() {
         return None;
     }
-    let incarnation = if let Some(session) = state.sessions.state(&session_id) {
-        session.incarnation
-    } else {
+    if state.sessions.state(&session_id).is_none() {
         state.sessions.register_cold(&session_id, 0);
-        0
-    };
+    }
     let materialization_id = Uuid::new_v4().to_string();
     state
         .sessions
@@ -1117,7 +1114,6 @@ fn session_materialization<'a>(
     state: &'a BridgeState,
     session_id: &str,
 ) -> Option<&'a crate::session_resources::MaterializationResources> {
-    let incarnation = state.sessions.state(session_id)?.incarnation;
     state
         .sessions
         .resources(session_id)
@@ -1134,7 +1130,6 @@ fn take_session_materialization(
     if session_materialization(state, session_id)?.attempt_id != attempt_id {
         return None;
     }
-    let incarnation = state.sessions.state(session_id)?.incarnation;
     state
         .sessions
         .resources_mut(session_id)
@@ -5556,7 +5551,7 @@ fn reserve_attachment_locked(
                 }
                 Err(error) => {
                     if let Some(materialization) = materialization {
-                        if let Some(incarnation) = previous_incarnation
+                        if previous_incarnation.is_some()
                             && let Ok(resources) = state.sessions.resources_mut(session_id)
                         {
                             resources.materialization = Some(materialization);
@@ -5861,7 +5856,7 @@ async fn require_session_workspace(
 
 async fn cancel_interactions(session_id: &str, state: &Arc<BridgeLock>, sink: &EventSink) {
     let mut state = state.lock().await;
-    cancel_interactions_locked(session_id, sink);
+    cancel_interactions_locked(session_id, &mut state, sink);
 }
 
 fn commit_session_cancel(

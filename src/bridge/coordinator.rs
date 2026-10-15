@@ -309,7 +309,7 @@ impl Coordinator {
                 let expected = match &item.event {
                     BridgeIngress::RpcCompleted(completion) => Some(completion.owner.clone()),
                     BridgeIngress::Continuation { owner, .. } => Some(owner.clone()),
-                    BridgeIngress::Terminal(snapshot) => Some(RequestOwner {
+                    BridgeIngress::Terminal(_) => Some(RequestOwner {
                         epoch: locked.sessions.epoch().to_string(),
                         session_id: requested_id.clone(),
                         incarnation,
