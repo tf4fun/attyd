@@ -169,6 +169,13 @@
     "sendNow": "立即发送",
     "removeLabel": "移除第 {{index}} 条待发送消息",
     "removeTitle": "移除待发送消息",
-    "remove": "移除"
+    "remove": "移除",
+    "sending": "发送中",
+    "refused": "已被拒绝（{{message}}），本轮结束后重新发送",
+    "uncertain": "结果未知：这条消息可能已送达 Agent，不会自动重发。",
+    "resend": "重新发送",
+    "resendLabel": "重新发送第 {{index}} 条消息",
+    "dismiss": "移除",
+    "dismissLabel": "移除第 {{index}} 条消息"
   }
 }

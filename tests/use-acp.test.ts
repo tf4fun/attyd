@@ -11,7 +11,7 @@ import {
 } from "../shared/business-api";
 import { workspaceContextSearchPath } from "../web/src/lib/api-client";
 import { projectPath, sessionPath } from "../web/src/lib/session-route";
-import { useAcp } from "../web/src/lib/use-acp";
+import { useAcp } from "../web/src/lib/use-acp-v1";
 import type { TerminalSnapshot } from "../shared/bridge";
 
 function terminalDelta(terminal: Record<string, unknown>, fromRevision = 1, overrides: Record<string, unknown> = {}) {

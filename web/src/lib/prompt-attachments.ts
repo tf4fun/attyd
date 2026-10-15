@@ -1,6 +1,7 @@
 import type { ContentBlock, PromptCapabilities } from "@agentclientprotocol/sdk";
 import i18n from "../i18n";
 import { randomId } from "./id";
+import type { PromptBlock } from "../../../shared/protocol";
 
 
 type PromptAttachmentErrorKey =
@@ -30,7 +31,7 @@ export interface PromptAttachment {
   id: string;
   name: string;
   size: number;
-  block: ContentBlock;
+  block: PromptBlock;
 }
 
 export async function createPromptAttachments(

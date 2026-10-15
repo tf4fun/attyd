@@ -6,7 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BridgeSessionView } from "../shared/business-api";
 import { sessionPath } from "../web/src/lib/session-route";
-import { useAcp } from "../web/src/lib/use-acp";
+import { useAcp } from "../web/src/lib/use-acp-v1";
 
 // M07-M09: exercise the real REST/SSE hook. The server may replace obsolete
 // presentation deltas with a reset, but the resulting view and turn outcome

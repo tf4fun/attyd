@@ -1,0 +1,1396 @@
+import i18n from "../i18n";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  AuthenticateResponse,
+  ContentBlock,
+  CreateElicitationResponse,
+  LogoutResponse,
+  RequestPermissionResponse,
+  SessionInfo,
+} from "@agentclientprotocol/sdk";
+import type { TerminalSnapshot } from "../../../shared/bridge";
+import {
+  type BridgeSessionView,
+  type BridgeTurnProcessPage,
+  type CreatedSessionResult,
+  type GlobalBusinessEvent,
+  type RuntimeView,
+  type SessionBusinessEvent,
+  type SessionListResult,
+  type SessionOwner,
+  type StartTurnResult,
+  type WorkspaceContextAttachment,
+  type WorkspaceContextMatch,
+  parseGlobalBusinessEvent,
+  parseSessionBusinessEvent,
+  sameSessionOwner,
+  strongEtag,
+} from "../../../shared/business-api";
+import { ApiError, RequestTimeoutError, requestJson, workspaceContextSearchPath } from "./api-client";
+import { randomId } from "./id";
+import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
+import { appReducer, type DeferredTurnProcess } from "./state";
+import { useAppStore } from "./app-store";
+import { applyLocalSessionDelta } from "./session-deltas";
+import { releaseSessionViewProcess, sameTurnProcess } from "./process-retention";
+import { containsHostedAttachment } from "./hosted-attachment";
+
+export function useAcp() {
+  const [state, store] = useAppStore();
+  const { dispatch } = store;
+  const [projectCwd, setProjectCwd] = useState(() => readProjectCwdFromPath(window.location.pathname));
+  // Presentation for a foreground history read, separate from background SSE refreshes.
+  const [sessionOpening, setSessionOpening] = useState<{ sessionId: string; error?: string } | undefined>(() => {
+    const sessionId = readSessionIdFromPath(window.location.pathname);
+    return sessionId == null ? undefined : { sessionId };
+  });
+
+  const globalEventsRef = useRef<EventSource | undefined>(undefined);
+  const sessionEventsRef = useRef<EventSource | undefined>(undefined);
+  const activeSessionIdRef = useRef<string | undefined>(undefined);
+  const connectionReadyRef = useRef(false);
+  const promptAdmissionsRef = useRef(new Map<string, {
+    requestId: string;
+    baseRevision: string;
+    owner: SessionOwner;
+    timeoutMessage?: string;
+  }>());
+  const refreshInFlightRef = useRef<{ sessionId: string; pending: boolean } | undefined>(undefined);
+  const runtimeRefreshRef = useRef<{ pending: boolean } | undefined>(undefined);
+  const runtimeRestoreRef = useRef<object | undefined>(undefined);
+  const sessionListQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const authInputQueueRef = useRef<{
+    requestId: string; tail: Promise<void>; closed: boolean;
+  } | undefined>(undefined);
+  const closeAuthInput = useCallback((requestId?: string) => {
+    const queue = authInputQueueRef.current;
+    if (queue != null && (requestId == null || queue.requestId === requestId)) queue.closed = true;
+  }, []);
+  const sessionCatalogRevisionRef = useRef<string | undefined>(undefined);
+  const catalogInvalidationRef = useRef(0);
+  const catalogRefreshRef = useRef<{ pending: boolean } | undefined>(undefined);
+  const sessionListSupportedRef = useRef(false);
+  const sessionLoadSupportedRef = useRef(false);
+  const navigationRef = useRef(0);
+  const observedProcessRef = useRef<{ owner: SessionOwner; operationId: string; navigation: number } | undefined>(undefined);
+  const releasedProcessesRef = useRef<{
+    owner: SessionOwner; navigation: number; operations: Set<string>; turns: Map<string, string>;
+  } | undefined>(undefined);
+  const releasedFor = useCallback((owner?: SessionOwner) => {
+    const released = releasedProcessesRef.current;
+    return released?.navigation === navigationRef.current && sameSessionOwner(released.owner, owner) ? released : undefined;
+  }, []);
+  const filterReleasedView = useCallback((view: BridgeSessionView) => {
+    const released = releasedFor(view);
+    if (released == null) return view;
+    return releaseSessionViewProcess(view, (turn) =>
+      released.operations.has(turn.operationId ?? turn.outcomes.at(-1)?.operationId ?? "") ||
+      released.turns.get(turn.turnId) === turn.historyRevision);
+  }, [releasedFor]);
+  const includedProcessFrom = useCallback((owner?: SessionOwner) => {
+    const observed = observedProcessRef.current;
+    return observed?.navigation === navigationRef.current && sameSessionOwner(observed.owner, owner)
+      ? observed.operationId : undefined;
+  }, []);
+  const reconnectRef = useRef<() => void>(() => undefined);
+  const refreshSessionRef = useRef<(sessionId: string) => void>(() => undefined);
+  const connectSessionEventsRef = useRef<(sessionId: string) => void>(() => undefined);
+  const refreshRuntimeRef = useRef<() => void>(() => undefined);
+
+  const prepareConnectionRestore = useCallback(() => {
+    closeAuthInput();
+    sessionEventsRef.current?.close();
+    sessionEventsRef.current = undefined;
+    activeSessionIdRef.current = undefined;
+    observedProcessRef.current = undefined;
+    releasedProcessesRef.current = undefined;
+    refreshInFlightRef.current = undefined;
+    promptAdmissionsRef.current.clear();
+    // Keep the route and mounted draft while replacing the old connection's
+    // presentation with a fresh Agent-owned history baseline.
+    dispatch({ type: "bridge/connection_replaced" });
+  }, [closeAuthInput]);
+
+  const resetSession = useCallback((preserve = false) => {
+    setSessionOpening(undefined);
+    sessionEventsRef.current?.close();
+    sessionEventsRef.current = undefined;
+    activeSessionIdRef.current = undefined;
+    observedProcessRef.current = undefined;
+    releasedProcessesRef.current = undefined;
+    refreshInFlightRef.current = undefined;
+    dispatch({ type: preserve ? "session/deselect" : "session/reset" });
+  }, []);
+
+  const returnHome = useCallback((replace = false, preserve = true) => {
+    navigationRef.current += 1;
+    setRoute("/", replace);
+    setProjectCwd(undefined);
+    resetSession(preserve);
+  }, [resetSession]);
+
+  const returnToSessionProject = useCallback((sessionId: string) => {
+    if (activeSessionIdRef.current !== sessionId) return;
+    const cwd = store.getState().sessionView?.workspace.cwd ?? readProjectCwdFromPath(window.location.pathname);
+    const path = cwd == null ? "/" : projectPath(cwd);
+    navigationRef.current += 1;
+    setRoute(path, true);
+    setProjectCwd(path === "/" ? undefined : cwd);
+    resetSession();
+  }, [resetSession]);
+
+  const navigateSession = useCallback((sessionId: string, cwd?: string | null, replace = false) => {
+    const validCwd = cwd != null && projectPath(cwd) !== "/" ? cwd : undefined;
+    setRoute(sessionPath(sessionId, validCwd), replace);
+    setProjectCwd(validCwd);
+  }, []);
+
+  const reportError = useCallback((error: unknown) => {
+    if (error instanceof ApiError) {
+      const body = error.body;
+      if (isRecord(body) && typeof body.code === "number") {
+        dispatch({
+          type: "request/failed",
+          error: {
+            message: typeof body.message === "string" ? body.message : error.message,
+            code: body.code,
+            data: body.data,
+          },
+        });
+        return;
+      }
+    }
+    dispatch({
+      type: "client/error",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }, []);
+
+  const reportRequestError = useCallback((
+    error: unknown,
+    requestId: string,
+    operation: string,
+  ) => {
+    dispatch({
+      type: "request/failed",
+      error: {
+        requestId,
+        operation,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }, []);
+
+  const hydrateSession = useCallback((view: BridgeSessionView) => {
+    if (activeSessionIdRef.current !== view.sessionId) return;
+    const current = store.getState().sessionView;
+    if (
+      current != null &&
+      current.sessionId === view.sessionId &&
+      current.bridgeEpoch === view.bridgeEpoch &&
+      current.sessionIncarnation === view.sessionIncarnation &&
+      view.viewRevision < current.viewRevision
+    ) return;
+    const admission = promptAdmissionsRef.current.get(view.sessionId);
+    let failedPrompt: { requestId: string; message: string } | undefined;
+    if (admission != null) {
+      if (!sameSessionOwner(view, admission.owner)) {
+        promptAdmissionsRef.current.delete(view.sessionId);
+      } else {
+        const reflectsAdmission =
+          view.activeTurn?.clientIntentId === admission.requestId ||
+          (view.phase === "ready" && view.historyRevision !== admission.baseRevision);
+        const confirmsUnaccepted = admission.timeoutMessage != null && view.phase === "ready" &&
+          view.activeTurn == null && view.historyRevision === admission.baseRevision;
+        if (!reflectsAdmission && !confirmsUnaccepted && view.phase === "ready") return;
+        if (confirmsUnaccepted) failedPrompt = { requestId: admission.requestId, message: admission.timeoutMessage! };
+        // Keep an unaccepted timeout's metadata until retry/history change, so
+        // subsequent ready refreshes preserve its manual retry presentation.
+        if (reflectsAdmission) promptAdmissionsRef.current.delete(view.sessionId);
+      }
+    }
+    // A response sent before a local release must not restore evicted bodies.
+    view = filterReleasedView(view);
+    const cwd = view.workspace.cwd;
+    if (cwd != null) navigateSession(view.sessionId, cwd, true);
+    if (includedProcessFrom(view) == null) {
+      observedProcessRef.current = view.activeTurn == null ? undefined : {
+        owner: { bridgeEpoch: view.bridgeEpoch, sessionId: view.sessionId, sessionIncarnation: view.sessionIncarnation },
+        operationId: view.activeTurn.operationId,
+        navigation: navigationRef.current,
+      };
+    }
+    dispatch({ type: "bridge/session_hydrate", view, failedPrompt });
+    setSessionOpening((opening) => opening?.sessionId === view.sessionId ? undefined : opening);
+  }, [filterReleasedView, includedProcessFrom, navigateSession]);
+
+  const refreshSession = useCallback((sessionId: string) => {
+    if (!connectionReadyRef.current || activeSessionIdRef.current !== sessionId) return;
+    if (refreshInFlightRef.current?.sessionId === sessionId) {
+      refreshInFlightRef.current.pending = true;
+      return;
+    }
+    const refresh = { sessionId, pending: false };
+    refreshInFlightRef.current = refresh;
+    void (async () => {
+      try {
+        do {
+          refresh.pending = false;
+          const cwd = store.getState().sessionView?.workspace.cwd ?? readProjectCwdFromPath(window.location.pathname);
+          const query = sessionCwdQuery(cwd, sessionLoadSupportedRef.current, store.getState().sessionView, true,
+            includedProcessFrom(store.getState().sessionView), releasedFor(store.getState().sessionView)?.operations);
+          const view = await requestJson<BridgeSessionView>(
+            `/api/v1/sessions/${encodeURIComponent(sessionId)}${query}`,
+          );
+          if (refreshInFlightRef.current !== refresh || activeSessionIdRef.current !== sessionId) return;
+          hydrateSession(view);
+          if (sessionEventsRef.current == null) connectSessionEventsRef.current(sessionId);
+        } while (refresh.pending && activeSessionIdRef.current === sessionId);
+      } catch (error) {
+        if (refreshInFlightRef.current !== refresh || activeSessionIdRef.current !== sessionId) return;
+        if (isRetiredSession(error, store.getState().sessionView, "bridge_replaced")) {
+          prepareConnectionRestore();
+          refreshRuntimeRef.current();
+          return;
+        }
+        if (isMissingSession(error) || isRetiredSession(error, store.getState().sessionView)) {
+          const owner = store.getState().sessionView;
+          if (owner != null) dispatch({ type: "session/retired", owner, deleted: isMissingSession(error) });
+          promptAdmissionsRef.current.delete(sessionId);
+          returnToSessionProject(sessionId);
+        }
+        else {
+          setSessionOpening((opening) => opening?.sessionId === sessionId
+            ? { sessionId, error: error instanceof Error ? error.message : String(error) } : opening);
+          reportError(error);
+        }
+      } finally {
+        if (refreshInFlightRef.current === refresh) {
+          refreshInFlightRef.current = undefined;
+          if (refresh.pending && activeSessionIdRef.current === sessionId) {
+            refreshSessionRef.current(sessionId);
+          }
+        }
+      }
+    })();
+  }, [hydrateSession, includedProcessFrom, prepareConnectionRestore, releasedFor, reportError, returnToSessionProject]);
+  refreshSessionRef.current = refreshSession;
+
+  const connectSessionEvents = useCallback((sessionId: string) => {
+    const current = store.getState().sessionView;
+    if (current == null || current.sessionId !== sessionId) return;
+    // The SSE error handler lives for the session: capture identity, not bodies.
+    const owner: SessionOwner = { bridgeEpoch: current.bridgeEpoch, sessionId, sessionIncarnation: current.sessionIncarnation };
+    sessionEventsRef.current?.close();
+    const cwd = store.getState().sessionView?.workspace.cwd ?? readProjectCwdFromPath(window.location.pathname);
+    const query = sessionCwdQuery(cwd, sessionLoadSupportedRef.current, owner);
+    const source = new EventSource(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
+    );
+    sessionEventsRef.current = source;
+    source.onmessage = ({ data }) => {
+      if (sessionEventsRef.current !== source) return;
+      let event: SessionBusinessEvent;
+      try {
+        event = parseSessionBusinessEvent(String(data));
+      } catch (error) {
+        reportError(error);
+        return;
+      }
+      if (activeSessionIdRef.current !== event.sessionId) return;
+      if (event.type === "bridge/session_retired") {
+        if (!sameSessionOwner(store.getState().sessionView, event)) return;
+        source.close();
+        promptAdmissionsRef.current.delete(sessionId);
+        dispatch({ type: "session/retired", owner: event, deleted: event.reason === "deleted" });
+        returnToSessionProject(sessionId);
+        return;
+      }
+      if (event.type === "bridge/session_turn_complete") {
+        clearMatchingPromptAdmission(promptAdmissionsRef.current, event);
+        const view = sessionViewAtTurnOutcome(store.getState().sessionView, event);
+        if (view == null) {
+          refreshSessionRef.current(sessionId);
+          return;
+        }
+        dispatch({ type: "bridge/turn_complete", event, view });
+        return;
+      }
+      if (event.type === "bridge/session_turn_failed") {
+        clearMatchingPromptAdmission(promptAdmissionsRef.current, event);
+        const view = sessionViewAtTurnOutcome(store.getState().sessionView, event);
+        if (view == null) {
+          const current = store.getState().sessionView;
+          if (
+            current != null &&
+            current.sessionId === event.sessionId &&
+            current.bridgeEpoch === event.bridgeEpoch &&
+            current.sessionIncarnation === event.sessionIncarnation &&
+            event.viewRevision < current.viewRevision
+          ) {
+            // A stale-revision failure for the same owner is an outcome the
+            // newer view cannot reconstruct from turnOutcomes. Surface the
+            // error and its retry prompt without rolling the view back.
+            dispatch({ type: "bridge/turn_failed", event });
+            return;
+          }
+          refreshSessionRef.current(sessionId);
+          return;
+        }
+        dispatch({ type: "bridge/turn_failed", event, view });
+        return;
+      }
+      const current = store.getState().sessionView;
+      if (event.type === "bridge/session_reset") {
+        if (
+          current == null ||
+          current.bridgeEpoch !== event.bridgeEpoch ||
+          current.sessionIncarnation !== event.sessionIncarnation ||
+          current.viewRevision !== event.viewRevision
+        ) {
+          refreshSessionRef.current(sessionId);
+        }
+        return;
+      }
+      if (
+        current == null ||
+        current.bridgeEpoch !== event.bridgeEpoch ||
+        current.sessionIncarnation !== event.sessionIncarnation ||
+        current.viewRevision !== event.fromRevision
+      ) {
+        refreshSessionRef.current(sessionId);
+        return;
+      }
+      if (event.change.kind === "terminal_update") {
+        const incoming = event.change.terminal;
+        const previous = Object.hasOwn(current.terminals, incoming.terminalId)
+          ? current.terminals[incoming.terminalId]
+          : undefined;
+        if (incoming.outputAppend && previous == null) {
+          refreshSessionRef.current(sessionId);
+          return;
+        }
+        const terminal = mergeTerminalSnapshot(previous, incoming);
+        dispatch({ type: "session/terminal_update", terminal, view: {
+          ...current,
+          viewRevision: event.viewRevision,
+          terminals: { ...current.terminals, [terminal.terminalId]: terminal },
+        } });
+        return;
+      }
+      if (event.change.kind === "turn_update" && event.change.update != null) {
+        dispatch({
+          type: "session/turn_update",
+          notification: { sessionId, update: event.change.update },
+          view: { ...current, viewRevision: event.viewRevision },
+        });
+        return;
+      }
+      const local = applyLocalSessionDelta(current, event.change, event.viewRevision);
+      if (local == null) {
+        dispatch({ type: "session/view_synced", view: { ...current, viewRevision: event.viewRevision } });
+        refreshSessionRef.current(sessionId);
+        return;
+      }
+      dispatch({ type: "bridge/session_live_update", view: local.view, settledControl: local.settledControl });
+    };
+    let probingRecovery = false;
+    source.onerror = () => {
+      // A failed reconnect may mean this owner retired while the network was
+      // absent, or that the whole Agent connection stopped. Check the global
+      // connection before querying a session on an unavailable Agent.
+      if (probingRecovery || sessionEventsRef.current !== source) return;
+      probingRecovery = true;
+      const navigation = navigationRef.current;
+      void requestJson<RuntimeView>("/api/v1/runtime").then((runtime) => {
+        if (sessionEventsRef.current !== source || navigationRef.current !== navigation ||
+          !sameSessionOwner(store.getState().sessionView, owner)) return;
+        if (!runtime.connected || runtime.phase?.phase !== "ready") {
+          connectionReadyRef.current = false;
+          refreshInFlightRef.current = undefined;
+          refreshRuntimeRef.current();
+        } else if (runtime.bridgeEpoch != null && runtime.bridgeEpoch !== owner.bridgeEpoch) {
+          prepareConnectionRestore();
+          refreshRuntimeRef.current();
+        } else {
+          refreshSessionRef.current(sessionId);
+        }
+      }).catch(() => {
+        // Global stream recovery reports connection loss. Native SSE retry will
+        // probe again once the network is reachable.
+      }).finally(() => { probingRecovery = false; });
+    };
+  }, [prepareConnectionRestore, reportError, returnToSessionProject]);
+  connectSessionEventsRef.current = connectSessionEvents;
+
+  const activateSession = useCallback((session: SessionInfo, transition = true, view?: BridgeSessionView) => {
+    if (transition) navigationRef.current += 1;
+    navigateSession(session.sessionId, view?.workspace.cwd ?? session.cwd, !transition);
+    if (activeSessionIdRef.current === session.sessionId && store.getState().sessionView != null) {
+      refreshSessionRef.current(session.sessionId);
+      return;
+    }
+    const requestId = randomId();
+    setSessionOpening({ sessionId: session.sessionId });
+    activeSessionIdRef.current = session.sessionId;
+    dispatch({ type: "session/view_synced", view: undefined });
+    sessionEventsRef.current?.close();
+    sessionEventsRef.current = undefined;
+    if (transition) {
+      dispatch({
+        type: "session/transition_start",
+        kind: "attach",
+        requestId,
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        title: session.title,
+      });
+    }
+    if (view != null) {
+      hydrateSession(view);
+      connectSessionEvents(session.sessionId);
+    }
+    else refreshSessionRef.current(session.sessionId);
+  }, [connectSessionEvents, hydrateSession, navigateSession]);
+
+  const readSessionList = useCallback(async (cursor?: string, isCurrent: () => boolean = () => true) => {
+    if (!sessionListSupportedRef.current) return { sessions: [] } as SessionListResult;
+    const invalidation = catalogInvalidationRef.current;
+    const query = new URLSearchParams();
+    if (cursor != null) {
+      query.set("cursor", cursor);
+      if (sessionCatalogRevisionRef.current != null) query.set("expectedCatalogRevision", sessionCatalogRevisionRef.current);
+    }
+    const suffix = query.size === 0 ? "" : `?${query}`;
+    const response = await requestJson<SessionListResult>(`/api/v1/sessions${suffix}`);
+    if (!isCurrent()) return response;
+    if (catalogInvalidationRef.current !== invalidation) {
+      throw new ApiError("Session catalog changed", 409, { data: { kind: "session_catalog_changed" } });
+    }
+    sessionCatalogRevisionRef.current = response.catalogRevision;
+    dispatch({ type: "sessions/listed", cursor, response });
+    return response;
+  }, []);
+
+  const withSessionList = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
+    const run = async () => {
+      try { return await operation(); }
+      catch (error) {
+        if (!isCatalogChanged(error)) throw error;
+        return operation();
+      }
+    };
+    const result = sessionListQueueRef.current.then(run, run);
+    sessionListQueueRef.current = result.catch(() => undefined);
+    return result;
+  }, []);
+
+  const refreshSessionList = useCallback((cursor?: string) => withSessionList(async () => {
+    const pathname = window.location.pathname;
+    const discoverProject = cursor == null && (
+      readProjectCwdFromPath(pathname) != null || readSessionIdFromPath(pathname) != null
+    );
+    try {
+      let listed = await readSessionList(cursor);
+      const cursors = new Set<string>();
+      while (discoverProject && listed.nextCursor != null && window.location.pathname === pathname) {
+        if (cursors.has(listed.nextCursor)) throw new Error(i18n.t("errors.repeatedCursor"));
+        cursors.add(listed.nextCursor);
+        listed = await readSessionList(listed.nextCursor);
+      }
+      return listed;
+    } catch (error) {
+      // The retry must start a new pagination chain, even for "load more".
+      if (isCatalogChanged(error)) cursor = undefined;
+      throw error;
+    }
+  }), [readSessionList, withSessionList]);
+
+  const invalidateSessionList = useCallback(() => {
+    if (catalogRefreshRef.current != null) {
+      catalogRefreshRef.current.pending = true;
+      return;
+    }
+    const refresh = { pending: false };
+    catalogRefreshRef.current = refresh;
+    void (async () => {
+      try {
+        do {
+          refresh.pending = false;
+          await refreshSessionList();
+        } while (refresh.pending);
+      } catch (error) { reportError(error); }
+      finally { catalogRefreshRef.current = undefined; }
+    })();
+  }, [refreshSessionList, reportError]);
+
+  const refreshRuntimeOnce = useCallback(async () => {
+    const restore = {};
+    runtimeRestoreRef.current = restore;
+    const navigation = navigationRef.current;
+    const routeProjectCwd = readProjectCwdFromPath(window.location.pathname);
+    const routeSessionId = readSessionIdFromPath(window.location.pathname);
+    const stillCurrent = () => runtimeRestoreRef.current === restore &&
+      navigationRef.current === navigation &&
+      readSessionIdFromPath(window.location.pathname) === routeSessionId &&
+      (routeSessionId != null || readProjectCwdFromPath(window.location.pathname) === routeProjectCwd);
+    const reportRestoreError = (error: unknown) => {
+      if (!stillCurrent()) return;
+      if (isMissingSession(error)) {
+        returnHome(true, false);
+        return;
+      }
+      if (routeSessionId != null && store.getState().sessionView == null) setSessionOpening({
+        sessionId: routeSessionId, error: error instanceof Error ? error.message : String(error),
+      });
+      if (!(error instanceof ApiError) || error.status >= 500) {
+        dispatch({ type: "socket/closed" });
+      }
+      reportError(error);
+    };
+    if (routeSessionId != null && store.getState().sessionView == null) {
+      setSessionOpening({ sessionId: routeSessionId });
+    }
+    try {
+      const runtime = await requestJson<RuntimeView>("/api/v1/runtime");
+      if (!stillCurrent()) return;
+      connectionReadyRef.current = runtime.connected && runtime.phase?.phase === "ready";
+      if (!connectionReadyRef.current) refreshInFlightRef.current = undefined;
+      const restoredView = store.getState().sessionView;
+      if (runtime.bridgeEpoch != null && restoredView != null && runtime.bridgeEpoch !== restoredView.bridgeEpoch) {
+        prepareConnectionRestore();
+      }
+      dispatch({ type: "socket/open" });
+      dispatch({ type: "runtime/loaded", runtime });
+      if (runtime.phase == null && !runtime.connected) dispatch({ type: "socket/closed" });
+      sessionListSupportedRef.current = runtime.initialized?.response.agentCapabilities?.sessionCapabilities?.list != null;
+      sessionLoadSupportedRef.current = runtime.initialized?.response.agentCapabilities?.loadSession === true;
+
+      if (!runtime.connected || runtime.phase?.phase !== "ready") {
+        setSessionOpening(undefined);
+        return;
+      }
+
+      const canList = sessionListSupportedRef.current;
+      const canLoad = sessionLoadSupportedRef.current;
+      const discovery = withSessionList(async () => {
+        if (!stillCurrent()) return;
+        let listed = await readSessionList(undefined, stillCurrent);
+        if (!stillCurrent() || (routeSessionId == null && routeProjectCwd == null)) return;
+
+        let selected = listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
+        const cursors = new Set<string>();
+        while (listed.nextCursor != null) {
+          if (cursors.has(listed.nextCursor)) throw new Error(i18n.t("errors.repeatedCursor"));
+          cursors.add(listed.nextCursor);
+          listed = await readSessionList(listed.nextCursor, stillCurrent);
+          if (!stillCurrent()) return;
+          selected ??= listed.sessions.find(({ sessionId }) => sessionId === routeSessionId);
+        }
+        return selected;
+      }).then(
+        (selected) => ({ ok: true as const, selected }),
+        (error: unknown) => {
+          // Directory failures do not invalidate the connection or a readable session.
+          if (stillCurrent()) reportError(error);
+          return { ok: false as const, error };
+        },
+      );
+
+      // Project discovery never opens a conversation. A retained session can be
+      // restored independently while any directory page is still pending.
+      if (routeSessionId == null) return;
+      if (activeSessionIdRef.current === routeSessionId) {
+        refreshInFlightRef.current = undefined;
+        connectSessionEvents(routeSessionId);
+        refreshSessionRef.current(routeSessionId);
+        return;
+      }
+      void (async () => {
+        const readView = (cwd?: string) => requestJson<BridgeSessionView>(
+          `/api/v1/sessions/${encodeURIComponent(routeSessionId)}${sessionCwdQuery(cwd, canLoad, undefined, true)}`,
+        );
+        let view: BridgeSessionView;
+        try {
+          // Avoid cold-loading a mismatched route workspace before discovery.
+          view = await readView(canList ? undefined : routeProjectCwd);
+        } catch (error) {
+          if (!isMissingSession(error) || !canList) throw error;
+          const discovered = await discovery;
+          if (!stillCurrent()) return;
+          if (!discovered.ok) {
+            setSessionOpening({ sessionId: routeSessionId,
+              error: discovered.error instanceof Error ? discovered.error.message : String(discovered.error) });
+            return;
+          }
+          // A local miss before listing is not an authoritative missing session.
+          view = await readView(discovered.selected?.cwd ?? routeProjectCwd);
+        }
+        if (stillCurrent()) {
+          activateSession({ sessionId: routeSessionId, cwd: view.workspace.cwd ?? "" }, false, view);
+        }
+      })().catch(reportRestoreError);
+    } catch (error) {
+      reportRestoreError(error);
+    }
+  }, [activateSession, connectSessionEvents, prepareConnectionRestore, readSessionList, reportError, returnHome, withSessionList]);
+
+  const refreshRuntime = useCallback(() => {
+    if (runtimeRefreshRef.current != null) {
+      runtimeRefreshRef.current.pending = true;
+      return;
+    }
+    const refresh = { pending: false };
+    runtimeRefreshRef.current = refresh;
+    void (async () => {
+      try {
+        do {
+          refresh.pending = false;
+          await refreshRuntimeOnce();
+        } while (refresh.pending && runtimeRefreshRef.current === refresh);
+      } finally {
+        if (runtimeRefreshRef.current === refresh) runtimeRefreshRef.current = undefined;
+      }
+    })();
+  }, [refreshRuntimeOnce]);
+  refreshRuntimeRef.current = refreshRuntime;
+
+  const retrySessionOpening = useCallback(() => {
+    const sessionId = readSessionIdFromPath(window.location.pathname);
+    if (sessionId == null) return;
+    setSessionOpening({ sessionId });
+    refreshRuntime();
+  }, [refreshRuntime]);
+
+  const openProject = useCallback((cwd: string) => {
+    const path = projectPath(cwd);
+    if (path === "/") {
+      returnHome();
+      return;
+    }
+    navigationRef.current += 1;
+    setRoute(path);
+    setProjectCwd(cwd);
+    resetSession(true);
+    void refreshRuntime();
+  }, [refreshRuntime, resetSession, returnHome]);
+
+  const handleGlobalEvent = useCallback((event: GlobalBusinessEvent) => {
+    if (event.type === "bridge/auth_terminal_exited") closeAuthInput(event.requestId);
+    switch (event.type) {
+      case "bridge/connection":
+        connectionReadyRef.current = event.phase === "ready";
+        // A stopped connection can still have queued session reset events and
+        // an outstanding GET. Neither may start another query or install a
+        // stale view after the Agent has exited.
+        if (!connectionReadyRef.current) refreshInFlightRef.current = undefined;
+        if (event.phase === "stopped" || event.phase === "error") {
+          promptAdmissionsRef.current.clear();
+          closeAuthInput();
+        }
+        dispatch({ type: "global/event", event });
+        if (event.phase === "ready") {
+          if (store.getState().authTerminal?.status === "succeeded") {
+            dispatch({ type: "auth/dismiss_terminal" });
+          }
+          void refreshRuntime();
+        }
+        return;
+      case "bridge/connection_error":
+        dispatch({ type: "global/event", event });
+        void refreshRuntime();
+        return;
+      case "bridge/catalog_changed":
+        catalogInvalidationRef.current += 1;
+        invalidateSessionList();
+        return;
+      default:
+        dispatch({ type: "global/event", event });
+    }
+  }, [closeAuthInput, refreshRuntime, invalidateSessionList]);
+
+  const connectGlobalEvents = useCallback(() => {
+    globalEventsRef.current?.close();
+    const source = new EventSource("/api/v1/events");
+    globalEventsRef.current = source;
+    source.onopen = () => {
+      dispatch({ type: "socket/open" });
+      void refreshRuntime();
+    };
+    source.onmessage = ({ data }) => {
+      try {
+        handleGlobalEvent(parseGlobalBusinessEvent(String(data)));
+      } catch (error) {
+        reportError(error);
+      }
+    };
+    source.onerror = () => dispatch({ type: "socket/closed" });
+  }, [handleGlobalEvent, refreshRuntime, reportError]);
+
+  const reconnect = useCallback(() => reconnectRef.current(), []);
+
+  useEffect(() => {
+    let disposed = false;
+    const reconnectStreams = () => {
+      if (disposed) return;
+      connectGlobalEvents();
+    };
+    reconnectRef.current = reconnectStreams;
+    connectGlobalEvents();
+    const restoreRoute = () => {
+      navigationRef.current += 1;
+      const cwd = readProjectCwdFromPath(window.location.pathname);
+      const sessionId = readSessionIdFromPath(window.location.pathname);
+      if (cwd == null && sessionId == null) returnHome(true);
+      else {
+        setProjectCwd(cwd);
+        setRoute(sessionId == null ? projectPath(cwd!) : sessionPath(sessionId, cwd), true);
+        if (sessionId == null || activeSessionIdRef.current !== sessionId) resetSession(true);
+      }
+      void refreshRuntime();
+    };
+    restoreRoute();
+
+    const recoverClosedStreams = () => {
+      if (
+        store.getState().phase === "stopped" || store.getState().phase === "error" ||
+        globalEventsRef.current?.readyState === EventSource.CLOSED ||
+        (activeSessionIdRef.current != null &&
+          sessionEventsRef.current?.readyState === EventSource.CLOSED)
+      ) reconnectStreams();
+    };
+    window.addEventListener("online", recoverClosedStreams);
+    window.addEventListener("focus", recoverClosedStreams);
+    window.addEventListener("pageshow", recoverClosedStreams);
+    window.addEventListener("popstate", restoreRoute);
+    document.addEventListener("visibilitychange", recoverClosedStreams);
+    return () => {
+      disposed = true;
+      closeAuthInput();
+      navigationRef.current += 1;
+      reconnectRef.current = () => undefined;
+      window.removeEventListener("online", recoverClosedStreams);
+      window.removeEventListener("focus", recoverClosedStreams);
+      window.removeEventListener("pageshow", recoverClosedStreams);
+      window.removeEventListener("popstate", restoreRoute);
+      document.removeEventListener("visibilitychange", recoverClosedStreams);
+      globalEventsRef.current?.close();
+      sessionEventsRef.current?.close();
+      refreshInFlightRef.current = undefined;
+    };
+  }, [closeAuthInput, connectGlobalEvents, refreshRuntime, resetSession, returnHome]);
+
+  const searchWorkspaceContext = useCallback(async (query: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) {
+      throw new Error(i18n.t("errors.searchNotReady"));
+    }
+    const response = await requestJson<{ matches: WorkspaceContextMatch[] }>(
+      workspaceContextSearchPath(query, sessionId),
+    );
+    return response.matches;
+  }, []);
+
+  const readWorkspaceContext = useCallback(async (path: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) {
+      throw new Error(i18n.t("errors.contextNotReady"));
+    }
+    const response = await requestJson<{ attachment: WorkspaceContextAttachment }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/context/read`,
+      { method: "POST", body: JSON.stringify({ path }) },
+    );
+    return response.attachment;
+  }, []);
+
+  const prompt = useCallback((blocks: ContentBlock[]) => {
+    const current = store.getState();
+    const view = store.getState().sessionView;
+    if (
+      current.session == null || current.running || current.pendingPrompt != null ||
+      current.sessionTransition != null || current.pendingSessionControl != null ||
+      current.pendingSessionDeletions.some(({ sessionId }) => sessionId === current.session?.sessionId) ||
+      current.runtimeOperation != null || view == null || view.phase !== "ready" ||
+      view.historyRevision == null
+    ) return false;
+    const owner = sessionIdentity(view);
+    const requestId = randomId();
+    const sessionId = current.session.sessionId;
+    const navigation = navigationRef.current;
+    promptAdmissionsRef.current.set(sessionId, {
+      requestId,
+      baseRevision: view.historyRevision,
+      owner,
+    });
+    dispatch({ type: "user/prompt", requestId, sessionId, blocks });
+    let submitted = false;
+    void (async () => {
+      // A reset token can settle the visible turn before its authoritative
+      // session GET completes. Resolve the append point immediately before
+      // admission so a queued prompt never reuses the preceding revision.
+      const latest = await requestJson<BridgeSessionView>(
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}${sessionCwdQuery(undefined, false, owner, true,
+          includedProcessFrom(owner), releasedFor(owner)?.operations)}`,
+      );
+      if (
+        latest.sessionId !== sessionId || latest.phase !== "ready" ||
+        latest.historyRevision == null
+      ) {
+        throw new Error(i18n.t("errors.promptNotReady"));
+      }
+      const admission = promptAdmissionsRef.current.get(sessionId);
+      if (admission?.requestId === requestId) {
+        promptAdmissionsRef.current.set(sessionId, {
+          ...admission,
+          baseRevision: latest.historyRevision,
+        });
+      }
+      if (sameSessionOwner(store.getState().sessionView, latest)) {
+        dispatch({ type: "session/view_synced", view: filterReleasedView(latest) });
+      }
+      submitted = true;
+      return requestJson<StartTurnResult>(
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
+        {
+          method: "POST",
+          headers: {
+            "If-Match": strongEtag(latest.historyRevision),
+            "Idempotency-Key": requestId,
+          },
+          body: JSON.stringify({ prompt: blocks }),
+        },
+      );
+    })().then((result) => {
+      if (navigationRef.current === navigation && sameSessionOwner(store.getState().sessionView, owner) &&
+        includedProcessFrom(owner) == null) {
+        observedProcessRef.current = {
+          owner,
+          operationId: result.operationId, navigation,
+        };
+      }
+      refreshSessionRef.current(sessionId);
+    }).catch((error) => {
+      const admission = promptAdmissionsRef.current.get(sessionId);
+      if (submitted && error instanceof RequestTimeoutError) {
+        if (admission?.requestId === requestId) {
+          // Keep only identity/error metadata; pendingPrompt already owns the input.
+          promptAdmissionsRef.current.set(sessionId, { ...admission, timeoutMessage: error.message });
+        }
+        // A lost admission response does not mean the Agent rejected the turn.
+        // Keep the prompt busy until a fresh authoritative read settles it.
+        if (navigationRef.current === navigation && sameSessionOwner(store.getState().sessionView, owner)) {
+          reportError(error);
+        }
+        if (refreshInFlightRef.current?.sessionId === sessionId) {
+          // An older ready snapshot cannot resolve this uncertain submission.
+          refreshInFlightRef.current = undefined;
+        }
+      } else {
+        if (admission?.requestId === requestId) promptAdmissionsRef.current.delete(sessionId);
+        reportRequestError(error, requestId, "session/prompt");
+      }
+      refreshSessionRef.current(sessionId);
+    });
+    return true;
+  }, [filterReleasedView, includedProcessFrom, releasedFor, reportError, reportRequestError]);
+
+  const cancel = useCallback(() => {
+    const view = store.getState().sessionView;
+    if (view?.activeTurn == null || view.phase !== "running" || view.activeTurn.cancelRequested) return;
+    const sessionId = view.sessionId;
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(view.sessionId)}/turns/${encodeURIComponent(view.activeTurn.operationId)}/cancel`,
+      { method: "POST" },
+    ).then(() => refreshSessionRef.current(sessionId)).catch(reportError);
+  }, [reportError]);
+
+  const setMode = useCallback((modeId: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || !["ready", "running", "reconciling"].includes(store.getState().sessionView?.phase ?? "")) return;
+    const requestId = randomId();
+    dispatch({ type: "session/control_start", kind: "mode", requestId, sessionId });
+    // The control delta carries the new mode; the acknowledgement only ends
+    // this request, whichever of the two arrives first.
+    void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/mode`, {
+      method: "POST",
+      body: JSON.stringify({ modeId }),
+    }).then(() => dispatch({ type: "session/control_settled", requestId })).catch((error) => {
+      reportRequestError(error, requestId, "session/set_mode");
+    });
+  }, [reportRequestError]);
+
+  const setConfig = useCallback((configId: string, value: string | boolean) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || !["ready", "running", "reconciling"].includes(store.getState().sessionView?.phase ?? "")) return;
+    const requestId = randomId();
+    dispatch({ type: "session/control_start", kind: "config", requestId, sessionId });
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/configuration/${encodeURIComponent(configId)}`,
+      { method: "POST", body: JSON.stringify({ value }) },
+    ).then(() => dispatch({ type: "session/control_settled", requestId })).catch((error) => {
+      reportRequestError(error, requestId, "session/set_config_option");
+    });
+  }, [reportRequestError]);
+
+  const respondPermission = useCallback((
+    permissionId: string,
+    outcome: RequestPermissionResponse["outcome"],
+  ) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) return;
+    const requestId = randomId();
+    dispatch({ type: "permission/respond_start", permissionId, requestId });
+    // The interaction_remove delta retires the request.
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(permissionId)}/response`,
+      { method: "POST", body: JSON.stringify({ kind: "permission", outcome }) },
+    ).catch((error) => {
+      reportRequestError(error, requestId, "permission/respond");
+    });
+  }, [reportRequestError]);
+
+  const respondElicitation = useCallback((
+    elicitationId: string,
+    response: CreateElicitationResponse,
+  ) => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null) return;
+    const requestId = randomId();
+    dispatch({ type: "elicitation/respond_start", elicitationId, requestId });
+    // The interaction_remove delta retires the request, and refetches the
+    // view when an accepted URL elicitation opens a flow.
+    void requestJson(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(elicitationId)}/response`,
+      { method: "POST", body: JSON.stringify({ kind: "elicitation", response }) },
+    ).catch((error) => {
+      reportRequestError(error, requestId, "elicitation/respond");
+    });
+  }, [reportRequestError]);
+
+  const authenticate = useCallback((methodId: string) => {
+    const method = store.getState().initialized?.authMethods?.find(({ id }) => id === methodId);
+    const terminal = method != null && "type" in method && method.type === "terminal";
+    if (terminal) {
+      void requestJson("/api/v1/auth/terminal", {
+        method: "POST",
+        body: JSON.stringify({ methodId, cols: 80, rows: 24 }),
+      }).catch(reportError);
+      return;
+    }
+    void requestJson<{ requestId: string; response: AuthenticateResponse }>(
+      `/api/v1/auth/${encodeURIComponent(methodId)}`,
+      { method: "POST" },
+    ).then(({ requestId, response }) => {
+      handleGlobalEvent({ type: "acp/authenticated", requestId, methodId, response });
+      void refreshRuntime();
+    }).catch(reportError);
+  }, [handleGlobalEvent, refreshRuntime, reportError]);
+
+  const writeAuthTerminal = useCallback((requestId: string, data: string) => {
+    const acceptsInput = () => {
+      const terminal = store.getState().authTerminal;
+      return terminal?.requestId === requestId &&
+        (terminal.status === "starting" || terminal.status === "running");
+    };
+    if (!acceptsInput()) return;
+    const queue = authInputQueueRef.current?.requestId === requestId
+      ? authInputQueueRef.current
+      : { requestId, tail: Promise.resolve(), closed: false };
+    authInputQueueRef.current = queue;
+    if (queue.closed) return;
+    // Separate HTTP requests can arrive out of order. Wait for each PTY write
+    // before sending the next keystroke, including Enter.
+    queue.tail = queue.tail.then(async () => {
+      if (authInputQueueRef.current !== queue || queue.closed || !acceptsInput()) return;
+      await requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/input`, {
+        method: "POST",
+        body: JSON.stringify({ data }),
+      });
+    }).catch((error) => {
+      if (authInputQueueRef.current !== queue || queue.closed || !acceptsInput()) return;
+      // Delivery may be uncertain: discard the queued suffix and never replay
+      // it. A later explicit keystroke starts a fresh queue for this terminal.
+      queue.closed = true;
+      authInputQueueRef.current = undefined;
+      reportRequestError(error, requestId, "auth/terminal_input");
+    });
+  }, [reportRequestError]);
+
+  const resizeAuthTerminal = useCallback((requestId: string, cols: number, rows: number) => {
+    void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/resize`, {
+      method: "POST",
+      body: JSON.stringify({ cols, rows }),
+    }).catch(reportError);
+  }, [reportError]);
+
+  const cancelAuthTerminal = useCallback((requestId: string) => {
+    closeAuthInput(requestId);
+    void requestJson(`/api/v1/auth/terminal/${encodeURIComponent(requestId)}/cancel`, {
+      method: "POST",
+    }).catch(reportError);
+  }, [closeAuthInput, reportError]);
+
+  const dismissAuthTerminal = useCallback(() => dispatch({ type: "auth/dismiss_terminal" }), []);
+
+  const logout = useCallback(() => {
+    void requestJson<{ requestId: string; response: LogoutResponse }>("/api/v1/auth/logout", {
+      method: "POST",
+    }).then(({ requestId, response }) => {
+      handleGlobalEvent({ type: "acp/logged_out", requestId, response });
+    }).catch(reportError);
+  }, [handleGlobalEvent, reportError]);
+
+  const newSession = useCallback((cwd: string): boolean => {
+    if (store.getState().phase !== "ready") return false;
+    const navigation = ++navigationRef.current;
+    const requestId = randomId();
+    dispatch({ type: "session/transition_start", kind: "new", requestId, cwd });
+    void requestJson<CreatedSessionResult>("/api/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ cwd }),
+    }).then((created) => {
+      catalogInvalidationRef.current += 1;
+      if (navigationRef.current !== navigation) {
+        void refreshSessionList().catch(reportError);
+        return;
+      }
+      navigateSession(created.sessionId, created.view.workspace.cwd ?? created.cwd ?? cwd);
+      activeSessionIdRef.current = created.sessionId;
+      dispatch({ type: "session/view_synced", view: undefined });
+      sessionEventsRef.current?.close();
+      hydrateSession(created.view);
+      connectSessionEvents(created.sessionId);
+      void refreshSessionList();
+    }).catch((error) => {
+      if (navigationRef.current === navigation) reportRequestError(error, requestId, "session/new");
+    });
+    return true;
+  }, [connectSessionEvents, hydrateSession, navigateSession, refreshSessionList, reportError, reportRequestError]);
+
+  const listSessions = useCallback((cursor?: string) => {
+    void refreshSessionList(cursor).catch(reportError);
+  }, [refreshSessionList, reportError]);
+
+  const attachSession = useCallback((session: SessionInfo) => activateSession(session), [activateSession]);
+
+  const closeSession = useCallback(() => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || store.getState().sessionTransition || store.getState().pendingSessionControl || store.getState().runtimeOperation) return;
+    const requestId = randomId();
+    const navigation = navigationRef.current;
+    const currentView = store.getState().sessionView;
+    const owner = currentView == null ? undefined : sessionIdentity(currentView);
+    dispatch({ type: "session/transition_start", kind: "close", requestId, sessionId });
+    void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}/close`, {
+      method: "POST",
+    }).then(() => {
+      dispatch({ type: "session/management_complete", requestId, sessionId, owner, deleted: false });
+      if (navigationRef.current === navigation && sameSessionOwner(store.getState().sessionView, owner)) {
+        returnToSessionProject(sessionId);
+      }
+      void refreshSessionList().catch(reportError);
+    }).catch((error) => reportRequestError(error, requestId, "session/close"));
+  }, [refreshSessionList, reportError, reportRequestError, returnToSessionProject]);
+
+  const forkSession = useCallback(() => {
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId == null || store.getState().running) return;
+    const navigation = ++navigationRef.current;
+    const requestId = randomId();
+    dispatch({ type: "session/transition_start", kind: "fork", requestId, sessionId });
+    void requestJson<CreatedSessionResult>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/fork`,
+      { method: "POST" },
+    ).then((forked) => {
+      catalogInvalidationRef.current += 1;
+      if (navigationRef.current !== navigation) {
+        void refreshSessionList().catch(reportError);
+        return;
+      }
+      navigateSession(forked.sessionId, forked.view.workspace.cwd ?? forked.cwd ?? store.getState().cwd);
+      activeSessionIdRef.current = forked.sessionId;
+      dispatch({ type: "session/view_synced", view: undefined });
+      sessionEventsRef.current?.close();
+      hydrateSession(forked.view);
+      connectSessionEvents(forked.sessionId);
+      void refreshSessionList();
+    }).catch((error) => {
+      if (navigationRef.current === navigation) reportRequestError(error, requestId, "session/fork");
+    });
+  }, [connectSessionEvents, hydrateSession, navigateSession, refreshSessionList, reportError, reportRequestError]);
+
+  const deleteSession = useCallback((sessionId: string) => {
+    if (store.getState().pendingSessionDeletions.some((pending) => pending.sessionId === sessionId)) {
+      return;
+    }
+    const requestId = randomId();
+    const navigation = navigationRef.current;
+    const { sessionView, cachedSessions } = store.getState();
+    const owner = sessionView?.sessionId === sessionId
+      ? sessionIdentity(sessionView)
+      : cachedSessions.get(sessionId)?.sessionOwner;
+    dispatch({ type: "session/delete_start", requestId, sessionId });
+    void requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    }).then(() => {
+      catalogInvalidationRef.current += 1;
+      dispatch({ type: "session/management_complete", requestId, sessionId, owner, deleted: true });
+      if (navigationRef.current === navigation && sameSessionOwner(store.getState().sessionView, owner)) {
+        returnToSessionProject(sessionId);
+      }
+      void refreshSessionList().catch(reportError);
+    }).catch((error) => reportRequestError(error, requestId, "session/delete"));
+  }, [refreshSessionList, reportError, reportRequestError, returnToSessionProject]);
+
+  const dismissExternalFlow = useCallback((elicitationId: string) => {
+    dispatch({ type: "elicitation/dismiss_flow", elicitationId });
+  }, []);
+
+  const loadTurnProcess = useCallback(async (
+    process: DeferredTurnProcess, offset: number, signal: AbortSignal,
+  ): Promise<BridgeTurnProcessPage> => {
+    const navigation = navigationRef.current;
+    const ownsSession = () => navigationRef.current === navigation &&
+      activeSessionIdRef.current === process.owner.sessionId &&
+      sameSessionOwner(store.getState().sessionView, process.owner);
+    const isCurrent = () => ownsSession() &&
+      store.getState().sessionView?.historyRevision === process.historyRevision;
+    const rejectStale = () => {
+      if (!signal.aborted && ownsSession() && !isCurrent()) {
+        refreshSessionRef.current(process.owner.sessionId);
+      }
+      throw new DOMException("Session history changed", "AbortError");
+    };
+    if (signal.aborted || !isCurrent()) rejectStale();
+    const query = new URLSearchParams({
+      expectedEpoch: process.owner.bridgeEpoch,
+      expectedIncarnation: String(process.owner.sessionIncarnation),
+      historyRevision: process.historyRevision,
+      offset: String(offset),
+    });
+    try {
+      const page = await requestJson<BridgeTurnProcessPage>(
+        `/api/v1/sessions/${encodeURIComponent(process.owner.sessionId)}/turns/${encodeURIComponent(process.turnId)}/process?${query}`,
+        { signal },
+      );
+      if (signal.aborted || !isCurrent()) rejectStale();
+      if (!isRecord(page) || !sameSessionOwner(page, process.owner) || page.turnId !== process.turnId ||
+        page.historyRevision !== process.historyRevision || page.offset !== offset ||
+        page.total !== process.processCount || !Array.isArray(page.items) ||
+        page.items.length !== Math.min(10, process.processCount - offset) ||
+        !page.items.every((item) => Array.isArray(item) && item.length > 0 &&
+          item.every((update) => isRecord(update) && typeof update.sessionUpdate === "string")) ||
+        !isRecord(page.terminals) || !Object.entries(page.terminals).every(([id, terminal]) =>
+          isRecord(terminal) && terminal.terminalId === id && terminal.sessionId === process.owner.sessionId &&
+          typeof terminal.output === "string" && typeof terminal.truncated === "boolean" &&
+          typeof terminal.released === "boolean") ||
+        (page.response != null && (!isRecord(page.response) || typeof page.response.stopReason !== "string")) ||
+        (page.nextOffset !== null && page.nextOffset !== offset + page.items.length) ||
+        offset + page.items.length > page.total ||
+        (page.nextOffset === null) !== (offset + page.items.length === page.total)) {
+        throw new Error("Bridge returned an invalid process page");
+      }
+      return page;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409 && isCurrent()) {
+        refreshSessionRef.current(process.owner.sessionId);
+      }
+      throw error;
+    }
+  }, []);
+
+  const releaseTurnProcess = useCallback((process: DeferredTurnProcess) => {
+    const view = store.getState().sessionView;
+    if (view == null || activeSessionIdRef.current !== process.owner.sessionId || !sameSessionOwner(view, process.owner) ||
+      !store.getState().timeline.some((item) => sameTurnProcess(item.retainedProcess, process))) return;
+    // Prompt preflight can advance the raw snapshot before the visible state.
+    // A stable operation still identifies that same completed turn at expiry.
+    const turn = view.collapsedTurns?.find((turn) => process.operationId != null
+      ? (turn.operationId ?? turn.outcomes.at(-1)?.operationId) === process.operationId
+      : turn.turnId === process.turnId && turn.historyRevision === process.historyRevision);
+    if (!turn?.processIncluded || turn.visibleRanges == null) return;
+    let released = releasedFor(view);
+    if (released == null) {
+      released = { owner: process.owner, navigation: navigationRef.current, operations: new Set(), turns: new Map() };
+      releasedProcessesRef.current = released;
+    }
+    if (process.operationId != null) released.operations.add(process.operationId);
+    released.turns.set(process.turnId, process.historyRevision);
+    // The reducer releases this turn from both the view and its projection.
+    dispatch({ type: "session/release_turn_process", process });
+  }, [releasedFor]);
+
+  const readThreadForExport = useCallback(async () => {
+    if (!store.getState().timeline.some((item) => item.deferredProcess != null) &&
+      !containsHostedAttachment(store.getState().timeline)) return store.getState();
+    const currentView = store.getState().sessionView;
+    const owner = currentView == null ? undefined : sessionIdentity(currentView);
+    if (owner == null) return undefined;
+    const navigation = navigationRef.current;
+    try {
+      const view = await requestJson<BridgeSessionView>(
+        `/api/v1/sessions/${encodeURIComponent(owner.sessionId)}${sessionCwdQuery(undefined, false, owner)}&includeAttachmentContent=true`,
+      );
+      if (navigationRef.current !== navigation || !sameSessionOwner(view, owner) ||
+        !sameSessionOwner(store.getState().sessionView, owner)) return undefined;
+      // Export requests a complete snapshot explicitly; it never expands the
+      // visible timeline or replaces a newer live revision.
+      return appReducer(store.getState(), { type: "bridge/session_hydrate", view });
+    } catch (error) {
+      if (navigationRef.current === navigation && sameSessionOwner(store.getState().sessionView, owner)) reportError(error);
+      return undefined;
+    }
+  }, [reportError]);
+
+  return {
+    state,
+    sessionOpening,
+    retrySessionOpening,
+    reconnect,
+    authenticate,
+    writeAuthTerminal,
+    resizeAuthTerminal,
+    cancelAuthTerminal,
+    dismissAuthTerminal,
+    logout,
+    prompt,
+    cancel,
+    setMode,
+    setConfig,
+    respondPermission,
+    respondElicitation,
+    dismissExternalFlow,
+    newSession,
+    listSessions,
+    attachSession,
+    projectCwd,
+    openProject,
+    goHome: returnHome,
+    forkSession,
+    closeSession,
+    deleteSession,
+    searchWorkspaceContext,
+    readWorkspaceContext,
+    loadTurnProcess,
+    releaseTurnProcess,
+    readThreadForExport,
+  };
+}
+
+function sessionIdentity(owner: SessionOwner): SessionOwner {
+  return { bridgeEpoch: owner.bridgeEpoch, sessionId: owner.sessionId, sessionIncarnation: owner.sessionIncarnation };
+}
+
+function sessionCwdQuery(cwd: string | null | undefined, canLoad: boolean | undefined, owner?: SessionOwner, compact = false, includeProcessFrom?: string, excludedOperations?: ReadonlySet<string>): string {
+  const query = new URLSearchParams();
+  if (compact) query.set("presentation", "compact");
+  if (canLoad === true && cwd != null) query.set("cwd", cwd);
+  if (owner != null) {
+    query.set("expectedEpoch", owner.bridgeEpoch);
+    query.set("expectedIncarnation", String(owner.sessionIncarnation));
+  }
+  if (compact && owner != null && includeProcessFrom != null) query.set("includeProcessFrom", includeProcessFrom);
+  if (compact && owner != null && excludedOperations?.size) query.set("excludeProcessFor", JSON.stringify([...excludedOperations]));
+  return query.size === 0 ? "" : `?${query}`;
+}
+
+function mergeTerminalSnapshot(
+  previous: TerminalSnapshot | undefined,
+  incoming: TerminalSnapshot,
+): TerminalSnapshot {
+  const appended = terminalOutputBytes(incoming);
+  let bytes = appended;
+  if (incoming.outputAppend && previous != null) {
+    const prefix = terminalOutputBytes(previous);
+    bytes = new Uint8Array(prefix.length + appended.length);
+    bytes.set(prefix);
+    bytes.set(appended, prefix.length);
+  }
+  let start = incoming.retainedBytes == null ? 0 : Math.max(0, bytes.length - incoming.retainedBytes);
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+  bytes = bytes.subarray(start);
+  // Keep the original bytes: a read can end in the middle of a UTF-8 character.
+  const output = new TextDecoder().decode(bytes, {
+    stream: incoming.exitStatus == null && !incoming.released,
+  });
+  const parts: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 16_384) {
+    parts.push(String.fromCharCode(...bytes.subarray(offset, offset + 16_384)));
+  }
+  return {
+    ...incoming,
+    output,
+    outputBytes: btoa(parts.join("")),
+    outputAppend: false,
+    retainedBytes: bytes.length,
+  };
+}
+
+function terminalOutputBytes(snapshot: TerminalSnapshot): Uint8Array {
+  return snapshot.outputBytes == null
+    ? new TextEncoder().encode(snapshot.output)
+    : Uint8Array.from(atob(snapshot.outputBytes), (character) => character.charCodeAt(0));
+}
+
+/** The view advanced to a turn outcome, or `undefined` when it must be refetched. */
+function sessionViewAtTurnOutcome(
+  current: BridgeSessionView | undefined,
+  event: Extract<SessionBusinessEvent, {
+    type: "bridge/session_turn_complete" | "bridge/session_turn_failed";
+  }>,
+): BridgeSessionView | undefined {
+  if (
+    current == null || current.sessionId !== event.sessionId ||
+    current.bridgeEpoch !== event.bridgeEpoch ||
+    current.sessionIncarnation !== event.sessionIncarnation ||
+    (current.activeTurn != null &&
+      current.activeTurn.operationId !== event.operationId &&
+      current.activeTurn.clientIntentId !== event.clientIntentId) ||
+    event.viewRevision < current.viewRevision
+  ) return undefined;
+  return {
+    ...current,
+    viewRevision: event.viewRevision,
+    historyRevision: event.historyRevision,
+    phase: event.phase,
+    activeTurn: event.phase === "ready" ? null : current.activeTurn,
+  };
+}
+
+function clearMatchingPromptAdmission(
+  admissions: Map<string, { requestId: string }>,
+  event: Extract<SessionBusinessEvent, {
+    type: "bridge/session_turn_complete" | "bridge/session_turn_failed";
+  }>,
+): void {
+  if (admissions.get(event.sessionId)?.requestId === event.clientIntentId) {
+    admissions.delete(event.sessionId);
+  }
+}
+
+function setRoute(path: string, replace = false): void {
+  if (window.location.pathname === path && !window.location.search && !window.location.hash) return;
+  if (replace) window.history.replaceState(null, "", path);
+  else window.history.pushState(null, "", path);
+}
+
+function isMissingSession(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404 &&
+    isRecord(error.body) && error.body.code === "session_not_found";
+}
+
+function isRetiredSession(error: unknown, owner?: SessionOwner, code = "session_retired"): boolean {
+  return error instanceof ApiError && error.status === 409 && isRecord(error.body) &&
+    error.body.code === code && owner != null &&
+    error.body.sessionId === owner.sessionId && error.body.bridgeEpoch === owner.bridgeEpoch &&
+    error.body.sessionIncarnation === owner.sessionIncarnation;
+}
+
+function isCatalogChanged(error: unknown): boolean {
+  return error instanceof ApiError && isRecord(error.body) &&
+    isRecord(error.body.data) && error.body.data.kind === "session_catalog_changed";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

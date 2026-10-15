@@ -41,6 +41,7 @@ const terminalAuthFile = process.env.ATTYD_FAKE_AUTH_FILE;
 const disconnectCancelFile = process.env.ATTYD_FAKE_DISCONNECT_CANCEL_FILE;
 const processMarkerFile = process.env.ATTYD_FAKE_PROCESS_MARKER_FILE;
 const turnCollapseGate = process.env.ATTYD_FAKE_TURN_COLLAPSE_GATE;
+const turnEndGate = process.env.ATTYD_FAKE_TURN_END_GATE;
 const turnDesign = process.env.ATTYD_FAKE_TURN_DESIGN === "1";
 // A JSON array that replaces the advertised authentication methods.
 const authMethodsOverride = process.env.ATTYD_FAKE_AUTH_METHODS;
@@ -283,6 +284,15 @@ const agent = acp
     }
     if (failLoadAlways) {
       throw acp.RequestError.invalidParams(undefined, "Synthetic deterministic load failure");
+    }
+    // A held session's v2 title comes from its notifications, not session/list.
+    const title = params.sessionId === "saved-session" ? "Saved ACP session"
+      : params.sessionId === "earlier-session" ? "Earlier Agent thread" : undefined;
+    if (title != null) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "session_info_update", title },
+      });
     }
     if (invalidLoadModeOnce && loadAttempts === 1) {
       await client.notify(acp.methods.client.session.update, {
@@ -564,7 +574,9 @@ const agent = acp
       observedMcpNotifications.push(params);
     },
   )
-  .onRequest(acp.methods.agent.session.prompt, async ({ params, client, requestId }) => {
+  // `holdTurnEnd` lets a browser test inspect a turn's process before the turn
+  // ends; protocol v2 removes the process when the turn commits.
+  .onRequest(acp.methods.agent.session.prompt, async (context) => holdTurnEnd(context.params, await (async ({ params, client, requestId }: typeof context) => {
     const promptText = params.prompt
       .filter((block) => block.type === "text")
       .map((block) => block.text)
@@ -2016,6 +2028,7 @@ const agent = acp
           rawOutput: { ...output, exitStatus },
         },
       });
+      await holdPoint(params, "hold-release");
       await client.request(acp.methods.client.terminal.release, {
         sessionId: params.sessionId,
         terminalId: terminal.terminalId,
@@ -2421,7 +2434,7 @@ const agent = acp
       },
     });
     return { stopReason: "end_turn" };
-  })
+  })(context)))
   .onNotification(acp.methods.agent.session.cancel, () => {
     if (disconnectCancelFile) writeFileSync(disconnectCancelFile, "cancel\n");
     finishDisconnectPrompt?.();
@@ -2434,6 +2447,28 @@ const stream = acp.ndJsonStream(
 );
 const connection = agent.connect(stream);
 await connection.closed;
+
+// A prompt whose text contains `[<tag>:<name>]` stops at that point until the
+// test writes `<ATTYD_FAKE_TURN_END_GATE>/<name>`; the Agent writes
+// `<name>.reached` when it arrives. `hold` is the end of the turn;
+// `hold-release` is right before a flow releases its terminal.
+async function holdPoint(params: acp.PromptRequest, tag: "hold" | "hold-release"): Promise<void> {
+  const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+  const name = new RegExp(`\\[${tag}:([\\w-]+)\\]`, "u").exec(text)?.[1];
+  if (name == null) return;
+  if (turnEndGate == null) throw new Error(`[${tag}:…] prompts require ATTYD_FAKE_TURN_END_GATE`);
+  writeFileSync(join(turnEndGate, `${name}.reached`), "");
+  const deadline = Date.now() + 30_000;
+  while (!existsSync(join(turnEndGate, name))) {
+    if (Date.now() >= deadline) throw new Error(`Timed out holding ${tag} ${name}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function holdTurnEnd<T>(params: acp.PromptRequest, result: T): Promise<T> {
+  await holdPoint(params, "hold");
+  return result;
+}
 
 function requireAuthentication(): void {
   if (!authenticated) {

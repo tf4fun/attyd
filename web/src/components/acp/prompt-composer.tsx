@@ -1,4 +1,6 @@
-import type { AvailableCommand, ContentBlock, PromptCapabilities } from "@agentclientprotocol/sdk";
+import type { AvailableCommand, PromptCapabilities } from "@agentclientprotocol/sdk";
+import type { PromptBlock } from "../../../../shared/protocol";
+import { useAttachedBlock } from "../../lib/attachments";
 import {
   AtSign,
   CornerDownLeft,
@@ -40,12 +42,12 @@ import { ContextUsage, type ContextUsageValue } from "./context-usage";
 
 export interface ComposerDraft {
   id: string;
-  blocks: ContentBlock[];
+  blocks: PromptBlock[];
 }
 
 interface RestoredPromptPart {
   id: string;
-  block: ContentBlock;
+  block: PromptBlock;
   placeholder?: boolean;
 }
 
@@ -91,11 +93,11 @@ export function PromptComposer({
     onReconnect: () => void;
   };
   draft?: ComposerDraft;
-  history?: ContentBlock[][];
+  history?: PromptBlock[][];
   onSubmit: (
     text: string,
-    attachments: ContentBlock[],
-    restoredBlocks?: ContentBlock[],
+    attachments: PromptBlock[],
+    restoredBlocks?: PromptBlock[],
   ) => boolean | void;
   onCancel: () => void;
   onNavigateThread?: (target: ThreadNavigationTarget) => void;
@@ -133,7 +135,7 @@ export function PromptComposer({
   const historyScratch = useRef<{
     value: string;
     attachments: PromptAttachment[];
-    blocks?: ContentBlock[];
+    blocks?: PromptBlock[];
   } | undefined>(undefined);
   const restoredPartsRef = useRef<RestoredPromptPart[] | undefined>(undefined);
   const focusedPartId = useRef<string | undefined>(undefined);
@@ -210,7 +212,7 @@ export function PromptComposer({
   const restoreComposer = (
     restoredValue: string,
     restoredAttachments: PromptAttachment[],
-    restoredBlocks?: ContentBlock[],
+    restoredBlocks?: PromptBlock[],
   ) => {
     let attachmentIndex = 0;
     const parts: RestoredPromptPart[] | undefined = restoredBlocks?.map((block) => ({
@@ -235,9 +237,9 @@ export function PromptComposer({
     restoredCaret.current = restoredValue.length;
   };
 
-  const restoreBlocks = (blocks: ContentBlock[]) => {
+  const restoreBlocks = (blocks: PromptBlock[]) => {
     const restoredText = blocks
-      .find((block): block is Extract<ContentBlock, { type: "text" }> => block.type === "text")?.text ?? "";
+      .find((block): block is Extract<PromptBlock, { type: "text" }> => block.type === "text")?.text ?? "";
     const restoredAttachments = blocks
       .filter((block) => block.type !== "text")
       .map((block, index) => promptAttachment(block, index));
@@ -626,7 +628,9 @@ export function PromptComposer({
   const renderAttachment = (attachment: PromptAttachment) => (
     <span key={attachment.id}>
       <AttachmentIcon block={attachment.block} />
-      <span>{attachment.name}</span>
+      <span>{attachment.block.type === "attachment"
+        ? <ReferencedName reference={attachment.block} fallback={attachment.name} />
+        : attachment.name}</span>
       <small>{attachmentLabel(attachment)}</small>
       <button
         type="button"
@@ -933,29 +937,39 @@ function formatBytes(value: number): string {
       });
 }
 
-function AttachmentIcon({ block }: { block: ContentBlock }) {
+function AttachmentIcon({ block }: { block: PromptBlock }) {
   switch (block.type) {
     case "image": return <ImageIcon size={12} />;
     case "audio": return <Music2 size={12} />;
     case "resource": return <FileText size={12} />;
     case "resource_link": return <Link2 size={12} />;
     case "text": return <File size={12} />;
+    case "attachment":
+      return block.block === "image" ? <ImageIcon size={12} />
+        : block.block === "audio" ? <Music2 size={12} /> : <FileText size={12} />;
   }
 }
 
+/** The name of a session attachment a restored prompt names by reference. */
+function ReferencedName({ reference, fallback }: {
+  reference: Extract<PromptBlock, { type: "attachment" }>;
+  fallback: string;
+}) {
+  const block = useAttachedBlock(reference);
+  const uri = block == null ? undefined : block.type === "resource" ? block.resource.uri : block.type === "image" ? block.uri : undefined;
+  return <>{uri ?? fallback}</>;
+}
+
 function attachmentLabel(attachment: PromptAttachment): string {
-  const kind = attachment.block.type === "resource_link"
-    ? "link"
-    : attachment.block.type === "resource"
-      ? "context"
-      : attachment.block.type;
+  const type = attachment.block.type === "attachment" ? attachment.block.block : attachment.block.type;
+  const kind = type === "resource_link" ? "link" : type === "resource" ? "context" : type;
   const label = i18n.t(`attachments.kind.${kind}`, { ns: "conversation" });
   return attachment.size
     ? i18n.t("attachments.description", { ns: "conversation", kind: label, size: formatBytes(attachment.size) })
     : label;
 }
 
-function promptAttachment(block: Exclude<ContentBlock, { type: "text" }>, index: number): PromptAttachment {
+function promptAttachment(block: Exclude<PromptBlock, { type: "text" }>, index: number): PromptAttachment {
   switch (block.type) {
     case "image":
       return { id: `draft:${index}`, name: block.uri ?? block.mimeType, size: decodedSize(block.data), block };
@@ -963,6 +977,8 @@ function promptAttachment(block: Exclude<ContentBlock, { type: "text" }>, index:
       return { id: `draft:${index}`, name: block.mimeType, size: decodedSize(block.data), block };
     case "resource_link":
       return { id: `draft:${index}`, name: block.title ?? block.name, size: block.size ?? 0, block };
+    case "attachment":
+      return { id: `draft:${index}`, name: block.uri ?? block.mimeType ?? block.block, size: 0, block };
     case "resource": {
       const size = "text" in block.resource
         ? new TextEncoder().encode(block.resource.text).byteLength

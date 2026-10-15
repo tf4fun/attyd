@@ -154,6 +154,11 @@
     "stoppedSignal": "已停止（{{signal}}）"
   },
   "content": {
+    "attachmentKind": {
+      "image": "图片",
+      "audio": "音频",
+      "resource": "上下文"
+    },
     "expandText": "展开全文",
     "collapseText": "收起全文",
     "annotations": "ACP 内容注解",
@@ -212,5 +217,10 @@
     "tokens_one": "{{value}} 个词元",
     "tokens_other": "{{value}} 个词元",
     "reportedBy": "由 Agent 通过 ACP <code>usage_update</code> 报告。"
+  },
+  "interaction": {
+    "waitingOthers": "回答已保存，将与其他待处理请求一起发送。",
+    "uncertain": "回答可能已送达 Agent，结果未知，不会再次发送。",
+    "refused": "回答被拒绝：{{message}}"
   }
 }

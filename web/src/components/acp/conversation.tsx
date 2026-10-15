@@ -15,7 +15,7 @@ import {
   TextSelect,
   UserRound,
 } from "lucide-react";
-import type { ContentBlock } from "@agentclientprotocol/sdk";
+import type { PromptBlock } from "../../../../shared/protocol";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import i18n, { useTranslation } from "../../i18n";
@@ -60,8 +60,8 @@ export function Conversation({
   timeline: TimelineItem[];
   terminalSnapshots?: TerminalSnapshot[];
   canReusePrompt?: boolean;
-  onReusePrompt?: (blocks: ContentBlock[]) => void;
-  onRetryPrompt?: (blocks: ContentBlock[]) => void;
+  onReusePrompt?: (blocks: PromptBlock[]) => void;
+  onRetryPrompt?: (blocks: PromptBlock[]) => void;
   agentActivity?: AgentActivity;
   onNavigateThread?: (target: "top" | "bottom") => void;
   onOpenThreadMarkdown?: () => void;
@@ -418,8 +418,8 @@ function TimelineEntry({
   item: TimelineItem;
   terminalSnapshots: TerminalSnapshot[];
   canReusePrompt: boolean;
-  onReusePrompt?: (blocks: ContentBlock[]) => void;
-  onRetryPrompt?: (blocks: ContentBlock[]) => void;
+  onReusePrompt?: (blocks: PromptBlock[]) => void;
+  onRetryPrompt?: (blocks: PromptBlock[]) => void;
   agentActivity?: AgentActivity;
   onNavigateThread?: (target: "top" | "bottom") => void;
   onOpenThreadMarkdown?: () => void;
@@ -514,8 +514,8 @@ function ErrorCard({
 }: {
   item: Extract<TimelineItem, { type: "error" }>;
   canRetry: boolean;
-  onEdit?: (blocks: ContentBlock[]) => void;
-  onRetry?: (blocks: ContentBlock[]) => void;
+  onEdit?: (blocks: PromptBlock[]) => void;
+  onRetry?: (blocks: PromptBlock[]) => void;
 }) {
   const { t } = useTranslation("conversation");
   const retryable = item.retryBlocks != null && item.retryBlocks.length > 0;
@@ -573,7 +573,7 @@ function MessageEntry({
 }: {
   item: Extract<TimelineItem, { type: "message" }>;
   canReusePrompt: boolean;
-  onReusePrompt?: (blocks: ContentBlock[]) => void;
+  onReusePrompt?: (blocks: PromptBlock[]) => void;
 }) {
   const { t } = useTranslation("conversation");
   const isProtocolUser = item.role === "protocol-user";
@@ -790,7 +790,7 @@ function AssistantChunk({
   copyableBlocks,
 }: {
   item: AssistantMessageChunk;
-  copyableBlocks?: ContentBlock[];
+  copyableBlocks?: PromptBlock[];
 }) {
   const { t } = useTranslation("conversation");
   return (
@@ -939,7 +939,7 @@ function MessageMeta({
   );
 }
 
-async function copyBlocks(blocks: ContentBlock[]): Promise<void> {
+async function copyBlocks(blocks: PromptBlock[]): Promise<void> {
   return copyText(contentBlocksToMarkdown(blocks));
 }
 

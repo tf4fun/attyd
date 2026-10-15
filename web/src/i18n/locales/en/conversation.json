@@ -152,6 +152,7 @@
     "history_other": "{{index}} of {{count, number}} previous prompts"
   },
   "markdown": {
+    "attachment": "Attachment · {{details}}",
     "metadata": {
       "agent": "Agent: {{name}}",
       "session": "Session: {{id}}",

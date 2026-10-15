@@ -1,5 +1,5 @@
 import type { TFunction } from "i18next";
-import type { ToolCall, ToolCallContent, ToolKind } from "@agentclientprotocol/sdk";
+import type { ToolCall, ToolKind } from "@agentclientprotocol/sdk";
 import {
   Check,
   ChevronRight,
@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "../../i18n";
-import type { TimelineItem } from "../../lib/state";
+import type { TimelineItem, ViewToolCallContent } from "../../lib/state";
 import type { TerminalSnapshot } from "../../../../shared/bridge";
 import { ContentBlockView } from "./content-block";
 import { DebugInfoButton, DebugInfoPanel, StructuredData } from "./debug-info";
@@ -59,7 +59,7 @@ export function ToolCallCard({
   const content = call.content ?? [];
   const visibleContent = visibleToolContents(content);
   const annotations = content.flatMap((item, index) =>
-    item.type === "content" && item.content.annotations
+    item.type === "content" && "annotations" in item.content && item.content.annotations
       ? [{ index, ...item.content.annotations }]
       : []
   );
@@ -214,7 +214,7 @@ function ToolStatus({ status }: { status: ToolCall["status"] | "cancelled" }) {
   );
 }
 
-export function visibleToolContents(content: ToolCallContent[]) {
+export function visibleToolContents(content: ViewToolCallContent[]) {
   return content.flatMap((item, index) =>
     item.type === "content" && item.content.type === "text" && item.content.text.trim().length === 0
       ? []
@@ -226,7 +226,7 @@ export function ToolContentView({
   content,
   terminalSnapshots,
 }: {
-  content: ToolCallContent;
+  content: ViewToolCallContent;
   terminalSnapshots: TerminalSnapshot[];
 }) {
   const { t } = useTranslation("cards");

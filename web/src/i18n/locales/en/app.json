@@ -78,7 +78,9 @@
     "repeatedCursor": "Agent session list repeated a cursor",
     "searchNotReady": "Wait for an active ACP session before searching workspace context",
     "contextNotReady": "Wait for an active ACP session before adding workspace context",
-    "promptNotReady": "The ACP session is not ready to accept this prompt"
+    "promptNotReady": "The ACP session is not ready to accept this prompt",
+    "uncertainWrite": "The {{operation}} request may have taken effect; its response was lost and it is not sent again.",
+    "refused": "The {{operation}} request was refused: {{message}}"
   },
   "historyNotices": {
     "resumePartial": "Only context received while resuming is available; earlier history may be missing.",
@@ -94,5 +96,6 @@
     "light": "Light",
     "dark": "Dark",
     "localNotice": "Preferences are saved in this browser."
-  }
+  },
+  "sessionTerminals": "Agent terminals"
 }

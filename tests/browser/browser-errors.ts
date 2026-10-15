@@ -2,6 +2,9 @@ import type { Page } from "@playwright/test";
 
 export type ExpectedHttpError = number | { status: number; pathname: string };
 
+// The v1 UI's first retained-view probe could miss before directory discovery.
+// The v2 UI sends no such read, so `collectBrowserErrors` no longer excuses it;
+// the classifier stays for its unit tests until v1 is removed (step 8).
 export function isExpectedRetainedViewMiss(text: string, location: string, pageUrl: string): boolean {
   const resource = URL.canParse(location) ? new URL(location) : undefined;
   return text.startsWith("Failed to load resource: the server responded with a status of 404 (") &&
@@ -24,9 +27,6 @@ export function collectBrowserErrors(page: Page, expectedHttpErrors: ExpectedHtt
   page.on("console", (message) => {
     if (message.type() !== "error") return;
     const text = message.text();
-    // The first retained-view probe may miss before directory discovery. Its
-    // display projection does not change that; cwd/owner/resource errors do.
-    if (isExpectedRetainedViewMiss(text, message.location().url, page.url())) return;
     if (isExpectedHttpError(text, message.location().url, page.url(), expectedHttpErrors)) return;
     errors.push(text);
   });

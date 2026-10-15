@@ -169,6 +169,13 @@
     "sendNow": "Send now",
     "removeLabel": "Remove queued message {{index}}",
     "removeTitle": "Remove queued message",
-    "remove": "Remove"
+    "remove": "Remove",
+    "sending": "Sending",
+    "refused": "Refused ({{message}}); sent again when the turn ends",
+    "uncertain": "The outcome is unknown: this message may have reached the Agent. It is not sent again automatically.",
+    "resend": "Send again",
+    "resendLabel": "Send message {{index}} again",
+    "dismiss": "Dismiss",
+    "dismissLabel": "Dismiss message {{index}}"
   }
 }

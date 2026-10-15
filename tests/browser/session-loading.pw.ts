@@ -24,7 +24,8 @@ for (const theme of ["light", "dark"] as const) {
       }, theme);
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
-      await page.route("**/api/v1/sessions/lazy-process-session?*", async (route) => {
+      // The subscription starts the load (S6); holding it holds the load.
+      await page.route(isSessionStream, async (route) => {
         await gate;
         await route.continue();
       });
@@ -57,27 +58,40 @@ for (const theme of ["light", "dark"] as const) {
   }
 }
 
-test("replaces loading with a timeout message and manually retries the session read", async ({ page }) => {
+test("replaces loading with the load failure and subscribes again on manual retry", async ({ page }) => {
+  let subscriptions = 0;
   let fail = true;
-  let reads = 0;
-  await page.route("**/api/v1/sessions/lazy-process-session?*", async (route) => {
-    reads += 1;
+  await page.route(isSessionStream, async (route) => {
+    subscriptions += 1;
     if (fail) {
-      await route.fulfill({ status: 504, contentType: "application/json", body: JSON.stringify({
-        code: "request_timeout", timeoutMs: 30000,
-      }) });
+      // The load ends the scope with `load_failed` (protocol §5.2).
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+        body: `data: ${JSON.stringify({
+          scope: SCOPE,
+          end: { reason: "load_failed", error: { code: "agent_error", message: "Synthetic load failure" } },
+        })}\n\n`,
+      });
     } else await route.continue();
   });
   await page.goto("/sessions/lazy-process-session");
   const opening = page.locator(".session-opening-panel");
-  await expect(opening.getByRole("alert")).toContainText("timed out");
+  await expect(opening.getByRole("alert")).toContainText("Synthetic load failure");
   await expect(opening.locator('[aria-busy="false"]')).toBeVisible();
   await expect(opening.getByRole("status")).toHaveCount(0);
   await expect(opening.locator(".skeleton")).toHaveCount(0);
-  const readsBeforeRetry = reads;
+  const before = subscriptions;
+  expect(before).toBeGreaterThan(0);
   fail = false;
   await opening.getByRole("button", { name: "Retry loading", exact: true }).click();
   await expect(page.getByText("The final answer is available without loading execution details.", { exact: true })).toBeVisible();
-  expect(reads).toBeGreaterThan(readsBeforeRetry);
+  expect(subscriptions).toBe(before + 1);
   await expect(opening).toHaveCount(0);
 });
+
+const SCOPE = "session/lazy-process-session";
+
+function isSessionStream(url: URL): boolean {
+  return url.pathname === "/api/v2/stream" && url.searchParams.getAll("scope").includes(SCOPE);
+}

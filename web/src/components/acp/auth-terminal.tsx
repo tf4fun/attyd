@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { RotateCcw, SquareTerminal, X } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 import { useTranslation } from "../../i18n";
 import type { AuthTerminalState } from "../../lib/state";
 
@@ -26,6 +26,8 @@ export function AuthTerminalCard({
   onDismiss: () => void;
 }) {
   const { t } = useTranslation("workspace");
+  // Several login terminals may be shown at once (protocol §4.6).
+  const headingId = useId();
   const host = useRef<HTMLDivElement>(null);
   const xterm = useRef<Terminal | undefined>(undefined);
   const writtenOutput = useRef("");
@@ -133,12 +135,12 @@ export function AuthTerminalCard({
   }, [active]);
 
   return (
-    <section className="auth-terminal-card" aria-labelledby="auth-terminal-heading">
+    <section className="auth-terminal-card" aria-labelledby={headingId}>
       <header>
         <span className="auth-terminal-mark"><SquareTerminal size={15} /></span>
         <div>
           <span className="eyebrow">{t("terminal.title")}</span>
-          <h2 id="auth-terminal-heading">{method.name}</h2>
+          <h2 id={headingId}>{method.name}</h2>
         </div>
         <span className={`auth-terminal-status status-${terminalState.status}`} role="status">
           {terminalStatusLabel(terminalState.status, t)}
