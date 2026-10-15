@@ -5,6 +5,7 @@
 //! Agent over the WebSocket transport, so each Agent connection is a real ACP
 //! connection the test answers. Requests go through a hyper client.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::http::Method;
 use clap::Parser;
@@ -278,16 +279,30 @@ impl Server {
     }
 
     async fn create(&self, link: &mut Link, session_id: &str) {
-        let hub = self.hub.clone();
+        let (_, global) = self.read("global").await;
+        let body = json!({
+            "expect": global["live"]["op"]["id"], "kind": "create", "args": {"cwd": CWD},
+        });
+        let address = self.address;
         let created = tokio::spawn(async move {
-            hub.business_request(json!({
-                "type": "session/new", "requestId": "new", "cwd": CWD,
-            }))
+            send(
+                address,
+                Method::POST,
+                "/api/v2/scopes/global/ops",
+                Some(body),
+            )
             .await
         });
         let new = link.request("session/new").await;
         link.reply(&new, json!({"sessionId": session_id})).await;
-        created.await.unwrap().unwrap();
+        let created = created.await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = json_of(created).await;
+        assert_eq!(
+            created["result"],
+            json!({"sessionId": session_id}),
+            "{created}"
+        );
     }
 }
 
@@ -869,31 +884,22 @@ async fn resumes_on_the_same_stream(replay: Vec<Value>, next_replay: Vec<Value>,
     assert_eq!(server.agents.accepted(), 2);
 }
 
-/// The next v1 event's data.
-async fn v1_event(events: &mut Sse) -> Value {
-    loop {
-        let message = events
-            .message(WAIT)
+/// The JSON body of a response.
+async fn json_of(response: Response<hyper::body::Incoming>) -> Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
             .await
-            .expect("the v1 stream sent no event");
-        let data: Vec<&str> = message
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect();
-        if !data.is_empty() {
-            return serde_json::from_str(&data.join("\n")).unwrap();
-        }
-    }
+            .unwrap(),
+    )
+    .unwrap()
 }
 
-/// Runs a real terminal login to success. Before step 6 the login starts
-/// through v1 and is not a v2 `terminal_login` operation, so its prompt and
-/// its exit are read from the v1 global events, opened while the connection
-/// runs and dropped once the login exited. The v2 stream alone then follows
-/// the next connection.
-async fn sign_in_through_v1(address: SocketAddr) {
-    let response = send(address, Method::GET, "/api/v1/events", None).await;
+/// Runs a real terminal login to success through a v2 `terminal_login`. Its
+/// prompt and its exit are read from a global stream of its own, opened
+/// while the connection runs and dropped once the login completed. The
+/// caller's stream alone then follows the next connection.
+async fn sign_in(address: SocketAddr) {
+    let response = send(address, Method::GET, "/api/v2/stream?scope=global", None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut events = Sse {
         body: Body::new(response.into_body()).into_data_stream(),
@@ -902,43 +908,47 @@ async fn sign_in_through_v1(address: SocketAddr) {
         aligned: BTreeSet::new(),
         ended: BTreeSet::new(),
     };
+    events.event().await;
+    let expect = events.replica("global").live["op"]["id"].clone();
     let started = send(
         address,
         Method::POST,
-        "/api/v1/auth/terminal",
-        Some(json!({"methodId": "terminal-login", "cols": 80, "rows": 24})),
+        "/api/v2/scopes/global/ops",
+        Some(json!({
+            "expect": expect,
+            "kind": "terminal_login",
+            "args": {"methodId": "terminal-login", "cols": 80, "rows": 24},
+        })),
     )
     .await;
     assert_eq!(started.status(), StatusCode::ACCEPTED);
-    let started: Value = serde_json::from_slice(
-        &axum::body::to_bytes(Body::new(started.into_body()), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let request_id = started["requestId"].as_str().unwrap().to_string();
+    let login = json_of(started).await["op"].as_str().unwrap().to_string();
     // Input waits for the prompt the login prints.
-    let mut output = String::new();
-    while !output.contains("Enter access code") {
-        let event = v1_event(&mut events).await;
-        if event["type"] == "bridge/auth_terminal_output" && event["requestId"] == request_id {
-            output.push_str(event["data"].as_str().unwrap());
-        }
+    let output = |events: &Sse| {
+        events.replica("global").live["terminals"][&login]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    while !output(&events).contains("Enter access code") {
+        events.event().await;
     }
     let input = send(
         address,
         Method::POST,
-        &format!("/api/v1/auth/terminal/{request_id}/input"),
+        &format!("/api/v2/scopes/global/resources/{login}/input"),
         Some(json!({"data": "open-sesame\r"})),
     )
     .await;
     assert!(input.status().is_success(), "{}", input.status());
     loop {
-        let event = v1_event(&mut events).await;
-        if event["type"] == "bridge/auth_terminal_exited" && event["requestId"] == request_id {
-            assert_eq!(event["status"], "succeeded", "{event}");
+        let op = events.replica("global").live["op"].clone();
+        if op["id"] == login.as_str() && op["status"] != "running" {
+            assert_eq!(op["status"], "completed", "{op}");
+            assert_eq!(op["result"], json!({"exitCode": 0, "signal": null}), "{op}");
             break;
         }
+        events.event().await;
     }
 }
 
@@ -1010,7 +1020,7 @@ async fn a_successful_terminal_login_starts_the_next_connection_for_a_global_onl
 
     // The login runs to success; then the old connection ends, and the next
     // one becomes ready on the same stream.
-    sign_in_through_v1(address).await;
+    sign_in(address).await;
     assert!(auth.exists(), "the login signed in");
     let mut ended = false;
     loop {
@@ -1434,7 +1444,7 @@ async fn a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing() 
         stream.event().await;
     }
 
-    sign_in_through_v1(address).await;
+    sign_in(address).await;
     let mut ended = false;
     loop {
         stream.event().await;
