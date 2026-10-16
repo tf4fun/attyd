@@ -1,8 +1,11 @@
 # ACP fidelity audit
 
-Status: draft for review, 2026-10-16 (#51). It audits the browser protocol as implemented
-on `main` (`a7eb3b4`, protocol revision 1) against the pinned ACP schema, and records
-the evidence for [protocol revision 2](protocol.md). **The runtime code is not
+Status: second draft for review, 2026-10-16 (#51). It audits the browser protocol as
+implemented on `main` (`a7eb3b4`, protocol revision 1) against the pinned ACP schema,
+and records the evidence for [protocol revision 2](protocol.md). Capabilities of the
+last release, v0.2.8, are compared separately in the
+[release parity matrix](release-parity.md); a released capability that `main` lost is a
+regression there (R1–R3), never a limitation here. **The runtime code is not
 migrated**: every finding below describes current behavior, and its target is a
 specification the code does not meet yet. The migration steps and their acceptance are
 in [state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2).
@@ -24,8 +27,9 @@ Classes:
 
 - **Defect**: the bridge drops, changes or misstates content that ACP gave, or breaks
   attyd's own stated contract (for example "carried verbatim").
-- **Limitation**: an attyd product rule that narrows what ACP allows. It is not an ACP
-  violation; each is either kept with a reason or scheduled.
+- **Limitation**: an attyd product rule that narrows what ACP allows and that v0.2.8
+  did not offer either. It is not an ACP violation; each is either kept with a reason
+  or scheduled.
 - **Boundary**: a deliberate product scope that stays (§4).
 - **Open**: the pinned schema does not settle the question; the draft states the rule
   it chose.
@@ -41,19 +45,22 @@ Classes:
 | D5 | Conversation updates outside a running prompt are accepted and dropped; an update to an entity of a committed turn has no projection, although validation keeps such entities across prompts. | `bridge.rs:2418–2424` → `session_mirror.rs:241–257` (`Ready => Ok(())`); `semantic.rs:40–46` ("compactions can continue outside a prompt's lifetime") | no schema rule ties `session/update` to a running prompt | the tail continues the last turn; an update to a settled entity changes its entry (§3.3) |
 | D6 | The hash chain covers `{prompt, reply}` text only, so two histories with different tool results, boundaries or metadata align as equal. | `canon.rs:463–470` (`chain` over `Turn`) | — (attyd's own alignment contract: a matched head means equal history) | the hash covers the whole published entry (§3.4) |
 | D7 | `_meta` is dropped at every level, also from the blocks the attachment table keeps, so an attachment read or a prompt that re-sends an attachment does not return the block as received. | `canon.rs:202–256`, `:269–283`; protocol r1 §1 "carried verbatim" | `_meta` is reserved for implementations (every type, e.g. `v1/tool_call.rs:79–88`). ACP does not oblige a client to relay it; dropping it breaks attyd's own "verbatim" contract | `_meta` and annotations carried; attachments kept as received (S8, §3.1) |
-| D8 | `terminal/release` removes the terminal and its output from `live`, also when a tool call embeds it. | `runtime_state.rs:1188–1190`; protocol r1 §4.6; `convergence_tests.rs:974`; `acp-ui.pw.ts:2564` | "After release, the `TerminalId` can no longer be used with other `terminal/*` methods, but tool calls that already contain it, continue to display its output." (`v1/client.rs:2621–2622`) | a frozen, `released` snapshot while content embeds it; not a holding need (§4.6, S6) |
+| D8 | `terminal/release` removes the terminal and its output from `live`, also when a tool call embeds it; the Agent connection's end removes every session terminal, also of a session whose log stays held. | `runtime_state.rs:1188–1190`; protocol r1 §4.6; `convergence_tests.rs:974`; `acp-ui.pw.ts:2564` | "After release, the `TerminalId` can no longer be used with other `terminal/*` methods, but tool calls that already contain it, continue to display its output." (`v1/client.rs:2621–2622`) | handle and output separated: the frozen output stays while content embeds it, through release and the connection's end; not a holding need (S7, §4.6) |
 | D9 | A resume-only session can be released; its next cold open resumes and turns the unknown log into a known empty one, so a client with an old head receives `from: 0, entries: []` and loses its history as if it were confirmed empty. Existing EOF tests cover only a held log. | `bridge/streams.rs:161–179` (resume counts as reattachable); `registry.rs:845–851` (`adopt_session_log`) | `session/resume` resumes "without returning previous messages" (`v1/agent.rs:1277`) | `history: "partial"`; the client may keep its earlier entries as unconfirmed UI state (§3.5) |
 | D10 | An answer must name exactly all pending interactions of the operation; the web client waits for drafts of all of them. Two pages answering two different interactions can never deliver. | `admission.rs:183–207`; `use-acp.ts:813–820`; protocol r1 §6.4 | each Agent request has its own response (JSON-RPC) | each interaction answered on its own, at most once (§7) |
-| D11 | An Agent request joins whatever operation runs in its scope, or starts an `agent_request`; the operation's end cancels it. A session-scoped elicitation that arrives during a `set_mode` is cancelled when the mode change ends. | protocol r1 §4.4, §6.2 "Agent requests"; state-sync §2.5 | an elicitation is scoped to a session (optionally a tool call) or to one JSON-RPC request (`v1/elicitation.rs:1484–1547`); only the permission rule ties requests to `session/cancel` (`v1/client.rs:2589–2590`). This is a product narrowing, not a wire violation | interactions are resources of their ACP scope; a request-scoped one has its operation as `parent` (§4.4) |
+| D11 | An Agent request joins whatever operation runs in its scope, or starts an `agent_request`; the operation's end cancels it. A session-scoped elicitation that arrives during a `set_mode` is cancelled when the mode change ends. | protocol r1 §4.4, §6.2 "Agent requests"; state-sync §2.5 | an elicitation is scoped to a session (optionally a tool call) or to one JSON-RPC request (`v1/elicitation.rs:1484–1547`); only the permission rule ties requests to `session/cancel` (`v1/client.rs:2589–2590`). This is a product narrowing, not a wire violation | interactions live by their ACP scope; a request-scoped one has the outstanding JSON-RPC request it names as `parent`, and an elicitation naming none is refused; interactions of a session being created move into it when it is installed (§4.4) |
 
 ## 3. Limitations
 
+The first draft listed controls during a prompt (L1) and the absence of an explicit
+close (L2) here. Both were released in v0.2.8, so they are regressions R1 and R2 of
+the [release parity matrix](release-parity.md#regressions), restored by actions
+(protocol §7); they are no longer limitations.
+
 | ID | Limitation | ACP basis | Decision in this draft |
 | --- | --- | --- | --- |
-| L1 | `set_mode` and `set_config` are refused while a prompt runs (S5: one operation per scope). | `session/set_mode` "can be called at any time … whether the Agent is idle or actively generating" (`v1/agent.rs:4898–4899`). The schema says nothing of the kind for `set_config_option`. | Kept for now and labeled as attyd's limit (§6.2). Lifting it needs a second slot or a non-occupying kind; that is a separate design step (state-sync §7, step 8). |
-| L2 | No explicit close; `session/close` is sent only on release, on a held delete, and on clean-up. | ACP defines the method, not a UI duty. | Kept. Release (S6) is the close path. |
 | L3 | A prompt's stop reason and usage were visible only on `op` until the next operation replaced it. | `PromptResponse` (`v1/agent.rs:3096–3118`) | Resolved by D4's target: `Turn.end` carries the response. |
-| L4 | A resume-only session is released like a loadable one, which loses the history the bridge held. | resume returns no messages (`v1/agent.rs:1277`) | Kept, made explicit by `history: "partial"` (D9). The alternative, keeping resume-only sessions held, trades memory for history and is open to review (redesign §12). |
+| L4 | A resume-only session is released like a loadable one, which loses the history the bridge held. | resume returns no messages (`v1/agent.rs:1277`) | Kept, as in v0.2.8, which released it too and showed a missing-history notice; `history: "partial"` makes it explicit (D9). Keeping such sessions held instead trades memory for history (redesign §12). |
 
 ## 4. Boundaries kept
 
@@ -73,11 +80,12 @@ These stay as they are; the audit does not widen the product:
 
 | ID | Question | Rule this draft chose |
 | --- | --- | --- |
-| Q1 | A chunk with `messageId` A after a message B: one message A continued, or a new one? | A new item with `messageId` A, after B: order is kept and the shared ID still says it is one ACP message (§3.2). |
-| Q2 | Does `session/cancel` end pending session-scoped elicitations? The schema states it only for permissions. | No; they end when answered, cancelled by the Agent, or with their scope (§4.4). |
-| Q3 | Does a legacy `plan` belong to the turn or to the session? The schema says only that each update replaces the plan. | Each turn keeps the plan's last state within it; the current plan is the last plan item. Nothing is lost and replacement holds (§3.2). |
+| Q1 | A chunk with `messageId` A after a message B, or after a tool: one message A continued, or a new one? | A new item with `messageId` A: the timeline keeps the order and the shared ID keeps the message's identity (§3.2, rule 1). In a replay, a user item that continues the turn's opening user message does not start a turn (§3.3). |
+| Q2 | Does `session/cancel` end pending session-scoped elicitations? The schema states it only for permissions. | No; they end when answered, cancelled by the Agent, or with their scope (§4.4). `session/close` ends the session, and with it all of them (§7). |
+| Q3 | Does a legacy `plan` belong to the turn or to the session? The schema says only that each update replaces the plan. | The schema gives it no ID, so each turn keeps a snapshot of its last state, as v0.2.8 did; the current plan is derived from the latest snapshot. A snapshot is a record, not the current entity, and no update reduces into an older one (§3.2). ID-addressed plans are session entities. |
 | Q4 | May a `tool_call_update` or compaction update arrive after the prompt's response? | Yes; the schema does not forbid it and the bridge's validation already keeps those entities. It changes the settled entry (§3.3). |
-| Q5 | Agent extension notifications (`_`-prefixed methods). | Unknown requests get `method_not_found` (`bridge/agent_dispatch.rs:209`), as JSON-RPC requires. Notifications: to be confirmed by a test in step 9. |
+| Q5 | Agent extension notifications (`_`-prefixed methods). | Unknown requests get `method_not_found` (`bridge/agent_dispatch.rs:209`), as JSON-RPC requires. Notifications: to be confirmed by a test in step 17. |
+| Q6 | A request-scoped elicitation whose `requestId` is `null`, or names a request that is not outstanding. The schema allows any `RequestId` (`rpc.rs:31–39`) and says only that the scope is "tied to a specific JSON-RPC request" (`v1/elicitation.rs:1539–1540`). | Refused with `invalid_params`, the two cases told apart in the error data; no interaction and no `global` fallback (§4.4). |
 
 ## 6. Version differences
 
@@ -106,21 +114,21 @@ revision 2 does not change the surface.
 | `session/resume` | `v1/agent.rs:1277`, `:4875–4880` | cold resume shows a known empty log (D9) | `history: "partial"` |
 | `session/fork` (unstable) | `v1/agent.rs:4863–4873` | conforming, with r1 log content | the fork's replay, else the source's log and status |
 | `session/list`, `session/delete` | `v1/agent.rs:4852–4861` | conforming | kept |
-| `session/close` | `v1/agent.rs:4882–4887` | sent on release and delete (L2) | kept |
-| `session/set_mode`, `session/set_config_option` | `v1/agent.rs:4889–4903` | conforming when idle; refused during a prompt (L1) | kept (L1 labeled) |
+| `session/close` | `v1/agent.rs:1432–1436`, `:4882–4887` | sent on release and delete only (R2) | also the `close` action, during a prompt too |
+| `session/set_mode`, `session/set_config_option` | `v1/agent.rs:4889–4903` | conforming when idle; refused during a prompt (R1) | actions, during a prompt too |
 | `session/prompt` | `v1/agent.rs:4905–4916` | result on `op` only; a failure drops output (D4) | `Turn.end`; every sent prompt settles |
 | `session/cancel` | `v1/agent.rs:5073–5084` | conforming; pending permissions answered `cancelled` | kept |
 | message and thought chunks | `v1/client.rs:100–105`, `:604–632` | text only, boundaries lost, thoughts dropped (D1–D3) | items with `messageId`, `_meta`, annotations |
-| `tool_call`, `tool_call_update` | `v1/tool_call.rs:29–88`, `:177–211` | folded while running, dropped after (D1) | items, upserted session-wide by `toolCallId` |
-| `plan`, `plan_update`, `plan_removed` | `v1/plan.rs:20–37`, `v1/client.rs:110–126` | per running turn, dropped after (D1) | items (Q3) |
+| `tool_call`, `tool_call_update` | `v1/tool_call.rs:29–88`, `:177–211`, `:295–296` | folded while running, dropped after (D1) | items, upserted session-wide by `toolCallId`; absent and `null` keep |
+| `plan`, `plan_update`, `plan_removed` | `v1/plan.rs:20–37`, `:79`, `:353`; `v1/client.rs:110–126` | per running turn, dropped after (D1) | ID plans: one item per `planId` in the session, removal in place; legacy: a snapshot per turn (Q3) |
 | `compaction_update`, `compaction_summary_chunk` (unstable) | `v1/client.rs:139–158`, `:210–299` | folded while running, dropped after; idle updates dropped (D1, D5) | items, upserted by `compactionId`, also outside prompts |
 | control updates (commands, mode, config, info, usage) | `v1/client.rs:127–138` | conforming, also when idle (§4.5) | kept |
 | `session/request_permission` | `v1/client.rs:2585–2593`, `:863–874` | joins the running op; group answers (D10, D11) | session interaction; its `toolCall` reduced into the timeline; answered alone |
-| `elicitation/create` (form, URL), `elicitation/complete` | `v1/elicitation.rs:1484–1547`; `v1/client.rs:2774–2777` | joins the running op (D11); URL flows conforming | interaction of its ACP scope; URL flows kept |
+| `elicitation/create` (form, URL), `elicitation/complete` | `v1/elicitation.rs:1484–1547`; `v1/client.rs:2774–2777` | joins the running op (D11); URL flows conforming | interaction of its ACP scope, parented by its JSON-RPC request (Q6); URL flows keep that scope |
 | `fs/read_text_file`, `fs/write_text_file` | `v1/client.rs` (client methods) | conforming (stdio) | kept |
 | `terminal/*` | `v1/client.rs:2594–2645`; `v1/tool_call.rs:575–582` | output removed on release (D8) | frozen snapshot while embedded |
 | `$/cancel_request` | `v1/protocol_level.rs:82` | conforming for fs, terminal wait, MCP and interactions | kept |
-| MCP over ACP (unstable) | `v1/client.rs:2778–2784` | conforming; not projected | kept |
+| MCP over ACP (unstable) | `v1/client.rs:2778–2784` | conforming; activity not projected (R3) | activity and connections in `global.live.diagnostics` (§4.7) |
 | extension methods | `v1/client.rs:2785–2792` | requests refused with `method_not_found`; notifications Q5 | kept |
 | `_meta` on any type | every type's `meta` field | dropped from log and attachments (D7) | carried |
 | NES, `document/*`, providers | unstable | not advertised (§4) | kept |

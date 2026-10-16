@@ -409,7 +409,8 @@ visibly in step 7.
 Status: **planned, not started.** [Protocol revision 2](protocol.md) changes what the
 documents carry, not how they are replicated: the commit step, the Hub, alignment,
 coalescing, admission and holding stay. The [audit](acp-fidelity-audit.md) lists the
-defects (D1–D11) each step removes. Each step is one PR, validated in CI, and lands
+defects (D1–D11) and the [release parity matrix](release-parity.md) the v0.2.8
+regressions (R1–R3) each step removes; every regression step is required. Each step is one PR, validated in CI, and lands
 with its acceptance cases ([redesign §11](client-api-redesign.md#11-acceptance)). Tests
 that assert revision 1's removals (`turn-collapse.pw.ts`, `lazy-process.pw.ts`, the
 release case in `acp-ui.pw.ts`, `terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release`,
@@ -422,10 +423,12 @@ the retained content instead; no other test is weakened.
   session updates and gives items, and the same function serves the tail, a settle
   point and a replay. The active-turn fold (`fold_shared_active_turn_update`) and the
   replay builder (`history_replay::HistoryBuilder`) already fold tool calls, plans and
-  text chunks; they become this reducer, with message boundaries by `messageId`,
-  session-wide entity lookup by `toolCallId` and `compactionId`, compaction patch
-  semantics, and `_meta` kept. An index from entity ID to its entry (or the tail)
-  makes a late update cheap to place.
+  text chunks; they become this reducer, implementing the three rules of protocol
+  §3.2 (identity, patch, fragments): message items by role and `messageId`, one item
+  per `toolCallId`, `planId` and `compactionId` in the session, `ToolCall::update` for
+  tool patches, the compaction's three-state patch, and chunks with their own `_meta`.
+  An index from entity ID to its entry (or the tail) makes a late update cheap to
+  place.
 - **Tail instead of process.** The running prompt's `SharedTurnUpdates` becomes the
   session's tail, which also exists between prompts. `project_session` projects it as
   `live.tail`; the identity diff that served `op.process` serves it.
@@ -438,11 +441,23 @@ the retained content instead; no other test is weakened.
   block; reference counting from the log and `live` is unchanged.
 - **Interactions.** Pending permissions and elicitations move from the operation slot
   to the scope's `live.interactions`, routed by their ACP scope (protocol §4.4). The
-  `answer` admission path becomes a resource action that resolves one interaction
-  under the bridge guard. `agent_request` and its completion rule go.
-- **Terminals.** A released session terminal keeps its frozen bounded output with
-  `released: true` while the reducer's index says an item embeds it; holding counts
-  only unreleased ones.
+  bridge notes each JSON-RPC request it sends, from send to response, with the scope
+  that shows its elicitations (an in-memory map, no record after the response); a
+  response ends the elicitations that name the request. Interactions of a session being created wait in the creating
+  operation's scope and move in the installing step. The `answer` admission path
+  becomes a resource action that resolves one interaction under the bridge guard.
+  `agent_request` and its completion rule go.
+- **Terminals.** The terminal service keeps the handle; the session document keeps
+  the frozen output with `released: true` while the reducer's index says an item
+  embeds it, also when the Agent connection ends for a session that stays held.
+  Holding counts only terminals with a handle.
+- **Actions.** `set_mode`, `set_config` and `close` leave the operation slot: they are
+  sent under the bridge guard without occupying the session, their HTTP response is
+  held until the Agent answers, and `close` sets `closing` until then. The v1 close
+  path of v0.2.8 (`close_session`) is the behavioral reference, not code to restore.
+- **Diagnostics.** The MCP relay and the Agent's stderr callback, which today are not
+  projected (stderr goes to the bridge log), write into `global.live.diagnostics` through the commit step, bounded as the
+  terminal tail is.
 - **History status.** `SessionLog::Known` carries `complete` or `partial`;
   `adopt_session_log` sets `partial` instead of building a known empty log.
 
@@ -453,20 +468,24 @@ request records or epochs.
 
 | Step | Work | Removes | Acceptance (redesign §11) |
 | --- | --- | --- | --- |
-| 10 | Docs: this revision, the audit, the coverage ledger | — | review |
-| 11 | Timeline reducer and entry shape: items, `end`, `_meta`, message boundaries, attachments as received, hash over the entry; live commits and replays through it; generated TypeScript; the web projection renders items from the log as it renders `op.process` today. Prompt `end` on completed and cancelled turns. | D1, D2, D3, D6, D7 | 1, 13, 19, 20, 25, 26, 27 |
+| 10 | Docs: this revision, the audit, the release parity matrix, the coverage ledger | — | review |
+| 11 | Timeline reducer and entry shape: items, `end`, `_meta`, message boundaries, attachments as received, hash over the entry; live commits and replays through it; generated TypeScript; the web projection renders items from the log as it renders `op.process` today. Prompt `end` on completed and cancelled turns. | D1, D2, D3, D6, D7 | 1, 13, 19, 20, 25, 26, 27, 30, 31 |
 | 12 | Settling of failed and interrupted prompts | D4 | 2, 22 |
 | 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |
 | 14 | History status `partial` for a cold resume; the client keeps a replaced log as unconfirmed UI state | D9 | 23 |
-| 15 | Released terminal snapshots and the holding change | D8 | 12, 24 |
+| 15 | Terminal handle and output separated: frozen output through release and the connection's end; the holding change | D8 | 12, 24 |
 | 16 | Interactions as scope resources with ACP lifecycles; per-interaction answers in bridge and client; `agent_request` removed | D10, D11 | 7, 8 |
 | 17 | Coverage ledger chains for the new paths; an extension-notification test (audit Q5) | — | the ledger's rows |
-| 18 | Optional, after a separate design review: controls during a prompt | L1 | — |
+| 18 | Actions: `set_mode`, `set_config` and `close` outside the operation slot, `closing`, `end: closed`; the client's controls enabled during a prompt and the close confirmation | R1, R2 | 18, 28, 29 |
+| 19 | `global.live.diagnostics`: Agent and MCP stderr, MCP-over-ACP connections and activity; the collapsible panels | R3 | 32 |
+| 20 | Markdown export over items, `end` and terminal snapshots; the browser cases of settled content and per-interaction answers | (D1, D4, D8 in the client) | 33, 34, 35 |
 
 Dependencies: 10 → 11 → 12 → 13; 14 and 15 after 11; 16 after 10 and independent of
-11–15; 17 after the step whose chain it records; 18 after 16. Each step leaves the
-product working: steps 11–15 only add content to documents the client already
-renders, and 16 changes one write and its client together.
+11–15; 17 after the step whose chain it records; 18 and 19 after 10 and independent of
+11–17; 20 after 12, 15 and 16. Each step leaves the product working: steps 11–15 only
+add content to documents the client already renders, 16 and 18 change one write and
+its client together, and 19 adds a `live` field. No step is optional: R1–R3 and the
+defects are closed only when their cases pass against the target.
 
 ### 7.3 Gates
 
@@ -477,4 +496,7 @@ renders, and 16 changes one write and its client together.
   entry, idle tail growth, and a coalesced rewrite.
 - **Browser**: completed, failed and reloaded turns show their tool cards, thoughts,
   plans and compactions collapsed by default and expandable; a released terminal's
-  output stays in its tool card.
+  output stays in its tool card; the v0.2.8 cases of live configuration and close
+  (`acp-ui.pw.ts` at the release, from line 2694) pass again.
+- **Release parity**: each row of the [matrix](release-parity.md) marked Regression
+  has a passing case; a test changed to assert a loss is changed back, not counted.

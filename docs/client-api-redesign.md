@@ -1,6 +1,6 @@
 # Client API redesign
 
-Status: **revision 2, draft for review, 2026-10-16 (#51)**; revision 1 was settled
+Status: **revision 2, second draft for review, 2026-10-16 (#51)**; revision 1 was settled
 in review on 2026-10-14 (sixth version) and is what `main` implements. §3 is the
 complete rule set; the later sections specify and derive from it. Revision 2 keeps
 revision 1's replication (alignment, admission, holding) and changes what the
@@ -8,7 +8,8 @@ documents carry: revision 1 kept only message text and removed a turn's process 
 it ended, which drops content ACP gave (the
 [ACP fidelity audit](acp-fidelity-audit.md)). **The runtime code is not migrated
 yet**; [state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2) is the
-plan. It replaces the earlier v2 draft of the client protocol and its replication
+plan. Revision 2 must also lose no capability of the last release, v0.2.8; the
+[release parity matrix](release-parity.md) is that check. It replaces the earlier v2 draft of the client protocol and its replication
 rules, and is specified normatively in [protocol.md](protocol.md). The review that led
 to revision 1 is recorded in [protocol-v2-review.md](protocol-v2-review.md) and in the
 comments of PR #35.
@@ -54,7 +55,7 @@ is the authority for clients; the ACP server is the authority behind it.
 
 The rules come in two groups: S1–S8 bind the bridge and the shape of the documents,
 and C1–C3 bind clients. Every behavior in §4–§8 follows from them; §3.3 lists the main
-derivations. Revision 2 rewrites S2 and S7, adds S8, and narrows S4–S6 (§3.4).
+derivations. Revision 2 rewrites S2, S4 and S7, adds S8, and narrows S5–S6 (§3.4).
 
 ### 3.1 Bridge rules
 
@@ -86,11 +87,16 @@ computed from it and names the position `(index, hash)` it follows. A client tha
 cannot apply a log change closes the stream and subscribes again with the head it
 holds.
 
-**S4 Operation.** Every write that starts bridge work is an operation of a scope.
-Every scope's `live` holds exactly one operation, `op = { id, kind, status, … }`. The
-bridge generates `id` at random and never reuses it. An operation's ID identifies it
-and is what writes are admitted against; it says nothing about what a replica has
-seen.
+**S4 Writes.** A client write is an **operation** or an **action**. An operation
+starts bridge work that occupies scopes (`prompt`, `fork`, `create`, `delete`,
+`authenticate`, `logout`, `terminal_login`, `list`, and the bridge's `load`). Every
+scope's `live` holds exactly one operation, `op = { id, kind, status, … }`. The bridge
+generates `id` at random and never reuses it. An operation's ID identifies it and is
+what writes are admitted against; it says nothing about what a replica has seen. An
+action acts on something that exists now and occupies nothing: a session's controls
+(`set_mode`, `set_config`), the session itself (`close`), or a resource (`answer`,
+`input`, `resize`, `dismiss`). Actions take no `expect`, fall outside S5, and each
+states its precondition and its repeat semantics.
 
 **S5 Admission.** Every operation write names `expect`, an operation ID, and the
 bridge handles writes and loads one at a time:
@@ -110,39 +116,44 @@ its `op` has ended and no operation occupies it. Anything else is refused.
 it, an operation occupies it, or one of its resources can still act (a pending
 interaction, an unreleased terminal, a waiting URL flow). It may release a session
 that is not needed only if the Agent can load or resume it; a session it cannot bring
-back stays held until it is deleted or the Agent connection ends. Subscribing to a
+back stays held until it is closed, deleted, or the Agent connection ends. Subscribing to a
 session the bridge does not hold makes the bridge hold it, which starts a `load`
 operation. A one-off read holds nothing.
 
-**S7 Resources.** Interactions, terminals and URL flows are resources. They live in
-their scope's `live`, each by the lifecycle ACP gives it, not by the operation that
-was running when it appeared:
+**S7 Resources.** Interactions, terminals and URL flows live by their ACP identity:
+a resource belongs to the scope its ACP message names (a session, or one JSON-RPC
+request) and ends at the ACP event that ends it, never because some operation ended.
+Where a client sees it never changes its life:
 
-- an **interaction** is an Agent request waiting for a client, in the scope its ACP
-  request names. It ends when it is answered, when the Agent cancels it, when its
-  parent request ends (a request-scoped elicitation), when a cancel of its session's
-  prompt answers it (permissions, as ACP requires), or with its scope or the Agent
-  connection;
-- a **URL flow** starts when a client accepts a URL elicitation, and ends when the
-  Agent completes it, a client dismisses it, or its scope or the Agent connection
-  ends;
-- a **terminal** ends its process when the Agent releases it, but its frozen output
-  stays while content embeds it, as ACP requires; it is removed when nothing embeds
-  it, or its scope or the Agent connection ends. A terminal login is removed when it
-  has exited and a client dismisses it.
+- an **interaction** is an Agent request waiting for a client. A session-scoped one
+  ends when it is answered, when the Agent cancels it, when a cancel or close of its
+  session answers it (permissions, as ACP requires), or with its session; a
+  request-scoped one ends when it is answered, cancelled, or when the JSON-RPC request
+  it names is answered. While its session is being created, it is shown in the
+  creating operation's scope and moves into the session when the session is
+  installed;
+- a **URL flow** starts when a client accepts a URL elicitation, keeps that
+  elicitation's scope, and ends when the Agent completes it, a client dismisses it,
+  or its scope (its session or its request) or the Agent connection ends;
+- a **terminal** has a **handle** (the process and its ID's use in `terminal/*`) and
+  **output**. The handle ends with `terminal/release` or the Agent connection; the
+  output is content, frozen then, and stays while content embeds it, as ACP requires.
+  A terminal login is removed when it has exited and a client dismisses it.
 
-Resource actions (answer, input, resize, dismiss) address a resource by its ID, take no
-`expect` and fall outside S5. Each states its repeat semantics: an answer is delivered
-at most once, dismiss has no further effect, resize to the same size leaves the same
-state, and input is not idempotent: it is written in order, every time.
+Resource actions address a resource by its ID. Each states its repeat semantics: an
+answer is delivered at most once, dismiss has no further effect, resize to the same
+size leaves the same state, and input is not idempotent: it is written in order, every
+time.
 
-**S8 Content.** A session's documents carry what ACP gave for the session. Each
-accepted session update is reduced by its own ACP semantics: chunks extend their
-message, an update patches the entity it names, a replacement replaces, a removal
-removes. Nothing else removes or rewrites content: not a turn's end, not an error, not
-a release, not a client's display. Fields the bridge does not interpret (`_meta`,
-annotations) are carried as received. Control updates are reduced into `controls`;
-every other update becomes timeline content.
+**S8 Content.** A session's documents carry what ACP gave for the session. Every
+timeline update belongs to an ACP **entity**: a message (its `messageId`, or, without
+one, the run of chunks it continues), or a tool call, ID-addressed plan or compaction
+(its ID, unique in the session). An update is reduced into its entity by that
+entity's ACP semantics. Nothing else removes or rewrites content: not a turn's end,
+not an error, not a release, not a client's display. Every field is kept at the level
+it arrived on, `_meta` and annotations included; the bridge interprets none of them.
+Control updates are reduced into `controls`; every other update becomes timeline
+content.
 
 ### 3.2 Client rules
 
@@ -157,8 +168,8 @@ again once the replica is in sync. Queued input that was never sent, or that was
 refused with a definite answer, may be submitted automatically once the replica shows
 the operation ended, naming that operation.
 
-**C3 Uncertainty.** A write or terminal input that was sent without a definite answer
-may have taken effect; a later `stale` proves nothing. The client never resends it
+**C3 Uncertainty.** A write, action or terminal input that was sent without a definite
+answer may have taken effect; a later `stale` proves nothing. The client never resends it
 automatically, with a new `expect` or otherwise. It keeps the input for the user to
 judge. An interaction answer is the exception: it is delivered at most once (S7), so
 resending it is safe.
@@ -170,6 +181,11 @@ resending it is safe.
 | Open, reconnect, a slow subscriber, a replaced stream, a bridge restart and a reopen are all one alignment | S3 |
 | After a reopen, a matching history is kept; a diverged one is truncated and the bridge's installed | S1, S3 |
 | A completed, failed or cancelled turn keeps its tool calls, thoughts, plans and compactions, live and after a load | S2, S8 |
+| A message split by a tool keeps its identity; a turn's mixed user message stays one turn | S8 |
+| A plan updated or removed in a later turn is one entity; no older copy stays current | S8 |
+| The mode or a configuration option changes while a prompt runs; a running session can be closed | S4 |
+| An interaction ends with the JSON-RPC request it names, not with an operation that outlives or precedes it | S7 |
+| A tool's terminal output survives release and the Agent connection's end while the log holds the tool | S7 |
 | A late tool or compaction update, or content the Agent sends between prompts, reaches every replica: it changes the entry it belongs to, or the tail | S2, S8 |
 | Two logs that align hold the same items, results and metadata, not only the same text | S1, S8 |
 | A resume never presents an unknown history as empty | S1 |
@@ -191,13 +207,15 @@ resending it is safe.
 | S2 Commit: only a completed turn enters the log; its process is removed | S2 Settling: every sent prompt settles; content outside a prompt settles too; nothing is removed | D1, D4, D5 |
 | entries are the final messages (`prompt`, `reply`) | entries are reduced timeline items with the turn's `end` | D1–D3 |
 | `canon` drops `_meta`; the hash covers text | entries carry `_meta`; the hash covers the published entry | D6, D7 |
-| S4: all work that may wait for a client is an operation; Agent requests join or start one (`agent_request`) | S4: operations are client writes and loads; Agent requests are interactions (S7) | D11 |
+| S4: all work that may wait for a client is an operation; Agent requests join or start one (`agent_request`); `set_mode`, `set_config` are operations | S4 Writes: operations occupy, actions (controls, `close`, resource actions) do not; Agent requests are interactions (S7) | D11, R1, R2 |
 | S5: an answer covers exactly the pending interactions | an answer is a resource action on one interaction | D10 |
-| S6/S7: a terminal is removed on release | its frozen output stays while embedded and holds nothing | D8 |
+| S6/S7: a terminal is removed on release | handle and output separated: its frozen output stays while embedded and holds nothing | D8 |
+| — | `global.live.diagnostics`: Agent stderr and MCP-over-ACP activity, bounded | R3 |
 | S1: a known log | complete or partial | D9 |
 | — | S8 Content | D1–D7 |
 
-The finding IDs are those of the [audit](acp-fidelity-audit.md#2-defects).
+The finding IDs are those of the [audit](acp-fidelity-audit.md#2-defects) (D) and of
+the [release parity matrix](release-parity.md#regressions) (R).
 
 ## 4. Documents
 
@@ -207,52 +225,70 @@ A log entry is one settled turn of the session's timeline:
 
 ```ts
 interface Turn {
-  items: Item[];            // reduced session updates of timeline kinds, in order
+  items: Item[];            // the turn's timeline, in order
   end?: { response: PromptResponse } | { error: ProtocolError };  // observed live only
 }
 
-type Item = SessionUpdate;  // message, thought, tool, plan and compaction kinds,
-                            // with byte-carrying blocks as attachment references
+type Item =                 // the bridge's own types around ACP values (protocol §3.1)
+  | { type: "message"; role: "user" | "agent" | "thought"; messageId?: string;
+      chunks: Array<{ content: Block; _meta?: unknown }> }
+  | { type: "tool"; call: ToolCall }
+  | { type: "plan"; update: Plan | PlanUpdate | PlanRemoved }
+  | { type: "compaction"; compactionId: string; status: CompactionStatus;
+      summary: Array<{ content: Block; _meta?: unknown }>; error?: string; _meta?: unknown };
 ```
 
-**Reduction** follows each update's ACP semantics (protocol §3.2):
+**Reduction** follows three rules (protocol §3.2):
 
-- **Messages.** A text chunk extends the previous item when that item is a text chunk
-  of the same kind and `messageId` that differs only in its text; any other chunk is
-  a new item. Consecutive items of one kind and `messageId` are one message; a
-  different `messageId`, or any other item between them, starts a new one.
-- **Entities.** A `tool_call` upserts and a `tool_call_update` patches the item of its
-  `toolCallId`, anywhere in the session; collections are replaced whole. A
-  `compaction_update` upserts the item of its `compactionId`, whose position its first
-  update fixed, with patch semantics; summary chunks append to it.
-- **Plans.** A plan update replaces the plan's last item in the turn being received,
-  or starts one; a removal is the plan's last state. The current plan is the last plan
-  item of the timeline.
-- **Content.** Image, audio and embedded resource blocks are replaced by an attachment
-  reference `{ type: "attachment", id, … }`, where `id` is the SHA-256 of the
-  canonical block as received. The bridge keeps the block; a read or a prompt that
-  references it gets it back unchanged. `_meta` and annotations stay everywhere.
-- The result is serialized as canonical JSON (RFC 8785), and the hash covers all of
-  it, `end` included.
+1. **Identity.** A tool call, an ID-addressed plan and a compaction each have one item
+   in the session, at the position of their first update; later updates reduce into
+   it wherever it is, so a plan updated or removed in a later turn changes its one
+   item, and a removed plan is an item in its removed state, never a still-current
+   older copy. A message is identified by role and `messageId`; its contiguous chunks
+   form one item, and a chunk after an intervening item starts a new item with the
+   same `messageId`, so `message(m1,"a") → tool → message(m1,"b")` gives two items of
+   the one message m1.
+2. **Patch.** Sparse updates apply by the pinned type: for a tool call
+   `ToolCall::update`, where absent and `null` both keep and collections are replaced
+   whole (`content: []` clears); for a compaction the schema's three states (absent
+   keeps, `null` clears, a value replaces). Nothing is deep-merged.
+3. **Fragments.** Every chunk keeps its own fields, including a chunk's `_meta` apart
+   from its block's. Text joins the previous chunk only when every other field of the
+   two is equal, so chunking never changes the result and metadata never merges away.
 
-**Turns.** A turn starts with a user message and holds what follows until the next
-one. A live prompt's turn starts with the user message the bridge sent; a replayed
-turn starts with each user message of the replay.
+The legacy `plan` has no ID. Each turn keeps a snapshot of its last state, as v0.2.8
+did; the current plan is derived from the latest snapshot and is not an entity that
+updates reduce into.
+
+**Content.** Image, audio and embedded resource blocks are replaced by an attachment
+reference `{ type: "attachment", id, … }`, where `id` is the SHA-256 of the canonical
+block as received. The bridge keeps the block; a read or a prompt that references it
+gets it back unchanged. `_meta` and annotations stay everywhere. The entry is
+serialized as canonical JSON (RFC 8785), and the hash covers all of it, `end`
+included.
+
+**Turns.** A turn is the part of the timeline one prompt produced. Live, it is what
+arrives from the prompt's admission to its end, starting with the user message the
+bridge sent (one item, one chunk per prompt block); user chunks the Agent sends are
+items and start no turn. A replay has no prompt boundaries, so a turn starts at each
+user message item, except one that continues the opening user message of the current
+turn (same, present `messageId`): a user message of text and an image is one turn.
 
 **Settling.** The tail holds the turn being received. A prompt's end appends the tail
 as a new entry with its `end`, whatever the stop reason or error: output the Agent
 sent is not withdrawn by a later failure. Content that arrives outside a prompt
 continues the last turn in the tail and settles into the last entry when the next
 prompt starts or the connection ends. An update for an entity already in the log
-changes that entry at once; the log change starts at its index.
+rewrites that entry at once; the log change starts at its index, the later turns stay
+as they were, and their hashes follow the rewritten one.
 
 The same updates give the same entries, however they were chunked, live or replayed.
 Updates that differ in IDs, metadata, results or order give different entries; the
-bridge does not make them equal. In particular a live turn and its replay usually
-differ (the replay has no `end`; an Agent may replay less, or differently), and
-alignment then replaces the client's log. That costs a redrawn history, never a wrong
-write, and is the price of letting ACP's replay decide. Identity serves
-synchronization only. Admission never compares hashes (S5).
+bridge does not make them equal. A live turn and its replay usually differ (the replay
+has no `end`; an Agent may replay less, or differently), and alignment then replaces
+the client's log. That costs a redrawn history, never a wrong write, and is the price
+of letting ACP's replay decide. Identity serves synchronization only. Admission never
+compares hashes (S5).
 
 ### 4.2 Live state
 
@@ -268,13 +304,15 @@ interface SessionLive extends ScopeLive {
   history: "complete" | "partial";            // absent while the log is unknown
   controls: Controls;            // modes, configOptions, commands, info, usage (reduced)
   tail: { continues: boolean; items: Item[] };   // the turn being received
-  terminals: Record<string, Terminal>;        // running, and released but still embedded
+  terminals: Record<string, Terminal>;        // with a handle, or frozen and still embedded
+  closing: boolean;                           // a close action is in flight
 }
 
 interface GlobalLive extends ScopeLive {
   agent: AgentState;             // connection phase, launch, initialize, authentication
   sessions: Record<string, SessionSummary>;  // sessions the bridge holds
   terminals: Record<string, LoginTerminal>;  // terminal logins, each with its methodId
+  diagnostics: Diagnostics;      // Agent stderr, MCP-over-ACP connections and activity, bounded
 }
 
 interface CatalogLive extends ScopeLive {
@@ -294,31 +332,42 @@ interface CatalogLive extends ScopeLive {
 
 This section specifies S7.
 
-- **Interactions.** An Agent request lives in the scope its ACP request names: a
-  permission request and a session-scoped elicitation in their session, a
-  request-scoped elicitation in the scope of the operation whose request it names
-  (that operation is its `parent`), anything else in `global`. While the session is
-  not held yet, its interactions are shown in the scope of the operation that brings
-  it. An interaction ends when it is answered, when the Agent cancels it, when its
-  parent ends, when a requested cancel of its session's prompt answers it (permissions
-  only, `cancelled`, as ACP requires), or with its scope or the Agent connection. No
-  other operation's end touches it.
+- **Interactions.** An Agent request belongs to its ACP scope. A permission request
+  and a session-scoped elicitation belong to their session and are shown in it; while
+  that session is being created or forked they are shown in the creating operation's
+  scope and move into the session when it is installed, or end (answered with their
+  cancel outcome) when it is not. A request-scoped elicitation belongs to the JSON-RPC
+  request it names and has that request as its `parent`; it is shown in the scope of
+  the write or load that sent the request, or in `global` for a request no write sent
+  (`initialize`, a release's close, a forwarded MCP request), and it ends when that
+  request is answered. A delete's `session/close` and `session/delete` are two
+  requests, so an elicitation of the first ends before the delete does. An elicitation
+  naming no outstanding request (`null`, or an ID not outstanding) is refused at once
+  and never shown. The bridge knows its outstanding requests from send to response
+  only; no request record is kept. Otherwise an interaction ends when it is answered,
+  when the Agent cancels it, when a cancel of its session's prompt or a close of its
+  session answers it (permissions only, `cancelled`, as ACP requires), or with its scope or the Agent
+  connection. No operation's end touches it.
 - **A URL flow** starts when a client accepts a URL elicitation: the interaction leaves
   `interactions` and the flow enters `urlFlows`. Accepting only consents; the external
   flow starts then. The flow is removed when one of these happens:
   - the Agent sends its completion notification;
   - a client dismisses it (§6.1), because ACP makes the completion notification
     optional and the user must be able to give up waiting;
-  - its scope ends, or the Agent connection that started it ends.
+  - its scope ends (its session, or for a request-scoped flow its request), its
+    session is not installed, or the Agent connection that started it ends.
 
-  No completion record is kept.
-- **A terminal** runs until the Agent releases it. After release ACP still has tool
-  calls that contain it display its output, so its bounded output and exit status stay,
-  frozen and marked `released`, while an item of the log or the tail embeds it. It is
-  removed when none does, or when its scope or the Agent connection ends. A terminal
-  login is removed when it exits and a client dismisses it.
+  It keeps its elicitation's scope and moves with installation. No completion record
+  is kept.
+- **A terminal** has a handle and output. The handle ends when the Agent releases the
+  terminal or the Agent connection ends (the bridge kills the process then). ACP still
+  has tool calls that contain it display its output, so the bounded output and exit
+  status stay, frozen and marked `released`, while an item of the log or the tail
+  embeds it: through a reconnect and a resume that keeps the log. They go only with
+  the session's documents. A terminal login is removed when it exits and a client
+  dismisses it.
 - **Holding.** A resource that can still act (a pending interaction, an unreleased
-  terminal, a waiting URL flow) keeps its session needed (S6). A released terminal's
+  terminal with a handle, a waiting URL flow) keeps its session needed (S6). Frozen
   output does not. When the last such resource of an unsubscribed, unoccupied session
   is removed, the session may be released.
 
@@ -340,8 +389,8 @@ interface Operation {
   it. A failed turn keeps its prompt and error there for a retry, and its content and
   error in the log; a refused mode change keeps the ACP error.
 - Waiting for the user is a non-empty `interactions` of a scope, not a state of an
-  operation. An operation that waits for its own ACP request's elicitation is the
-  `parent` of that interaction.
+  operation. A request-scoped elicitation names its JSON-RPC request as `parent`; the
+  operation that sent the request only decides where it is shown.
 - A session the bridge has just held starts with a `load` operation. A session
   created by `create` or `fork` starts with a completed `open`.
 
@@ -361,7 +410,7 @@ type Event =
   | { scope: string; log: { from: number; prev: string; entries: Array<{ turn: Turn; hash: string }> };
       live?: LiveChange }
   | { scope: string; live: LiveChange }
-  | { scope: string; end: { reason: "deleted" | "load_failed"; error?: ProtocolError } };
+  | { scope: string; end: { reason: "deleted" | "closed" | "load_failed"; error?: ProtocolError } };
 
 type LiveChange = { replace: unknown } | { patch: JsonPatchOperation[] };
 ```
@@ -415,23 +464,28 @@ depend on the log it was written against.
 
 ### 5.3 End
 
-A scope ends when its session was deleted, or when its load failed. The event
+A scope ends when its session was deleted or closed, or when its load failed. The event
 gives the reason and, for `load_failed`, the error. The client drops the document.
 Subscribing again after `load_failed` tries the load again; the client does this
 only on the user's request.
 
 ## 6. Writes
 
-### 6.1 Operations by scope
+### 6.1 Writes by scope
 
-| Scope | Starts an operation | Acts on the running operation |
-| --- | --- | --- |
-| `session/<id>` | `prompt { prompt }`, `set_mode { modeId }`, `set_config { configId, value }`, `fork { cwd }` | `cancel` (prompt) |
-| `global` | `create { cwd }`, `delete { sessionId }`, `authenticate { methodId }`, `logout`, `terminal_login { methodId }` | `cancel` (terminal login) |
-| `catalog` | `list { cursor }` | — |
+| Scope | Starts an operation | Acts on the running operation | Actions |
+| --- | --- | --- | --- |
+| `session/<id>` | `prompt { prompt }`, `fork { cwd }` | `cancel` (prompt) | `set_mode { modeId }`, `set_config { configId, value }`, `close`; resource actions |
+| `global` | `create { cwd }`, `delete { sessionId }`, `authenticate { methodId }`, `logout`, `terminal_login { methodId }` | `cancel` (terminal login) | resource actions |
+| `catalog` | `list { cursor }` | — | resource actions |
 
 - **No open command.** Subscribing holds the session (S6).
-- **No close command.** A session that is not needed is released (S6).
+- **Close** is an action of the session, as in v0.2.8, also while a prompt runs: the
+  Agent cancels the session's work as if `session/cancel` had been sent and frees it.
+  The bridge marks the session `closing`, answers pending permissions `cancelled`, and
+  on success ends the scope with `closed`; the session stays in the catalog and a later
+  subscription loads or resumes it. A session that is not needed is still released
+  (S6).
 - **Delete** is a global operation, so it works for sessions the bridge does not
   hold. It occupies `global` and `session/<id>` (S5):
   - while the session is held, the delete is its `op`, so a prompt naming the
@@ -442,18 +496,20 @@ only on the user's request.
 
   The bridge closes a held session, deletes it on the Agent and ends the scope with
   `deleted`. Its result or error is on `global.op`.
-- **Controls during a prompt.** `set_mode` and `set_config` wait for the session's
-  operation to end. ACP allows setting the mode while the Agent generates; this is
-  attyd's limit (audit L1), kept until a separate design lifts it.
+- **Controls** are actions: they occupy nothing and run while a prompt runs, as ACP
+  allows for the mode and v0.2.8 did for both. Each response is held until the Agent
+  answers and carries its error, if any; the new state reaches every replica through
+  `controls`. A queued control change is therefore never needed.
 - **The catalog** is its own scope, so that listing does not contend with global
   writes. `list` runs the Agent's `session/list`. An elicitation the Agent sends
   during it and scoped to that request is an interaction of `catalog` with the `list`
   as its parent, answered like any other.
-- **Resource actions are not operations.** Answering an interaction, terminal input,
-  resize, and dismissing a URL flow or an exited terminal login address a resource by
-  its ID and take no `expect`:
+- **Actions are not operations.** Controls and close address their session; answering
+  an interaction, terminal input, resize, and dismissing a URL flow or an exited
+  terminal login address a resource by its ID. None takes `expect`:
 
   ```text
+  POST /api/v2/scopes/{scope}/actions/{action}
   POST /api/v2/scopes/{scope}/resources/{id}/{action}
   ```
 
@@ -462,6 +518,8 @@ only on the user's request.
 
   | Action | Repeated |
   | --- | --- |
+  | set_mode, set_config | sets a value: the same value again leaves the same state |
+  | close | while one is in flight, `not_allowed`; after success the scope is gone (`404`) |
   | answer | **at most once**: checked against its request, delivered and removed in one step; a repeat, or an answer after the interaction ended, gives `404` and leaves the same state |
   | dismiss | no further effect: a second dismissal, or one after completion, gives `404` and leaves the same state |
   | resize | sets a size: repeating the same size leaves the same state |
@@ -483,12 +541,14 @@ POST /api/v2/scopes/{scope}/ops   { "expect": "<op.id>", "kind": "...", "args": 
   on the scope's `op` until the next operation replaces it. If that response is
   lost, the initiator loses the result: a created session is still listed in
   `global.sessions` while held and in the catalog, and a page can be listed again.
+- **Actions** answer `204`, or, for controls and close, `200 {}` or `200 { error }`
+  once the Agent answers. An Agent error is a definite answer.
 - **Refused:** `{ error: { code, message } }`. The codes are:
 
   | Code | Meaning |
   | --- | --- |
   | `stale` | `expect` is not the current `op.id` |
-  | `not_allowed` | the operation is running and the write starts one, or the operation has ended and the write acts on it, or another scope the operation acts on is not free |
+  | `not_allowed` | the operation is running and the write starts one, or the operation has ended and the write acts on it, or another scope the operation acts on is not free, or the session is `closing`, or an action's precondition does not hold |
   | `invalid_request` | the request is malformed |
   | `unsupported` | the Agent did not advertise the capability |
   | `unavailable` | the Agent is not connected |
@@ -535,8 +595,8 @@ This section applies C2 and C3 to writes.
   client sends terminal input in order and one request at a time per terminal.
   Input the user types again is new input and is delivered normally. No sequence
   numbers or deduplication are needed.
-- **Queued input may be submitted automatically.** A queued prompt or control
-  change that was never sent, or that was refused with a definite answer, is
+- **Queued input may be submitted automatically.** A queued prompt that was never
+  sent, or that was refused with a definite answer, is
   submitted when the replica shows the operation ended, naming that operation.
 
 ## 7. Holding
@@ -577,8 +637,9 @@ This section applies C2 and C3 to writes.
 Reads that may wait for a client are operations instead: the catalog is listed by
 the `list` operation (§6.1).
 
-**Markdown export** is assembled by the client from the log, the tail and the
-attachment read. There is no export endpoint.
+**Markdown export** is assembled by the client from the log, the tail, the session's
+terminals and the attachment read. There is no export endpoint. It covers every
+section v0.2.8 exported ([release parity](release-parity.md#markdown-export)).
 
 ## 9. Extending
 
@@ -610,6 +671,7 @@ changes to it are in §3.4: the log now holds whole turns rather than final mess
 - The compact history's process pages: `historyRevision`, `collapsedTurns`,
   `visibleRanges`, `GET …/process`. In revision 1 a completed turn's process was gone; revision 2 settles it into the log instead (S2, S8).
 - Open and close commands, the per-command endpoints, and `GET /api/v2/catalog`.
+  (Revision 2 restores close as an action, §6.1.)
 - In the client: owner handling, intent recovery, request-record waits, the watched
   process cache (`ObservedProcesses`), process-page export, and the v1
   compensating state.
@@ -626,7 +688,8 @@ changes to it are in §3.4: the log now holds whole turns rather than final mess
 - The hash-chained log and `canon`, with message reduction.
 - Atomic alignment by log head, and one `log` event for alignment and commit.
 - The operation slot, `expect`, occupation across scopes, and one write endpoint.
-- The `catalog` scope and `agent_request` operations.
+- The `catalog` scope. (`agent_request` operations were added in revision 1 and are
+  removed by revision 2.)
 - `urlFlows` on every scope; resource lifecycles independent of operations;
   resource actions, including dismissing a URL flow.
 - Hold by subscription and need, release only of loadable sessions; delete as a
@@ -637,23 +700,30 @@ changes to it are in §3.4: the log now holds whole turns rather than final mess
 Each rule gets tests at the bridge first and then in the client engine. Document
 consistency is checked after **every** event, not only once synchronization ends.
 Revision 2 adds a second kind of check: a replica that equals the bridge's projection
-proves nothing if the projection dropped content. Cases 1, 2, 13 and 19–27 therefore
-also assert, **from the ACP input**, which items and fields the log or the tail holds
-(audit §8). Cases marked r2 are new or changed in revision 2; their runtime code is
-not migrated yet.
+proves nothing if the projection dropped content. Cases 1, 2, 13, 19–27 and 30–33
+therefore also assert, **from the ACP input**, which items and fields the log or the
+tail holds (audit §8). Cases 28, 29, 34 and 35 restore v0.2.8 capabilities and are
+checked against that release's behavior; a test deleted, or changed to assert that a
+capability is gone, never counts ([release parity](release-parity.md)). Cases marked
+r2 are new or changed in revision 2; their runtime code is not migrated yet.
 
-1. **Identity (S1, S8, §4.1)** r2. The same updates give the same entries and hashes
-   when:
-   - streamed in different chunks;
-   - a user message has several content blocks (text and an image), live or replayed
-     as several chunks;
-   - reduced live into the tail and settled, or replayed by `load`.
+1. **Identity (S1, S8, §4.1)** r2. Three separate checks:
+   - **Reduction is chunking-invariant.** The same ACP update sequence, streamed in
+     different chunks (also a user message of text and an image), gives the same
+     items. Chunks that differ in `_meta` or annotations stay separate chunks.
+   - **Equal entries, equal hashes.** Two entries that are equal as published (items
+     and `end`) have the same hash, whether reduced live and settled or rebuilt;
+     entries that differ in a tool result, a `messageId`, a message boundary, a
+     chunk's `_meta` or the presence of `end` have different hashes.
+   - **The replay is authoritative.** A replay of a live-observed turn, which has no
+     `end`, gives an entry that differs from the live one; alignment replaces the
+     live entry with it and the client applies that normally. Live and replayed
+     entries are not required to be equal.
 
-   Updates that differ only in a tool result, a `messageId`, a message boundary or a
-   `_meta` value give different hashes. Normalized content with attachment references
-   and prompts that reference attachments pass the generated types and validation;
-   the bridge resolves references to the blocks as received before it calls the
-   Agent, and an attachment read returns them unchanged, `_meta` included.
+   Normalized content with attachment references and prompts that reference
+   attachments pass the generated types and validation; the bridge resolves
+   references to the blocks as received before it calls the Agent, and an attachment
+   read returns them unchanged, `_meta` included.
 2. **Settling (S2)** r2. A prompt's end appends its entry with `end`, empties the tail
    and ends its operation in one event, for a completed, a cancelled, a failed and an
    interrupted prompt alike. The failed prompt keeps its prompt and error on `op` too.
@@ -691,12 +761,23 @@ not migrated yet.
    and leaves the interaction pending.
 8. **Interactions everywhere (§4.3)** r2. Interactions during `load`, `fork`,
    `create`, `set_config`, `list` and outside any operation are shown and answered
-   the same way. A request-scoped elicitation ends with its parent's request. A
-   session-scoped elicitation that arrives during a `set_mode` survives the mode
-   change's end. A cancel of a prompt answers the session's pending permissions
-   `cancelled`. Interactions of a delete's `session/close` are shown in the session
-   and can be answered. A URL flow accepted outside an operation stays visible after
-   the next operation replaces `op`.
+   the same way. A session-scoped elicitation that arrives during a `set_mode`
+   survives the mode change's end. A cancel of a prompt answers the session's pending
+   permissions `cancelled`. A URL flow accepted outside an operation stays visible
+   after the next operation replaces `op`. Request scopes (each from the ACP input,
+   asserting where the interaction is shown and when it ends):
+   - a delete of a held session: an elicitation naming its `session/close` ends with
+     the close's response while the delete still runs; one naming its
+     `session/delete` ends with the delete;
+   - an elicitation naming a request no write sent (`initialize` on reconnect, a
+     release's close) is shown in `global` and ends with that request;
+   - an elicitation with `requestId: null`, and one naming an answered request, are
+     refused with `invalid_params`, with the two cases distinguishable, and never
+     shown;
+   - a permission and a URL elicitation for the session a `create` is creating are
+     shown in `global`, move into the session in the event that installs it, and the
+     accepted URL flow stays with the session; when the `create` fails they are
+     answered with their cancel outcome and the flow is removed.
 9. **Responses (§6.2).**
    - An answer's success arriving before the stream shows the change, and an
      operation B replaced by C before a slow subscriber sees B, both leave the replica
@@ -737,11 +818,12 @@ not migrated yet.
 17. **Terminal logins (S7).** A login with method A fails and is not dismissed; a
     login with method B starts. A fresh replica shows both terminals with their own
     method.
-18. **Controls (§4.2).** A successful `set_mode` or `set_config` whose response comes
-    without a notification shows the new mode or the confirmed config options when
-    its operation ends; a failed one changes nothing.
+18. **Controls (§4.2)** r2. A successful `set_mode` or `set_config` whose response
+    comes without a notification shows the new mode or the confirmed config options
+    when its response arrives; a failed one changes nothing and returns its error.
 19. **Retained content (S8)** r2. A scripted turn with thoughts, message chunks of two
-    `messageId`s around a tool call, a tool call with sparse updates (status, content
+    `messageId`s around a tool call, chunks of one `messageId` on both sides of a
+    tool call (`m1 "a" → tool → m1 "b"`: two items, both `m1`), a tool call with sparse updates (status, content
     with a diff and a terminal, locations, raw input and output, `_meta`), a legacy
     plan and an ID-addressed plan, and a compaction with summary chunks: after it
     completes, after it fails, after it is cancelled, and after a `load` replays it,
@@ -749,12 +831,15 @@ not migrated yet.
     message boundaries.
 20. **Sparse updates (§4.1)** r2. A `tool_call_update` that changes only `content`
     produces a document change and a new hash; one that omits a collection keeps it;
-    one that sends a collection replaces it whole; one for an unknown ID starts an
-    item.
+    one that sends a collection replaces it whole, and `content: []` clears it; one
+    with `{ name: null, content: null, rawOutput: null }` leaves name, content and raw
+    output as they were; one for an unknown ID starts an item. A compaction update
+    with `summary: null` clears the summary, and one without `summary` keeps it.
 21. **Late and idle updates (S2)** r2. A `tool_call_update` and a compaction summary
     chunk that arrive after the prompt's response change the settled entry they
-    belong to, by a log change from its index; every replica converges, including
-    one that was coalesced. A message, plan or compaction the Agent sends while no
+    belong to, by a log change from its index; the later entries' turns are unchanged
+    and their hashes are recomputed; every replica converges, including one that was
+    coalesced. A message, plan or compaction the Agent sends while no
     prompt runs appears in the tail and settles into the last entry when the next
     prompt starts.
 22. **Failure keeps output (S2, S8)** r2. A prompt that streams messages and a tool
@@ -767,15 +852,54 @@ not migrated yet.
 24. **Released terminals (S7)** r2. A terminal embedded in a tool call and then
     released keeps its final output and exit status, marked `released`, for every
     replica and a fresh one; it no longer keeps its session needed; it is removed
-    once nothing embeds it.
+    once nothing embeds it. Then, in one scenario: embed → exit → release → stay
+    subscribed → the Agent connection ends (and, separately, a terminal login
+    succeeds and the Agent reconnects) → a resume that keeps the log: the output,
+    `exitStatus` and `truncated` are unchanged, `terminal/*` on the ID fails, and the
+    terminal does not keep the session needed. Persistence across a bridge restart is
+    not required.
 25. **Opaque fields (S8)** r2. `_meta` on a chunk, a content block, a tool call, a plan,
-    a compaction and a prompt response, and annotations on blocks, are in the log as
-    received.
+    a compaction, a compaction summary chunk and a prompt response, and annotations on
+    blocks, are in the log as received. Two text chunks, and two summary chunks, that
+    differ only in the chunk's `_meta` stay two chunks with their own `_meta`.
 26. **User chunks (§4.1)** r2. User message chunks the Agent sends during a live
     prompt are items of its turn, in order.
 27. **Replay authority (§4.1)** r2. A replay that differs from what was observed live
     (fewer details, other IDs) replaces the log; nothing the replay did not provide is
     invented, and the observed `end` of replaced turns is not carried over.
+28. **Controls during a prompt (S4)** r2, release. While a prompt runs, `set_mode` and
+    a boolean `set_config` are delivered to the Agent and their confirmed values reach
+    every replica; the prompt is not affected. In the browser, the v0.2.8 case: the
+    "Verbose" switch toggles during a running prompt.
+29. **Close (S4, §6.1)** r2, release. In the browser, the v0.2.8 case: closing a
+    running session asks for confirmation; dismissing it sends no request; confirming
+    sends exactly one close and returns to the project. At the bridge: a close during
+    a prompt answers pending permissions `cancelled`, refuses a new prompt while
+    `closing`, ends the scope with `closed` on success and leaves the session in the
+    catalog; an Agent error leaves the session as it was; a later subscription loads
+    it again.
+30. **Message identity and turns (§4.1)** r2. A replay of a user message of text and an
+    image with one `messageId` is one turn; `user m1 → tool → user m1` in a replay is
+    one turn; two user messages with different IDs are two turns. Live, the bridge's
+    user item has one chunk per prompt block, and an Agent user chunk starts no turn.
+31. **Plan identity (§4.1)** r2. Turn A creates ID plans P and Q; turn B updates and
+    then removes P. The log holds one item for P, at its position in turn A, in its
+    removed state, and one current item for Q; no older state of P remains current.
+    A legacy plan sent in turns A and B leaves one snapshot in each, and the current
+    plan is B's.
+32. **Diagnostics (§4.2)** r2, release. MCP-over-ACP connect, message and disconnect
+    appear in `global.live.diagnostics.mcp` (connection count and messages, bounded,
+    oldest dropped with `truncated`); Agent and MCP stderr appear in `agentStderr`;
+    a fresh replica sees the same; nothing is kept across a bridge restart.
+33. **Markdown export (§8)** r2, release. The export case of the
+    [release parity matrix](release-parity.md#markdown-export), from a settled log,
+    from the tail and after a reconnect.
+34. **Per-interaction answers in the browser** r2, release. Two pending interactions
+    of one session can be answered separately, in either order, as in v0.2.8.
+35. **Settled tool cards in the browser** r2, release. Completed, failed and reloaded
+    turns show tool cards, thoughts, plans and compactions collapsed by default and
+    expandable, with the disclosure kept across new turns; thread search and change
+    review find their content.
 
 The bridge's handling of ACP failures and its internal clean-up belong to layer 1 and
 are tested there. They add no duties to clients.
@@ -791,7 +915,8 @@ revision 2's own choices:
 2. A turn's `end` is part of the entry and of its hash, so a reload whose replay has
    no `end` replaces live-observed entries. The alternative, an unhashed `end`, would
    let two different logs align as equal (audit D6).
-3. Legacy plans keep one item per turn with the plan's last state in it (audit Q3).
+3. Legacy plans keep one snapshot per turn, as v0.2.8 did; ID-addressed plans are one
+   item per session (audit Q3).
 4. An update for a settled entity rewrites the log from that entry. Late updates are
    rare; the alternative, a patch kept in `live` beside the log, would split one
    entity over two places.
@@ -805,9 +930,15 @@ revision 2's own choices:
 8. `create`, `fork` and `list` deliver their result in the HTTP response; a lost
    response loses it for that client (§6.2).
 9. Sessions the Agent cannot load or resume are never released while the connection
-   lasts (§7). A resume-only session is released, and comes back `partial`; keeping
-   it held instead trades memory for history (audit L4).
-10. Controls wait for a running prompt to end (audit L1).
+   lasts (§7). A resume-only session is released, and comes back `partial`, as v0.2.8
+   released it and showed a missing-history notice; keeping it held instead trades
+   memory for history (audit L4).
+10. Controls and close are actions, so they run during a prompt (release parity R1,
+    R2). Close sets `closing`, which is the only new session state they need.
+11. Diagnostics keep the last 200 MCP-over-ACP messages and a bounded stderr tail in
+    memory (release parity R3); the bound is a default, not a protocol constant.
+12. A request-scoped elicitation that names no outstanding request is refused rather
+    than shown in `global` (audit Q6).
 
 ## 13. Migration
 
