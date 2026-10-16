@@ -12,11 +12,19 @@ const image = {
 
 export const entry = {
   turn: {
-    prompt: [{ type: "text", text: "look" }, image],
-    reply: [
-      { type: "text", text: "I see" },
-      { type: "resource_link", uri: "file:///a", name: "a" },
+    items: [
+      { type: "message", role: "user", chunks: [{ content: { type: "text", text: "look" } }, { content: image }] },
+      {
+        type: "message", role: "agent", messageId: "m", chunks: [
+          { content: { type: "text", text: "I see" } },
+          { content: { type: "resource_link", uri: "file:///a", name: "a" } },
+        ],
+      },
+      { type: "tool", call: { toolCallId: "t", status: "pending" } },
+      { type: "plan", update: { planId: "p" } },
+      { type: "compaction", compactionId: "c", status: "completed", summary: [] },
     ],
+    end: { response: { stopReason: "end_turn" } },
   },
   hash: "AAAAAAAAAAAAAAAAAAAAAA",
 } satisfies LogEntry;

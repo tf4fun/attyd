@@ -449,7 +449,18 @@ fn a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one
     assert_eq!(commit["log"]["prev"], ChainHash::ZERO.wire());
     assert_eq!(
         commit["log"]["entries"][0]["turn"],
-        json!({ "prompt": [text("hi")], "reply": [text("hello")] })
+        json!({
+            "items": [
+                { "type": "message", "role": "user", "chunks": [{ "content": text("hi") }] },
+                { "type": "message", "role": "agent", "chunks": [{ "content": text("hel") }] },
+                { "type": "tool", "call": {
+                    "toolCallId": "t", "title": "read", "kind": "other", "status": "completed",
+                    "content": [], "locations": [],
+                }},
+                { "type": "message", "role": "agent", "chunks": [{ "content": text("lo") }] },
+            ],
+            "end": { "response": { "stopReason": "end_turn" } },
+        })
     );
     assert!(
         commit["live"].get("patch").is_some(),

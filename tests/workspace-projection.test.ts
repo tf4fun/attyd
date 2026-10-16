@@ -8,8 +8,14 @@ import {
   standaloneTerminals,
 } from "../web/src/lib/workspace-projection";
 
-const entry = (prompt: string, reply: string, hash: string): LogEntry => ({
-  turn: { prompt: [{ type: "text", text: prompt }], reply: [{ type: "text", text: reply }] },
+const entry = (prompt: string, reply: string, hash: string, stopReason?: "max_tokens"): LogEntry => ({
+  turn: {
+    items: [
+      { type: "message", role: "user", chunks: [{ content: { type: "text", text: prompt } }] },
+      { type: "message", role: "agent", chunks: [{ content: { type: "text", text: reply } }] },
+    ],
+    ...(stopReason != null ? { end: { response: { stopReason } } } : {}),
+  },
   hash,
 });
 
@@ -30,7 +36,7 @@ const summary = (title: string | null): SessionSummary => ({
 
 describe("projected thread", () => {
   it("keeps a completed prompt's result in the turn the commit appended", () => {
-    const timeline = projectTimeline("s", [entry("first", "one", "h1"), entry("second", "two", "h2")], operation({
+    const timeline = projectTimeline("s", [entry("first", "one", "h1"), entry("second", "two", "h2", "max_tokens")], operation({
       status: "completed", result: { stopReason: "max_tokens" },
     }));
     expect(timeline.map((item) => item.type)).toEqual(["message", "assistant", "message", "assistant", "stop"]);
@@ -41,12 +47,11 @@ describe("projected thread", () => {
   });
 
   it("keeps the whole reply of a committed turn in one Agent entry", () => {
-    const reply: LogEntry = {
-      turn: { prompt: [{ type: "text", text: "p" }], reply: [{ type: "text", text: "Paragraph 1.\n\nParagraph 2.\n\nFinal." }] },
-      hash: "h",
-    };
+    const reply = entry("p", "Paragraph 1.\n\nParagraph 2.\n\nFinal.", "h");
     const [, agent] = projectTimeline("s", [reply], undefined);
-    expect(agent).toMatchObject({ type: "assistant", chunks: [{ role: "agent", blocks: reply.turn.reply }] });
+    expect(agent).toMatchObject({
+      type: "assistant", chunks: [{ role: "agent", blocks: [{ type: "text", text: "Paragraph 1.\n\nParagraph 2.\n\nFinal." }] }],
+    });
   });
 
   it("shows a running prompt's input and process, and a failed one's error without a log entry", () => {
@@ -143,7 +148,7 @@ describe("projected thread", () => {
     expect(timeline[3]).toMatchObject({ call: { toolCallId: "t2", status: "pending" } });
     expect(timeline[5]).toMatchObject({ update: { sessionUpdate: "plan" } });
     expect(timeline[6]).toMatchObject({ update: { sessionUpdate: "plan_removed", planId: "p" } });
-    expect(timeline[7]).toMatchObject({ compactionId: "c", status: "completed", blocks: [text("summary")] });
+    expect(timeline[7]).toMatchObject({ compactionId: "c", status: "completed", blocks: [text("sum"), text("mary")] });
     // The Agent's echo of the prompt is not shown twice; another user message is.
     expect(timeline[8]).toMatchObject({ role: "protocol-user", blocks: [text("other")] });
     expect(timeline[10]).toMatchObject({ type: "stop", response: { stopReason: "end_turn" } });

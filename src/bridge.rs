@@ -6124,11 +6124,13 @@ mod tests {
                             .collect::<String>()
                     };
                     let turn = &replica.log.last().expect("the committed turn")["turn"];
-                    let text = turn["reply"]
+                    let text = turn["items"]
                         .as_array()
                         .unwrap()
                         .iter()
-                        .filter_map(|block| block["text"].as_str())
+                        .filter(|item| item["role"] == "agent")
+                        .flat_map(|item| item["chunks"].as_array().unwrap())
+                        .filter_map(|chunk| chunk["content"]["text"].as_str())
                         .collect::<String>();
                     assert_eq!(text, expected, "output preceding EOF was truncated");
                 }
@@ -6417,8 +6419,11 @@ mod tests {
         let log = &session.replicas[scope].log;
         assert_eq!(log.len(), 1, "history commit redispatched the prompt");
         assert_eq!(
-            log[0]["turn"]["prompt"],
-            json!([{ "type": "text", "text": "message-actions-flow" }])
+            log[0]["turn"]["items"][0],
+            json!({
+                "type": "message", "role": "user",
+                "chunks": [{ "content": { "type": "text", "text": "message-actions-flow" } }],
+            })
         );
         assert_ne!(session.replicas[scope].head(), initial_head);
 
@@ -7109,7 +7114,8 @@ mod tests {
             panic!("the committed load knows the log");
         };
         assert_eq!(
-            serde_json::to_value(&log.entries()[0].turn).unwrap()["reply"][0]["text"],
+            serde_json::to_value(&log.entries()[0].turn).unwrap()["items"][0]["chunks"][0]
+                ["content"]["text"],
             "candidate"
         );
         state

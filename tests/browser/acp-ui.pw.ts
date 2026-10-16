@@ -19,7 +19,7 @@ type AgentPid = () => Promise<string>;
 interface TurnEnd {
   /** Waits until a `[hold:<name>]` turn is ready to end. */
   reached(name: string): Promise<void>;
-  /** Lets it end; the commit then removes its process (protocol S2). */
+  /** Lets it end; its process then settles with the turn (protocol S8). */
   release(name: string): Promise<void>;
 }
 
@@ -465,15 +465,16 @@ for (const action of ["complete", "cancel"] as const) {
     await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
     await expect(dockPlan).toHaveCount(0);
-    // The plan was the turn's process: the commit removes it (protocol S2).
+    // The plan settles with its turn (protocol S8), folded in its process.
     const turn = page.locator(".conversation-turn").last();
-    await expect(turn.locator(".plan-card")).toHaveCount(0);
+    await expectProcessSettled(page, ".plan-card");
+    await expect(turn.locator(".plan-card")).toContainText("Answer the test");
     await page.reload();
     await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
     await expect(dockPlan).toHaveCount(0);
-    await expect(turn.locator(".plan-card")).toHaveCount(0);
-    await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
-    await page.screenshot({ path: testInfo.outputPath(`plan-${action}-committed.png`) });
+    await turn.getByRole("button", { name: "Expand execution process", exact: true }).click();
+    await expect(turn.locator(".plan-card")).toContainText("Answer the test");
+    await page.screenshot({ path: testInfo.outputPath(`plan-${action}-archived.png`) });
     await composer.fill("usage-flow");
     await composer.press("Enter");
     await expect(page.getByText("max_tokens", { exact: true })).toBeVisible();
@@ -925,10 +926,12 @@ test("opens attachment chips with native browser viewing and automatic downloads
   expect(JSON.stringify(view.log)).toContain('"type":"attachment"');
   expect(JSON.stringify(view)).not.toContain("# 完整的中文附件");
   expect(JSON.stringify(view)).not.toContain(wave.toString("base64"));
-  // The prompt's six attachments are `AttachmentRef`s in its log entry (§3.2).
-  const entry = (view.log as Array<{ turn: { prompt: Array<{ type: string; text?: string }> } }>)
-    .find(({ turn }) => turn.prompt.some((block) => block.type === "text" && block.text?.includes("attachment-input-flow")));
-  expect(entry?.turn.prompt.filter((block) => block.type === "attachment")).toHaveLength(6);
+  // The prompt's six attachments are `AttachmentRef`s in its log entry (§3.1).
+  type Chunks = { chunks: Array<{ content: { type: string; text?: string } }> };
+  const prompts = (view.log as Array<{ turn: { items: Chunks[] } }>)
+    .map(({ turn }) => turn.items[0]?.chunks.map(({ content }) => content) ?? []);
+  const logged = prompts.find((blocks) => blocks.some((block) => block.type === "text" && block.text?.includes("attachment-input-flow")));
+  expect(logged?.filter((block) => block.type === "attachment")).toHaveLength(6);
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("attachment-chips-mobile.png") });
 
@@ -1846,16 +1849,16 @@ test("reviews Agent-reported ACP diffs without inventing editor actions", async 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(review.locator(".change-review-panel")).toBeVisible();
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process stays with its settled turn (protocol S8).
   await turnEnd.release("review");
-  await expectProcessRemoved(page, page.locator(".change-review, .tool-card"));
+  await expectProcessSettled(page, ".change-review, .tool-card");
   expect(browserErrors).toEqual([]);
 });
 
-// Reported changes come from tool calls, which are process: a turn shows them
-// while it runs, and its commit removes them (protocol S2). They never move to
+// Reported changes come from tool calls: a turn shows them while it runs and
+// keeps them once it settles (protocol S8), as in v0.2.8. They never move to
 // another turn or to the composer dock.
-test("shows file changes only in the running turn that reported them", async ({ page, turnEnd }) => {
+test("keeps file changes with their original turns across later prompts", async ({ page, turnEnd }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");
   const thread = page.getByRole("region", { name: "Conversation thread" });
@@ -1872,27 +1875,30 @@ test("shows file changes only in the running turn that reported them", async ({ 
   await reviews.first().locator(".change-review-trigger").click();
   await expect(reviews.first().locator(".change-review-panel")).toBeVisible();
   await turnEnd.release("first");
-  await expectProcessRemoved(page, reviews);
+  await expectProcessSettled(page, ".change-review");
   await expect(turnOf("review-flow first edit")).toContainText("Reported two workspace changes.");
 
   await composer.fill("stream-follow-flow without edits");
   await composer.press("Enter");
   await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
-  await expect(reviews).toHaveCount(0);
+  await expect(reviews).toHaveCount(1);
+  await expect(turnOf("stream-follow-flow without edits").getByLabel("Agent-reported changes")).toHaveCount(0);
 
   await composer.fill("review-flow second edit [hold:second]");
   await composer.press("Enter");
   await turnEnd.reached("second");
-  await expect(reviews).toHaveCount(1);
+  await expect(reviews).toHaveCount(2);
   await expect(turnOf("review-flow second edit").getByLabel("Agent-reported changes")).toHaveCount(1);
-  await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes")).toHaveCount(0);
-  await expect(reviews.first().locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "false");
-  await expect(reviews.first().locator(".change-review-trigger")).toContainText("2 files");
-  await expect(reviews.first().locator(".change-review-trigger")).toContainText("+4");
+  await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes")).toHaveCount(1);
+  const second = turnOf("review-flow second edit").getByLabel("Agent-reported changes");
+  await expect(second.locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "false");
+  await expect(second.locator(".change-review-trigger")).toContainText("2 files");
+  await expect(second.locator(".change-review-trigger")).toContainText("+4");
   await expect(page.locator(".composer-dock .change-review")).toHaveCount(0);
   await turnEnd.release("second");
-  await expectProcessRemoved(page, reviews);
+  await expectProcessSettled(page, ".change-review");
   await expect(page.getByText("Reported two workspace changes.", { exact: false })).toHaveCount(2);
+  await expect(thread.locator(".tool-card").filter({ hasText: "Edit workspace files" })).toHaveCount(2);
   expect(browserErrors).toEqual([]);
 });
 
@@ -2049,9 +2055,9 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
     expect(expandedLayout.titleHeightOverflow).toBe(false);
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   }
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process stays with its settled turn (protocol S8).
   await turnEnd.release("activity");
-  await expectProcessRemoved(page, page.locator(".thinking-block, .tool-card"));
+  await expectProcessSettled(page, ".thinking-block, .tool-card");
   expect(browserErrors).toEqual([]);
 });
 
@@ -2085,9 +2091,9 @@ test("uses one visual language for structured tool input and Markdown tool outpu
   expect(outputAppearance).toEqual(inputAppearance);
   expect(inputAppearance.background).not.toBe("rgba(0, 0, 0, 0)");
   expect(inputAppearance.radius).toBe("6px");
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process stays with its settled turn (protocol S8).
   await turnEnd.release("tool-content");
-  await expectProcessRemoved(page, page.locator(".tool-card"));
+  await expectProcessSettled(page, ".tool-card");
   expect(browserErrors).toEqual([]);
 });
 
@@ -2155,9 +2161,9 @@ test("keeps wide tool tables scrollable and long resource names compact with ful
     expect(resourceLayout.textOverflow).toBe("ellipsis");
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   }
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process stays with its settled turn (protocol S8).
   await turnEnd.release("tool-layout");
-  await expectProcessRemoved(page, page.locator(".tool-card"));
+  await expectProcessSettled(page, ".tool-card");
   expect(browserErrors).toEqual([]);
 });
 
@@ -2498,9 +2504,9 @@ test("searches the visible ACP Agent thread with Zed-style match navigation", as
   await page.getByRole("button", { name: "Search Agent thread" }).click();
   await expect(page.getByRole("search", { name: "Search this Agent thread" })).toBeVisible();
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process stays with its settled turn (protocol S8).
   await turnEnd.release("search");
-  await expectProcessRemoved(page, page.locator(".thinking-block, .tool-card"));
+  await expectProcessSettled(page, ".thinking-block, .tool-card");
   expect(browserErrors).toEqual([]);
 });
 
@@ -2552,12 +2558,12 @@ test("preserves terminal content beside additional output and searches only expa
   await expect(info).toContainText("Locations");
   await expect(info).toContainText('"terminalId"');
   await expect(search.locator("output")).toHaveText("1/1");
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
-  // Release, then the turn ends: the tool card was process and the released
-  // terminal keeps no output record.
+  // Release, then the turn ends: the tool card settles with its turn
+  // (protocol S8). The released terminal's output is not kept until
+  // migration step 15, so the card no longer embeds it.
   await turnEnd.release("terminal");
-  await expectProcessRemoved(page, page.locator(".tool-card"));
-  await expect(page.getByText("TERMINAL_FLOW_OUTPUT")).toHaveCount(0);
+  await expectProcessSettled(page, ".tool-card");
+  await expect(page.locator(".terminal-embed pre").filter({ hasText: "TERMINAL_FLOW_OUTPUT" })).toHaveCount(0);
   expect(browserErrors).toEqual([]);
 });
 
@@ -2593,21 +2599,22 @@ test("keeps live terminal output across reconnect and drops it for every observe
     await openRunningCard(observer);
     await writeFile(gatePath, "finish");
     // The fixture releases its terminal and ends the turn back to back; the
-    // tool card was process and the released terminal keeps no output record
-    // (protocol S2, §4.6). protocol-ui.pw.ts holds the two apart with separate
-    // barriers ("keeps a session terminal after its operation ends ...").
+    // tool card settles with its turn (protocol S8), and the released
+    // terminal's output is not kept until migration step 15. protocol-ui.pw.ts
+    // holds the two apart with separate barriers ("keeps a session terminal
+    // after its operation ends ...").
     for (const tab of [page, observer]) {
       await expect(tab.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
-      await expect(cardFor(tab)).toHaveCount(0);
-      await expect(tab.getByText(/LIVE_START/u)).toHaveCount(0);
+      await expect(cardFor(tab)).toHaveCount(1);
+      await expect(tab.locator(".terminal-embed pre").filter({ hasText: /LIVE_START/u })).toHaveCount(0);
     }
 
     const api = trackApi(page);
     await page.reload();
     const restoredPrompt = page.locator(".message-user").filter({ hasText: `terminal-live-flow ${gatePath}` });
     await expect(restoredPrompt).toBeVisible();
-    await expect(cardFor(page)).toHaveCount(0);
-    await expect(page.getByText(/LIVE_START/u)).toHaveCount(0);
+    await expect(cardFor(page)).toHaveCount(1);
+    await expect(page.locator(".terminal-embed pre").filter({ hasText: /LIVE_START/u })).toHaveCount(0);
     expect(api.streams.length).toBeGreaterThan(0);
     expect(api.process).toEqual([]);
     expect(api.v1).toEqual([]);
@@ -2656,9 +2663,9 @@ test("collapses completed ACP compaction summaries into a Zed-style thread discl
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(compaction).toBeVisible();
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process stays with its settled turn (protocol S8).
   await turnEnd.release("compaction");
-  await expectProcessRemoved(page, page.locator(".compaction-card"));
+  await expectProcessSettled(page, ".compaction-card");
   expect(browserErrors).toEqual([]);
 });
 
@@ -2748,9 +2755,9 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
   await page.keyboard.press("Escape");
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
 
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process stays with its settled turn (protocol S8).
   await turnEnd.release("actions");
-  await expectProcessRemoved(page, page.locator(".thinking-block"));
+  await expectProcessSettled(page, ".thinking-block");
   await response.focus();
   await page.keyboard.press("Shift+F10");
   menu = page.getByRole("menu", { name: "Agent response actions" });
@@ -3820,9 +3827,20 @@ async function expectRunningProcess(page: Page, entry: Locator): Promise<void> {
   await expect(entry.first()).toBeVisible();
 }
 
-/** The turn committed and its process left the thread with it. */
-async function expectProcessRemoved(page: Page, process: Locator): Promise<void> {
+/**
+ * The last turn settled and keeps its process (protocol S8): folded under
+ * its disclosure when the thread is at the bottom, shown once expanded.
+ */
+async function expectProcessSettled(page: Page, selector: string): Promise<void> {
   await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
-  await expect(process).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
+  const turn = page.locator(".conversation-turn").last();
+  await expect(turn.locator(".turn-stop")).toBeVisible();
+  const process = turn.locator(selector);
+  const expand = turn.getByRole("button", { name: "Expand execution process", exact: true });
+  if (await expand.count()) {
+    await expect(expand).toHaveAttribute("aria-expanded", "false");
+    await expect(process.first()).toBeHidden();
+    await expand.click();
+  }
+  await expect(process.first()).toBeVisible();
 }

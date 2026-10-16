@@ -84,9 +84,12 @@ export function globalLive(replica: Replica | undefined): GlobalLive | undefined
   return replica?.live as GlobalLive | undefined;
 }
 
-/** The text of a log entry's reply, its text blocks joined. */
+/** The text of a log entry's Agent messages, their text chunks joined. */
 export function replyText(entry: LogEntry): string {
-  return entry.turn.reply.map((block) => (block.type === "text" ? block.text : "")).join("");
+  return entry.turn.items
+    .flatMap((item) => (item.type === "message" && item.role === "agent" ? item.chunks : []))
+    .map(({ content }) => (content.type === "text" ? content.text : ""))
+    .join("");
 }
 
 /** One SSE stream as `EventSource` offers it; it reports a failure once, through `onerror`. */

@@ -95,7 +95,7 @@ function have(url: string): string[] {
 }
 
 function entry(text: string, hash: string): LogEntry {
-  return { turn: { prompt: [{ type: "text", text }], reply: [] }, hash };
+  return { turn: { items: [{ type: "message", role: "user", chunks: [{ content: { type: "text", text: text } }] }] }, hash };
 }
 
 const e1 = entry("one", "h1-aaaaaaaaaaaaaaaaaaa");

@@ -201,7 +201,7 @@ describe("v2 workspace lifecycle review", () => {
     expect(acp.sessionOpening).toEqual({ sessionId });
     const history: LogEntry = {
       hash: "BBBBBBBBBBBBBBBBBBBBBA",
-      turn: { prompt: [{ type: "text", text: "Question" }], reply: [{ type: "text", text: "Recovered answer" }] },
+      turn: { items: [{ type: "message", role: "user", chunks: [{ content: { type: "text", text: "Question" } }] }, { type: "message", role: "agent", chunks: [{ content: { type: "text", text: "Recovered answer" } }] }] },
     };
     await emit(retry, {
       scope, log: { from: 0, prev: H0, entries: [history] },

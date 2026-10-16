@@ -14,23 +14,30 @@ const OUTPUT: &str = "shared/protocol.ts";
 /// ACP types embedded verbatim; they come from the SDK and are not regenerated.
 const ACP_TYPES: &[&str] = &[
     "AvailableCommand",
+    "CompactionStatus",
     "ContentBlock",
     "Cost",
     "CreateElicitationRequest",
     "CreateElicitationResponse",
     "InitializeResponse",
+    "Plan",
+    "PlanRemoved",
+    "PlanUpdate",
     "PromptResponse",
     "RequestPermissionOutcome",
     "RequestPermissionRequest",
     "SessionConfigOption",
     "SessionMode",
     "SessionUpdate",
+    "ToolCallUpdate",
 ];
 
 /// Projections of ACP types that ts-rs cannot express. A process update is the
 /// SDK's `SessionUpdate` with each content position (the fields
-/// `attachments::update_blocks` visits) normalized to a `Block` (§4.4).
+/// `attachments::update_blocks` visits) normalized to a `Block` (§4.4); a tool
+/// item's state is the SDK's `ToolCallUpdate`, normalized the same way (§3.1).
 const PROJECTED_TYPES: &[&str] = &[
+    "type ToolCallState = ProjectedToolCall<ToolCallUpdate>;",
     "type ProcessUpdate = ProjectedFields<Extract<SessionUpdate, { sessionUpdate: \"user_message_chunk\" | \"agent_message_chunk\" | \"agent_thought_chunk\" | \"compaction_summary_chunk\" }>, \"content\"> | ProjectedFields<Extract<SessionUpdate, { sessionUpdate: \"compaction_update\" }>, \"summary\"> | ProjectedToolCall<Extract<SessionUpdate, { sessionUpdate: \"tool_call\" | \"tool_call_update\" }>> | Exclude<SessionUpdate, { sessionUpdate: \"user_message_chunk\" | \"agent_message_chunk\" | \"agent_thought_chunk\" | \"compaction_summary_chunk\" | \"compaction_update\" | \"tool_call\" | \"tool_call_update\" }>;",
     "type ProjectedFields<T, K extends PropertyKey> = T extends unknown ? { [P in keyof T]: P extends K ? ProjectedBlocks<T[P]> : T[P] } : never;",
     "type ProjectedBlocks<V> = V extends ContentBlock ? Block : V extends Array<infer B> ? Array<ProjectedBlocks<B>> : V;",
@@ -51,6 +58,14 @@ fn declarations(cfg: &Config) -> Vec<String> {
         Op,
         AppendTail,
         Turn,
+        Item,
+        MessageItem,
+        Role,
+        Chunk,
+        ToolItem,
+        PlanItem,
+        CompactionItem,
+        TurnEnd,
         Block,
         PromptBlock,
         AttachmentRef,

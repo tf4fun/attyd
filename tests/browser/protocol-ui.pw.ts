@@ -11,6 +11,7 @@ import type { Event, GlobalLive, LogEntry, OpRequest } from "../../shared/protoc
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
 import {
   BarrierProxy,
+  entryBlocks,
   entryText,
   globalLive,
   headParam,
@@ -846,7 +847,7 @@ test.describe("resources and media", () => {
     await send(page, "image");
     await expect(page.getByText("Image reply.", { exact: true })).toBeVisible();
     await expect.poll(() => logOf(tap, ALPHA).length).toBe(2);
-    const reply = logOf(tap, ALPHA)[1]!.turn.reply;
+    const reply = entryBlocks(logOf(tap, ALPHA)[1]!, "reply");
     const attachment = reply.find((block) => block.type === "attachment");
     expect(attachment).toMatchObject({ type: "attachment", block: "image", mimeType: "image/png" });
     const attachmentId = attachment?.type === "attachment" ? attachment.id : "";

@@ -378,6 +378,24 @@ async fn permission(
                     "A permission request is already pending for tool call: {tool_call_id}"
                 )));
             }
+            // The permission's tool call is a tool update of the running
+            // turn's timeline (protocol §3.2).
+            if state
+                .sessions
+                .state(&session_id)
+                .is_some_and(|session| {
+                    session.phase == crate::session_mirror::MirrorPhase::Running
+                })
+                && let Some(operation_id) = session_mirror(&mut state)
+                    .active_operation_id(&session_id)
+                    .map(str::to_string)
+            {
+                let mut update = tool_call.clone();
+                update["sessionUpdate"] = serde_json::Value::from("tool_call_update");
+                session_mirror(&mut state)
+                    .append_turn_update(&session_id, &operation_id, update)
+                    .map_err(mirror_error)?;
+            }
             state
                 .sessions
                 .bind_interaction(&permission_id, OpScope::Session(session_id.clone()));

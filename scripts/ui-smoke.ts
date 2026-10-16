@@ -76,7 +76,7 @@ try {
     assert.equal((completed.result as PromptResult).stopReason, "max_tokens");
     const log = client.replicas.get(scope)!.log;
     assert.equal(log.length, loaded.log.length + 1);
-    assert.match(JSON.stringify(log.at(-1)?.turn.prompt), /usage-flow/u);
+    assert.match(JSON.stringify(log.at(-1)?.turn.items[0]), /usage-flow/u);
 
     const deletion = await client.ops.write("global", { kind: "delete", args: { sessionId: "saved-session" } });
     assert.ok(deletion.kind === "accepted", JSON.stringify(deletion));

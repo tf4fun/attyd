@@ -18,7 +18,7 @@ import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Event, GlobalLive, LogEntry, OpRequest, SessionLive } from "../../shared/protocol";
+import type { Block, Event, GlobalLive, LogEntry, OpRequest, SessionLive } from "../../shared/protocol";
 import { applyEvent, createReplica, headOf, type Replica } from "../../shared/replica";
 import { startRustTestServer, type RustTestServer } from "../../scripts/rust-test-server";
 
@@ -487,9 +487,19 @@ export function hasLog(scope: string): (event: Event) => boolean {
   return (event) => event.scope === scope && "log" in event;
 }
 
-/** The text of a log entry's blocks. */
+/** The blocks of a log entry's prompt (its first user message) or of its Agent messages. */
+export function entryBlocks(entry: LogEntry, part: "prompt" | "reply"): Block[] {
+  const [first, ...rest] = entry.turn.items;
+  const messages = part === "prompt"
+    ? (first?.type === "message" && first.role === "user" ? [first] : [])
+    : (first?.type === "message" && first.role === "user" ? rest : entry.turn.items)
+      .flatMap((item) => item.type === "message" && item.role === "agent" ? [item] : []);
+  return messages.flatMap(({ chunks }) => chunks.map(({ content }) => content));
+}
+
+/** The text of a log entry's prompt or Agent messages. */
 export function entryText(entry: LogEntry, part: "prompt" | "reply"): string {
-  return entry.turn[part].map((block) => block.type === "text" ? block.text : `[${block.type}]`).join("");
+  return entryBlocks(entry, part).map((block) => block.type === "text" ? block.text : `[${block.type}]`).join("");
 }
 
 /**

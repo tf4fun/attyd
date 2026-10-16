@@ -1130,7 +1130,14 @@ async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
     assert_eq!(commit["log"]["from"], 0);
     assert_eq!(
         commit["log"]["entries"][0]["turn"],
-        json!({ "prompt": [text("hi")], "reply": [text("hello")] })
+        json!({
+            "items": [
+                {"type": "message", "role": "user", "chunks": [{"content": text("hi")}]},
+                {"type": "message", "role": "agent", "messageId": "answer", "chunks": [{"content": text("hello")}]},
+                {"type": "tool", "call": {"toolCallId": "tool", "title": "Confirm", "status": "pending"}},
+            ],
+            "end": {"response": {"stopReason": "end_turn"}},
+        })
     );
     peer.gate.assert_committed_atomically(&scope, &json!(op));
     let live = peer.live(&scope);
@@ -1361,7 +1368,13 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
     assert_eq!(source_log.len(), 1);
     assert_eq!(
         source_log[0]["turn"],
-        json!({"prompt": [text("source prompt")], "reply": [text("source reply")]})
+        json!({
+            "items": [
+                {"type": "message", "role": "user", "chunks": [{"content": text("source prompt")}]},
+                {"type": "message", "role": "agent", "messageId": "source-reply", "chunks": [{"content": text("source reply")}]},
+            ],
+            "end": {"response": {"stopReason": "end_turn"}},
+        })
     );
     let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
     let request = peer.request("session/fork").await;
@@ -1477,8 +1490,10 @@ async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
     );
     assert_eq!(
         peer.log("session/forked")[0]["turn"],
-        json!({"prompt": [], "reply": [text("Forked session.")]}),
-        "adjacent plain text blocks merge (protocol §3.2)"
+        json!({"items": [
+            {"type": "message", "role": "agent", "messageId": "welcome", "chunks": [{"content": text("Forked session.")}]},
+        ]}),
+        "adjacent plain text chunks join (protocol §3.2)"
     );
     peer.settled().await;
 }
