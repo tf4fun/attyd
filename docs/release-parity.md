@@ -1,6 +1,6 @@
 # Release parity
 
-Status: draft for review, 2026-10-16 (#51). It compares the user-visible capabilities
+Status: settled, 2026-10-16 (#51). It compares the user-visible capabilities
 of the last release with the current `main` and with [protocol revision 2](protocol.md),
 so that the protocol's simplification removes no released capability.
 
@@ -8,7 +8,7 @@ so that the protocol's simplification removes no released capability.
 | --- | --- | --- |
 | release | **v0.2.8**, `a5b07ff`, 2026-09-18 | the tag; its `docs/acp-coverage.md`, `docs/active-turn-runtime.md`, web and browser tests |
 | current | `main`, `a7eb3b4`: protocol revision 1 | [fidelity audit](acp-fidelity-audit.md) |
-| target | protocol revision 2 (this draft) | [protocol.md](protocol.md); migration in [state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2) |
+| target | protocol revision 2 (target specification; not implemented) | [protocol.md](protocol.md); migration in [state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2) |
 
 **Classes.**
 
@@ -17,8 +17,8 @@ so that the protocol's simplification removes no released capability.
   Internal models and endpoints of v0.2.8 are not restored.
 - **Regression**: v0.2.8 had it and `main` lost it. The target restores it, in the
   migration step named; it is not an accepted limitation.
-- **Decision**: a product tradeoff where the target does not simply restore v0.2.8. It
-  is open to review and is not accepted by being listed.
+- **Decision**: a product tradeoff where the target does not simply restore v0.2.8.
+  Each is settled below with the rule the target keeps.
 
 **Acceptance.** A regression is closed only by a test that exercises the v0.2.8
 behavior against the target. A test that was deleted, or changed to assert that the
@@ -127,12 +127,12 @@ written from the ACP input, not from the projection.
 
 Their acceptance is redesign §11 cases 28, 29 and 37 (R1, R2), 32 (R3) and 11 (R4). The other regressions are the audit's defects D1–D5, D8–D10, restored as listed above.
 
-## Decisions open to review
+## Decisions
 
-| ID | Question | Proposal |
+| ID | Question | Decision |
 | --- | --- | --- |
 | P1 | v0.2.8 showed raw events of other sessions, a consequence of its single-session event stream. | Not restored. Each session's state is its own document, and `global.sessions` shows every held session's operation and pending interactions; a client opens any of them. Restoring a raw event list would need an event log the target does not keep. |
 | P2 | Stop reason, usage and terminal output of turns observed live are lost when the session is released and loaded again, because ACP replays neither. | Same as v0.2.8, which lost them on a cold load as well. Not kept beyond the session's documents, since that needs persistence. |
-| P4 | How a URL flow's outcome reaches clients. v0.2.8 showed it only to pages connected when it happened and kept no record. | The flow stays in `urlFlows` with its outcome until a client dismisses it or the session scope that shows it ends; only `waiting` changes, so a late completion or connection end never overwrites an outcome; it then shows after a reconnect too, which v0.2.8 did not promise and the target does not require. No finished-flow table, request record or reconnect log. Open: whether a finished flow should instead be removed after the first client acknowledges it. v0.2.8 also aborted session flows on a prompt cancel; ACP states no such rule and the target does not (audit Q2). |
+| P4 | How a URL flow's outcome reaches clients. v0.2.8 showed it only to pages connected when it happened and kept no record. | The flow stays in `urlFlows` with its outcome until a client dismisses it or the session scope that shows it ends; only `waiting` changes, so a late completion or connection end never overwrites an outcome; it then shows after a reconnect too, which v0.2.8 did not promise and the target does not require. No finished-flow table, request record or reconnect log. v0.2.8 also aborted session flows on a prompt cancel; ACP states no such rule and the target does not (audit Q2). |
 | P3 | v0.2.8's unobserved timeout could close a session while it ran; `main` and the target release only a session nothing needs. | Keep the target's rule: a running prompt is never cut by a timer. |
 | P5 | Whether the answer to a request-scoped elicitation's parent request ends a URL flow the user already accepted. The pinned schema ties the elicitation to "a specific JSON-RPC request" (`v1/elicitation.rs:1539`) and states no rule for an accepted external flow; it is a product choice, not an ACP requirement. | **Settled: it does not.** The parent's response, success or error, cancels only interactions not yet answered; an accepted flow stays `waiting` until a completion, the connection's end, a dismissal or the end of its document, and the answered request is not remembered. This follows Zed's ACP v1 client at [`28d0a35`](https://github.com/zed-industries/zed/commit/28d0a3547f16b9609b301b48ab363bfca649c864), used as an implementation reference only (our ACP pins stay): [authenticate](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/agent_servers/src/acp/v1.rs#L1545-L1563) does not touch accepted flows when its request returns; the shared thread model's [state changes](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/acp_thread/src/acp_thread.rs#L610-L646) and [`finish_request` / `cancel_request`](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/acp_thread/src/acp_thread.rs#L774-L798) keep accepted URL flows on a finish and end them only on a cancel; [completions](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/agent_servers/src/acp.rs#L757-L780) route by `elicitationId`, only from accepted. Not taken: Zed's display, which [shows](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/agent_ui/src/conversation_view/elicitation.rs#L1822-L1829) only pending and accepted flows (R4 needs both outcomes), and its session cancel ending URL flows (audit Q2 stands). |

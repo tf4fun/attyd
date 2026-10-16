@@ -1,6 +1,6 @@
 # Client API redesign
 
-Status: **revision 2, second draft for review, 2026-10-16 (#51)**; revision 1 was settled
+Status: **revision 2, settled as the target specification, 2026-10-16 (#51)**; revision 1 was settled
 in review on 2026-10-14 (sixth version) and is what `main` implements. §3 is the
 complete rule set; the later sections specify and derive from it. Revision 2 keeps
 revision 1's replication (alignment, admission, holding) and changes what the
@@ -970,7 +970,7 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
 The bridge's handling of ACP failures and its internal clean-up belong to layer 1 and
 are tested there. They add no duties to clients.
 
-## 12. Defaults open to review
+## 12. Defaults
 
 Revision 1's defaults 1 and 5 (`canon` takes message content only; a completed turn's
 process disappears from every client) are withdrawn by S8. The remaining ones, and

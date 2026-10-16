@@ -1,6 +1,6 @@
 # ACP fidelity audit
 
-Status: second draft for review, 2026-10-16 (#51). It audits the browser protocol as
+Status: settled, 2026-10-16 (#51). It audits the browser protocol as
 implemented on `main` (`a7eb3b4`, protocol revision 1) against the pinned ACP schema,
 and records the evidence for [protocol revision 2](protocol.md). Capabilities of the
 last release, v0.2.8, are compared separately in the
@@ -31,8 +31,8 @@ Classes:
   did not offer either. It is not an ACP violation; each is either kept with a reason
   or scheduled.
 - **Boundary**: a deliberate product scope that stays (§4).
-- **Open**: the pinned schema does not settle the question; the draft states the rule
-  it chose.
+- **Open**: the pinned schema does not settle the question; the audit states the rule
+  revision 2 chose (§5).
 
 ## 2. Defects
 
@@ -52,12 +52,12 @@ Classes:
 
 ## 3. Limitations
 
-The first draft listed controls during a prompt (L1) and the absence of an explicit
+An earlier version of this audit listed controls during a prompt (L1) and the absence of an explicit
 close (L2) here. Both were released in v0.2.8, so they are regressions R1 and R2 of
 the [release parity matrix](release-parity.md#regressions), restored by actions
 (protocol §7); they are no longer limitations.
 
-| ID | Limitation | ACP basis | Decision in this draft |
+| ID | Limitation | ACP basis | Decision |
 | --- | --- | --- | --- |
 | L3 | A prompt's stop reason and usage were visible only on `op` until the next operation replaced it. | `PromptResponse` (`v1/agent.rs:3096–3118`) | Resolved by D4's target: `Turn.end` carries the response. |
 | L4 | A resume-only session is released like a loadable one, which loses the history the bridge held. | resume returns no messages (`v1/agent.rs:1277`) | Kept, as in v0.2.8, which released it too and showed a missing-history notice; `history: "partial"` makes it explicit (D9). Keeping such sessions held instead trades memory for history (redesign §12). |
@@ -76,9 +76,9 @@ These stay as they are; the audit does not widen the product:
   is not interpreting it, and the UI need not render it.
 - ACP methods need no one-to-one HTTP endpoint.
 
-## 5. Open questions
+## 5. Questions the schema leaves open
 
-| ID | Question | Rule this draft chose |
+| ID | Question | Rule revision 2 chose |
 | --- | --- | --- |
 | Q1 | A chunk with `messageId` A after a message B, or after a tool: one message A continued, or a new one? | A new item with `messageId` A: the timeline keeps the order and the shared ID keeps the message's identity (§3.2, rule 1). In a replay, a user item that continues the turn's opening user message does not start a turn (§3.3). |
 | Q2 | Does `session/cancel` end pending session-scoped elicitations? The schema states it only for permissions. | No; they end when answered, cancelled by the Agent, or with their scope (§4.4). `session/close` ends the session, and with it all of them (§7). |
@@ -103,7 +103,7 @@ Listed so that none is mistaken for supported behavior:
 
 ## 7. Coverage by ACP surface
 
-Status of revision 1 (current code) and of revision 2 (this draft). "Kept" means
+Status of revision 1 (current code) and of revision 2 (the target specification). "Kept" means
 revision 2 does not change the surface.
 
 | ACP surface | Pinned basis | Revision 1 | Revision 2 |

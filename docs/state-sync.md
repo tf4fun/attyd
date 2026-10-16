@@ -1,7 +1,8 @@
 # Sync protocol implementation plan
 
 Status: revision 1 implemented, steps 1–9, 2026-10-15 (§5). Revision 2 of the
-protocol (#51) is planned in §7 and **not implemented**; where this document
+protocol (#51) is settled as the target specification and planned in §7; it is
+**not implemented**; where this document
 describes `canon`, the commit of a turn, `op.process` or I8, it describes revision 1.
 This document is how the bridge implements
 [attyd protocol v2](protocol.md), settled in
@@ -406,7 +407,7 @@ visibly in step 7.
 
 ## 7. Fidelity migration (revision 2)
 
-Status: **planned, not started.** [Protocol revision 2](protocol.md) changes what the
+Status: **step 10 (docs) done; steps 11–20 not started.** [Protocol revision 2](protocol.md) changes what the
 documents carry, not how they are replicated: the commit step, the Hub, alignment,
 coalescing, admission and holding stay. The [audit](acp-fidelity-audit.md) lists the
 defects (D1–D11) and the [release parity matrix](release-parity.md) the v0.2.8
@@ -477,7 +478,7 @@ request records or epochs.
 
 | Step | Work | Removes | Acceptance (redesign §11) |
 | --- | --- | --- | --- |
-| 10 | Docs: this revision, the audit, the release parity matrix, the coverage ledger | — | review |
+| 10 | Docs: this revision, the audit, the release parity matrix, the coverage ledger | — | review (done) |
 | 11 | Timeline reducer and entry shape: items, `end`, `_meta`, message boundaries, attachments as received, hash over the entry; live commits and replays through it; generated TypeScript; the web projection renders items from the log as it renders `op.process` today. Prompt `end` on completed and cancelled turns. | D1, D2, D3, D6, D7 | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36 |
 | 12 | Settling of failed and interrupted prompts | D4 | 2, 22 |
 | 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |

@@ -1,6 +1,6 @@
 # attyd protocol v2
 
-Status: **target specification, revision 2 (second draft, #51), 2026-10-16.** It is
+Status: **target specification, revision 2 (settled, #51), 2026-10-16.** It is
 served under `/api/v2`, the only browser API since `/api/v1` was removed (PR #46).
 Revision 1 (2026-10-14) is what the code on `main` implements: it kept only the text of
 user and Agent messages in the log and dropped every other session update once a turn
