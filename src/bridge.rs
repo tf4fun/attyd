@@ -595,12 +595,14 @@ fn serialized_value_len(value: &impl Serialize) -> usize {
     serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.0)
 }
 
-fn conversation_notification_values(updates: &[SessionNotification]) -> Vec<Value> {
+/// The conversation updates among a session's early notifications, bare as a
+/// replay gives them to `TurnLog::from_replay`.
+fn conversation_updates(updates: &[SessionNotification]) -> Vec<Value> {
     updates
         .iter()
         .filter_map(|notification| {
-            let value = serde_json::to_value(notification).ok()?;
-            is_conversation_update(value.get("update").unwrap_or(&Value::Null)).then_some(value)
+            let update = serde_json::to_value(&notification.update).ok()?;
+            is_conversation_update(&update).then_some(update)
         })
         .collect()
 }
@@ -2980,6 +2982,10 @@ async fn handle_command_inner(
                     }
 
                     session_mirror(&mut state).register_new(session_id.clone());
+                    // The Agent's messages before the response are the
+                    // session's first history (#8).
+                    session_mirror(&mut state)
+                        .replace_session_log(&session_id, &conversation_updates(&early_updates));
                     state.sessions.complete_scope_operation(
                         &OpScope::Global,
                         OpKind::Create,
@@ -3482,13 +3488,14 @@ async fn handle_command_inner(
                     return Err(error);
                 }
             };
-            let target_history = conversation_notification_values(&early_updates);
-            let target_log = if target_history.is_empty() {
+            // Early updates with no message entry, such as a thought or a
+            // plan alone, leave the target with the source's turns.
+            let target_history =
+                crate::protocol::canon::TurnLog::from_replay(&conversation_updates(&early_updates));
+            let target_log = if target_history.entries().is_empty() {
                 source_log
             } else {
-                Some(Arc::new(crate::protocol::canon::TurnLog::from_replay(
-                    &target_history,
-                )))
+                Some(Arc::new(target_history))
             };
             let target_replay = Some(notification_values(&early_updates));
             let epoch = state.sessions.epoch().to_string();
