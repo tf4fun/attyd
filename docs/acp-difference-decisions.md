@@ -31,9 +31,9 @@
 
 | 编号/对应审查 | ACP 允许什么 | Zed 当前实现 | attyd 审查时实现 | 决策状态与实施内容 |
 | --- | --- | --- | --- | --- |
-| T01 / A10 | 生成中可切 mode/config；close 可取消活动工作 | 控制请求不以 prompt idle 为前置，thread release 可 close | 同 session 的 prompt 与控制/lifecycle mutation 互斥 | 已由协议 v2 S5/S6 取代（PR #46）：同一 scope 一次只运行一个操作，prompt 运行时不接受设置；没有客户端关闭操作，离开只是停止关注；会话不再被需要后才按 CLI 时长释放，绝不切断运行中的工作。 |
-| T02 / A18 | 不规定客户端累计历史内存预算 | 编辑器实体和资源生命周期与 Web bridge 不同，不能直接移植预算 | 明确选择完整保留当前物化会话，不按累计字节截断；关闭/释放时回收 | 现行（协议 S6）：会话没有订阅、运行或占用中的操作、未释放终端或已接受 URL flow 时，达到 CLI 配置时长后释放，且只释放 Agent 能 load 或 resume 的会话。不增加累计历史裁剪或持久化。 |
-| T03 / A07、A08 的无历史部分 | resume 独立于 load，不返回旧历史；fork 能力也不隐含 load | resume 可继续而不补 load；固定外部 adapter 没有 fork | 公开冷恢复需要 load；resume/fork 仍有 load 能力硬前置 | 现行（协议 S1）：log 由 Agent 回放构建，空回放即空 log；Agent 重启后的 resume 保留已知 log；fork 无回放时沿用来源会话已知的 log。缺失历史提示和带标注的来源快照已删除。 |
+| T01 / A10 | 生成中可切 mode/config；close 可取消活动工作 | 控制请求不以 prompt idle 为前置，thread release 可 close | 同 session 的 prompt 与控制/lifecycle mutation 互斥 | 已由协议 v2 S5/S6 取代（PR #46）：同一 scope 一次只运行一个操作，prompt 运行时不接受设置；没有客户端关闭操作，离开只是停止关注；会话不再被需要后才按 CLI 时长释放，绝不切断运行中的工作。**2026-10-16 更正（#51，[审计](acp-fidelity-audit.md) L1、L2）：**“生成中不可设置”是 attyd 的产品限制，不是 ACP 要求（schema 1.7.0 `v1/agent.rs:4898–4899` 允许生成中 set_mode）；它也是 v0.2.8 已有能力的回退（[发布对照](release-parity.md) R1、R2）；协议修订 2 把设置与关闭改为 action，生成中也可执行（state-sync §7 步骤 18）。当前代码尚未迁移。 |
+| T02 / A18 | 不规定客户端累计历史内存预算 | 编辑器实体和资源生命周期与 Web bridge 不同，不能直接移植预算 | 明确选择完整保留当前物化会话，不按累计字节截断；关闭/释放时回收 | 现行（协议 S6）：会话没有订阅、运行或占用中的操作、未释放终端或已接受 URL flow 时，达到 CLI 配置时长后释放，且只释放 Agent 能 load 或 resume 的会话。不增加累计历史裁剪或持久化。**2026-10-16 补充（#51，L4、D8）：**修订 2 起，“被需要”只计仍可行动的资源（待回答交互、未释放终端、等待中的 URL flow）；已释放终端的冻结输出在仍被工具内容引用时保留，但不保活会话。仅能 resume 的会话释放后再打开，历史标记为 `partial`。 |
+| T03 / A07、A08 的无历史部分 | resume 独立于 load，不返回旧历史；fork 能力也不隐含 load | resume 可继续而不补 load；固定外部 adapter 没有 fork | 公开冷恢复需要 load；resume/fork 仍有 load 能力硬前置 | 现行（协议 S1）：log 由 Agent 回放构建，空回放即空 log；Agent 重启后的 resume 保留已知 log；fork 无回放时沿用来源会话已知的 log。缺失历史提示和带标注的来源快照已删除。**2026-10-16 更正（#51，D9）：**“空回放即空 log”对 resume 不成立：resume 按 ACP 不返回旧消息（`v1/agent.rs:1277`），把未知历史当成已知空历史是缺陷。修订 2 区分未知、`complete` 与 `partial`；load 的回放仍为准，fork 规则不变。当前代码尚未迁移。 |
 | T04 / A21 | 有 configOptions 时 SHOULD 排他使用它，legacy modes 仍在 v1 | 存在 configOptions 就不用 legacy modes | 仅发现 mode 类 config 时隐藏 legacy modes | 已实施：遵循 ACP 建议及 Zed，提供 configOptions 就排他使用；未提供才回退 modes，显式空数组不触发回退。 |
 | T05 / 终端执行 | 要求 create/output/wait/kill/release 语义，不规定 shell、PTY 或 detached 子进程政策 | 本地 Unix 固定 /bin/sh，Windows 优先 Git Bash；项目环境、PTY、交互 shell 标志，命令 stdin 重定向为空 | Unix 非交互 /bin/sh、pipes、字面 argv；正常退出不补杀后台组，运行中显式终止清理 | 已确认、保留现状：Unix 固定 /bin/sh，保持 Agent 执行入口稳定；保留非交互、管道输出、环境继承及已确认的子进程策略。 |
 | T06 / 卡片与媒体 | 必要字段语义和内容必须正确；不规定布局、折叠、编辑器导航或所有二进制播放器 | 多种编辑器呈现方式；本版本 audio/混合媒体仍有降级 | 统一卡片、原始细节折叠、Web media；binary resource 暂为摘要 | 2026-09-26 更新：附件统一为紧凑入口，工具内采用文件行；点击在新页面打开，预览/下载交由浏览器。内容由 attyd 会话内存托管，不新增预览器或持久化。 |
@@ -42,7 +42,7 @@
 
 ### T01 已确认：控制权与关闭副作用
 
-状态：**已由协议 v2 的 S5（准入）与 S6（保持）取代**（PR #46）。生成中提交设置、手动关闭确认和无观察者关闭倒计时都已删除；现行规则见 [usage](usage.md#projects-and-sessions)。下文保留为当时的决策记录；关于终端与子进程的边界仍然适用，只是关闭现在只发生在会话释放时。
+状态：**已由协议 v2 的 S5（准入）与 S6（保持）取代**（PR #46）；修订 2（#51）将“生成中不可设置”与无关闭操作认定为 v0.2.8 能力的回退 R1、R2，并以 action 恢复，见上表。生成中提交设置、手动关闭确认和无观察者关闭倒计时都已删除；现行规则见 [usage](usage.md#projects-and-sessions)。下文保留为当时的决策记录；关于终端与子进程的边界仍然适用，只是关闭现在只发生在会话释放时。
 
 - 允许生成中提交 mode/config 请求，以 Agent 响应及通知确认设置。实际生效时点由 Agent 控制，不承诺本轮推理立即采用新设置，也不自动取消或重发 prompt。
 - 用户主动关闭会话时，先显示确认框，再调用已协商的 `session/close`；成功后清理本地会话资源。错误或结果不明时保留可恢复状态，如实显示结果，不声称 Agent 已停止或已经回滚所有副作用。
@@ -100,6 +100,8 @@ CLI 必须接受负数参数，不能将其误识别为另一个选项。自动�
 ### T03 已确认：消息上下文尽力恢复
 
 状态：**已由协议 v2 的 S1 取代**（PR #46）：log 只由 Agent 回放和本地提交构建，内存缓存降级、缺失历史提示 `historyNotice` 和带标注的来源快照都已删除。下文保留为当时的决策记录。
+
+**2026-10-16 更正（#51）：**PR #46 的取代过度了一处：它把冷 resume 的“无回放”当作已知空历史（审计 D9）。本节“不把部分消息标作完整恢复”的原则重新适用，但不恢复 `historyNotice` 或缓存来源快照：协议修订 2 用 `history: "partial"` 表明 bridge 只持有 resume 之后的内容；客户端可把之前的 log 作为未确认的界面状态保留，不作为 bridge 权威。当前代码尚未迁移。
 
 
 沿用无持久化、尽力展示完整消息上下文的设计；不新增要求用户选择的“无历史模式”。这里的服务器历史指 ACP Agent 提供的历史，attyd 的服务端与浏览器缓存都只存在于内存中。
