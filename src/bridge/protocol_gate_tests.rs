@@ -1399,6 +1399,53 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
     peer.settled().await;
 }
 
+/// Early process updates without a message are no history: the target
+/// still keeps the source's completed messages (#8).
+#[tokio::test]
+async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
+    let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
+    peer.create("source", json!({})).await;
+    let (prompt_op, prompt) = peer.prompt("source", vec![text("source prompt")]).await;
+    peer.update("source", chunk("source-reply", text("source reply")))
+        .await;
+    peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+    peer.until("the source turn commits", |peer| {
+        peer.live("session/source")["op"]["id"] == prompt_op
+            && peer.live("session/source")["op"]["status"] == "completed"
+    })
+    .await;
+    let source_log = peer.log("session/source");
+    assert_eq!(source_log.len(), 1);
+    let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
+    let request = peer.request("session/fork").await;
+    peer.update(
+        "forked",
+        json!({"sessionUpdate": "agent_thought_chunk", "content": text("thinking")}),
+    )
+    .await;
+    peer.update(
+        "forked",
+        json!({"sessionUpdate": "plan", "entries": [
+            {"content": "Step", "priority": "medium", "status": "pending"},
+        ]}),
+    )
+    .await;
+    peer.reply(&request, json!({"sessionId": "forked"})).await;
+    Peer::ended(forked).await.unwrap();
+    peer.until("the fork completes", |peer| {
+        peer.live("session/source")["op"]["id"] == op
+            && peer.live("session/source")["op"]["status"] == "completed"
+            && peer.has("session/forked")
+    })
+    .await;
+    assert_eq!(
+        peer.log("session/forked"),
+        source_log,
+        "process updates alone do not replace the source's messages"
+    );
+    peer.settled().await;
+}
+
 /// The Agent's messages for the target before the fork response are its
 /// history: without load support nothing replaces them (#8).
 #[tokio::test]
