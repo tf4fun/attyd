@@ -1,7 +1,9 @@
 # Sync protocol implementation plan
 
-Status: implemented, steps 1–9, 2026-10-15 (§5). This document is how
-the bridge implements
+Status: revision 1 implemented, steps 1–9, 2026-10-15 (§5). Revision 2 of the
+protocol (#51) is planned in §7 and **not implemented**; where this document
+describes `canon`, the commit of a turn, `op.process` or I8, it describes revision 1.
+This document is how the bridge implements
 [attyd protocol v2](protocol.md), settled in
 [client-api-redesign.md](client-api-redesign.md). It covers the internal design,
 the invariants tests enforce, and the migration from the earlier v2 draft and
@@ -274,10 +276,11 @@ admission and delivery types are internal. ACP types are referenced from
 | I2 per-event consistency | after every event, a replica's `live` equals a published `live`, and its log equals the published log, or its own unconfirmed log while the bridge's is unknown |
 | I3 exact cut | an alignment plus the events after it reproduce the published documents, with no gap and no duplicate |
 | I4 coalescing safety | replacing any queued suffix by an alignment gives the same final document; `end` survives |
-| I5 identity | the same messages give the same entries and hashes, live or replayed, however chunked |
+| I5 identity | the same messages give the same entries and hashes, live or replayed, however chunked. Revision 2: the same updates give the same items however chunked, and entries that differ in any published field have different hashes |
 | I6 admission | writes and loads are serial; `expect`, status and occupation decide; IDs never repeat |
 | I7 holding | a needed session is held; only a loadable session is released |
-| I8 privacy | a committed turn's process never appears in a later document or event |
+| I8 privacy | a committed turn's process never appears in a later document or event. **Withdrawn by revision 2** (S8): it encoded the removal of content; it is replaced by I9 |
+| I9 fidelity (revision 2) | every accepted timeline update is reflected in the log or the tail by its reduction (protocol §3.2), and only a reduction or a replacing load removes content |
 
 ### 4.1 Convergence gate (I1–I4, I8)
 
@@ -400,3 +403,78 @@ visibly in step 7.
 - **Several sample points.** Alignment matches the head only (redesign §12.3). If
   long histories make full alignment costly, `have` can carry several points; the
   Hub then picks the longest match.
+
+## 7. Fidelity migration (revision 2)
+
+Status: **planned, not started.** [Protocol revision 2](protocol.md) changes what the
+documents carry, not how they are replicated: the commit step, the Hub, alignment,
+coalescing, admission and holding stay. The [audit](acp-fidelity-audit.md) lists the
+defects (D1–D11) each step removes. Each step is one PR, validated in CI, and lands
+with its acceptance cases ([redesign §11](client-api-redesign.md#11-acceptance)). Tests
+that assert revision 1's removals (`turn-collapse.pw.ts`, `lazy-process.pw.ts`, the
+release case in `acp-ui.pw.ts`, `terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release`,
+the I8 assertions) change in the step that changes the rule they encode, to assert
+the retained content instead; no other test is weakened.
+
+### 7.1 Design
+
+- **One reducer.** `canon` becomes the timeline reducer of protocol §3.2: it takes
+  session updates and gives items, and the same function serves the tail, a settle
+  point and a replay. The active-turn fold (`fold_shared_active_turn_update`) and the
+  replay builder (`history_replay::HistoryBuilder`) already fold tool calls, plans and
+  text chunks; they become this reducer, with message boundaries by `messageId`,
+  session-wide entity lookup by `toolCallId` and `compactionId`, compaction patch
+  semantics, and `_meta` kept. An index from entity ID to its entry (or the tail)
+  makes a late update cheap to place.
+- **Tail instead of process.** The running prompt's `SharedTurnUpdates` becomes the
+  session's tail, which also exists between prompts. `project_session` projects it as
+  `live.tail`; the identity diff that served `op.process` serves it.
+- **Settle points in the commit step.** The transitions that end a prompt, admit a
+  prompt, end the connection, complete a load, or place an update in a settled entry
+  change the `TurnLog`; the commit step already turns an appended or rebuilt
+  `TurnLog` into a `LogChange` from the first changed index (§2.3). A rewritten entry
+  is a rebuilt log whose common prefix ends before it.
+- **Attachments.** The table keeps blocks as received, keyed by the hash of the whole
+  block; reference counting from the log and `live` is unchanged.
+- **Interactions.** Pending permissions and elicitations move from the operation slot
+  to the scope's `live.interactions`, routed by their ACP scope (protocol §4.4). The
+  `answer` admission path becomes a resource action that resolves one interaction
+  under the bridge guard. `agent_request` and its completion rule go.
+- **Terminals.** A released session terminal keeps its frozen bounded output with
+  `released: true` while the reducer's index says an item embeds it; holding counts
+  only unreleased ones.
+- **History status.** `SessionLog::Known` carries `complete` or `partial`;
+  `adopt_session_log` sets `partial` instead of building a known empty log.
+
+Nothing here adds persistence, vendor branches, or the earlier draft's intents,
+request records or epochs.
+
+### 7.2 Steps
+
+| Step | Work | Removes | Acceptance (redesign §11) |
+| --- | --- | --- | --- |
+| 10 | Docs: this revision, the audit, the coverage ledger | — | review |
+| 11 | Timeline reducer and entry shape: items, `end`, `_meta`, message boundaries, attachments as received, hash over the entry; live commits and replays through it; generated TypeScript; the web projection renders items from the log as it renders `op.process` today. Prompt `end` on completed and cancelled turns. | D1, D2, D3, D6, D7 | 1, 13, 19, 20, 25, 26, 27 |
+| 12 | Settling of failed and interrupted prompts | D4 | 2, 22 |
+| 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |
+| 14 | History status `partial` for a cold resume; the client keeps a replaced log as unconfirmed UI state | D9 | 23 |
+| 15 | Released terminal snapshots and the holding change | D8 | 12, 24 |
+| 16 | Interactions as scope resources with ACP lifecycles; per-interaction answers in bridge and client; `agent_request` removed | D10, D11 | 7, 8 |
+| 17 | Coverage ledger chains for the new paths; an extension-notification test (audit Q5) | — | the ledger's rows |
+| 18 | Optional, after a separate design review: controls during a prompt | L1 | — |
+
+Dependencies: 10 → 11 → 12 → 13; 14 and 15 after 11; 16 after 10 and independent of
+11–15; 17 after the step whose chain it records; 18 after 16. Each step leaves the
+product working: steps 11–15 only add content to documents the client already
+renders, and 16 changes one write and its client together.
+
+### 7.3 Gates
+
+- **Fidelity cases** (audit §8): a scripted ACP Agent sends a fixed update sequence;
+  the test asserts the reduced items and fields of the log or the tail, written from
+  the ACP input, not from the projection.
+- **Convergence** (§4.1): the three replicas, plus settle points that rewrite an
+  entry, idle tail growth, and a coalesced rewrite.
+- **Browser**: completed, failed and reloaded turns show their tool cards, thoughts,
+  plans and compactions collapsed by default and expandable; a released terminal's
+  output stays in its tool card.

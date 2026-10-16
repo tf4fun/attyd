@@ -27,7 +27,7 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
 - Label embedded output **Terminal**; retain terminal IDs in Tool info. Tool status and process exit status remain independent.
 - Treat a present terminal `exitStatus` as finished, even without a code or signal. Show waiting text only while a process can still produce output; completed empty output and unavailable snapshots need distinct messages.
 - Indicate truncation. See [ACP terminals](https://agentclientprotocol.com/protocol/v1/terminals).
-- Terminal output is display data in the session's `live.terminals` while the Agent keeps the terminal. Release removes it with its output, and a completed turn keeps no tool calls, so output is shown only while its turn runs or its terminal is unreleased ([protocol §4.6](protocol.md)). Unavailable output is not reconstructed or written into Agent message fields.
+- Terminal output is display data in the session's `live.terminals` while the Agent keeps the terminal. Release removes it with its output, and a completed turn keeps no tool calls, so output is shown only while its turn runs or its terminal is unreleased ([protocol §4.6](protocol.md)). Unavailable output is not reconstructed or written into Agent message fields. This is protocol revision 1; revision 2 (#51, [audit](acp-fidelity-audit.md) D1, D8) keeps tool calls in the log and a released terminal's frozen output while a tool call embeds it, as ACP requires. Not yet implemented.
 
 ## Media and attachments
 
