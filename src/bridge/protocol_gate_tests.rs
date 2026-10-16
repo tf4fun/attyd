@@ -1430,7 +1430,8 @@ async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
     );
     assert_eq!(
         peer.log("session/forked")[0]["turn"],
-        json!({"prompt": [], "reply": [text("Forked "), text("session.")]})
+        json!({"prompt": [], "reply": [text("Forked session.")]}),
+        "adjacent plain text blocks merge (protocol §3.2)"
     );
     peer.settled().await;
 }

@@ -323,15 +323,16 @@ async fn a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscript
     );
     let reply = &document["log"][0]["turn"]["reply"];
     assert_eq!(document["log"][0]["turn"]["prompt"], json!([]));
-    assert_eq!(reply[0], text("Session "));
-    assert_eq!(reply[1], text("initialized."));
-    assert_eq!(reply[2]["type"], "attachment", "{reply}");
-    assert_eq!(reply[2]["block"], "image", "{reply}");
+    // Adjacent plain text blocks merge (protocol §3.2).
+    assert_eq!(reply[0], text("Session initialized."));
+    assert_eq!(reply[1]["type"], "attachment", "{reply}");
+    assert_eq!(reply[1]["block"], "image", "{reply}");
+    assert_eq!(reply.as_array().unwrap().len(), 2, "{reply}");
     assert_eq!(document["live"]["controls"]["info"]["title"], "Welcome");
     let (status, served) = bench
         .get(&format!(
             "/api/v2/sessions/s/attachments/{}",
-            reply[2]["id"].as_str().unwrap()
+            reply[1]["id"].as_str().unwrap()
         ))
         .await;
     assert_eq!(status, StatusCode::OK, "{served}");
