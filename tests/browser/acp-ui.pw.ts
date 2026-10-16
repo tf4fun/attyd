@@ -1321,6 +1321,23 @@ test("keeps mobile session and Agent popovers bounded and restores focus after E
   expect(browserErrors).toEqual([]);
 });
 
+test("shows a new project's early Agent message before any prompt and after reload", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "New project", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "New project", exact: true });
+  await dialog.getByLabel("Project working directory", { exact: true }).fill(process.cwd());
+  await dialog.getByRole("button", { name: "Create project", exact: true }).click();
+  await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
+  // The fake Agent sends this message before its `session/new` response.
+  const welcome = page.locator(".conversation-turn .message-agent");
+  await expect(welcome).toHaveCount(1);
+  await expect(welcome).toContainText("Session initialized before acknowledgement.");
+  await expect(page.locator(".conversation-turn .message-user")).toHaveCount(0);
+  await page.reload();
+  await expect(welcome).toHaveCount(1);
+  await expect(welcome).toContainText("Session initialized before acknowledgement.");
+});
+
 test("filters only project sessions in the session switcher", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");

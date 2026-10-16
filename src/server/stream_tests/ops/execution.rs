@@ -287,6 +287,75 @@ async fn a_create_response_survives_its_replacement_and_a_late_reader_converges(
     late.converged(&bench).await;
 }
 
+/// The Agent's messages before the `session/new` response are the new
+/// session's history (#8): a read and every subscription get them as one turn
+/// with an empty prompt, an image among them as an attachment reference the
+/// session serves, and the controls among them settle as before.
+#[tokio::test]
+async fn a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscription() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    let expect = bench.expect_of("global").await;
+    let created = bench.spawn_op("global", &expect, "create", json!({"cwd": CWD}));
+    let new = link.request("session/new").await;
+    let picture = image("d2VsY29tZQ==");
+    let early = [
+        json!({"sessionUpdate": "agent_message_chunk", "messageId": "welcome", "content": text("Session ")}),
+        json!({"sessionUpdate": "session_info_update", "title": "Welcome"}),
+        json!({"sessionUpdate": "agent_message_chunk", "messageId": "welcome", "content": text("initialized.")}),
+        json!({"sessionUpdate": "agent_message_chunk", "messageId": "welcome", "content": picture.clone()}),
+    ];
+    for update in &early {
+        link.update("s", update.clone()).await;
+    }
+    link.reply(&new, json!({"sessionId": "s"})).await;
+    let (status, body) = created.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "create: {body}");
+    assert_eq!(body["result"], json!({"sessionId": "s"}), "{body}");
+
+    let expected = crate::protocol::stream_check::log_values(
+        crate::protocol::canon::TurnLog::from_replay(&early).entries(),
+    );
+    let document = bench.document("session/s").await;
+    assert_eq!(
+        document["log"],
+        json!(expected),
+        "the early messages are the log, with the canon's hash"
+    );
+    let reply = &document["log"][0]["turn"]["reply"];
+    assert_eq!(document["log"][0]["turn"]["prompt"], json!([]));
+    // Adjacent plain text blocks merge (protocol §3.2).
+    assert_eq!(reply[0], text("Session initialized."));
+    assert_eq!(reply[1]["type"], "attachment", "{reply}");
+    assert_eq!(reply[1]["block"], "image", "{reply}");
+    assert_eq!(reply.as_array().unwrap().len(), 2, "{reply}");
+    assert_eq!(document["live"]["controls"]["info"]["title"], "Welcome");
+    let (status, served) = bench
+        .get(&format!(
+            "/api/v2/sessions/s/attachments/{}",
+            reply[1]["id"].as_str().unwrap()
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{served}");
+    assert_eq!(served, picture, "the reference names the early image");
+
+    let mut first = bench.watch(&scopes(&["session/s"])).await;
+    first
+        .until("the first subscription aligns", |watch| {
+            watch.has("session/s")
+        })
+        .await;
+    assert_eq!(first.log("session/s"), expected);
+    let mut later = bench.watch(&scopes(&["session/s"])).await;
+    later
+        .until("a later subscription aligns", |watch| {
+            watch.has("session/s")
+        })
+        .await;
+    assert_eq!(later.log("session/s"), expected);
+    first.converged(&bench).await;
+    later.converged(&bench).await;
+}
+
 /// Agent EOF ends admitted writes with their own errors, even when the
 /// fork's source already shows its next load or has left the published scopes.
 #[tokio::test]
