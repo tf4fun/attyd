@@ -132,9 +132,10 @@ Where a client sees it never changes its life:
   it names is answered. While its session is being created, it is shown in the
   creating operation's scope and moves into the session when the session is
   installed;
-- a **URL flow** starts when a client accepts a URL elicitation, keeps that
-  elicitation's scope, and ends when the Agent completes it, a client dismisses it,
-  or its scope (its session or its request) or the Agent connection ends;
+- a **URL flow** starts when a client accepts a URL elicitation and keeps that
+  elicitation's scope. It stops waiting when the Agent completes it, or its request
+  or the Agent connection ends, and keeps that outcome until a client dismisses it or
+  its scope ends;
 - a **terminal** has a **handle** (the process and its ID's use in `terminal/*`) and
   **output**. The handle ends with `terminal/release` or the Agent connection; the
   output is content, frozen then, and stays while content embeds it, as ACP requires.
@@ -349,16 +350,18 @@ This section specifies S7.
   session answers it (permissions only, `cancelled`, as ACP requires), or with its scope or the Agent
   connection. No operation's end touches it.
 - **A URL flow** starts when a client accepts a URL elicitation: the interaction leaves
-  `interactions` and the flow enters `urlFlows`. Accepting only consents; the external
-  flow starts then. The flow is removed when one of these happens:
-  - the Agent sends its completion notification;
-  - a client dismisses it (§6.1), because ACP makes the completion notification
-    optional and the user must be able to give up waiting;
-  - its scope ends (its session, or for a request-scoped flow its request), its
-    session is not installed, or the Agent connection that started it ends.
+  `interactions` and the flow enters `urlFlows` as `waiting`. Accepting only consents;
+  the external flow starts then. It stops waiting when the Agent sends its completion
+  notification (`completed`), or when its request (a request-scoped flow) or the Agent
+  connection ends (`ended`, with the reason), and then stays, with that outcome, so
+  that every client can tell success from giving up, also when the Agent completes
+  it much later. It is removed when:
+  - a client dismisses it (§6.1), waiting or finished; ACP makes the completion
+    notification optional and the user must be able to give up waiting;
+  - its scope ends, or its session is not installed.
 
-  It keeps its elicitation's scope and moves with installation. No completion record
-  is kept.
+  It keeps its elicitation's scope and moves with installation. Only a waiting flow
+  keeps its session needed. No record of dismissed flows is kept.
 - **A terminal** has a handle and output. The handle ends when the Agent releases the
   terminal or the Agent connection ends (the bridge kills the process then). ACP still
   has tool calls that contain it display its output, so the bounded output and exit
@@ -702,7 +705,7 @@ consistency is checked after **every** event, not only once synchronization ends
 Revision 2 adds a second kind of check: a replica that equals the bridge's projection
 proves nothing if the projection dropped content. Cases 1, 2, 13, 19–27 and 30–33
 therefore also assert, **from the ACP input**, which items and fields the log or the
-tail holds (audit §8). Cases 28, 29, 34 and 35 restore v0.2.8 capabilities and are
+tail holds (audit §8). Cases 11, 28, 29, 32, 34 and 35 restore v0.2.8 capabilities and are
 checked against that release's behavior; a test deleted, or changed to assert that a
 capability is gone, never counts ([release parity](release-parity.md)). Cases marked
 r2 are new or changed in revision 2; their runtime code is not migrated yet.
@@ -788,11 +791,15 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
     - A prompt on a held session racing its delete is refused.
     - A subscription to an unheld session during its delete gets `end: deleted`, or
       its load after a failed delete.
-11. **URL flows (S7).**
+11. **URL flows (S7)** r2, release.
     - A URL flow of `global` (authenticate), of `catalog` (`list`) and of a session
       survives a reload of the client between accept and completion.
-    - It is removed on the Agent's completion, on a client's dismissal (also when
-      dismissed twice), and when its scope or the Agent connection ends.
+    - The Agent's completion, also long after the accept, shows it `completed` on
+      every replica; its request's end and the Agent connection's end show it
+      `ended` with the reason; the two are distinguishable in the browser.
+    - A finished flow no longer keeps its session needed. It is removed on a
+      client's dismissal (also when dismissed twice; a second gives `404`) and when
+      its scope ends.
 12. **Holding (S6, §7).**
     - A session released before its first subscription is loaded by that
       subscription and continues its log.
@@ -939,6 +946,8 @@ revision 2's own choices:
     memory (release parity R3); the bound is a default, not a protocol constant.
 12. A request-scoped elicitation that names no outstanding request is refused rather
     than shown in `global` (audit Q6).
+13. A URL flow keeps its outcome in `urlFlows` until dismissed (release parity R4,
+    P4); the alternative, a transient notice outside the documents, would break C1.
 
 ## 13. Migration
 

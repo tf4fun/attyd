@@ -513,6 +513,8 @@ interface UrlFlow {
   elicitationId: string;                    // Agent-chosen; may be reused after the flow ends
   request: CreateElicitationRequest;
   parent?: { requestId: RequestId; method: string };  // as its interaction's (§4.4)
+  status: "waiting" | "completed" | "ended";          // the flow's outcome, below
+  reason?: "request_ended" | "connection_ended";      // why an `ended` flow stopped waiting
 }
 
 interface Terminal {
@@ -529,9 +531,16 @@ interface Terminal {
 | Resource | Created | Removed | Keeps its session needed |
 | --- | --- | --- | --- |
 | interaction | an Agent request arrives (§4.4) | it is answered or ends by its ACP scope (§4.4) | yes |
-| URL flow | a client accepts a URL elicitation; the interaction leaves `interactions` in the same step, and the flow keeps its ACP scope and where it is shown, moving with installation (§4.4). Accepting only consents. | the Agent's `elicitation/complete` for its `elicitationId` (the one flow with that ID); a client's dismissal (§7); for a request-scoped flow, its parent request's response; its session not being installed; its scope ending; the Agent connection ending | yes |
+| URL flow | a client accepts a URL elicitation, with `status: "waiting"`; the interaction leaves `interactions` in the same step, and the flow keeps its ACP scope and where it is shown, moving with installation (§4.4). Accepting only consents. | a client's dismissal (§7); its session not being installed; its scope ending. Before that it stays with its outcome: the Agent's `elicitation/complete` for its `elicitationId` (the one waiting flow with that ID) sets `completed`; its parent request's response (a request-scoped flow) or the Agent connection's end sets `ended` with that `reason` | while `waiting` |
 | session terminal | the Agent's `terminal/create` | once its handle is gone and no item of the log or the tail embeds it (`ToolCallContent` of type `terminal`); its scope ending | while its handle exists |
 | terminal login | a `terminal_login` operation starts; it keeps its `methodId` for its whole life, whatever operation follows | it has exited and a client dismisses it (§7); the Agent connection ending | — |
+
+**URL flow outcomes.** v0.2.8 told the user whether a flow completed or was given up,
+also when the Agent completed it later, asynchronously. The outcome is therefore part
+of the flow, not a separate record: a flow that stops waiting stays in `urlFlows`
+with its `status` until a client dismisses it or its scope ends, and only a `waiting`
+flow keeps its session needed. Nothing else is kept: no table of finished flows, no
+request record, and a flow already dismissed is not shown again after a reconnect.
 
 **Handle and output** (S7). A session terminal's handle is its process and the use of
 its ID in `terminal/*`. It ends with `terminal/release`, or when the Agent connection
@@ -787,7 +796,7 @@ sent is a §9 error (`404` when the target does not exist). Otherwise:
 | terminal login (`global`) | `input` | `{ data }` | it runs | `204` | **not idempotent**: the bytes are written to stdin each time, in the order the bridge receives them |
 | terminal login (`global`) | `resize` | `{ cols, rows }` | it runs | `204` | sets the size; the same size leaves the same state |
 | terminal login (`global`) | `dismiss` | `{}` | it has exited | `204` | removes it; a repeat gives `404` and changes nothing |
-| URL flow (any scope) | `dismiss` | `{}` | — | `204` | removes it; a repeat gives `404` and changes nothing |
+| URL flow (any scope) | `dismiss` | `{}` | — | `204` | removes it, waiting or finished (a waiting one stops being waited for); a repeat gives `404` and changes nothing |
 
 - **Controls** run whatever the session's `op` is doing, a prompt included: ACP lets a
   client set the mode "at any time … whether the Agent is idle or actively generating"
@@ -913,4 +922,5 @@ audit finding.
 | no `close` | the `close` action, also during a prompt (§7) | R2 |
 | request-scoped elicitations parented by operations; unknown request IDs go to `global` | parented by the outstanding JSON-RPC request; no outstanding request is refused (§4.4) | D11 |
 | interactions of a session being created ended with the `create` | moved into the session when it is installed (§4.4) | D11 |
-| Agent stderr and MCP-over-ACP activity not projected | `global.live.diagnostics`, bounded (§4.7) | R4 |
+| Agent stderr and MCP-over-ACP activity not projected | `global.live.diagnostics`, bounded (§4.7) | R3 |
+| a URL flow is removed when it completes or ends, so its outcome is not shown | the flow stays with `status` until dismissed (§4.6) | R4 |

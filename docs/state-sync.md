@@ -410,7 +410,7 @@ Status: **planned, not started.** [Protocol revision 2](protocol.md) changes wha
 documents carry, not how they are replicated: the commit step, the Hub, alignment,
 coalescing, admission and holding stay. The [audit](acp-fidelity-audit.md) lists the
 defects (D1–D11) and the [release parity matrix](release-parity.md) the v0.2.8
-regressions (R1–R3) each step removes; every regression step is required. Each step is one PR, validated in CI, and lands
+regressions (R1–R4) each step removes; every regression step is required. Each step is one PR, validated in CI, and lands
 with its acceptance cases ([redesign §11](client-api-redesign.md#11-acceptance)). Tests
 that assert revision 1's removals (`turn-collapse.pw.ts`, `lazy-process.pw.ts`, the
 release case in `acp-ui.pw.ts`, `terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release`,
@@ -474,7 +474,7 @@ request records or epochs.
 | 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |
 | 14 | History status `partial` for a cold resume; the client keeps a replaced log as unconfirmed UI state | D9 | 23 |
 | 15 | Terminal handle and output separated: frozen output through release and the connection's end; the holding change | D8 | 12, 24 |
-| 16 | Interactions as scope resources with ACP lifecycles; per-interaction answers in bridge and client; `agent_request` removed | D10, D11 | 7, 8 |
+| 16 | Interactions as scope resources with ACP lifecycles; per-interaction answers in bridge and client; URL flow outcomes; `agent_request` removed | D10, D11, R4 | 7, 8, 11 |
 | 17 | Coverage ledger chains for the new paths; an extension-notification test (audit Q5) | — | the ledger's rows |
 | 18 | Actions: `set_mode`, `set_config` and `close` outside the operation slot, `closing`, `end: closed`; the client's controls enabled during a prompt and the close confirmation | R1, R2 | 18, 28, 29 |
 | 19 | `global.live.diagnostics`: Agent and MCP stderr, MCP-over-ACP connections and activity; the collapsible panels | R3 | 32 |
@@ -484,7 +484,7 @@ Dependencies: 10 → 11 → 12 → 13; 14 and 15 after 11; 16 after 10 and indep
 11–15; 17 after the step whose chain it records; 18 and 19 after 10 and independent of
 11–17; 20 after 12, 15 and 16. Each step leaves the product working: steps 11–15 only
 add content to documents the client already renders, 16 and 18 change one write and
-its client together, and 19 adds a `live` field. No step is optional: R1–R3 and the
+its client together, and 19 adds a `live` field. No step is optional: R1–R4 and the
 defects are closed only when their cases pass against the target.
 
 ### 7.3 Gates

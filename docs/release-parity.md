@@ -59,6 +59,7 @@ the capability (state-sync §7).
 | Answer each permission or elicitation on its own | `POST …/interactions/{id}/response` | all pending interactions of an operation at once (D10) | `answer` action per interaction, at most once (§7) | Regression → step 16 |
 | Session- and request-scoped elicitations stay distinct | coverage ledger, "Form elicitation" | joined to the running operation (D11) | ACP scope; parent is the JSON-RPC request (§4.4) | Regression → step 16 |
 | URL elicitation with consent and completion | yes | yes | yes, with the ACP scope | Kept |
+| A finished URL flow shows whether it completed or was given up, also on an asynchronous completion | `acp/elicitation_complete` / `acp/elicitation_aborted` shown as a transient result (`web/src/lib/state.ts:2967–3003`, `ExternalFlowCard`; `tests/state.test.ts:2502–2538`, `:2570–2622`); the bridge removed the flow | only `waiting`; removal tells neither outcome | the flow stays with `status` `completed` or `ended` until dismissed (protocol §4.6) | **Regression R4** → step 16 |
 | Permission card merges the request's tool call | yes | yes, while running | yes, also settled | Kept |
 
 ### Session operations and settings
@@ -122,8 +123,9 @@ written from the ACP input, not from the projection.
 | R1 | `set_mode`, `set_config` while a prompt runs | v0.2.8 `tests/browser/acp-ui.pw.ts:2694–2736`; ACP allows the mode at any time (`v1/agent.rs:4898–4899`) | actions that occupy nothing (S4, §7) |
 | R2 | close, also during a prompt, with a confirmation | the same test; v0.2.8 `POST /api/v1/sessions/{id}/close` | the `close` action and `end: closed` (§7) |
 | R3 | Agent stderr and MCP-over-ACP activity | v0.2.8 `web/src/app.tsx:689–704` | bounded `global.live.diagnostics` (§4.7) |
+| R4 | completed and given-up URL flows are distinguishable | v0.2.8 `web/src/lib/state.ts:2967–3003`, `tests/state.test.ts:2502–2538`, `:2570–2622` | the outcome as the flow's `status` (§4.6) |
 
-The other regressions are the audit's defects D1–D5, D8–D10, restored as listed above.
+Their acceptance is redesign §11 cases 28, 29, 32 and 11. The other regressions are the audit's defects D1–D5, D8–D10, restored as listed above.
 
 ## Decisions open to review
 
@@ -131,4 +133,5 @@ The other regressions are the audit's defects D1–D5, D8–D10, restored as lis
 | --- | --- | --- |
 | P1 | v0.2.8 showed raw events of other sessions, a consequence of its single-session event stream. | Not restored. Each session's state is its own document, and `global.sessions` shows every held session's operation and pending interactions; a client opens any of them. Restoring a raw event list would need an event log the target does not keep. |
 | P2 | Stop reason, usage and terminal output of turns observed live are lost when the session is released and loaded again, because ACP replays neither. | Same as v0.2.8, which lost them on a cold load as well. Not kept beyond the session's documents, since that needs persistence. |
+| P4 | How a URL flow's outcome reaches clients. v0.2.8 showed it only to pages connected when it happened and kept no record. | The flow stays in `urlFlows` with its outcome until a client dismisses it or its scope ends; it then shows after a reconnect too, which v0.2.8 did not promise and the target does not require. No finished-flow table, request record or reconnect log. Open: whether a finished flow should instead be removed after the first client acknowledges it. v0.2.8 also aborted session flows on a prompt cancel; ACP states no such rule and the target does not (audit Q2). |
 | P3 | v0.2.8's unobserved timeout could close a session while it ran; `main` and the target release only a session nothing needs. | Keep the target's rule: a running prompt is never cut by a timer. |
