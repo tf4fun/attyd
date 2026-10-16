@@ -1526,3 +1526,7 @@ mod tests {
         assert!(matches!(block, Block::Attachment(_)));
     }
 }
+
+#[cfg(test)]
+#[path = "canon/review_retention.rs"]
+mod review_retention;
