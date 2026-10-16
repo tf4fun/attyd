@@ -109,6 +109,64 @@ describe("projected thread", () => {
     });
   });
 
+  it("shows a settled turn's items from the log: thoughts, tools, plans, compactions and its end", () => {
+    const text = (value: string) => ({ type: "text" as const, text: value });
+    const settled = {
+      turn: {
+        items: [
+          { type: "message", role: "user", chunks: [{ content: text("go") }] },
+          { type: "message", role: "thought", messageId: "th", chunks: [{ content: text("think") }] },
+          { type: "message", role: "agent", messageId: "m1", chunks: [{ content: text("a") }] },
+          { type: "tool", call: { toolCallId: "t1", title: "Edit", kind: "edit", status: "completed" } },
+          { type: "tool", call: { toolCallId: "t2", status: "pending" } },
+          { type: "message", role: "agent", messageId: "m1", chunks: [{ content: text("b") }] },
+          { type: "plan", update: { entries: [{ content: "Step", priority: "medium", status: "in_progress" }] } },
+          { type: "plan", update: { planId: "p" } },
+          { type: "compaction", compactionId: "c", status: "completed", summary: [{ content: text("sum") }, { content: text("mary") }] },
+          { type: "message", role: "user", chunks: [{ content: text("go") }] },
+          { type: "message", role: "user", chunks: [{ content: text("other") }] },
+          { type: "message", role: "agent", messageId: "m2", chunks: [{ content: text("done") }] },
+        ],
+        end: { response: { stopReason: "end_turn" } },
+      },
+      hash: "h",
+    } as unknown as LogEntry;
+    const timeline = projectTimeline("s", [settled], undefined);
+    expect(timeline.map((item) => item.type)).toEqual([
+      "message", "assistant", "tool", "tool", "assistant", "plan", "plan", "compaction", "message", "assistant", "stop",
+    ]);
+    expect(timeline.every((item) => item.historyTurnId === "turn:h")).toBe(true);
+    expect(timelineTurnStarts(timeline).filter((start) => start < timeline.length)).toEqual([0]);
+    expect(timeline[0]).toMatchObject({ role: "user", blocks: [text("go")] });
+    expect(timeline[1]).toMatchObject({ chunks: [{ role: "thought", messageId: "th" }, { role: "agent", messageId: "m1" }] });
+    expect(timeline[2]).toMatchObject({ call: { toolCallId: "t1", title: "Edit", status: "completed" } });
+    expect(timeline[3]).toMatchObject({ call: { toolCallId: "t2", status: "pending" } });
+    expect(timeline[5]).toMatchObject({ update: { sessionUpdate: "plan" } });
+    expect(timeline[6]).toMatchObject({ update: { sessionUpdate: "plan_removed", planId: "p" } });
+    expect(timeline[7]).toMatchObject({ compactionId: "c", status: "completed", blocks: [text("summary")] });
+    // The Agent's echo of the prompt is not shown twice; another user message is.
+    expect(timeline[8]).toMatchObject({ role: "protocol-user", blocks: [text("other")] });
+    expect(timeline[10]).toMatchObject({ type: "stop", response: { stopReason: "end_turn" } });
+  });
+
+  it("shows the end of each settled turn, not the operation's result", () => {
+    const ended = {
+      turn: {
+        items: [{ type: "message", role: "user", chunks: [{ content: { type: "text", text: "stop" } }] }],
+        end: { response: { stopReason: "cancelled" } },
+      },
+      hash: "h1",
+    } as unknown as LogEntry;
+    const replayed = {
+      turn: { items: [{ type: "message", role: "user", chunks: [{ content: { type: "text", text: "old" } }] }] },
+      hash: "h2",
+    } as unknown as LogEntry;
+    const timeline = projectTimeline("s", [ended, replayed], operation({ status: "completed", result: { stopReason: "end_turn" } }));
+    expect(timeline.filter((item) => item.type === "stop")).toMatchObject([
+      { response: { stopReason: "cancelled" }, historyTurnId: "turn:h1" },
+    ]);
+  });
+
   it("shows only terminals no tool card shows", () => {
     const terminals = ["a", "b"].map((terminalId) => ({ sessionId: "s", terminalId, output: "", truncated: false, released: false }));
     const timeline = projectTimeline("s", [], operation({ process: [{
