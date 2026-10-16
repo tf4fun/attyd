@@ -335,7 +335,7 @@ async fn a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscript
     let (status, served) = bench
         .get(&format!(
             "/api/v2/sessions/s/attachments/{}",
-            reply[1]["id"].as_str().unwrap()
+            chunks[1]["content"]["id"].as_str().unwrap()
         ))
         .await;
     assert_eq!(status, StatusCode::OK, "{served}");

@@ -833,12 +833,12 @@ test("edits and resends ordered prompt blocks without moving attachments", async
     new URL(request.url()).pathname === `/api/v2/scopes/${scope}/ops` && request.postDataJSON()?.kind === "prompt";
   const submitted = page.waitForRequest(isPrompt);
   await fields.nth(1).press("Enter");
-  // The log holds the normalized prompt (protocol §3.2): `_meta` dropped, media
-  // as `AttachmentRef`s of the session, which the resend names as they are.
+  // The log holds the prompt as received (protocol §3.1): text inline with its
+  // `_meta`, media as `AttachmentRef`s of the session, which the resend names
+  // as they are.
   const body = (await submitted).postDataJSON().args;
-  const text = ({ type, text }: { type: string; text?: string }) => ({ type, text });
   expect(body.prompt.map((block: { type: string }) => block.type)).toEqual(["text", "attachment", "text", "attachment"]);
-  expect(body.prompt[0]).toEqual(text(blocks[0]));
+  expect(body.prompt[0]).toEqual(blocks[0]);
   expect(body.prompt[2]).toEqual({ type: "text", text: edited });
   expect(body.prompt[1]).toMatchObject({ type: "attachment", block: "image", mimeType: "image/png", id: expect.stringMatching(/^[0-9a-f]{64}$/u) });
   expect(body.prompt[3]).toMatchObject({ type: "attachment", block: "resource", uri: "attyd://attachment/note.txt" });
@@ -854,7 +854,7 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   await fields.nth(1).press("Enter");
   const remaining = (await removed).postDataJSON().args.prompt;
   expect(remaining.map((block: { type: string }) => block.type)).toEqual(["text", "text", "attachment"]);
-  expect(remaining[0]).toEqual(text(blocks[0]));
+  expect(remaining[0]).toEqual(blocks[0]);
   expect(remaining[1]).toEqual({ type: "text", text: edited });
   await expect(page.getByText("Received prompt blocks: text,text,resource.", { exact: true })).toBeVisible();
   expect(browserErrors).toEqual([]);
@@ -2767,7 +2767,9 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
   const markdown = await popupPromise;
   await markdown.waitForLoadState();
   await expect(markdown.locator("body")).toContainText("**Context menu response.**\n\n- first item\n- second item");
-  await expect(markdown.locator("body")).not.toContainText("Considering possible follow-up work.");
+  // The settled turn keeps its thought (protocol S8), and the export shows it.
+  await expect(markdown.locator("body")).toContainText("Considering possible follow-up work.");
+  await expect(markdown.locator("body")).toContainText("message-actions-answer");
   await markdown.close();
 
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
@@ -3444,10 +3446,10 @@ test("restores the session in a directly opened URL on reload and in a fresh bro
   expect(browserErrors).toEqual([]);
 });
 
-// The log keeps prompt, reply and hash only (protocol §3.1): earlier turns have
-// no stop reason to show. The current operation keeps its result until the next
-// one replaces it (§4.4), so the last turn's stop reason stays visible.
-test("keeps turn boundaries across reload and shows only the current operation's stop reason", async ({ page }) => {
+// Each settled turn keeps how its prompt ended (protocol §3.1, `end`), so every
+// turn shows its own stop reason at its boundary, also after a reload, as in
+// v0.2.8.
+test("keeps completed turn markers at their original boundaries across reload", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");
 
@@ -3456,17 +3458,19 @@ test("keeps turn boundaries across reload and shows only the current operation's
   await composer.fill("context-window-flow");
   await composer.press("Enter");
   await expect(page.getByText("Context usage updated.", { exact: true })).toBeVisible();
+  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(1);
 
   await composer.fill("usage-flow");
   await composer.press("Enter");
   await expect(page.locator('.turn-stop[data-stop-reason="max_tokens"]')).toHaveCount(1);
-  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(0);
+  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(1);
   await expectTurnOrder(page);
 
   await page.reload();
   await expect(page.getByText("Context usage updated.", { exact: true })).toBeVisible();
   await expect(page.locator('.turn-stop[data-stop-reason="max_tokens"]')).toHaveCount(1);
-  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(0);
+  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(1);
+  await expect(page.locator(".turn-stop")).toHaveCount(2);
   await expectTurnOrder(page);
   expect(browserErrors).toEqual([]);
 });
@@ -3780,13 +3784,16 @@ async function expectTurnOrder(page: Page): Promise<void> {
   );
   const firstPrompt = entries.indexOf("user:context-window-flow");
   const firstAnswer = entries.indexOf("agent:Context usage updated.");
+  const firstStop = entries.indexOf("stop:end_turn");
   const secondPrompt = entries.indexOf("user:usage-flow");
   const secondStop = entries.indexOf("stop:max_tokens");
   expect(firstPrompt).toBeGreaterThanOrEqual(0);
   expect(firstAnswer).toBeGreaterThan(firstPrompt);
-  expect(secondPrompt).toBeGreaterThan(firstAnswer);
+  expect(firstStop).toBeGreaterThan(firstAnswer);
+  expect(secondPrompt).toBeGreaterThan(firstStop);
   expect(secondStop).toBeGreaterThan(secondPrompt);
-  expect(entries.filter((entry) => entry.startsWith("stop:"))).toEqual(["stop:max_tokens"]);
+  // The loaded history has no `end`; each prompt sent here has its own.
+  expect(entries.filter((entry) => entry.startsWith("stop:"))).toEqual(["stop:end_turn", "stop:max_tokens"]);
 }
 
 async function readMarker(path: string): Promise<string> {
