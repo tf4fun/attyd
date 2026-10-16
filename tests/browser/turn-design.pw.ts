@@ -39,14 +39,18 @@ test("distinguishes historical prompts, code, and turn boundaries in both deskto
     await expectDistinctCode(turns.nth(1));
     await alignTurn(page, turns.nth(1));
     await page.screenshot({ path: testInfo.outputPath(`turn-design-desktop-${theme}.png`), animations: "disabled" });
-    // A committed turn keeps its final messages only (protocol S2).
-    await expect(turns.nth(1).locator(".turn-process-trigger")).toHaveCount(0);
-    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true })).toHaveCount(0);
+    const process = turns.nth(1).getByRole("button", { name: "Expand execution process", exact: true });
+    await process.click();
+    await expect(turns.nth(1).locator(".turn-process-trigger")).toHaveAttribute("aria-expanded", "true");
+    await expect(turns.nth(1).locator(".turn-process-action")).toHaveText("Hide");
+    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true })).toBeVisible();
+    await turns.nth(1).getByRole("button", { name: "Collapse execution process", exact: true }).click();
+    await expect(turns.nth(1).locator(".turn-process-action")).toHaveText("Show");
   }
   expect(errors).toEqual([]);
 });
 
-test("keeps turn landmarks and message actions readable on a phone in Chinese", async ({ page }, testInfo) => {
+test("keeps turn landmarks and process actions readable on a phone in Chinese", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await createConversation(page);
   const turns = page.locator(".conversation-turn");
@@ -70,8 +74,12 @@ test("keeps turn landmarks and message actions readable on a phone in Chinese", 
     ))).toBeLessThanOrEqual(1);
     await alignTurn(page, turns.nth(1));
     await page.screenshot({ path: testInfo.outputPath(`turn-design-mobile-${theme}.png`), animations: "disabled" });
-    await expect(turns.nth(1).getByRole("button", { name: "展开执行过程", exact: true })).toHaveCount(0);
-    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true })).toHaveCount(0);
+    const process = turns.nth(1).getByRole("button", { name: "展开执行过程", exact: true });
+    await process.click();
+    await expect(turns.nth(1).getByRole("button", { name: "收起执行过程", exact: true })).toHaveAttribute("aria-expanded", "true");
+    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath(`turn-design-mobile-${theme}-expanded.png`), animations: "disabled" });
+    await turns.nth(1).getByRole("button", { name: "收起执行过程", exact: true }).click();
   }
 
   const prompt = turns.nth(1).locator(".message-user");
@@ -116,7 +124,7 @@ async function createConversation(page: Page) {
     await expect(turn.locator(".message-agent")).not.toHaveCount(0);
     await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
-    await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
+    await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveAttribute("aria-expanded", "false");
   }
 }
 
@@ -132,6 +140,7 @@ async function expectTurnHierarchy(turn: Locator, user: string, agent: string) {
   await expect(turn.locator(".turn-agent-label")).toHaveText(agent);
   const layout = await turn.evaluate((element) => {
     const prompt = element.querySelector(".message-user")!;
+    const trigger = element.querySelector(".turn-process-trigger")!;
     const heading = element.querySelector(".turn-heading")!;
     const header = prompt.querySelector(".message-header")!;
     const roleRect = header.querySelector(".message-role")!.getBoundingClientRect();
@@ -145,7 +154,10 @@ async function expectTurnHierarchy(turn: Locator, user: string, agent: string) {
     const answerStyle = getComputedStyle(answer);
     const turnRect = element.getBoundingClientRect();
     const promptRect = prompt.getBoundingClientRect();
+    const triggerRect = trigger.getBoundingClientRect();
+    const triggerStyle = getComputedStyle(trigger);
     const ruleStyle = getComputedStyle(heading, "::after");
+    const action = trigger.querySelector(".turn-process-action")!;
     return {
       promptRatio: promptRect.width / turnRect.width,
       promptLeft: promptRect.left,
@@ -164,6 +176,12 @@ async function expectTurnHierarchy(turn: Locator, user: string, agent: string) {
         const rect = button.getBoundingClientRect();
         return Math.min(rect.width, rect.height);
       }),
+      triggerHeight: triggerRect.height,
+      triggerRatio: triggerRect.width / turnRect.width,
+      triggerBorder: triggerStyle.borderTopWidth,
+      triggerBorderColor: triggerStyle.borderTopColor,
+      triggerBackground: triggerStyle.backgroundColor,
+      actionOpacity: getComputedStyle(action).opacity,
       separator: ruleStyle.content,
     };
   });
@@ -180,10 +198,15 @@ async function expectTurnHierarchy(turn: Locator, user: string, agent: string) {
   expect(layout.actionsWithinPrompt).toBe(true);
   expect(layout.actionsOpacity).toBe("1");
   expect(layout.targetSizes.every((size) => size >= 26)).toBe(true);
+  expect(layout.triggerHeight).toBeGreaterThanOrEqual(44);
+  expect(layout.triggerRatio).toBeGreaterThan(0.98);
+  expect(Number.parseFloat(layout.triggerBorder)).toBeGreaterThan(0);
+  expect(layout.triggerBorderColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(layout.triggerBackground).not.toBe("rgba(0, 0, 0, 0)");
+  expect(layout.actionOpacity).toBe("1");
   expect(layout.separator).not.toBe("none");
-  // A committed turn has no process to disclose (protocol S2); the former
-  // process trigger layout checks went with it.
-  await expect(turn.locator(".turn-process-trigger")).toHaveCount(0);
+  await expect(turn.locator(".turn-process-count")).toHaveText(/[1-9]/u);
+  await expect(turn.locator(".turn-process-action")).toBeVisible();
 }
 
 async function expectDistinctCode(turn: Locator) {

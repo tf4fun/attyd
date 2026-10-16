@@ -97,7 +97,16 @@ export const events = [
       prev: "AAAAAAAAAAAAAAAAAAAAAA",
       entries: [
         {
-          turn: { prompt: [{ type: "text", text: "hi" }], reply: [{ type: "text", text: "hello" }] },
+          turn: {
+            items: [
+              { type: "message", role: "user", chunks: [{ content: { type: "text", text: "hi" } }] },
+              { type: "message", role: "agent", messageId: "m", chunks: [{ content: { type: "text", text: "hello" }, _meta: { k: 1 } }] },
+              { type: "tool", call: { toolCallId: "t", status: "pending" } },
+              { type: "plan", update: { planId: "p" } },
+              { type: "compaction", compactionId: "c", status: "completed", summary: [] },
+            ],
+            end: { response: { stopReason: "end_turn" } },
+          },
           hash: "AAAAAAAAAAAAAAAAAAAAAA",
         },
       ],

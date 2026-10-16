@@ -113,45 +113,6 @@ impl HistoryCache {
     }
 }
 
-/// The history fold the replay builder reproduces incrementally.
-#[cfg(test)]
-pub(crate) fn fold_history_update(
-    retained: &[Value],
-    update: &Value,
-) -> Result<Vec<Value>, crate::runtime_state::RuntimeStateError> {
-    if update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update") {
-        // Tool IDs belong to the session: a background tool may finish after a
-        // later prompt starts. Keep its original slot (and outcome offsets).
-        let tool_id = update.get("toolCallId");
-        if let Some(position) = retained.iter().rposition(|candidate| {
-            matches!(
-                candidate.get("sessionUpdate").and_then(Value::as_str),
-                Some("tool_call" | "tool_call_update")
-            ) && candidate.get("toolCallId") == tool_id
-        }) {
-            let mut folded = retained.to_vec();
-            folded[position] = crate::runtime_state::fold_active_turn_update(
-                &[retained[position].clone()],
-                update,
-            )?
-            .remove(0);
-            return Ok(folded);
-        }
-    }
-    let turn_start = retained
-        .iter()
-        .rposition(|candidate| {
-            candidate.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
-        })
-        .unwrap_or(0);
-    let mut folded = retained[..turn_start].to_vec();
-    folded.extend(crate::runtime_state::fold_active_turn_update(
-        &retained[turn_start..],
-        update,
-    )?);
-    Ok(folded)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

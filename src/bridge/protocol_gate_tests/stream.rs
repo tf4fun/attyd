@@ -1669,7 +1669,13 @@ async fn review_refused_automatic_close_waits_for_a_new_subscription_cycle() {
         assert_eq!(stream.log(&scope).len(), history.len() + 1);
         assert_eq!(
             stream.log(&scope).last().unwrap()["turn"],
-            json!({"prompt": [text("still usable")], "reply": [text("still here")]})
+            json!({
+                "items": [
+                    {"type": "message", "role": "user", "chunks": [{"content": text("still usable")}]},
+                    {"type": "message", "role": "agent", "messageId": "after-refusal", "chunks": [{"content": text("still here")}]},
+                ],
+                "end": {"response": {"stopReason": "end_turn"}},
+            })
         );
         peer.settled().await;
         stream.converged(&peer);

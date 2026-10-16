@@ -19,15 +19,11 @@ const test = baseTest.extend<{ fixtureUrl: string }>({
   baseURL: async ({ fixtureUrl }, use) => use(fixtureUrl),
 });
 
-// Protocol v2 keeps only final messages in the log (S2, §10): a loaded turn's
-// tools and thoughts are not part of any document, and no process page exists.
-// The former paging tests ("pages of ten", "release after five minutes", the
-// pagination footer through loading, timeout and retry) had nothing left to
-// page; their replacement is that the history arrives without process and the
-// page never asks for it. Running process layout stays covered below and in
-// turn-collapse.pw.ts, before the turn ends.
+// A loaded turn keeps its tool calls in the log (protocol S8): the history
+// arrives whole in the session document, its process folded under the final
+// answer and expandable, and no process page is ever requested.
 
-test("loads history as final messages only and never requests execution details", async ({ page }) => {
+test("loads history with its process folded and never requests process pages", async ({ page }) => {
   const api = trackApi(page);
   await page.goto("/sessions/lazy-process-session");
   const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
@@ -38,15 +34,18 @@ test("loads history as final messages only and never requests execution details"
   );
   const document = await (await page.request.get(`/api/v2/scopes/${encodeURIComponent(`session/${SESSION_ID}`)}`)).text();
   expect(document).toContain(FINAL_ANSWER);
-  expect(document).not.toContain("HIDDEN_PROCESS_PAYLOAD_");
-  expect(document).not.toContain("Inspect process item");
-  await expect(turn.locator(".tool-card")).toHaveCount(0);
-  await expect(turn.locator(".turn-process-count")).toHaveCount(0);
-  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
-  await expect(page.getByText("Inspect process item 01", { exact: true })).toHaveCount(0);
+  expect(document).toContain("HIDDEN_PROCESS_PAYLOAD_25");
+  expect(document).toContain("Inspect process item 25");
+  const expand = turn.getByRole("button", { name: "Expand execution process", exact: true });
+  await expect(expand).toHaveAttribute("aria-expanded", "false");
+  await expect(turn.locator(".turn-process-count")).toContainText("25");
+  await expect(page.getByText("Inspect process item 01", { exact: true })).toBeHidden();
+  await expand.click();
+  await expect(turn.locator(".tool-card")).toHaveCount(25);
+  await expect(page.getByText("Inspect process item 01", { exact: true })).toBeVisible();
   await page.reload();
   await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
-  await expect(turn.locator(".tool-card")).toHaveCount(0);
+  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveAttribute("aria-expanded", "false");
   expect(api.process).toEqual([]);
   expect(api.v1).toEqual([]);
 });
@@ -94,8 +93,13 @@ test("keeps task progress on the left and recovers composer space when the mobil
   await expect(plan.locator(".plan-body")).toBeVisible();
   await page.getByRole("button", { name: "Stop current turn", exact: true }).click();
   await expect.poll(() => opsOf(api, "cancel", `session/${SESSION_ID}`)).toHaveLength(1);
-  // The cancelled turn commits; its plan was process and leaves with it.
+  // The cancelled turn settles with its plan: the composer's plan of the
+  // running turn goes, and the plan is in the turn's folded process.
   await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
   await expect(plan).toHaveCount(0);
+  const settled = page.locator(".conversation-turn").filter({ has: page.locator(".message-user", { hasText: "Show the live task plan" }) });
+  await expect(settled.locator('[data-stop-reason="cancelled"]')).toBeVisible();
+  await settled.getByRole("button", { name: "Expand execution process", exact: true }).click();
+  await expect(settled.locator(".plan-card")).toContainText("Verify pagination boundaries");
   expect(api.v1).toEqual([]);
 });

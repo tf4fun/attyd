@@ -3,17 +3,22 @@
 
 import type {
   AvailableCommand,
+  CompactionStatus,
   ContentBlock,
   Cost,
   CreateElicitationRequest,
   CreateElicitationResponse,
   InitializeResponse,
+  Plan,
+  PlanRemoved,
+  PlanUpdate,
   PromptResponse,
   RequestPermissionOutcome,
   RequestPermissionRequest,
   SessionConfigOption,
   SessionMode,
   SessionUpdate,
+  ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 
 export type SessionControls = { modes: SessionModes | null, 
@@ -35,13 +40,59 @@ export type AppendTail = { values: unknown[], } | { text: string, };
 
 export type Turn = { 
 /**
- * The user's message, normalized.
+ * The turn's timeline, in order (§3.2).
  */
-prompt: Array<Block>, 
+items: Array<Item>, 
 /**
- * The Agent's message content, in order, normalized.
+ * How its prompt ended, when the bridge observed it.
  */
-reply: Array<Block>, };
+end?: TurnEnd, };
+
+export type Item = { "type": "message" } & MessageItem | { "type": "tool" } & ToolItem | { "type": "plan" } & PlanItem | { "type": "compaction" } & CompactionItem;
+
+export type MessageItem = { role: Role, 
+/**
+ * The chunks' `messageId`; absent when they had none.
+ */
+messageId?: string, chunks: Array<Chunk>, };
+
+export type Role = "user" | "agent" | "thought";
+
+export type Chunk = { content: Block, 
+/**
+ * The chunk's `_meta`, apart from the block's own.
+ */
+_meta?: unknown, };
+
+export type ToolItem = { 
+/**
+ * ACP's sparse `ToolCallUpdate`, reduced: a field is absent until the
+ * Agent provides it.
+ */
+call: ToolCallState, };
+
+export type PlanItem = { 
+/**
+ * A legacy `Plan` (this turn's snapshot), or by `planId` the plan's
+ * state: a `PlanUpdate` or a `PlanRemoved`.
+ */
+update: Plan | PlanUpdate | PlanRemoved, };
+
+export type CompactionItem = { compactionId: string, status: CompactionStatus, 
+/**
+ * From `summary` (no chunk `_meta`) and summary chunks.
+ */
+summary: Array<Chunk>, error?: string, 
+/**
+ * The compaction's `_meta`, patched.
+ */
+_meta?: unknown, };
+
+export type TurnEnd = { 
+/**
+ * ACP, verbatim.
+ */
+response: PromptResponse, };
 
 export type Block = AttachmentRef | Extract<ContentBlock, { type: "text" | "resource_link" }>;
 
@@ -49,7 +100,7 @@ export type PromptBlock = AttachmentRef | ContentBlock;
 
 export type AttachmentRef = { type: "attachment", 
 /**
- * Lowercase hex SHA-256 of the block's canonical JSON.
+ * Lowercase hex SHA-256 of the block's canonical JSON, `_meta` included.
  */
 id: string, block: AttachmentKind, mimeType?: string, 
 /**
@@ -61,7 +112,7 @@ export type AttachmentKind = "image" | "audio" | "resource";
 
 export type LogEntry = { turn: Turn, 
 /**
- * `h_i` in its wire form (protocol §3.3).
+ * `h_i` in its wire form (protocol §3.4).
  */
 hash: string, };
 
@@ -264,6 +315,8 @@ export type ErrorBody = { error: ProtocolError, };
 export type HostError = { error: string, };
 
 export type Health = { ok: boolean, protocol: string, backend: string, };
+
+export type ToolCallState = ProjectedToolCall<ToolCallUpdate>;
 
 export type ProcessUpdate = ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" }>, "content"> | ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "compaction_update" }>, "summary"> | ProjectedToolCall<Extract<SessionUpdate, { sessionUpdate: "tool_call" | "tool_call_update" }>> | Exclude<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" | "compaction_update" | "tool_call" | "tool_call_update" }>;
 

@@ -407,7 +407,7 @@ visibly in step 7.
 
 ## 7. Fidelity migration (revision 2)
 
-Status: **step 10 (docs) done; steps 11–20 not started.** [Protocol revision 2](protocol.md) changes what the
+Status: **steps 10 (docs) and 11 (timeline reducer) done; steps 12–20 not started.** [Protocol revision 2](protocol.md) changes what the
 documents carry, not how they are replicated: the commit step, the Hub, alignment,
 coalescing, admission and holding stay. The [audit](acp-fidelity-audit.md) lists the
 defects (D1–D11) and the [release parity matrix](release-parity.md) the v0.2.8
@@ -489,6 +489,12 @@ request records or epochs.
 | 18 | Actions: `set_mode`, `set_config` and `close` outside the operation slot, `closing`, `end: closed`; the client's controls enabled during a prompt and the close confirmation | R1, R2 | 18, 28, 29, 37 |
 | 19 | `global.live.diagnostics`: Agent and MCP stderr, MCP-over-ACP connections and activity; the collapsible panels | R3 | 32 |
 | 20 | Markdown export over items, `end` and terminal snapshots; the browser cases of settled content and per-interaction answers | (D1, D4, D8 in the client) | 33, 34, 35 |
+
+Step 11 reduces the turns of completed and cancelled prompts and of `load` replays;
+within a prompt, an update for an entity of an earlier entry rewrites that entry when
+the prompt settles. Cases 19, 31 and 36 are covered for those turns only: failed and
+interrupted prompts (step 12) and updates outside a prompt or after its response
+(step 13) do not reach the log yet.
 
 Dependencies: 10 → 11 → 12 → 13; 14 and 15 after 11; 16 after 10 and independent of
 11–15; 17 after the step whose chain it records; 18 and 19 after 10 and independent of

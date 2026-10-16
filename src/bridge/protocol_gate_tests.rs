@@ -1130,7 +1130,14 @@ async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
     assert_eq!(commit["log"]["from"], 0);
     assert_eq!(
         commit["log"]["entries"][0]["turn"],
-        json!({ "prompt": [text("hi")], "reply": [text("hello")] })
+        json!({
+            "items": [
+                {"type": "message", "role": "user", "chunks": [{"content": text("hi")}]},
+                {"type": "message", "role": "agent", "messageId": "answer", "chunks": [{"content": text("hello")}]},
+                {"type": "tool", "call": {"toolCallId": "tool", "title": "Confirm", "status": "pending"}},
+            ],
+            "end": {"response": {"stopReason": "end_turn"}},
+        })
     );
     peer.gate.assert_committed_atomically(&scope, &json!(op));
     let live = peer.live(&scope);
@@ -1361,7 +1368,13 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
     assert_eq!(source_log.len(), 1);
     assert_eq!(
         source_log[0]["turn"],
-        json!({"prompt": [text("source prompt")], "reply": [text("source reply")]})
+        json!({
+            "items": [
+                {"type": "message", "role": "user", "chunks": [{"content": text("source prompt")}]},
+                {"type": "message", "role": "agent", "messageId": "source-reply", "chunks": [{"content": text("source reply")}]},
+            ],
+            "end": {"response": {"stopReason": "end_turn"}},
+        })
     );
     let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
     let request = peer.request("session/fork").await;
@@ -1399,10 +1412,10 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
     peer.settled().await;
 }
 
-/// Early process updates without a message are no history: the target
-/// still keeps the source's completed messages (#8).
+/// Early thought/plan updates do not provide a full history replay: a fork
+/// without load keeps the source's history and the new ACP content (#8).
 #[tokio::test]
-async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
+async fn a_forks_early_process_updates_keep_source_history_and_new_content() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
     peer.create("source", json!({})).await;
     let (prompt_op, prompt) = peer.prompt("source", vec![text("source prompt")]).await;
@@ -1438,10 +1451,38 @@ async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
             && peer.has("session/forked")
     })
     .await;
+    let target_log = peer.log("session/forked");
+    let items: Vec<Value> = target_log
+        .iter()
+        .flat_map(|entry| entry["turn"]["items"].as_array().unwrap().iter().cloned())
+        .collect();
+    let source_items = source_log[0]["turn"]["items"].as_array().unwrap();
+    assert!(
+        items.starts_with(source_items),
+        "early thought/plan updates must not erase the fork's inherited history: {items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item["type"] == "message"
+                && item["role"] == "thought"
+                && item["chunks"][0]["content"] == text("thinking")
+        }),
+        "the early thought must also remain: {items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item["type"] == "plan"
+                && item["update"]["entries"]
+                    == json!([
+                        {"content": "Step", "priority": "medium", "status": "pending"},
+                    ])
+        }),
+        "the early plan must also remain: {items:#?}"
+    );
     assert_eq!(
-        peer.log("session/forked"),
+        peer.log("session/source"),
         source_log,
-        "process updates alone do not replace the source's messages"
+        "fork leaves the source unchanged"
     );
     peer.settled().await;
 }
@@ -1477,8 +1518,10 @@ async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
     );
     assert_eq!(
         peer.log("session/forked")[0]["turn"],
-        json!({"prompt": [], "reply": [text("Forked session.")]}),
-        "adjacent plain text blocks merge (protocol §3.2)"
+        json!({"items": [
+            {"type": "message", "role": "agent", "messageId": "welcome", "chunks": [{"content": text("Forked session.")}]},
+        ]}),
+        "adjacent plain text chunks join (protocol §3.2)"
     );
     peer.settled().await;
 }

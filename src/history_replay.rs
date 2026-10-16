@@ -11,17 +11,22 @@ use crate::runtime_state::{RuntimeStateError, fold_active_turn_update, fold_cont
 use crate::semantic::{SessionUpdateSemanticState, validate_history_update};
 
 /// Incremental history folding. Only the changed slot is cloned/serialized;
-/// completed turns are never copied for each newly received record.
+/// completed turns are never copied for each newly received record. The fold
+/// only joins what the timeline reducer reduces alike: `TurnLog::from_replay`
+/// gives the same log from the folded updates as from the received ones.
 #[derive(Default)]
 struct HistoryBuilder {
     updates: Vec<Value>,
     turn_start: usize,
     tools: HashMap<String, usize>,
+    plans: HashMap<String, usize>,
 }
 
 impl HistoryBuilder {
     fn append(&mut self, update: Value) -> Result<(), RuntimeStateError> {
         let kind = update.get("sessionUpdate").and_then(Value::as_str);
+        // Tool calls and ID-addressed plans are entities of the session; a
+        // legacy plan is a snapshot of its turn.
         let position = match kind {
             Some("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk") => {
                 self.updates.len().checked_sub(1)
@@ -29,24 +34,13 @@ impl HistoryBuilder {
             Some("tool_call" | "tool_call_update") => update
                 .get("toolCallId")
                 .and_then(Value::as_str)
-                .and_then(|id| self.tools.get(id).copied())
-                .filter(|position| {
-                    kind == Some("tool_call_update") || *position >= self.turn_start
-                }),
-            Some("plan" | "plan_update" | "plan_removed") => self.updates[self.turn_start..]
+                .and_then(|id| self.tools.get(id).copied()),
+            Some("plan_update" | "plan_removed") => {
+                plan_id(&update).and_then(|id| self.plans.get(id).copied())
+            }
+            Some("plan") => self.updates[self.turn_start..]
                 .iter()
-                .position(|candidate| match kind {
-                    Some("plan") => candidate["sessionUpdate"] == "plan",
-                    _ => {
-                        candidate["sessionUpdate"] == "plan_update"
-                            && &candidate["plan"]["planId"]
-                                == if kind == Some("plan_removed") {
-                                    &update["planId"]
-                                } else {
-                                    &update["plan"]["planId"]
-                                }
-                    }
-                })
+                .position(|candidate| candidate["sessionUpdate"] == "plan")
                 .map(|position| position + self.turn_start),
             _ => None,
         };
@@ -55,33 +49,34 @@ impl HistoryBuilder {
             .unwrap_or(&[]);
         let mut folded = fold_active_turn_update(retained, &update)?;
         if let Some(position) = position {
-            if folded.is_empty() {
-                self.updates.remove(position);
-                for slot in self.tools.values_mut() {
-                    if *slot > position {
-                        *slot -= 1;
-                    }
-                }
-            } else {
-                self.updates[position] = folded.remove(0);
-            }
+            self.updates[position] = folded.remove(0);
         }
         for entry in folded {
             let position = self.updates.len();
-            if matches!(
-                entry["sessionUpdate"].as_str(),
-                Some("tool_call" | "tool_call_update")
-            ) {
-                if let Some(id) = entry["toolCallId"].as_str() {
-                    self.tools.insert(id.to_owned(), position);
+            match entry["sessionUpdate"].as_str() {
+                Some("tool_call" | "tool_call_update") => {
+                    if let Some(id) = entry["toolCallId"].as_str() {
+                        self.tools.insert(id.to_owned(), position);
+                    }
                 }
-            }
-            if entry["sessionUpdate"] == "user_message_chunk" {
-                self.turn_start = position;
+                Some("plan_update" | "plan_removed") => {
+                    if let Some(id) = plan_id(&entry) {
+                        self.plans.insert(id.to_owned(), position);
+                    }
+                }
+                Some("user_message_chunk") => self.turn_start = position,
+                _ => {}
             }
             self.updates.push(entry);
         }
         Ok(())
+    }
+}
+
+fn plan_id(update: &Value) -> Option<&str> {
+    match update["sessionUpdate"].as_str()? {
+        "plan_update" => update["plan"]["planId"].as_str(),
+        _ => update["planId"].as_str(),
     }
 }
 
@@ -210,11 +205,14 @@ impl ReplayCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history_cache::{HistoryCache, fold_history_update};
+    use crate::history_cache::HistoryCache;
+    use crate::protocol::canon::TurnLog;
     use serde_json::json;
 
+    // The fold keeps what the reducer needs: every prefix of a replay gives
+    // the same log folded as received, across turns too.
     #[test]
-    fn incremental_fold_matches_history_semantics() {
+    fn incremental_fold_keeps_the_reduced_history() {
         let updates = vec![
             json!({"sessionUpdate":"user_message_chunk","messageId":"u","content":{"type":"text","text":"start"}}),
             json!({"sessionUpdate":"agent_message_chunk","messageId":"a","content":{"type":"text","text":"hello"}}),
@@ -224,18 +222,26 @@ mod tests {
             json!({"sessionUpdate":"plan","entries":[{"content":"step","status":"pending","priority":"medium"}]}),
             json!({"sessionUpdate":"plan_update","plan":{"planId":"p","type":"items","entries":[]}}),
             json!({"sessionUpdate":"plan_removed","planId":"p"}),
+            json!({"sessionUpdate":"agent_message_chunk","messageId":"a","content":{"type":"text","text":"!"},"_meta":{"m":1}}),
             json!({"sessionUpdate":"user_message_chunk","messageId":"u2","content":{"type":"text","text":"next turn"}}),
-            json!({"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed"}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed","content":[]}),
             json!({"sessionUpdate":"tool_call","toolCallId":"tool","title":"again","status":"in_progress"}),
-            json!({"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed"}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed","rawOutput":null}),
+            json!({"sessionUpdate":"plan_update","plan":{"planId":"p","type":"items","entries":[]}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"sparse","title":"Late"}),
+            json!({"sessionUpdate":"compaction_update","compactionId":"c","status":"in_progress"}),
+            json!({"sessionUpdate":"compaction_summary_chunk","compactionId":"c","content":{"type":"text","text":"s"}}),
         ];
-        let mut expected = Vec::new();
         let mut actual = HistoryBuilder::default();
-        for update in updates {
-            expected = fold_history_update(&expected, &update).unwrap();
-            actual.append(update).unwrap();
-            assert_eq!(actual.updates, expected);
+        for (index, update) in updates.iter().enumerate() {
+            actual.append(update.clone()).unwrap();
+            assert_eq!(
+                TurnLog::from_replay(&actual.updates),
+                TurnLog::from_replay(&updates[..=index]),
+                "after {update}"
+            );
         }
+        assert!(actual.updates.len() < updates.len(), "the fold joins updates");
     }
 
     #[test]

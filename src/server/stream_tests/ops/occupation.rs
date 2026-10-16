@@ -331,7 +331,10 @@ async fn a_failed_held_delete_keeps_its_error_and_the_subscription() {
             assert_eq!(log.len(), 1, "the Agent's replay is installed: {log:?}");
             assert_eq!(
                 log[0]["turn"],
-                json!({"prompt": [text("earlier prompt")], "reply": [text("earlier reply")]})
+                json!({"items": [
+                    {"type": "message", "role": "user", "chunks": [{"content": text("earlier prompt")}]},
+                    {"type": "message", "role": "agent", "chunks": [{"content": text("earlier reply")}]},
+                ]})
             );
         } else {
             // A refused close never retired the original session. It is

@@ -79,7 +79,7 @@ async fn ws_with(flags: &[&str], capabilities: Value) -> (Bench, Link) {
 
 /// An attachment is served while its own session's log or live references
 /// it: a failed prompt's input until the next operation replaces it, a
-/// running prompt's process until its commit. Another session's reference
+/// running prompt's process and then the entry it settles into. Another session's reference
 /// to the same block does not stand in for this one's, and a running
 /// operation leaves the log's references readable.
 #[tokio::test]
@@ -175,7 +175,7 @@ async fn attachments_are_served_while_their_own_session_references_them() {
 
     // The next operation replaces the failed one: its input no longer
     // references the block, while t's log still does. The running prompt's
-    // process references a block of its own until its commit.
+    // process references a block of its own, and its entry keeps it.
     let (status, body) = bench
         .op(
             "session/s",
@@ -220,27 +220,20 @@ async fn attachments_are_served_while_their_own_session_references_them() {
     assert_eq!(log.len(), 2, "{log:?}");
     assert_eq!(
         references(&json!(log)),
-        in_log,
-        "the process block never enters the log"
+        [in_log[0].clone(), in_process[0].clone()],
+        "the process block settles into the log"
     );
-    assert_unserved(
-        &bench,
-        "s",
-        &in_process[0],
-        "a process block after the commit",
-    )
-    .await;
+    assert_served(&bench, "s", &in_process[0], &process).await;
     assert_served(&bench, "s", &in_log[0], &logged).await;
     link.quiet(QUIET).await;
     watch.quiet(QUIET).await;
     watch.converged(&bench).await;
 }
 
-/// A compaction summary's block is a process block: served while the running
-/// prompt's process references it, not found once the commit removes the
-/// process, and never in the log.
+/// A compaction summary's block is served while the running prompt's process
+/// references it, and then from the log its turn settles into.
 #[tokio::test]
-async fn a_compaction_summary_block_is_served_until_its_turn_commits() {
+async fn a_compaction_summary_block_is_served_while_running_and_once_settled() {
     let (bench, mut link) = Bench::ws(json!({"promptCapabilities": {"image": true}})).await;
     bench.create(&mut link, "s", json!({})).await;
     let mut watch = bench.watch(&scopes(&["session/s"])).await;
@@ -285,17 +278,12 @@ async fn a_compaction_summary_block_is_served_until_its_turn_commits() {
     link.reply(&request, json!({"stopReason": "end_turn"}))
         .await;
     watch.until_op("session/s", &prompt, "completed").await;
-    assert!(
-        references(&json!(watch.log("session/s"))).is_empty(),
-        "the summary block never enters the log"
+    assert_eq!(
+        references(&json!(watch.log("session/s"))),
+        in_process,
+        "the summary block settles into the log"
     );
-    assert_unserved(
-        &bench,
-        "s",
-        &in_process[0],
-        "a summary block after the commit",
-    )
-    .await;
+    assert_served(&bench, "s", &in_process[0], &summary).await;
     link.quiet(QUIET).await;
     watch.quiet(QUIET).await;
     watch.converged(&bench).await;

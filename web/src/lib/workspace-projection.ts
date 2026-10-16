@@ -5,11 +5,13 @@
 
 import type { PromptResponse, SessionInfo } from "@agentclientprotocol/sdk";
 import type { TerminalSnapshot } from "../../../shared/bridge";
+import { assertNever } from "../../../shared/exhaustive";
 import type {
   Block,
   CatalogLive,
   GlobalLive,
   Interaction,
+  Item,
   LogEntry,
   Operation,
   ProcessUpdate,
@@ -67,11 +69,11 @@ export function needsAuthentication(error: ProtocolError | null | undefined): bo
 }
 
 /**
- * The thread of a session: its log's turns, each a prompt and its reply, and
- * then the current operation. A completed turn keeps its final messages only
- * (S2): the whole `reply`, every Agent message of the turn, in one entry. A
- * running prompt shows its input and its folded process; a completed one its
- * result, a failed one its error.
+ * The thread of a session: its log's turns, each its items and end, and then
+ * the current operation. A settled turn's items are shown as a running
+ * prompt's process is (§3.1): its first user message as the prompt, the rest
+ * as process and output. A running prompt shows its input and its folded
+ * process; a failed one its error.
  */
 export function projectTimeline(sessionId: string, log: readonly LogEntry[], op: Operation | undefined): TimelineItem[] {
   const timeline: TimelineItem[] = [];
@@ -81,33 +83,29 @@ export function projectTimeline(sessionId: string, log: readonly LogEntry[], op:
     // The completed prompt is the log's last entry (S2): it keeps the identity
     // the running turn had, so the thread does not remount it at the commit.
     const turnOperationId = committed && index === log.length - 1 ? op.id : undefined;
-    if (entry.turn.prompt.length > 0) {
-      timeline.push({
-        id: `${key}:prompt`, type: "message", role: "user", blocks: entry.turn.prompt, raw: [],
-        historyTurnId: key, ...(turnOperationId ? { turnOperationId } : {}),
+    const [first, ...rest] = entry.turn.items;
+    const opener = first?.type === "message" && first.role === "user" ? first : undefined;
+    const prompt = opener?.chunks.map(({ content }) => content) ?? [];
+    const items: TimelineItem[] = [];
+    if (opener != null) {
+      items.push({
+        id: `${key}:prompt`, type: "message", role: "user", blocks: prompt, raw: [],
+        ...(opener.messageId != null ? { messageId: opener.messageId } : {}),
+        ...(turnOperationId ? { turnOperationId } : {}),
       });
     }
-    if (entry.turn.reply.length > 0) {
-      timeline.push({
-        id: `${key}:reply`, type: "assistant", historyTurnId: key,
-        chunks: [{ id: `${key}:reply:0`, role: "agent", blocks: entry.turn.reply, raw: [] }],
-      });
+    const updates = (opener != null ? rest : entry.turn.items).flatMap(itemUpdates);
+    items.push(...projectUpdates(sessionId, key, updates, prompt, { settled: true }).items);
+    if (entry.turn.end != null) {
+      items.push({ id: `${key}:stop`, type: "stop", response: entry.turn.end.response });
     }
+    timeline.push(...items.map((item) => ({ ...item, historyTurnId: key })));
   });
   if (op == null) return timeline;
   const base = `op:${op.id}`;
   if (op.kind === "prompt") {
-    if (op.status === "completed") {
-      // The result belongs to the turn the commit appended: the log's last entry.
-      const last = log.at(-1);
-      if (isPromptResult(op.result)) {
-        timeline.push({
-          id: `${base}:stop`, type: "stop", response: op.result,
-          ...(last != null ? { historyTurnId: `turn:${last.hash}` } : {}),
-        });
-      }
-      return timeline;
-    }
+    // A completed prompt's result is its entry's end.
+    if (op.status === "completed") return timeline;
     const prompt = promptInput(op);
     if (prompt.length > 0) {
       timeline.push({ id: `${base}:prompt`, type: "message", role: "user", blocks: prompt, raw: [], turnOperationId: op.id });
@@ -118,6 +116,37 @@ export function projectTimeline(sessionId: string, log: readonly LogEntry[], op:
     timeline.push(operationError(`${base}:error`, op, op.error));
   }
   return timeline;
+}
+
+/** The updates a settled item stands for, as a process carries them. */
+function itemUpdates(item: Item): ProcessUpdate[] {
+  switch (item.type) {
+    case "message": {
+      const sessionUpdate = item.role === "user" ? "user_message_chunk"
+        : item.role === "agent" ? "agent_message_chunk" : "agent_thought_chunk";
+      return item.chunks.map((chunk) => ({
+        sessionUpdate, content: chunk.content,
+        ...(item.messageId != null ? { messageId: item.messageId } : {}),
+        ...(chunk._meta !== undefined ? { _meta: chunk._meta } : {}),
+      }) as ProcessUpdate);
+    }
+    case "tool":
+      return [{ sessionUpdate: "tool_call_update", ...item.call } as ProcessUpdate];
+    case "plan": {
+      const update = item.update;
+      if ("plan" in update) return [{ sessionUpdate: "plan_update", ...update }];
+      if ("planId" in update) return [{ sessionUpdate: "plan_removed", ...update }];
+      return [{ sessionUpdate: "plan", ...update }];
+    }
+    case "compaction":
+      return [{
+        sessionUpdate: "compaction_update", compactionId: item.compactionId, status: item.status,
+        summary: item.summary.map(({ content }) => content),
+        ...(item.error != null ? { error: item.error } : {}),
+      } as ProcessUpdate];
+    default:
+      return assertNever(item, "log item");
+  }
 }
 
 export function operationError(id: string, op: Operation, error: ProtocolError): Extract<TimelineItem, { type: "error" }> {
@@ -153,7 +182,21 @@ export function projectProcess(
   process: readonly ProcessUpdate[],
   prompt: readonly PromptBlock[] = [],
 ): ProjectedProcess {
-  const base = `op:${operationId}`;
+  return projectUpdates(sessionId, `op:${operationId}`, process, prompt, { turnOperationId: operationId });
+}
+
+/**
+ * The thread entries of a process, or of a settled turn's items. A settled
+ * turn shows each of its plans in place; a running one shows its unfinished
+ * plan above the composer.
+ */
+function projectUpdates(
+  sessionId: string,
+  base: string,
+  process: readonly ProcessUpdate[],
+  prompt: readonly PromptBlock[],
+  { settled = false, turnOperationId }: { settled?: boolean; turnOperationId?: string },
+): ProjectedProcess {
   const items: TimelineItem[] = [];
   let activePlan: ProjectedProcess["activePlan"];
   let activity: AgentActivity | undefined;
@@ -167,7 +210,7 @@ export function projectProcess(
         if (echoesPrompt(update.content, prompt)) return;
         items.push({
           id, type: "message", role: "protocol-user", blocks: [update.content],
-          messageId: update.messageId ?? undefined, turnOperationId: operationId, raw: [notification],
+          messageId: update.messageId ?? undefined, ...(turnOperationId ? { turnOperationId } : {}), raw: [notification],
         });
         return;
       case "agent_message_chunk":
@@ -218,6 +261,10 @@ export function projectProcess(
       }
       case "plan": {
         const item: Extract<TimelineItem, { type: "plan" }> = { id, type: "plan", update, raw: [notification] };
+        if (settled) {
+          if (update.entries.length > 0) items.push(item);
+          return;
+        }
         // An unfinished plan is shown above the composer; a finished one in its turn.
         if (update.entries.some(({ status }) => status !== "completed")) {
           activePlan = item;

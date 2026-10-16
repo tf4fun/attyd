@@ -8,8 +8,14 @@ import {
   standaloneTerminals,
 } from "../web/src/lib/workspace-projection";
 
-const entry = (prompt: string, reply: string, hash: string): LogEntry => ({
-  turn: { prompt: [{ type: "text", text: prompt }], reply: [{ type: "text", text: reply }] },
+const entry = (prompt: string, reply: string, hash: string, stopReason?: "max_tokens"): LogEntry => ({
+  turn: {
+    items: [
+      { type: "message", role: "user", chunks: [{ content: { type: "text", text: prompt } }] },
+      { type: "message", role: "agent", chunks: [{ content: { type: "text", text: reply } }] },
+    ],
+    ...(stopReason != null ? { end: { response: { stopReason } } } : {}),
+  },
   hash,
 });
 
@@ -30,7 +36,7 @@ const summary = (title: string | null): SessionSummary => ({
 
 describe("projected thread", () => {
   it("keeps a completed prompt's result in the turn the commit appended", () => {
-    const timeline = projectTimeline("s", [entry("first", "one", "h1"), entry("second", "two", "h2")], operation({
+    const timeline = projectTimeline("s", [entry("first", "one", "h1"), entry("second", "two", "h2", "max_tokens")], operation({
       status: "completed", result: { stopReason: "max_tokens" },
     }));
     expect(timeline.map((item) => item.type)).toEqual(["message", "assistant", "message", "assistant", "stop"]);
@@ -41,12 +47,11 @@ describe("projected thread", () => {
   });
 
   it("keeps the whole reply of a committed turn in one Agent entry", () => {
-    const reply: LogEntry = {
-      turn: { prompt: [{ type: "text", text: "p" }], reply: [{ type: "text", text: "Paragraph 1.\n\nParagraph 2.\n\nFinal." }] },
-      hash: "h",
-    };
+    const reply = entry("p", "Paragraph 1.\n\nParagraph 2.\n\nFinal.", "h");
     const [, agent] = projectTimeline("s", [reply], undefined);
-    expect(agent).toMatchObject({ type: "assistant", chunks: [{ role: "agent", blocks: reply.turn.reply }] });
+    expect(agent).toMatchObject({
+      type: "assistant", chunks: [{ role: "agent", blocks: [{ type: "text", text: "Paragraph 1.\n\nParagraph 2.\n\nFinal." }] }],
+    });
   });
 
   it("shows a running prompt's input and process, and a failed one's error without a log entry", () => {
@@ -107,6 +112,64 @@ describe("projected thread", () => {
     expect(compactions[0]).toMatchObject({
       status: "failed", error: "compaction failed", blocks: [{ type: "text", text: "Summary" }],
     });
+  });
+
+  it("shows a settled turn's items from the log: thoughts, tools, plans, compactions and its end", () => {
+    const text = (value: string) => ({ type: "text" as const, text: value });
+    const settled = {
+      turn: {
+        items: [
+          { type: "message", role: "user", chunks: [{ content: text("go") }] },
+          { type: "message", role: "thought", messageId: "th", chunks: [{ content: text("think") }] },
+          { type: "message", role: "agent", messageId: "m1", chunks: [{ content: text("a") }] },
+          { type: "tool", call: { toolCallId: "t1", title: "Edit", kind: "edit", status: "completed" } },
+          { type: "tool", call: { toolCallId: "t2", status: "pending" } },
+          { type: "message", role: "agent", messageId: "m1", chunks: [{ content: text("b") }] },
+          { type: "plan", update: { entries: [{ content: "Step", priority: "medium", status: "in_progress" }] } },
+          { type: "plan", update: { planId: "p" } },
+          { type: "compaction", compactionId: "c", status: "completed", summary: [{ content: text("sum") }, { content: text("mary") }] },
+          { type: "message", role: "user", chunks: [{ content: text("go") }] },
+          { type: "message", role: "user", chunks: [{ content: text("other") }] },
+          { type: "message", role: "agent", messageId: "m2", chunks: [{ content: text("done") }] },
+        ],
+        end: { response: { stopReason: "end_turn" } },
+      },
+      hash: "h",
+    } as unknown as LogEntry;
+    const timeline = projectTimeline("s", [settled], undefined);
+    expect(timeline.map((item) => item.type)).toEqual([
+      "message", "assistant", "tool", "tool", "assistant", "plan", "plan", "compaction", "message", "assistant", "stop",
+    ]);
+    expect(timeline.every((item) => item.historyTurnId === "turn:h")).toBe(true);
+    expect(timelineTurnStarts(timeline).filter((start) => start < timeline.length)).toEqual([0]);
+    expect(timeline[0]).toMatchObject({ role: "user", blocks: [text("go")] });
+    expect(timeline[1]).toMatchObject({ chunks: [{ role: "thought", messageId: "th" }, { role: "agent", messageId: "m1" }] });
+    expect(timeline[2]).toMatchObject({ call: { toolCallId: "t1", title: "Edit", status: "completed" } });
+    expect(timeline[3]).toMatchObject({ call: { toolCallId: "t2", status: "pending" } });
+    expect(timeline[5]).toMatchObject({ update: { sessionUpdate: "plan" } });
+    expect(timeline[6]).toMatchObject({ update: { sessionUpdate: "plan_removed", planId: "p" } });
+    expect(timeline[7]).toMatchObject({ compactionId: "c", status: "completed", blocks: [text("sum"), text("mary")] });
+    // The Agent's echo of the prompt is not shown twice; another user message is.
+    expect(timeline[8]).toMatchObject({ role: "protocol-user", blocks: [text("other")] });
+    expect(timeline[10]).toMatchObject({ type: "stop", response: { stopReason: "end_turn" } });
+  });
+
+  it("shows the end of each settled turn, not the operation's result", () => {
+    const ended = {
+      turn: {
+        items: [{ type: "message", role: "user", chunks: [{ content: { type: "text", text: "stop" } }] }],
+        end: { response: { stopReason: "cancelled" } },
+      },
+      hash: "h1",
+    } as unknown as LogEntry;
+    const replayed = {
+      turn: { items: [{ type: "message", role: "user", chunks: [{ content: { type: "text", text: "old" } }] }] },
+      hash: "h2",
+    } as unknown as LogEntry;
+    const timeline = projectTimeline("s", [ended, replayed], operation({ status: "completed", result: { stopReason: "end_turn" } }));
+    expect(timeline.filter((item) => item.type === "stop")).toMatchObject([
+      { response: { stopReason: "cancelled" }, historyTurnId: "turn:h1" },
+    ]);
   });
 
   it("shows only terminals no tool card shows", () => {

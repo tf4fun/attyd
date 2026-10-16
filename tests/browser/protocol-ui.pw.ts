@@ -11,6 +11,7 @@ import type { Event, GlobalLive, LogEntry, OpRequest } from "../../shared/protoc
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
 import {
   BarrierProxy,
+  entryBlocks,
   entryText,
   globalLive,
   headParam,
@@ -152,6 +153,14 @@ function opId(tap: StreamTap, scope: string): string {
   return sessionLive(received(tap, scope)).op.id;
 }
 
+/** Expands the last turn's folded process, once the turn has settled. */
+async function expandSettledProcess(page: Page): Promise<void> {
+  const turn = page.locator(".conversation-turn").last();
+  await expect(turn.locator(".turn-stop")).toBeVisible();
+  const expand = turn.getByRole("button", { name: "Expand execution process", exact: true });
+  if (await expand.count()) await expand.click();
+}
+
 function logOf(tap: StreamTap, scope: string, held: readonly LogEntry[] = []): readonly LogEntry[] {
   return received(tap, scope, held).log;
 }
@@ -289,7 +298,10 @@ test.describe("replica and reconnection", () => {
   test.describe("cold reopen", () => {
     test.use({ serverArgs: ["--session-unobserved-timeout", "0"] });
 
-    test("keeps the held log while a released session loads again and confirms it with the suffix", async ({ page, fixture, pageProxy: proxy }) => {
+    // The reload's replay is authoritative (protocol §3.3; acceptance 1, 27): a
+    // replayed turn has no `end` and carries the Agent's message IDs, so it
+    // differs from the live entry, and alignment replaces the held log whole.
+    test("keeps the held log while a released session loads again and replaces it with the replay", async ({ page, fixture, pageProxy: proxy }) => {
       const first = await openAlpha(page, proxy);
       await send(page, "echo kept");
       await expect(page.getByText("Echo: echo kept", { exact: true })).toBeVisible();
@@ -318,7 +330,13 @@ test.describe("replica and reconnection", () => {
       await expect.poll(() => received(tap, ALPHA, held).confirmed).toBe(true);
       const confirming = tap.delivered.find((event): event is Extract<Event, { log: unknown }> =>
         event.scope === ALPHA && "log" in event);
-      expect(confirming?.log).toMatchObject({ from: 2, entries: [] });
+      expect(held[1]?.turn.end).toMatchObject({ response: { stopReason: "end_turn" } });
+      expect(confirming?.log).toMatchObject({ from: 0, prev: "AAAAAAAAAAAAAAAAAAAAAA" });
+      const replayed = confirming!.log.entries;
+      expect(replayed.map((entry) => entryText(entry, "reply"))).toEqual(held.map((entry) => entryText(entry, "reply")));
+      expect(replayed[1]?.turn.end).toBeUndefined();
+      expect(replayed[1]?.hash).not.toBe(held[1]?.hash);
+      expect(logOf(tap, ALPHA, held)).toEqual(replayed);
       await expect(page.getByText("Echo: echo kept", { exact: true })).toHaveCount(1);
       await expect(composer(page)).toBeEnabled();
       expect(proxy.scopeReads()).toEqual([]);
@@ -831,7 +849,9 @@ test.describe("resources and media", () => {
     await send(page, "terminal t1");
     await expect(page.getByText("Terminal t1 started.", { exact: true })).toBeVisible();
     await expect.poll(() => sessionLive(received(tap, ALPHA)).op.status).toBe("completed");
-    // The operation ended; the terminal lives by its own lifecycle.
+    // The operation ended; the terminal lives by its own lifecycle, in the
+    // tool card its settled turn keeps folded (protocol S8).
+    await expandSettledProcess(page);
     await expect(page.getByText(/TERM t1 ready/u)).toBeVisible();
     await fixture.gates.finishTerminal("t1");
     await expect(page.getByText(/TERM t1 done/u)).toBeVisible();
@@ -846,10 +866,13 @@ test.describe("resources and media", () => {
     await send(page, "image");
     await expect(page.getByText("Image reply.", { exact: true })).toBeVisible();
     await expect.poll(() => logOf(tap, ALPHA).length).toBe(2);
-    const reply = logOf(tap, ALPHA)[1]!.turn.reply;
+    const reply = entryBlocks(logOf(tap, ALPHA)[1]!, "reply");
     const attachment = reply.find((block) => block.type === "attachment");
     expect(attachment).toMatchObject({ type: "attachment", block: "image", mimeType: "image/png" });
     const attachmentId = attachment?.type === "attachment" ? attachment.id : "";
+    // The image is an earlier Agent message of the settled turn: it is in the
+    // turn's folded process, under the final answer.
+    await expandSettledProcess(page);
     const image = page.locator(".message-agent img, .conversation-turn img").last();
     await expect(image).toBeVisible();
     await expect.poll(() => image.evaluate((element) => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);

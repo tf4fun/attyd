@@ -829,10 +829,8 @@ mod tests {
         };
         assert_eq!(known.entries().len(), 1);
         assert_eq!(
-            known.entries()[0].turn.prompt,
-            TurnLog::from_replay(&[user_update("complete")]).entries()[0]
-                .turn
-                .prompt
+            known.entries()[0].turn,
+            TurnLog::from_replay(&[user_update("complete")]).entries()[0].turn
         );
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
     }

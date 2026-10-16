@@ -17,7 +17,7 @@ import {
 const S = "session/S";
 
 function entry(text: string, hash: string): LogEntry {
-  return { turn: { prompt: [{ type: "text", text }], reply: [{ type: "text", text: `re ${text}` }] }, hash };
+  return { turn: { items: [{ type: "message", role: "user", chunks: [{ content: { type: "text", text: text } }] }, { type: "message", role: "agent", chunks: [{ content: { type: "text", text: `re ${text}` } }] }] }, hash };
 }
 
 const e1 = entry("one", "h1-aaaaaaaaaaaaaaaaaaa");

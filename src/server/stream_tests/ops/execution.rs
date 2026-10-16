@@ -321,18 +321,21 @@ async fn a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscript
         json!(expected),
         "the early messages are the log, with the canon's hash"
     );
-    let reply = &document["log"][0]["turn"]["reply"];
-    assert_eq!(document["log"][0]["turn"]["prompt"], json!([]));
-    // Adjacent plain text blocks merge (protocol §3.2).
-    assert_eq!(reply[0], text("Session initialized."));
-    assert_eq!(reply[1]["type"], "attachment", "{reply}");
-    assert_eq!(reply[1]["block"], "image", "{reply}");
-    assert_eq!(reply.as_array().unwrap().len(), 2, "{reply}");
+    let items = &document["log"][0]["turn"]["items"];
+    assert_eq!(items.as_array().unwrap().len(), 1, "one message: {items}");
+    assert_eq!(items[0]["role"], "agent", "{items}");
+    assert_eq!(items[0]["messageId"], "welcome", "{items}");
+    let chunks = &items[0]["chunks"];
+    // Adjacent plain text chunks join (protocol §3.2).
+    assert_eq!(chunks[0]["content"], text("Session initialized."));
+    assert_eq!(chunks[1]["content"]["type"], "attachment", "{chunks}");
+    assert_eq!(chunks[1]["content"]["block"], "image", "{chunks}");
+    assert_eq!(chunks.as_array().unwrap().len(), 2, "{chunks}");
     assert_eq!(document["live"]["controls"]["info"]["title"], "Welcome");
     let (status, served) = bench
         .get(&format!(
             "/api/v2/sessions/s/attachments/{}",
-            reply[1]["id"].as_str().unwrap()
+            chunks[1]["content"]["id"].as_str().unwrap()
         ))
         .await;
     assert_eq!(status, StatusCode::OK, "{served}");

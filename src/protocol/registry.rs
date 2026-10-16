@@ -752,14 +752,15 @@ impl SessionRegistry {
         }
     }
 
-    /// The running prompt's turn ended. A completed turn is appended to the log
-    /// (S2) whichever client started it; the prompt operation ends.
+    /// The running prompt's turn ended. A completed turn, whatever its stop
+    /// reason, settles into the log with its response (S2) whichever client
+    /// started it; the prompt operation ends.
     pub(crate) fn end_session_turn(&mut self, session_id: &str, outcome: TurnEnd<'_>) {
         let Some(entry) = self.sessions.get_mut(session_id) else {
             return;
         };
         let state = &mut entry.state;
-        if let TurnEnd::Completed(_) = outcome
+        if let TurnEnd::Completed(response) = outcome
             && let (Some(turn), SessionLog::Known(log)) = (&state.active_turn, &mut state.log)
         {
             let updates: Vec<Value> = turn
@@ -767,7 +768,7 @@ impl SessionRegistry {
                 .iter()
                 .map(|update| (**update).clone())
                 .collect();
-            Arc::make_mut(log).commit(&turn.prompt, &updates);
+            Arc::make_mut(log).commit(&turn.prompt, &updates, response);
         }
         let Some(live) = state.live.as_mut() else {
             return;

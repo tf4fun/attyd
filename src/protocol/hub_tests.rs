@@ -318,7 +318,7 @@ fn single(events: &[Value], scope: &str) -> Value {
 }
 
 fn entry(hash: &str) -> Value {
-    json!({ "turn": { "prompt": [], "reply": [] }, "hash": hash })
+    json!({ "turn": { "items": [] }, "hash": hash })
 }
 
 // ---------------------------------------------------------------------------

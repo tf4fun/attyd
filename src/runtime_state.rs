@@ -2010,6 +2010,11 @@ pub(crate) fn fold_shared_active_turn_update(
             }) {
                 let retained_kind = folded[position]["sessionUpdate"].clone();
                 let target = Arc::make_mut(&mut folded[position]);
+                if kind == "tool_call" {
+                    // A later announcement patches with the schema's defaults of
+                    // the fields it omits, as the timeline reducer applies it.
+                    announce_tool_defaults(target)?;
+                }
                 replace_tool_fields(target, update)?;
                 target["sessionUpdate"] = if kind == "tool_call" {
                     Value::String("tool_call".to_string())
@@ -2031,46 +2036,31 @@ pub(crate) fn fold_shared_active_turn_update(
                 update,
             );
         }
-        "plan_update" => {
-            let plan = update
-                .get("plan")
-                .and_then(Value::as_object)
-                .ok_or(RuntimeStateError::OperationMismatch)?;
-            let plan_id = plan
-                .get("planId")
-                .and_then(Value::as_str)
-                .filter(|plan_id| !plan_id.is_empty())
-                .ok_or(RuntimeStateError::OperationMismatch)?;
-            if plan.get("type").and_then(Value::as_str) == Some("items")
-                && !plan.get("entries").is_some_and(Value::is_array)
-            {
-                return Err(RuntimeStateError::OperationMismatch);
-            }
+        "plan_update" | "plan_removed" => {
+            let plan_id = if kind == "plan_update" {
+                let plan = update
+                    .get("plan")
+                    .and_then(Value::as_object)
+                    .ok_or(RuntimeStateError::OperationMismatch)?;
+                if plan.get("type").and_then(Value::as_str) == Some("items")
+                    && !plan.get("entries").is_some_and(Value::is_array)
+                {
+                    return Err(RuntimeStateError::OperationMismatch);
+                }
+                plan.get("planId")
+                    .and_then(Value::as_str)
+                    .filter(|plan_id| !plan_id.is_empty())
+                    .ok_or(RuntimeStateError::OperationMismatch)?
+            } else {
+                required_fold_string(update, "planId")?
+            };
+            // A plan's state is its latest update or removal, at the place of
+            // its first (protocol §3.2).
             replace_shared_fold_slot(
                 &mut folded,
-                |candidate| {
-                    candidate.get("sessionUpdate").and_then(Value::as_str) == Some("plan_update")
-                        && candidate
-                            .get("plan")
-                            .and_then(|plan| plan.get("planId"))
-                            .and_then(Value::as_str)
-                            == Some(plan_id)
-                },
+                |candidate| plan_id_of(candidate) == Some(plan_id),
                 update,
             );
-        }
-        "plan_removed" => {
-            let plan_id = required_fold_string(update, "planId")?;
-            if let Some(position) = folded.iter().position(|candidate| {
-                candidate.get("sessionUpdate").and_then(Value::as_str) == Some("plan_update")
-                    && candidate
-                        .get("plan")
-                        .and_then(|plan| plan.get("planId"))
-                        .and_then(Value::as_str)
-                        == Some(plan_id)
-            }) {
-                folded.remove(position);
-            }
         }
         _ => folded.push(Arc::new(update.clone())),
     }
@@ -2114,6 +2104,31 @@ fn text_chunk_shape(update: &Value) -> Result<Option<(Value, &str)>, RuntimeStat
     }
     shape["content"]["text"] = Value::String(String::new());
     Ok(Some((shape, text)))
+}
+
+/// The `planId` of a `plan_update` or `plan_removed`.
+fn plan_id_of(update: &Value) -> Option<&str> {
+    match update.get("sessionUpdate").and_then(Value::as_str)? {
+        "plan_update" => update.get("plan")?.get("planId")?.as_str(),
+        "plan_removed" => update.get("planId")?.as_str(),
+        _ => None,
+    }
+}
+
+/// The fields `ToolCallUpdate::from` a `tool_call` gives when it omits them.
+fn announce_tool_defaults(target: &mut Value) -> Result<(), RuntimeStateError> {
+    let target = target
+        .as_object_mut()
+        .ok_or(RuntimeStateError::OperationMismatch)?;
+    for (field, default) in [
+        ("kind", Value::String("other".into())),
+        ("status", Value::String("pending".into())),
+        ("content", Value::Array(Vec::new())),
+        ("locations", Value::Array(Vec::new())),
+    ] {
+        target.insert(field.to_string(), default);
+    }
+    Ok(())
 }
 
 fn required_fold_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, RuntimeStateError> {
@@ -2670,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_replaces_plan_slots_in_place_and_removal_clears_only_its_slot() {
+    fn active_turn_replaces_plan_slots_in_place_and_a_removal_replaces_only_its_slot() {
         let mut state = state();
         open(&mut state, "session");
         state
@@ -2733,19 +2748,36 @@ mod tests {
             .active_turn
             .unwrap()
             .updates;
-        assert_eq!(retained.len(), 3);
-        assert_eq!(retained[0]["content"]["text"], "between");
-        assert_eq!(retained[1]["plan"]["planId"], "two");
-        assert_eq!(retained[2]["sessionUpdate"], "plan");
-        assert_eq!(retained[2]["entries"][0]["content"], "legacy latest");
-        assert!(retained.iter().all(|update| {
-            update.get("planId").and_then(Value::as_str) != Some("one")
-                && update
-                    .get("plan")
-                    .and_then(|plan| plan.get("planId"))
-                    .and_then(Value::as_str)
-                    != Some("one")
-        }));
+        // A removal is the plan's state, at the place of its first update.
+        assert_eq!(retained.len(), 4);
+        assert_eq!(
+            *retained[0],
+            json!({ "sessionUpdate": "plan_removed", "planId": "one" })
+        );
+        assert_eq!(retained[1]["content"]["text"], "between");
+        assert_eq!(retained[2]["plan"]["planId"], "two");
+        assert_eq!(retained[3]["sessionUpdate"], "plan");
+        assert_eq!(retained[3]["entries"][0]["content"], "legacy latest");
+
+        // A later update makes it current again, in the same place.
+        state
+            .append_runtime_update_for_test(
+                "epoch",
+                "session",
+                json!({
+                    "sessionUpdate": "plan_update",
+                    "plan": { "type": "markdown", "planId": "one", "content": "again" }
+                }),
+            )
+            .unwrap();
+        let retained = state
+            .session("session")
+            .unwrap()
+            .active_turn
+            .unwrap()
+            .updates;
+        assert_eq!(retained.len(), 4);
+        assert_eq!(retained[0]["plan"]["content"], "again");
     }
 
     #[test]
