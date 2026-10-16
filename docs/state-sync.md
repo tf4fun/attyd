@@ -246,6 +246,10 @@ Step 6 lands the resource actions (protocol §7) in `bridge::resources`:
   it reuses the settle and route primitives that end a flow with its scope, so a
   late dismissal of an old flow never reaches a new flow that reuses its
   `elicitationId`.
+- A parent request's response cancels only that request's interactions not yet
+  answered and drops its outstanding entry; an accepted URL flow is keyed by its
+  interaction and `elicitationId`, so it keeps waiting. The flow keeps no parent and
+  no reason field.
 - A login terminal's dismissal is allowed only after the terminal exits, and it
   leaves the ended operation as it is.
 - Input and resize run after the guard is released. Input goes on the terminal's

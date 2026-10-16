@@ -134,9 +134,9 @@ Where a client sees it never changes its life:
   creating operation's scope and moves into the session when the session is
   installed;
 - a **URL flow** starts when a client accepts a URL elicitation and keeps that
-  elicitation's scope. It stops waiting once, when the Agent completes it, or its
-  request or the Agent connection ends, and keeps that first outcome until a client
-  dismisses it or the document that shows it ends;
+  elicitation's scope. It stops waiting once, when the Agent completes it or the
+  Agent connection ends (its request's response does not end it), and keeps that
+  first outcome until a client dismisses it or the document that shows it ends;
 - a **terminal** has a **handle** (the process and its ID's use in `terminal/*`) and
   **output**. The handle ends with `terminal/release` or the Agent connection; the
   output is content, frozen then, and stays while content embeds it, as ACP requires.
@@ -360,12 +360,12 @@ This section specifies S7.
 - **A URL flow** starts when a client accepts a URL elicitation: the interaction leaves
   `interactions` and the flow enters `urlFlows` as `waiting`. Accepting only consents;
   the external flow starts then. It stops waiting when the Agent sends its completion
-  notification (`completed`), or when its request (a request-scoped flow) or the Agent
-  connection ends (`ended`, with the reason); only `waiting` changes, so a later
-  completion, response or connection end never overwrites an outcome. Ending a flow
-  the user accepted when its parent request is answered is this protocol's product
-  rule, not an ACP requirement (release parity P5). The flow then stays, with that outcome, so
-  that every client can tell success from giving up, also when the Agent completes
+  notification (`completed`), or when the Agent connection ends (`ended`); only
+  `waiting` changes, so a later completion or connection end never overwrites an
+  outcome. The response of a request-scoped flow's parent request, success or error,
+  ends only interactions not yet answered; an accepted flow keeps waiting, and the
+  answered request is not remembered (protocol §4.6, release parity P5). A finished
+  flow stays, with its outcome, so that every client can tell success from giving up, also when the Agent completes
   it much later. It is removed when:
   - a client dismisses it (§6.1), waiting or finished; ACP makes the completion
     notification optional and the user must be able to give up waiting;
@@ -815,11 +815,17 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
     - A URL flow of `global` (authenticate), of `catalog` (`list`) and of a session
       survives a reload of the client between accept and completion.
     - The Agent's completion, also long after the accept, shows it `completed` on
-      every replica; its request's end and the Agent connection's end show it
-      `ended` with the reason; the two are distinguishable in the browser.
+      every replica; the Agent connection's end shows it `ended`; the two are
+      distinguishable in the browser.
+    - A request-scoped flow outlives its parent request: accept, then the parent's
+      response (once success, once a JSON-RPC error), and the flow is still
+      `waiting` and keeps its session needed; a late `elicitation/complete` then
+      shows it `completed`. In the same run an interaction of that request not yet
+      answered ends with the response, answered with its cancel outcome, and the
+      bridge no longer has the request outstanding: an elicitation naming it
+      afterwards is refused with `invalid_params`.
     - A finished flow keeps its first outcome: a `completed` flow stays `completed`
-      when its parent request is answered or the connection ends afterwards, and an
-      `ended` flow stays `ended` when a completion for its `elicitationId` arrives
+      when the connection ends afterwards, and an `ended` flow stays `ended` when a completion for its `elicitationId` arrives
       late (which then completes no other flow).
     - A finished flow no longer keeps its session needed. It is removed on a
       client's dismissal (also when dismissed twice; a second gives `404`) and when
@@ -1001,8 +1007,8 @@ revision 2's own choices:
     than shown in `global` (audit Q6).
 13. A URL flow keeps its outcome in `urlFlows` until dismissed (release parity R4,
     P4); the alternative, a transient notice outside the documents, would break C1.
-    Ending an accepted request-scoped flow when its parent request is answered is a
-    product rule, open to review (P5).
+    An accepted request-scoped flow is not ended by its parent request's response
+    (P5, settled).
 14. A tool item's state is ACP's `ToolCallUpdate`, so a call first seen sparsely is
     represented as received (§4.1). No own type and no placeholder values are added.
 15. An action waiting for the Agent keeps its session held through the outstanding

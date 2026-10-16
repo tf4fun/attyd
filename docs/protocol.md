@@ -528,9 +528,7 @@ interface UrlFlow {
   interactionId: string;                    // the accepted elicitation; identifies the flow
   elicitationId: string;                    // Agent-chosen; may be reused after the flow ends
   request: CreateElicitationRequest;
-  parent?: { requestId: RequestId; method: string };  // as its interaction's (§4.4)
   status: "waiting" | "completed" | "ended";          // the flow's outcome, below
-  reason?: "request_ended" | "connection_ended";      // why an `ended` flow stopped waiting
 }
 
 interface Terminal {
@@ -547,7 +545,7 @@ interface Terminal {
 | Resource | Created | Removed | Keeps its session needed |
 | --- | --- | --- | --- |
 | interaction | an Agent request arrives (§4.4) | it is answered or ends by its ACP scope (§4.4) | yes |
-| URL flow | a client accepts a URL elicitation, with `status: "waiting"`; the interaction leaves `interactions` in the same step, and the flow keeps its ACP scope and where it is shown, moving with installation (§4.4). Accepting only consents. | a client's dismissal (§7); its session not being installed; the end of the document that shows it (a session scope ending; `global` and `catalog` never end). Before that it stays with its outcome: the Agent's `elicitation/complete` for its `elicitationId` (the one waiting flow with that ID) sets `completed`; the Agent connection's end, or its parent request's response (a request-scoped flow; a product rule, release parity P5), sets `ended` with that `reason`. Only `waiting` changes: a finished flow keeps its outcome against a later parent response, connection end or completion | while `waiting` |
+| URL flow | a client accepts a URL elicitation, with `status: "waiting"`; the interaction leaves `interactions` in the same step, and the flow keeps its ACP scope and where it is shown, moving with installation (§4.4). Accepting only consents. | a client's dismissal (§7); its session not being installed; the end of the document that shows it (a session scope ending; `global` and `catalog` never end). Before that it stays with its outcome: the Agent's `elicitation/complete` for its `elicitationId` (the one waiting flow with that ID) sets `completed`; the Agent connection's end sets `ended`. Its parent request's response does not end it (below). Only `waiting` changes: a finished flow keeps its outcome against a later connection end or completion | while `waiting` |
 | session terminal | the Agent's `terminal/create` | once its handle is gone and no item of the log or the tail embeds it (`ToolCallContent` of type `terminal`); its scope ending | while its handle exists |
 | terminal login | a `terminal_login` operation starts; it keeps its `methodId` for its whole life, whatever operation follows | it has exited and a client dismisses it (§7); the Agent connection ending | — |
 
@@ -562,8 +560,18 @@ request record, and a flow already dismissed is not shown again after a reconnec
 **Parent request of an accepted flow.** The pinned schema ties a request-scoped
 elicitation to "a specific JSON-RPC request" (`v1/elicitation.rs:1539`) and states
 no rule for an external URL flow the user already accepted when that request is
-answered. Ending it then (`ended`, `request_ended`) is a product rule of this
-protocol, not an ACP requirement, and open to review (release parity P5).
+answered. The parent's response, success or error, ends only an interaction not yet
+answered (§4.4). An accepted flow is identified by its `interactionId` and
+`elicitationId`, not by the request, so it keeps `waiting` until a completion, the
+connection's end, a dismissal or the end of the document that shows it, and no
+mapping of the answered request is kept. This follows Zed's ACP v1 client at
+[`28d0a35`](https://github.com/zed-industries/zed/commit/28d0a3547f16b9609b301b48ab363bfca649c864):
+its [authenticate](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/agent_servers/src/acp/v1.rs#L1545-L1563)
+awaits the response without touching accepted flows, and its shared thread model
+[separates](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/acp_thread/src/acp_thread.rs#L774-L798)
+finishing a request (pending interactions only) from cancelling it. Only the
+lifecycle is taken, not Zed's display, which hides finished flows (release parity
+P5).
 
 **Handle and output** (S7). A session terminal's handle is its process and the use of
 its ID in `terminal/*`. It ends with `terminal/release`, or when the Agent connection
