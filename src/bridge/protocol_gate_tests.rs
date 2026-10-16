@@ -1399,6 +1399,42 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
     peer.settled().await;
 }
 
+/// The Agent's messages for the target before the fork response are its
+/// history: without load support nothing replaces them (#8).
+#[tokio::test]
+async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
+    let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
+    peer.create("source", json!({})).await;
+    let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
+    let request = peer.request("session/fork").await;
+    let early = [
+        chunk("welcome", text("Forked ")),
+        chunk("welcome", text("session.")),
+    ];
+    for update in &early {
+        peer.update("forked", update.clone()).await;
+    }
+    peer.reply(&request, json!({"sessionId": "forked"})).await;
+    Peer::ended(forked).await.unwrap();
+    peer.until("the fork completes", |peer| {
+        peer.live("session/source")["op"]["id"] == op
+            && peer.live("session/source")["op"]["status"] == "completed"
+            && peer.has("session/forked")
+    })
+    .await;
+    let expected = crate::protocol::canon::TurnLog::from_replay(&early);
+    assert_eq!(
+        peer.log("session/forked"),
+        crate::protocol::stream_check::log_values(expected.entries()),
+        "the target's log is its early messages, as one turn with an empty prompt"
+    );
+    assert_eq!(
+        peer.log("session/forked")[0]["turn"],
+        json!({"prompt": [], "reply": [text("Forked "), text("session.")]})
+    );
+    peer.settled().await;
+}
+
 #[tokio::test]
 async fn a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"close": {}, "delete": {}}})).await;
