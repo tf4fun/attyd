@@ -113,8 +113,9 @@ holds back the load of each such scope the bridge does not hold. A scope is free
 its `op` has ended and no operation occupies it. Anything else is refused.
 
 **S6 Holding.** The bridge holds a session while it is needed: a client subscribes to
-it, an operation occupies it, or one of its resources can still act (a pending
-interaction, an unreleased terminal, a waiting URL flow). It may release a session
+it, an operation occupies it, an action on it is still waiting for the Agent's
+answer, or one of its resources can still act (a pending interaction, an unreleased
+terminal, a waiting URL flow). It may release a session
 that is not needed only if the Agent can load or resume it; a session it cannot bring
 back stays held until it is closed, deleted, or the Agent connection ends. Subscribing to a
 session the bridge does not hold makes the bridge hold it, which starts a `load`
@@ -133,9 +134,9 @@ Where a client sees it never changes its life:
   creating operation's scope and moves into the session when the session is
   installed;
 - a **URL flow** starts when a client accepts a URL elicitation and keeps that
-  elicitation's scope. It stops waiting when the Agent completes it, or its request
-  or the Agent connection ends, and keeps that outcome until a client dismisses it or
-  its scope ends;
+  elicitation's scope. It stops waiting once, when the Agent completes it, or its
+  request or the Agent connection ends, and keeps that first outcome until a client
+  dismisses it or the document that shows it ends;
 - a **terminal** has a **handle** (the process and its ID's use in `terminal/*`) and
   **output**. The handle ends with `terminal/release` or the Agent connection; the
   output is content, frozen then, and stays while content embeds it, as ACP requires.
@@ -187,6 +188,8 @@ resending it is safe.
 | The mode or a configuration option changes while a prompt runs; a running session can be closed | S4 |
 | An interaction ends with the JSON-RPC request it names, not with an operation that outlives or precedes it | S7 |
 | A tool's terminal output survives release and the Agent connection's end while the log holds the tool | S7 |
+| A tool call first seen through a sparse update or a permission keeps only what the Agent sent; later updates fill it in | S8 |
+| A control change or close still waiting for the Agent is never cut by a release | S6 |
 | A late tool or compaction update, or content the Agent sends between prompts, reaches every replica: it changes the entry it belongs to, or the tail | S2, S8 |
 | Two logs that align hold the same items, results and metadata, not only the same text | S1, S8 |
 | A resume never presents an unknown history as empty | S1 |
@@ -233,7 +236,7 @@ interface Turn {
 type Item =                 // the bridge's own types around ACP values (protocol §3.1)
   | { type: "message"; role: "user" | "agent" | "thought"; messageId?: string;
       chunks: Array<{ content: Block; _meta?: unknown }> }
-  | { type: "tool"; call: ToolCall }
+  | { type: "tool"; call: ToolCallUpdate }   // sparse: absent until provided
   | { type: "plan"; update: Plan | PlanUpdate | PlanRemoved }
   | { type: "compaction"; compactionId: string; status: CompactionStatus;
       summary: Array<{ content: Block; _meta?: unknown }>; error?: string; _meta?: unknown };
@@ -249,9 +252,13 @@ type Item =                 // the bridge's own types around ACP values (protoco
    form one item, and a chunk after an intervening item starts a new item with the
    same `messageId`, so `message(m1,"a") → tool → message(m1,"b")` gives two items of
    the one message m1.
-2. **Patch.** Sparse updates apply by the pinned type: for a tool call
-   `ToolCall::update`, where absent and `null` both keep and collections are replaced
-   whole (`content: []` clears); for a compaction the schema's three states (absent
+2. **Patch.** Sparse updates apply by the pinned type: for a tool call the field rule
+   of `ToolCall::update`, where absent and `null` both keep and collections are
+   replaced whole (`content: []` clears). The state is a `ToolCallUpdate`, not a
+   `ToolCall`, because ACP's `ToolCall` requires a `title` that a first sparse update
+   or a permission's `toolCall` (`{ toolCallId }`) need not carry; an unprovided field
+   stays absent, never invented, and no update is dropped for lacking one. For a
+   compaction the schema's three states (absent
    keeps, `null` clears, a value replaces). Nothing is deep-merged.
 3. **Fragments.** Every chunk keeps its own fields, including a chunk's `_meta` apart
    from its block's. Text joins the previous chunk only when every other field of the
@@ -283,8 +290,9 @@ prompt starts or the connection ends. An update for an entity already in the log
 rewrites that entry at once; the log change starts at its index, the later turns stay
 as they were, and their hashes follow the rewritten one.
 
-The same updates give the same entries, however they were chunked, live or replayed.
-Updates that differ in IDs, metadata, results or order give different entries; the
+The same updates give the same reduced items, however they were chunked, live or
+replayed; an entry also holds its `end`, which only a live turn has. Updates that
+differ in IDs, metadata, results or order give different items; the
 bridge does not make them equal. A live turn and its replay usually differ (the replay
 has no `end`; an Agent may replay less, or differently), and alignment then replaces
 the client's log. That costs a redrawn history, never a wrong write, and is the price
@@ -353,12 +361,16 @@ This section specifies S7.
   `interactions` and the flow enters `urlFlows` as `waiting`. Accepting only consents;
   the external flow starts then. It stops waiting when the Agent sends its completion
   notification (`completed`), or when its request (a request-scoped flow) or the Agent
-  connection ends (`ended`, with the reason), and then stays, with that outcome, so
+  connection ends (`ended`, with the reason); only `waiting` changes, so a later
+  completion, response or connection end never overwrites an outcome. Ending a flow
+  the user accepted when its parent request is answered is this protocol's product
+  rule, not an ACP requirement (release parity P5). The flow then stays, with that outcome, so
   that every client can tell success from giving up, also when the Agent completes
   it much later. It is removed when:
   - a client dismisses it (§6.1), waiting or finished; ACP makes the completion
     notification optional and the user must be able to give up waiting;
-  - its scope ends, or its session is not installed.
+  - the document that shows it ends (a session scope's end), or its session is not
+    installed.
 
   It keeps its elicitation's scope and moves with installation. Only a waiting flow
   keeps its session needed. No record of dismissed flows is kept.
@@ -505,8 +517,8 @@ only on the user's request.
   `controls`. A queued control change is therefore never needed.
 - **The catalog** is its own scope, so that listing does not contend with global
   writes. `list` runs the Agent's `session/list`. An elicitation the Agent sends
-  during it and scoped to that request is an interaction of `catalog` with the `list`
-  as its parent, answered like any other.
+  during it and scoped to that request is an interaction of `catalog` with the
+  `session/list` request as its parent, answered like any other.
 - **Actions are not operations.** Controls and close address their session; answering
   an interaction, terminal input, resize, and dismissing a URL flow or an exited
   terminal login address a resource by its ID. None takes `expect`:
@@ -516,7 +528,11 @@ only on the user's request.
   POST /api/v2/scopes/{scope}/resources/{id}/{action}
   ```
 
-  They never wait for a client and fall outside S5 (S7). The resource ID identifies the
+  They occupy nothing and fall outside S5. Resource actions never wait for a client;
+  a control or close waits for the Agent's answer, and the Agent may ask a client
+  something meanwhile (an elicitation), which is an interaction like any other. Until
+  that answer the action keeps its session held (S6), through the outstanding-request
+  entry the bridge already keeps; the answer settles only that action's session. The resource ID identifies the
   resource, not one action on it, so each action states its own repeat semantics:
 
   | Action | Repeated |
@@ -524,7 +540,7 @@ only on the user's request.
   | set_mode, set_config | sets a value: the same value again leaves the same state |
   | close | while one is in flight, `not_allowed`; after success the scope is gone (`404`) |
   | answer | **at most once**: checked against its request, delivered and removed in one step; a repeat, or an answer after the interaction ended, gives `404` and leaves the same state |
-  | dismiss | no further effect: a second dismissal, or one after completion, gives `404` and leaves the same state |
+  | dismiss | removes the flow, waiting or finished, or the exited login; a second dismissal gives `404` and leaves the same state |
   | resize | sets a size: repeating the same size leaves the same state |
   | input | **not idempotent**: the bytes are written to the terminal's stdin each time, in the order the bridge receives them |
 
@@ -605,8 +621,12 @@ This section applies C2 and C3 to writes.
 ## 7. Holding
 
 - **Needed sessions are held.** A session is needed while a client subscribes to
-  it, an operation occupies it, or one of its resources can still act: a pending
-  interaction, an unreleased terminal, a waiting URL flow (S6).
+  it, an operation occupies it, a `set_mode`, `set_config` or `close` on it waits for
+  the Agent's answer, or one of its resources can still act: a pending interaction,
+  an unreleased terminal, a waiting URL flow (S6). An action needs no slot or record
+  for this: its outstanding JSON-RPC request is the need, from send to response.
+  A release never starts while a client close is outstanding, and its own close sets
+  `closing`, so the two never overlap.
 - **Release only what can be loaded again.** The bridge releases a session that is
   not needed, as an ordinary ACP client would close it, only if the Agent
   advertises `session/load` or `session/resume`. How long it waits first affects
@@ -797,9 +817,14 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
     - The Agent's completion, also long after the accept, shows it `completed` on
       every replica; its request's end and the Agent connection's end show it
       `ended` with the reason; the two are distinguishable in the browser.
+    - A finished flow keeps its first outcome: a `completed` flow stays `completed`
+      when its parent request is answered or the connection ends afterwards, and an
+      `ended` flow stays `ended` when a completion for its `elicitationId` arrives
+      late (which then completes no other flow).
     - A finished flow no longer keeps its session needed. It is removed on a
       client's dismissal (also when dismissed twice; a second gives `404`) and when
-      its scope ends.
+      the session scope that shows it ends; a flow of `global` or `catalog` stays
+      until dismissed.
 12. **Holding (S6, §7).**
     - A session released before its first subscription is loaded by that
       subscription and continues its log.
@@ -907,6 +932,34 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
     turns show tool cards, thoughts, plans and compactions collapsed by default and
     expandable, with the disclosure kept across new turns; thread search and change
     review find their content.
+36. **First sparse tool state (§4.1)** r2. From the ACP input, for each of: a
+    permission whose `toolCall` is `{ toolCallId: "t" }` before any `tool_call`; a first
+    `tool_call_update` `{ toolCallId: "u", status: "pending" }`; then later updates
+    that add `title`, `kind`, `content` and `rawInput`, and a `tool_call` for `t`:
+    - the item exists from the first update, at its position, and holds exactly the
+      fields received so far; no `title`, `kind` or `status` is filled in, no update
+      is dropped, and no `null` appears in the state;
+    - each later update fills in its fields by the patch rule, and the `tool_call`
+      gives its fields, its schema defaults included;
+    - the same holds in the tail, in the settled log, in a replay that sends the same
+      updates, and in the hash; the generated TypeScript types the item's `call` as
+      `ToolCallUpdate`, and the browser renders an item without `title` (as not
+      reported) in the live turn, a settled turn, a reload and the export.
+37. **Actions hold their session (S6, §6.1)** r2. With a release delay of `0`, an
+    idle session gets a `set_config` the scripted Agent leaves unanswered, and the
+    last subscription ends:
+    - the session stays held and is not released, closed or loaded again while the
+      request is outstanding;
+    - a session-scoped elicitation the Agent sends meanwhile is shown in the session
+      and answered; a subscription made meanwhile aligns with the held documents;
+    - the delayed response folds into that session's `controls` and answers the
+      original HTTP request; then, with nothing else needed, the session is released
+      after the delay, once;
+    - the same for `set_mode` and for `close`, where the release sends no second
+      `session/close` and the close ends the scope with `closed`; while a release's
+      own `session/close` is outstanding, a client `close` gets `not_allowed`;
+    - the Agent connection ending while the request is outstanding answers it
+      `unavailable` and changes no `controls`.
 
 The bridge's handling of ACP failures and its internal clean-up belong to layer 1 and
 are tested there. They add no duties to clients.
@@ -948,6 +1001,12 @@ revision 2's own choices:
     than shown in `global` (audit Q6).
 13. A URL flow keeps its outcome in `urlFlows` until dismissed (release parity R4,
     P4); the alternative, a transient notice outside the documents, would break C1.
+    Ending an accepted request-scoped flow when its parent request is answered is a
+    product rule, open to review (P5).
+14. A tool item's state is ACP's `ToolCallUpdate`, so a call first seen sparsely is
+    represented as received (§4.1). No own type and no placeholder values are added.
+15. An action waiting for the Agent keeps its session held through the outstanding
+    request the bridge already tracks (§7); no slot, owner or record is added.
 
 ## 13. Migration
 

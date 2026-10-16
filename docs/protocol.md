@@ -75,8 +75,9 @@ specifies their fields, endpoints and behavior.
   acts on until it actually ends, a requested cancel included: it is the `op` of each
   held one and holds back the load of each unheld one. Anything else is refused.
 - **S6 Holding.** The bridge holds a session while it is needed: subscribed, occupied,
-  or with a resource that can still act (a pending interaction, an unreleased
-  terminal, a waiting URL flow). It releases a session that is not needed, after the
+  with an action whose ACP request is outstanding (§7), or with a resource that can
+  still act (a pending interaction, an unreleased terminal, a waiting URL flow). It
+  releases a session that is not needed, after the
   release delay (`--session-unobserved-timeout`), only if the Agent can load or resume
   it; any other session stays held until it is closed, deleted, or the Agent
   connection ends. Subscribing to an unheld session starts a
@@ -112,7 +113,7 @@ specifies their fields, endpoints and behavior.
   is the exception: it is delivered at most once (§7), so resending it is safe.
 
 **Conventions.** All paths are under `/api/v2`. JSON field names are camelCase.
-Embedded ACP types (`ContentBlock`, `SessionUpdate`, `ToolCall`, `PromptResponse`,
+Embedded ACP types (`ContentBlock`, `SessionUpdate`, `ToolCallUpdate`, `PromptResponse`,
 `RequestPermissionRequest`, `InitializeResponse`, …) are carried as the ACP schema
 pinned in `Cargo.lock` defines them, `_meta` included. The one position the bridge
 changes is a content block that carries bytes, which is replaced by an `AttachmentRef`
@@ -164,7 +165,8 @@ interface Chunk {           // one received chunk, its own fields kept
 
 interface ToolItem {
   type: "tool";
-  call: ToolCall;           // ACP, reduced (§3.2); `_meta` is the call's
+  call: ToolCallUpdate;     // ACP's sparse type, reduced (§3.2): a field is absent
+                            // until the Agent provides it; `_meta` is the call's
 }
 
 type PlanItem =
@@ -203,12 +205,23 @@ interface LogEntry {
 ```
 
 - Item types are the bridge's own. Every ACP value inside them (`ContentBlock`,
-  `ToolCall`, `Plan`, `PlanUpdate`, `PlanRemoved`, `PromptResponse`) is carried as the
+  `ToolCallUpdate`, `Plan`, `PlanUpdate`, `PlanRemoved`, `PromptResponse`) is carried as the
   pinned schema defines it, `_meta` included.
 - An attachment's `id` is computed over the whole block as the Agent or the client
   gave it, `_meta` included, and the bridge keeps that block. Reading an attachment
   (§8) and resolving a prompt's reference (§6.2) return it unchanged.
 - Text and resource links stay inline. Annotations and `_meta` stay on every block.
+- **Tool state.** A tool item holds the reduced state as the pinned `ToolCallUpdate`
+  (`v1/tool_call.rs:220–236`), in which every field but `toolCallId` is optional. The
+  pinned `ToolCall` cannot hold it: its `title` is required (`:33`), and
+  `TryFrom<ToolCallUpdate>` fails without one (`:395–420`), while the first update the
+  bridge sees for an ID may be a sparse `tool_call_update` or a permission's
+  `toolCall`, e.g. `{ "toolCallId": "t" }`. A field the Agent has not provided is
+  absent: the bridge fills in no title, kind or status, and drops no update for a
+  missing field. A later update or `tool_call` provides it by rule 2. The state never
+  holds `null`, since `null` keeps (rule 2). The same type is in the log, the tail, a
+  replay and the generated TypeScript (`ToolCallUpdate` of the TS SDK). A client shows
+  an absent field as not reported.
 
 ### 3.2 Reduction
 
@@ -228,9 +241,10 @@ Three rules decide every reduction. The table applies them per update.
    item with the same `messageId`: the timeline keeps the order, and the shared ID
    keeps the message's identity. Chunks without a `messageId` belong to the message
    their run continues.
-2. **Patch.** A sparse update applies by its pinned type. For tool calls this is
-   `ToolCall::update`: a field absent **or `null`** keeps the value, a value replaces
-   it, collections are replaced whole, so `content: []` and `locations: []` clear. A
+2. **Patch.** A sparse update applies by its pinned type. For tool calls this is the
+   field rule of `ToolCall::update`, applied to the `ToolCallUpdate` state: a field
+   absent **or `null`** keeps the value (or its absence), a value replaces it,
+   collections are replaced whole, so `content: []` and `locations: []` clear. A
    compaction's `summary`, `error` and `_meta` are three-state: absent keeps, `null`
    clears, a value replaces. A field the type gives no patch rule (`_meta` of a tool
    call update) follows the same rule as the type's other optional fields: absent or
@@ -243,8 +257,8 @@ Three rules decide every reduction. The table applies them per update.
 | ACP update | Reduction | ACP basis (schema 1.7.0) |
 | --- | --- | --- |
 | `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk` | Joins the last item when that item is a message of the same role and `messageId` (both absent counts as the same), by rule 3; otherwise starts a message item. | chunks of one message share `messageId`; a change means a new message (`v1/client.rs:614–617`); `ContentChunk._meta` (`:622–631`) |
-| `tool_call` | Upserts the tool item of its `toolCallId`: on an existing item, the fields it carries replace the item's; otherwise it starts one. | `toolCallId` is unique within the session (`v1/tool_call.rs:30`) |
-| `tool_call_update` | Patches the tool item of its `toolCallId` by rule 2; an unknown ID starts an item from the update. | `ToolCall::update` applies only present values; collections "are overwritten, not extended" (`v1/tool_call.rs:177–205`); `name` absent or `null` "left unchanged" (`:295–296`); "only changed fields need to be included" (`:210–211`) |
+| `tool_call` | Reduced as `ToolCallUpdate::from` the call, which carries every field it has, the schema's defaults for `kind`, `status`, `content` and `locations` included: it patches the item of its `toolCallId` by rule 2, or starts one. | `toolCallId` is unique within the session (`v1/tool_call.rs:30`); `From<ToolCall> for ToolCallUpdate` (`:434–465`) |
+| `tool_call_update` | Patches the tool item of its `toolCallId` by rule 2; an unknown ID starts an item that holds exactly the update's fields. | `ToolCall::update` applies only present values; collections "are overwritten, not extended" (`v1/tool_call.rs:177–205`); `name` absent or `null` "left unchanged" (`:295–296`); "only changed fields need to be included" (`:210–211`) |
 | `plan` | Replaces the legacy plan snapshot of the turn it arrives in, or starts one. | the client replaces the entire plan (`v1/plan.rs:36–37`); the schema gives the legacy plan no ID |
 | `plan_update` | Upserts the plan item of its `planId`: the update is the plan's state. | `PlanId` is unique within a session (`v1/plan.rs:79`) |
 | `plan_removed` | Sets the plan item of its `planId` to the removal, in place. A removed plan is no current plan; an unknown ID starts a removal item. A later `plan_update` with the ID makes it current again, in the same item. | removal notice for a plan identified by ID (`v1/plan.rs:353`) |
@@ -257,7 +271,8 @@ Three rules decide every reduction. The table applies them per update.
   a record of that turn, not the current plan, and no update reduces into an older
   turn's snapshot.
 - A permission request's `toolCall` is a `ToolCallUpdate` and is reduced like one,
-  where its session's timeline is.
+  where its session's timeline is; the first one for an ID starts an item with only
+  its fields.
 - The same updates give the same items however they were chunked, live or replayed.
   Updates that differ in IDs, `_meta`, results or order give different items; the
   bridge does not make them equal.
@@ -351,7 +366,8 @@ interface SessionLive extends ScopeLive {
   tail: { continues: boolean; items: Item[] };  // the turn being received (§3.3);
                                             // `continues`: it extends the last entry
   terminals: Record<string, Terminal>;      // Agent terminals (§4.6)
-  closing: boolean;                         // a `close` action is in flight (§7)
+  closing: boolean;                         // a `close` action, or a release's
+                                            // `session/close`, is outstanding (§7)
 }
 ```
 
@@ -531,16 +547,23 @@ interface Terminal {
 | Resource | Created | Removed | Keeps its session needed |
 | --- | --- | --- | --- |
 | interaction | an Agent request arrives (§4.4) | it is answered or ends by its ACP scope (§4.4) | yes |
-| URL flow | a client accepts a URL elicitation, with `status: "waiting"`; the interaction leaves `interactions` in the same step, and the flow keeps its ACP scope and where it is shown, moving with installation (§4.4). Accepting only consents. | a client's dismissal (§7); its session not being installed; its scope ending. Before that it stays with its outcome: the Agent's `elicitation/complete` for its `elicitationId` (the one waiting flow with that ID) sets `completed`; its parent request's response (a request-scoped flow) or the Agent connection's end sets `ended` with that `reason` | while `waiting` |
+| URL flow | a client accepts a URL elicitation, with `status: "waiting"`; the interaction leaves `interactions` in the same step, and the flow keeps its ACP scope and where it is shown, moving with installation (§4.4). Accepting only consents. | a client's dismissal (§7); its session not being installed; the end of the document that shows it (a session scope ending; `global` and `catalog` never end). Before that it stays with its outcome: the Agent's `elicitation/complete` for its `elicitationId` (the one waiting flow with that ID) sets `completed`; the Agent connection's end, or its parent request's response (a request-scoped flow; a product rule, release parity P5), sets `ended` with that `reason`. Only `waiting` changes: a finished flow keeps its outcome against a later parent response, connection end or completion | while `waiting` |
 | session terminal | the Agent's `terminal/create` | once its handle is gone and no item of the log or the tail embeds it (`ToolCallContent` of type `terminal`); its scope ending | while its handle exists |
 | terminal login | a `terminal_login` operation starts; it keeps its `methodId` for its whole life, whatever operation follows | it has exited and a client dismisses it (§7); the Agent connection ending | — |
 
 **URL flow outcomes.** v0.2.8 told the user whether a flow completed or was given up,
 also when the Agent completed it later, asynchronously. The outcome is therefore part
 of the flow, not a separate record: a flow that stops waiting stays in `urlFlows`
-with its `status` until a client dismisses it or its scope ends, and only a `waiting`
-flow keeps its session needed. Nothing else is kept: no table of finished flows, no
+with its `status` until a client dismisses it or the document that shows it ends, and
+only a `waiting` flow keeps its session needed. `waiting` is the only status that
+changes, once, to `completed` or `ended`. Nothing else is kept: no table of finished flows, no
 request record, and a flow already dismissed is not shown again after a reconnect.
+
+**Parent request of an accepted flow.** The pinned schema ties a request-scoped
+elicitation to "a specific JSON-RPC request" (`v1/elicitation.rs:1539`) and states
+no rule for an external URL flow the user already accepted when that request is
+answered. Ending it then (`ended`, `request_ended`) is a product rule of this
+protocol, not an ACP requirement, and open to review (release parity P5).
 
 **Handle and output** (S7). A session terminal's handle is its process and the use of
 its ID in `terminal/*`. It ends with `terminal/release`, or when the Agent connection
@@ -814,6 +837,19 @@ sent is a §9 error (`404` when the target does not exist). Otherwise:
   or resumes it with a `partial` history. On an Agent error `closing` clears and the
   session stays as it was. A lost response is uncertain (C3): the replica shows which
   it was.
+- **Holding.** A control or close action whose ACP request is outstanding keeps its
+  session needed (S6), from the request's send to its response, by the same
+  outstanding-request entry that parents its elicitations (§4.4); nothing else is
+  recorded. So a release never cuts it, whatever the release delay, `0` included,
+  and the Agent requests it causes (a session-scoped elicitation, a permission) find
+  their session held. Once it is answered, the session is released as usual if
+  nothing else needs it. A release never starts while a client `close` is
+  outstanding, and while a release's own `session/close` is outstanding the session
+  is `closing`, so the two never overlap.
+- **Response.** The Agent's response settles only the action it answers: it folds
+  into the session that action named (§4.5) and answers that HTTP request. If the
+  session's documents are gone by then (a delete was admitted meanwhile), it changes
+  no document; if the Agent connection ends first, the action answers `unavailable`.
 - An answer that does not fit its request (an option the request does not offer, a
   form response that fails its schema) is `invalid_request` and changes nothing.
 - Each interaction is answered on its own. Two clients may answer two interactions of
@@ -872,14 +908,14 @@ ends; the client subscribes again with its heads.
 | `Position`, `epoch`, `seq`, `Last-Event-ID`, `at`, `prev` positions | none; alignment by log head (§5) |
 | `snapshot`, `reset` plus `GET /sessions/{id}` | alignment event `{ log, live: { replace } }` |
 | `ops` | `{ live: { patch } }`, or a settle point `{ log, live: { patch } }` |
-| `end` (`closed`, `unobserved`, `replaced`, `gone`) | `end` (`deleted`, `load_failed`); a released session is loaded again on subscription |
+| `end` (`closed`, `unobserved`, `replaced`, `gone`) | `end` (`deleted`, `closed`, `load_failed`); a released session is loaded again on subscription |
 | `position` | SSE comments |
 | `session/<id>@<epoch>:<incarnation>` | `session/<id>` |
 | `history.timeline`, `collapsedTurns`, process pages | `log` of settled turns (§3); `live.tail` |
 | `turn`, `outcomes`, `operation` | `op`; a turn's `end` |
 | `global.requests`, request records, acknowledgements | `op` of each scope |
-| `interactions`, `requestId` parents | `live.interactions`, with a `parent` operation for request-scoped elicitations |
-| URL flow `status` and acknowledgement | removal on completion or dismissal (§4.6) |
+| `interactions`, `requestId` parents | `live.interactions`; a request-scoped elicitation's `parent` is the outstanding JSON-RPC request it names (§4.4) |
+| URL flow `status` and acknowledgement | `status` `waiting`, then `completed` or `ended`, kept until dismissal or the end of the document that shows it; no acknowledgement (§4.6) |
 | `Idempotency-Key`, intents, `If-Match` tags, `historyRevision` CAS | `expect` (§6.4) |
 | `POST /sessions/{id}/open`, first-subscription lease | subscription with `cwd` (§5.1) |
 | `POST /sessions/{id}/close` | the `close` action (§7); release when not needed (S6) |
@@ -911,16 +947,17 @@ audit finding.
 | a released terminal leaves `live` with its output | it stays, frozen and `released`, while content embeds it (§4.6) | D8 |
 | a resume of an unknown log gives a known empty log | `history: "partial"` (§3.5) | D9 |
 | `answer` must cover all pending interactions of the operation | each interaction answered on its own, at most once (§7) | D10 |
-| interactions join the running operation, or start an `agent_request`; an operation's end cancels them | interactions are resources of their ACP scope; only a request-scoped one has a parent operation (§4.4) | D11 |
+| interactions join the running operation, or start an `agent_request`; an operation's end cancels them | interactions are resources of their ACP scope; only a request-scoped one has a parent, the JSON-RPC request it names (§4.4) | D11 |
 | `op.process` on a running prompt | `live.tail` on the session | D1, D5 |
 | S2 Commit, I8 privacy (a committed turn's process never appears again) | S2 Settling, S8 Content | D1 |
 | plans reduced per turn by `planId` | an ID-addressed plan is one item per session; a removal sets it, in place (§3.2) | D1 |
 | tool updates: every present field replaces, `null` included | `ToolCall::update`: absent and `null` keep, collections replace (§3.2) | D1 |
+| tool state as `ToolCall` | `ToolCallUpdate`: a first sparse update or permission keeps only its fields, nothing filled in (§3.1) | D1 |
 | chunk `_meta` merged away with the text | each chunk keeps its fields; text joins only equal neighbours (§3.2) | D7 |
 | a released terminal's output removed on release and at the connection's end | handle and output separated; the output stays while embedded (§4.6) | D8 |
-| `set_mode`, `set_config` are operations, refused during a prompt | actions, allowed during a prompt (§7) | R1 |
-| no `close` | the `close` action, also during a prompt (§7) | R2 |
+| `set_mode`, `set_config` are operations, refused during a prompt | actions, allowed during a prompt; an outstanding one keeps its session held (§7) | R1 |
+| no `close` | the `close` action, also during a prompt; `end: closed` (§5.2, §7) | R2 |
 | request-scoped elicitations parented by operations; unknown request IDs go to `global` | parented by the outstanding JSON-RPC request; no outstanding request is refused (§4.4) | D11 |
 | interactions of a session being created ended with the `create` | moved into the session when it is installed (§4.4) | D11 |
 | Agent stderr and MCP-over-ACP activity not projected | `global.live.diagnostics`, bounded (§4.7) | R3 |
-| a URL flow is removed when it completes or ends, so its outcome is not shown | the flow stays with `status` until dismissed (§4.6) | R4 |
+| a URL flow is removed when it completes or ends, so its outcome is not shown | the flow stays with `status` until dismissed; only `waiting` changes (§4.6) | R4 |

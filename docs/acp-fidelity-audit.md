@@ -86,6 +86,7 @@ These stay as they are; the audit does not widen the product:
 | Q4 | May a `tool_call_update` or compaction update arrive after the prompt's response? | Yes; the schema does not forbid it and the bridge's validation already keeps those entities. It changes the settled entry (§3.3). |
 | Q5 | Agent extension notifications (`_`-prefixed methods). | Unknown requests get `method_not_found` (`bridge/agent_dispatch.rs:209`), as JSON-RPC requires. Notifications: to be confirmed by a test in step 17. |
 | Q6 | A request-scoped elicitation whose `requestId` is `null`, or names a request that is not outstanding. The schema allows any `RequestId` (`rpc.rs:31–39`) and says only that the scope is "tied to a specific JSON-RPC request" (`v1/elicitation.rs:1539–1540`). | Refused with `invalid_params`, the two cases told apart in the error data; no interaction and no `global` fallback (§4.4). |
+| Q7 | Does the response to a request-scoped elicitation's parent request end a URL flow the user already accepted? The schema ties the elicitation to its request (`v1/elicitation.rs:1539–1540`) and states no rule for an accepted external flow. | Not an ACP requirement. The target ends it (`ended`, `request_ended`) as a product rule, open to review (release parity P5). |
 
 ## 6. Version differences
 

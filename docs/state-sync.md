@@ -425,8 +425,10 @@ the retained content instead; no other test is weakened.
   replay builder (`history_replay::HistoryBuilder`) already fold tool calls, plans and
   text chunks; they become this reducer, implementing the three rules of protocol
   §3.2 (identity, patch, fragments): message items by role and `messageId`, one item
-  per `toolCallId`, `planId` and `compactionId` in the session, `ToolCall::update` for
-  tool patches, the compaction's three-state patch, and chunks with their own `_meta`.
+  per `toolCallId`, `planId` and `compactionId` in the session, the tool state as a
+  `ToolCallUpdate` patched by the field rule of `ToolCall::update` (a first sparse
+  update or permission keeps only its fields; today's fold into a `ToolCall` would
+  need an invented `title`), the compaction's three-state patch, and chunks with their own `_meta`.
   An index from entity ID to its entry (or the tail) makes a late update cheap to
   place.
 - **Tail instead of process.** The running prompt's `SharedTurnUpdates` becomes the
@@ -453,7 +455,10 @@ the retained content instead; no other test is weakened.
   Holding counts only terminals with a handle.
 - **Actions.** `set_mode`, `set_config` and `close` leave the operation slot: they are
   sent under the bridge guard without occupying the session, their HTTP response is
-  held until the Agent answers, and `close` sets `closing` until then. The v1 close
+  held until the Agent answers, and `close` sets `closing` until then. The
+  outstanding-request map of the interactions note is also the holding input: a
+  session with an outstanding action request is needed, so the release timer does
+  not run until the response; a release sets `closing` while its own close is out. The v1 close
   path of v0.2.8 (`close_session`) is the behavioral reference, not code to restore.
 - **Diagnostics.** The MCP relay and the Agent's stderr callback, which today are not
   projected (stderr goes to the bridge log), write into `global.live.diagnostics` through the commit step, bounded as the
@@ -469,14 +474,14 @@ request records or epochs.
 | Step | Work | Removes | Acceptance (redesign §11) |
 | --- | --- | --- | --- |
 | 10 | Docs: this revision, the audit, the release parity matrix, the coverage ledger | — | review |
-| 11 | Timeline reducer and entry shape: items, `end`, `_meta`, message boundaries, attachments as received, hash over the entry; live commits and replays through it; generated TypeScript; the web projection renders items from the log as it renders `op.process` today. Prompt `end` on completed and cancelled turns. | D1, D2, D3, D6, D7 | 1, 13, 19, 20, 25, 26, 27, 30, 31 |
+| 11 | Timeline reducer and entry shape: items, `end`, `_meta`, message boundaries, attachments as received, hash over the entry; live commits and replays through it; generated TypeScript; the web projection renders items from the log as it renders `op.process` today. Prompt `end` on completed and cancelled turns. | D1, D2, D3, D6, D7 | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36 |
 | 12 | Settling of failed and interrupted prompts | D4 | 2, 22 |
 | 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |
 | 14 | History status `partial` for a cold resume; the client keeps a replaced log as unconfirmed UI state | D9 | 23 |
 | 15 | Terminal handle and output separated: frozen output through release and the connection's end; the holding change | D8 | 12, 24 |
 | 16 | Interactions as scope resources with ACP lifecycles; per-interaction answers in bridge and client; URL flow outcomes; `agent_request` removed | D10, D11, R4 | 7, 8, 11 |
 | 17 | Coverage ledger chains for the new paths; an extension-notification test (audit Q5) | — | the ledger's rows |
-| 18 | Actions: `set_mode`, `set_config` and `close` outside the operation slot, `closing`, `end: closed`; the client's controls enabled during a prompt and the close confirmation | R1, R2 | 18, 28, 29 |
+| 18 | Actions: `set_mode`, `set_config` and `close` outside the operation slot, `closing`, `end: closed`; the client's controls enabled during a prompt and the close confirmation | R1, R2 | 18, 28, 29, 37 |
 | 19 | `global.live.diagnostics`: Agent and MCP stderr, MCP-over-ACP connections and activity; the collapsible panels | R3 | 32 |
 | 20 | Markdown export over items, `end` and terminal snapshots; the browser cases of settled content and per-interaction answers | (D1, D4, D8 in the client) | 33, 34, 35 |
 
