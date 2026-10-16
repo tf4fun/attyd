@@ -1412,10 +1412,10 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
     peer.settled().await;
 }
 
-/// Early process updates without a message are no history: the target
-/// still keeps the source's completed messages (#8).
+/// Early thought/plan updates do not provide a full history replay: a fork
+/// without load keeps the source's history and the new ACP content (#8).
 #[tokio::test]
-async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
+async fn a_forks_early_process_updates_keep_source_history_and_new_content() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
     peer.create("source", json!({})).await;
     let (prompt_op, prompt) = peer.prompt("source", vec![text("source prompt")]).await;
@@ -1451,10 +1451,38 @@ async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
             && peer.has("session/forked")
     })
     .await;
+    let target_log = peer.log("session/forked");
+    let items: Vec<Value> = target_log
+        .iter()
+        .flat_map(|entry| entry["turn"]["items"].as_array().unwrap().iter().cloned())
+        .collect();
+    let source_items = source_log[0]["turn"]["items"].as_array().unwrap();
+    assert!(
+        items.starts_with(source_items),
+        "early thought/plan updates must not erase the fork's inherited history: {items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item["type"] == "message"
+                && item["role"] == "thought"
+                && item["chunks"][0]["content"] == text("thinking")
+        }),
+        "the early thought must also remain: {items:#?}"
+    );
+    assert!(
+        items.iter().any(|item| {
+            item["type"] == "plan"
+                && item["update"]["entries"]
+                    == json!([
+                        {"content": "Step", "priority": "medium", "status": "pending"},
+                    ])
+        }),
+        "the early plan must also remain: {items:#?}"
+    );
     assert_eq!(
-        peer.log("session/forked"),
+        peer.log("session/source"),
         source_log,
-        "process updates alone do not replace the source's messages"
+        "fork leaves the source unchanged"
     );
     peer.settled().await;
 }
