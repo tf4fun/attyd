@@ -1,16 +1,15 @@
 # Verification
 
-The bridge-first state-machine migration and its executable acceptance ledger are documented in
-[`bridge-state-machine-tdd.md`](bridge-state-machine-tdd.md). That ledger is authoritative for ACP
-lifecycle, reconnect, concurrency, and subscriber correctness; browser tests validate only the
-projection after the bridge gates pass.
+This guide owns commands, environments and fixtures. The [TDD guide](bridge-state-machine-tdd.md)
+defines the testing method; the [ACP memory contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract)
+and [简易 Agent 交互协议](protocol.md) define the behavior. Existing test evidence
+is recorded in [the coverage ledger](acp-coverage.md), and pending work in
+[the implementation plan](state-sync.md#7-fidelity-migration-revision-2).
 
-The browser talks to the host only through [protocol v2](protocol.md) under `/api/v2`; its
-invariants and gates are listed in the [implementation plan](state-sync.md#4-invariants-and-gates).
-A completed turn arrives as a log entry without its process, and writes wait for their HTTP
-answer without a short deadline. The earlier
-[process pagination](lazy-turn-process.md) and [HTTP timeout](http-request-timeouts.md) ledgers
-describe the removed `/api/v1` API and are kept as history.
+Verify ACP behavior and retained memory before client replication. The current
+experimental code still has the [audited fidelity gaps](acp-fidelity-audit.md#2-defects);
+existing assertions of lost content must change with the repair, not be treated
+as target behavior. Earlier API and test designs are in [the history index](history.md).
 
 The production host and every host-level integration harness run the Rust backend. TypeScript is
 used only for the browser application, shared browser protocol types, test Agents, and test
@@ -110,8 +109,8 @@ Its **审批、设置与状态** tab also offers permission content/input, form 
 elicitation, grouped/boolean controls, legacy modes, context usage, and running/cancelling/late-result
 examples. These use the real components with local state and no backend calls. The dedicated
 `style-showcase.pw.ts` case checks those interactions at desktop/mobile widths. The
-[display audit](acp-display-audit-2026-09-26.md#10-补齐实现) distinguishes these samples from full
-protocol/lifecycle coverage.
+[tool-card guide](tool-card-presentation.md) defines presentation behavior.
+Fixture rendering is not evidence of ACP lifecycle correctness.
 
 `prompt-folding.pw.ts` fetches a separate set of static samples to verify the nine-line
 rendered-height boundary, short labels with long Markdown URLs, headings/tables, responsive
@@ -159,11 +158,11 @@ and no popup.
 CI retains one diagnostic retry but fails on flaky tests, so a retry cannot turn a
 first-attempt failure into a successful browser or coverage gate.
 
-Browser assertions follow the current projection contract. A completed turn shows its prompt and
-final messages; its process ended with the turn and is not shown again after a reload. Check a tool
-call while its turn runs. A session terminal is a resource, not process (protocol S7): it stays in
-`live.terminals` after its operation ends until the Agent releases it, as
-`keeps a session terminal after its operation ends and drops its output once released` checks.
+Browser assertions follow the target content contract as each migration step lands.
+The existing completed-turn collapse and released-terminal removal assertions
+encode defects D1 and D8; they must become retention cases when those paths are
+repaired. Check retained content directly in bridge tests before testing its
+collapsed and expanded presentation.
 
 `tests/browser/browser-errors.ts` fails a case on any console error or page error. A case may
 allow only an HTTP status it causes deliberately, on one same-origin path: the session list
@@ -181,56 +180,16 @@ The native `auth_terminal::tests` gate verifies PTY input and lifecycle behavior
 
 ## Backend behavior
 
-The Rust suite covers CLI and MCP configuration boundaries,
-filesystem roots/read/write/context behavior, terminal and terminal-auth lifecycle, optional
-capability gates, Agent-owned cwd selection, early/late update routing, large lossless relay values,
-complete structured errors, large HTTP/stdio/WebSocket payloads, delayed admission, cyclic pagination, session races, complete ContentBlock validation,
-prompt/usage coherence, configuration and mode references, transactional session updates,
-permission and elicitation semantics, and MCP process/request races.
-Protocol v2 has its own gates: `protocol::convergence_tests` compares replicas with the
-published documents after every event, `protocol::hub_tests` covers cuts, queues and coalescing,
-`bridge::protocol_gate_tests` runs the coordinator over a real ACP transport, and
-`server::stream_tests` adds real HTTP for the stream, writes, resource actions and reads.
+Run the native Rust suite for direct state, semantic validation and service
+lifecycles; use real coordinator/ACP and HTTP harnesses when the failure crosses
+those boundaries. The [coverage ledger](acp-coverage.md#backend-behavior) owns the
+named lifecycle cases and their evidence limits; its
+[current protocol chains](acp-coverage.md#protocol-chain-current-protocol) identify
+the coordinator and route-level gates.
 
-The bridge identifies a session by its ID only (migration step 9,
-[plan §5](state-sync.md#5-migration)). Its session-lifecycle gates are behaviour
-tests, not checks of an internal identity:
-
-- updates before a creation response: `preserves_early_update_bursts_until_creation_completes`,
-  `a_new_sessions_early_controls_survive_its_creation_response`,
-  `an_early_compaction_continues_its_summary_after_creation`,
-  `invalid_early_updates_prevent_session_commit_and_clear_cleanly`;
-- the response as the cut between replay and live data:
-  `replay_response_seals_history_before_following_live_data`;
-- a cold placeholder: `a_cold_placeholder_keeps_wire_replay_before_the_creation_response`
-  (real ACP transport and coordinator),
-  `creation_staging_keeps_cold_resources_separate_and_counts_every_unknown_id`;
-- a load committed atomically or rolled back:
-  `load_candidate_is_invisible_until_success_then_commits_atomically`,
-  `failed_load_discards_candidate_and_resume_never_claims_replayed_history`,
-  `invalid_replay_cannot_publish_a_valid_prefix`,
-  `invalidated_load_attempt_cannot_commit_a_truncated_replay`,
-  `replay_validation_rollback_settles_only_its_own_attempt`;
-- close and delete cleanup:
-  `close_cleanup_rejects_late_live_resources_without_publication_or_resurrection`,
-  `close_then_delete_is_irreversible_and_partial_failure_stays_closed`,
-  `delete_close_success_releases_resources_before_delete_response`;
-- resource release: `closing_a_session_releases_resources_once`,
-  `replacement_retires_old_resources_and_history_removal_preserves_live_ones`,
-  `failed_attachment_releases_every_pre_response_live_resource`,
-  `releases_only_terminals_owned_by_closed_session`.
-
-A late notification names only a `sessionId`. One for an ID with no running
-session is dropped when no creation is pending; while a creation is pending it may
-be staged, bounded by the number of pending creations, and is replayed only into
-the session whose ID the creation response returns. One for an ID that a new
-session has taken applies to that session. No test claims to tell where a
-notification came from, such as a session closed earlier under the same ID.
-
-The replica engine and the page projection remain TypeScript because the browser runs them;
-their tests are `tests/replica.test.ts`, `tests/protocol-client.test.ts` and
-`tests/workspace-projection.test.ts`. Test Agents and HTTP/WebSocket ACP fixtures also remain TypeScript test
-infrastructure; they are upstream peers or drivers, not an attyd backend.
+The replica engine and page projection remain TypeScript because the browser runs
+them. Their tests and the independent test-Agent fixtures do not constitute a
+second backend. Client agreement cannot replace the direct source-memory tests.
 
 ## Zed-derived cases
 

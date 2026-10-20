@@ -84,6 +84,7 @@ See [deployment guidance](docs/usage.md#deployment-and-trust-boundaries).
 
 ## Documentation
 
+- [Documentation map](docs/README.md) — current contracts, implementation, evidence, and historical references.
 - [Usage](docs/usage.md) — installation, configuration, remote connections, and agent examples.
 - [ACP compatibility](docs/acp-coverage.md) — supported features and protocol boundaries.
 - [Contributor guide](AGENTS.md), [tests](docs/testing.md), and [protocol](docs/protocol.md) with its [implementation plan](docs/state-sync.md) — development and verification.

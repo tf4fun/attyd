@@ -1,100 +1,64 @@
 # ACP v1 client coverage
 
-This matrix is the acceptance ledger for `attyd` as an ACP client.
+This is the **test-evidence ledger**, not a second capability specification.
+The [source matrix](acp-bridge-matrix.md) owns the pinned source inventory and
+field-level requirements; [audit §9](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract)
+owns the first-layer memory contract. [State-sync §7](state-sync.md#7-fidelity-migration-revision-2)
+assigns implementation and acceptance work. Test commands and fixture setup are in
+[testing.md](testing.md).
 
-> **Revision 2 (#51).** The [ACP fidelity audit](acp-fidelity-audit.md) found that the
-> current code (protocol revision 1) drops content ACP gave: everything but message
-> text when a turn ends, the output of a failed prompt, updates outside a prompt,
-> `_meta`, a released terminal's embedded output, and the distinction between an
-> unknown and an empty history; it also ties interactions to unrelated operations.
-> Rows below that the audit affects carry **Gap (Dn)** with the finding and the
-> revision 2 target; rows where `main` lost a capability of v0.2.8 carry
-> **Regression (Rn)** from the [release parity matrix](release-parity.md). Neither is
-> supported until its migration step
-> ([state-sync §7](state-sync.md#7-fidelity-migration-revision-2)) lands.
- Production uses protocol version `1` through the official Rust SDK (schema `1.7.0`, Rust SDK git revision pinned in `Cargo.lock`); the TypeScript SDK `1.4.0` supplies independent test peers. “Supported” means the bridge, browser state, UI, and tests implement the negotiated behavior; merely having an SDK type does not count. The stable-v1 SDK entry points also expose explicitly unstable extensions, including fork, ACP-transport MCP, ID-addressed plans, prompt usage, compaction, provider configuration, and NES. Those surfaces remain labeled experimental or as an explicit product exclusion below.
-
-The [difference decisions](acp-difference-decisions.md) separate architectural exclusions, confirmed
-tradeoffs and implementation defects from the [fixed-version audit](acp-release-audit-2026-09-08.md).
-Zed is a design reference; its own deviations do not replace ACP requirements.
-
-The [2026-09-26 display audit](acp-display-audit-2026-09-26.md) checks individual fields and UI
-states beyond this capability ledger. Its six findings in permission context/null merging,
-early cancellation feedback, grouped config labels, mode descriptions, and elicitation choice
-descriptions have been addressed; the report preserves the original evidence and records the
-follow-up implementation. A supported branch alone does not prove complete field presentation.
-
-`attyd` deliberately has no application access authentication, users, tenants, provider registry, session database, or persistent completed-history store. Agent account authentication remains Agent-owned: attyd invokes only methods advertised through ACP. Agent-handled methods never expose credential fields to attyd; terminal methods run the Agent's own interactive login program in a PTY with ephemeral browser scrollback and no durable input log. Agent-owned session persistence is accessed only through ACP lifecycle methods. The bridge holds, in memory, each needed session's log of completed turns and its running operation; [protocol v2](protocol.md) (S1–S7) is the client contract and [its plan](state-sync.md) the implementation.
+Evidence below describes `experiment/protocol-v2` at `991b053` (revision 1), compared
+with stable rc.5 `60f8606`. Revision 2 and draft PR #53 are targets, not completed
+coverage. A named test proves only its specific assertions: an RPC handler or a
+replica matching its projection does not certify field retention. D/L/Q identifiers
+refer to the [fidelity audit](acp-fidelity-audit.md), R/P to
+[release parity](release-parity.md). Neither a deleted test nor an assertion changed
+to expect content loss closes a gap.
 
 ## Compatibility contract
 
-The [ACP v1 specification](https://agentclientprotocol.com/protocol/v1/transports)
-and negotiated capabilities define compatibility. Tests exercise protocol requests,
-responses, notifications, cancellation, and lifecycle behavior through SDK fixtures.
-A particular Agent's behavior does not override that contract.
-
-Stdio, HTTP/SSE, and WebSocket are implemented. Stdio is the specified baseline;
-the current ACP transport document lists Streamable HTTP as a draft and permits
-custom transports. The remote modes use the SDK transport profile and preserve ACP
-JSON-RPC semantics. Experimental methods remain capability-gated and identified below.
-
-SDK upgrades must review protocol differences, run stdio, HTTP/SSE and WebSocket
-regressions, and update this matrix. The pinned remote transport profile is the
-compatibility target; new drafts or ACP v2 do not enter scope automatically.
-Existing negotiated experimental features remain available without a separate flag.
-No particular Agent is a conformance gate or required backend, and no test depends on one.
+The pinned Rust schema, SDK transport profile and negotiated capabilities define
+the compatibility target; see the [fixed versions and actual features](acp-bridge-matrix.md#1-来源和版本).
+The TypeScript SDK 1.4.0 supplies independent test peers, not the full Rust 1.7
+field inventory. SDK upgrades require a source-difference review and stdio,
+HTTP/SSE and WebSocket regressions. New drafts, ACP v2 and particular Agent behavior
+do not automatically change the target; no vendor is a conformance gate.
 
 ## Client → Agent
 
-| ACP surface | Status | Negotiation / evidence |
+Method fields, capability gates and out-of-scope providers/NES/document methods are
+specified in [lifecycle](acp-matrix/lifecycle.md). The following groups locate the
+existing evidence and the assertions still needed; “path” is not complete support.
+
+| Surface | Evidence location below | Open direct-memory acceptance |
 | --- | --- | --- |
-| `initialize` | Supported | Protocol version equality check; client capability declaration |
-| Agent transport | Supported | `-t/--transport` selects stdio (default), Streamable HTTP/SSE, or WebSocket through the pinned Rust SDK, preserving the stable ACP v1 message surface |
-| `session/new` | Supported | Transactional creation; notifications emitted before the response are validated and committed atomically to the returned session ID; rejected allocations are closed when safely addressable and negotiated |
-| `session/prompt` | Supported; **Gap (D4)** | A failed or interrupted prompt drops its streamed output and adds no entry; revision 2 settles every sent prompt with its `end`. Baseline; content blocks are structurally and semantically validated at admission, attachment references resolve to the blocks they name, the operation carries the complete stop reason and usage, and a session-bound browser queue without a fixed count limit sends each prompt after the previous one ends |
-| `session/cancel` | Supported | Baseline; pending permission/elicitation requests are cancelled, and queued-message Send now uses this standard notification before dispatching the selected follow-up |
-| `session/load` | Supported for cold attachment; **Gap (D1, D2)** | The replay is reduced to message text; revision 2 reduces it to timeline items (`history: "complete"`). When `loadSession === true`, subscribing to an unheld session with its cwd runs a `load`; the session's log is built from the validated replay when the load succeeds, including an empty one. Known IDs can be opened with cwd without listing. A held session commits observed turns without reloading. Without load, negotiated resume attaches the session. |
-| `session/list` | Supported | Only when `sessionCapabilities.list` is present; every transport omits the cwd filter so sessions outside the startup workspace remain discoverable. Results retain every Agent-host cwd, bound cursor pagination/response sizes, and client-side upsert duplicate IDs. The homepage groups projects by exact cwd; project pages show their sessions, and the session title dropdown switches only within the project. Project/session routes discover all pages; home search and counts cover loaded pages. Projects and sessions are ordered by recent activity; search remains local to loaded metadata. |
-| `session/delete` | Supported | Only when `sessionCapabilities.delete` is present; explicit UI confirmation, a `delete` operation in `global` that also occupies the session, and admission only while the session runs no operation |
-| `session/resume` | Supported; **Gap (D9)** | A cold resume turns an unknown log into a known empty one; revision 2 marks it `partial`. Independent of load; used for cold opening when load is absent. The log is built from whatever the Agent replays; a resume after an Agent restart keeps the known log. |
-| `session/close` | Supported on release and delete; **Regression (R2)** | v0.2.8 let the user close a session, also while it ran, after a confirmation; revision 2 restores it as the `close` action (`end: closed`). Today there is no client close. The bridge sends the negotiated close when it releases a session (protocol S6: nothing needs it for `--session-unobserved-timeout`, default 300 seconds, negative disables, zero immediate, and the Agent can load or resume it), in the close stage of a held delete, and when it cleans up a rejected creation or attachment. A running operation, a subscriber, an unreleased terminal or an accepted URL flow keeps a session held. |
-| `session/set_mode` | Supported when idle; **Regression (R1)** | ACP allows it while the Agent generates (`v1/agent.rs:4898–4899`) and v0.2.8 allowed it; `main` refuses it while a prompt runs; revision 2 makes it an action. Rendered from Agent-provided mode state; a `set_mode` operation folds the acknowledged mode into `controls` when it ends; a failure folds nothing |
-| `session/set_config_option` | Supported when idle; **Regression (R1)** | v0.2.8 allowed it during a prompt (the "Verbose" switch case); revision 2 makes it an action. Select and negotiated boolean variants; a `set_config` operation folds the complete Agent response into `controls` when it ends |
-| Text and resource-link prompts | Supported | ACP baseline |
-| Image, audio, embedded-resource prompts | Supported | Each input is gated by `promptCapabilities`; picker, filesystem drop, clipboard-file input, and Zed-style `@` workspace-file search converge on ContentBlock preparation, with `@` files embedded as the ACP-preferred resource shape |
-| `authenticate` | Supported | Every method is validated from `initialize.authMethods`; only an exact Agent-advertised, Agent-handled method ID can be submitted. `auth_required` becomes a recoverable UI state; after a successful `authenticate` operation, a load that failed for want of authentication is tried again instead of creating an empty thread. ACP terminal methods are deliberately never passed to this RPC. |
-| Terminal authentication | Supported (stdio) | `clientCapabilities.auth.terminal` is advertised only when attyd can reproduce the configured local Agent invocation. attyd launches that executable as a separate PTY with its base argv plus the method's `args`, and its base environment overridden by method `env`. The `terminal_login` operation shows the PTY as a `global` terminal; input and resize are resource actions, sent in order and never resent, and cancel is the operation's. A zero exit starts the next Agent connection, while cancellation or a nonzero exit leaves the original connection available for retry. Remote HTTP/WS connections omit this capability. |
-| `logout` | Supported | Gated by `agentCapabilities.auth.logout` independently of `authMethods`; the settings action remains available with an empty method list without assuming external sign-in state. The `logout` operation keeps its error or result for inspection. A successful logout does not invent semantics for already-running sessions. |
-| MCP server configuration on session setup | Supported (static) | Repeatable `--mcp-config`; stdio, HTTP, SSE, and ACP-transport definitions are validated and capability-gated before session creation |
-| `additionalDirectories` | Supported (static) | Repeatable `--add-dir`; roots join the filesystem/terminal boundary and require the negotiated session capability |
-| `session/fork` | Supported (experimental) | Requires fork capability and an ended operation in the source, independently of load. The fork runs in the source session, so nothing else is admitted there meanwhile; the new ID must be distinct. The new session's log is built from the Agent's replay for it, or, without one, is the source's known log. A refresh never repeats a fork. |
-| Provider configuration | Product exclusion | Experimental and Agent/provider configuration is outside the attyd UI boundary |
-| `nes/start`, `nes/suggest`, `nes/accept`, `nes/reject`, `nes/close` | Product exclusion / unadvertised | NES is an unstable editor integration, so attyd no longer advertises Client NES capabilities or exposes its former editor panel. This keeps the product within the Agent interaction UI boundary. |
-| `document/didOpen`, `didChange`, `didClose`, `didSave`, `didFocus` | Product exclusion / unadvertised | These unstable editor-document notifications are not negotiated because attyd does not provide a project text editor. |
+| initialize; stdio/HTTP/WebSocket | current chain step 5; backend/remote suites | Transport T01–T19 and zero-session recovery (step 14) |
+| new/load/resume/fork | current chains; Backend behavior | Full replay, history knowledge, fork cut/resources, setup metadata and unknown-session attribution: D1–D3/D7/D9; steps 11/14 |
+| list/delete | current chain step 6; Backend behavior cleanup | Complete catalog/current-result metadata and failure ordering; step 14 |
+| prompt/cancel; all prompt content kinds | current chain step 6; native semantic/content fixtures | Retained outcomes, failure/idle content, exact fields/numeric domain and proper interaction lifetime: D1–D7/D11; steps 11–13/16 |
+| mode/config/close | current chain acknowledgements; cleanup tests | Prompt-time controls and explicit close R1/R2; source metadata D12 and late acknowledgements; step 18 |
+| authenticate/logout/terminal login | current chains; `auth_terminal::tests` | Metadata, no-session recovery and actual pending-parent lifetime; steps 14/16 |
+| MCP setup/additionalDirectories | native CLI/configuration and capability fixtures | Assert exact outbound setup fields and host policy; lifecycle capability rows, step 17 |
 
 ## Agent → Client
 
-| ACP surface | Status | Notes |
+Per-method execution and resource semantics are in [services](acp-matrix/services.md);
+notification and reduction semantics are in [content](acp-matrix/content.md).
+
+| Surface | Evidence location below | Open direct-memory acceptance |
 | --- | --- | --- |
-| `session/update` message chunks | Supported while running; **Gap (D1–D3, D5, D7)** | After a turn: thoughts and user chunks are dropped, messages of different `messageId`s are merged, `_meta` is dropped, and chunks outside a prompt are dropped; revision 2 keeps them as items. Text, image, audio, resource link, embedded resource; content semantics are validated before relay and annotations/resource metadata are rendered semantically. Following Zed, adjacent compatible chunks merge by semantic role/message ID, thought and answer chunks remain ordered inside one assistant entry, and an interleaved tool creates a real entry boundary. Live reasoning expands only while its thought stream is active and remains manually inspectable afterward. Agent-response actions copy selection or answer blocks as Markdown. |
-| Tool calls and sparse updates | Supported while running; **Gap (D1, D5)** | Dropped when the turn ends and from replays; late updates have no path; revision 2 keeps the reduced tool call in the log and places late updates in their entry. Content, diffs, terminals, portable absolute locations, raw input/output, and original payloads. Both `tool_call` and permission-carried tool patches upsert by ID; a missing-start `tool_call_update` becomes a visible failed tool card, while late fields and status corrections remain recoverable as in Zed. Compact cards expose the four ACP statuses textually, remain collapsed by default for every status/content kind, and retain the user's disclosure choice. Reported diffs are also grouped into a read-only review without implying that a change landed or inventing editor/rollback semantics. |
-| Legacy plans | Supported while running; **Gap (D1)** | Revision 2 keeps each turn's last plan state in the log. Complete replacement semantics; only the running turn's unfinished plan appears beside the composer. All-done updates immediately move it into the thread; empty updates clear it. In revision 1 plans are process updates that end with their turn and are not part of the log. |
-| ID-addressed plan update/removal | Supported while running (experimental); **Gap (D1)** | Capability advertised; updates/removals are recoverable ID upserts and keep their position in the running turn's process. |
-| Available commands | Supported | Dynamic slash-command menu; unique names, complete collections, and keyboard/ARIA listbox interaction |
-| Mode/config/session-info/usage updates | Supported | Folded into the session's `controls` (protocol §4.5) and shown without a refresh. Dynamic modes remain Agent-owned rather than being checked against stale creation options; config updates are complete replacements; the presence of configOptions, including an empty list, suppresses legacy mode controls; unparseable timestamps remain inspectable; usage updates retain a previously reported cumulative cost when the optional cost field is absent. |
-| Compaction update/summary chunks | Supported while running (experimental); **Gap (D1, D5)** | Dropped after the turn and outside a prompt, although ACP fixes a compaction's timeline position and validation keeps it across prompts; revision 2 keeps it as an item, also between prompts. Capability advertised; ID-addressed patch/stream lifecycle, terminal-state, field, and cumulative-size validation. The semantic disclosure opens while the Agent streams, collapses on completed/cancelled, stays open on failure, preserves subsequent manual toggles, and keeps collapsed summaries out of thread search until opened |
-| `session/request_permission` | Supported; **Gap (D10, D11)** | An answer must cover every pending interaction, and an interaction ends with whatever operation it joined; revision 2 answers each on its own and keeps the ACP lifecycle. The request-carried `ToolCallUpdate` is a self-contained upsert and may be the tool's first appearance. The approval card merges its name/kind, locations, and default-visible raw input; only Agent-offered option IDs are accepted; one `answer` write covers exactly the pending interactions, and its card is locked until the write is answered. |
-| `fs/read_text_file` | Supported (stdio) | Absolute paths, workspace realpath boundary, validated 1-based line ranges, cancellation propagation, and complete file contents; remote clients do not advertise or service the attyd-host filesystem |
-| `fs/write_text_file` | Supported (stdio) | In-place full overwrite with existing parents, complete content and resolved-target confinement. Errors report path, stage, OS cause and possible partial changes. Cancellation precedes mutation; no automatic retry, mkdir or rollback. Read-only and remote modes omit the capability. |
-| Terminal lifecycle | Supported (stdio) | Create/output/wait/kill/release; spawn acknowledgement, validated create inputs, session-scoped handles, cancellable leak-free waiters, uint32-safe exits, one live output buffer honoring explicit Agent limits, and incremental/coalesced browser output. Kill/release, session close, and bridge shutdown clean up the process group while its main command is running; natural command exit leaves surviving background processes outside terminal-handle management. A live terminal may outlive a turn and stays in `live.terminals`, with a bounded output tail, until the Agent releases it; release removes it and its output. **Gap (D8):** ACP keeps a released terminal's output displayed in tool calls that contain it (`v1/client.rs:2621–2622`); revision 2 keeps a frozen snapshot while embedded, without holding the session. Remote clients do not advertise or service attyd-host terminals. Unix execution uses `/bin/sh`: an empty `args` array runs `command` as a shell script; a nonempty array preserves the command name and each argument literally. See [terminal command semantics](usage.md#terminal-command-semantics). |
-| Form elicitation | Supported; **Gap (D10, D11)** | Session-scoped elicitations are cancelled when the operation they happened to join ends; revision 2 routes them by ACP scope. Primitive schema UI plus server-side request/response validation; valid schema defaults are checked before rendering, all safely representable JSON-RPC request IDs remain faithful, and session/request scopes remain distinct. A tool-scoped elicitation preserves its Agent-provided reference without requiring a prior tool event. |
-| URL elicitation | Supported | HTTP(S)-only browser handoff; unique flow IDs, consent, an accepted flow in `live.urlFlows` until `elicitation/complete`, dismissal, or the end of its scope or connection |
-| `mcp/connect`, request/notification `mcp/message`, `mcp/disconnect` | Supported (experimental) | Client-declared ACP transport; bidirectional inner MCP JSON-RPC, opaque connection IDs, connect/request cancellation, error preservation, and process/message/request lifecycle tracking. **Regression (R3):** v0.2.8's collapsible activity inspector (open connections and relayed messages) is not projected on `main`; revision 2 restores it, bounded, in `global.live.diagnostics` |
+| message/thought/tool/plan/compaction updates | native semantic/runtime tests; existing convergence gates | Completed/replayed and idle/late retention, IDs/boundaries/metadata, first sparse tool and removals: D1–D7; steps 11–13 |
+| commands/mode/config/info/usage updates | current chain control acknowledgements; native controls tests | Full source metadata and early/response/later ordering: D12; step 18 |
+| permission; form/URL elicitation and completion | current chain interactions/flows; captured cancellation tests | Independent answers, parent/scope lifetime, permission-only tool, URL outcomes, form patterns and i64 precision/domain: D10/D11/L5; step 16 |
+| fs read/write | native filesystem and cancellable-I/O suites | Direct replies, root/read-only/remote boundaries and mutation-stage cancellation: services S04/S05 |
+| terminal create/output/wait/kill/release | native terminal suite; Backend behavior resources | Retained referenced output after release/connection end and stale local callbacks: D8; step 15 |
+| MCP connect/message/disconnect, both directions | native/remote MCP fixtures | Results/errors, nested callbacks, cancellation and process cleanup: services S11–S14 |
+| unknown extensions; `$/cancel_request` | native dispatch/coordinator/inbound-request suites | Unknown-notification liveness (Q5), one response and allocation-exact cancellation: services S15–S17; step 17 |
 
 ## Protocol chain (current protocol)
 
-The chains of the [current protocol](protocol.md), added in migration steps 5 and 6
-([plan §5](state-sync.md#5-migration)); since step 8 they are the only client API. Tests in `bridge::protocol_gate_tests::stream`
+The revision 1 chains at `991b053`, added in migration steps 5 and 6
+([plan §5](state-sync.md#5-completed-migration-history)); since step 8 they are the only client API. Tests in `bridge::protocol_gate_tests::stream`
 run the coordinator over a real ACP transport; tests in `server::stream_tests` add
 real HTTP. Step 5:
 
@@ -123,126 +87,110 @@ Step 6 (`POST /api/v2/scopes/{scope}/ops`, the resource actions and the session 
 
 ## Protocol chain (earlier v2 draft, history)
 
-Each capability row above also needs its protocol chain (the earlier coverage gate,
-[plan at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/state-sync.md#42-acp-semantic-coverage-gate-s8)).
-The chains below describe the earlier v2 draft, and their "protocol §" references
-are to [that draft at `11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md).
-Migration step 2 removed the draft, so the tests named below exist only at that
-commit; the [current protocol](protocol.md) replaces these chains with its own as
-its steps land ([plan §4.2](state-sync.md#42-acceptance)):
+The earlier draft's request records, owner scopes and replication log were removed.
+Its tests are not current coverage. The complete chain and named-test evidence
+remain at fixed commit
+[`11d04d0`](https://github.com/tf4fun/attyd/blob/11d04d0/docs/acp-coverage.md#protocol-v2-chain)
+and in the [historical ledger snapshot](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/acp-coverage.md#protocol-chain-earlier-v2-draft-history).
+See [history](history.md) for the corresponding old implementation plans.
 
-```text
-ACP capability → bridge authority → public projection / command → finished result
-               → recovery after a fresh replica → lifecycle end
-```
+## Backend behavior
 
-Paths are JSON Pointers into the `global` (**G**) or `session/<id>` (**S**)
-document. **Test** names the test that proves the chain, or the migration step that
-adds it. A row is done when every link has a test. "Internal" marks requests the
-bridge fulfils itself as the ACP client: they have no client endpoint, and only
-their user-visible effects are projected.
+Native evidence includes CLI/configuration, filesystem/context, terminal/auth,
+capability/cwd, validation, structured errors, large HTTP/stdio/WebSocket values,
+delayed admission, cyclic pagination and MCP process/request races. The named
+lifecycle cases below preserve the evidence previously listed in `testing.md`.
+Their existing assertions do not close the new field-level matrix automatically.
 
-### Client → Agent
+The bridge identifies a session by its ID only (migration step 9,
+[plan §5](state-sync.md#5-completed-migration-history)). Its session-lifecycle gates are behaviour
+tests, not checks of an internal identity:
 
-| ACP surface | Bridge authority | Projection / command | Finished result | Recovery | Lifecycle end | Test |
-| --- | --- | --- | --- | --- | --- | --- |
-| `initialize` | connection task | G `/agent/initialize`, `/agent/phase` | `/agent/phase = ready`, or `/agent/error` | `GET /api/v2/global` | epoch end; next epoch's `/agent/predecessor` | `summaries_report_work_and_pending_counts` (agent copy), `cancellation_commits_agent_stopped`, `initialize_refusal_commits_agent_error`; `a_terminal_login_restart_names_auth_restart_as_the_predecessor` |
-| Agent transport | launch options | G `/agent/launch/transport` | static per epoch | global snapshot | epoch end | `snapshot_reads_serve_held_sessions_and_never_load`, `the_connection_end_closes_streams_and_keeps_the_final_global_readable` |
-| `session/new` | creation staging | `POST /api/v2/sessions` → G `/requests/<id>` (`create`) | record `result.kind = session`; first-subscription lease | `global.requests` by `clientIntentId` | record acknowledged or retained out | `request_scoped_elicitations_during_create_and_a_catalog_read_have_visible_parents`, `two_pages_creating_in_one_directory_each_find_their_own_session`, `a_full_intent_table_never_dispatches_a_second_session_new`, `a_created_session_waits_for_a_delayed_first_subscription_at_timeout_zero` |
-| `session/prompt` | turn admission (`SessionState`) | `POST …/turns` → S `/turn` | S `/outcomes/<operationId>` | `turn`, then `outcomes` (protocol §5.2) | outcome retained out; session `end` | `completed_turns_release_process_content_and_attachment_bytes` (projection); `a_lost_response_recovers_from_public_state_or_gets_result_expired` (recovery, `resultExpired` after the scope ended) |
-| `session/cancel` | turn execution | `POST …/turns/{operationId}/cancel` (control) → S `/turn/cancelRequested` | outcome with the Agent's stop reason | S `/turn` | turn end | `a_turn_cancel_is_a_control_on_the_running_turn` |
-| `session/load` | attachment operation | `POST …/open` → S `/operation` (`load`), `/history/phase` | record `result.kind = session`; `history.phase = ready` | `global.requests`, session snapshot | session `end` | `open_returns_the_owner_and_a_retry_never_materializes_again`, `a_tiny_intent_budget_answers_an_open_from_its_tombstone` |
-| `session/list` | catalog gate | `GET /api/v2/catalog` (read); G `/requests/<id>` (`agent_request`) while in flight; G `/catalog/revision` | page returned to the reader | re-read when `catalog.revision` changes | Agent-owned, not replicated | `request_scoped_elicitations_during_create_and_a_catalog_read_have_visible_parents`, `a_stale_catalog_revision_is_refused_without_listing` |
-| `session/delete` | deletion reservation; cold catalog deletion | `DELETE /api/v2/sessions/{id}` with an owner tag or `"<epoch>:0"` → G `/requests/<id>` | record `done`; `end: deleted` | `global.requests` | record retained out; retired-incarnation table | `controls_turns_permissions_close_and_delete_converge`, `cold_delete_never_loads_and_refuses_a_held_session`, `cold_delete_needs_the_agent_capability`, `cold_session_deletion_uses_global_management_without_loading` |
-| `session/resume` | attachment operation | `POST …/open` → S `/operation` (`resume`), `/history/notice` | as load | as load | session `end` | `open_returns_the_owner_and_a_retry_never_materializes_again` |
-| `session/close` | close operation | `POST …/close` → G `/requests/<id>`; S `/operation` (`close`) | record `done`; `end: closed` | `global.requests` | record retained out; retired-incarnation table | `sse_resume_returns_the_retired_owner_without_fresh_open` (`end: closed`, retired table); `refused_controls_and_a_held_close_keep_their_result_in_global_requests` |
-| `session/set_mode` | control transaction | `PUT …/mode` → G `/requests/<id>`; S `/operation` (`set_mode`) | S `/controls/modes`; record `done` or the ACP error | `global.requests` (`params.modeId`) | record retained out | `response_overrides_only_its_fields_between_early_and_later_updates`; `two_clients_setting_modes_each_find_their_own_record_by_intent` |
-| `session/set_config_option` | control transaction | `PUT …/config/{configId}` → G `/requests/<id>` | S `/controls/configOptions`; record | `global.requests` (`params.configId`, `value`) | record retained out | `config_options_distinguish_never_provided_from_provided_empty`, `projected_config_preserves_response_clear_and_later_updates`; `refused_controls_and_a_held_close_keep_their_result_in_global_requests`, `one_key_on_two_targets_is_an_intent_conflict` |
-| Text and resource-link prompts | content validation | turn body `prompt` | S `/history/timeline`, `/outcomes` | session snapshot | history revision | `a_lost_response_recovers_from_public_state_or_gets_result_expired` |
-| Image, audio, embedded-resource prompts | content validation; attachment projection | turn body `prompt`; documents carry `resource_link` references, bytes via `GET …/attachments/{id}` | as text | session snapshot | session `end` | `completed_turns_release_process_content_and_attachment_bytes` |
-| `authenticate` | auth method validation | `POST /api/v2/agent/authenticate` → G `/requests/<id>` (`methodId`) | record; G `/agent/authenticatedMethodId` | global snapshot | record retained out; epoch end | `global_url_authentication_survives_a_refresh_then_completes`, `a_cancelled_global_url_authentication_ends_its_interaction_and_fails_its_parent`, `authentication_admission_refuses_unknown_and_terminal_methods`, `out_of_session_v1_requests_get_agent_request_records` |
-| Terminal authentication | auth terminal manager | `POST /api/v2/agent/auth-terminals` → G `/requests/<id>/terminal`; input, resize and cancel are controls | record status; `predecessor.reason = auth_restart` when the Agent restarts | global snapshot | record retained out; epoch end | `an_auth_terminal_keeps_its_method_from_running_to_failed`, `cancelling_an_auth_terminal_ends_its_record_cancelled`, `a_terminal_login_restart_names_auth_restart_as_the_predecessor` |
-| `logout` | logout gate | `POST /api/v2/agent/logout` → G `/requests/<id>` | record; G `/agent/authenticatedMethodId = null` | global snapshot | record retained out | `acknowledging_a_finished_request_creates_no_record` |
-| MCP server configuration on session setup | launch options | G `/agent/launch/mcpServers` (name and type only) | static per epoch | global snapshot | epoch end | `snapshot_reads_serve_held_sessions_and_never_load`, `the_connection_end_closes_streams_and_keeps_the_final_global_readable` |
-| `additionalDirectories` | launch options | G `/agent/launch/additionalDirectories` | static per epoch | global snapshot | epoch end | `snapshot_reads_serve_held_sessions_and_never_load`, `the_connection_end_closes_streams_and_keeps_the_final_global_readable` |
-| `session/fork` | fork operation on a held source | `POST …/fork` → G `/requests/<id>`; source S `/operation` (`fork`) | record `result.kind = session`; lease on the new owner | `global.requests` | record retained out | `a_tiny_intent_budget_answers_a_fork_from_its_tombstone`, `a_fork_target_survives_until_its_delayed_subscription` |
-| Provider configuration | Product exclusion | not projected | — | — | — | — |
-| `nes/*` | Product exclusion | not projected | — | — | — | — |
-| `document/*` | Product exclusion | not projected | — | — | — | — |
+- updates before a creation response: `preserves_early_update_bursts_until_creation_completes`,
+  `a_new_sessions_early_controls_survive_its_creation_response`,
+  `an_early_compaction_continues_its_summary_after_creation`,
+  `invalid_early_updates_prevent_session_commit_and_clear_cleanly`;
+- the response as the cut between replay and live data:
+  `replay_response_seals_history_before_following_live_data`;
+- a cold placeholder: `a_cold_placeholder_keeps_wire_replay_before_the_creation_response`
+  (real ACP transport and coordinator),
+  `creation_staging_keeps_cold_resources_separate_and_counts_every_unknown_id`;
+- a load committed atomically or rolled back:
+  `load_candidate_is_invisible_until_success_then_commits_atomically`,
+  `failed_load_discards_candidate_and_resume_never_claims_replayed_history`,
+  `invalid_replay_cannot_publish_a_valid_prefix`,
+  `invalidated_load_attempt_cannot_commit_a_truncated_replay`,
+  `replay_validation_rollback_settles_only_its_own_attempt`;
+- close and delete cleanup:
+  `close_cleanup_rejects_late_live_resources_without_publication_or_resurrection`,
+  `close_then_delete_is_irreversible_and_partial_failure_stays_closed`,
+  `delete_close_success_releases_resources_before_delete_response`;
+- resource release: `closing_a_session_releases_resources_once`,
+  `replacement_retires_old_resources_and_history_removal_preserves_live_ones`,
+  `failed_attachment_releases_every_pre_response_live_resource`,
+  `releases_only_terminals_owned_by_closed_session`.
 
-### Agent → Client
-
-| ACP surface | Bridge authority | Projection / command | Finished result | Recovery | Lifecycle end | Test |
-| --- | --- | --- | --- | --- | --- | --- |
-| `session/update` message chunks | update ingest; history cache | S `/turn/updates` while running; `/history/timeline` once committed | `history.revision` advances | session snapshot | session `end`; process pages `410` after the revision | `completed_turns_release_process_content_and_attachment_bytes`; `a_turn_streams_appends_and_folds_tool_calls_into_their_slot`, `controls_turns_permissions_close_and_delete_converge` (text `append`) |
-| Tool calls and sparse updates | update fold (`fold_history_update`) | S `/turn/updates`; completed bodies on process pages (protocol §6) | collapsed into `history.collapsedTurns` | session snapshot; process page | as above | `completed_turns_release_process_content_and_attachment_bytes`; `a_turn_streams_appends_and_folds_tool_calls_into_their_slot` (in-slot `set`, background fold into history) |
-| Legacy plans | update fold | S `/turn/updates`, `/history/timeline` | as above | session snapshot | as above | `plans_and_compactions_fold_in_place_and_removals_shrink_the_turn` |
-| ID-addressed plan update/removal | update fold | as legacy plans | as above | session snapshot | as above | `plans_and_compactions_fold_in_place_and_removals_shrink_the_turn` |
-| Available commands | control state | S `/controls/commands` | — | session snapshot | session `end` | `response_overrides_only_its_fields_between_early_and_later_updates`, `agent_control_updates_converge_in_arrival_order` |
-| Mode/config/session-info/usage updates | control state | S `/controls/*`; G `/sessions/<id>/title` | — | session snapshot | session `end` | `sparse_session_info_keeps_absent_fields_clears_null_and_sets_values`, `usage_without_cost_keeps_the_last_known_cost`, `settling_lets_the_response_override_only_its_fields`, `projected_modes_follow_early_updates_response_and_later_updates`, `agent_control_updates_converge_in_arrival_order`, `controls_turns_permissions_close_and_delete_converge` |
-| Compaction update/summary chunks | update fold | S `/turn/updates`, `/history/timeline` | as message chunks | session snapshot | as above | `projected_compaction_attachments_are_references_resolvable_from_authority`; `plans_and_compactions_fold_in_place_and_removals_shrink_the_turn` |
-| `session/request_permission` | permission responders | S `/interactions/<id>` (`permission`); G `/sessions/<id>/pending`; `POST /api/v2/interactions/{id}` → G `/requests/<id>` | record `succeeded` on delivery, or `failed` with `interaction_ended` | session snapshot, then `global.requests` | removed on answer, Agent cancel or session end | `summaries_report_work_and_pending_counts`, `projected_permission_references_the_public_turn_operation`, `controls_turns_permissions_close_and_delete_converge`; `interaction_responses_report_delivery`, `one_key_on_two_targets_is_an_intent_conflict` |
-| `fs/read_text_file` | Internal (workspace filesystem) | effects only, through tool calls | — | — | — | not applicable |
-| `fs/write_text_file` | Internal (workspace filesystem) | effects only, through tool calls | — | — | — | not applicable |
-| Terminal lifecycle | Internal (terminal manager); output projected | S `/terminals/<id>` (`output` by `trim` + `append`) | `exitStatus`, `released` | session snapshot | removed once released and unreferenced | `controls_operations_and_live_terminals_are_projected`; `a_terminal_rolling_past_its_bound_trims_and_appends` |
-| Form elicitation | elicitation responders | S `/interactions/<id>`, or G `/interactions/<id>` with `requestId`; `POST /api/v2/interactions/{id}` | record on delivery | snapshots, then `global.requests` | removed on answer, cancel, or end of its session or request | `summaries_report_work_and_pending_counts`, `request_scoped_interactions_and_url_flows_are_global_and_keyed_by_interaction`; `interaction_responses_report_delivery`; `request_scoped_elicitations_during_create_and_a_catalog_read_have_visible_parents`, `out_of_session_v1_requests_get_agent_request_records` |
-| URL elicitation | URL flow registry | S or G `/urlFlows/<interactionId>`; acknowledge with `DELETE …/url-flows/{interactionId}` | `status = completed` on `elicitation/complete`; `cancelled` on Agent cancel or session end | snapshots | acknowledged or retained out | `request_scoped_interactions_and_url_flows_are_global_and_keyed_by_interaction`, `url_flows_complete_and_cancel_in_session_and_global_scopes`; `url_flows_are_acknowledged_by_interaction_never_by_elicitation_id` (session); `global_url_authentication_survives_a_refresh_then_completes`, `a_late_global_acknowledgement_never_touches_a_flow_reusing_its_elicitation_id` (global) |
-| `mcp/connect`, `mcp/message`, `mcp/disconnect` | Internal (ACP-transport MCP) | not projected (**R3**; revision 2: G `/diagnostics/mcp`) | — | — | — | not applicable |
+A late notification names only a `sessionId`. One for an ID with no running
+session is dropped when no creation is pending; while a creation is pending it may
+be staged, bounded by the number of pending creations, and is replayed only into
+the session whose ID the creation response returns. One for an ID that a new
+session has taken applies to that session. No test claims to tell where a
+notification came from, such as a session closed earlier under the same ID.
 
 ## Cross-cutting invariants
 
-- Optional methods are rejected server-side unless the Agent advertised the matching capability.
-- Agent authentication is separate from attyd access control. Method IDs, names, descriptions, Agent-provided terminal argv/environment, terminal input/output, and relay payloads have no application size/count limit; invalid formats and duplicate IDs are rejected. No credential field exists in the browser UI. Agent-handled authentication, terminal authentication, and logout are serialized; each is one operation in `global`, and its result or error stays on that operation. In stdio mode, terminal auth never invokes `authenticate`: it reproduces the configured Agent command without a shell, appends only the advertised args, applies environment overrides server-side, and uses a real PTY/xterm interaction. Remote transports omit the terminal-auth capability and reject a nonconforming Agent that advertises such a method anyway. A successful zero exit starts the next Agent connection because ACP requires a fresh initialized Agent; nonzero exit and cancellation remain retryable. After `logout`, the existing session remains visible because ACP does not define its fate; the Client waits for actual Agent errors rather than deleting it optimistically.
-- Prompt, cancel, filesystem, terminal, permission, elicitation, mode, and config operations are rejected for unknown sessions; mode/config values must have been offered by the Agent.
-- Conversation updates for a session ID with no running session are dropped, except that they are staged while a creation is pending (see below). ACP notifications carry only a `sessionId`, so an update for an ID that a new session has taken applies to that session; the bridge keeps no older identity to tell them apart (migration step 9). The lifecycle gates (early replay, the response cut, a cold placeholder, atomic load and rollback, close/delete cleanup, resource release) are listed in [Verification](testing.md#backend-behavior). Valid control updates (mode, config, commands, session info, usage) for a held idle session update its `live` without inventing a prompt boundary; message and process updates outside a running prompt are not added to any document (**Gap D5**); tool/message IDs remain session-scoped. Load replay is staged independently, and every completed prompt appends to the log without another load.
-- Load replay is one validation and delivery transaction: every replayed update uses the same format and semantic checks as an active session, while dynamic mode notifications remain Agent-owned and the later response establishes final mode/config controls. A structurally invalid, interrupted or rejected replay aborts the replacement without exposing partial history; if the ACP request cannot be cancelled, the bridge drains and discards it before accepting another operation.
-- A held session keeps its log without cumulative clipping. It is released only when nothing needs it (protocol S6): no subscriber, no running or occupying operation, no unreleased terminal and no accepted URL flow, so release never cuts off running work; it then waits `--session-unobserved-timeout`, and only a session the Agent can load or resume is released. Different sessions run independently. Within a scope, one operation runs at a time (I6): a mode or config change, a fork or a delete is refused while a prompt runs.
-- A write names the operation it replaces with `expect`; admission is serial, so of two writes with the same `expect` at most one starts. The ended operation keeps its result or error in `live` for any client, so a replacement browser reads the outcome of a write another one sent; nothing is matched against a browser transaction.
-- A conforming Agent may emit updates for a new or forked session before returning its session ID. While a creation request is pending, attyd validates and buffers all such updates across candidate IDs, binds only the replay matching the returned ID, and commits it with the operation that created the session. Invalid replays fail the creation and are discarded before a clean retry; response mode/config state remains authoritative because it occurs later on the ACP wire.
-- When `session/new` or `session/fork` returns an unusable response after allocating a distinct session, attyd sends a best-effort `session/close` only if close was advertised, exactly one creation is pending, the ID is browser-addressable, and it cannot name a tracked, attaching, or deleting session. Duplicate new IDs and a fork that reuses its source ID are deliberately never auto-closed, preventing cleanup from terminating valid user state.
-- A failed `session/load` or `session/resume` validation similarly closes only its exact, still-exclusive pending attachment when close was advertised. It never closes a session that reached tracked state or entered deletion.
-- A prompt operation ends only with the Agent's `session/prompt` response or the end of the Agent connection; a cancel only sets `cancelRequested`. A browser that leaves or disconnects ends nothing, and a reconnecting one is aligned from the published documents.
-- Prompt responses are relayed completely to the browser. Per-turn token counts must be non-negative safe integers, individual counts cannot exceed `totalTokens`, and input plus output cannot exceed the reported total. Valid usage is rendered semantically beside the exact ACP stop reason while the original response remains inspectable.
-- Session `usage_update` remains distinct from ambiguous prompt-response token accounting: its Agent-reported context window and optional cumulative cost are rendered beside the composer as a Zed-style usage ring. The disclosure shows exact used, size, remaining, and currency values; warning color starts at 80%, while no compaction or summary capability is inferred from usage alone.
-- A fork, a delete and the controls are operations like a prompt: a fork runs in its source session, a delete in `global` while occupying its session, and `set_mode`/`set_config` in the session. Each is admitted only after the scope's operation ended, a failure changes nothing it did not report, and only its own end folds its result. The UI disables these actions while another operation runs.
-- Malformed writes and invalid operation kinds, request/session IDs, cursors, paths, URIs, and control IDs produce request errors without reaching the Agent or poisoning the ACP connection.
-- The host keeps no session-event journal: it publishes one document per scope and hands each change to the Hub. A replica checks every event against its log head (`prev`) and applies `live` patches in order; a stream that breaks is subscribed again with the heads it holds and aligned from the published documents. A failed write is shown and never resent. A disconnected Agent shows a disabled composer with a user-invoked reconnect action.
-- Home, project, and session pages use the full width without a sidebar or a separate global toolbar. Navigation, titles, and actions share the page content column. Home offers New project, which takes a working directory and starts its first session; project pages create sessions within that project. An independent back link always goes to the structural parent, including for shared URLs. Idle browser-cache membership is not displayed as a session status. The session title dropdown filters and switches within the project; Agent settings sit alongside the page actions. Both menus fit desktop/mobile viewports, dismiss on outside clicks or Escape, and restore trigger focus on Escape. Permission and elicitation cards likewise focus their first action, map Escape to ACP `cancelled`/`cancel`, lock every action while an answer write is pending, keep a refused answer's input, and unwind focus correctly even when multiple Agent interactions are stacked. The Agent composer mirrors Zed's `Shift+Alt+Escape` expanded message-composer interaction while preserving the exact draft, attachments, completion menus, and negotiated session controls; this is not a file-editor surface. A pending permission, form, or external flow deterministically returns it to auto-height so the ACP interaction cannot be obscured. When the draft is empty, ↑/↓ traverses the complete session-bound prompt history derived from local and Agent-replayed user messages. Recalled image, audio, resource, resource-link, annotations, and block ordering are resent exactly unless the user edits the recalled draft; adjacent identical local/protocol echoes are collapsed without collapsing intentional repeated prompts across turns. These behaviors and slash-command keyboard submission have portable DOM interaction tests.
-- Agent-thread search is a presentation-only index over visible semantic conversation content. `Ctrl/⌘F` opens a Zed-style search bar with case, whole-word, regex, wrapping navigation, count, and highlight state; Escape closes it and restores composer focus. Collapsed thought/tool bodies are indexed only after expansion, raw ACP inspectors never contribute duplicate hits, and streamed updates are rescanned after 150 ms. Queries, scans and matches have no application size/count cap; invalid patterns remain a local UI error and never create ACP traffic.
-- Production-browser CI drives a fresh real Rust host and stdio SDK Agent through the protocol v2 API per Chromium case. It verifies permission subject disclosure (tool name, location, and raw input), permission and full form elicitation focus entry/restoration, Agent-handled and real-PTY terminal authentication/reconnect, a running prompt surviving browser reconnect, completed turns shown as their final messages only (revision 1 behavior, **Gap D1**), two concurrent session turns with local switching and busy-session deletion guards, explicit composer recovery after an Agent exit, queued follow-ups plus Stop/pause/new-message resume and `session/cancel` Send now/FIFO dispatch, clipboard-image, dropped resource, and `@`-selected workspace context reaching the Agent in order, complete attachment-prompt ↑/↓ recall, live thought auto-expansion followed by tool-phase collapse and manual reinspection, default-collapsed terminal output entering search only after expansion, complete read-only Agent diff review without invented editor actions, structured ACP error inspection plus exact failed-ContentBlock retry, absence of an NES/editor entry point, mouse and Shift+F10 Agent-response context actions with focus restoration and complete Markdown export, semantic thread search with visibility rules/match navigation/highlighting, live `usage_update` context/cost disclosure beside the composer, desktop/mobile expanded message-composer bounds plus automatic return for a pending permission, successful browser-to-Agent responses, deterministic top/bottom long-thread navigation, desktop/mobile top-menu dismissal and focus restoration, absence of console/page errors, and desktop/mobile horizontal layout bounds; failure traces, screenshots, and the HTML report are retained as CI artifacts. The non-browser black-box suite drives the same production backend.
-- Follow-up prompts are retained only for the current Agent session, with full capability-gated ACP prompts and no fixed queue length, cleared on session replacement or terminal bridge state, and emitted strictly after the preceding prompt settles. Queue editing never creates a protocol update; the user message enters the ACP timeline only after `session/prompt` is successfully written.
-- Permission requests are self-contained tool upserts, so their carried patch may introduce or update the tool. Tool-scoped elicitations preserve the Agent's association without requiring a preceding visible tool update. Permission option IDs remain valid and unique.
-- Session-scoped elicitations are isolated from the visible session; request-scoped elicitations survive session transitions. Their scope preserves string, safe-integer, and `null` JSON-RPC IDs, including an empty string, instead of treating valid but discouraged IDs as missing. Browser turn cancellation and Agent `$/cancel_request` both settle pending permission/elicitation RPCs exactly once and remove their UI cards.
-- Agent `$/cancel_request` propagates into cancellable filesystem reads, pre-mutation filesystem writes, terminal `wait_for_exit`, and MCP connect/message handlers. Cancelled terminal waiters are removed immediately without killing or releasing the underlying process, so repeated cancellation cannot leak waiter registrations and a later wait/kill/release lifecycle remains valid. A cancelled in-flight MCP connection attempt terminates its unannounced provider process before any connection ID can escape.
-- Form elicitation schemas are checked before rendering; required fields, safe patterns, formats, enum fallbacks, unique multi-select values, numeric/length bounds, and defaults against their own constraints are revalidated server-side. Unknown elicitation modes and non-HTTP(S) URL handoffs are rejected.
-- URL elicitation IDs must be unique among outstanding flows on a connection. Completed, declined or cancelled IDs may identify a new flow. Completion notifications are relayed only for a tracked flow whose opening was accepted; accepted flows stay in their scope's `live.urlFlows` across session switches and browser reconnects until completion, dismissal, the end of their scope, or the end of the Agent connection. Unknown completion notifications do not poison the connection.
-- An accepted URL flow is a resource of the scope it belongs to (protocol S7): cancelling a prompt keeps it (`review_prompt_cancel_preserves_accepted_*_url_flow`). It leaves `live` on `elicitation/complete`, on dismissal, when its scope ends, or when the Agent connection ends. A request-scoped flow stays in the scope recorded for it in `flow_scopes` (a session, `catalog` or `global`), and in `global` when none is recorded; so a session's end also removes a request-scoped flow recorded for that session. Completed and cancelled flows are terminal against late contradictory events.
-- An operation's error stays in its `op.error`. A malformed Agent notification is dropped and written to the host's tracing log; it reaches no document and does not end an active prompt. Only the prompt's own response, or the end of the Agent connection, ends it.
-- Startup, subprocess, and ACP transport failures are published in `global.live.agent` before bridge resources close. The end of a connection fails its running operations and removes their interactions, MCP connections and terminals in its final commit, so the UI cannot remain falsely actionable or permanently busy.
-- ACP JSON-RPC `RequestError` codes, messages and structured error data are preserved completely in browser-visible errors.
-- HTTP request bodies, Agent stdout NDJSON lines, WebSocket frames/messages and relayed values have no application size limit. Valid content is preserved through transport, validation, state reduction and browser delivery.
-- Binary content blocks require canonical base64. MIME types, absolute resource URIs, linked-resource sizes, finite annotation priorities, and string annotation timestamps are validated for prompts plus Agent message, tool, and compaction output; invalid Agent updates are dropped without poisoning the connection. Text/binary embedded resources, images, and audio use compact attachment entries rather than inline previews. Documents carry attachment references only; `GET /api/v2/sessions/{id}/attachments/{attachmentId}` serves the normalized block from bridge memory while the session is held and its log or `live` refers to it. One new-page link delegates preview/download to the browser. Only HTTP(S) resource links and attyd-hosted references are clickable; invalid payloads have no enabled open action. Resource descriptions/MIME appear in tooltips, sizes in attachment entries, and tool annotations in Tool info. No remote prefetch, dedicated viewer, or persistent attachment store is introduced.
-- Picker, drag-and-drop, and clipboard attachments have no application size/count limit. Files are converted only to capability-offered image/audio/resource blocks; unsupported drops and pastes remain local visible errors and never reach the Agent. Unnamed clipboard media receives a stable synthetic attachment URI.
-- `@` context search is available only when the Agent advertises `promptCapabilities.embeddedContext`. It scans entries across the configured realpath-confined workspace roots, skips symlinks plus common dependency/generated directories, returns all matching text files, and rechecks type and real path when the user selects a result. The exact UTF-8 file content and canonical `file:` URI are sent as an ACP embedded resource; stale search responses cannot replace newer results.
-- Wire values, session/list data, pending operations and interactions, control collections, terminal inputs and live-resource counts have no application quota. Explicit Agent output limits and protocol/lifecycle constraints remain enforced. Repeated session IDs are safe upserts; independent observers may use their own Agent-provided pagination cursors.
-- `session/list` pages and retained metadata have no application size/count cap. Rows use portable absolute paths (POSIX, drive-letter, or UNC), preserve all additional roots and metadata, and permit unparseable `updatedAt` strings. Workspace grouping uses the exact Agent-reported cwd; rows with missing or invalid dates follow dated rows within their workspace and retain the Agent’s order.
-- Session terminals are `live.terminals` entries keyed by terminal ID, streamed as `trim` plus `append` patches of a bounded output tail with their exit status and truncation flag; Agent tool payloads and `rawOutput` remain unchanged while the turn runs. A released terminal leaves `live` with its output, and a committed turn keeps no process, so neither can be read again (**Gaps D8, D1**); cold restoration depends on Agent replay.
-- Terminal creation is acknowledged after the execution shell starts. A shell or working-directory launch failure returns a create error without publishing a handle; command failures appear as terminal output and the shell's exit status (`127` for a standalone command that cannot be found). The [ACP terminal documentation](https://agentclientprotocol.com/protocol/v1/terminals) describes shell commands and separate `args`, but does not mandate a shell or quoting algorithm. attyd's Unix contract uses `/bin/sh -c` consistently, with literal positional parameters when `args` is nonempty; it neither retries failed commands nor selects behavior by Agent identity or command punctuation. OS exit values outside ACP's uint32/null domain are normalized to `null` before browser relay.
-- Terminal completion, including a nonzero exit, retires process-group ownership without killing background jobs. Explicit termination checks whether the main command has already exited before signalling its group. Output uses pipes with a one-second final drain; stopping collection does not set ACP's byte-limit `truncated` flag. Independently launched services must redirect standard input/output/error and be stopped by their launcher. This is attyd execution policy; [Zed is a client design reference](testing.md#zed-derived-cases), while ACP remains the compatibility contract.
-- ACP-transport MCP providers are declared by unique server IDs. Launch commands and environment variables remain host-private; only `{type, name, serverId}` reaches the Agent and only `{type, name}` reaches the browser metadata.
-- ACP-transport MCP processes, messages and pending requests have no application size/count limit. Unknown and cross-connection IDs, invalid or contradictory responses, duplicate response IDs, provider-start cancellation, message cancellation, disconnect, and named/status-bearing process exit retain their lifecycle behavior. Request registration and close remain atomic so work cannot be inserted after termination.
-- The stable-v1 initialization advertises only Agent-interaction capabilities. NES/document capability fields are absent, so conforming Agents cannot treat attyd as an editor host; unnegotiated editor methods are not exposed through the browser API.
-- Agent JSON-RPC errors retain the safe-integer code and complete structured `data` as separate fields. A failed prompt adds no log entry; its operation keeps the prompt and the error, for Retry or Edit Prompt. Other failures cannot acquire retry state.
-- ACP method, `SessionUpdate`, and content-block unions have typed coverage ledgers; newly added SDK variants fail compilation until classified and handled.
-- Raw inspectors show the values of the running operation's process. The log keeps a turn as `canon` normalizes it (revision 1): `_meta` is dropped at every level and attachments become references, so neither Markdown export nor a reload returns vendor metadata (**Gap D7**; revision 2 carries `_meta` and serves attachments as received). Markdown export is assembled by the client from the log and its attachments. Diagnostics have no admission or retention quotas. The server and browser use exhaustive discriminant checks so new SDK union variants fail compilation until classified.
+These are **baseline evidence boundaries at `991b053`**, not replacement target
+rules. Detailed semantics live in the source matrix. The following conditions are
+kept because removing them from the evidence inventory would lose a specific test
+obligation or implementation limit.
+
+| Area | Baseline condition to retain in direct coverage |
+| --- | --- |
+| Failed installation cleanup | A distinct unusable new/fork target is best-effort closed only when close is negotiated, exactly one creation is pending, the ID is addressable, and it names no tracked/attaching/deleting session. Duplicate IDs and a fork's source ID must never be auto-closed. Failed load/resume cleanup targets only its still-exclusive attachment. |
+| Load transaction | A malformed, rejected or interrupted replay cannot expose a valid prefix. If its RPC cannot be cancelled, drain/discard before reusing the operation path; completion/rollback belongs to the actual attempt. |
+| Notification and error isolation | Malformed Agent notifications are dropped to tracing without ending the prompt. Only its own response or connection end ends a prompt. Preserve structured error code/message/data; no browser disconnect or unrelated request failure may substitute for that result. |
+| Admission and release | The revision 1 chain tests `expect`/operation admission and unneeded-session release. Those tests do not waive R1/R2 or authorize deleting active work. Keep `--session-unobserved-timeout` negative/zero/delayed cases and distinguish load/resume availability. |
+| Numeric and field validation | Prompt Usage safe-integer and sum checks are implementation restrictions to audit against schema u64, not ACP facts. Session usage/cost is a different update. Base64, resource URI/MIME/size, finite annotation priority and timestamp checks also need the pinned field/domain cases, not only rejection tests. |
+| Terminal execution policy | Shell acknowledgement precedes publishing a handle; launch/cwd failure leaks none. Missing standalone commands exit 127. Unix `/bin/sh -c` uses literal positional args when provided; no Agent-specific retry/quoting branch. Natural main-command exit retires process-group ownership without killing background jobs; explicit termination checks that exit first. Final pipe drain is one second and does not set ACP byte-limit `truncated`; uint32-incompatible exit values become null. See [usage](usage.md#terminal-command-semantics). |
+| Host I/O | In-place fs writes have no automatic mkdir, retry or rollback; errors carry path/stage/OS cause/possible partial change. Pre-mutation cancellation differs from a started write. Cancel a terminal waiter without killing the process; cancel an unannounced MCP startup without leaking its child. |
+| MCP privacy and close race | Provider launch argv/environment stay host-private; the Agent sees `{type,name,serverId}`, browser metadata `{type,name}`. Registration and close are atomic; duplicate/contradictory responses, reverse requests, named/status-bearing exits and cross-connection IDs require distinct cases. |
+| Catalog and workspace inputs | Session rows preserve portable absolute cwd (POSIX/drive/UNC), additional roots and metadata; duplicate IDs upsert; unparseable dates do not invalidate rows. Cursors are Agent-owned and independent. Catalog intentionally omits cwd filtering. Context search skips symlinks/generated directories and rechecks selected real paths and UTF-8 content within all configured roots. |
+| Capability/identity restrictions | Unknown sessions and unoffered mode/config IDs are refused. Remote host fs/terminal/auth and read-only writes remain unadvertised. Request-scoped IDs currently have a JS-safe restriction; form patterns use a restricted engine. Those are explicit limits, not complete-domain support. |
+| URL cancellation evidence | `review_prompt_cancel_preserves_accepted_*_url_flow` covers the accepted-flow cancellation boundary. Revision 1 removes finished flows; outcome retention and actual parent-RPC cleanup remain step 16 work. Unknown completion must leave the connection usable. |
+| Payload and retention limits | HTTP bodies, ACP stdout/WS messages, relayed values, held histories, catalog rows, pending work and most resource collections have no cumulative application quota; explicit Agent output limits and the form-pattern restrictions remain separate. This is not proof of retention, field fidelity or leak freedom. |
+
+## Browser evidence (separate layer)
+
+The full revision 1 presentation checklist is retained at the
+[fixed implementation snapshot](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/acp-coverage.md#cross-cutting-invariants).
+The [historical display audit](history.md#审计与发布记录) preserves field-level findings
+and their follow-up evidence; [release parity](release-parity.md) separately records
+rc.5 regressions and historical v0.2.8 UI/export behavior. These references are not
+new first-layer requirements.
+
+| Evidence family | What remains relevant to that layer |
+| --- | --- |
+| Production browser harness | Fresh real Rust host and stdio SDK Agent per Chromium case; desktop/mobile bounds, console/page errors, screenshots/traces/report. Native/black-box behavior remains independently tested. |
+| Client replica/projection | `tests/replica.test.ts`, `tests/protocol-client.test.ts`, `tests/workspace-projection.test.ts`; convergence is not the ACP-content oracle. |
+| Navigation and focus | Project/cwd grouping, paginated discovery, structural back links, session switching, menu Escape/outside-click behavior and focus restoration; permission/form focus and refused-answer draft retention. |
+| Composer and queue | Session-bound prompts/attachments; queued edits are local, next prompt sends after settlement, Send now cancels through ACP. Expanded composer preserves draft/menus/controls and contracts for interactions; ↑/↓ recall retains complete ContentBlocks without merging intentional repeats. |
+| Content presentation | Ordered thought/tool/message display, expandable tool/terminal/compaction details, read-only diffs, copy/context actions and full Markdown export. Revision 1 completed-message-only assertions encode D1, not fidelity. |
+| Search and disclosure | Visibility-only semantic search excludes collapsed/raw duplicate content; keyboard controls, regex errors, 150 ms streamed rescan and manual expansion state remain UI evidence. Usage display's exact values and 80% warning are presentation, not a new ACP capability. |
+| Attachment/context input | Picker/drop/clipboard/`@` paths, capability refusal, synthetic clipboard URIs, original ContentBlock order and recall; no prefetch or persistent viewer store. Resource opening remains restricted to supported safe link kinds. |
+| Authentication and recovery | Agent-managed and PTY login, ordered input/resize, no replay of lost input, cancellation/signal/next-connection behavior, browser reconnect during a prompt and explicit recovery after Agent exit. |
 
 ## Remaining verification work
 
-- Confirmed [tradeoffs](acp-difference-decisions.md) keep exclusive configOptions (including an empty list) and release without cumulative history clipping; controls during prompts and best-effort history notices were replaced by protocol S5/S6.
-  They must not be silently changed while fixing protocol errors.
-
-- Keep the Rust backend coverage gate at or above 85% while expanding behavior. Native tests plus the real-binary UI and remote-transport harnesses cover semantic validation, configuration, filesystem/context, terminal/auth-terminal, capability/cwd, large lossless relays, early/late routing, cyclic pagination, session mutation, cancellable filesystem RPC, ordered MCP provider-start and message cancellation, disconnect/process-exit/pending-request recovery, large Agent lines, malformed protocol values, and post-failure liveness. The replica engine and page projection stay in the TypeScript frontend, with their own tests; this is not a backend gap.
-- Keep conformance fixtures aligned with the official ACP specification and negotiated capability combinations, including Agents that omit optional methods. No Agent-specific test defines compatibility or justifies protocol rewrites.
-- Broaden the rendering-engine matrix beyond Chromium if cross-browser CSS or accessibility differences become a supported compatibility target; current CI uses production Chromium while portable DOM tests cover the wider interaction state space.
-- Broaden adversarial coverage as experimental ACP surfaces evolve; today it comes from native Rust validation, the per-event convergence gate (`protocol::convergence_tests`) and real HTTP boundary checks.
-- NES and editor-document capabilities should stay unadvertised unless the product scope explicitly expands beyond the Agent interaction UI.
+- Add direct fixtures for the unresolved rows above and record the test names as
+  they land; [state-sync §7.3](state-sync.md#73-gates) is the first-layer gate.
+  Source fields and unsupported subsets remain tracked in the domain matrices.
+- Keep the Rust line-coverage gate at or above 85% and existing native, remote,
+  real-HTTP and browser suites; commands/environment belong to [testing.md](testing.md).
+  A passing aggregate suite is not proof of each new acceptance requirement.
+- Retain current `protocol::convergence_tests`, `protocol::hub_tests`,
+  `bridge::protocol_gate_tests` and `server::stream_tests` as regression evidence.
+  The later client verification/repair design follows
+  [protocol §12](protocol.md#12-synchronization-design-requirements).
+- Broaden adversarial fixtures as negotiated experimental surfaces evolve. Keep
+  optional-feature omissions explicit. Cross-browser rendering/accessibility,
+  export and diagnostic panels remain separately scoped presentation work.

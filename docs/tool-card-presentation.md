@@ -1,6 +1,10 @@
 # Tool card presentation
 
 These are client presentation rules for [ACP v1 tool calls](https://agentclientprotocol.com/protocol/v1/tool-calls), not additional protocol requirements. Every tool uses the same card structure, regardless of Agent or tool name.
+Retained content and resource lifetimes are defined by the
+[memory contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract) and
+[protocol](protocol.md#46-resources); the [audit](acp-fidelity-audit.md#2-defects)
+tracks experimental implementation gaps.
 
 ## Summary and disclosure
 
@@ -27,7 +31,9 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
 - Label embedded output **Terminal**; retain terminal IDs in Tool info. Tool status and process exit status remain independent.
 - Treat a present terminal `exitStatus` as finished, even without a code or signal. Show waiting text only while a process can still produce output; completed empty output and unavailable snapshots need distinct messages.
 - Indicate truncation. See [ACP terminals](https://agentclientprotocol.com/protocol/v1/terminals).
-- Terminal output is display data in the session's `live.terminals` while the Agent keeps the terminal. Release removes it with its output, and a completed turn keeps no tool calls, so output is shown only while its turn runs or its terminal is unreleased ([protocol §4.6](protocol.md)). Unavailable output is not reconstructed or written into Agent message fields. This is protocol revision 1; revision 2 (#51, [audit](acp-fidelity-audit.md) D1, D8) keeps tool calls in the log and a released terminal's frozen output while a tool call embeds it, as ACP requires. Not yet implemented.
+- Show retained terminal results even after their handle is released. Distinguish
+  a frozen result from running output and from unavailable content. Unavailable
+  output is not reconstructed or written into Agent message fields.
 
 ## Media and attachments
 
@@ -48,8 +54,8 @@ These are client presentation rules for [ACP v1 tool calls](https://agentclientp
   remain descriptive entries. Do not fetch remote bytes just to build a preview or download action.
   Invalid payloads have no enabled open action.
 - Keep protocol diagnostics in folded details. Inline payloads are omitted from attachment views.
-  Markdown export is assembled from the log and its attachments, as `canon` normalizes them:
-  `_meta` is dropped, and tool calls are not part of it.
+  Export coverage is specified in [release parity](release-parity.md#markdown-export);
+  presentation must not discard metadata or tool content from the underlying state.
 
 ## Technical details
 
@@ -57,5 +63,5 @@ Keep IDs, file locations, content annotations, and raw message events in **Tool 
 
 Permission cards reuse tool-content rendering, including diffs and terminal snapshots, and apply
 the same null/omission semantics to inherited input. Cancellation intent comes from the running
-operation's `cancelRequested` before the final prompt response. See the
-[2026-09-26 display audit](acp-display-audit-2026-09-26.md) for the original findings and follow-up.
+operation's `cancelRequested` before the final prompt response.
+The original display audit is available through [the history index](history.md).

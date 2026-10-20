@@ -1,22 +1,28 @@
 # ACP fidelity audit
 
-Status: settled, 2026-10-16 (#51). It audits the browser protocol as
-implemented on `main` (`a7eb3b4`, protocol revision 1) against the pinned ACP schema,
-and records the evidence for [protocol revision 2](protocol.md). Capabilities of the
-last release, v0.2.8, are compared separately in the
-[release parity matrix](release-parity.md); a released capability that `main` lost is a
-regression there (R1–R3), never a limitation here. **The runtime code is not
-migrated**: every finding below describes current behavior, and its target is a
-specification the code does not meet yet. The migration steps and their acceptance are
-in [state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2).
+Status: reviewed, 2026-10-16. The original audit (#51, `a7eb3b4`) and its
+revision 2 decisions are retained below. The current comparison is between
+`experiment/protocol-v2` at `991b053` (revision 1 runtime, revision 2 documents)
+and stable `main` at `60f8606` (`488ccd9`, rc5, plus the rustls repair).
+Revision 2 is a target, not a claim that its behavior is implemented.
+
+The [source-level feature matrix](acp-bridge-matrix.md) expands this audit into
+every pinned Rust method, type and field, with fixed Zed references and a separate
+upstream-version comparison. Its source closure does not imply runtime acceptance.
+
+[§9](#9-acp-to-bridge-memory-contract) defines the current first-stage scope:
+complete the ordinary ACP client and its authoritative, displayable memory before
+validating FE replication. It distinguishes experimental regressions from gaps shared
+with rc5 and from decisions still open. The older v0.2.8 comparison remains in the
+[release parity matrix](release-parity.md); it does not establish rc5 behavior.
+Migration work is tracked in
+[state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2).
 
 ## 1. Baseline
 
-| Component | Pinned version | Source |
-| --- | --- | --- |
-| Rust SDK `agent-client-protocol` | 2.0.0, git rev `754d5aa1` | `Cargo.toml`, `Cargo.lock` |
-| Rust schema `agent-client-protocol-schema` | `=1.7.0`, module `v1`, SDK feature `unstable` (plan operations, session compaction, session fork, end-turn usage, tool call name, MCP over ACP, LLM providers) | `Cargo.lock`, SDK `Cargo.toml` |
-| TypeScript SDK `@agentclientprotocol/sdk` | 1.4.0 (test peers and browser types) | `package-lock.json` |
+The [source matrix](acp-bridge-matrix.md#1-来源和版本) owns the fixed implementation,
+SDK and schema versions. TypeScript SDK 1.4.0 supplies test peers and browser types
+(`package-lock.json`); its narrower type surface is discussed in §6.
 
 Evidence cites the schema crate's doc comments as `v1/<file>.rs:<line>`, relative to
 `agent-client-protocol-schema-1.7.0/src`. They are the pinned normative text. The ACP
@@ -27,14 +33,18 @@ Classes:
 
 - **Defect**: the bridge drops, changes or misstates content that ACP gave, or breaks
   attyd's own stated contract (for example "carried verbatim").
-- **Limitation**: an attyd product rule that narrows what ACP allows and that v0.2.8
-  did not offer either. It is not an ACP violation; each is either kept with a reason
-  or scheduled.
+- **Limitation**: a product boundary or support restriction shared with stable v1.
+  Its protocol implications must be assessed explicitly; it is not automatically a
+  migration regression or proof of complete ACP support.
 - **Boundary**: a deliberate product scope that stays (§4).
 - **Open**: the pinned schema does not settle the question; the audit states the rule
   revision 2 chose (§5).
 
 ## 2. Defects
+
+D1–D11 retain the original revision 1 findings; D12 is the rc5 comparison's
+additional control-state finding. Line references are evidence at the audited
+commits, not promises of current line numbers.
 
 | ID | Finding | Evidence (current code and docs) | ACP basis | Target (revision 2) |
 | --- | --- | --- | --- | --- |
@@ -49,29 +59,32 @@ Classes:
 | D9 | A resume-only session can be released; its next cold open resumes and turns the unknown log into a known empty one, so a client with an old head receives `from: 0, entries: []` and loses its history as if it were confirmed empty. Existing EOF tests cover only a held log. | `bridge/streams.rs:161–179` (resume counts as reattachable); `registry.rs:845–851` (`adopt_session_log`) | `session/resume` resumes "without returning previous messages" (`v1/agent.rs:1277`) | `history: "partial"`; the client may keep its earlier entries as unconfirmed UI state (§3.5) |
 | D10 | An answer must name exactly all pending interactions of the operation; the web client waits for drafts of all of them. Two pages answering two different interactions can never deliver. | `admission.rs:183–207`; `use-acp.ts:813–820`; protocol r1 §6.4 | each Agent request has its own response (JSON-RPC) | each interaction answered on its own, at most once (§7) |
 | D11 | An Agent request joins whatever operation runs in its scope, or starts an `agent_request`; the operation's end cancels it. A session-scoped elicitation that arrives during a `set_mode` is cancelled when the mode change ends. | protocol r1 §4.4, §6.2 "Agent requests"; state-sync §2.5 | an elicitation is scoped to a session (optionally a tool call) or to one JSON-RPC request (`v1/elicitation.rs:1484–1547`); only the permission rule ties requests to `session/cancel` (`v1/client.rs:2589–2590`). This is a product narrowing, not a wire violation | interactions live by their ACP scope; a request-scoped one has the outstanding JSON-RPC request it names as `parent`, and an elicitation naming none is refused; interactions of a session being created move into it when it is installed (§4.4) |
+| D12 | Reduced controls discard the outer `_meta` of mode, config, commands and usage notifications, and of the response's `modes` object. Nested option/mode metadata and `session_info_update._meta` are not the missing fields. | experimental `runtime_state.rs:743–764`, `protocol/controls.rs:16–42,55–68,78–88`, `protocol/mod.rs:44–83`; rc5 `runtime_state.rs:1045–1068,2587–2605` retains complete control updates, and `:2614–2617` retains the complete `modes` object | ACP defines metadata on these containers (e.g. `v1/client.rs:701–710`); retaining it is attyd's own S8 contract, not a requirement to interpret it | preserve the metadata with the control state it qualifies, at its original level; current §4.5 DTOs need this addition (step 18). No control-event journal or claim of preserving the entire setup response is needed |
 
 ## 3. Limitations
 
 An earlier version of this audit listed controls during a prompt (L1) and the absence of an explicit
-close (L2) here. Both were released in v0.2.8, so they are regressions R1 and R2 of
+close (L2) here. Both are also present in stable rc.5, so they are regressions R1 and R2 of
 the [release parity matrix](release-parity.md#regressions), restored by actions
 (protocol §7); they are no longer limitations.
 
 | ID | Limitation | ACP basis | Decision |
 | --- | --- | --- | --- |
 | L3 | A prompt's stop reason and usage were visible only on `op` until the next operation replaced it. | `PromptResponse` (`v1/agent.rs:3096–3118`) | Resolved by D4's target: `Turn.end` carries the response. |
-| L4 | A resume-only session is released like a loadable one, which loses the history the bridge held. | resume returns no messages (`v1/agent.rs:1277`) | Kept, as in v0.2.8, which released it too and showed a missing-history notice; `history: "partial"` makes it explicit (D9). Keeping such sessions held instead trades memory for history (redesign §12). |
+| L4 | A resume-only session is released like a loadable one, which loses the history the bridge held. | resume returns no messages (`v1/agent.rs:1277`) | Kept, as in v0.2.8, which released it too and showed a missing-history notice; `history: "partial"` makes it explicit (D9). Keeping such sessions held instead trades memory for history ([design tradeoffs](client-api-redesign.md#3-decisions-and-tradeoffs)). |
+| L5 | Form elicitation accepts only a restricted pattern subset; even the ordinary JSON Schema pattern `^(a\|b)+$` is rejected by the quantified-group check. This is shared by rc5 and the experiment, not a v2 regression. | `v1/elicitation.rs:165–169,1120–1121` supplies a JSON Schema pattern, without the implementation's safe-pattern restriction; `elicitation_validation.rs:366–373,438–451` rejects it before registration (`bridge/agent_dispatch.rs:467–469`). The coverage ledger already calls these "safe patterns". | Complete the supported form behavior in step 16, including this ordinary pattern regression. Keep any remaining unsupported syntax explicit; do not describe the current subset as complete form support. |
 
 ## 4. Boundaries kept
 
 These stay as they are; the audit does not widen the product:
 
 - No persistence: no database, file or browser store as a history source; no
-  cross-restart terminal output, intents or stop boundaries (difference decisions §1).
+  cross-restart terminal output, intents or stop boundaries.
 - NES, `document/*`, provider configuration: not advertised.
 - Remote transports advertise no host filesystem, terminal or terminal authentication.
 - MCP servers and additional directories are static launch configuration.
-- Unix terminals run through `/bin/sh` (T05); in-place file writes (T08).
+- Unix terminal and process rules follow [terminal semantics](usage.md#terminal-command-semantics);
+  in-place file writes follow the [filesystem contract](acp-matrix/services.md).
 - No vendor-specific interpretation of `_meta` or error text: carrying an opaque field
   is not interpreting it, and the UI need not render it.
 - ACP methods need no one-to-one HTTP endpoint.
@@ -103,45 +116,120 @@ Listed so that none is mistaken for supported behavior:
 
 ## 7. Coverage by ACP surface
 
-Status of revision 1 (current code) and of revision 2 (the target specification). "Kept" means
-revision 2 does not change the surface.
-
-| ACP surface | Pinned basis | Revision 1 | Revision 2 |
-| --- | --- | --- | --- |
-| `initialize`, capability negotiation | `v1/agent.rs:4780–4789` | conforming: version check, client capabilities, `global.agent.initialize` verbatim | kept |
-| `authenticate`, terminal auth, `logout` | `v1/agent.rs:4791–4826` | conforming; one operation in `global` each | kept |
-| `session/new` | `v1/agent.rs:4828–4839` | conforming; early updates staged | early timeline updates also become items (§3.3) |
-| `session/load` | `v1/agent.rs:4841–4850` | replay reduced to message text (D1, D2) | replay reduced to items; `history: "complete"` |
-| `session/resume` | `v1/agent.rs:1277`, `:4875–4880` | cold resume shows a known empty log (D9) | `history: "partial"` |
-| `session/fork` (unstable) | `v1/agent.rs:4863–4873` | conforming, with r1 log content | the fork's replay, else the source's log and status |
-| `session/list`, `session/delete` | `v1/agent.rs:4852–4861` | conforming | kept |
-| `session/close` | `v1/agent.rs:1432–1436`, `:4882–4887` | sent on release and delete only (R2) | also the `close` action, during a prompt too |
-| `session/set_mode`, `session/set_config_option` | `v1/agent.rs:4889–4903` | conforming when idle; refused during a prompt (R1) | actions, during a prompt too |
-| `session/prompt` | `v1/agent.rs:4905–4916` | result on `op` only; a failure drops output (D4) | `Turn.end`; every sent prompt settles |
-| `session/cancel` | `v1/agent.rs:5073–5084` | conforming; pending permissions answered `cancelled` | kept |
-| message and thought chunks | `v1/client.rs:100–105`, `:604–632` | text only, boundaries lost, thoughts dropped (D1–D3) | items with `messageId`, `_meta`, annotations |
-| `tool_call`, `tool_call_update` | `v1/tool_call.rs:29–88`, `:177–211`, `:295–296` | folded while running, dropped after (D1) | items, upserted session-wide by `toolCallId`; absent and `null` keep |
-| `plan`, `plan_update`, `plan_removed` | `v1/plan.rs:20–37`, `:79`, `:353`; `v1/client.rs:110–126` | per running turn, dropped after (D1) | ID plans: one item per `planId` in the session, removal in place; legacy: a snapshot per turn (Q3) |
-| `compaction_update`, `compaction_summary_chunk` (unstable) | `v1/client.rs:139–158`, `:210–299` | folded while running, dropped after; idle updates dropped (D1, D5) | items, upserted by `compactionId`, also outside prompts |
-| control updates (commands, mode, config, info, usage) | `v1/client.rs:127–138` | conforming, also when idle (§4.5) | kept |
-| `session/request_permission` | `v1/client.rs:2585–2593`, `:863–874` | joins the running op; group answers (D10, D11) | session interaction; its `toolCall` reduced into the timeline; answered alone |
-| `elicitation/create` (form, URL), `elicitation/complete` | `v1/elicitation.rs:1484–1547`; `v1/client.rs:2774–2777` | joins the running op (D11); URL flows conforming | interaction of its ACP scope, parented by its JSON-RPC request (Q6); URL flows keep that scope |
-| `fs/read_text_file`, `fs/write_text_file` | `v1/client.rs` (client methods) | conforming (stdio) | kept |
-| `terminal/*` | `v1/client.rs:2594–2645`; `v1/tool_call.rs:575–582` | output removed on release (D8) | frozen snapshot while embedded |
-| `$/cancel_request` | `v1/protocol_level.rs:82` | conforming for fs, terminal wait, MCP and interactions | kept |
-| MCP over ACP (unstable) | `v1/client.rs:2778–2784` | conforming; activity not projected (R3) | activity and connections in `global.live.diagnostics` (§4.7) |
-| extension methods | `v1/client.rs:2785–2792` | requests refused with `method_not_found`; notifications Q5 | kept |
-| `_meta` on any type | every type's `meta` field | dropped from log and attachments (D7) | carried |
-| NES, `document/*`, providers | unstable | not advertised (§4) | kept |
+The [source matrix and domain chapters](acp-bridge-matrix.md#2-怎样使用矩阵) own
+method/field coverage, implementation gaps and direct acceptance by ACP surface.
+The [test ledger](acp-coverage.md) records existing test evidence. This audit owns
+the findings and memory contract, not a second capability catalog.
 
 ## 8. Acceptance principle
 
-Replica-equals-projection checks cannot find these defects: the projection itself
-dropped the content. Every migration step therefore adds **ACP input → retained
-entity** tests, written against this ledger and not against the projection: a scripted
-Agent sends ACP updates, and the test asserts which items and fields the log or the
-tail holds afterwards, across completion, failure, cancel, load, resume, release, late
-updates, answers from several clients, reconnects and queue coalescing. The per-event
-convergence gate (state-sync §4.1) still runs on top. The cases are listed with their
-steps in [state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2) and in
-[client-api-redesign.md §11](client-api-redesign.md#11-acceptance).
+Use the direct ACP-to-memory cases in [§9.4](#94-direct-acceptance), the numbered
+[protocol acceptance cases](protocol-acceptance.md), and the
+[implementation gates](state-sync.md#73-gates). Their layers remain separate.
+
+## 9. ACP-to-bridge memory contract
+
+This is the first layer: an ordinary ACP client executing the negotiated protocol
+and retaining the state that a presentation needs. The Agent is the authority for
+its session; bridge memory is the authority for what the bridge currently knows;
+the FE displays that memory. A projection cannot repair content discarded before
+it reaches the projection. Conversely, a missing FE view is not proof that the ACP
+handler or the underlying memory is missing.
+
+This stage does not redesign FE synchronization, add persistence, or require a
+one-to-one HTTP wrapper around ACP. The declared boundaries in §4 remain explicit:
+unadvertised NES, document/editor and provider-management features are not silently
+counted as implemented. The locked schema's experimental MCP-over-ACP protocol is
+the baseline, not a newer upstream draft.
+
+### 9.1 Basic rules
+
+1. **Execute the negotiated client contract.** Every supported request has its own
+   response, error and cancellation path. Preserve ACP data without vendor-specific
+   interpretation. Keep capability declarations consistent with actual behavior;
+   name unsupported subsets instead of calling them complete support.
+2. **Reduce content, not meaning.** Keep the Agent's displayable content, identities,
+   boundaries and metadata in bridge memory. Deltas may become current entities;
+   control notifications may become current controls. Neither reduction may discard
+   information merely because an operation ended or a field has no current UI.
+   Opaque `_meta` must be retained, not understood or obligatorily rendered.
+3. **Use the resource's real lifetime.** A request lives until its own answer or
+   cancellation; an interaction follows its ACP scope. An operation is not a proxy
+   for another RPC's lifetime. Keep only outstanding RPC correlation, and remove it
+   after the response. Answer one interaction independently and at most once.
+4. **Release handles separately from referenced content.** Ended work cannot remain
+   actionable, but its received content and known result remain while the containing
+   session is held. A referenced attachment or terminal result remains readable after
+   its producer ends. Releasing the session may free that memory; a later resume
+   cannot manufacture the missing history. Connection recovery must also work when
+   there is no held session.
+
+These rules constrain behavior, not a new storage architecture. They do not require
+an event archive, a historical request table, a completed-request journal or a second
+authoritative copy of session state.
+
+### 9.2 Displayable memory
+
+"Retained" below means available in bridge memory while its owning content or scope
+is held. It does not mean every field must have a UI widget or survive a restart.
+
+| Data | Required state and lifetime |
+| --- | --- |
+| Session inventory and current work | Session IDs, Agent-provided cwd/info and catalog pages/cursors; which sessions are held and what work is currently running or has just ended, with its result/error. Keep current state sufficient to choose an available action; this does not require a history of every command. Reading a catalog must not invent loaded conversation content. |
+| Session timeline | User, Agent and thought messages; tool calls with name, status, input, output, content, diffs and locations; plans and compactions with summaries. Keep ordering, message/entity IDs, block boundaries, annotations and `_meta`. Reduce updates into their entities, including updates outside a prompt or after its result. Preserve replayed tool/process content as well as live content. |
+| Prompt result | Associate the actual stop reason and usage, or structured ACP error, with the prompt whose output was received. A failed/cancelled prompt retains its content. A lost response is unknown/interrupted, never invented success. A later operation must not erase the result. |
+| Controls and session information | Current modes, configuration options, commands, title, usage and cost, with metadata at the source level it qualifies (D12). Fold early updates, response fields and later updates in order; distinguish absent, null and empty where ACP does. Preserve the established preference for config options over legacy modes. |
+| Interactions | Complete permission/form/URL request, actual session/tool association or outstanding parent RPC, and the original responder. Remove on its own answer/cancellation or scope end. A permission's carried tool patch also contributes to the timeline. An unrelated control or prompt result does not remove a session-scoped form. |
+| Accepted URL flow | Request, interaction identity, Agent elicitation ID and `waiting/completed/ended` outcome. Acceptance ends the interaction but not the external flow; the parent RPC's response does not end an accepted flow. A terminal outcome does not revert. Dismissal or scope release removes it; no separate finished table is needed. |
+| Attachments and session terminals | Referenced attachment blocks remain available as received, including compaction-summary attachments. A terminal keeps its actual output, truncation and exit status; release removes its handle, not output embedded by retained content. A connection ending freezes referenced output of sessions that remain held. Frozen output does not itself hold a session open. |
+| History knowledge | Distinguish unknown, partial and complete history; an actual empty replay is different from no replay. Load reflects the history the Agent supplied; cold resume preserves the fact that prior content is unknown rather than asserting complete empty history. No reconstruction of interactions or terminal bytes the Agent did not replay. |
+| Connection and authentication | Initialization/capabilities, current Agent state and structured failure; authentication's method and terminal state/results while retained. Pending calls finish when their connection ends. An explicit recovery from stopped/error state works before any session has been created, so create/auth/list are not permanently stranded. |
+
+File read/write results and MCP transport messages need correct execution and ACP
+responses, not automatic entries in this table. If the Agent publishes their results
+as session content, that content follows the timeline rule. MCP connection handles,
+pending messages and cancellation state are operational state; disconnect releases
+them. Agent/MCP stderr, activity inspectors and raw RPC logs are optional diagnostics,
+not this stage's acceptance gate.
+
+### 9.3 Implementation status at the comparison commits
+
+| Class | Evidence and required follow-through |
+| --- | --- |
+| Implemented execution paths | Both baselines dispatch permission, elicitation, two fs methods, five terminal methods and three MCP requests; `session/update`, `elicitation/complete` and MCP notifications have handlers (`bridge/agent_dispatch.rs:196–236`). Capabilities agree (`bridge.rs:2219–2241`; rc5 `:2921–2943`). MCP relay code is unchanged; fs ACP methods and cancellable I/O remain. This does not certify downstream retention. |
+| Experimental regressions | Confirmed examples are the discarded completed/replayed timeline, stripped metadata, released terminal output, group-only answers, operation-bound interactions, and lost control/close actions. In particular, rc5 retains referenced released terminal output (`session_mirror.rs:430–478`); the experiment removes it (`runtime_state.rs:1188–1190`). The new operation binding actually cancels session forms (`bridge/publication.rs:234–292`), not merely their display. The defect table also contains shared or independent contract gaps; its IDs are not all claims of a rc5 regression. |
+| Shared gaps or restrictions | Form patterns are a subset (L5). Both rc5 and the experiment cancel pending session forms on prompt cancel; Q2's narrower rule is still to implement. Real parent-RPC lifetime management is not complete in rc5 either. Neither baseline's settled URL map retains the outcome: rc5 `runtime_state.rs:1597–1623` removes the flow and publishes the remaining map, as does the experiment `:1133–1158`. Do not infer a rc5 finished-flow table or completion-event guarantee from the older v0.2.8 comparison. Step 16 covers these interaction/form/outcome paths. |
+| History and recovery | rc5 also released resume-only history; D9 adds explicit knowledge instead of claiming empty completeness. Experimental recovery is triggered only by a followed session or login restart (`server.rs:222–236`), leaving no explicit recovery when neither exists. Step 14 must cover partial history and recovery with no session; the exact user-facing trigger is not prescribed here. |
+| Additional retention work | D12 belongs with the existing controls/actions work in step 18. This is preservation of current controls and their metadata, not a control-update archive. |
+| Still to decide or verify | Fork notifications arriving before the response, the provenance of inherited fork history, and resources naming an unknown session during concurrent creation need a clear supported boundary and tests; their routing must not be guessed. After close/reopen replaces a local session under the same ID, an old action's acknowledgement must settle only its original pending request and must not write into the replacement; verify that boundary, without changing the response-arrival ordering rule for actions of the current session. Late terminal callbacks after local session replacement also need targeted verification. These are not certified regressions or a reason to restore a public owner/CAS scheme. |
+
+The installation promises in §4.4 of the protocol remain subject to the unresolved
+unknown-session association above. This stage does not invent a provisional-owner
+scheme or require all possible early installation cases before fixing the confirmed
+gaps. An already allocated session loading its history is a separate, testable case.
+
+### 9.4 Direct acceptance
+
+Drive a scripted Agent through the real coordinator and ACP transport. Assert the
+bridge's owned state, resource tables and actual ACP replies against explicit fixture
+values. Do not derive expected values by calling the projection, reducer under test,
+or replica. These tests precede, and are independent of, later FE convergence tests.
+
+| Case | Bridge-memory / ACP assertion |
+| --- | --- |
+| Negotiation and session operations | Check initialize/version/capabilities, supported authentication methods, and new/list/load/resume/fork/close/delete with actual ACP requests and replies. Preserve session metadata and opaque cursors; show current work and its real outcome. A refused or failed operation does not invent a session or successful result. Exercise mode/config and close while a prompt runs. |
+| Complete live turn and load replay | Send every supported timeline kind, multiple message IDs, mixed text/attachments and metadata. After completion and after replay, the expected content and boundaries remain; no tool/thought/plan/compaction kind disappears. |
+| Failure, cancel and idle/late update | After partial output followed by error, cancellation or connection loss, content remains with the actual or unknown result. An idle update is retained; a late update changes its existing entity. The next prompt does not remove the earlier result. |
+| Controls | Early update → response → later update produces the explicit expected values. Exercise sparse info, absent cost, null versus empty config, outer/nested metadata and successful action acknowledgements. Check stored state directly, including D12's metadata. |
+| Independent interactions | Two pending requests exist in memory. Answering one sends only its ACP response; the other remains. A repeated answer sends nothing. Ending `set_mode` does not cancel a session form. Permission tool content is retained even without a preceding tool notification. |
+| Parent RPC and cancellation | A request-scoped elicitation ends with its named RPC, not a longer multi-RPC operation. Invalid/stale parent IDs are refused explicitly. Prompt cancel answers permissions `cancelled` without erasing unrelated session forms; a delayed local cancellation callback settles only its captured request, not a replacement registration. |
+| Accepted URL flow | Accept → parent response leaves a waiting flow; completion sets completed; a later connection end cannot overwrite it. Dismissed flows are not recreated by late completion. Validate session and request scopes without retaining finished parent requests. |
+| Form validation | A valid form with ordinary pattern `^(a\|b)+$` is accepted, valid content can be returned, and invalid content is refused without consuming the responder. Cover the pinned primitive/enum/array/default constraints; document any remaining pattern subset. |
+| Referenced resources | Release a terminal embedded in a tool: subsequent terminal methods refuse its ID, while the retained entity still resolves the exact frozen output/status. Keep referenced output through connection end. Attachments, including compaction-summary blocks, resolve unchanged while referenced and are freed when their owning content is released. |
+| Physical service and cleanup | Exercise fs read/write, terminal create/output/wait/kill/release, and bidirectional MCP requests/notifications. Check results/errors, cancellation before file mutation, cancellation of a terminal waiter without killing its process, and MCP connect/disconnect cleanup. No transcript of these service RPCs is required. |
+| History knowledge | A successful empty load is complete empty; a cold resume with no replay is partial, not complete empty. Retained history is not silently replaced with invented empty history. An already allocated session can receive interactions during load. Fork/unknown-session cases remain separately marked above. |
+| Recovery without a session | Stop or fail the Agent before any session exists; an explicit recovery starts initialization again and permits create/auth/list. Preserve the real failure until recovery begins, and settle old pending calls without attributing them to the new connection. This does not require an FE recovery UI test. |
+
+No hash, stream cursor, queue coalescing, raw diagnostic panel or browser screenshot
+can substitute for these first-layer assertions. Their later validation is a separate
+task after the bridge has the required information.

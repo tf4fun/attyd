@@ -1,21 +1,23 @@
-# attyd protocol v2
+# 简易 Agent 交互协议
 
-Status: **target specification, revision 2 (settled, #51), 2026-10-16.** It is
-served under `/api/v2`, the only browser API since `/api/v1` was removed (PR #46).
-Revision 1 (2026-10-14) is what the code on `main` implements: it kept only the text of
-user and Agent messages in the log and dropped every other session update once a turn
-ended. **The runtime code has not been migrated to revision 2.** Each difference between
-them is listed in the [ACP fidelity audit](acp-fidelity-audit.md), each capability of the
-last release (v0.2.8) is compared in the [release parity matrix](release-parity.md), and
-both migrate by the steps of [state-sync.md §7](state-sync.md#7-fidelity-migration-revision-2).
-§11 summarizes the changes.
+This is attyd's project-defined protocol between the FE (and other presentation
+clients) and the bridge. “Private protocol” here means project-defined. The bridge
+remains an ordinary ACP client toward the Agent. The existing `/api/v2` endpoint
+namespace and revision numbering belong to this application protocol, separately
+from ACP's versions.
 
-This document defines the client ↔ bridge protocol. Its rationale, derivations and
-acceptance cases are in [client-api-redesign.md](client-api-redesign.md); how the
-bridge produces it is in [state-sync.md](state-sync.md); the capabilities it must carry
-are in the [ACP coverage ledger](acp-coverage.md). The baseline is the ACP schema
-pinned in `Cargo.lock` (`agent-client-protocol-schema` 1.7.0, module `v1`, SDK feature
-`unstable`). Newer ACP releases and drafts are not part of it.
+Status: **revision 2 target and synchronization working baseline**. Complete the
+[ACP memory contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract) first,
+then finalize this protocol's synchronization, verification and repair design.
+[§12](#12-synchronization-design-requirements) is the brief for that second stage.
+The current implementation and migration status live in [the plan](state-sync.md#7-fidelity-migration-revision-2);
+the [source matrix](acp-bridge-matrix.md#1-来源和版本) fixes the ACP versions in scope.
+
+This is the single definition of the client contract. Related documents have
+separate roles: [design decisions](client-api-redesign.md),
+[numbered acceptance cases](protocol-acceptance.md),
+[implementation](state-sync.md), and [test evidence](acp-coverage.md).
+Earlier protocol revisions and draft comparisons are in the [history index](history.md).
 
 ## 1. Model
 
@@ -25,14 +27,22 @@ attyd is a mediator without a persistence layer:
 client  <  bridge memory  <  ACP server
 ```
 
-The bridge is an ordinary ACP client toward the ACP server; that layer is ACP's and is
-not specified here. Toward clients, the bridge is the single leader of a replication
+The bridge is an ordinary ACP client toward the ACP server; ACP defines that wire
+behavior. Its implementation and retained displayable state must first pass the
+[ACP-to-bridge memory contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract).
+Toward clients, the bridge is the single leader of a replication
 model in the manner of Raft: clients are read-only replicas of its memory and send
 writes to it.
 
-The protocol is defined by eleven rules. They are restated from
-[client-api-redesign.md §3](client-api-redesign.md#3-rules); the rest of this document
-specifies their fields, endpoints and behavior.
+These are separate acceptance layers. A replica matching a lossy projection is not
+ACP fidelity. This revision first completes the bridge's memory; client replication,
+content verification and repair are then designed and reviewed independently (plan §7).
+The synchronization design must carry the retained ACP state, not narrow it to fit
+an existing wire shape.
+
+The current proposal has eleven rules. This document defines them and their
+fields, endpoints and behavior; §12 identifies what must be resolved before the
+synchronization design is final.
 
 **Bridge rules**
 
@@ -331,8 +341,8 @@ Hashes serve alignment only. Admission never compares them.
 | `live.history` | The log holds | Set by |
 | --- | --- | --- |
 | (the log is unknown) | nothing; the client keeps its own log, unconfirmed | holding a session by subscription, until its first load or resume ends |
-| `complete` | the timeline from the session's beginning | `create`; a completed `session/load` (ACP: the entire history, `v1/agent.rs:4845–4848`); a `fork`, from its replay or, without one, the source's log and status |
-| `partial` | only what the bridge received since the Agent resumed it | a `session/resume` of a session whose log was unknown (ACP: no previous messages, `v1/agent.rs:1277`) |
+| `complete` | the timeline from the session's beginning | `create`; a completed `session/load` (ACP: the entire history, `v1/agent.rs:4845–4848`); a fork only with an established complete history source (below) |
+| `partial` | the known timeline is not guaranteed to start at the session's beginning | a `session/resume` of a session whose log was unknown (ACP: no previous messages, `v1/agent.rs:1277`); fork conditions remain to be specified below |
 
 A resume of a session whose log is known keeps the log and its status. A `partial`
 history arises whenever the bridge resumes a session whose log it did not hold: after
@@ -340,6 +350,14 @@ a release of a resume-only session, a `close`, a bridge restart, or a first open
 the catalog. v0.2.8 showed the same case as a missing-history notice. A `partial` log
 is aligned like any other. A client that held earlier entries may keep them as its own
 UI state and show them as not confirmed by the bridge (C1).
+
+**Fork rule to finish before implementation.** Capturing a source for a fork must
+include its timeline at admission, including an idle tail and referenced resources,
+without mutating the source. A few target notifications during `session/fork` are
+not evidence of a full replay. The choice between inherited source content and
+target content, and its complete/partial status, needs an explicit rule (audit §9);
+the earlier shorthand “fork replay, else source log” is not sufficient. A successful
+`session/load` remains the explicit complete-replay path.
 
 ## 4. Live documents
 
@@ -391,7 +409,7 @@ interface GlobalLive extends ScopeLive {
   };
   sessions: Record<string, SessionSummary>; // sessions the bridge holds
   terminals: Record<string, LoginTerminal>; // terminal logins, by operation ID
-  diagnostics: Diagnostics;                 // §4.7
+  diagnostics?: Diagnostics;                // later proposal, only if adopted (§4.7)
 }
 
 interface LoginTerminal extends Terminal {
@@ -412,6 +430,12 @@ interface CatalogLive extends ScopeLive {
 ```
 
 ### 4.4 Operations and interactions
+
+The installation rule below requires an unambiguous association with the installing
+request. When concurrent create/fork requests have not yet returned their session
+IDs, a resource naming an unknown session cannot be attributed by guessing. That
+association, including the boundary for pre-installation terminal/filesystem calls,
+is an open first-layer decision (audit §9), not an implemented guarantee.
 
 ```ts
 type OperationStatus = "running" | "completed" | "failed" | "cancelled";
@@ -485,6 +509,15 @@ scope (S7); the scope whose `live` shows it follows from the same scope:
 
 ### 4.5 Controls
 
+**Representation gap (D12).** The DTO below describes reduced control values but
+cannot yet carry all notification-level `_meta` or setup `modes._meta` promised by
+S8. Complete the representation before implementing it: keep metadata with its ACP
+source, separate from unrelated notifications, without interpreting vendor keys.
+The reduction order below remains valid; it does not authorize dropping those
+fields. A late action acknowledgement must also remain associated with the actual
+request that sent it, rather than mutate a replacement session merely sharing its
+ID (audit §9).
+
 `controls` is the **reduced current state** of the session's controls, folded from
 three sources in this order:
 
@@ -516,7 +549,7 @@ interface SessionControls {
 | `current_mode_update` | sets `modes.currentModeId` |
 | response `configOptions`, `config_option_update` | replace `configOptions` as a whole; an explicit `[]` stays `[]` |
 | `available_commands_update` | replaces `commands` as a whole |
-| `session_info_update` | per field: absent keeps the value, `null` clears it, a value sets it |
+| `session_info_update` | `title`/`updatedAt`: absent keeps, `null` clears, a value sets; `_meta` is `Option`, so typed ingress treats null and omission alike; preserve reported metadata at its source level |
 | `usage_update` | sets `used` and `size`; `cost` absent or `null` keeps the last known cost |
 | successful `set_mode` | sets `modes.currentModeId` to the requested `modeId` |
 | successful `set_config` | replaces `configOptions` with the response's `configOptions` |
@@ -571,7 +604,9 @@ awaits the response without touching accepted flows, and its shared thread model
 [separates](https://github.com/zed-industries/zed/blob/28d0a3547f16b9609b301b48ab363bfca649c864/crates/acp_thread/src/acp_thread.rs#L774-L798)
 finishing a request (pending interactions only) from cancelling it. Only the
 lifecycle is taken, not Zed's display, which hides finished flows (release parity
-P5).
+P5). The shared finish/cancel methods do not establish that the v1 adapter tracks
+parent RPC completion. The [newer fixed-source review](acp-bridge-matrix.md#5-zed-参考的适用范围)
+explicitly separates those call paths; this remains a bridge lifecycle choice.
 
 **Handle and output** (S7). A session terminal's handle is its process and the use of
 its ID in `terminal/*`. It ends with `terminal/release`, or when the Agent connection
@@ -580,12 +615,17 @@ the output and exit status are frozen. ACP keeps that output visible: "tool call
 already contain it, continue to display its output" (`v1/client.rs:2621–2622`). So the
 output is content: it stays for as long as an item of the log or the tail embeds the
 terminal, through a reconnect of the Agent and a `session/resume` that keeps the log
-(§3.5), and it is gone only with its session's documents (a release, `close`,
-`delete`, or a bridge restart). It holds nothing: only a terminal with a handle keeps
+(§3.5). Once the handle is gone, the output can be released when nothing embeds it;
+ending its owning document also releases that ownership. It holds nothing: only a terminal with a handle keeps
 its session needed. Its output is what the bridge kept; nothing is restored after the
 session's documents are gone. No completion record is kept.
 
 ### 4.7 Diagnostics
+
+This is a subsequent presentation proposal based on older UI capabilities, not a
+requirement for basic ACP support or the first-layer memory milestone. Its scope is
+reviewed separately (plan step 19); a full history of fs/MCP RPCs is not part of the
+session content contract.
 
 ```ts
 interface Diagnostics {
@@ -609,8 +649,8 @@ interface McpActivity {                     // one MCP-over-ACP message the brid
 }
 ```
 
-`diagnostics` is what v0.2.8 showed as the Agent's stderr and the MCP-over-ACP
-activity panel, now one bounded part of `global.live`. It is in memory only, carried
+If this later proposal is adopted, `diagnostics` is one bounded part of
+`global.live` for Agent stderr and MCP-over-ACP activity. It is in memory only, carried
 as relayed, interpreted by nothing, and bounded so that it costs a fixed amount: the
 stderr tail by the terminal bound, the activity by count. A connection leaves
 `connections` when it is disconnected or the Agent connection ends; the activity
@@ -909,63 +949,122 @@ type ErrorCode =
 The body of every non-2xx response is `{ error: ProtocolError }`. A stream that fails
 ends; the client subscribes again with its heads.
 
-## 10. Changes from the earlier v2 draft
+## 10. Previous revisions
 
-| Earlier v2 draft | v2 |
-| --- | --- |
-| `Position`, `epoch`, `seq`, `Last-Event-ID`, `at`, `prev` positions | none; alignment by log head (§5) |
-| `snapshot`, `reset` plus `GET /sessions/{id}` | alignment event `{ log, live: { replace } }` |
-| `ops` | `{ live: { patch } }`, or a settle point `{ log, live: { patch } }` |
-| `end` (`closed`, `unobserved`, `replaced`, `gone`) | `end` (`deleted`, `closed`, `load_failed`); a released session is loaded again on subscription |
-| `position` | SSE comments |
-| `session/<id>@<epoch>:<incarnation>` | `session/<id>` |
-| `history.timeline`, `collapsedTurns`, process pages | `log` of settled turns (§3); `live.tail` |
-| `turn`, `outcomes`, `operation` | `op`; a turn's `end` |
-| `global.requests`, request records, acknowledgements | `op` of each scope |
-| `interactions`, `requestId` parents | `live.interactions`; a request-scoped elicitation's `parent` is the outstanding JSON-RPC request it names (§4.4) |
-| URL flow `status` and acknowledgement | `status` `waiting`, then `completed` or `ended`, kept until dismissal or the end of the document that shows it; no acknowledgement (§4.6) |
-| `Idempotency-Key`, intents, `If-Match` tags, `historyRevision` CAS | `expect` (§6.4) |
-| `POST /sessions/{id}/open`, first-subscription lease | subscription with `cwd` (§5.1) |
-| `POST /sessions/{id}/close` | the `close` action (§7); release when not needed (S6) |
-| per-command endpoints | `POST /scopes/{scope}/ops` |
-| auth terminal input, resize, cancel | actions (§7); `cancel` operation |
-| `GET /api/v2/catalog` | `list` on `catalog` |
-| `GET /api/v2/global`, `GET /api/v2/sessions/{id}` | `GET /api/v2/scopes/{scope}` |
-| `owner_mismatch`, `history_mismatch`, `precondition_required`, `conflict`, `intent_conflict`, `intent_capacity`, `gone`, `interaction_ended` | `stale`, `not_allowed`, `404` |
+The [history index](history.md) links the fixed earlier drafts and their migration
+comparisons. They are evidence of past designs, not additional protocol rules.
+Current work is tracked only in [the implementation plan](state-sync.md#7-fidelity-migration-revision-2).
 
-`/api/v1` no longer exists. For the record of how its routes map here, the earlier
-draft's
-[mapping from v1](https://github.com/tf4fun/attyd/blob/11d04d0/docs/protocol.md#8-mapping-from-v1)
-applies through this table.
+## 11. Fidelity changes
 
-## 11. Changes from revision 1
+The [ACP fidelity audit](acp-fidelity-audit.md#2-defects) owns D1–D12 and their source
+evidence. [Release parity](release-parity.md) distinguishes stable-release regressions
+from shared gaps and optional presentation work. Their target behavior is defined
+in §§1–9 here; those findings are not duplicated as a second change table.
 
-Revision 1 is implemented on `main`; revision 2 is not yet. Each row links to its
-audit finding.
+## 12. Synchronization design requirements
 
-| Revision 1 | Revision 2 | Finding |
+Status: **second-stage design requirements, 2026-10-20; not implementation
+coverage.** Complete and directly verify the ACP-to-bridge memory contract first.
+Then use that state to finish 简易 Agent 交互协议. Sections 1–9 provide the current
+wire baseline; this section identifies what its later design must establish.
+It does not select new fields, version numbers or repair algorithms.
+
+### 12.1 Basic requirements
+
+1. **One authority.** The bridge supplies the state clients can confirm. A client
+   cache, draft or previously displayed history cannot restore facts that the
+   bridge no longer holds or has not learned from the Agent.
+2. **Complete representation.** Carry all displayable and actionable business state
+   established by the first layer, preserving its meaning and lifecycle. Internal
+   execution handles stay in the bridge. Referenced content may be read separately;
+   collapsing a card does not remove its data from the protocol's coverage.
+3. **Atomic installation.** A client installs the related content and state of one
+   event together, from one bridge cut. Failure leaves no half-applied document and
+   advances no confirmed position. The design states the boundary of a cut, including
+   any related scopes; it must not imply cross-scope atomicity it cannot deliver.
+4. **Verified content.** Confirmation concerns the content actually installed.
+   Checking a supplied hash against another cached hash, or successfully applying
+   a patch, is not by itself content verification. Define what is checked, when it
+   is checked, and how failure becomes visible, for both history and mutable state.
+5. **Repair from the authority.** Replace inconsistent or missing state using the
+   bridge's current representation. Equal, verified content can be reused across
+   reopen; unknown and partial history remain distinguishable from confirmed empty
+   history. Repair does not replay business commands.
+6. **Separate presentation and command outcomes.** Drafts, folding and selection
+   remain client UI state. Sending a command, receiving its answer, and installing
+   its effect are distinct events. Specify definite refusal, known completion and
+   uncertain delivery without inventing success or automatically repeating a write
+   whose result is unknown.
+
+Use the same small set of rules for first open, reconnect, a slow subscriber and
+reopen. Neither the bridge nor this protocol adds a persistence layer. Existing
+runtime request correlation remains internal; synchronization does not require a
+completed-request history.
+
+### 12.2 Representation coverage
+
+This maps semantic ownership, not new DTOs. Each row must have a defined document
+or read representation before the synchronization design is considered complete.
+The [source matrix](acp-bridge-matrix.md) remains the first-layer authority.
+
+| Bridge state | Client-visible meaning to carry | Internal execution detail |
 | --- | --- | --- |
-| `Turn { prompt, reply }`: user and Agent message text only; thoughts, tools, plans and compactions dropped at commit and from replays | `Turn { items, end? }`: every timeline update, reduced (§3.1–§3.2) | D1 |
-| Agent messages of a turn concatenated; text merged across message boundaries | items keep `messageId` and boundaries | D2 |
-| user message chunks of a live turn dropped | kept as items | D3 |
-| a failed prompt adds no entry; its process is dropped | every sent prompt settles, with `end.error` | D4 |
-| updates outside a prompt dropped; no path for late updates of committed entities | the tail continues the last turn; an update to a settled entity changes its entry (§3.3) | D5 |
-| the hash covers message text only | the hash covers the whole published entry (§3.4) | D6 |
-| `_meta` dropped at every level, also in attachments | carried; attachments are kept and served as received | D7 |
-| a released terminal leaves `live` with its output | it stays, frozen and `released`, while content embeds it (§4.6) | D8 |
-| a resume of an unknown log gives a known empty log | `history: "partial"` (§3.5) | D9 |
-| `answer` must cover all pending interactions of the operation | each interaction answered on its own, at most once (§7) | D10 |
-| interactions join the running operation, or start an `agent_request`; an operation's end cancels them | interactions are resources of their ACP scope; only a request-scoped one has a parent, the JSON-RPC request it names (§4.4) | D11 |
-| `op.process` on a running prompt | `live.tail` on the session | D1, D5 |
-| S2 Commit, I8 privacy (a committed turn's process never appears again) | S2 Settling, S8 Content | D1 |
-| plans reduced per turn by `planId` | an ID-addressed plan is one item per session; a removal sets it, in place (§3.2) | D1 |
-| tool updates: every present field replaces, `null` included | `ToolCall::update`: absent and `null` keep, collections replace (§3.2) | D1 |
-| tool state as `ToolCall` | `ToolCallUpdate`: a first sparse update or permission keeps only its fields, nothing filled in (§3.1) | D1 |
-| chunk `_meta` merged away with the text | each chunk keeps its fields; text joins only equal neighbours (§3.2) | D7 |
-| a released terminal's output removed on release and at the connection's end | handle and output separated; the output stays while embedded (§4.6) | D8 |
-| `set_mode`, `set_config` are operations, refused during a prompt | actions, allowed during a prompt; an outstanding one keeps its session held (§7) | R1 |
-| no `close` | the `close` action, also during a prompt; `end: closed` (§5.2, §7) | R2 |
-| request-scoped elicitations parented by operations; unknown request IDs go to `global` | parented by the outstanding JSON-RPC request; no outstanding request is refused (§4.4) | D11 |
-| interactions of a session being created ended with the `create` | moved into the session when it is installed (§4.4) | D11 |
-| Agent stderr and MCP-over-ACP activity not projected | `global.live.diagnostics`, bounded (§4.7) | R3 |
-| a URL flow is removed when it completes or ends, so its outcome is not shown | the flow stays with `status` until dismissed; only `waiting` changes (§4.6) | R4 |
+| Connection and current work | Initialization/capabilities, authentication state, current work and its actual result or structured error | SDK connection, execution tasks and cancellation handles |
+| Catalog and session knowledge | Current Agent session metadata, page/cursor, held state and unknown/partial/complete history | Load candidates, execution queues and subscription counts |
+| Timeline and tail | Message/thought/tool/plan/compaction entities, order, boundaries, IDs, annotations and applicable source metadata | Entity indexes and superseded patches |
+| Turn result | Complete received PromptResponse or error/interruption/unknown outcome associated with its content | Completed RPC correlation |
+| Controls | Modes, configuration, commands, info, usage/cost and their source metadata; omitted/null/empty remain distinct where meaningful | Setup candidates and callback association |
+| Pending interactions | Complete request/options/schema, scope, answerable identity and current availability | Original responder, locks and cancellation handles; the bridge sends the ACP reply |
+| Accepted URL flows | Original request, URL, flow identity and waiting/completed/ended outcome | ACP completion routing |
+| Referenced resources | Original attachment content through resolvable references; terminal output, truncation, known exit state and release state | Processes, PTYs, pipes and resource lookup indexes |
+
+Catalog results and metadata, controls metadata, and notification-envelope metadata
+still need their first-layer representation decisions. The current DTOs do not close
+those items. Diagnostics are separate optional presentation work (§4.7).
+Filesystem and MCP services do not automatically create conversation records.
+
+### 12.3 Decisions required before the wire design is final
+
+| Decision | Required answer |
+| --- | --- |
+| Representation and encoding | Show where every row above is carried. Define stable content equality, including metadata, field presence and numeric values supported by both runtimes. Preserve ACP meaning across encoding. |
+| History verification | Explain how clients verify received entry bodies and their chain, and validate locally retained content before advertising it as confirmed. Specify the relation between the full chain digest and its wire encoding if §3.4 is retained. |
+| Mutable-state verification | Define how a divergent `live` value is detected and repaired while the log/head remains unchanged, including idle periods. State the verification trigger and guarantee; a later prompt or accidental reconnect is not a verification policy. |
+| Atomicity and ordering | Define snapshot/subscription handoff, patch failure, queue coalescing and delayed old-stream/GET results. A queued event is not a delivered event. State what consistency related scopes provide. |
+| Repair | Define which verified content can be retained, which inconsistent portion is replaced, and how repeated failure is surfaced. A full authoritative replacement is a valid simple fallback; partial repair requires a demonstrated benefit. |
+| Resource reads | Relate a separately fetched block or terminal result to the installed content. Distinguish pending reads, validation failure and genuine release; specify behavior when a read races replacement or release. |
+| Commands and actions | State repeat semantics and the relationship between HTTP answers and replicated state, including concurrency and uncertain delivery. Reconciliation must not create a second business execution path. |
+
+The baseline in §5 checks the preceding log position and patch applicability. Those
+checks alone do not settle body verification, detection of a valid-looking but wrong
+`live`, or validation of separately read resources. The design must close these
+questions before claiming that clients can verify and repair the bridge projection.
+This is an accidental inconsistency/corruption check, not proof that a faulty or
+hostile authority is truthful.
+
+### 12.4 Independent acceptance
+
+These are required cases, not tests claimed to exist. Start with bridge states whose
+ACP fidelity has already been verified. Write expected client content from those
+states and independent fixtures; do not use the production projector or reducer to
+generate its own expected answer.
+
+| Case | Required observation |
+| --- | --- |
+| Complete initial installation | All applicable rows in §12.2 survive initial read/subscription, including metadata and resource resolution. Compare against the specified bridge cut, not a newer state reached concurrently. |
+| Received body disagrees with its hash | Alter content, metadata or a result while keeping valid framing and unchanged supplied hashes. Neither GET nor stream installation may confirm it; repair restores the bridge content. |
+| Local content disagrees with cached identity | Alter an installed entry but leave its cached head/hash intact. At the design's stated verification boundary the client detects and repairs it; a matching cached head cannot permanently confirm wrong content. |
+| Live-only changes and divergence | With an unchanged log/head, update controls, interactions, URL outcomes, tail and terminals. Separately inject valid-looking wrong live content. The declared verification trigger must detect and repair it without relying on a subsequent log change. |
+| Atomic failure in either half | Combine a valid log change with an invalid live patch, and invalid log content with valid live changes. Neither leaves half a new document or advances confirmation past failed content. |
+| Rewritten history and queue coalescing | Start with a conflicting suffix, rewrite a settled entity and coalesce queued events. Remove every conflicting item/field and install a valid cut; unsent data cannot advance the delivery baseline. |
+| Reconnect and competing sources | Break a stream during changes, replace the subscription and delay old events/GET results. Superseded sources cannot overwrite the new installed state; all accepted updates follow the declared ordering rule. |
+| Referenced content | Return wrong bytes, interrupt a read, and race a resource release. The client distinguishes unavailable/unverified/released content; retained referenced content remains readable, including frozen terminal output. |
+| History knowledge and restart | Distinguish incomplete load, confirmed empty load, resume without replay, Agent reconnection and bridge process restart. Cached UI content cannot become confirmed history without the bridge establishing it. |
+| Commands during reconciliation | Vary HTTP/stream response order, use two clients and lose a write response. State repair preserves drafts, follows resource answer rules and causes no automatic replay of an uncertain business write. |
+
+Keep per-event convergence checks as well. Add failure injection at the actual
+client decode, verification and installation boundaries, including after it
+cached an identity; comparing two copies of the same lossy projection is not enough.
+The implementation must demonstrate its stated detection trigger, not merely
+repair after the test manually forces a reconnect.

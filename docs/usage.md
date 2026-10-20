@@ -4,6 +4,11 @@
 to use separately, then give attyd its ACP command or endpoint. Available session
 controls depend on the capabilities that Agent advertises.
 
+**Version scope:** this checkout's UI/API descriptions refer to the experimental
+implementation, not the stable v1 release. Known differences and target fixes are
+tracked in [release parity](release-parity.md); design requirements are not a claim
+that a feature is already available.
+
 ## Reading conversations
 
 Numbered separators group each prompt with its Agent response. The numbers follow
@@ -18,6 +23,8 @@ end with the turn and are not shown again, also not after a reload. The whole
 reply is shown as one Agent message. Markdown export contains
 the prompts and messages, with their attachments. A failed prompt keeps its error
 and the prompt for Retry.
+These completed-content losses are known experimental defects, not intended
+retention rules; see [the fidelity audit](acp-fidelity-audit.md#2-defects).
 
 ## Interface preferences
 
@@ -235,8 +242,10 @@ discovery is not filtered by attyd's startup directory. A known project/session
 link can load history even when the Agent does not provide a session list.
 
 Opening a cold session uses `session/load` when available, otherwise negotiated
-`session/resume`. The conversation shown is built from the Agent's replay; a
-successful empty replay shows an empty conversation. A session attaches only once
+`session/resume`. A successful empty **load** establishes empty history.
+Resume does not return prior history; the experiment currently presents an
+unknown cold-resume history as empty, which is defect D9. The target distinguishes
+unknown, partial and complete history. A session attaches only once
 its load or resume succeeds; a failure ends that attempt with its error, and
 **Retry** opens it again. A session attaches without load support through resume.
 A fork shows the history the Agent replays for it; without a replay it starts from
@@ -271,8 +280,8 @@ loses that state; durable history and restoration support belong to the Agent.
 
 attyd does not provide a persistent conversation database, an editor with unsaved
 buffers, NES/document synchronization, model-provider credential management, or
-vendor-specific tool/history interpretation. Terminal output is shown while the
-Agent keeps the terminal; old commands are never re-executed to reconstruct it.
+vendor-specific tool/history interpretation. Old commands are never re-executed to
+reconstruct terminal output; its current retention gap is described below.
 
 ## Files and attachments
 
@@ -320,10 +329,10 @@ three preview lines fade gently. Markdown is parsed in full, preserving formatti
 and links; reusing and exporting retain its complete original source.
 When editing a reused prompt, text fields and attachment chips follow the original
 content-block order. Editing changes only that text block, removing an attachment
-removes only that block, and new attachments append at the end. A turn's content
-is kept as attyd normalizes it: `_meta` is dropped at every level, and adjacent
-text blocks that differ only in their text are merged; nothing else is combined or
-given extra separators.
+removes only that block, and new attachments append at the end. The experimental
+normalizer still drops `_meta` and merges adjacent text blocks whose remaining
+fields match. Metadata loss is defect D7; preservation is required by the
+[target content contract](protocol.md#32-reduction).
 Text shown inline uses UTF-8; downloaded bytes are the block's own.
 Links without bytes open only on a user click; attyd does not fetch them to make
 previews. Downloads are exports, not a persistent conversation cache.
@@ -359,8 +368,10 @@ When the main command exits, including with a nonzero status, attyd leaves
 surviving background processes running. `terminal/kill` and `terminal/release`
 check for completion before terminating a running command's process group;
 session close and bridge shutdown also clean up groups whose main command is
-still running. Release invalidates the terminal handle and preserves its output
-for tool presentation. Cleanup does not cover separate process groups.
+still running. Release invalidates the terminal handle. The experiment also drops
+its output (D8); the [target resource contract](protocol.md#46-resources) requires
+preserving output still referenced by retained tool content. Cleanup does not
+cover separate process groups.
 
 Keep services in the foreground when their lifetime should follow the terminal.
 For an independent background service, redirect all three standard streams:
@@ -478,9 +489,9 @@ Remote transports do not expose attyd-host filesystem operations, terminal
 execution, or terminal authentication. Agent-handled ACP sign-in remains
 available when supported.
 
-For implementation details, see [ACP support](acp-coverage.md),
-[session recovery](active-turn-runtime.md), [tool card presentation](tool-card-presentation.md),
-and [testing](testing.md).
+For implementation details, see the [documentation map](README.md),
+[session state and recovery](state-sync.md#71-design), and
+[tool card presentation](tool-card-presentation.md).
 
 ## Optional example: Goose
 

@@ -1,422 +1,310 @@
-# Sync protocol implementation plan
+# Bridge implementation and migration plan
 
-Status: revision 1 implemented, steps 1–9, 2026-10-15 (§5). Revision 2 of the
-protocol (#51) is settled as the target specification and planned in §7; it is
-**not implemented**; where this document
-describes `canon`, the commit of a turn, `op.process` or I8, it describes revision 1.
-This document is how the bridge implements
-[attyd protocol v2](protocol.md), settled in
-[client-api-redesign.md](client-api-redesign.md). It covers the internal design,
-the invariants tests enforce, and the migration from the earlier v2 draft and
-`/api/v1`.
-Lifecycle and concurrency changes follow the
-[TDD ledger](bridge-state-machine-tdd.md): bridge behavior is tested before browser
-projections.
+This document owns implementation structure, migration order and test gates.
+[简易 Agent 交互协议](protocol.md) owns the FE ↔ bridge contract;
+[design rationale](client-api-redesign.md) explains its choices;
+[protocol acceptance](protocol-acceptance.md) keeps the numbered behavior cases.
+The [ACP source matrix](acp-bridge-matrix.md) defines the first-layer functionality
+and retained-memory scope. Source coverage is not evidence of completed behavior.
+
+Status: the experimental baseline is `experiment/protocol-v2` at `991b053`.
+Revision 2 is the target; step 11 is in draft PR #53, not merged. Stable `main`
+remains v1 at `v0.3.0-rc.5`. Section 7 records current work: complete ACP behavior
+and authoritative memory first, then finish client synchronization, verification
+and repair. Sections 1–4 identify reusable implementation, not proof that the
+baseline meets either milestone. Lifecycle/concurrency work follows the
+[TDD ledger](bridge-state-machine-tdd.md).
 
 ## 1. Starting point
 
-This section records where the migration started, on 2026-10-14. An earlier v2 draft was implemented on `main` (its migration steps 1–5, last at
-`11d04d0`) until step 2 removed it. It was never completed: no client used it, and
-the web UI then ran on `/api/v1`. It was also
-over-designed for the settled model (incarnation owner tags, epochs and log
-positions, a retained log with resume, request records, intent tables, process
-pages). It is therefore **removed first** (§5, step 2), not kept beside the new
-protocol, which takes its place under `/api/v2`.
+Reuse the ordinary ACP client, ordered ingress/coordinator, session registry and
+host services. Repair their state and lifecycle gaps incrementally; do not add a
+parallel bridge or restore the removed public owner/intent/request-history model.
 
-Three generic parts implement rules the new protocol keeps unchanged. Step 2 keeps
-them, with their tests:
-
-| Part | Path | Rule it implements |
+| Existing part | Path | Role in the current work |
 | --- | --- | --- |
-| Control reduction | `src/protocol/controls.rs` | protocol §4.5 |
-| JSON Pointer patcher and generic diff | `src/protocol/diff.rs` | protocol §5.3 |
-| DTO-to-TypeScript generation | `src/protocol/typescript.rs` | §3 |
+| Ordered ACP dispatch and completion | `src/ordered_ingress.rs`, `src/bridge/scheduling.rs`, `src/bridge/coordinator.rs` | Actual request/session routing and ordered state transitions |
+| Session ownership | `src/session_registry.rs`, `src/session_state.rs`, `src/session_resources.rs` | One installed entry; business state and non-cloneable resources share its lifetime |
+| Load candidate | `src/history_cache.rs`, `src/history_replay.rs` | Private attempt-local replay; replace installed history only on successful completion |
+| Control reduction | `src/protocol/controls.rs` | Preserve ordering; extend source metadata in step 18 |
+| Publication and generic diff | `src/bridge/publication.rs`, `src/protocol/project.rs`, `src/protocol/publish.rs`, `src/protocol/diff.rs` | Commit, pure projection and incremental delivery |
+| Subscription Hub | `src/protocol/hub.rs`, `src/bridge/streams.rs` | Atomic cut, queue coalescing and delivery |
+| Generated types | `src/protocol/typescript.rs`, `shared/protocol.ts` | Keep Rust DTOs and browser types aligned |
 
-Two more techniques of the draft were reused in the new code, while the draft's own
-modules went with it in step 2: the identity diff of turn updates (now in
-`src/protocol/publish.rs`, for `op.process` in §2.3) and byte-budgeted subscriber
-queues (now in `src/protocol/hub.rs`, §2.4). Nothing else of the draft was a
-constraint: its routes, documents, records, intents, log, owner handling and tests
-went.
+The full completed migration and abandoned-draft details are linked in §5 rather
+than maintained as a second implementation plan.
 
-Layer 1 (bridge ↔ ACP server) was not changed by this plan until its last step
-(9): until then the bridge kept its sessions, incarnations, ingress and
-coordinator internally, and the protocol never exposed them. Step 9 removed the
-session incarnation (§5); the bridge now identifies a session by its ID only.
-
-## 2. Design
+## 2. Reusable implementation
 
 ```text
-ACP ──▶ bridge actor: transition ──▶ commit step ──────────────▶ Hub ──▶ replicas
-                                       │ log: canon, hash chain     │ cut, queues,
-                                       │ live: project → diff → ops │ coalescing
-                                       ▼                            │
-                              published documents (per scope)  ◀────┘ alignment reads them
+ACP → ordered coordinator → authoritative state transition → commit → Hub → clients
+                                                            │
+                                                    published read cache
 ```
 
-### 2.1 Bridge state added
+The commit and Hub remain useful while the retained content changes. Their current
+success does not establish full ACP fidelity or client-side verification.
 
-- **Operation slots.** Every scope has an `OpSlot { id, kind, status, input,
-  cancel_requested, result, error, attachments, completion }` in bridge state
-  (`src/protocol/op.rs`); `attachments` are the blocks a prompt input references,
-  and `completion` is the held response of a `create`, `fork` or `list`. A held session keeps it in
-  its registry entry; `global` and `catalog` keep theirs in the registry. The
-  operation's pending interactions are the scope's pending Agent requests, which
-  the bridge keeps as today; the projection reads them from there.
-- **Occupation.** An `occupied: HashMap<Scope, OpId>` records scopes an operation
-  occupies besides its own (delete occupies `session/<id>`). A held occupied scope
-  shows the occupying operation as its `op`.
-- **Turn log.** A held session keeps `TurnLog { entries: Vec<Arc<LogEntry>>,
-  attachments }`, appended by commits and rebuilt from a load's replay (§2.3).
-- **Holding need.** A session's need is computed, not stored: subscribers, occupation,
-  or live resources (protocol S6).
+### 2.1 Bridge state
+
+`SessionRegistry` owns each `SessionEntry`; `SessionState` owns its installed
+history and execution state, and `SessionResources` owns responders and other
+non-cloneable resources. `HistoryCache` holds only unfinished load candidates.
+The connection has its Agent state and global/catalog work; lookup maps and entity
+indexes must remain indexes of those facts, not independently updated authority.
+
+Existing operation slots and scope occupation implement the current admission
+baseline. They do not own all ACP interactions. Section 7.1 defines the required
+content, independent resource lifecycles and removal of operation-bound interaction
+cleanup. Holding is derived from actual work/resources and subscribers, not stored
+as another business state.
 
 ### 2.2 Projection
 
-Pure functions define the published documents:
+The current pure entry points in `src/protocol/project.rs` are:
 
-- `project_session(&SessionRegistry, session_id: &str) -> Option<SessionDocument>`
-- `project_global(&SessionRegistry, &AgentInfo) -> GlobalLive`
-- `project_catalog(&SessionRegistry, revision: u64) -> CatalogLive`
+- `project_session(&SessionRegistry, session_id: &str) -> Option<SessionDocument>`;
+- `project_global(&SessionRegistry, &AgentInfo) -> GlobalLive`;
+- `project_catalog(&SessionRegistry, revision: u64) -> CatalogLive`.
 
-`SessionDocument` hands the commit step what it publishes separately: the `log`
-(`Unknown` until the first load completes, else `Known`), the `live` document, the
-running prompt's `process`, and the attachments its `op.input` references. They
-live in `src/protocol/project.rs` and are the only definition of what clients
-see. `op.process` comes from the running turn's `SharedTurnUpdates`; it is absent
-once the turn committed, so released process content never enters a document.
+They produce a displayable representation of retained business state. Publication
+may share immutable history and cache unchanged item projections; it cannot be the
+only owner of attachment bytes or frozen terminal output. Rebuilding that cache
+must preserve content and resource reads. The target replaces the running
+operation's process projection with the session tail (§7.1), while retaining the
+identity-diff technique.
 
 ### 2.3 Commit step
 
-Every transition in the bridge actor ends with one commit step, run when the bridge
-lock's mutable guard is released (as in the earlier draft):
+`BridgeLock`'s mutable guard runs one commit when released, on every return path:
 
-1. **Log.** For each held session, compare its `TurnLog` with the published one.
-   - unchanged (the same `Arc`): nothing;
-   - appended: a `LogChange { from: old length, prev, entries: new tail }`;
-   - rebuilt (a load replaced it): `from` is the longest common prefix of the two
-     chains, found by comparing hashes.
-2. **Live.** Project, then diff against the published `live` with the identity
-   diff (pointer comparison for `op.process`, value comparison for small fields,
-   `trim` plus `append` for terminal tails).
-3. **Publish.** Emit one event per changed scope. A log change and the same scope's
-   live patch are one event, so a commit carries both (protocol S2). Store the new
-   published documents and hand the events to the Hub under the same lock.
+1. Compare a session's retained log with the last published one. Shared unchanged
+   content needs no work; an append emits the tail; a replacement or entity rewrite
+   emits from the first changed entry and updates subsequent chain identities.
+2. Project live state and diff against its published value. Reuse pointer identity
+   for unchanged content, value comparison for small fields, and `trim` plus
+   `append` for bounded terminal output.
+3. Store the published cut and enqueue its events under the same bridge lock. A
+   scope's related log and live changes are published together.
 
-**`canon` and hashing** live in `src/protocol/canon.rs`:
+`src/protocol/canon.rs` remains the home for the timeline reduction, attachment
+normalization/resolution and chain encoding. Step 11 replaces its message-only
+semantics; live, replay and settled content use one set of rules (§7.1). A content
+hash identifies retained data; computing it in the bridge does not prove that
+clients verify received bodies.
 
-- `reduce_messages(&[SessionUpdate]) -> Vec<Message>` applies protocol §3.2 step 1;
-- `turns(messages) -> Vec<TurnContent>` applies step 2;
-- `normalize(&[ContentBlock], &mut Attachments) -> Vec<Block>` applies step 3,
-  where `Block` is the protocol's normalized content (text, resource links and
-  `AttachmentRef`), a bridge DTO rather than an ACP type; it keeps each referenced
-  block in the attachment table;
-- `resolve(&[PromptBlock], &Attachments) -> Result<Vec<ContentBlock>, UnknownAttachment>`
-  turns a prompt's references back into the ACP blocks they name, before
-  `session/prompt`;
-- `chain(&ChainHash, &Turn) -> ChainHash` hashes the JCS serialization
-  (`canonical_json`).
-
-`TurnLog::commit(prompt, updates)` builds a live turn from the prompt sent in
-`session/prompt` and the Agent messages among the turn's updates;
-`TurnLog::from_replay(updates)` builds every turn from a replay. Both go through
-the same functions, so the same messages give the same entry (acceptance 1).
-
-Attachment references in entries point at blocks the session keeps in an attachment
-table keyed by ID, counted by references from the log and from `live`. A block whose
-count reaches zero is released (protocol §8).
+State transitions decide what is retained. The publisher observes and emits them;
+its queue or cache budget cannot justify deleting authoritative ACP content.
 
 ### 2.4 Hub
 
-The Hub owns delivery only:
+The existing Hub owns delivery only. Reuse these invariants while the second-stage
+wire design is reviewed:
 
-- **Cut.** A subscription is registered under the bridge lock. For each scope the
-  Hub builds the alignment event from the published documents: the log from the
-  client's head if `have` matches, else from `0`, with `live: { replace }`. Events
-  of later commits enter the subscriber's queue in the same critical section that
-  produced them, so nothing falls between the cut and the stream (protocol S3).
-- **Baseline and queued tail.** For each session scope the Hub keeps two log
-  positions per subscription:
-  - the **baseline**: the head the client declared, advanced to an event's target
-    log position only when that event is taken from the replaceable queue and
-    handed to the stream's ordered output. A change still in the queue never
-    advances it, since coalescing may drop it;
-  - the **queued tail**: the target log position of the last event queued for the
-    scope, or the baseline when nothing is queued.
+- **Cut.** Register a subscription under the bridge lock and build its alignment
+  from one published cut. Later commit events enter its queue in that critical
+  section, so none fall between the cut and following delivery.
+- **Baseline and queued tail.** For each subscribed session scope, keep two log
+  positions. The baseline is the client's declared head, advanced only when an
+  event leaves the replaceable queue for the stream's ordered output. The queued
+  tail is the last queued event's target, or the baseline when the queue is empty.
+  Ordinary increments are computed at enqueue time from the queued tail; each
+  follows the preceding queued increment. A resync is computed from the baseline.
+  A queued event never advances the delivery baseline.
+- **Coalescing.** At the existing 1 MiB queue budget, replace a queued suffix for
+  each extant scope with one alignment from the baseline. Its target becomes the
+  queued tail. Preserve a queued `end`, with nothing following for that scope.
+- **Heartbeats.** The baseline sends an SSE comment after 15 seconds of idleness.
+- **Holding.** A session subscription is a lease while its stream is open. Loading
+  an unheld session follows admission; occupation delays it. Global/catalog
+  subscriptions alone do not hold sessions.
+- **Connection handoff.** Publication and Hub outlive an Agent connection.
+  `WaitingSession` transfers retained state to its replacement; it is not another
+  mutable session authority. The current recovery path is driven by followed
+  sessions or terminal-login completion. Step 14 must also provide explicit
+  zero-session recovery and correct retained content during handoff.
 
-  An ordinary log change is computed when it is queued, from the queued tail, so
-  each queued change follows the one before it; the queue is never pre-built from
-  a baseline that has not advanced yet. A resync is computed from the baseline. No
-  client acknowledgement, sequence number or retained log is needed; the
-  per-event convergence gate (§4.1) checks both positions.
-- **Coalescing.** A queue past its byte budget (1 MiB, as in the earlier draft) is
-  collapsed per scope: queued events of a scope that still exists are replaced by
-  one alignment from the baseline, whose target becomes the queued tail; a queued
-  `end` is kept, and nothing of its scope follows it.
-- **Heartbeats.** An SSE comment on a stream idle for 15 seconds.
-- **Holding.** A subscription to a session scope counts as one subscriber of that
-  session while the stream is open. Subscribing to an unheld session submits a
-  `load` to admission (§2.5); the stream waits for it under occupation.
+The baseline has no retained delivery log: reconnect aligns from published state.
+Per-event tests check the baseline and queued tail independently. This delivery
+model is not a settled guarantee of received-body or mutable-state verification;
+that belongs to §7.4.
 
-- **Across connections.** The published documents and the Hub belong to the host
-  and outlive one Agent connection, so a stream stays open across it. While the
-  Agent initializes, a new subscription is aligned from the published cut and its
-  loads wait for readiness. One cancellable recovery task starts the next
-  connection after the previous one's final commit, when an open stream follows a
-  session scope that has not ended, or once after a successful terminal login. It
-  decides the need again when it starts and backs off while attempts never become
-  ready. A global or catalog stream alone, and a read, start no connection.
+### 2.5 Execution and completion
 
-No log is retained: a client that reconnects is aligned from the published
-documents.
+Admission, registration and the initial state transition happen under the bridge
+guard. ACP sends and waits occur outside it; actual responses and local failures
+return through the ordered completion path. A held HTTP response is only a channel
+for the initiating client, not another result ledger; dropping it must not undo an
+admitted operation.
 
-### 2.5 Operations
+Reuse `OrderedIngress.pending` and the exact request/attempt association. Preserve
+short-lived completion context until the coordinator applies it. A wire response
+may already have removed the ingress entry, so scanning that map alone cannot
+end a child interaction or release a session before its ordered completion.
 
-Operation writes are handled in the bridge actor, one at a time:
+Load replay remains a private candidate until its matching successful response;
+a failed or stale attempt cannot replace installed content. Step 14 completes
+history knowledge, fork source capture and recovery. Controls, close and
+interactions follow the target transitions in §7.1, replacing the baseline's
+operation-bound cleanup. Resource actions consume the actual responder at most
+once; unknown-result business writes are not automatically replayed.
 
-1. **Admission** (protocol §6.4), in one critical section: compare `expect` with the
-   scope's `OpSlot`, check its status and the occupied scopes, then the capability,
-   arguments and Agent connection.
-2. **Install.** A starting operation replaces the scope's slot and occupies its
-   other scopes, in the same critical section. The commit step publishes it.
-3. **Run.** `bridge::operations` turns the operation into the bridge command of its kind,
-   which the coordinator runs over ACP. Interactions
-   of its ACP requests are added to its slot; answers are delivered by the existing
-   interaction delivery path.
-4. **End.** The transition that ends it sets its final status, result or error,
-   frees its occupation, and wakes waiting subscriptions and loads.
+### 2.6 Services and resource reads
 
-`create`, `fork` and `list` keep their HTTP request open on a completion channel
-that the ending transition fulfils. A dropped connection only drops the channel.
+Keep filesystem, terminal, authentication and MCP execution paths. Terminal input
+and resize run outside the bridge guard; input uses the terminal's ordered writer,
+so stdin backpressure cannot hold the lock needed by output delivery. A URL flow is
+addressed by its bridge interaction registration; a delayed action on an old flow
+must not reach a new one that reuses the Agent's elicitation ID.
 
-**Agent requests.** The coordinator routes each Agent request to a scope as today:
-by session, or for a request-scoped elicitation by the JSON-RPC ID it names
-(`ElicitationRequestScope.request_id`), resolved in wire order. The request joins
-the scope's running operation, its own or the one occupying it, or starts an
-`agent_request` operation when none runs.
-
-**Cancel.** A cancel is admitted only for `prompt`, `terminal_login` and
-`agent_request`. It sets `cancel_requested` and starts the kind's cancellation;
-the operation keeps its occupation until the transition that actually ends it.
-
-**Controls.** A successful `set_mode` or `set_config` folds its acknowledgement
-into `controls` in the transition that ends the operation, as the bridge does today
-(`complete_control_operation`): the requested mode, or the response's
-`configOptions`. A failure folds nothing.
-
-**Loads.** A subscription to an unheld session is admitted like a write without
-`expect`: it waits while the session is occupied, then installs a running `load`
-with the given `cwd`. Until the first load completes, the session's `TurnLog` is
-`Unknown`, distinct from empty: alignments carry `live` only and leave each
-subscriber's baseline where the client declared it. The load reuses the existing
-`session/load` / `session/resume` attachment path and ends by building the
-`TurnLog` from the replay; the transition publishes, per subscriber, the log from
-its baseline together with the patch that ends the load. A reload of a held session
-(after an Agent restart) keeps its known log until the replay replaces it.
-
-**Where step 6 lands.** `POST /api/v2/scopes/{scope}/ops` (`server::write_scope`)
-reads the body field by field and sends it to the actor as one input.
-`protocol::admission` checks it on the published documents in admission order;
-`bridge::operations` installs a starting operation and builds the command of its
-kind under the same guard, or applies `cancel` and `answer` there. An `answer` is
-checked whole before anything is delivered. Each interaction is found by its ID
-wherever it waits, and is resolved and delivered to its pending responder in the
-same guard (`resolve_permission`, `resolve_elicitation`). An accepted URL
-elicitation becomes a flow in that step. A cancel sets `cancel_requested` once on the owning slot. A prompt or login
-whose ACP call has not started yet sees the flag when it starts.
-
-**Release.** A session whose need ends starts the existing retirement timer
-(`--session-unobserved-timeout`), now only a performance setting. When it fires and
-the session is still not needed, the bridge closes it only if the Agent advertises
-`session/load` or `session/resume`. The timer is cancelled by any new need.
-
-### 2.6 Resources
-
-Session terminals and URL flows keep their current bridge representation, keyed by
-terminal ID and interaction ID. A login terminal keeps its `methodId` with the
-terminal itself, not on the operation that started it. They leave `live` as protocol §4.6 states;
-acknowledgement records and terminal statuses go. The terminal login keeps the auth
-terminal manager and its ordered events; its operation ends with the process exit,
-and its terminal stays until dismissed. Terminal input is written as received, in
-order; the bridge does not deduplicate it.
-
-Step 6 lands the resource actions (protocol §7) in `bridge::resources`:
-- The resource is found by the full scope and resource ID. It is checked under
-  one guard, without `expect` and without an operation.
-- A URL flow is named by its interaction ID (the flow's registration). Dismissing
-  it reuses the settle and route primitives that end a flow with its scope, so a
-  late dismissal of an old flow never reaches a new flow that reuses its
-  `elicitationId`.
-- A login terminal's dismissal is allowed only after the terminal exits, and it
-  leaves the ended operation as it is.
-- Input and resize run after the guard is released. Input goes on the terminal's
-  own blocking writer, in the order the actor receives it. A stdin under
-  backpressure therefore never holds the bridge lock that the terminal's output
-  observer takes.
-
-The session reads (protocol §8) are `server::read_session`:
-- An attachment comes from the published cut (`Publisher::attachment`).
-- The context search and read run outside the actor, in the workspace the actor
-  returns for the held session's own `cwd`, with the existing workspace checks.
-- A read holds, loads and renews nothing.
+Workspace context reads run outside the actor using the held session's resolved
+workspace and existing path checks. Attachment reads may use the published cut,
+but retained bridge content must also own the original block. Reads hold, load and
+renew nothing. The handle/output and reference-release contracts are in §7.1.
 
 ## 3. Types
 
-The documents, events, ops, operation requests and results, and errors are typed
-Rust DTOs. TypeScript in `shared/protocol.ts` is generated from them, and a test
-fails when the generated output is stale. The HTTP bodies of writes, resource
-actions, reads and errors are in `src/protocol/wire.rs`. The bridge's own
-admission and delivery types are internal. ACP types are referenced from
-`@agentclientprotocol/sdk`, not regenerated. The earlier draft's types are deleted in step 2.
+Rust DTOs define the bridge's documents, events, operations, resource actions,
+results and errors. `shared/protocol.ts` is generated and checked for staleness.
+HTTP body types are in `src/protocol/wire.rs`; execution and responder types stay
+internal. ACP values reference the pinned SDK types rather than a separately
+maintained approximation. Representation gaps from the source matrix are completed
+with their owning state before the corresponding migration step closes.
 
 ## 4. Invariants and gates
 
-| Invariant | Statement |
+| Invariant | Required property |
 | --- | --- |
-| I1 single write path | only the commit step publishes documents and events |
-| I2 per-event consistency | after every event, a replica's `live` equals a published `live`, and its log equals the published log, or its own unconfirmed log while the bridge's is unknown |
-| I3 exact cut | an alignment plus the events after it reproduce the published documents, with no gap and no duplicate |
-| I4 coalescing safety | replacing any queued suffix by an alignment gives the same final document; `end` survives |
-| I5 identity | the same messages give the same entries and hashes, live or replayed, however chunked. Revision 2: the same updates give the same items however chunked, and entries that differ in any published field have different hashes |
-| I6 admission | writes and loads are serial; `expect`, status and occupation decide; IDs never repeat |
-| I7 holding | a needed session is held; only a loadable session is released |
-| I8 privacy | a committed turn's process never appears in a later document or event. **Withdrawn by revision 2** (S8): it encoded the removal of content; it is replaced by I9 |
-| I9 fidelity (revision 2) | every accepted timeline update is reflected in the log or the tail by its reduction (protocol §3.2), and only a reduction or a replacing load removes content |
+| I1 single write path | Only the commit step publishes documents and events |
+| I2 per-event consistency | Each installed event produces a coherent published cut; unknown history stays explicitly unconfirmed |
+| I3 exact cut | Alignment and subsequent ordered events have no gap or duplicate effect |
+| I4 coalescing safety | Replacing a queued suffix with alignment preserves its final meaning; scope end survives |
+| I5 content identity | Equal reduction input yields equal items regardless of eligible chunk splitting; entries differing in published content are not treated as equal |
+| I6 admission | Admission is serialized; the current contract's operation/resource preconditions decide execution |
+| I7 holding | Needed sessions remain held; automatic release requires load/resume capability |
+| I9 fidelity | Accepted timeline content remains represented by its specified reduction until legitimate replacement or release; no display choice removes it |
 
-### 4.1 Convergence gate (I1–I4, I8)
+I8 was the withdrawn process-removal rule. It is not a current gate; its historical
+assertions change when their owning migration step changes behavior. Existing
+convergence verifies publication consistency, not the second-stage verification
+requirements of protocol §12.
 
-A Rust harness drives the bridge with a scripted Agent. Three replicas apply events
-**one at a time** and are compared, after each event, against the sequence of
-published documents:
+### 4.1 Convergence gate
 
-- one follows every event;
-- one lags and has random suffixes of its queue coalesced (I4);
-- one disconnects at random cuts and subscribes again with its head (I3);
-- one pauses consumption, has a queued but unsent log change coalesced, and
-  resumes; it must apply the alignment directly, without subscribing again.
+Keep the scripted-Agent harness and compare after every event with the published
+cut it represents, not a newer state reached concurrently. Exercise normal delivery,
+lag with random coalescing, reconnect at random cuts, and paused consumption with a
+queued-but-unsent change that is coalesced. Check both Hub positions; an unchanged
+baseline must not be mistaken for the queued tail.
 
-Scenarios run on the session registry (control updates, streamed and folded turns,
-commits, reloads with equal and diverging replays, terminals rolling past their
-bound, URL flows) and through the real coordinator and ACP transport (prompts,
-permissions, a turn started by another client, delete, release, Agent restart). The
-harness also mutates state without committing and asserts that it reports the
-divergence.
+Run applicable scenarios at the registry and through the real coordinator/ACP
+transport: controls, streamed/folded turns, late rewrites, replay replacement,
+terminals, URL flows, permissions, deletion, release and Agent restart. Retain the
+negative test that mutates state without committing. Direct ACP/memory assertions
+in §7.3 are independent of the projector and supplement this gate.
 
 ### 4.2 Acceptance
 
-The acceptance cases of
-[client-api-redesign.md §11](client-api-redesign.md#11-acceptance) (1–18) are the
-acceptance suite. Each lands, as a bridge test, in the step that makes it
-reachable (§5), and again in the client engine where it has a client half (3, 4, 9,
-15, 16). The [coverage ledger](acp-coverage.md) replaces the earlier draft's chains with one per
-capability:
+[Cases 1–37](protocol-acceptance.md) retain their original numbers and subcases.
+Each lands with the change that makes it reachable; client cases run again at the
+client boundary. The [source matrix](acp-bridge-matrix.md) adds method/field/domain
+coverage, and [protocol §12](protocol.md#12-synchronization-design-requirements)
+adds independent synchronization-verification failures.
 
-```text
-ACP capability → bridge authority → document path or operation → result in op
-               → alignment of a fresh replica → lifecycle end
-```
+The [coverage ledger](acp-coverage.md) links a capability to its actual execution,
+authoritative state, direct reply/result and lifecycle test. Document delivery and
+client repair are checked separately; neither chain can substitute for the other.
 
-## 5. Migration
+## 5. Completed migration history
 
-The web UI stayed on `/api/v1` until it moved to v2 in one step (7), so the
-product kept working throughout. Each step is one PR, validated in CI. Steps 1–8 are
-done: step 8 (PR #46) removed the v1 routes and SSE, the business events and
-journal, the browser's v1 store and compensation, and drove the backend smokes over
-v2. Step 9 (PR #47) is done, below.
+The removal of the abandoned draft, implementation of revision 1, migration of the
+browser and removal of `/api/v1` are completed history. Their steps and code details
+remain at the fixed baseline
+[`991b053`](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/state-sync.md#5-migration).
+They are not instructions to reproduce the old semantics.
 
-| Step | Work | Acceptance |
-| --- | --- | --- |
-| 1 | The redesign settled, the protocol and this plan (docs only) | — |
-| 2 | Remove the earlier v2 draft: `src/server/v2.rs` and its routes, the records and intent table, the replication log and Hub, the commit step, owner-qualified subscriptions, the projections and their tests, and the generated `shared/protocol.ts` types; `controls.rs`, `diff.rs` and `typescript.rs` stay (§1); v1 unchanged | v1 suites still pass |
-| 3 | `canon.rs`: message reduction, turns, normalization, prompt resolution, hash chain; `TurnLog` built from live commits and from replays | 1 |
-| 4a | DTOs and generated TypeScript; operation slots and occupation in bridge state; projections and the commit step for `log` and `live`, driven by the session registry's transitions; the per-event convergence gate on the session registry | 2, 5, 13, 18 |
-| 4b | The commit step in the bridge actor, run when the bridge lock's mutable guard is released; the bridge's remaining transitions (global and catalog operations, login terminals, the Agent connection); the gate through the real coordinator and ACP transport | — |
-| 5 | `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}`: Hub cut, alignment, coalescing, `end`; hold by subscription and need, `load` on subscription, release of loadable sessions only; the publication shared across connections and their automatic recovery | 3, 4, 12 |
-| 6 | `POST /api/v2/scopes/{scope}/ops`: admission, all kinds, `create`/`fork`/`list` responses, occupation, `agent_request`, the `catalog` scope; resource actions | 6–11, 14, 16, 17 (bridge) |
-| 7 | Web UI on v2: the generic replica engine (alignment, log truncation and append, `prev` checks, live patches) outside React, and the projection. PR #34, built on the earlier draft, is not landed; `shared/replica.ts` and `shared/protocol-validate.ts` are carried over where they fit | 3, 4, 9, 15, 16 (client) |
-| 8 | Remove v1: routes, business events, browser compensating state; Markdown export and attachment links on v2 | — |
-| 9 | Layer 1 clean-up: remove incarnation-based isolation from the bridge internals | existing gates |
+That migration removed session incarnation-based isolation. Ordinary JSON-RPC
+correlation, request/attempt-local completion and rollback, resource IDs/responders,
+and connection shutdown remain necessary. A session ID alone cannot justify
+applying an old local completion to a replacement entry; §7 resolves this through
+the real outstanding request, without restoring a public owner/CAS/intent system.
 
-Step 9 removed the session incarnation entirely, without a renamed successor
-(no session generation, owner token or tombstone). That covered:
+## 6. Open implementation choices
 
-- its allocation and storage: `SessionRegistry::next_incarnation` and
-  `SessionState.incarnation`;
-- its use in resource addressing: `SessionResourceOwner`, the permission,
-  elicitation and URL routes, terminals, the history-sync owner, and the unused
-  v1 attachment reference;
-- its use in the ingress, the per-session FIFO (`SessionHandle` with its
-  registration allocation), the coordinator, RPC completion hand-off, and
-  load/replay continuations;
-- every `StaleIncarnation` check and error, and the tests that only simulate an
-  old incarnation number.
-
-It also removed three mechanisms that only served that identity:
-
-- the per-registration allocation of a session queue (`SessionHandle`'s
-  `allocation`, `next_allocation` and `StaleHandle`): registering an existing
-  queue returns it, with its queued events and busy delivery;
-- the retired-ID filter (`SessionRegistry.retired_ids`, `is_retired`) for late
-  notifications of a session the connection had once retired;
-- the pointer identity of a session update's validation owner
-  (`SessionUpdateOwner` and its `Arc<()>` allocation): an ordinary
-  `session/update` is validated against the current session's validation or the
-  creation staging under one lock.
-
-What stays is ordinary ACP: JSON-RPC request/response correlation, the exact end
-of the current op, cancellation and shutdown draining, one load's candidate
-committed atomically or rolled back, and each resource's own ID and responder
-(permission and elicitation requests, URL registrations, terminals). The bridge
-generation (one Agent connection, its `epoch`) and an outstanding RPC's own
-allocation also stay. A session is identified by its ID, as in ACP.
-
-The result, in the code:
-
-- A load's history candidate is keyed by session ID; every append, commit and
-  discard still checks the load's attempt ID. A replay validation backup records
-  the actual request (`request_id` of an explicit load, `attempt_id` of an
-  automatic sync), and only that request commits or rolls it back.
-- A session installed under an ID that names an idle entry replaces it: the old
-  entry's resources are cancelled and removed (`retire_entry`) and its history is
-  cleared.
-- A delete takes the session path when the entry has a running session, and the
-  catalog path otherwise (an unopened history row or a cold placeholder).
-- Agent input naming a cold placeholder (an entry without a running session) takes
-  the connection-level path, so a `session/update` before the creation response
-  is staged and replayed into the created session.
-- A `session/update` naming no running session is dropped, unless a creation is
-  pending: then it is staged, bounded by the number of pending creations, and only
-  the created session's ID is replayed into it. ACP notifications carry only a
-  `sessionId`, so the bridge does not tell a late notification of a session
-  replaced under the same ID from one of the current session; it applies to the
-  session that runs under that ID.
-
-The browser protocol (`/api/v2`) did not change.
-
-Dependencies: 1 → 2 → 3 → 4a → 4b → 5 → 6 → 7 → 8, and 9 after 8. #16 and #17 are fixed
-visibly in step 7.
-
-## 6. Open questions
-
-- **Release timer.** Step 4 keeps `--session-unobserved-timeout` as the linger before
-  release. Whether its default should change now that it affects performance only is
-  decided with measurements.
-- **Several sample points.** Alignment matches the head only (redesign §12.3). If
-  long histories make full alignment costly, `have` can carry several points; the
-  Hub then picks the longest match.
+- **Release delay.** Keep `--session-unobserved-timeout` until measurements justify
+  a change. Releasing a resume-only session also changes which history the bridge
+  can recover; it is not exclusively a performance choice.
+- **Alignment optimization.** Multiple matching sample points are a possible
+  optimization only after the second-stage correctness/verification contract is
+  settled and full replacement is measurably costly. They are not required now.
 
 ## 7. Fidelity migration (revision 2)
 
-Status: **step 10 (docs) done; steps 11–20 not started.** [Protocol revision 2](protocol.md) changes what the
-documents carry, not how they are replicated: the commit step, the Hub, alignment,
-coalescing, admission and holding stay. The [audit](acp-fidelity-audit.md) lists the
-defects (D1–D11) and the [release parity matrix](release-parity.md) the v0.2.8
-regressions (R1–R4) each step removes; every regression step is required. Each step is one PR, validated in CI, and lands
-with its acceptance cases ([redesign §11](client-api-redesign.md#11-acceptance)). Tests
+Status: **step 10 (docs) merged; step 11 in draft PR #53; steps 12–20 planned.**
+The current milestone is **ACP → bridge functionality and displayable memory**,
+defined in the [first-layer contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract).
+The [audit](acp-fidelity-audit.md) distinguishes runtime defects, shared v1
+limitations and open rules; the [release parity matrix](release-parity.md) compares
+the stable rc.5 baseline and keeps older release evidence separately. A draft PR or
+a target rule is not implemented coverage.
+
+[Protocol revision 2](protocol.md) supplies the target content model. The existing
+commit step, Hub and alignment machinery are reused; that does not by itself prove
+that clients verify and repair all replicated content. That is the separate second
+milestone (§7.4). The existing convergence suites remain regression checks during
+first-layer work. Each implementation step lands with its acceptance cases
+([protocol acceptance](protocol-acceptance.md)). Tests
 that assert revision 1's removals (`turn-collapse.pw.ts`, `lazy-process.pw.ts`, the
 release case in `acp-ui.pw.ts`, `terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release`,
 the I8 assertions) change in the step that changes the rule they encode, to assert
 the retained content instead; no other test is weakened.
+
+### 7.0 First milestone: ACP and bridge memory
+
+The bridge remains an ordinary ACP client, with no persistence layer. Its one
+authoritative memory model must retain the ACP content needed for presentation,
+independently of whether a browser is connected or a card is expanded. This is a
+logical state contract, not a requirement to combine every store into one struct or
+keep a second raw event archive.
+
+**Implementation objective (2026-10-20).** Execute the supported ACP capabilities
+in the [source matrix](acp-bridge-matrix.md), and keep their complete semantic state
+in bridge memory. A method is not complete merely because its RPC succeeds: its
+received content, current state, result and referenced resources must remain
+available for their proper lifetimes. Optional features marked as excluded remain
+explicit boundaries; this milestone does not silently enable a newer ACP version.
+The protocol between the bridge and Agent remains ordinary ACP. Browser replicas
+do not supply missing Agent history or determine the bridge's facts.
+
+Implementation order:
+
+1. **Finish the content foundation (11, PR #53).** Complete the reducer, items,
+   message boundaries, metadata, original attachments and successful/cancelled
+   prompt results. Resolve the existing regression cases. Keep the generated types
+   and minimum client adaptation needed to leave the application usable.
+2. **Complete content and resource lifecycles (12–16, 18).** Settle failed and
+   interrupted prompts; accept idle and late updates; state history completeness
+   honestly; retain referenced terminal output; manage interactions by ACP scope;
+   restore controls during generation and explicit close. Include controls metadata
+   in 18, form-schema and request-ID support in 16, and no-session connection
+   recovery plus current catalog/auth results in 14. These are incremental repairs
+   to the current owners and execution paths, not a second bridge implementation.
+3. **Close first-layer coverage (17, alongside each step).** Verify the pinned ACP
+   methods, notifications, responses and cancellation directly, as well as the
+   resulting memory state. Existing filesystem, terminal, authentication and MCP
+   services are retained, not rebuilt as a new request-history system.
+
+The outstanding rules in the audit's §9 must be settled before the affected path is
+implemented: fork source capture and target completeness, resources before a new
+session's ID can be attributed, and the destination of a late control response.
+State the required isolation using actual pending requests; no public owner token,
+intent table or retained request log is needed. An explicit recovery path must work
+without an open session, but may not resend a business command whose result is
+unknown.
+
+Diagnostics, export and UI redesign are subsequent presentation work (19–20), not
+proof that this milestone is complete. Necessary client adaptations still accompany
+each changed operation or resource so an intermediate version remains usable.
 
 ### 7.1 Design
 
@@ -441,13 +329,22 @@ the retained content instead; no other test is weakened.
   `TurnLog` into a `LogChange` from the first changed index (§2.3). A rewritten entry
   is a rebuilt log whose common prefix ends before it.
 - **Attachments.** The table keeps blocks as received, keyed by the hash of the whole
-  block; reference counting from the log and `live` is unchanged.
+  block. References from both the log and live content keep them available; replacing
+  tool content or clearing a compaction summary releases only blocks with no remaining
+  reference. The retention rule must be tested, not assumed from the current table.
 - **Interactions.** Pending permissions and elicitations move from the operation slot
   to the scope's `live.interactions`, routed by their ACP scope (protocol §4.4). The
-  bridge notes each JSON-RPC request it sends, from send to response, with the scope
-  that shows its elicitations (an in-memory map, no record after the response); a
-  response ends the elicitations that name the request. Interactions of a session being created wait in the creating
-  operation's scope and move in the installing step. The `answer` admission path
+  bridge reuses `OrderedIngress.pending` and its ordered completion path to associate
+  an elicitation with the actual outstanding JSON-RPC request. Capture the request
+  identity and scope at ingress; apply parent completion in coordinator order, not
+  by scanning a table after a later wire response has already removed its entry.
+  Queued completion context lasts only until that completion is handled. Do not add
+  an independent pending-request authority or a completed-request table. A response
+  ends unanswered interactions that name that request. For a session being created,
+  assign or move interactions only when the association is known; concurrent new/fork
+  requests do not justify guessing a parent. The unsupported/temporarily unassigned
+  case must have an explicit rule and direct test before that path is extended.
+  The `answer` admission path
   becomes a resource action that resolves one interaction under the bridge guard.
   `agent_request` and its completion rule go.
 - A parent request's response cancels only that request's interactions not yet
@@ -459,54 +356,193 @@ the retained content instead; no other test is weakened.
   embeds it, also when the Agent connection ends for a session that stays held.
   Holding counts only terminals with a handle.
 - **Actions.** `set_mode`, `set_config` and `close` leave the operation slot: they are
-  sent under the bridge guard without occupying the session, their HTTP response is
-  held until the Agent answers, and `close` sets `closing` until then. The
-  outstanding-request map of the interactions note is also the holding input: a
-  session with an outstanding action request is needed, so the release timer does
-  not run until the response; a release sets `closing` while its own close is out. The v1 close
-  path of v0.2.8 (`close_session`) is the behavioral reference, not code to restore.
-- **Diagnostics.** The MCP relay and the Agent's stderr callback, which today are not
-  projected (stderr goes to the bridge log), write into `global.live.diagnostics` through the commit step, bounded as the
-  terminal tail is.
+  admitted and registered under the bridge guard without occupying the session;
+  sending and waiting happen outside the guard. Their HTTP response is held until
+  the Agent answers and the coordinator applies the completion; `close` sets
+  `closing` until then. Existing execution and transient completion state hold the
+  session through that transition, including the interval after the wire response
+  removes the ingress registration. The release timer must not depend only on
+  scanning that registration map. A release sets `closing` while its own close is
+  out. The v1 close
+  path of stable rc.5 (`close_session`) is the behavioral reference, not code to restore.
+- **Diagnostics (later proposal).** If step 19 is adopted, the MCP relay and Agent
+  stderr callback can feed a bounded presentation through the commit step. Neither
+  its presence nor a particular buffer shape is a first-layer requirement.
 - **History status.** `SessionLog::Known` carries `complete` or `partial`;
   `adopt_session_log` sets `partial` instead of building a known empty log.
+- **Controls.** Preserve the existing early-update → setup-response → later-update
+  order, including acknowledgements. The state must also retain the setup's
+  `modes._meta` and each control notification's outer metadata, without flattening
+  unrelated sources or interpreting vendor keys. Protocol §4.5's current DTO is
+  incomplete for that requirement; define its representation before implementing 18.
+- **Other source containers.** The [source matrix](acp-bridge-matrix.md) also identifies
+  notification-envelope, setup/catalog and current-result metadata losses. Decide
+  their representation alongside the owning timeline, controls or current operation
+  before closing its migration step. Preserve the semantic association; do not add
+  an all-notification archive or a completed-request table. Direct acceptance also
+  covers the declared form/ID/numeric domain limits, not merely happy-path values.
 
 Nothing here adds persistence, vendor branches, or the earlier draft's intents,
 request records or epochs.
 
+#### Ownership and write path
+
+Keep the existing ownership boundaries. The names below identify current code,
+not new mandatory Rust types or browser DTOs.
+
+| Owner | Authoritative facts and required change | Derived or temporary data |
+| --- | --- | --- |
+| `BridgeState` / connection | Initialization result, negotiated capabilities, authentication and connection state; current global/catalog work and its actual result/error | Capability/auth lookup maps are indexes of those facts, updated with their source; no independent truth or request history |
+| `SessionRegistry` → `SessionEntry` | One installed session's lifecycle, cwd, history knowledge, timeline/tail, controls, interactions, URL flows and referenced display resources | Entity-ID indexes locate the same items. `SessionState` and `SessionResources` share ownership; no parallel session store |
+| Pending request / `SessionResources` | Actual execution stage, responder and cancellation handle while work is outstanding | Existing ingress registration and short-lived completion identity; one reply consumes the original responder |
+| `HistoryCache` load candidate | Private candidate and validation state for the current load attempt | Temporary replacement transaction, not another installed history. `SessionState.log` remains the only completed history; failure discards only the candidate |
+| Terminal/filesystem/MCP services | Real process, file operation and MCP routing lifetimes; actual results and failures | Preserve referenced terminal output separately from its handle; fs/MCP execution does not automatically create chat history |
+| `Publisher` / Hub | No independent ACP business facts | Rebuildable publication/diff caches and delivery queues. `WaitingSession` transfers retained state between connections; it does not create a second mutable owner |
+
+An ACP input follows the existing ordered coordinator path: resolve its actual
+request/session, validate against the negotiated contract, update the owning memory,
+then commit its published representation. External I/O waits happen outside the
+bridge guard; their completions re-enter the same ordered path. A publication or
+subscriber failure cannot undo an ACP result that the bridge has already received.
+
+Live, replay and settled updates must use one set of reduction rules. Replace the
+content-reduction responsibilities currently spread across `TurnOverlay` updates,
+`HistoryBuilder` and `TurnLog`; do not add a fourth independently evolving reducer.
+Replay keeps a separate candidate because atomic replacement and rollback need it,
+but uses the same content semantics. Presentation folding never changes this state.
+
+`SessionState.operation` currently describes execution admission/stages, while
+`SessionLiveState.op` describes the current published work. Maintain both in the
+same transition, or derive the latter; do not let them separately decide success,
+interaction cleanup or session lifetime. This does not require a preliminary
+rewrite of the entire state machine.
+
+Resource reads must still resolve the same content after discarding and rebuilding
+the Publisher cache from retained bridge state. A cache is not the sole owner of
+attachment bytes or a released terminal result. Use existing shared ownership and
+content references for retention; no generic garbage-collection framework is
+required. Referenced immutable values may be shared rather than copied per commit.
+
+#### End and release contract
+
+| Event | Retain in the authoritative memory while its owner remains | End or release |
+| --- | --- | --- |
+| Prompt succeeds, is refused or is cancelled | Received timeline and the complete actual PromptResponse | Prompt execution and its own completed RPC; no deletion of process content or unrelated session interactions |
+| Prompt fails or its connection ends without a response | Received prefix and structured error, or an explicitly unknown/interrupted result | Pending execution; never invent a successful ACP stop reason or resend the prompt automatically |
+| Another operation starts | Earlier turn content/results, current controls and independent scope resources | Replace only the current-work slot where the protocol permits it; no all-command history is added |
+| Parent RPC completes | Any accepted URL flow and unrelated session-scoped interactions | That RPC's still-unanswered request-scoped interactions, then its transient correlation |
+| `terminal/release` or connection teardown | Frozen output/truncation/known exit state still embedded in held content | ACP handle and associated live waits/process resources; frozen output is not running work |
+| Content is replaced or removed | Still-referenced blocks and results; explicit removal state where the reducer requires it | Only resources with no remaining owner/reference; an old patch is not a permanent event record |
+| Full load succeeds | Atomically installed replay with its established knowledge level | Previous replaced content and the matching candidate; following notifications use the installed state |
+| Load fails; cold resume or partial fork occurs | Previously known content on failed replacement; honest unknown/partial status when no full replay exists | Failed attempt only; absence of replay never manufactures complete empty history |
+| Session/document is released | Only facts still owned elsewhere, such as an independently retained fork | Its responders, handles and unreferenced content; a disconnected FE alone does not cancel active ACP work |
+| Bridge process exits | Nothing is promised to survive as bridge state | All runtime memory/handles. A new process learns content from the Agent according to its capabilities |
+
+No database, session-state file, WAL, recovery journal or browser backup is added.
+Reading launch configuration, executing ACP `fs/write_text_file`, or the Agent's
+own storage does not constitute bridge-state persistence; those existing client
+services continue to work. An Agent connection restart within the same process is
+different from a bridge process restart: memory still held by the bridge can remain,
+but expired execution handles cannot become live again.
+
 ### 7.2 Steps
 
-| Step | Work | Removes | Acceptance (redesign §11) |
+| Step | Work | Removes | Acceptance (cases 1–37) |
 | --- | --- | --- | --- |
 | 10 | Docs: this revision, the audit, the release parity matrix, the coverage ledger | — | review (done) |
-| 11 | Timeline reducer and entry shape: items, `end`, `_meta`, message boundaries, attachments as received, hash over the entry; live commits and replays through it; generated TypeScript; the web projection renders items from the log as it renders `op.process` today. Prompt `end` on completed and cancelled turns. | D1, D2, D3, D6, D7 | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36 |
+| 11 | One timeline reducer and entry shape: items, `end`, message boundaries, block/entity/notification-source metadata, original attachments, hash over the entry; live commits and replay through it; complete PromptResponse for successful/cancelled turns; validate numeric-domain limits against the locked schema. Generated types and minimum item rendering accompany the change | D1, D2, D3, D6, D7; source matrix content fields | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36; content matrix CN/CB/TC/PL/EN cases |
 | 12 | Settling of failed and interrupted prompts | D4 | 2, 22 |
 | 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |
-| 14 | History status `partial` for a cold resume; the client keeps a replaced log as unconfirmed UI state | D9 | 23 |
+| 14 | Honest load/resume/fork knowledge and attempt-local rollback; fork source cut includes tail and referenced resources, not a guessed complete target replay; zero-session Agent recovery; retain current catalog pages/cursors and setup/auth/logout result metadata without request history. State the unknown-session association boundary | D9; source matrix lifecycle/metadata gaps and open rules | 23; direct history, fork-resource, catalog/current-result and zero-session recovery cases |
 | 15 | Terminal handle and output separated: frozen output through release and the connection's end; the holding change | D8 | 12, 24 |
-| 16 | Interactions as scope resources with ACP lifecycles; per-interaction answers in bridge and client; URL flow outcomes; `agent_request` removed | D10, D11, R4 | 7, 8, 11 |
-| 17 | Coverage ledger chains for the new paths; an extension-notification test (audit Q5) | — | the ledger's rows |
-| 18 | Actions: `set_mode`, `set_config` and `close` outside the operation slot, `closing`, `end: closed`; the client's controls enabled during a prompt and the close confirmation | R1, R2 | 18, 28, 29, 37 |
-| 19 | `global.live.diagnostics`: Agent and MCP stderr, MCP-over-ACP connections and activity; the collapsible panels | R3 | 32 |
-| 20 | Markdown export over items, `end` and terminal snapshots; the browser cases of settled content and per-interaction answers | (D1, D4, D8 in the client) | 33, 34, 35 |
+| 16 | Independent scope interactions and original responders; actual parent-RPC lifetime using existing ingress registration; permission tool patch contributes to timeline; accepted URL outcomes; remove `agent_request`; form schema/value support, ordinary patterns, exact i64 request IDs and integer-bound validation | D10, D11; shared form, ID-domain and URL-result gaps | 7, 8, 11; services S01–S03/F01–F11, including two simultaneous answers and multi-RPC parent lifetime |
+| 17 | Close matrix-to-direct-test coverage alongside each change; exercise retained transport/fs/terminal/auth/MCP paths and extension fallback; keep optional exclusions explicit. This adds tests and evidence, not another runtime state system | Unverified coverage; audit Q5 | Matrix methods, fields, capabilities, replies/cancellation and cleanup; existing convergence remains a separate regression gate |
+| 18 | Actions: `set_mode`, `set_config` and `close` outside the operation slot, `closing`, `end: closed`; complete controls metadata and isolate late acknowledgements by their actual request; necessary client controls and close confirmation | R1, R2, D12 | 18, 28, 29, 37; direct metadata and late-response cases |
+| 19 | Subsequent presentation work: bounded Agent/MCP diagnostics and collapsible panels; scope decided separately from basic ACP conformance | Historical R3; not a first-layer gap | 32 if retained in the presentation scope |
+| 20 | Subsequent presentation work: Markdown export over items, `end` and terminal snapshots; browser cases of settled content and per-interaction answers | (D1, D4, D8 in the client) | 33, 34, 35 |
 
-Dependencies: 10 → 11 → 12 → 13; 14 and 15 after 11; 16 after 10 and independent of
-11–15; 17 after the step whose chain it records; 18 and 19 after 10 and independent of
-11–17; 20 after 12, 15 and 16. Each step leaves the product working: steps 11–15 only
-add content to documents the client already renders, 16 and 18 change one write and
-its client together, and 19 adds a `live` field. No step is optional: R1–R4 and the
-defects are closed only when their cases pass against the target.
+Dependencies: 10 → 11 → 12 → 13; 15 follows 11. Step 14's history-knowledge and
+recovery work can start after 11, but its full fork gate requires 13's tail and 15's
+referenced terminal results. Step 16's interaction work can proceed alongside the
+content work, but its permission-only tool gate requires 11. Steps 16 and 18 reuse
+the same existing pending-RPC registration/completion foundation; whichever changes
+it first establishes the shared behavior, not a second map. Step 17 accompanies
+each implementation increment. Step 20 follows 12, 15 and 16.
+§7.0 puts first-layer completion before presentation work in 19–20. Each step includes the minimum client
+adaptation necessary to keep the product working. A first-layer defect closes only
+when its direct ACP/memory case passes; later presentation acceptance remains open
+until its own case passes. Historical UI features are not silently promoted to
+mandatory ACP capabilities.
 
 ### 7.3 Gates
 
 - **Fidelity cases** (audit §8): a scripted ACP Agent sends a fixed update sequence;
-  the test asserts the reduced items and fields of the log or the tail, written from
-  the ACP input, not from the projection.
+  the test asserts the bridge's retained items, fields, controls and resources, and
+  the actual ACP replies/cancellation. Expected values are written from the ACP
+  input, not calculated by the reducer or projection under test. The full
+  first-layer matrix is in [audit §9](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract).
+- **Memory ownership:** repeat the applicable cases with no browser subscriber;
+  inspect the owning session/resource state before projection. Rebuilding derived
+  publication caches preserves content and resource reads. Check both sides of
+  cleanup: retained results remain readable, consumed responders cannot answer
+  again, dead handles are unusable, and unreferenced resources can be released.
+- **Ordered lifetime cases:** use explicit barriers around early notifications,
+  response receipt, coordinator completion and delayed local callbacks. Distinguish
+  scope lifetime from operation lifetime; use the actual request/attempt association,
+  without reinstating historical owner/CAS/intent machinery.
 - **Convergence** (§4.1): the three replicas, plus settle points that rewrite an
   entry, idle tail growth, and a coalesced rewrite.
-- **Browser**: completed, failed and reloaded turns show their tool cards, thoughts,
+- **Browser (presentation acceptance)**: completed, failed and reloaded turns show their tool cards, thoughts,
   plans and compactions collapsed by default and expandable; a released terminal's
   output stays in its tool card; the v0.2.8 cases of live configuration and close
   (`acp-ui.pw.ts` at the release, from line 2694) pass again.
-- **Release parity**: each row of the [matrix](release-parity.md) marked Regression
-  has a passing case; a test changed to assert a loss is changed back, not counted.
+- **Release parity**: each first-layer regression against rc.5 in the
+  [matrix](release-parity.md) has a passing case. Shared gaps and stronger target
+  guarantees have their own cases and are not mislabeled as regressions. A test
+  changed to assert a loss is changed back, not counted as fidelity coverage.
+
+### 7.4 Second milestone: bridge-to-client replication
+
+This stage designs **简易 Agent 交互协议**, the project's private protocol between
+FE/other presentation clients and the bridge. ACP continues to govern the bridge's
+communication with the Agent.
+The design brief is [protocol §12](protocol.md#12-synchronization-design-requirements):
+basic requirements, semantic representation coverage, unresolved wire decisions
+and independent failure-injection acceptance. “Complete state” means all displayable
+and actionable business state, including resolvable resources; responders and
+execution handles remain internal.
+
+**Sequence:** complete and directly verify ACP functionality and its authoritative
+memory representation first; then design the FE ↔ bridge synchronization protocol
+from that state. This second milestone includes protocol design, not only testing
+an already-fixed synchronization scheme. The existing wire rules and implementation
+are a working baseline to reassess, not constraints that justify removing ACP
+content or changing its lifecycle.
+
+The design must explain how clients receive the full displayable state, verify what
+they have installed, and replace inconsistent or missing state from the bridge,
+including initial subscription, concurrent changes, disconnection and reopen.
+Browser UI state is separate; browser replicas cannot supply authority missing
+from bridge memory. Derive these behaviors from a small shared set of rules and
+retain the memory-only boundary.
+
+Retaining full content and hashing it in the bridge does not prove that a replica
+validates the content it installs. Check the trust placed in received log hashes,
+the detection and replacement of divergent live state, and recovery from a
+mismatched suffix or interrupted stream. Specify the verification points before
+choosing fields or mechanisms. This first-layer plan does not settle the final
+wire shape or repair algorithm.
+
+After the first-layer gate, finish this stage in order:
+
+1. Map the validated memory to documents and resource reads using protocol §12.2;
+   settle the remaining representation choices before selecting synchronization fields.
+2. Derive one synchronization/verification/repair scheme, answer each §12.3 decision,
+   and revise the existing rules and DTOs together so only one current contract remains.
+3. Add §12.4's independent and failure-injection cases, then implement the smallest
+   bridge and client changes that satisfy them. Keep the existing working paths
+   usable during migration; optional UI and diagnostics remain separate.
+
+Keep existing atomic-application and per-event convergence tests throughout the
+migration. They prove a different property from ACP fidelity and cannot replace the
+direct memory assertions in §7.3.
