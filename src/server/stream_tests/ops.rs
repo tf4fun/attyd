@@ -236,6 +236,23 @@ impl Bench {
         .await
     }
 
+    /// An operation write whose ID the client chose (protocol §6.5).
+    async fn op_with_id(
+        &self,
+        scope: &str,
+        expect: &Value,
+        id: &str,
+        kind: &str,
+        args: Value,
+    ) -> (StatusCode, Value) {
+        self.call(
+            Method::POST,
+            &ops_path(scope),
+            Some(json!({ "id": id, "expect": expect, "kind": kind, "args": args })),
+        )
+        .await
+    }
+
     /// The same write, sent from a task: for `create`, `fork` and `list`,
     /// whose response waits for the operation's end.
     fn spawn_op(

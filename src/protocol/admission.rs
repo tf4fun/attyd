@@ -18,6 +18,9 @@ use super::publish::Publisher;
 /// `POST /api/v2/scopes/{scope}/ops` (protocol §6.1).
 #[derive(Debug, Clone)]
 pub(crate) struct OpWrite {
+    /// The ID the client chose for the operation it starts (§6.5); the bridge
+    /// names the operation when the write has none.
+    pub id: Option<String>,
     pub expect: String,
     pub kind: String,
     pub args: Value,
@@ -28,7 +31,17 @@ pub(crate) struct OpWrite {
 pub(crate) enum Admitted {
     /// Starts an operation of `kind` with `input` (its `args`). A prompt's
     /// `input` is its blocks with every attachment reference resolved.
-    Start { kind: OperationKind, input: Value },
+    Start {
+        kind: OperationKind,
+        input: Value,
+        /// The ID the client chose.
+        id: Option<String>,
+        /// The operation it replaces: the write's `expect`.
+        after: String,
+    },
+    /// A write whose ID is the scope's current operation: the client repeats
+    /// a write whose answer it did not get. Nothing starts (§6.6).
+    Repeat { op: String },
     /// `cancel` of the running operation `op` of `kind`.
     Cancel { op: String, kind: OperationKind },
     /// `answer` of the running operation `op`: one validated answer for each
@@ -44,6 +57,15 @@ pub(crate) enum Admitted {
 pub(crate) enum Answer {
     Permission(RequestPermissionOutcome),
     Elicitation(CreateElicitationResponse),
+}
+
+/// Whether `id` has the form of an operation ID: 128 bits in unpadded
+/// base64url, 22 characters (protocol §6.5).
+pub(crate) fn valid_operation_id(id: &str) -> bool {
+    id.len() == 22
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 fn refuse(code: ErrorCode, message: impl Into<String>) -> ProtocolError {
@@ -85,10 +107,25 @@ pub(crate) fn admit(
             write.kind
         )));
     }
+    if let Some(id) = &write.id
+        && !valid_operation_id(id)
+    {
+        return Err(invalid(format!(
+            "an operation ID is 22 characters of base64url, not {id:?}"
+        )));
+    }
     let live = publisher
         .live(scope)
         .ok_or_else(|| refuse(ErrorCode::NotFound, format!("{scope} is not held")))?;
     let op = &live["op"];
+    // A write whose ID is the current operation's repeats one whose answer was
+    // lost: accepted again, before `expect` is judged (protocol §6.4, §6.6).
+    if started.is_some()
+        && let Some(id) = &write.id
+        && op["id"].as_str() == Some(id.as_str())
+    {
+        return Ok(Admitted::Repeat { op: id.clone() });
+    }
     if op["id"].as_str() != Some(write.expect.as_str()) {
         return Err(refuse(
             ErrorCode::Stale,
@@ -167,7 +204,12 @@ pub(crate) fn admit(
         .filter(|initialize| !initialize.is_null());
     capability(initialize, kind)?;
     let input = arguments(publisher, initialize, scope, live, kind, &write.args)?;
-    Ok(Admitted::Start { kind, input })
+    Ok(Admitted::Start {
+        kind,
+        input,
+        id: write.id.clone(),
+        after: write.expect.clone(),
+    })
 }
 
 /// The Agent capability a kind needs (protocol §6.2). While the Agent never

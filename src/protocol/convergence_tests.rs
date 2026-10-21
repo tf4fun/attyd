@@ -1005,6 +1005,38 @@ fn terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release()
 }
 
 #[test]
+fn an_installed_operation_remembers_its_scope_and_the_operation_it_replaced() {
+    let mut gate = Gate::new();
+    gate.open("s", json!({ "sessionId": "s" }));
+    let open = gate.live("session/s")["op"]["id"].as_str().unwrap().to_string();
+    let scope = Scope::Session("s".into());
+    let id = gate
+        .registry
+        .install_operation_as(
+            &scope,
+            OperationKind::SetMode,
+            json!({ "modeId": "plan" }),
+            Some("Zm9yLXRoZS1jbGllbnQtMQ".into()),
+            Some(open.clone()),
+        )
+        .unwrap();
+    assert_eq!(id, "Zm9yLXRoZS1jbGllbnQtMQ");
+    let slot = gate.registry.shown_slot(&scope).unwrap();
+    assert_eq!(slot.after.as_deref(), Some(open.as_str()));
+    assert_eq!(slot.scope.as_deref(), Some("session/s"));
+
+    // Without a client ID the bridge names the operation.
+    let mut other = Gate::new();
+    other.open("t", json!({ "sessionId": "t" }));
+    let scope = Scope::Session("t".into());
+    let generated = other
+        .registry
+        .install_operation_as(&scope, OperationKind::SetMode, json!({}), None, None)
+        .unwrap();
+    assert_eq!(generated.len(), 22);
+}
+
+#[test]
 fn url_flows_appear_on_accept_and_leave_on_completion() {
     let mut gate = Gate::new();
     gate.open("s", json!({ "sessionId": "s" }));

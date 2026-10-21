@@ -560,6 +560,7 @@ impl Peer {
             .send(BridgeInput::Operation {
                 scope,
                 write: OpWrite {
+                    id: None,
                     expect,
                     kind: kind.to_string(),
                     args,

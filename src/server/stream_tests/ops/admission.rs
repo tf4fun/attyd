@@ -334,6 +334,94 @@ async fn a_global_write_is_refused_while_a_fork_runs() {
     bench.create(&mut link, "next", json!({})).await;
 }
 
+/// 128 random bits in unpadded base64url (protocol §6.5): 22 characters.
+const CLIENT_ID: &str = "Zm9yLXRoZS1jbGllbnQtMQ";
+const OTHER_ID: &str = "Zm9yLXRoZS1jbGllbnQtMg";
+
+#[tokio::test]
+async fn a_write_with_a_client_id_is_installed_under_that_id() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create(&mut link, "s", json!({})).await;
+    let open = bench.expect_of("session/s").await;
+    let (status, body) = bench
+        .op_with_id("session/s", &open, CLIENT_ID, "prompt", json!({"prompt": [text("hi")]}))
+        .await;
+    assert_eq!(assert_accepted(status, &body, "a prompt with an ID"), CLIENT_ID);
+    let request = link.request("session/prompt").await;
+    assert_eq!(bench.expect_of("session/s").await, CLIENT_ID);
+    link.reply(&request, json!({"stopReason": "end_turn"})).await;
+}
+
+#[tokio::test]
+async fn a_malformed_client_id_is_refused_before_anything_happens() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create(&mut link, "s", json!({})).await;
+    let open = bench.expect_of("session/s").await;
+    let before = bench.document("session/s").await;
+    for id in ["", "short", "Zm9yLXRoZS1jbGllbnQtMQ==", "has spaces in it 22chr", "Zm9yLXRoZS1jbGllbnQtMQx"] {
+        let (status, body) = bench
+            .op_with_id("session/s", &open, id, "prompt", json!({"prompt": [text("hi")]}))
+            .await;
+        invalid(status, &body, &format!("the ID {id:?}"));
+    }
+    link.quiet(QUIET).await;
+    assert_eq!(bench.document("session/s").await, before);
+}
+
+#[tokio::test]
+async fn a_repeated_write_is_accepted_again_and_does_nothing_more() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create(&mut link, "s", json!({})).await;
+    let open = bench.expect_of("session/s").await;
+    let write = json!({"prompt": [text("once")]});
+    let (status, body) = bench
+        .op_with_id("session/s", &open, CLIENT_ID, "prompt", write.clone())
+        .await;
+    assert_accepted(status, &body, "the write");
+    let request = link.request("session/prompt").await;
+
+    // The answer was lost: the client sends the same write again while it
+    // runs, and again once it has ended.
+    let (status, body) = bench
+        .op_with_id("session/s", &open, CLIENT_ID, "prompt", write.clone())
+        .await;
+    assert_eq!(assert_accepted(status, &body, "a repeat while it runs"), CLIENT_ID);
+    link.reply(&request, json!({"stopReason": "end_turn"})).await;
+    let mut watch = bench.watch(&scopes(&["session/s"])).await;
+    watch
+        .until_op("session/s", &json!(CLIENT_ID), "completed")
+        .await;
+    let (status, body) = bench
+        .op_with_id("session/s", &open, CLIENT_ID, "prompt", write.clone())
+        .await;
+    assert_eq!(assert_accepted(status, &body, "a repeat after it ended"), CLIENT_ID);
+    link.quiet(QUIET).await;
+}
+
+#[tokio::test]
+async fn a_write_that_is_not_a_repeat_is_judged_by_expect_and_status_as_before() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create(&mut link, "s", json!({})).await;
+    let open = bench.expect_of("session/s").await;
+    let (status, body) = bench
+        .op_with_id("session/s", &open, CLIENT_ID, "prompt", json!({"prompt": [text("a")]}))
+        .await;
+    assert_accepted(status, &body, "the first write");
+    let request = link.request("session/prompt").await;
+
+    // Another ID on the replaced `expect` is stale; on the current one the
+    // running operation refuses it.
+    let (status, body) = bench
+        .op_with_id("session/s", &open, OTHER_ID, "prompt", json!({"prompt": [text("b")]}))
+        .await;
+    stale(status, &body, "another ID on the replaced expect");
+    let (status, body) = bench
+        .op_with_id("session/s", &json!(CLIENT_ID), OTHER_ID, "prompt", json!({"prompt": [text("b")]}))
+        .await;
+    not_allowed(status, &body, "another ID while the first runs");
+    link.reply(&request, json!({"stopReason": "end_turn"})).await;
+}
+
 #[tokio::test]
 async fn a_list_needs_the_current_ended_catalog_op() {
     let (bench, mut link) = Bench::ws(json!({"sessionCapabilities": {"list": {}}})).await;

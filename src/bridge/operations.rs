@@ -27,6 +27,8 @@ pub(super) enum Write {
     /// A `cancel` or `answer` of the running operation, which the caller
     /// applies under the same guard (`cancel`, `answer`).
     Running(Admitted),
+    /// A repeat of a write already admitted: accepted again, nothing starts.
+    Repeat(OperationAdmission),
 }
 
 /// Admits `write` in `scope`; a write that starts an operation installs it.
@@ -39,15 +41,28 @@ pub(super) fn admit(
         let published = state.protocol.publication.lock();
         admission::admit(&published.publisher, scope, write)?
     };
-    let Admitted::Start { kind, input } = admitted else {
+    if let Admitted::Repeat { op } = admitted {
+        return Ok(Write::Repeat(OperationAdmission { op, end: None }));
+    }
+    let Admitted::Start {
+        kind,
+        input,
+        id,
+        after,
+    } = admitted
+    else {
         return Ok(Write::Running(admitted));
     };
     let installed = match (kind, scope) {
         (OpKind::Prompt, OpScope::Session(session_id)) => {
             let blocks = input["prompt"].as_array().cloned().unwrap_or_default();
-            state.sessions.install_prompt(session_id, &blocks)
+            state
+                .sessions
+                .install_prompt_as(session_id, &blocks, id, Some(after))
         }
-        _ => state.sessions.install_operation(scope, kind, input.clone()),
+        _ => state
+            .sessions
+            .install_operation_as(scope, kind, input.clone(), id, Some(after)),
     };
     let op = installed.map_err(|error| match error {
         InstallError::NotFound => {
@@ -203,7 +218,9 @@ pub(super) fn apply(
     admitted: Admitted,
 ) -> Result<OperationAdmission, ProtocolError> {
     let op = match admitted {
-        Admitted::Start { .. } => unreachable!("a started operation is installed by admit"),
+        Admitted::Start { .. } | Admitted::Repeat { .. } => {
+            unreachable!("a started operation is installed by admit")
+        }
         Admitted::Answer { op, answers } => {
             let deliveries = deliveries(state, answers)?;
             deliver(state, sink, deliveries);

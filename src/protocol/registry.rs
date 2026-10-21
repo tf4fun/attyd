@@ -184,7 +184,25 @@ impl SessionRegistry {
         kind: OperationKind,
         input: Value,
     ) -> Result<String, InstallError> {
-        self.install(scope, OpSlot::running(kind, input))
+        self.install_operation_as(scope, kind, input, None, None)
+    }
+
+    /// Installs a running operation under `id`, the one its client chose
+    /// (protocol §6.5), or a generated one; `after` is the operation it replaces.
+    pub(crate) fn install_operation_as(
+        &mut self,
+        scope: &Scope,
+        kind: OperationKind,
+        input: Value,
+        id: Option<String>,
+        after: Option<String>,
+    ) -> Result<String, InstallError> {
+        let mut slot = OpSlot::running(kind, input);
+        if let Some(id) = id {
+            slot.id = id;
+        }
+        slot.after = after;
+        self.install(scope, slot)
     }
 
     /// Installs a running prompt with its normalized input.
@@ -193,14 +211,27 @@ impl SessionRegistry {
         session_id: &str,
         prompt: &[Value],
     ) -> Result<String, InstallError> {
-        self.install(
-            &Scope::Session(session_id.to_string()),
-            OpSlot::prompt(prompt),
-        )
+        self.install_prompt_as(session_id, prompt, None, None)
     }
 
-    fn install(&mut self, scope: &Scope, slot: OpSlot) -> Result<String, InstallError> {
+    pub(crate) fn install_prompt_as(
+        &mut self,
+        session_id: &str,
+        prompt: &[Value],
+        id: Option<String>,
+        after: Option<String>,
+    ) -> Result<String, InstallError> {
+        let mut slot = OpSlot::prompt(prompt);
+        if let Some(id) = id {
+            slot.id = id;
+        }
+        slot.after = after;
+        self.install(&Scope::Session(session_id.to_string()), slot)
+    }
+
+    fn install(&mut self, scope: &Scope, mut slot: OpSlot) -> Result<String, InstallError> {
         self.scope_free(scope)?;
+        slot.scope = Some(scope.to_string());
         let occupies = match (scope, slot.kind) {
             (Scope::Global, OperationKind::Delete) => {
                 slot.input["sessionId"].as_str().map(String::from)

@@ -1880,6 +1880,10 @@ where
                                 let _ = reply.send(applied);
                                 continue;
                             }
+                            Ok(operations::Write::Repeat(admission)) => {
+                                let _ = reply.send(Ok(admission));
+                                continue;
+                            }
                             Ok(operations::Write::Start(admission, command)) => {
                                 let _ = reply.send(Ok(admission));
                                 command
@@ -6114,6 +6118,7 @@ mod tests {
                     .send(BridgeInput::Operation {
                         scope,
                         write: crate::protocol::admission::OpWrite {
+                            id: None,
                             expect,
                             kind: "prompt".into(),
                             args: json!({"prompt": [{
@@ -6270,6 +6275,7 @@ mod tests {
                 .send(BridgeInput::Operation {
                     scope: OpScope::parse(scope).unwrap(),
                     write: crate::protocol::admission::OpWrite {
+                        id: None,
                         expect: self.live(scope)["op"]["id"].as_str().unwrap().to_string(),
                         kind: kind.into(),
                         args,
