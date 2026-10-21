@@ -303,7 +303,7 @@ Hashes serve alignment only. Admission never compares them.
 ### 3.5 History status
 
 Defined by [memory model §6](bridge-memory-model.md#6-history-knowledge-and-materialization),
-including the fork proposal; the table below is its wire form.
+including fork history; the table below is its wire form, and its fork paragraph is superseded by memory model §6.3.
 
 | `live.history` | The log holds | Set by |
 | --- | --- | --- |

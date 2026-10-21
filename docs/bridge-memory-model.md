@@ -76,25 +76,33 @@ interface MessageEntry {
   kind: "message";
   role: "user" | "agent" | "thought";   // user_message_chunk, agent_message_chunk, agent_thought_chunk
   messageId?: string;                   // first present messageId of its chunks
-  chunks: { content: ContentBlock; _meta?: unknown }[];
+  chunks: Chunk[];
+}
+
+interface Chunk {
+  content: ContentBlock;
+  _meta?: unknown;          // ContentChunk._meta
+  notificationMeta?: unknown;   // SessionNotification._meta of the chunk's notification (§3.5)
 }
 
 interface ToolEntry {
   kind: "tool";
-  call: ToolCallUpdate;   // reduced sparse state; every field but toolCallId may be absent
+  call: ToolCallUpdate;     // reduced sparse state; every field but toolCallId may be absent
+  notificationMeta?: unknown;   // §3.5
 }
 
 type PlanEntry =
-  | { kind: "plan"; legacy: Plan }                         // `plan` (no ID), §3.4
-  | { kind: "plan"; update: PlanUpdate | PlanRemoved };    // by planId
+  | { kind: "plan"; legacy: Plan; notificationMeta?: unknown }                       // `plan` (no ID), §3.4
+  | { kind: "plan"; update: PlanUpdate | PlanRemoved; notificationMeta?: unknown };  // by planId
 
 interface CompactionEntry {
   kind: "compaction";
   compactionId: string;
   status: CompactionStatus;
-  summary: { content: ContentBlock; _meta?: unknown }[];
+  summary: Chunk[];
   error?: string;
   _meta?: unknown;
+  notificationMeta?: unknown;   // §3.5
 }
 ```
 
@@ -127,8 +135,8 @@ Three rules decide every timeline update.
    A compaction's `summary`, `error` and `_meta` are three-state: absent keeps, `null`
    clears, a value replaces. Nothing is deep-merged.
 3. **Fragments.** A text chunk is appended to the previous chunk of its entry when that
-   chunk is text and all other fields (annotations, block `_meta`, chunk `_meta`) are
-   equal; otherwise it is a new chunk. Equal content therefore gives equal entries
+   chunk is text and all other fields (annotations, block `_meta`, chunk `_meta`,
+   `notificationMeta`) are equal; otherwise it is a new chunk. Equal content therefore gives equal entries
    however it was split into chunks.
 
 | ACP update | Reduction |
@@ -150,7 +158,10 @@ Further rules:
 - Updates are accepted whether or not a prompt runs (D5). An idle update is reduced by
   the same rules; there is no separate tail.
 - An update the bridge's semantic validation rejects is dropped and reaches no entry.
-  An update for a session the bridge does not hold is dropped.
+- An update for a session that is being installed is staged with that installation and
+  reduced in arrival order when it succeeds (§9); for example
+  `session/new` → `agent_message_chunk(S)` → response `S` keeps the chunk. An update for
+  a session neither held nor being installed is dropped.
 
 ### 3.3 Determinism
 
@@ -168,6 +179,20 @@ one. The current legacy plan is the one of the latest turn that has one. Older t
 entries are records and are never updated. Zed keeps only one session-level legacy
 plan; attyd keeps the per-turn record so that history shows how the plan evolved.
 
+### 3.5 Notification envelope metadata
+
+`SessionNotification._meta` qualifies one update, not the entity as a whole, and is
+kept without a notification log:
+
+- **chunks** (message and compaction summary): on the chunk the notification produced,
+  as `notificationMeta`; rule 3 joins text only when it is equal.
+- **tool, plan and compaction entries**: on the entry, by the patch rule: absent or
+  `null` keeps, a value replaces. Only the latest envelope `_meta` that set a value is
+  kept.
+- **control updates**: with the control they set (§7).
+- A permission's `toolCall` has no envelope; the request's `_meta` stays with the
+  interaction (§8.2).
+
 ## 4. Live-only additions
 
 ### 4.1 The sent prompt
@@ -177,16 +202,27 @@ one message entry, role `user`, no `messageId` (the pinned `PromptRequest` has n
 one chunk per prompt block, with an internal flag `sent` (not part of content).
 
 Some Agents echo the prompt as `user_message_chunk`s; others do not. The **echo rule**
-keeps one entry either way (after Zed, `handle_session_update`, `UserMessageChunk`):
+keeps one entry when the echo is exact (after Zed, `handle_session_update`,
+`UserMessageChunk`, which also checks ID compatibility):
 
-- While the last entry is the `sent` user message, an incoming user chunk whose
-  content equals the next not-yet-matched prompt block is an echo: it adds no chunk; if
-  the entry has no `messageId`, it takes the chunk's.
-- Any other user chunk is reduced normally. Following Zed, a chunk with a `messageId`
-  does not join a `sent` entry that still has none and did not match; it starts a new
-  user entry.
-- The `sent` flag ends when every block was matched or another entry follows.
+- While the last entry is the `sent` user message, an incoming user chunk is an echo
+  when its content equals the next not-yet-matched prompt block **and** its
+  `messageId` is compatible with the entry's (the entry has none yet, or they are
+  equal). An echo adds no chunk. It completes the matched chunk with what the echo
+  carries: the entry takes the echo's `messageId` if it has none, and the matched
+  chunk takes the echo's chunk `_meta` and `notificationMeta`.
+- Any other user chunk is not an echo. It ends `sent` and starts a new user entry; it
+  never joins the `sent` entry, so a mismatched echo cannot corrupt the sent text.
+- `sent` also ends when every block was matched or another entry follows.
 
+Matching is exact and per block; there is no fuzzy or semantic matching. So:
+
+- sending `[A, B]` and receiving `A (u1)`, `B (u2)` matches `A`; `B` has an
+  incompatible ID and starts a second user entry `u2` with `B`;
+- an echo split differently from the sent blocks (`"hello"` echoed as `"hel"`, `"lo"`)
+  does not match and yields a second user entry `"hello"`.
+
+Both are visible duplicates, not lost or merged content; §4.3 states the boundary.
 An Agent that replays a different form of the prompt in a later load (for example a
 resource as text) produces a different user entry in that load. That is expected; the
 load is authoritative (§6.2).
@@ -213,10 +249,21 @@ interface Prompt {
 
 ### 4.3 Equivalence requirement
 
-For any ACP content, the entries built from the live path (sent prompt, optional echo,
-updates) and from a load replay of the same content are equal, ignoring `prompts` and
-the internal `sent` flag. This is a required test (§10), and the reason no structure
-may depend on which path produced it.
+Live and replay use one structure and one reducer for every Agent. Their **entries are
+equal**, ignoring `prompts` and the internal `sent` flag, when the Agent's replay of
+each prompt is one user message whose chunks equal the sent blocks one to one, and live
+it either:
+
+- echoes the prompt exactly that way (§4.1), or
+- does not echo, and its replay of the prompt carries no `messageId` and no chunk or
+  envelope `_meta`.
+
+Outside that boundary (a differently split or normalized echo, an ID or metadata only
+the replay has) the two may differ: live may hold a duplicate user entry, or a user
+entry without the replay's ID. That is accepted; a load replaces live entries anyway
+(§6.2). All non-user content (agent and thought messages, tools, plans, compactions)
+is equal under the same update sequence without condition. These are required tests
+(§10).
 
 ## 5. Derived turns
 
@@ -236,8 +283,8 @@ their own in memory.
 | `history` | Meaning | Set by |
 | --- | --- | --- |
 | `unknown` | the bridge holds no history for the session | a session that is being opened, until its load or resume ends |
-| `complete` | `entries` start at the session's beginning | `session/new` (empty); a successful `session/load` ("the entire conversation history", `v1/agent.rs:4845–4848`) |
-| `partial` | `entries` may lack what came before | `session/resume` of a session whose history was unknown ("without returning previous messages", `v1/agent.rs:1277`); `session/fork` (§6.3) |
+| `complete` | `entries` start at the session's beginning | `session/new` (empty); a successful `session/load` ("the entire conversation history", `v1/agent.rs:4845–4848`), including a fork target's (§6.3) |
+| `partial` | `entries` may lack what came before | `session/resume` of a session whose history was unknown ("without returning previous messages", `v1/agent.rs:1277`); a fork without load (§6.3) |
 
 An empty `complete` history and an `unknown` one are different and are never confused
 (D9). New content after a resume is appended to a `partial` history as usual.
@@ -247,18 +294,38 @@ An empty `complete` history and an `unknown` one are different and are never con
 A load reduces the replay with the §3 reducer into a **candidate** session structure,
 private to that attempt. On a successful response the candidate replaces `entries`,
 clears `prompts` and sets `complete`, in one step. On failure the candidate is
-discarded and the installed state is unchanged. The bridge never loads a session it
-holds with a known history, and performs no load after a prompt: live content is
-already in memory by §4.
+discarded and the installed state is unchanged.
 
-### 6.3 Fork (proposal)
+A load is needed whenever the session is not attached on the **current** Agent
+connection: a cold open, and reattaching a held session after the connection was
+replaced. To reattach, the bridge uses `session/load` when advertised (the candidate
+replaces the retained entries on success; on failure they stay unchanged and the
+session stays unattached), otherwise `session/resume`, which keeps the retained
+entries and their `history`. This is the existing reattach order.
+The bridge never loads a session already attached on the current connection, with one
+exception: a fork target, whose response attaches it without history (§6.3). It
+performs no load after a prompt: live content is already in memory by §4.
+
+### 6.3 Fork
 
 `session/fork` "creates a new session based on the context of an existing one"
-(`v1/agent.rs:1105–1108`); it promises no replay. Proposal: the target starts with a
-copy of the source's `entries` at admission (without `prompts`), `history: partial`
-(inherited, not confirmed by the Agent). Updates the Agent sends for the target before
-or after the response are reduced into it by §3. A later cold reopen of the target uses
-`session/load` like any session (§6.2) and becomes `complete`. Resources are not copied.
+(`v1/agent.rs:1105–1108`). It promises no transcript or ID inheritance, and tool,
+plan and compaction IDs are unique only within their own session. Copying the source's
+entries into the target would let a target tool `"1"` patch an inherited source tool
+`"1"`, and a target replay of source messages would append them twice. So the target
+never inherits source entries:
+
+- **Agent advertises load:** after the fork response the bridge loads the target
+  (§6.2); `history` is `unknown` until it ends. On success its entries are what the
+  Agent replays, `history: complete`. On failure the target keeps what the Agent sent
+  for it, as below, `history: partial`.
+- **Otherwise:** the target holds only what the Agent sent for it, staged during the
+  fork and reduced on installation (§9), then later updates; `history: partial`.
+
+No resource of the source is copied: execution handles (terminals, responders) belong
+to their session, and the target's entries reference only the target's own resources.
+This changes the earlier convention that a fork without load copies the source log
+([release parity](release-parity.md#session-operations-and-settings)).
 
 ### 6.4 Release
 
@@ -287,8 +354,10 @@ through §6.2 (load) or §6.1 (resume, `partial`); no client state restores it.
 | successful `session/set_mode` | sets `modes.currentModeId` to the requested ID |
 | successful `session/set_config_option` | replaces `configOptions` with the response's |
 
-Each control keeps the `_meta` of the latest notification or response that set it,
-next to the value it qualifies (D12). No control-event history is kept. Clients prefer
+Each control keeps, next to the value it qualifies (D12), the source metadata of the
+latest notification or response that set it: the update's own `_meta` (for example
+`CurrentModeUpdate._meta`, the response `modes._meta`) and the envelope's
+`SessionNotification._meta` (§3.5), separately. No control-event history is kept. Clients prefer
 `configOptions` over legacy `modes` when it is non-null.
 
 ## 8. Resources
@@ -351,8 +420,11 @@ keep it needed.
 - **One installation at a time.** `create` and `fork` both use the global operation
   slot, so at most one session is being installed at any moment. A resource naming a
   session ID the bridge does not hold yet, arriving while an installation runs, belongs
-  to that installation: it is shown there and moves into the session when installed, or
-  is cancelled if installation fails. With no installation running it is refused. This
+  to that installation: an interaction or URL flow is shown there and moves into the
+  session when installed, or is cancelled if installation fails; a timeline or control
+  notification is staged and reduced into the new session in arrival order on success,
+  or discarded on failure (§3.2, §7). With no installation running it is refused or
+  dropped. This
   closes the unknown-session attribution question of audit §9.3 without a provisional
   owner scheme.
 - **Generations.** Each installation of a session ID (new, load, resume, fork) gets a
@@ -376,6 +448,19 @@ input, not computed by the reducer under test. This model adds:
   with several IDs, mixed blocks, tools with sparse updates, plans, compactions,
   `_meta`): run it live (with and without an echo) and as a load replay; the entries are
   equal and equal to the fixture's expected entries.
+- **Echo boundary (§4.1).** Exact echo merges and adopts ID and chunk metadata;
+  `[A, B]` echoed as `A (u1)`, `B (u2)` gives two user entries; a split echo gives a
+  duplicate entry, never concatenated text.
+- **Envelope metadata (§3.5).** Chunk, entity and control envelope `_meta` are retained
+  at the stated position, live and replayed.
+- **Pre-installation content.** `session/new` → chunk → response keeps the chunk; a
+  failed creation discards it.
+- **Reattach.** After the Agent connection is replaced, a load-only Agent gets
+  `session/load` for a held session with known history; failure keeps the retained
+  entries.
+- **Fork.** With load: target entries come from its replay. Without load: only target
+  notifications, `partial`; a target tool reusing a source tool ID does not touch any
+  source content.
 - **Idle and late updates.** An update after the prompt's response, or between prompts,
   changes the existing entry by §3.2; no new structure appears.
 - **Load atomicity.** A failed load leaves the installed entries unchanged; a successful
@@ -404,7 +489,4 @@ interpretation are not adopted.
 
 ## 12. Open items
 
-- §6.3 fork history is a proposal to review.
-- The echo rule (§4.1) compares content blocks for equality; an Agent that echoes a
-  normalized form of a block yields a second user entry live. Decide whether that needs
-  a looser match after testing the supported Agents.
+- Whether a looser echo match is needed after testing the supported Agents (§4.1).
