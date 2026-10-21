@@ -316,3 +316,81 @@ fn a_finished_operation_keeps_its_result_or_error() {
     assert_eq!(failed["error"]["code"], "unavailable");
     assert!(failed.get("result").is_none());
 }
+
+// --- interactions and URL flows (§4.4, §4.6) ------------------------------------------
+
+fn pending_permission(registry: &mut SessionRegistry, id: &str) {
+    registry
+        .bind_interaction(id, Scope::Session("s".into()));
+    registry
+        .upsert_permission("epoch", "s", id, json!({ "sessionId": "s", "toolCall": { "toolCallId": "t" } }))
+        .unwrap();
+}
+
+#[test]
+fn pending_interactions_are_a_member_of_live_beside_the_operation() {
+    let mut registry = registry();
+    pending_permission(&mut registry, "p1");
+    let live = scope_live(&registry, &Scope::Session("s".into()), &agent(), 0).unwrap();
+    assert_eq!(
+        live["interactions"]["p1"],
+        json!({ "interactionId": "p1", "kind": "permission",
+                "request": { "sessionId": "s", "toolCall": { "toolCallId": "t" } } })
+    );
+    assert!(live["op"].get("interactions").is_none());
+    assert_eq!(live["urlFlows"], json!({}));
+}
+
+#[test]
+fn a_session_live_document_has_every_member_of_the_protocol() {
+    let live = scope_live(&registry(), &Scope::Session("s".into()), &agent(), 0).unwrap();
+    let mut members: Vec<&str> = live.as_object().unwrap().keys().map(String::as_str).collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        ["closing", "controls", "cwd", "interactions", "op", "sessionId", "terminals", "urlFlows"]
+    );
+    assert_eq!(live["op"]["kind"], "open");
+}
+
+#[test]
+fn global_and_catalog_have_the_scope_members_too() {
+    let registry = registry();
+    let global = scope_live(&registry, &Scope::Global, &agent(), 4).unwrap();
+    let mut members: Vec<&str> = global.as_object().unwrap().keys().map(String::as_str).collect();
+    members.sort_unstable();
+    assert_eq!(members, ["agent", "interactions", "op", "sessions", "terminals", "urlFlows"]);
+    assert_eq!(global["op"]["kind"], "none");
+
+    let catalog = scope_live(&registry, &Scope::Catalog, &agent(), 4).unwrap();
+    let mut members: Vec<&str> = catalog.as_object().unwrap().keys().map(String::as_str).collect();
+    members.sort_unstable();
+    assert_eq!(members, ["interactions", "op", "revision", "urlFlows"]);
+    assert_eq!(catalog["revision"], "4");
+}
+
+#[test]
+fn an_accepted_url_flow_waits_with_its_status() {
+    let mut registry = registry();
+    let scope = Scope::Session("s".into());
+    let request = json!({ "mode": "url", "elicitationId": "e", "url": "https://example.test" });
+    registry.bind_interaction("i1", scope.clone());
+    registry
+        .upsert_elicitation("epoch", Some("s"), "i1", request.clone())
+        .unwrap();
+    registry
+        .resolve_elicitation("epoch", Some("s"), "i1", Some("e"))
+        .unwrap();
+    let live = scope_live(&registry, &scope, &agent(), 0).unwrap();
+    assert_eq!(
+        live["urlFlows"],
+        json!({ "i1": { "interactionId": "i1", "elicitationId": "e", "request": request,
+                        "status": "waiting" } })
+    );
+    assert_eq!(live["interactions"], json!({}), "an accepted elicitation is no longer pending");
+}
+
+#[test]
+fn an_unknown_scope_has_no_live_document() {
+    assert_eq!(scope_live(&registry(), &Scope::Session("unknown".into()), &agent(), 0), None);
+}
