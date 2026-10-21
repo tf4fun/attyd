@@ -472,6 +472,28 @@ impl Peer {
         .await;
     }
 
+    /// A `session/update` whose notification carries its own `_meta`.
+    async fn update_with_meta(&mut self, session_id: &str, update: Value, meta: Value) {
+        self.send(json!({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": session_id, "update": update, "_meta": meta},
+        }))
+        .await;
+    }
+
+    /// The session's timeline entries, read from bridge memory (not from a
+    /// published document).
+    async fn timeline(&self, session_id: &str) -> Value {
+        let lock = self.lock();
+        let state = lock.lock().await;
+        let timeline = state
+            .sessions
+            .state(session_id)
+            .and_then(|session| session.timeline.as_ref())
+            .expect("the session's timeline is known");
+        serde_json::to_value(timeline.entries()).unwrap()
+    }
+
     async fn agent_request(&mut self, id: &str, method: &str, params: Value) {
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await;
@@ -1480,6 +1502,58 @@ async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
         json!({"prompt": [], "reply": [text("Forked session.")]}),
         "adjacent plain text blocks merge (protocol §3.2)"
     );
+    peer.settled().await;
+}
+
+/// The Agent's messages for a new session before the `session/new` response are
+/// its first history (#8): in bridge memory, with the notifications' own `_meta`.
+#[tokio::test]
+async fn a_new_sessions_early_messages_are_the_start_of_its_timeline() {
+    let mut peer = Peer::start(json!({})).await;
+    let (_, end) = peer
+        .start_op("global", "create", json!({"cwd": "/workspace"}))
+        .await;
+    let new = peer.request("session/new").await;
+    peer.update("early", chunk("welcome", text("Hello ")))
+        .await;
+    peer.update_with_meta(
+        "early",
+        chunk("welcome", text("there")),
+        json!({"trace": "t1"}),
+    )
+    .await;
+    peer.update(
+        "early",
+        json!({"sessionUpdate": "tool_call", "toolCallId": "t", "title": "Setup"}),
+    )
+    .await;
+    peer.reply(&new, json!({"sessionId": "early"})).await;
+    Peer::ended(end).await.unwrap();
+    peer.until("the created session is published", |peer| {
+        peer.has("session/early")
+    })
+    .await;
+    assert_eq!(
+        peer.timeline("early").await,
+        json!([
+            {"kind": "message", "role": "agent", "messageId": "welcome", "chunks": [
+                {"content": text("Hello ")},
+                {"content": text("there"), "notificationMeta": {"trace": "t1"}},
+            ]},
+            {"kind": "tool", "call": {
+                "toolCallId": "t", "title": "Setup", "kind": "other", "status": "pending",
+                "content": [], "locations": [],
+            }},
+        ])
+    );
+    peer.settled().await;
+}
+
+#[tokio::test]
+async fn a_new_session_without_early_messages_has_an_empty_known_timeline() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create("quiet", json!({})).await;
+    assert_eq!(peer.timeline("quiet").await, json!([]));
     peer.settled().await;
 }
 

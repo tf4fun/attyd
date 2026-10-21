@@ -597,6 +597,27 @@ fn serialized_value_len(value: &impl Serialize) -> usize {
 
 /// The conversation updates among a session's early notifications, bare as a
 /// replay gives them to `TurnLog::from_replay`.
+/// The session timeline reduced from notifications as the Agent sent them,
+/// each with its own `_meta` (bridge memory model §3).
+fn timeline_from_notifications(
+    notifications: &[SessionNotification],
+) -> crate::protocol::timeline::Timeline {
+    let mut timeline = crate::protocol::timeline::Timeline::default();
+    for notification in notifications {
+        let Ok(update) = serde_json::to_value(&notification.update) else {
+            continue;
+        };
+        if is_conversation_update(&update) {
+            let envelope = notification
+                .meta
+                .as_ref()
+                .map(|meta| Value::Object(meta.clone()));
+            timeline.reduce(&update, envelope.as_ref());
+        }
+    }
+    timeline
+}
+
 fn conversation_updates(updates: &[SessionNotification]) -> Vec<Value> {
     updates
         .iter()
@@ -3006,6 +3027,10 @@ async fn handle_command_inner(
                     // session's first history (#8).
                     session_mirror(&mut state)
                         .replace_session_log(&session_id, &conversation_updates(&early_updates));
+                    session_mirror(&mut state).replace_session_timeline(
+                        &session_id,
+                        timeline_from_notifications(&early_updates),
+                    );
                     state.sessions.complete_scope_operation(
                         &OpScope::Global,
                         OpKind::Create,
