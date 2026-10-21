@@ -74,16 +74,7 @@ async fn create_fork_and_list_responses_outlive_the_json_deadline() {
         .await;
     let create = watch.live("global")["op"]["id"].clone();
 
-    let expect = watch.live("session/s")["op"]["id"].clone();
-    let forked = untimed_op(&bench, "session/s", &expect, "fork", json!({}));
-    let fork_request = link.request("session/fork").await;
-    watch
-        .until_live("session/s", "the fork runs", |live| {
-            live["op"]["kind"] == "fork" && live["op"]["status"] == "running"
-        })
-        .await;
-    let fork = watch.live("session/s")["op"]["id"].clone();
-
+    // The catalog is its own scope: a list runs beside the create.
     let expect = watch.live("catalog")["op"]["id"].clone();
     let listed = untimed_op(&bench, "catalog", &expect, "list", json!({}));
     let list_request = link.request("session/list").await;
@@ -108,7 +99,7 @@ async fn create_fork_and_list_responses_outlive_the_json_deadline() {
     tokio::time::advance(PAST_THE_DEADLINE).await;
     tokio::time::resume();
     link.quiet(QUIET).await;
-    for (what, response) in [("create", &created), ("fork", &forked), ("list", &listed)] {
+    for (what, response) in [("create", &created), ("list", &listed)] {
         assert!(
             !response.is_finished(),
             "the {what} response is still waiting for its operation"
@@ -128,7 +119,7 @@ async fn create_fork_and_list_responses_outlive_the_json_deadline() {
         "accept"
     );
     // The list settles first, so its catalog revision check does not race
-    // the create and fork that follow.
+    // the create that follows.
     link.reply(&list_request, json!({"sessions": [], "nextCursor": null}))
         .await;
     let listed = finished("list", listed, &list).await;
@@ -137,18 +128,38 @@ async fn create_fork_and_list_responses_outlive_the_json_deadline() {
     assert!(listed["revision"].is_string(), "{listed}");
     watch.until_op("catalog", &list, "completed").await;
     assert!(
-        !created.is_finished() && !forked.is_finished(),
-        "the create and fork responses still wait for their operations"
+        !created.is_finished(),
+        "the create response still waits for its operation"
     );
 
-    link.reply(&fork_request, json!({"sessionId": "forked"}))
-        .await;
     link.reply(&new, json!({"sessionId": "created"})).await;
     let created = finished("create", created, &create).await;
     assert_eq!(created, json!({"sessionId": "created"}));
+    watch.until_op("global", &create, "completed").await;
+
+    // A fork installs a session too, so it starts once the create has ended
+    // (protocol §6.2), and its response outlives the deadline the same way.
+    let expect = watch.live("session/s")["op"]["id"].clone();
+    let forked = untimed_op(&bench, "session/s", &expect, "fork", json!({}));
+    let fork_request = link.request("session/fork").await;
+    watch
+        .until_live("session/s", "the fork runs", |live| {
+            live["op"]["kind"] == "fork" && live["op"]["status"] == "running"
+        })
+        .await;
+    let fork = watch.live("session/s")["op"]["id"].clone();
+    tokio::time::pause();
+    tokio::time::advance(PAST_THE_DEADLINE).await;
+    tokio::time::resume();
+    link.quiet(QUIET).await;
+    assert!(
+        !forked.is_finished(),
+        "the fork response is still waiting for its operation"
+    );
+    link.reply(&fork_request, json!({"sessionId": "forked"}))
+        .await;
     let forked = finished("fork", forked, &fork).await;
     assert_eq!(forked, json!({"sessionId": "forked"}));
-    watch.until_op("global", &create, "completed").await;
     watch.until_op("session/s", &fork, "completed").await;
     // The create/fork also change catalog. Its event may follow those
     // scopes' completion events; GET is only a target, never a repair of
