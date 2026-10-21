@@ -468,8 +468,11 @@ input, not computed by the reducer under test. This model adds:
   notifications, `partial`; a target tool reusing a source tool ID does not touch any
   source content.
 - **Sent text joining.** `[text("A"), text("B")]` sent with an exact per-block echo,
-  without an echo, and replayed all give one chunk `"AB"`; echo metadata that differs
-  between the blocks gives two chunks in all three.
+  without an echo, and replayed all give one chunk `"AB"`. Metadata that differs between
+  the blocks splits them into two chunks only on the paths that receive it: when it is
+  on the original prompt blocks, all three paths give two chunks; when only the echo
+  and the replay carry it, those two give two chunks and the path without an echo
+  keeps one `"AB"`.
 - **Idle and late updates.** An update after the prompt's response, or between prompts,
   changes the existing entry by §3.2; no new structure appears.
 - **Load atomicity.** A failed load leaves the installed entries unchanged; a successful
