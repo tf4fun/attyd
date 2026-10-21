@@ -194,6 +194,20 @@ impl Timeline {
         &self.prompts
     }
 
+    /// Whether a tool entry's content embeds the terminal (`ToolCallContent`
+    /// of type `terminal`): the output the entry shows is then content that
+    /// outlives the terminal's handle (memory model §8.3).
+    pub(crate) fn embeds_terminal(&self, terminal_id: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(&**entry, Entry::Tool(tool)
+                if tool.call.get("content").and_then(Value::as_array).is_some_and(|content| {
+                    content.iter().any(|item| {
+                        item["type"] == "terminal" && item["terminalId"] == terminal_id
+                    })
+                }))
+        })
+    }
+
     /// Reduces one `session/update` (`update` carries its `sessionUpdate` tag;
     /// `envelope` is the notification's `_meta`). Control updates and updates the
     /// bridge cannot reduce change nothing.

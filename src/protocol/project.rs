@@ -263,6 +263,7 @@ pub(crate) fn project_session(
             terminals: live
                 .terminals
                 .iter()
+                .chain(&live.frozen_terminals)
                 .map(|(terminal_id, value)| (terminal_id.clone(), terminal(terminal_id, value)))
                 .collect(),
         },

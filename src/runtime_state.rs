@@ -43,6 +43,10 @@ pub(crate) struct SessionLiveState {
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
+    /// Released terminals whose output a timeline entry still embeds: no
+    /// handle, only the frozen snapshot (memory model §8.3). Kept apart from
+    /// `terminals`, whose entries have a handle and make the session busy.
+    pub frozen_terminals: BTreeMap<String, Value>,
     resolved_permissions: VecDeque<String>,
     resolved_elicitations: VecDeque<String>,
     resolved_url_flows: VecDeque<String>,
@@ -357,6 +361,7 @@ impl SessionRegistry {
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
+                frozen_terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
                 resolved_url_flows: VecDeque::new(),
@@ -651,6 +656,7 @@ impl SessionRegistry {
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
+                frozen_terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
                 resolved_url_flows: VecDeque::new(),
@@ -1172,8 +1178,15 @@ impl SessionRegistry {
         terminal: Value,
     ) -> Result<TerminalUpsert, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
+        let terminal_id: String = terminal_id.into();
+        // Whether an entry embeds the terminal decides what its release keeps.
+        let embedded = terminal_released(&terminal)
+            && self
+                .sessions
+                .get(session_id)
+                .and_then(|entry| entry.state.timeline.as_ref())
+                .is_some_and(|timeline| timeline.embeds_terminal(&terminal_id));
         let session = self.require_live_mut(session_id)?;
-        let terminal_id = terminal_id.into();
         if session
             .released_terminals
             .iter()
@@ -1189,6 +1202,12 @@ impl SessionRegistry {
         };
         if terminal_released(&terminal) {
             session.terminals.remove(&terminal_id);
+            // The handle is gone; the output stays while content embeds it.
+            if embedded {
+                session
+                    .frozen_terminals
+                    .insert(terminal_id.clone(), materialized);
+            }
             remember_resolved_interaction(&mut session.released_terminals, &terminal_id);
         } else {
             session.terminals.insert(terminal_id.clone(), materialized);
