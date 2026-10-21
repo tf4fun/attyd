@@ -830,6 +830,107 @@ mod tests {
         );
     }
 
+    /// A prompt that streamed `partial` and then ended as `end` says.
+    fn prompt_with_partial_output(mirror: &mut SessionMirror) -> String {
+        load_initial(mirror, "session");
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        mirror
+            .append_turn_update("session", &operation, agent_update("partial", "m"))
+            .unwrap();
+        operation
+    }
+
+    fn assert_partial_output_kept(mirror: &SessionMirror) {
+        assert_eq!(
+            entries_from(mirror, 3),
+            json!([{ "kind": "message", "role": "agent", "messageId": "m",
+                     "chunks": [{ "content": text("partial") }] }]),
+            "content the Agent sent is not withdrawn by how the prompt ended"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_stop_reason_is_a_response_and_keeps_the_content() {
+        let mut mirror = mirror();
+        let operation = prompt_with_partial_output(&mut mirror);
+        mirror
+            .complete_turn("session", &operation, json!({ "stopReason": "cancelled" }))
+            .unwrap();
+        assert_partial_output_kept(&mirror);
+        assert_eq!(
+            prompts(&mirror),
+            json!([{ "entry": 2, "end": { "response": { "stopReason": "cancelled" } } }])
+        );
+    }
+
+    #[test]
+    fn an_agent_error_is_the_prompts_end_and_keeps_the_content() {
+        let mut mirror = mirror();
+        let operation = prompt_with_partial_output(&mut mirror);
+        mirror
+            .complete_turn(
+                "session",
+                &operation,
+                json!({ "error": { "code": -32603, "message": "boom" } }),
+            )
+            .unwrap();
+        assert_partial_output_kept(&mirror);
+        assert_eq!(
+            prompts(&mirror),
+            json!([{ "entry": 2, "end": { "error": { "code": -32603, "message": "boom" } } }])
+        );
+    }
+
+    #[test]
+    fn an_invalid_response_is_recorded_as_an_error_not_as_success() {
+        let mut mirror = mirror();
+        let operation = prompt_with_partial_output(&mut mirror);
+        mirror
+            .complete_turn(
+                "session",
+                &operation,
+                json!({ "invalidPromptResponse": "stopReason is missing" }),
+            )
+            .unwrap();
+        assert_partial_output_kept(&mirror);
+        assert_eq!(
+            prompts(&mirror),
+            json!([{ "entry": 2, "end": { "error": { "invalidPromptResponse": "stopReason is missing" } } }])
+        );
+    }
+
+    #[test]
+    fn a_lost_answer_is_interrupted_never_an_invented_stop_reason() {
+        let mut mirror = mirror();
+        let operation = prompt_with_partial_output(&mut mirror);
+        mirror
+            .block_turn("session", &operation, "transport closed")
+            .unwrap();
+        assert_partial_output_kept(&mirror);
+        assert_eq!(
+            prompts(&mirror),
+            json!([{ "entry": 2, "end": { "interrupted": true } }])
+        );
+    }
+
+    #[test]
+    fn blocking_after_the_response_does_not_replace_the_recorded_end() {
+        let mut mirror = mirror();
+        let operation = prompt_with_partial_output(&mut mirror);
+        mirror
+            .complete_turn("session", &operation, json!({ "stopReason": "end_turn" }))
+            .unwrap();
+        mirror
+            .block_turn("session", &operation, "commit failed")
+            .unwrap();
+        assert_eq!(
+            prompts(&mirror),
+            json!([{ "entry": 2, "end": { "response": { "stopReason": "end_turn" } } }])
+        );
+    }
+
     #[test]
     fn an_update_after_the_response_changes_its_entry_in_place() {
         let mut mirror = mirror();

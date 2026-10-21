@@ -39,6 +39,19 @@ pub(crate) struct TurnExecution {
     pub(crate) cancel_requested: bool,
 }
 
+/// How a turn's terminal value ends its prompt (memory model §4.2): the Agent's
+/// response, the Agent's error, or an answer the bridge could not accept, which
+/// is recorded as it is and never as a success.
+fn prompt_end(terminal: &Value) -> PromptEnd {
+    if let Some(error) = terminal.get("error") {
+        PromptEnd::Error(error.clone())
+    } else if terminal.get("invalidPromptResponse").is_some() {
+        PromptEnd::Error(terminal.clone())
+    } else {
+        PromptEnd::Response(terminal.clone())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionState {
@@ -313,7 +326,7 @@ impl SessionState {
             return Err(MirrorError::OperationMismatch);
         }
         if let Some(timeline) = self.timeline.as_mut() {
-            Arc::make_mut(timeline).end_prompt(PromptEnd::Response(terminal.clone()));
+            Arc::make_mut(timeline).end_prompt(prompt_end(&terminal));
         }
         let turn = self
             .active_turn
@@ -352,6 +365,11 @@ impl SessionState {
                 .is_none_or(|turn| turn.operation_id != operation_id)
         {
             return Err(MirrorError::OperationMismatch);
+        }
+        // No answer arrived: the outcome is unknown, never an invented stop
+        // reason (memory model §4.2). A recorded response stays.
+        if let Some(timeline) = self.timeline.as_mut() {
+            Arc::make_mut(timeline).end_prompt(PromptEnd::Interrupted(true));
         }
         self.phase = MirrorPhase::Blocked;
         self.sync_error = Some(message.into());
