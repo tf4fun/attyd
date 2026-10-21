@@ -7,7 +7,7 @@
 //! embeds) and whether a close is outstanding.
 use serde_json::{Value, json};
 
-use super::documents::AgentInfo;
+use super::documents::{AgentInfo, Scope};
 use super::project;
 use crate::runtime_state::{SessionLifecycle, SessionLiveState};
 use crate::session_registry::SessionRegistry;
@@ -94,6 +94,30 @@ pub(crate) fn catalog_live(registry: &SessionRegistry, revision: u64) -> Value {
     let catalog = serde_json::to_value(project::project_catalog(registry, revision))
         .expect("the catalog live document serializes");
     json!({ "revision": catalog["revision"] })
+}
+
+/// The operation `scope` shows (protocol §4.4): that of the scope whose
+/// operation occupies it, if any. Its `scope` is the one it was written to and
+/// its `after` the operation it replaced there; a scope's first operation
+/// replaced none. Pending interactions are not part of it.
+pub(crate) fn operation_doc(registry: &SessionRegistry, scope: &Scope) -> Option<Value> {
+    let slot = registry.shown_slot(scope)?;
+    let mut operation = json!({
+        "id": slot.id,
+        "scope": slot.scope.clone().unwrap_or_else(|| scope.to_string()),
+        "after": slot.after,
+        "kind": slot.kind,
+        "status": slot.status,
+        "input": slot.input,
+        "cancelRequested": slot.cancel_requested,
+    });
+    if let Some(result) = &slot.result {
+        operation["result"] = result.clone();
+    }
+    if let Some(error) = &slot.error {
+        operation["error"] = serde_json::to_value(error).expect("an error serializes");
+    }
+    Some(operation)
 }
 
 #[cfg(test)]
