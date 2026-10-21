@@ -360,7 +360,9 @@ async fn a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscript
 /// fork's source already shows its next load or has left the published scopes.
 #[tokio::test]
 async fn admitted_create_fork_and_list_keep_their_errors_when_the_agent_disconnects() {
-    for loadable in [false, true] {
+    // A create and a fork both install a session, one at a time (protocol §6.2):
+    // each runs beside a list, which is the catalog's own scope.
+    for (loadable, with_fork) in [(false, false), (false, true), (true, false), (true, true)] {
         let (bench, mut link) = Bench::ws(json!({
             "loadSession": loadable,
             "sessionCapabilities": {"fork": {}, "list": {}},
@@ -376,10 +378,14 @@ async fn admitted_create_fork_and_list_keep_their_errors_when_the_agent_disconne
             })
             .await;
 
+        let installing = if with_fork {
+            ("session/source", "fork", "session/fork", json!({}))
+        } else {
+            ("global", "create", "session/new", json!({"cwd": CWD}))
+        };
         let mut pending = Vec::new();
         for (scope, kind, method, args) in [
-            ("global", "create", "session/new", json!({"cwd": CWD})),
-            ("session/source", "fork", "session/fork", json!({})),
+            installing,
             ("catalog", "list", "session/list", json!({})),
         ] {
             let expect = watch.live(scope)["op"]["id"].clone();
@@ -395,7 +401,10 @@ async fn admitted_create_fork_and_list_keep_their_errors_when_the_agent_disconne
             // No ACP response is sent: the connection's end must settle it.
             pending.push((kind, op, held, response));
         }
-        let fork = pending[1].1.clone();
+        let fork = pending
+            .iter()
+            .find(|(kind, ..)| *kind == "fork")
+            .map_or(Value::Null, |(_, op, ..)| op.clone());
         if loadable {
             bench.follow_next_generation().await;
         }
