@@ -117,7 +117,7 @@ block that carries bytes (image, audio, embedded resource) is replaced by an
 ```ts
 interface AttachmentRef {   // the bridge's own type, not an ACP ContentBlock
   type: "attachment";
-  id: string;               // lowercase hex SHA-256 of the block's canonical JSON (§5.5)
+  id: string;               // lowercase hex SHA-256 of the block's exact form (§8)
   block: "image" | "audio" | "resource";
   mimeType?: string;
   uri?: string;             // a resource's URI
@@ -127,8 +127,10 @@ type Block = ContentBlock /* with byte-carrying blocks as AttachmentRef */;
 type PromptBlock = ContentBlock | AttachmentRef;   // what a prompt may contain (§6.2)
 ```
 
-The `id` is computed over the whole block as received, `_meta` included; reading it
-returns that block unchanged, and a client can verify the read against the `id`.
+The `id` identifies the block exactly as received, `_meta` included, with no numeric
+rounding (§8); reading it returns that block unchanged, and a client can verify the
+read against the `id`. Two blocks that differ anywhere, also in an integer beyond
+±2^53, have different IDs.
 Text and resource links stay inline.
 
 ### 3.2 Prompts
@@ -228,7 +230,8 @@ type OperationStatus = "running" | "completed" | "failed" | "cancelled";
 
 interface Operation {
   id: string;               // chosen by the client that wrote it (§6.5); bridge-chosen for load/open/none
-  after: string | null;     // the `expect` it was admitted with (§6.6)
+  scope: string;            // the scope it was written to (its issuing scope)
+  after: string | null;     // the `expect` it was admitted with: the issuing scope's previous `op.id` (§6.6)
   kind: OperationKind;
   status: OperationStatus;
   input: unknown;           // the write's `args` (a prompt as `Block[]`), or the load's cwd
@@ -424,7 +427,7 @@ each successfully applied event, and **verified** at `rev` after a matching dige
 | first open | no `have`; a full snapshot |
 | reconnect after a break, epoch unchanged | `have` with the current epoch; a snapshot with `base: "update"` carrying only the entries changed since, plus the rest of the document |
 | an ops event whose `rev` is not the replica's `rev + 1`, or an op that does not apply | the client discards the event, closes the stream, and subscribes again with its last current `have` |
-| a slow subscriber | the bridge drops that subscriber's queued events of each scope and queues one snapshot from the last `rev` actually written to its output; a queued event never counts as delivered |
+| a slow subscriber | per scope, the bridge drops that subscriber's queued events and queues one snapshot from the last `rev` actually written to its output; a queued event never counts as delivered. A scope whose queue holds an `end` keeps only that `end` and gets no snapshot |
 | a load replaces the history, a session is reopened, the bridge restarts | new epoch; a full snapshot (`base: "replace"`) |
 | a resume of a session whose history was unknown | new epoch; `history: partial` with only the content since |
 | the Agent connection ends | the documents stay; each subscribed session's `op` becomes a running `load` waiting for reattachment (memory model §6.2); a session that cannot be reattached ends with `load_failed` |
@@ -438,9 +441,12 @@ The bridge sends an SSE comment at least every 15 seconds on an idle stream.
 
 ### 5.5 Verification
 
-**Digest.** `canon` is JCS (RFC 8785) of a JSON value as both sides parse it: integers
-outside ±2^53 are canonicalized as their IEEE double, the value a browser holds. `H` is
-SHA-256; a digest on the wire is the unpadded base64url of its first 16 bytes.
+**Digest.** `canon` is JCS (RFC 8785) of a JSON value as both sides parse it. JCS
+works in the IEEE double domain (RFC 8785 §3.1), so integers outside ±2^53 are
+canonicalized as their double, the value a browser holds; the digest therefore cannot
+see differences beyond double precision. That limit applies to document digests only,
+not to attachment identity (§8). `H` is SHA-256; a digest on the wire is the unpadded
+base64url of its first 16 bytes.
 
 ```text
 e_i    = H(canon(entries[i]))
@@ -448,9 +454,17 @@ E      = H(e_0 ‖ e_1 ‖ … ‖ e_{n-1})             (absent entries: E = H("
 digest = H(canon({ epoch, rev, history, prompts, live }) ‖ E)
 ```
 
-For `global` and `catalog`, `digest = H(canon({ epoch, rev, live }))`. Both sides cache
-`e_i` per entry and recompute only changed entries. Clients need a synchronous SHA-256
-implementation, since `crypto.subtle` is missing on non-secure origins.
+For `global` and `catalog`, `digest = H(canon({ epoch, rev, live }))`. Clients need a
+synchronous SHA-256 implementation, since `crypto.subtle` is missing on non-secure
+origins.
+
+**Caching `e_i`.** A cached entry hash must be bound to the content it was computed
+from, never to an index or a `rev` alone; otherwise an entry changed without an event
+keeps a stale hash and passes verification. The client keeps replica entries
+immutable (deep-frozen) and caches `e_i` by the entry value's identity, so every
+applied change yields a new value and a cache miss. A full snapshot's verification
+computes every `e_i` without the cache. The bridge, being the authority, may cache by
+its own change tracking.
 
 **When the bridge sends a digest:**
 
@@ -564,15 +578,21 @@ IDs the bridge allocates (`load`, `open`, `none`) have the same form.
 make repeats safe and let a client resolve a lost answer from its replica, without a
 table of past requests.
 
+`after` is the predecessor **in the operation's issuing scope** only. An operation that
+also occupies other scopes replaces their `op` too, but its `after` says nothing about
+them. A client resolving a lost write therefore reads the `op` of the scope it wrote to
+(`W`, with its `id` and `expect`), and uses `after` only of an operation whose `scope`
+is `W`:
+
 | Situation | Outcome |
 | --- | --- |
 | two clients start operations with the same `expect` | exactly one is admitted; the other gets `stale` and keeps its input (C2) |
 | a client repeats a write (same `id`) while it is the scope's `op` | `202`, no effect |
 | a client's answer was lost; the replica shows `op.id == id` | admitted |
-| the replica shows `op.id == expect`, ended | not admitted (an admitted write would have replaced it); the client may repeat with the same `id` |
-| the replica shows an operation whose `after == expect` and whose `id` is not the client's | not admitted: that operation won the race (C2) |
-| the replica shows an operation whose `after == id` | admitted, then followed by that operation |
-| none of these (the replica moved two or more operations past) | unknown (C3): left to the user |
+| `W`'s `op.id == expect`, ended | not admitted (any admitted operation occupying `W` would have replaced it); the client may repeat with the same `id` |
+| `W`'s `op` has `scope == W`, `after == expect` and another `id` | not admitted: that operation won the race in `W` (C2) |
+| `W`'s `op` has `scope == W` and `after == id` | admitted, then followed by that operation |
+| anything else, including an `op` written to another scope (for example a `fork` from a session that also occupies `global`) | unknown (C3): left to the user |
 | a `create`/`fork` answer was lost | `global.live.sessions` shows the session whose `origin` is the `id` while it is held |
 
 ## 7. Actions
@@ -614,12 +634,25 @@ is a §9 error (`404` when the target does not exist).
 | Read | Notes |
 | --- | --- |
 | `GET /api/v2/scopes/{scope}` | the document as one snapshot (§5.2, `base: "replace"`, with `digest`); `404` for an unheld session; holds nothing |
-| `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | the block as received; served while the session's document references it, else `404`; verifiable against the `id` (§5.5) |
+| `GET /api/v2/sessions/{id}/attachments/{attachmentId}` | the block as received, in its exact form (below); served while the session's document references it, else `404` |
 | `GET /api/v2/sessions/{id}/files?query=` | context search within the session's workspace |
 | `GET /api/v2/sessions/{id}/files/content?path=` | context read |
 
-A `GET` result is a snapshot like any other: a client installs it only into a scope it
-does not follow on a stream, or if its `(epoch, rev)` is newer than the replica's.
+A `GET` result is a snapshot, but its ordering against the stream is unknown: epochs are
+random, so `(epoch, rev)` has no order across epochs, and a `GET` issued before a new
+epoch may return after it. Hence:
+
+- a client never installs a `GET` result into a scope it follows on a stream; the
+  stream is that scope's only source;
+- for a scope it does not follow, it installs only the result of its latest `GET` for
+  that scope (a per-scope request counter discards older ones), and within the same
+  epoch only if `rev` is not older than the replica's.
+**Attachment identity.** The exact form of a block is JCS key order and string
+escaping with every number written as the decimal digits the bridge received, without
+conversion to double. `id` is the SHA-256 of these bytes. The attachment read's body is
+exactly these bytes, so a client verifies it by hashing the raw body before parsing;
+a body whose hash is not the `id` is unverified (§5.5).
+
 **Markdown export** is assembled by the client from entries, prompts, terminals and
 attachment reads.
 
@@ -692,13 +725,15 @@ client's actual decode, apply, verify and install steps.
 | Rev gap and reorder | a missing, duplicated or reordered ops event is detected before it is applied; recovery by differential snapshot |
 | Inapplicable op | an op whose target is missing leaves the replica unchanged and triggers resubscription |
 | Wrong content with valid framing | alter an entry, a `live` value or a prompt result in an event while keeping `rev` continuous; the next checkpoint detects it; a full snapshot repairs it |
-| Corrupted local replica | alter the replica without an event; the next checkpoint or reconnect snapshot detects and repairs it; a differential snapshot never confirms it |
+| Corrupted local replica | replace an entry in the replica without an event; the hash cache misses, the next checkpoint or reconnect snapshot detects and repairs it; a differential snapshot never confirms it |
 | Late update to an early entry | `set` on that entry; a reconnecting client receives only that entry and verifies |
 | Slow subscriber | queued events are coalesced into one snapshot from the delivered `rev`; the result verifies |
 | New epoch | load replacement, reopen and bridge restart give a full snapshot; earlier entries are not confirmed |
 | Several clients | two subscribers at equal `rev` have equal digests; their writes race as §6.6 states; two answers to one interaction deliver exactly one |
-| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin` |
-| Reconnect races | a superseded stream's or GET's late events cannot overwrite a newer replica |
+| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, and a multi-scope race (`authenticate` in `global` lost while a `fork` from a session replaces `global`'s `op`) resolved as unknown, never as not admitted |
+| Large integers | two attachments differing only in an integer beyond ±2^53 get different IDs and read back unchanged; document digests agree between bridge and client for such values |
+| Reconnect races | a superseded stream's late events cannot overwrite a newer replica; a `GET` from an older epoch returning after a new epoch's snapshot is not installed |
+| Ended scope in a slow queue | a `close` or `delete` `end` queued behind events reaches the slow subscriber; no snapshot is generated for that scope |
 | Bad attachment read | wrong bytes are not shown; a read racing a release yields `404`, not wrong content |
 
 Per-event convergence tests (replica equals bridge document after every event) remain
