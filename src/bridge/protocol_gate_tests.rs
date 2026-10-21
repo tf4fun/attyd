@@ -1687,14 +1687,13 @@ async fn a_forks_load_replaces_its_timeline_with_the_replay_as_complete() {
     .await;
     peer.update("forked", chunk("answer", text("hello"))).await;
     peer.reply(&load, json!({})).await;
-    peer.until("the target's load completes", |peer| {
-        peer.live("session/forked")["op"]["kind"] == "load"
-            && peer.live("session/forked")["op"]["status"] == "completed"
-    })
-    .await;
+    // The target's load is a background history workflow, not a published
+    // operation: its commit shows in bridge memory, where two replayed entries
+    // replace the one staged entry.
+    let timeline = peer.timeline_len("forked", 2).await;
 
     assert_eq!(
-        peer.timeline("forked").await,
+        timeline,
         json!([
             {"kind": "message", "role": "user", "chunks": [{"content": text("hi")}]},
             {"kind": "message", "role": "agent", "messageId": "answer",
