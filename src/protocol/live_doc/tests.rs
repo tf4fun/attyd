@@ -4,8 +4,19 @@
 use serde_json::{Value, json};
 
 use super::*;
+use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase};
 use crate::runtime_state::SessionLifecycle;
 use crate::session_registry::SessionRegistry;
+
+fn agent() -> AgentInfo {
+    AgentInfo {
+        phase: AgentPhase::Ready,
+        error: None,
+        launch: AgentLaunch::default(),
+        initialize: None,
+        authenticated_method_id: Some("login".into()),
+    }
+}
 
 fn registry() -> SessionRegistry {
     let mut registry = SessionRegistry::new("epoch");
@@ -126,4 +137,67 @@ fn a_session_closing_says_so_and_a_closed_one_is_not_published() {
     lifecycle(&mut registry, SessionLifecycle::Closed);
     assert_eq!(session_live(&registry, "s"), None);
     assert_eq!(session_live(&registry, "unknown"), None);
+}
+
+// --- global and catalog (§4.3) -----------------------------------------------------
+
+#[test]
+fn global_names_the_agent_the_held_sessions_and_the_terminal_logins() {
+    let mut registry = registry();
+    registry
+        .update_control_state(
+            "epoch",
+            "s",
+            json!({ "sessionUpdate": "session_info_update", "title": "Titled" }),
+        )
+        .unwrap();
+    registry.start_login_terminal("login-op", "agent-login");
+    registry.login_output("login-op", "Opening a browser...");
+
+    let live = global_live(&registry, &agent());
+    assert_eq!(live["agent"]["phase"], "ready");
+    assert_eq!(live["agent"]["authenticatedMethodId"], "login");
+    assert_eq!(live["agent"]["error"], Value::Null);
+    assert_eq!(
+        live["sessions"],
+        json!({ "s": {
+            "sessionId": "s", "cwd": "/work", "title": "Titled",
+            "op": { "kind": "open", "status": "completed" },
+            "pending": { "interactions": 0, "urlFlows": 0 },
+        } })
+    );
+    assert_eq!(
+        live["terminals"],
+        json!({ "login-op": {
+            "terminalId": "login-op", "output": "Opening a browser...", "truncated": false,
+            "exitStatus": null, "methodId": "agent-login", "released": false,
+        } })
+    );
+}
+
+#[test]
+fn global_lists_only_the_sessions_the_bridge_holds() {
+    let mut registry = registry();
+    registry
+        .open_new("epoch", "t", "/other", json!({ "sessionId": "t" }))
+        .unwrap();
+    let live = global_live(&registry, &agent());
+    let mut held: Vec<&String> = live["sessions"].as_object().unwrap().keys().collect();
+    held.sort();
+    assert_eq!(held, ["s", "t"]);
+    registry
+        .sessions
+        .get_mut("t")
+        .unwrap()
+        .state
+        .live
+        .as_mut()
+        .unwrap()
+        .lifecycle = SessionLifecycle::Closed;
+    assert!(global_live(&registry, &agent())["sessions"].get("t").is_none());
+}
+
+#[test]
+fn the_catalog_names_the_revision_of_the_agents_list() {
+    assert_eq!(catalog_live(&registry(), 7), json!({ "revision": "7" }));
 }
