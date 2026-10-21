@@ -20,6 +20,20 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+/// What the bridge knows about how much of a session's history its timeline
+/// holds (memory model §6.1). A session whose history is unknown has no
+/// timeline, which is not the same as an empty `Complete` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum History {
+    /// The timeline starts at the session's beginning: a new session, or a
+    /// successful `session/load`.
+    Complete,
+    /// It may lack what came before: a `session/resume`, or context the Agent
+    /// gave without a replay.
+    Partial,
+}
+
 /// Memory model §3.1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

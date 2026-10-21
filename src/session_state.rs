@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
 use crate::protocol::registry::SessionLog;
-use crate::protocol::timeline::{PromptEnd, Timeline};
+use crate::protocol::timeline::{History, PromptEnd, Timeline};
 use crate::runtime_state::{
     SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
     SharedTurnUpdates, fold_shared_active_turn_update,
@@ -75,6 +75,10 @@ pub(crate) struct SessionState {
     /// is derived from it.
     #[serde(skip)]
     pub(crate) timeline: Option<Arc<Timeline>>,
+    /// How much of the history the timeline holds; `Some` exactly when the
+    /// timeline is known (memory model §6.1).
+    #[serde(skip)]
+    pub(crate) history: Option<History>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +144,7 @@ impl SessionState {
             load_origin: None,
             log: SessionLog::Unknown,
             timeline: None,
+            history: None,
         }
     }
 
@@ -148,6 +153,7 @@ impl SessionState {
         session.phase = MirrorPhase::Ready;
         session.log = SessionLog::empty();
         session.timeline = Some(Arc::default());
+        session.history = Some(History::Complete);
         session
     }
 
