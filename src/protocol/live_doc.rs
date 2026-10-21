@@ -7,6 +7,8 @@
 //! embeds) and whether a close is outstanding.
 use serde_json::{Value, json};
 
+use super::documents::AgentInfo;
+use super::project;
 use crate::runtime_state::{SessionLifecycle, SessionLiveState};
 use crate::session_registry::SessionRegistry;
 
@@ -62,6 +64,36 @@ pub(crate) fn session_live(registry: &SessionRegistry, session_id: &str) -> Opti
             SessionLifecycle::Closing | SessionLifecycle::ClosingForDelete
         ),
     }))
+}
+
+/// What `live` holds for `global` besides its operation, interactions and URL
+/// flows (protocol §4.3): the Agent, the sessions the bridge holds and the
+/// terminal logins. A login terminal is a terminal like any other, whose handle
+/// lasts until it is dismissed.
+pub(crate) fn global_live(registry: &SessionRegistry, agent: &AgentInfo) -> Value {
+    let global = serde_json::to_value(project::project_global(registry, agent))
+        .expect("the global live document serializes");
+    let mut terminals = global["terminals"].clone();
+    for terminal in terminals
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|terminals| terminals.values_mut())
+    {
+        terminal["released"] = Value::Bool(false);
+    }
+    json!({
+        "agent": global["agent"],
+        "sessions": global["sessions"],
+        "terminals": terminals,
+    })
+}
+
+/// What `live` holds for `catalog` besides its operation, interactions and URL
+/// flows (protocol §4.3): the revision of the Agent's list.
+pub(crate) fn catalog_live(registry: &SessionRegistry, revision: u64) -> Value {
+    let catalog = serde_json::to_value(project::project_catalog(registry, revision))
+        .expect("the catalog live document serializes");
+    json!({ "revision": catalog["revision"] })
 }
 
 #[cfg(test)]
