@@ -332,7 +332,7 @@ content-block order. Editing changes only that text block, removing an attachmen
 removes only that block, and new attachments append at the end. The experimental
 normalizer still drops `_meta` and merges adjacent text blocks whose remaining
 fields match. Metadata loss is defect D7; preservation is required by the
-[target content contract](protocol.md#32-reduction).
+[target content contract](bridge-memory-model.md#3-timeline-entries).
 Text shown inline uses UTF-8; downloaded bytes are the block's own.
 Links without bytes open only on a user click; attyd does not fetch them to make
 previews. Downloads are exports, not a persistent conversation cache.
