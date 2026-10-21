@@ -756,6 +756,149 @@ mod tests {
         assert_eq!(mirror.history.candidates(), 0);
     }
 
+    fn text(text: &str) -> Value {
+        json!({ "type": "text", "text": text })
+    }
+
+    /// The entries from the start of the prompt `load_initial` leaves behind.
+    fn entries_from(mirror: &SessionMirror, from: usize) -> Value {
+        Value::Array(timeline_entries(mirror).as_array().unwrap()[from..].to_vec())
+    }
+
+    fn prompts(mirror: &SessionMirror) -> Value {
+        serde_json::to_value(
+            mirror
+                .state("session")
+                .unwrap()
+                .timeline
+                .as_ref()
+                .unwrap()
+                .prompts(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_started_prompt_is_a_user_entry_and_a_running_prompt() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        assert_eq!(
+            entries_from(&mirror, 2),
+            json!([{ "kind": "message", "role": "user", "chunks": [{ "content": text("next") }] }])
+        );
+        assert_eq!(prompts(&mirror), json!([{ "entry": 2 }]));
+    }
+
+    #[test]
+    fn live_updates_are_reduced_as_received_and_the_response_ends_the_prompt() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        for update in [
+            agent_update("Hel", "m1"),
+            agent_update("lo", "m1"),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "Run" }),
+            agent_update(" again", "m1"),
+        ] {
+            mirror
+                .append_turn_update("session", &operation, update)
+                .unwrap();
+        }
+        mirror
+            .complete_turn("session", &operation, json!({ "stopReason": "end_turn" }))
+            .unwrap();
+        assert_eq!(
+            entries_from(&mirror, 2),
+            json!([
+                { "kind": "message", "role": "user", "chunks": [{ "content": text("next") }] },
+                { "kind": "message", "role": "agent", "messageId": "m1",
+                  "chunks": [{ "content": text("Hello") }] },
+                { "kind": "tool", "call": { "toolCallId": "t", "title": "Run", "kind": "other",
+                  "status": "pending", "content": [], "locations": [] } },
+                { "kind": "message", "role": "agent", "messageId": "m1",
+                  "chunks": [{ "content": text(" again") }] },
+            ])
+        );
+        assert_eq!(
+            prompts(&mirror),
+            json!([{ "entry": 2, "end": { "response": { "stopReason": "end_turn" } } }])
+        );
+    }
+
+    #[test]
+    fn an_update_after_the_response_changes_its_entry_in_place() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        mirror
+            .append_turn_update(
+                "session",
+                &operation,
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "Run" }),
+            )
+            .unwrap();
+        mirror
+            .complete_turn("session", &operation, json!({ "stopReason": "end_turn" }))
+            .unwrap();
+        mirror
+            .append_session_update(
+                "session",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "completed" }),
+            )
+            .unwrap();
+        let entries = entries_from(&mirror, 2);
+        assert_eq!(entries.as_array().unwrap().len(), 2, "no entry was added");
+        assert_eq!(entries[1]["call"]["status"], json!("completed"));
+    }
+
+    #[test]
+    fn a_rejected_update_leaves_the_timeline_unchanged() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        let before = timeline_entries(&mirror);
+        assert!(
+            mirror
+                .append_turn_update(
+                    "session",
+                    &operation,
+                    json!({ "sessionUpdate": "plan", "entries": 7 }),
+                )
+                .is_err()
+        );
+        assert_eq!(timeline_entries(&mirror), before);
+    }
+
+    #[test]
+    fn an_exact_echo_of_the_prompt_is_not_a_second_user_entry() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        mirror
+            .append_turn_update(
+                "session",
+                &operation,
+                json!({ "sessionUpdate": "user_message_chunk", "messageId": "u1", "content": text("next") }),
+            )
+            .unwrap();
+        assert_eq!(
+            entries_from(&mirror, 2),
+            json!([{ "kind": "message", "role": "user", "messageId": "u1",
+                     "chunks": [{ "content": text("next") }] }])
+        );
+    }
+
     #[test]
     fn prompt_terminal_retains_the_turn_until_its_commit() {
         let mut mirror = mirror();

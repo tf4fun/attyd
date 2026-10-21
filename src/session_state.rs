@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
 use crate::protocol::registry::SessionLog;
-use crate::protocol::timeline::Timeline;
+use crate::protocol::timeline::{PromptEnd, Timeline};
 use crate::runtime_state::{
     SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
     SharedTurnUpdates, fold_shared_active_turn_update,
@@ -229,6 +229,11 @@ impl SessionState {
     ) -> Result<(), MirrorError> {
         self.can_begin(SessionAdmission::Prompt)?;
         self.phase = MirrorPhase::Running;
+        // The prompt the bridge sends is the user entry the next echo may
+        // complete; its outcome is recorded when the turn ends (memory model §4).
+        if let Some(timeline) = self.timeline.as_mut() {
+            Arc::make_mut(timeline).begin_prompt(&prompt);
+        }
         self.active_turn = Some(TurnOverlay {
             operation_id,
             prompt: Arc::new(prompt),
@@ -279,6 +284,11 @@ impl SessionState {
             .as_mut()
             .expect("the turn was checked above")
             .updates = Arc::new(updates);
+        // Reduced only once the fold accepted the update, so a rejected one
+        // leaves the timeline as it was.
+        if let Some(timeline) = self.timeline.as_mut() {
+            Arc::make_mut(timeline).reduce(&update, None);
+        }
         Ok(())
     }
 
@@ -301,6 +311,9 @@ impl SessionState {
         // History-only owners have no responders and can retire the execution here.
         if self.live.is_some() && turn.execution.is_some() {
             return Err(MirrorError::OperationMismatch);
+        }
+        if let Some(timeline) = self.timeline.as_mut() {
+            Arc::make_mut(timeline).end_prompt(PromptEnd::Response(terminal.clone()));
         }
         let turn = self
             .active_turn
