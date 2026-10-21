@@ -601,6 +601,7 @@ impl SessionRegistry {
             }
         }
         for entry in self.sessions.values_mut() {
+            let timeline = entry.state.timeline.clone();
             if let Some(live) = entry.state.live.as_mut() {
                 if live.op.is_running() {
                     live.op.fail(error.clone());
@@ -608,7 +609,19 @@ impl SessionRegistry {
                 live.permissions.clear();
                 live.elicitations.clear();
                 live.url_flows.clear();
-                live.terminals.clear();
+                // Every handle ends with the connection; the output an entry
+                // embeds stays frozen with the session that remains held.
+                for (terminal_id, mut snapshot) in std::mem::take(&mut live.terminals) {
+                    if timeline
+                        .as_ref()
+                        .is_some_and(|timeline| timeline.embeds_terminal(&terminal_id))
+                    {
+                        if let Some(fields) = snapshot.as_object_mut() {
+                            fields.insert("released".to_owned(), Value::Bool(true));
+                        }
+                        live.frozen_terminals.insert(terminal_id, snapshot);
+                    }
+                }
             }
         }
         self.scopes.occupied.clear();
@@ -848,7 +861,13 @@ impl SessionRegistry {
     /// retained one in one step (bridge memory model §6.2).
     pub(crate) fn replace_session_timeline(&mut self, session_id: &str, timeline: Timeline) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
-            entry.state.timeline = Some(Arc::new(timeline));
+            let timeline = Arc::new(timeline);
+            // Frozen output nothing in the new timeline embeds is freed.
+            if let Some(live) = entry.state.live.as_mut() {
+                live.frozen_terminals
+                    .retain(|terminal_id, _| timeline.embeds_terminal(terminal_id));
+            }
+            entry.state.timeline = Some(timeline);
             entry.state.history = Some(History::Complete);
         }
     }

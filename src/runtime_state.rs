@@ -43,6 +43,10 @@ pub(crate) struct SessionLiveState {
     pub elicitations: BTreeMap<String, PendingInteraction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub terminals: BTreeMap<String, Value>,
+    /// Released terminals whose output a timeline entry still embeds: no
+    /// handle, only the frozen snapshot (memory model §8.3). Kept apart from
+    /// `terminals`, whose entries have a handle and make the session busy.
+    pub frozen_terminals: BTreeMap<String, Value>,
     resolved_permissions: VecDeque<String>,
     resolved_elicitations: VecDeque<String>,
     resolved_url_flows: VecDeque<String>,
@@ -357,6 +361,7 @@ impl SessionRegistry {
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
+                frozen_terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
                 resolved_url_flows: VecDeque::new(),
@@ -651,6 +656,7 @@ impl SessionRegistry {
                 elicitations: BTreeMap::new(),
                 url_flows: BTreeMap::new(),
                 terminals: BTreeMap::new(),
+                frozen_terminals: BTreeMap::new(),
                 resolved_permissions: VecDeque::new(),
                 resolved_elicitations: VecDeque::new(),
                 resolved_url_flows: VecDeque::new(),
@@ -1172,8 +1178,15 @@ impl SessionRegistry {
         terminal: Value,
     ) -> Result<TerminalUpsert, RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
+        let terminal_id: String = terminal_id.into();
+        // Whether an entry embeds the terminal decides what its release keeps.
+        let embedded = terminal_released(&terminal)
+            && self
+                .sessions
+                .get(session_id)
+                .and_then(|entry| entry.state.timeline.as_ref())
+                .is_some_and(|timeline| timeline.embeds_terminal(&terminal_id));
         let session = self.require_live_mut(session_id)?;
-        let terminal_id = terminal_id.into();
         if session
             .released_terminals
             .iter()
@@ -1189,6 +1202,12 @@ impl SessionRegistry {
         };
         if terminal_released(&terminal) {
             session.terminals.remove(&terminal_id);
+            // The handle is gone; the output stays while content embeds it.
+            if embedded {
+                session
+                    .frozen_terminals
+                    .insert(terminal_id.clone(), materialized);
+            }
             remember_resolved_interaction(&mut session.released_terminals, &terminal_id);
         } else {
             session.terminals.insert(terminal_id.clone(), materialized);
@@ -2226,6 +2245,118 @@ mod tests {
             .start_prompt("epoch", session_id, operation_id.clone(), prompt)
             .unwrap();
         operation_id
+    }
+
+    /// A tool entry that embeds `terminal` in its content, as the Agent sends it.
+    fn embed_terminal(state: &mut RuntimeState, terminal: &str) {
+        state
+            .append_session_update(
+                "session",
+                json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "run", "title": "Run",
+                    "content": [{ "type": "terminal", "terminalId": terminal }],
+                }),
+            )
+            .unwrap();
+    }
+
+    fn snapshot(output: &str, released: bool) -> Value {
+        json!({ "output": output, "released": released })
+    }
+
+    #[test]
+    fn a_released_terminal_a_tool_embeds_keeps_its_frozen_output() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "terminal");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept output", false))
+            .unwrap();
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept output", true))
+            .unwrap();
+
+        let live = state.live("session").unwrap();
+        assert!(live.terminals.is_empty(), "the handle is gone");
+        assert_eq!(live.frozen_terminals["terminal"]["output"], "kept output");
+        // A late snapshot of the released terminal changes nothing.
+        assert_eq!(
+            state
+                .upsert_terminal("epoch", "session", "terminal", snapshot("late", false))
+                .unwrap(),
+            TerminalUpsert::Stale
+        );
+        assert_eq!(
+            state.live("session").unwrap().frozen_terminals["terminal"]["output"],
+            "kept output"
+        );
+    }
+
+    #[test]
+    fn a_released_terminal_nothing_embeds_is_dropped() {
+        let mut state = state();
+        open(&mut state, "session");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("gone", true))
+            .unwrap();
+        let live = state.live("session").unwrap();
+        assert!(live.terminals.is_empty() && live.frozen_terminals.is_empty());
+    }
+
+    #[test]
+    fn frozen_output_does_not_keep_the_session_busy() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "terminal");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept", true))
+            .unwrap();
+        state
+            .start_reload("epoch", "session", "reload", SessionOperationKind::Load)
+            .expect("only a terminal with a handle makes the session busy");
+    }
+
+    #[test]
+    fn the_connection_ending_freezes_the_embedded_terminals_of_held_sessions() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "embedded");
+        for id in ["embedded", "loose"] {
+            state
+                .upsert_terminal("epoch", "session", id, snapshot(id, false))
+                .unwrap();
+        }
+        state.end_connection(crate::protocol::documents::ProtocolError::new(
+            crate::protocol::documents::ErrorCode::Unavailable,
+            "the connection ended",
+        ));
+        let live = state.live("session").unwrap();
+        assert!(live.terminals.is_empty(), "every handle is gone");
+        assert_eq!(live.frozen_terminals.len(), 1);
+        assert_eq!(live.frozen_terminals["embedded"]["output"], "embedded");
+    }
+
+    #[test]
+    fn a_load_frees_frozen_output_its_timeline_no_longer_embeds() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "terminal");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept", true))
+            .unwrap();
+        let still = [json!({
+            "sessionUpdate": "tool_call", "toolCallId": "run", "title": "Run",
+            "content": [{ "type": "terminal", "terminalId": "terminal" }],
+        })];
+        state.replace_session_timeline(
+            "session",
+            crate::protocol::timeline::Timeline::from_replay(
+                still.iter().map(|update| (update, None)),
+            ),
+        );
+        assert!(state.live("session").unwrap().frozen_terminals.contains_key("terminal"));
+        state.replace_session_timeline("session", crate::protocol::timeline::Timeline::default());
+        assert!(state.live("session").unwrap().frozen_terminals.is_empty());
     }
 
     #[test]
