@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 #[cfg(not(feature = "dev"))]
 use rust_embed::RustEmbed;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
@@ -936,7 +936,13 @@ fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
         Some(args) if args.is_object() => args.clone(),
         Some(_) => return Err(invalid_request("args must be an object")),
     };
+    let id = match body.get("id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(id.clone()),
+        Some(_) => return Err(invalid_request("id must be a string")),
+    };
     Ok(OpWrite {
+        id,
         expect: field("expect")?,
         kind: field("kind")?,
         args,

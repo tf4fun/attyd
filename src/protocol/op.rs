@@ -70,6 +70,11 @@ pub(crate) struct OpSlot {
     pub attachments: Attachments,
     /// The held response waiting for this operation's end, if any.
     pub completion: Completion,
+    /// The scope the operation was written to: its issuing scope (protocol §4.4).
+    pub scope: Option<String>,
+    /// The operation this one replaced in its issuing scope: the `expect` it
+    /// was admitted with, which lets a client resolve a lost answer (§6.6).
+    pub after: Option<String>,
 }
 
 impl OpSlot {
@@ -84,6 +89,8 @@ impl OpSlot {
             error: None,
             attachments: Attachments::default(),
             completion: Completion::default(),
+            scope: None,
+            after: None,
         }
     }
 
