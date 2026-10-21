@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::history_cache::HistoryCacheError;
 use crate::history_replay::Replay;
 use crate::protocol::canon::TurnLog;
+use crate::protocol::op::operation_id;
 use crate::protocol::registry::SessionLog;
 use crate::protocol::timeline::History;
 use crate::runtime_state::SessionOperationKind;
@@ -197,6 +198,7 @@ impl SessionRegistry {
             // known to be there (memory model §6.1).
             session.timeline = Some(Arc::default());
             session.history = Some(History::Partial);
+            session.timeline_epoch = Some(operation_id());
         }
         session.history_settled();
         Ok(())
@@ -692,6 +694,79 @@ mod tests {
             "sessionUpdate": "agent_message_chunk", "messageId": message_id,
             "content": { "type": "text", "text": text }
         })
+    }
+
+    fn epoch(mirror: &SessionMirror, session_id: &str) -> Option<String> {
+        mirror.state(session_id).unwrap().timeline_epoch.clone()
+    }
+
+    #[test]
+    fn a_timeline_has_an_epoch_that_a_cold_session_lacks_and_each_new_session_has_its_own() {
+        let mut mirror = mirror();
+        mirror.register_cold("cold");
+        mirror.register_new("a");
+        mirror.register_new("b");
+        assert_eq!(epoch(&mirror, "cold"), None);
+        let (a, b) = (epoch(&mirror, "a").unwrap(), epoch(&mirror, "b").unwrap());
+        assert_eq!(a.len(), 22, "128 random bits in unpadded base64url");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn live_updates_keep_the_epoch_and_a_load_or_a_resume_gives_the_timeline_a_new_one() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        let loaded = epoch(&mirror, "session").unwrap();
+
+        // Prompts, updates and idle updates grow the timeline within its epoch.
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        mirror
+            .append_turn_update("session", &operation, agent_update("a", "m"))
+            .unwrap();
+        mirror
+            .complete_turn("session", &operation, json!({ "stopReason": "end_turn" }))
+            .unwrap();
+        mirror
+            .append_session_update("session", agent_update("late", "m"))
+            .unwrap();
+        mirror.commit_completed_turn("session", &operation).unwrap();
+        assert_eq!(epoch(&mirror, "session"), Some(loaded.clone()));
+
+        // A failed load replaces nothing.
+        mirror.begin_load("session", "failing").unwrap();
+        mirror.fail_load("session", "failing", "boom", true).unwrap();
+        assert_eq!(epoch(&mirror, "session"), Some(loaded.clone()));
+
+        // A load that commits replaces the timeline: another epoch.
+        mirror.begin_load("session", "again").unwrap();
+        mirror.commit_load("session", "again").unwrap();
+        let reloaded = epoch(&mirror, "session").unwrap();
+        assert_ne!(reloaded, loaded);
+
+        // A resume of a session whose history is unknown adopts a timeline.
+        mirror.register_cold("resumed");
+        mirror.begin_load("resumed", "resume").unwrap();
+        mirror.commit_attachment_cache("resumed", "resume").unwrap();
+        let adopted = epoch(&mirror, "resumed").unwrap();
+        // A second resume keeps the timeline it already has, and so its epoch.
+        mirror.begin_load("resumed", "again").unwrap();
+        mirror.commit_attachment_cache("resumed", "again").unwrap();
+        assert_eq!(epoch(&mirror, "resumed"), Some(adopted));
+    }
+
+    #[test]
+    fn going_on_with_given_context_gives_an_epoch_and_a_known_timeline_keeps_its_own() {
+        let mut mirror = mirror();
+        mirror.register_cold("cold");
+        mirror.use_cached_history("cold", None).unwrap();
+        assert!(epoch(&mirror, "cold").is_some());
+
+        mirror.register_new("new");
+        let before = epoch(&mirror, "new");
+        mirror.use_cached_history("new", None).unwrap();
+        assert_eq!(epoch(&mirror, "new"), before);
     }
 
     #[test]

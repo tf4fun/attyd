@@ -296,6 +296,7 @@ impl SessionRegistry {
         entry.state.log = waiting.log;
         entry.state.timeline = waiting.timeline;
         entry.state.history = waiting.history;
+        entry.state.timeline_epoch = waiting.timeline_epoch;
         entry
             .state
             .live
@@ -2376,6 +2377,8 @@ mod tests {
         let held = state.state("session").unwrap().timeline.clone().unwrap();
         let history = state.state("session").unwrap().history;
         assert_eq!(history, Some(crate::protocol::timeline::History::Complete));
+        let epoch = state.state("session").unwrap().timeline_epoch.clone();
+        assert!(epoch.is_some());
 
         let waiting = state
             .wait_for_next_connection("session")
@@ -2385,6 +2388,11 @@ mod tests {
 
         let restored = next.state("session").unwrap().timeline.clone().unwrap();
         assert_eq!(next.state("session").unwrap().history, history);
+        assert_eq!(
+            next.state("session").unwrap().timeline_epoch,
+            epoch,
+            "the same timeline is the same epoch across a connection"
+        );
         assert!(Arc::ptr_eq(&held, &restored));
         assert_eq!(restored.entries().len(), 1);
     }

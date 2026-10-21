@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
 use crate::protocol::registry::SessionLog;
+use crate::protocol::op::operation_id;
 use crate::protocol::timeline::{History, PromptEnd, Timeline};
 use crate::runtime_state::{
     SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
@@ -79,6 +80,12 @@ pub(crate) struct SessionState {
     /// timeline is known (memory model §6.1).
     #[serde(skip)]
     pub(crate) history: Option<History>,
+    /// Names the timeline the session holds: a random value that changes
+    /// whenever the timeline is replaced rather than grown, so that a publisher
+    /// rebuilds the document instead of patching it (protocol §5.4). `Some`
+    /// exactly when the timeline is known.
+    #[serde(skip)]
+    pub(crate) timeline_epoch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +152,7 @@ impl SessionState {
             log: SessionLog::Unknown,
             timeline: None,
             history: None,
+            timeline_epoch: None,
         }
     }
 
@@ -154,6 +162,7 @@ impl SessionState {
         session.log = SessionLog::empty();
         session.timeline = Some(Arc::default());
         session.history = Some(History::Complete);
+        session.timeline_epoch = Some(operation_id());
         session
     }
 
