@@ -65,6 +65,12 @@ Session
 
 `entries` is a flat list. It holds no turn container; turns are derived (§5).
 
+Entries are shared individually (copy-on-write). Views of the timeline are held while
+the session keeps changing, so cloning a timeline copies pointers and an update copies
+only the entry it changes. An update must therefore not allocate in proportion to
+content it does not touch; this is gated by allocation tests
+(`src/protocol/timeline/memory_tests.rs`).
+
 ## 3. Timeline entries
 
 ### 3.1 Entry kinds
