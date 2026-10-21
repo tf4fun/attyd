@@ -226,6 +226,88 @@ def write(name, value):
     (HERE / name).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def engine_scenario():
+    """What the bridge's publisher does for one session, step by step.
+
+    Each step mutates the timeline the way the bridge does (`prompt`, `updates`,
+    `end`) and commits it with `live`. `doc` is the published document after the
+    step (`null` when nothing changed), `digest` its digest, `changedRevs` the rev
+    at which each entry last changed, and `snapshots` what a subscriber that holds
+    `have` is sent.
+    """
+    scope = "session/S"
+    epoch = "E1"
+    run, done = live("op-2", "running", "prompt"), live("op-2", "completed", "prompt")
+    t1 = {"kind": "tool", "call": {"toolCallId": "t1", "title": "Run", "kind": "other", "status": "pending",
+                                    "content": [], "locations": []}}
+    plan = [
+        ({"prompt": [text("hi")]}, run, lambda e, p: (e + [message("user", "hi")], p + [{"entry": 0}])),
+        ({"updates": [{"sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": text("Hel")}]}, run,
+         lambda e, p: (e + [message("agent", "Hel", "m1")], p)),
+        ({"updates": [{"sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": text("lo")}]}, run,
+         lambda e, p: (e[:1] + [message("agent", "Hello", "m1")], p)),
+        ({"updates": [{"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Run"}]}, run,
+         lambda e, p: (e + [copy.deepcopy(t1)], p)),
+        ({"updates": [{"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"}]}, run,
+         lambda e, p: (e[:2] + [dict(t1, call=dict(t1["call"], status="completed"))], p)),
+        ({"end": {"stopReason": "end_turn"}}, done,
+         lambda e, p: (e, [dict(p[0], end={"response": {"stopReason": "end_turn"}})])),
+        ({"updates": []}, done, lambda e, p: (e, p)),
+    ]
+    steps, entries, prompts, changed, rev, doc = [], [], [], [], -1, None
+    for mutation, live_doc, evolve in plan:
+        new_entries, new_prompts = evolve(copy.deepcopy(entries), copy.deepcopy(prompts))
+        if doc is None or new_entries != entries or new_prompts != prompts or live_doc != doc["live"]:
+            rev += 1
+            for i, entry in enumerate(new_entries):
+                if i >= len(entries) or entry != entries[i]:
+                    if i < len(changed):
+                        changed[i] = rev
+                    else:
+                        changed.append(rev)
+            entries, prompts = new_entries, new_prompts
+            doc = {"epoch": epoch, "rev": rev, "history": "complete", "entries": copy.deepcopy(entries),
+                   "prompts": copy.deepcopy(prompts), "live": copy.deepcopy(live_doc)}
+            step_doc = doc
+        else:
+            step_doc = None
+        steps.append({"mutation": mutation, "live": live_doc, "doc": step_doc,
+                      "digest": session_digest(doc)[0], "changedRevs": list(changed)})
+    final = doc
+    snapshots = [{"have": None, "base": "replace", "length": len(final["entries"]),
+                  "changed": list(range(len(final["entries"])))}]
+    for have_rev in (0, 2, 4, final["rev"]):
+        snapshots.append({"have": {"epoch": epoch, "rev": have_rev}, "base": "update", "length": len(final["entries"]),
+                          "changed": [i for i, r in enumerate(changed) if r > have_rev]})
+    snapshots.append({"have": {"epoch": "E0", "rev": 3}, "base": "replace", "length": len(final["entries"]),
+                      "changed": list(range(len(final["entries"])))})
+    return {"scope": scope, "epoch": epoch, "steps": steps, "final": final,
+            "finalDigest": session_digest(final)[0], "snapshots": snapshots}
+
+
+def global_engine_scenario():
+    sessions_a = {"S": {"sessionId": "S", "title": None}}
+    sessions_b = {"S": {"sessionId": "S", "title": "T"}}
+    terminal = {"login": {"terminalId": "login", "output": "abcd", "truncated": False}}
+    op = {"id": "n", "kind": "none", "status": "completed"}
+    lives = [
+        {"op": op, "sessions": {}, "terminals": {}},
+        {"op": op, "sessions": sessions_a, "terminals": {}},
+        {"op": op, "sessions": sessions_b, "terminals": terminal},
+        {"op": op, "sessions": sessions_b, "terminals": terminal},
+    ]
+    steps, rev, previous, doc = [], -1, None, None
+    for live_doc in lives:
+        if previous is None or live_doc != previous:
+            rev += 1
+            doc = {"epoch": "G1", "rev": rev, "live": copy.deepcopy(live_doc)}
+            steps.append({"live": live_doc, "doc": doc, "digest": scope_digest(doc)})
+        else:
+            steps.append({"live": live_doc, "doc": None, "digest": scope_digest(doc)})
+        previous = live_doc
+    return {"scope": "global", "epoch": "G1", "steps": steps}
+
+
 def with_digests(steps, digest_of):
     """Adds the digest of the document after each step."""
     return [dict(step, digest=digest_of(step["doc"])) for step in steps]
@@ -239,4 +321,9 @@ if __name__ == "__main__":
             "session": with_digests(session_scenario(), lambda doc: session_digest(doc)[0]),
             "global": with_digests(global_scenario(), scope_digest),
         },
+    })
+    write("protocol-engine-scenario.json", {
+        "comment": "What the bridge's publisher emits for a session and for global, step by step, computed independently (docs/protocol.md §5.2–§5.5). Replayed by the Rust engine.",
+        "session": engine_scenario(),
+        "global": global_engine_scenario(),
     })

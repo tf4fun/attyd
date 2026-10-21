@@ -1,0 +1,834 @@
+{
+  "comment": "What the bridge's publisher emits for a session and for global, step by step, computed independently (docs/protocol.md §5.2–§5.5). Replayed by the Rust engine.",
+  "session": {
+    "scope": "session/S",
+    "epoch": "E1",
+    "steps": [
+      {
+        "mutation": {
+          "prompt": [
+            {
+              "type": "text",
+              "text": "hi"
+            }
+          ]
+        },
+        "live": {
+          "sessionId": "S",
+          "cwd": "/w",
+          "closing": false,
+          "op": {
+            "id": "op-2",
+            "kind": "prompt",
+            "status": "running",
+            "input": null,
+            "cancelRequested": false
+          },
+          "interactions": {},
+          "urlFlows": {},
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 0,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "wCQtKzq9ifXP-kmVm61O8Q",
+        "changedRevs": [
+          0
+        ]
+      },
+      {
+        "mutation": {
+          "updates": [
+            {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m1",
+              "content": {
+                "type": "text",
+                "text": "Hel"
+              }
+            }
+          ]
+        },
+        "live": {
+          "sessionId": "S",
+          "cwd": "/w",
+          "closing": false,
+          "op": {
+            "id": "op-2",
+            "kind": "prompt",
+            "status": "running",
+            "input": null,
+            "cancelRequested": false
+          },
+          "interactions": {},
+          "urlFlows": {},
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 1,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hel"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "lf39YS50F22KbmTSpEJ1Cg",
+        "changedRevs": [
+          0,
+          1
+        ]
+      },
+      {
+        "mutation": {
+          "updates": [
+            {
+              "sessionUpdate": "agent_message_chunk",
+              "messageId": "m1",
+              "content": {
+                "type": "text",
+                "text": "lo"
+              }
+            }
+          ]
+        },
+        "live": {
+          "sessionId": "S",
+          "cwd": "/w",
+          "closing": false,
+          "op": {
+            "id": "op-2",
+            "kind": "prompt",
+            "status": "running",
+            "input": null,
+            "cancelRequested": false
+          },
+          "interactions": {},
+          "urlFlows": {},
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 2,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hello"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "fVK4Jtza9l4gjTjLtKpVKw",
+        "changedRevs": [
+          0,
+          2
+        ]
+      },
+      {
+        "mutation": {
+          "updates": [
+            {
+              "sessionUpdate": "tool_call",
+              "toolCallId": "t1",
+              "title": "Run"
+            }
+          ]
+        },
+        "live": {
+          "sessionId": "S",
+          "cwd": "/w",
+          "closing": false,
+          "op": {
+            "id": "op-2",
+            "kind": "prompt",
+            "status": "running",
+            "input": null,
+            "cancelRequested": false
+          },
+          "interactions": {},
+          "urlFlows": {},
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 3,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hello"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            },
+            {
+              "kind": "tool",
+              "call": {
+                "toolCallId": "t1",
+                "title": "Run",
+                "kind": "other",
+                "status": "pending",
+                "content": [],
+                "locations": []
+              }
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "VX2MFwXhvcWymvHxG_Cf_Q",
+        "changedRevs": [
+          0,
+          2,
+          3
+        ]
+      },
+      {
+        "mutation": {
+          "updates": [
+            {
+              "sessionUpdate": "tool_call_update",
+              "toolCallId": "t1",
+              "status": "completed"
+            }
+          ]
+        },
+        "live": {
+          "sessionId": "S",
+          "cwd": "/w",
+          "closing": false,
+          "op": {
+            "id": "op-2",
+            "kind": "prompt",
+            "status": "running",
+            "input": null,
+            "cancelRequested": false
+          },
+          "interactions": {},
+          "urlFlows": {},
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 4,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hello"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            },
+            {
+              "kind": "tool",
+              "call": {
+                "toolCallId": "t1",
+                "title": "Run",
+                "kind": "other",
+                "status": "completed",
+                "content": [],
+                "locations": []
+              }
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "cmlR-yWo_5UKA7_GWPlObg",
+        "changedRevs": [
+          0,
+          2,
+          4
+        ]
+      },
+      {
+        "mutation": {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        },
+        "live": {
+          "sessionId": "S",
+          "cwd": "/w",
+          "closing": false,
+          "op": {
+            "id": "op-2",
+            "kind": "prompt",
+            "status": "completed",
+            "input": null,
+            "cancelRequested": false
+          },
+          "interactions": {},
+          "urlFlows": {},
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 5,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hello"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            },
+            {
+              "kind": "tool",
+              "call": {
+                "toolCallId": "t1",
+                "title": "Run",
+                "kind": "other",
+                "status": "completed",
+                "content": [],
+                "locations": []
+              }
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0,
+              "end": {
+                "response": {
+                  "stopReason": "end_turn"
+                }
+              }
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "completed",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "GElUkJxV1cx7brULqjHjUw",
+        "changedRevs": [
+          0,
+          2,
+          4
+        ]
+      },
+      {
+        "mutation": {
+          "updates": []
+        },
+        "live": {
+          "sessionId": "S",
+          "cwd": "/w",
+          "closing": false,
+          "op": {
+            "id": "op-2",
+            "kind": "prompt",
+            "status": "completed",
+            "input": null,
+            "cancelRequested": false
+          },
+          "interactions": {},
+          "urlFlows": {},
+          "terminals": {}
+        },
+        "doc": null,
+        "digest": "GElUkJxV1cx7brULqjHjUw",
+        "changedRevs": [
+          0,
+          2,
+          4
+        ]
+      }
+    ],
+    "final": {
+      "epoch": "E1",
+      "rev": 5,
+      "history": "complete",
+      "entries": [
+        {
+          "kind": "message",
+          "role": "user",
+          "chunks": [
+            {
+              "content": {
+                "type": "text",
+                "text": "hi"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "message",
+          "role": "agent",
+          "chunks": [
+            {
+              "content": {
+                "type": "text",
+                "text": "Hello"
+              }
+            }
+          ],
+          "messageId": "m1"
+        },
+        {
+          "kind": "tool",
+          "call": {
+            "toolCallId": "t1",
+            "title": "Run",
+            "kind": "other",
+            "status": "completed",
+            "content": [],
+            "locations": []
+          }
+        }
+      ],
+      "prompts": [
+        {
+          "entry": 0,
+          "end": {
+            "response": {
+              "stopReason": "end_turn"
+            }
+          }
+        }
+      ],
+      "live": {
+        "sessionId": "S",
+        "cwd": "/w",
+        "closing": false,
+        "op": {
+          "id": "op-2",
+          "kind": "prompt",
+          "status": "completed",
+          "input": null,
+          "cancelRequested": false
+        },
+        "interactions": {},
+        "urlFlows": {},
+        "terminals": {}
+      }
+    },
+    "finalDigest": "GElUkJxV1cx7brULqjHjUw",
+    "snapshots": [
+      {
+        "have": null,
+        "base": "replace",
+        "length": 3,
+        "changed": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "have": {
+          "epoch": "E1",
+          "rev": 0
+        },
+        "base": "update",
+        "length": 3,
+        "changed": [
+          1,
+          2
+        ]
+      },
+      {
+        "have": {
+          "epoch": "E1",
+          "rev": 2
+        },
+        "base": "update",
+        "length": 3,
+        "changed": [
+          2
+        ]
+      },
+      {
+        "have": {
+          "epoch": "E1",
+          "rev": 4
+        },
+        "base": "update",
+        "length": 3,
+        "changed": []
+      },
+      {
+        "have": {
+          "epoch": "E1",
+          "rev": 5
+        },
+        "base": "update",
+        "length": 3,
+        "changed": []
+      },
+      {
+        "have": {
+          "epoch": "E0",
+          "rev": 3
+        },
+        "base": "replace",
+        "length": 3,
+        "changed": [
+          0,
+          1,
+          2
+        ]
+      }
+    ]
+  },
+  "global": {
+    "scope": "global",
+    "epoch": "G1",
+    "steps": [
+      {
+        "live": {
+          "op": {
+            "id": "n",
+            "kind": "none",
+            "status": "completed"
+          },
+          "sessions": {},
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "G1",
+          "rev": 0,
+          "live": {
+            "op": {
+              "id": "n",
+              "kind": "none",
+              "status": "completed"
+            },
+            "sessions": {},
+            "terminals": {}
+          }
+        },
+        "digest": "AEKlIVpRqslELbPuwzLHBw"
+      },
+      {
+        "live": {
+          "op": {
+            "id": "n",
+            "kind": "none",
+            "status": "completed"
+          },
+          "sessions": {
+            "S": {
+              "sessionId": "S",
+              "title": null
+            }
+          },
+          "terminals": {}
+        },
+        "doc": {
+          "epoch": "G1",
+          "rev": 1,
+          "live": {
+            "op": {
+              "id": "n",
+              "kind": "none",
+              "status": "completed"
+            },
+            "sessions": {
+              "S": {
+                "sessionId": "S",
+                "title": null
+              }
+            },
+            "terminals": {}
+          }
+        },
+        "digest": "3tiFKnbLBKyEWfPh8v1yng"
+      },
+      {
+        "live": {
+          "op": {
+            "id": "n",
+            "kind": "none",
+            "status": "completed"
+          },
+          "sessions": {
+            "S": {
+              "sessionId": "S",
+              "title": "T"
+            }
+          },
+          "terminals": {
+            "login": {
+              "terminalId": "login",
+              "output": "abcd",
+              "truncated": false
+            }
+          }
+        },
+        "doc": {
+          "epoch": "G1",
+          "rev": 2,
+          "live": {
+            "op": {
+              "id": "n",
+              "kind": "none",
+              "status": "completed"
+            },
+            "sessions": {
+              "S": {
+                "sessionId": "S",
+                "title": "T"
+              }
+            },
+            "terminals": {
+              "login": {
+                "terminalId": "login",
+                "output": "abcd",
+                "truncated": false
+              }
+            }
+          }
+        },
+        "digest": "ZcWQNyvFhdyxqctrRK0tOw"
+      },
+      {
+        "live": {
+          "op": {
+            "id": "n",
+            "kind": "none",
+            "status": "completed"
+          },
+          "sessions": {
+            "S": {
+              "sessionId": "S",
+              "title": "T"
+            }
+          },
+          "terminals": {
+            "login": {
+              "terminalId": "login",
+              "output": "abcd",
+              "truncated": false
+            }
+          }
+        },
+        "doc": null,
+        "digest": "ZcWQNyvFhdyxqctrRK0tOw"
+      }
+    ]
+  }
+}
