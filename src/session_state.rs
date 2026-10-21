@@ -279,6 +279,16 @@ impl SessionState {
         self.fold_overlay_update(update)
     }
 
+    /// A conversation update while no prompt runs and none awaits its commit.
+    /// The accepted update changes its entity, or continues the timeline,
+    /// whether or not a prompt is running (memory model §3.2); the turn
+    /// overlay and the log still ignore it.
+    pub(crate) fn append_idle_update(&mut self, update: &Value) {
+        if let Some(timeline) = self.timeline.as_mut() {
+            Arc::make_mut(timeline).reduce(update, None);
+        }
+    }
+
     pub(crate) fn append_reconciling_update(&mut self, update: Value) -> Result<(), MirrorError> {
         if self.phase != MirrorPhase::Reconciling || self.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);

@@ -243,9 +243,9 @@ impl SessionRegistry {
             .append_turn_update(operation_id, update)
     }
 
-    /// A conversation update outside a turn: a completed turn being
-    /// reconciled keeps it; otherwise no turn holds it, and the log is only
-    /// appended by turns and rebuilt by loads.
+    /// A conversation update outside a turn. A completed turn being reconciled
+    /// keeps it in its overlay. The timeline reduces it in both cases; the log
+    /// is still only appended by turns and rebuilt by loads.
     pub(crate) fn append_session_update(
         &mut self,
         session_id: &str,
@@ -257,7 +257,10 @@ impl SessionRegistry {
         }
         match session.phase {
             MirrorPhase::Reconciling => session.append_reconciling_update(update),
-            MirrorPhase::Ready => Ok(()),
+            MirrorPhase::Ready => {
+                session.append_idle_update(&update);
+                Ok(())
+            }
             _ => Err(MirrorError::WrongPhase),
         }
     }
@@ -929,6 +932,75 @@ mod tests {
             prompts(&mirror),
             json!([{ "entry": 2, "end": { "response": { "stopReason": "end_turn" } } }])
         );
+    }
+
+    #[test]
+    fn an_update_between_prompts_is_reduced_into_the_timeline() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
+        // A thought is a different role from the last entry, so it starts one.
+        mirror
+            .append_session_update(
+                "session",
+                json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "n",
+                        "content": text("unprompted") }),
+            )
+            .unwrap();
+        assert_eq!(
+            entries_from(&mirror, 2),
+            json!([{ "kind": "message", "role": "thought", "messageId": "n",
+                     "chunks": [{ "content": text("unprompted") }] }])
+        );
+        // The session is still idle and no prompt was invented for the update.
+        let state = mirror.state("session").unwrap();
+        assert_eq!(state.phase, MirrorPhase::Ready);
+        assert!(state.active_turn.is_none());
+        assert_eq!(prompts(&mirror), json!([]));
+    }
+
+    #[test]
+    fn a_late_tool_update_between_prompts_changes_its_entry_in_place() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        mirror
+            .append_turn_update(
+                "session",
+                &operation,
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "Run" }),
+            )
+            .unwrap();
+        mirror
+            .complete_turn("session", &operation, json!({ "stopReason": "end_turn" }))
+            .unwrap();
+        mirror.commit_completed_turn("session", &operation).unwrap();
+        assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
+
+        mirror
+            .append_session_update(
+                "session",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "completed" }),
+            )
+            .unwrap();
+        let entries = entries_from(&mirror, 2);
+        assert_eq!(entries.as_array().unwrap().len(), 2, "no entry was added");
+        assert_eq!(entries[1]["call"]["status"], json!("completed"));
+    }
+
+    #[test]
+    fn an_idle_update_for_a_session_with_unknown_history_changes_nothing() {
+        let mut mirror = mirror();
+        mirror.register_cold("session");
+        // A cold session is not Ready: the update is refused, as before.
+        assert!(
+            mirror
+                .append_session_update("session", agent_update("early", "x"))
+                .is_err()
+        );
+        assert!(mirror.state("session").unwrap().timeline.is_none());
     }
 
     #[test]
