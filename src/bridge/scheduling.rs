@@ -565,10 +565,11 @@ impl IngressSender {
                     SessionNotification::parse_message(message.method(), message.params())
                         .map_err(super::error_message)?;
                 super::relay_bytes(&notification).map_err(super::error_message)?;
+                let envelope = notification.meta.map(serde_json::Value::Object);
                 let update =
                     serde_json::to_value(notification.update).map_err(|error| error.to_string())?;
                 let conversation = super::is_conversation_update(&update);
-                replay.ingest(update, conversation)
+                replay.ingest_with_meta(update, conversation, envelope.as_ref())
             })();
             if let Err(message) = result {
                 replay.reject(message.clone());

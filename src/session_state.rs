@@ -261,10 +261,20 @@ impl SessionState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn append_turn_update(
         &mut self,
         operation_id: &str,
         update: Value,
+    ) -> Result<(), MirrorError> {
+        self.append_turn_update_with_meta(operation_id, update, None)
+    }
+
+    pub(crate) fn append_turn_update_with_meta(
+        &mut self,
+        operation_id: &str,
+        update: Value,
+        envelope: Option<&Value>,
     ) -> Result<(), MirrorError> {
         if self.phase != MirrorPhase::Running {
             return Err(MirrorError::WrongPhase);
@@ -276,27 +286,35 @@ impl SessionState {
         if turn.operation_id != operation_id || turn.terminal.is_some() {
             return Err(MirrorError::OperationMismatch);
         }
-        self.fold_overlay_update(update)
+        self.fold_overlay_update(update, envelope)
     }
 
     /// A conversation update while no prompt runs and none awaits its commit.
     /// The accepted update changes its entity, or continues the timeline,
     /// whether or not a prompt is running (memory model §3.2); the turn
     /// overlay and the log still ignore it.
-    pub(crate) fn append_idle_update(&mut self, update: &Value) {
+    pub(crate) fn append_idle_update(&mut self, update: &Value, envelope: Option<&Value>) {
         if let Some(timeline) = self.timeline.as_mut() {
-            Arc::make_mut(timeline).reduce(update, None);
+            Arc::make_mut(timeline).reduce(update, envelope);
         }
     }
 
-    pub(crate) fn append_reconciling_update(&mut self, update: Value) -> Result<(), MirrorError> {
+    pub(crate) fn append_reconciling_update(
+        &mut self,
+        update: Value,
+        envelope: Option<&Value>,
+    ) -> Result<(), MirrorError> {
         if self.phase != MirrorPhase::Reconciling || self.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);
         }
-        self.fold_overlay_update(update)
+        self.fold_overlay_update(update, envelope)
     }
 
-    fn fold_overlay_update(&mut self, update: Value) -> Result<(), MirrorError> {
+    fn fold_overlay_update(
+        &mut self,
+        update: Value,
+        envelope: Option<&Value>,
+    ) -> Result<(), MirrorError> {
         let turn = self
             .active_turn
             .as_ref()
@@ -310,7 +328,7 @@ impl SessionState {
         // Reduced only once the fold accepted the update, so a rejected one
         // leaves the timeline as it was.
         if let Some(timeline) = self.timeline.as_mut() {
-            Arc::make_mut(timeline).reduce(&update, None);
+            Arc::make_mut(timeline).reduce(&update, envelope);
         }
         Ok(())
     }
