@@ -7,10 +7,15 @@
 //! ([`Timeline::begin_prompt`], [`Timeline::end_prompt`]). Turns are not stored;
 //! [`Timeline::turns`] derives them.
 //!
+//! Entries are shared structurally (`Arc<Entry>`): cloning a timeline copies
+//! pointers, and an update copies only the entry it changes, so a held view of the
+//! timeline never makes an update allocate in proportion to unrelated content.
+//!
 //! Content blocks are kept as received. Replacing byte-carrying blocks with
 //! attachment references is a wire concern of the projection, not of this memory.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -145,7 +150,7 @@ struct Sent {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Timeline {
-    entries: Vec<Entry>,
+    entries: Vec<Arc<Entry>>,
     prompts: Vec<Prompt>,
     places: HashMap<Entity, usize>,
     /// The user entry that started the current turn, if any (§5).
@@ -167,7 +172,7 @@ impl Timeline {
         timeline
     }
 
-    pub(crate) fn entries(&self) -> &[Entry] {
+    pub(crate) fn entries(&self) -> &[Arc<Entry>] {
         &self.entries
     }
 
@@ -255,7 +260,7 @@ impl Timeline {
         let mut starts: Vec<usize> = Vec::new();
         let mut opener: Option<usize> = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            if !matches!(entry, Entry::Message(m) if m.role == Role::User) {
+            if !matches!(&**entry, Entry::Message(m) if m.role == Role::User) {
                 continue;
             }
             if self.continues_turn(opener, index) {
@@ -281,7 +286,7 @@ impl Timeline {
 
     /// Whether the user entry at `index` continues the turn `opener` started.
     fn continues_turn(&self, opener: Option<usize>, index: usize) -> bool {
-        let id = |i: usize| match &self.entries[i] {
+        let id = |i: usize| match &*self.entries[i] {
             Entry::Message(message) => message.message_id.as_deref(),
             _ => None,
         };
@@ -290,7 +295,7 @@ impl Timeline {
 
     fn push(&mut self, entry: Entry) -> usize {
         let index = self.entries.len();
-        self.entries.push(entry);
+        self.entries.push(Arc::new(entry));
         if self.sent.as_ref().is_some_and(|sent| sent.entry != index) {
             self.sent = None;
         }
@@ -332,15 +337,20 @@ impl Timeline {
             self.sent = None;
             start_new = true;
         }
-        if !start_new
-            && let Some(Entry::Message(last)) = self.entries.last_mut()
-            && last.role == role
-            && compatible(last.message_id.as_deref(), message_id.as_deref())
-        {
-            if last.message_id.is_none() {
-                last.message_id = message_id;
+        let joins = !start_new
+            && matches!(
+                self.entries.last().map(|entry| &**entry),
+                Some(Entry::Message(last))
+                    if last.role == role
+                        && compatible(last.message_id.as_deref(), message_id.as_deref())
+            );
+        if joins {
+            if let Some(Entry::Message(last)) = self.entries.last_mut().map(Arc::make_mut) {
+                if last.message_id.is_none() {
+                    last.message_id = message_id;
+                }
+                join(&mut last.chunks, chunk);
             }
-            join(&mut last.chunks, chunk);
             return;
         }
         self.push_message(role, message_id, vec![chunk]);
@@ -352,19 +362,24 @@ impl Timeline {
         let Some(sent) = &mut self.sent else {
             return false;
         };
-        let Some(Entry::Message(entry)) = self.entries.get_mut(sent.entry) else {
-            return false;
-        };
         let Some(expected) = sent.blocks.get_mut(sent.matched) else {
             return false;
         };
-        if expected.content != chunk.content
-            || !compatible(entry.message_id.as_deref(), message_id.as_deref())
-        {
+        let id_fits = match self.entries.get(sent.entry).map(|entry| &**entry) {
+            Some(Entry::Message(entry)) => {
+                compatible(entry.message_id.as_deref(), message_id.as_deref())
+            }
+            _ => return false,
+        };
+        if expected.content != chunk.content || !id_fits {
             return false;
         }
         expected.meta = chunk.meta.clone();
         expected.notification_meta = chunk.notification_meta.clone();
+        let Some(Entry::Message(entry)) = self.entries.get_mut(sent.entry).map(Arc::make_mut)
+        else {
+            return false;
+        };
         if entry.message_id.is_none() {
             entry.message_id = message_id.clone();
         }
@@ -387,7 +402,7 @@ impl Timeline {
         let entity = Entity::Tool(tool_call_id.to_owned());
         match self.places.get(&entity).copied() {
             Some(index) => {
-                if let Entry::Tool(tool) = &mut self.entries[index] {
+                if let Entry::Tool(tool) = Arc::make_mut(&mut self.entries[index]) {
                     if let Some(call) = tool.call.as_object_mut() {
                         call.extend(patch);
                     }
@@ -412,7 +427,7 @@ impl Timeline {
         let state = PlanState::Legacy(untagged(update));
         match self.legacy_plan {
             Some(index) => {
-                if let Entry::Plan(plan) = &mut self.entries[index] {
+                if let Entry::Plan(plan) = Arc::make_mut(&mut self.entries[index]) {
                     plan.state = state;
                     if let Some(envelope) = envelope {
                         plan.notification_meta = Some(envelope.clone());
@@ -434,7 +449,7 @@ impl Timeline {
         let entity = Entity::Plan(plan_id.to_owned());
         match self.places.get(&entity).copied() {
             Some(index) => {
-                if let Entry::Plan(plan) = &mut self.entries[index] {
+                if let Entry::Plan(plan) = Arc::make_mut(&mut self.entries[index]) {
                     plan.state = state;
                     if let Some(envelope) = envelope {
                         plan.notification_meta = Some(envelope.clone());
@@ -488,7 +503,7 @@ impl Timeline {
                 index
             }
         };
-        let Entry::Compaction(entry) = &mut self.entries[index] else {
+        let Entry::Compaction(entry) = Arc::make_mut(&mut self.entries[index]) else {
             return;
         };
         if let Some(status) = update.get("status") {
@@ -526,7 +541,7 @@ impl Timeline {
             meta: meta(update),
             notification_meta: envelope.cloned(),
         };
-        if let Entry::Compaction(entry) = &mut self.entries[index] {
+        if let Entry::Compaction(entry) = Arc::make_mut(&mut self.entries[index]) {
             join(&mut entry.summary, chunk);
         }
     }
@@ -612,5 +627,7 @@ fn tool_patch(update: &Value, announce: bool) -> Map<String, Value> {
     patch
 }
 
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod tests;

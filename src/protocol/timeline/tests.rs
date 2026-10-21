@@ -587,7 +587,7 @@ fn the_current_turn_cursor_agrees_with_the_derived_turns() {
     // One legacy plan entry per turn, each in its own turn.
     for turn in &turns {
         let plans = (turn.start..turn.end)
-            .filter(|&i| matches!(timeline.entries()[i], Entry::Plan(_)))
+            .filter(|&i| matches!(&*timeline.entries()[i], Entry::Plan(_)))
             .count();
         assert_eq!(plans, 1);
     }
