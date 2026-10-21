@@ -6,6 +6,7 @@ use crate::history_cache::HistoryCacheError;
 use crate::history_replay::Replay;
 use crate::protocol::canon::TurnLog;
 use crate::protocol::registry::SessionLog;
+use crate::protocol::timeline::History;
 use crate::runtime_state::SessionOperationKind;
 #[cfg(test)]
 pub(crate) use crate::session_registry::SessionRegistry as SessionMirror;
@@ -192,7 +193,10 @@ impl SessionRegistry {
             session.log = SessionLog::Known(log.unwrap_or_default());
         }
         if session.timeline.is_none() {
+            // The context the Agent gave is no replay: what came before is not
+            // known to be there (memory model §6.1).
             session.timeline = Some(Arc::default());
+            session.history = Some(History::Partial);
         }
         session.history_settled();
         Ok(())
@@ -467,6 +471,7 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::timeline::History;
     use crate::runtime_state::SessionOperationKind;
     use serde_json::json;
 
@@ -697,6 +702,64 @@ mod tests {
         assert!(mirror.state("cold").unwrap().timeline.is_none());
         let new = mirror.state("new").unwrap().timeline.as_ref().unwrap();
         assert!(new.entries().is_empty());
+    }
+
+    fn history(mirror: &SessionMirror, session_id: &str) -> Option<History> {
+        mirror.state(session_id).unwrap().history
+    }
+
+    #[test]
+    fn history_is_unknown_for_a_cold_session_and_complete_for_a_new_one() {
+        let mut mirror = mirror();
+        mirror.register_cold("cold");
+        mirror.register_new("new");
+        assert_eq!(history(&mirror, "cold"), None);
+        assert_eq!(history(&mirror, "new"), Some(History::Complete));
+    }
+
+    #[test]
+    fn a_successful_empty_load_is_complete_not_unknown() {
+        let mut mirror = mirror();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "load").unwrap();
+        assert_eq!(history(&mirror, "session"), None);
+        mirror.commit_load("session", "load").unwrap();
+        assert_eq!(history(&mirror, "session"), Some(History::Complete));
+        assert!(timeline_entries(&mirror).as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resume_without_a_replay_gives_partial_history_and_a_load_makes_it_complete() {
+        let mut mirror = mirror();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "resume").unwrap();
+        mirror
+            .append_load_update("session", "resume", user_update("cached"))
+            .unwrap();
+        mirror.commit_attachment_cache("session", "resume").unwrap();
+        assert_eq!(history(&mirror, "session"), Some(History::Partial));
+
+        // A second resume keeps the status of the timeline it already has.
+        mirror.begin_load("session", "again").unwrap();
+        mirror.commit_attachment_cache("session", "again").unwrap();
+        assert_eq!(history(&mirror, "session"), Some(History::Partial));
+
+        mirror.begin_load("session", "load").unwrap();
+        mirror.commit_load("session", "load").unwrap();
+        assert_eq!(history(&mirror, "session"), Some(History::Complete));
+    }
+
+    #[test]
+    fn going_on_with_the_context_the_agent_gave_is_partial_and_keeps_a_known_status() {
+        let mut mirror = mirror();
+        mirror.register_cold("cold");
+        mirror.use_cached_history("cold", None).unwrap();
+        assert_eq!(history(&mirror, "cold"), Some(History::Partial));
+        assert!(mirror.state("cold").unwrap().timeline.is_some());
+
+        mirror.register_new("new");
+        mirror.use_cached_history("new", None).unwrap();
+        assert_eq!(history(&mirror, "new"), Some(History::Complete));
     }
 
     #[test]

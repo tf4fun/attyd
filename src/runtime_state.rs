@@ -291,6 +291,7 @@ impl SessionRegistry {
             .expect("the session was opened");
         entry.state.log = waiting.log;
         entry.state.timeline = waiting.timeline;
+        entry.state.history = waiting.history;
         entry
             .state
             .live
@@ -2242,6 +2243,8 @@ mod tests {
             ),
         );
         let held = state.state("session").unwrap().timeline.clone().unwrap();
+        let history = state.state("session").unwrap().history;
+        assert_eq!(history, Some(crate::protocol::timeline::History::Complete));
 
         let waiting = state
             .wait_for_next_connection("session")
@@ -2250,6 +2253,7 @@ mod tests {
         next.seed_waiting(waiting).unwrap();
 
         let restored = next.state("session").unwrap().timeline.clone().unwrap();
+        assert_eq!(next.state("session").unwrap().history, history);
         assert!(Arc::ptr_eq(&held, &restored));
         assert_eq!(restored.entries().len(), 1);
     }

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::SessionControls;
 use super::canon::TurnLog;
-use super::timeline::Timeline;
+use super::timeline::{History, Timeline};
 use super::documents::{
     End, EndReason, ErrorCode, ExitStatus, LoginTerminal, OperationKind, ProtocolError, Scope,
 };
@@ -39,6 +39,7 @@ pub(crate) struct WaitingSession {
     pub controls: SessionControls,
     pub log: SessionLog,
     pub timeline: Option<Arc<Timeline>>,
+    pub history: Option<History>,
     pub op: OpSlot,
 }
 
@@ -634,6 +635,7 @@ impl SessionRegistry {
             controls: live.controls.clone(),
             log: entry.state.log.clone(),
             timeline: entry.state.timeline.clone(),
+            history: entry.state.history,
             op: live.op.clone(),
         })
     }
@@ -847,6 +849,7 @@ impl SessionRegistry {
     pub(crate) fn replace_session_timeline(&mut self, session_id: &str, timeline: Timeline) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
             entry.state.timeline = Some(Arc::new(timeline));
+            entry.state.history = Some(History::Complete);
         }
     }
 
@@ -857,6 +860,7 @@ impl SessionRegistry {
             && entry.state.timeline.is_none()
         {
             entry.state.timeline = Some(Arc::new(timeline));
+            entry.state.history = Some(History::Partial);
         }
     }
 
