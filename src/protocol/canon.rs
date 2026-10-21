@@ -341,7 +341,7 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
-fn write_string(text: &str, out: &mut Vec<u8>) {
+pub(super) fn write_string(text: &str, out: &mut Vec<u8>) {
     out.push(b'"');
     for c in text.chars() {
         match c {
@@ -360,7 +360,7 @@ fn write_string(text: &str, out: &mut Vec<u8>) {
 }
 
 /// A number as ECMAScript's `Number.prototype.toString` writes the double.
-fn canonical_number(number: &serde_json::Number) -> String {
+pub(super) fn canonical_number(number: &serde_json::Number) -> String {
     const EXACT: i64 = 1 << 53;
     if let Some(integer) = number.as_i64()
         && (-EXACT..=EXACT).contains(&integer)
