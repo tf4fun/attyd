@@ -239,6 +239,101 @@ async fn global_writes_need_the_current_ended_op_and_replace_it() {
     watch.converged(&bench).await;
 }
 
+/// A fork occupies `global` while it runs (protocol §6.2, memory model §9): a
+/// session being installed has one installing operation, so what it receives
+/// before its ID is known has one owner.
+fn fork_capabilities() -> Value {
+    json!({
+        "protocolVersion": 1,
+        "agentCapabilities": {
+            "auth": {"logout": {}},
+            "sessionCapabilities": {"close": {}, "delete": {}, "fork": {}},
+        },
+        "authMethods": [{"id": "agent-login", "name": "Login"}],
+    })
+}
+
+#[tokio::test]
+async fn a_fork_is_refused_while_a_global_operation_runs() {
+    let (bench, mut link) = Bench::ws_initialized(fork_capabilities()).await;
+    let created = bench.create(&mut link, "s", json!({})).await;
+    let open = bench.expect_of("session/s").await;
+    let mut watch = bench.watch(&scopes(&["global"])).await;
+    watch
+        .until("the alignment", |watch| watch.has("global"))
+        .await;
+
+    let (status, body) = bench
+        .op(
+            "global",
+            &created,
+            "authenticate",
+            json!({"methodId": "agent-login"}),
+        )
+        .await;
+    let auth = assert_accepted(status, &body, "authenticate");
+    let request = link.request("authenticate").await;
+    watch
+        .until_live("global", "the authentication runs", |live| {
+            live["op"]["id"] == auth
+        })
+        .await;
+
+    let before = bench.document("session/s").await;
+    let (status, body) = bench.op("session/s", &open, "fork", json!({})).await;
+    not_allowed(status, &body, "a fork while global is not free");
+    link.quiet(QUIET).await;
+    assert_eq!(
+        bench.document("session/s").await,
+        before,
+        "a refused fork changes nothing"
+    );
+
+    link.reply(&request, json!({})).await;
+    watch.until_op("global", &auth, "completed").await;
+    let forked = bench.spawn_op("session/s", &open, "fork", json!({}));
+    let request = link.request("session/fork").await;
+    link.reply(&request, json!({"sessionId": "forked"})).await;
+    let (status, body) = forked.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "a fork once global is free: {body}");
+}
+
+#[tokio::test]
+async fn a_global_write_is_refused_while_a_fork_runs() {
+    let (bench, mut link) = Bench::ws_initialized(fork_capabilities()).await;
+    let created = bench.create(&mut link, "s", json!({})).await;
+    let open = bench.expect_of("session/s").await;
+
+    let forked = bench.spawn_op("session/s", &open, "fork", json!({}));
+    let request = link.request("session/fork").await;
+    let before = bench.document("global").await;
+    for (kind, args) in [
+        ("create", json!({"cwd": CWD})),
+        ("delete", json!({"sessionId": "s"})),
+        ("authenticate", json!({"methodId": "agent-login"})),
+        ("logout", json!({})),
+        (
+            "terminal_login",
+            json!({"methodId": "agent-login", "cols": 80, "rows": 24}),
+        ),
+    ] {
+        let (status, body) = bench.op("global", &created, kind, args).await;
+        not_allowed(status, &body, &format!("{kind} while a fork installs"));
+    }
+    link.quiet(QUIET).await;
+    assert_eq!(
+        bench.document("global").await,
+        before,
+        "refused writes change nothing"
+    );
+
+    link.reply(&request, json!({"sessionId": "forked"})).await;
+    let (status, body) = forked.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The fork has ended: global is free again and a create is admitted.
+    bench.create(&mut link, "next", json!({})).await;
+}
+
 #[tokio::test]
 async fn a_list_needs_the_current_ended_catalog_op() {
     let (bench, mut link) = Bench::ws(json!({"sessionCapabilities": {"list": {}}})).await;

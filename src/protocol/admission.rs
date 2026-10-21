@@ -138,8 +138,31 @@ pub(crate) fn admit(
             format!("session/{session_id} is not free"),
         ));
     }
-    let initialize = publisher
-        .live(&Scope::Global)
+    // A fork occupies `global` while it runs (protocol §6.2): one session is
+    // installed at a time, so what it receives before its ID is known has one
+    // owner (bridge memory model §9). A fork needs `global` free, and a write
+    // in `global` needs no fork running.
+    let global = publisher.live(&Scope::Global);
+    if kind == OperationKind::Fork
+        && global.is_some_and(|global| global["op"]["status"] == "running")
+    {
+        return Err(refuse(ErrorCode::NotAllowed, "global is not free"));
+    }
+    if matches!(scope, Scope::Global)
+        && global
+            .and_then(|global| global["sessions"].as_object())
+            .is_some_and(|sessions| {
+                sessions.values().any(|session| {
+                    session["op"]["kind"] == "fork" && session["op"]["status"] == "running"
+                })
+            })
+    {
+        return Err(refuse(
+            ErrorCode::NotAllowed,
+            "a fork is installing a session",
+        ));
+    }
+    let initialize = global
         .map(|global| &global["agent"]["initialize"])
         .filter(|initialize| !initialize.is_null());
     capability(initialize, kind)?;
