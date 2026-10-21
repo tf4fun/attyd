@@ -30,6 +30,7 @@ pub(crate) mod registry;
 #[cfg(test)]
 pub(crate) mod stream_check;
 pub(crate) mod timeline;
+pub(crate) mod timeline_doc;
 #[cfg(test)]
 mod typescript;
 pub(crate) mod wire;
