@@ -1,93 +1,64 @@
 # Client API design rationale
 
-This document explains choices behind [简易 Agent 交互协议](protocol.md), the
-project-defined FE ↔ bridge protocol. The wire contract and its current design
-requirements live only there; implementation and migration live in
-[state-sync.md](state-sync.md). This document defines no additional fields,
+This document explains the choices behind [简易 Agent 交互协议](protocol.md), the
+project-defined FE ↔ bridge protocol. The wire contract lives only there; layer 1 (ACP →
+bridge memory) lives in the [bridge memory model](bridge-memory-model.md); implementation
+and migration live in [state-sync.md](state-sync.md). This document defines no fields,
 endpoints or lifecycle rules.
 
-Status: **revision 2 target (#51), reviewed design #52; sequencing clarified
-2026-10-20.** Complete the bridge's ACP functionality and authoritative memory
-first, then finish client synchronization, verification and repair. Existing
-replication mechanisms are a working baseline for that second stage, not a reason
-to narrow ACP content. See the [source matrix](acp-bridge-matrix.md) and
-[second-stage design requirements](protocol.md#12-synchronization-design-requirements).
-The experimental runtime has not yet completed this target; the
-[plan](state-sync.md#7-fidelity-migration-revision-2) tracks its status.
+Status: **revision 3 proposal, 2026-10-21.**
 
 ## 1. Scope
 
-The authority order is `FE < bridge memory < ACP server`. The bridge is an ordinary
-ACP client and has no persistence layer. Clients present the displayable and
-actionable memory the bridge actually holds; their drafts, disclosure state and
-unconfirmed cached history cannot restore authority the bridge lacks.
+The authority order is `FE < bridge memory < ACP server`. The bridge is an ordinary,
+memory-only ACP client; `session/load` is the only history recovery path. Clients
+present the memory the bridge holds; their drafts, folding and cached content cannot
+restore authority the bridge lacks.
 
-A faithful first layer and a converged second layer prove different things.
-Comparing a replica with a lossy projection misses an ACP content loss; checking a
-cached hash or applying a patch alone does not verify the installed content.
-That is why the plan completes and directly checks ACP behavior and memory before
-finalizing the FE protocol.
+The two layers prove different things. Layer 1 shows that bridge memory faithfully
+reduces what ACP gave. Layer 2 shows that every client's replica equals that memory,
+can tell when it does not, and recovers. A replica that equals a lossy projection
+proves nothing about ACP fidelity, which is why layer 1 is specified and tested first.
 
-## 2. Why this model
+## 2. Goals
 
-The useful Raft analogy is one authority supplying ordered state and replacing a
-replica's conflicting suffix. attyd has one bridge, no election or votes, no term,
-and no persistent consensus log. The analogy does not require another distributed
-system inside the bridge. A fresh or returning presentation client should follow
-the same synchronization rules.
+1. **Reliable, verifiable, recoverable synchronization** of bridge memory.
+2. **Push to every subscriber** when memory changes.
+3. **Correct concurrent and repeated requests** from several clients.
 
-The original simplification removed content when a turn ended. That made the
-representation too weak: a tool result, thought, plan, metadata or terminal output
-may still be needed after the operation finishes. The correction is to retain the
-semantic entities and their results, while releasing execution handles and
-superseded patches. Folding a card remains a presentation choice.
+The analogy is one leader replicating ordered state to read-only replicas that replace
+any conflicting state from it. There is one bridge, no election and no persistent log;
+the analogy does not require a distributed system inside the bridge.
 
 ## 3. Decisions and tradeoffs
 
-These choices explain the current target and baseline. The linked protocol section
-is the contract; an unresolved second-stage choice is not finalized by this table.
-
-| Choice | Reason and tradeoff | Contract or follow-up |
+| Choice | Reason and tradeoff | Contract |
 | --- | --- | --- |
-| Keep reduced timeline entities, not an unlimited raw event archive | Entity updates preserve current meaning and order without retaining every prior patch. One entity is not split between log and a correction table. | [Reduction](protocol.md#32-reduction) |
-| Preserve sparse tool state as ACP `ToolCallUpdate` | A permission or first update can contain only an ID. Required `ToolCall` fields would force invented values; absent information must remain absent. | [Entries](protocol.md#31-entries) |
-| Keep legacy plan snapshots per turn; ID-addressed plans have session identity | The legacy type has no ID; treating it like an ID-addressed plan would invent identity. | [Reduction](protocol.md#32-reduction) |
-| Settle every sent prompt, including failure or interruption | Received content is not withdrawn by a later error. Unobserved outcomes cannot become successful stop reasons. | [Settling](protocol.md#33-turns-and-settling) |
-| Hash the entire published entry, including its observed result | Omitting `end`, metadata or tool results would let different entries appear equal. This does not itself prove that a client verifies the entry it installs. | [Hash chain](protocol.md#34-hash-chain), [verification requirements](protocol.md#12-synchronization-design-requirements) |
-| Let a complete Agent replay replace live-observed history | A replay normally lacks the live PromptResponse and may contain different detail or IDs. Equal reduction input gives equal items; live and replay need not give equal entries. Inventing missing detail to keep hashes equal would reverse authority. | [History status](protocol.md#35-history-status) |
-| Rewrite a settled entity at its existing position | A second mutable correction store would split one entity's state. Recomputing the subsequent chain costs work; optimize only if measurements justify it. | [Settling](protocol.md#33-turns-and-settling) |
-| Keep between-prompt content in the tail until a settle point | Streaming can use the existing mutable-state path without pretending each update is a separate prompt. | [Settling](protocol.md#33-turns-and-settling) |
-| Start with head alignment and full replacement on mismatch | One fallback covers reconnect and divergent history. Multiple sample points are only a possible optimization; full replacement is valid if its content is verified. | [Stream baseline](protocol.md#5-stream), [design requirements](protocol.md#12-synchronization-design-requirements) |
-| Use current operation admission instead of a retained intent/result system | An admitted new operation replaces the old `expect`; no ABA is introduced by returning to the same history. But `stale` cannot distinguish an admitted lost request from a competing write. | [Admission](protocol.md#64-admission) |
-| Keep uncertain writes for the user, without automatic resend | A write with no definite answer may already have run. A user submitting again is new input. At-most-once interaction answers are the stated exception; terminal input is not idempotent. | [Client rules](protocol.md#1-model), [actions](protocol.md#7-actions) |
-| Keep current results, with held HTTP responses for create/fork/list | The initiating client receives the needed result even if the visible operation is replaced. Losing that response loses it for that client; there is no historical result lookup guarantee. | [Responses](protocol.md#63-response) |
-| Serialize global operations and give listing its own scope | Create/delete/authentication share the global slot; listing need not be blocked by them. | [Operation kinds](protocol.md#62-kinds) |
-| Release only sessions the Agent can load or resume | Otherwise a first or returning subscriber could lose an unrecoverable session. A resume-only release trades memory for incomplete history and must return `partial`. | [Holding](protocol.md#1-model), [history status](protocol.md#35-history-status) |
-| Run controls and close as actions, including during a prompt | ACP permits these actions without another exclusive operation slot. Their actual unfinished requests keep the session needed until ordered completion is applied. | [Actions](protocol.md#7-actions), [implementation](state-sync.md#71-design) |
-| Scope interactions by their real ACP request/session | An operation may outlive one RPC or end before an independent interaction. Unknown parents are not guessed; current request correlation suffices without request history. | [Interactions](protocol.md#44-operations-and-interactions) |
-| Keep accepted URL outcomes on the flow until dismissal or scope end | A transient notification would leave a fresh replica unable to distinguish completion from disappearance. Parent response ends unanswered interactions, not an already accepted external flow. | [Resources](protocol.md#46-resources) |
-| Separate terminal handles from referenced output | Releasing execution must not erase output embedded in a tool. Frozen output holds no live work and is reclaimed when no retained content references it. | [Resources](protocol.md#46-resources) |
-| Keep diagnostics optional and bounded if adopted | Agent stderr and MCP activity can help users, but do not turn every service RPC into session history. Scope and bounds belong to later presentation work. | [Diagnostics proposal](protocol.md#47-diagnostics), plan step 19 |
+| Replicate the memory model's flat entries, derive turns in the client | Load replay and live prompts build one structure (memory model §1); a turn-shaped wire log would reintroduce a structure only one path produces. The client needs one shared derivation function, tested against the bridge's fixtures. | [Session history](protocol.md#3-session-history) |
+| `epoch` + `rev` instead of a hash chain | Live and replayed turns never hashed equal (replays lack `PromptResponse` and the sent prompt's shape), so the chain only helped same-process reconnects, where a version is enough. Late updates no longer rehash every later entry. A new epoch never reuses content, so a reload always replaces. | [Synchronization](protocol.md#54-synchronization) |
+| Per-entry `rev` and differential snapshots | A reconnect within an epoch resends only entries changed since the client's `rev`, including a late update to an early entry. Costs one integer per entry in the bridge. | [Events](protocol.md#52-events) |
+| Client-computed digest at snapshots and checkpoints | Comparing hashes the client was handed proves nothing about what it installed; recomputing over its own replica does, for entries and mutable `live` state alike. Costs JCS and SHA-256 on both sides, with per-entry caching; checkpoints are debounced. | [Verification](protocol.md#55-verification) |
+| Full resubscription after a digest mismatch | Once content is known to differ, no part of the replica can be trusted cheaply; a full snapshot is the one simple repair. Partial repair would need per-part digests without a demonstrated benefit. | [Verification](protocol.md#55-verification) |
+| Per-scope atomicity only | Events are per scope; promising cross-scope atomicity (for example a session's installation across `global` and its own scope) would be untrue. Clients tolerate the intermediate state. | [Several clients](protocol.md#56-several-clients) |
+| Operation admission by `expect`, IDs chosen by the client | `expect` serializes competing operations with no lock or request table. A client-chosen `id` makes a repeat harmless and, with the recorded `after`, lets a lost answer be resolved from the replica in the common cases. Two or more operations later it is unknown, which is left to the user. | [Admission](protocol.md#64-admission), [repeats](protocol.md#66-repeats-races-and-lost-answers) |
+| Every operation answers `202`; results live in the document | One result path for every client, including ones that did not write. `origin` identifies a created session; `catalog.pages` keeps listing results. No HTTP response is held open for minutes. | [Response](protocol.md#63-response) |
+| `fork` also occupies `global` | One installation at a time makes a not-yet-installed session's resources and notifications attributable without a provisional owner (memory model §9). Forks wait for a create or login. | [Kinds](protocol.md#62-kinds) |
+| Controls and close are actions, also during a prompt | ACP allows them while the Agent generates; they need no exclusive slot. Their responses apply to the session generation they were sent for. | [Actions](protocol.md#7-actions) |
+| Interaction answers at most once, independently | Each Agent request has its own response; two clients may answer two interactions, and of two answers to one, exactly one is delivered. | [Actions](protocol.md#7-actions) |
+| Content-addressed attachments | A separately read block can be verified against its reference; prompts can reuse a block by reference. | [Reads](protocol.md#8-reads) |
+| Diagnostics optional and bounded | Useful, but not session history and not part of basic ACP conformance. | [Diagnostics](protocol.md#47-diagnostics) |
 
-The representation decisions still open in the first layer—fork history source,
-pre-installation resource attribution, and source-level metadata—remain in the
-[source matrix](acp-bridge-matrix.md). No rationale above resolves them by implication.
-The second stage must also define content equality and verification, mutable-state
-divergence detection, resource-read association, ordering and repair before it can
-claim a complete client contract.
+## 4. Acceptance
 
-## 11. Acceptance
-
-The original **cases 1–37** and all their subcases are maintained in
-[Protocol acceptance](protocol-acceptance.md), with stable anchors `a01`–`a37`.
-The [source matrix](acp-bridge-matrix.md) adds ACP field-level cases; the
-[protocol's second-stage requirements](protocol.md#12-synchronization-design-requirements)
-add independent content-verification and repair cases.
+The original cases 1–37 are maintained in [Protocol acceptance](protocol-acceptance.md)
+(`a01`–`a37`); layer-1 cases are in [audit §9.4](acp-fidelity-audit.md#94-direct-acceptance)
+and [memory model §10](bridge-memory-model.md#10-acceptance); layer-2 verification and
+repair cases are in [protocol §12.4](protocol.md#124-independent-acceptance).
 
 ## History
 
-The prior proposal, duplicated rule tables and migration narrative are available
-at the fixed experimental baseline
+Revision 2's rationale (turn log, hash chain, held responses) is at
+[`7ceca79`](https://github.com/tf4fun/attyd/blob/7ceca793d0733b0c3ac62d3bcfba4b31e2c119f5/docs/client-api-redesign.md);
+earlier proposals are at
 [`991b053`](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/client-api-redesign.md).
-They explain earlier choices but do not override today's contract or plan.
-The abandoned draft review remains a [historical review](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/protocol-v2-review.md).
+They explain earlier choices but do not override today's contract.

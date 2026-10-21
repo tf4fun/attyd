@@ -7,17 +7,22 @@ already pass. The [implementation plan](state-sync.md#7-fidelity-migration-revis
 assigns the work; the [ACP source matrix](acp-bridge-matrix.md) adds field-level
 first-layer coverage.
 
-S1–S8/C1–C3 refer to [protocol rules](protocol.md#1-model). The section references
-in case titles retain the original proposal's numbering: old §4.1 maps to
-[log](protocol.md#3-log), §4.2/§4.3 to
+**Revision 3 (2026-10-21).** Rules S1–S8 of revision 2 map to
+[memory model](bridge-memory-model.md) (content, settling, resources) and to protocol
+rules B1–B6 (documents, versions, holding); C1–C3 keep their names
+([protocol rules](protocol.md#1-model)). Cases that assert the hash chain, `have=<n>:<h_n>`,
+settle points or held `create`/`fork`/`list` responses are read as the revision 3
+mechanism: `epoch`/`rev`, differential snapshots, digests, and `202` with results in the
+document. The section references in case titles retain the original proposal's
+numbering: old §4.1 maps to [session history](protocol.md#3-session-history), §4.2/§4.3 to
 [live documents and resources](protocol.md#4-live-documents), §5.2 to
 [synchronization](protocol.md#54-synchronization), §6.1/§6.2 to
 [operations](protocol.md#6-operations) and [actions](protocol.md#7-actions),
 §7 to holding (S6), and §8 to [reads](protocol.md#8-reads).
 They are historical cross-references, not a second contract.
 
-The second-stage design must also satisfy the independent verification and repair
-cases in [protocol §12](protocol.md#12-synchronization-design-requirements).
+The design must also satisfy the independent verification and repair cases in
+[protocol §12.4](protocol.md#124-independent-acceptance).
 Baseline convergence cases below do not substitute for those failure-injection
 requirements. Cases 32–35 contain later presentation work; implementation status
 and release-parity classifications remain in their respective ledgers.

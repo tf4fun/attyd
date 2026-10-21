@@ -28,6 +28,7 @@
 
 | 技术主题 | 历史原文 | 当前归属 |
 | --- | --- | --- |
+| 实验协议修订 2（turn 日志、哈希链、挂起响应） | [protocol.md](https://github.com/tf4fun/attyd/blob/7ceca793d0733b0c3ac62d3bcfba4b31e2c119f5/docs/protocol.md)、[client-api-redesign.md](https://github.com/tf4fun/attyd/blob/7ceca793d0733b0c3ac62d3bcfba4b31e2c119f5/docs/client-api-redesign.md) | [简易 Agent 交互协议](protocol.md)（修订 3）、[bridge 内存模型](bridge-memory-model.md) |
 | 实验协议修订 1 与修订 2 的原始规范及对照 | [protocol.md](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/protocol.md) | [简易 Agent 交互协议](protocol.md)、[忠实性缺陷](acp-fidelity-audit.md#2-defects) |
 | 客户端协议原始提案、推导与验收 | [client-api-redesign.md](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/client-api-redesign.md) | [设计取舍](client-api-redesign.md)、[编号验收](protocol-acceptance.md) |
 | 实验协议旧实现与迁移步骤 1–9 | [state-sync.md](https://github.com/tf4fun/attyd/blob/991b0532f8f2cc321f2955a1f250e283beac1ddb/docs/state-sync.md) | [当前实现与迁移](state-sync.md) |

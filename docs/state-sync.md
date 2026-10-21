@@ -509,6 +509,13 @@ mandatory ACP capabilities.
 
 ### 7.4 Second milestone: bridge-to-client replication
 
+Status (2026-10-21): the design is proposed as [protocol revision 3](protocol.md):
+replication of the memory model's documents with `epoch`/`rev`, differential
+snapshots, client-computed digests at snapshots and checkpoints, client-chosen
+operation IDs and results in the document. Its acceptance cases are
+[protocol §12.4](protocol.md#124-independent-acceptance). Implementation follows the
+first-layer gate.
+
 This stage designs **简易 Agent 交互协议**, the project's private protocol between
 FE/other presentation clients and the bridge. ACP continues to govern the bridge's
 communication with the Agent.
@@ -541,12 +548,13 @@ wire shape or repair algorithm.
 
 After the first-layer gate, finish this stage in order:
 
-1. Map the validated memory to documents and resource reads using protocol §12.2;
-   settle the remaining representation choices before selecting synchronization fields.
-2. Derive one synchronization/verification/repair scheme, answer each §12.3 decision,
-   and revise the existing rules and DTOs together so only one current contract remains.
-3. Add §12.4's independent and failure-injection cases, then implement the smallest
-   bridge and client changes that satisfy them. Keep the existing working paths
+1. Map the validated memory to documents and resource reads: protocol §3–§4
+   (proposed).
+2. One synchronization, verification and repair scheme with its write semantics:
+   protocol §5–§7 (proposed). Replace the turn log, hash chain and held responses in
+   the bridge DTOs and `shared/` together, so only one contract remains.
+3. Add protocol §12.4's independent and failure-injection cases, then implement the
+   smallest bridge and client changes that satisfy them. Keep the existing working paths
    usable during migration; optional UI and diagnostics remain separate.
 
 Keep existing atomic-application and per-event convergence tests throughout the
