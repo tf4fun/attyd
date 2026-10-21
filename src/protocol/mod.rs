@@ -28,6 +28,7 @@ pub(crate) mod publish;
 pub(crate) mod registry;
 #[cfg(test)]
 pub(crate) mod stream_check;
+pub(crate) mod timeline;
 #[cfg(test)]
 mod typescript;
 pub(crate) mod wire;
