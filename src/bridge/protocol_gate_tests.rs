@@ -494,6 +494,30 @@ impl Peer {
         serde_json::to_value(timeline.entries()).unwrap()
     }
 
+    /// Waits until the session's timeline holds `len` entries. An update that
+    /// changes no published document is visible only in bridge memory.
+    async fn timeline_len(&self, session_id: &str, len: usize) -> Value {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let entries = self.timeline(session_id).await;
+            if entries.as_array().is_some_and(|entries| entries.len() == len) {
+                return entries;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {len} entries of {session_id}: {entries}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// How much history the session's timeline holds, read from bridge memory.
+    async fn history(&self, session_id: &str) -> Option<crate::protocol::timeline::History> {
+        let lock = self.lock();
+        let state = lock.lock().await;
+        state.sessions.state(session_id).and_then(|session| session.history)
+    }
+
     async fn agent_request(&mut self, id: &str, method: &str, params: Value) {
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await;
@@ -1554,6 +1578,134 @@ async fn a_new_session_without_early_messages_has_an_empty_known_timeline() {
     let mut peer = Peer::start(json!({})).await;
     peer.create("quiet", json!({})).await;
     assert_eq!(peer.timeline("quiet").await, json!([]));
+    peer.settled().await;
+}
+
+/// A fork's target never inherits the source's entries (bridge memory model
+/// §6.3): tool IDs are unique only within their own session, so an inherited
+/// entry could be patched by the target's own tool, and a replay would add the
+/// source's messages twice. Without load support the target holds only what the
+/// Agent sent for it, as partial history.
+#[tokio::test]
+async fn a_forks_timeline_is_its_own_notifications_and_never_the_sources() {
+    let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
+    peer.create("source", json!({})).await;
+    peer.update(
+        "source",
+        json!({"sessionUpdate": "tool_call", "toolCallId": "1", "title": "source tool"}),
+    )
+    .await;
+    peer.update("source", chunk("s", text("source says"))).await;
+    let source = peer.timeline_len("source", 2).await;
+
+    let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
+    let request = peer.request("session/fork").await;
+    peer.update(
+        "forked",
+        json!({"sessionUpdate": "tool_call", "toolCallId": "1", "title": "target tool"}),
+    )
+    .await;
+    peer.update("forked", chunk("t", text("target says"))).await;
+    peer.reply(&request, json!({"sessionId": "forked"})).await;
+    Peer::ended(forked).await.unwrap();
+    peer.until("the fork completes", |peer| {
+        peer.live("session/source")["op"]["id"] == op
+            && peer.live("session/source")["op"]["status"] == "completed"
+            && peer.has("session/forked")
+    })
+    .await;
+
+    assert_eq!(
+        peer.timeline("forked").await,
+        json!([
+            {"kind": "tool", "call": {
+                "toolCallId": "1", "title": "target tool", "kind": "other",
+                "status": "pending", "content": [], "locations": [],
+            }},
+            {"kind": "message", "role": "agent", "messageId": "t",
+             "chunks": [{"content": text("target says")}]},
+        ]),
+        "the target's tool 1 is its own entry, not a patch of the source's"
+    );
+    assert_eq!(
+        peer.history("forked").await,
+        Some(crate::protocol::timeline::History::Partial)
+    );
+    assert_eq!(peer.timeline("source").await, source, "the source is unchanged");
+    peer.settled().await;
+}
+
+#[tokio::test]
+async fn a_fork_without_early_notifications_has_an_empty_partial_timeline() {
+    let mut peer = Peer::start(json!({"sessionCapabilities": {"fork": {}}})).await;
+    peer.create("source", json!({})).await;
+    peer.update("source", chunk("s", text("source says"))).await;
+    peer.timeline_len("source", 1).await;
+
+    let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
+    let request = peer.request("session/fork").await;
+    peer.reply(&request, json!({"sessionId": "forked"})).await;
+    Peer::ended(forked).await.unwrap();
+    peer.until("the fork completes", |peer| {
+        peer.live("session/source")["op"]["id"] == op
+            && peer.live("session/source")["op"]["status"] == "completed"
+            && peer.has("session/forked")
+    })
+    .await;
+
+    assert_eq!(peer.timeline("forked").await, json!([]));
+    assert_eq!(
+        peer.history("forked").await,
+        Some(crate::protocol::timeline::History::Partial),
+        "nothing says the target starts at the session's beginning"
+    );
+    peer.settled().await;
+}
+
+#[tokio::test]
+async fn a_forks_load_replaces_its_timeline_with_the_replay_as_complete() {
+    let mut peer =
+        Peer::start(json!({"loadSession": true, "sessionCapabilities": {"fork": {}}})).await;
+    peer.create("source", json!({})).await;
+    let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
+    let request = peer.request("session/fork").await;
+    peer.update("forked", chunk("early", text("early"))).await;
+    peer.reply(&request, json!({"sessionId": "forked"})).await;
+    Peer::ended(forked).await.unwrap();
+    peer.until("the fork completes", |peer| {
+        peer.live("session/source")["op"]["id"] == op
+            && peer.live("session/source")["op"]["status"] == "completed"
+            && peer.has("session/forked")
+    })
+    .await;
+
+    let load = peer.request("session/load").await;
+    peer.update(
+        "forked",
+        json!({"sessionUpdate": "user_message_chunk", "content": text("hi")}),
+    )
+    .await;
+    peer.update("forked", chunk("answer", text("hello"))).await;
+    peer.reply(&load, json!({})).await;
+    peer.until("the target's load completes", |peer| {
+        peer.live("session/forked")["op"]["kind"] == "load"
+            && peer.live("session/forked")["op"]["status"] == "completed"
+    })
+    .await;
+
+    assert_eq!(
+        peer.timeline("forked").await,
+        json!([
+            {"kind": "message", "role": "user", "chunks": [{"content": text("hi")}]},
+            {"kind": "message", "role": "agent", "messageId": "answer",
+             "chunks": [{"content": text("hello")}]},
+        ]),
+        "the replay replaces what was staged for the target"
+    );
+    assert_eq!(
+        peer.history("forked").await,
+        Some(crate::protocol::timeline::History::Complete)
+    );
     peer.settled().await;
 }
 
