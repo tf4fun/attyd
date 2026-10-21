@@ -1005,6 +1005,34 @@ fn terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release()
 }
 
 #[test]
+fn a_released_terminal_a_tool_embeds_stays_in_the_document_with_its_output() {
+    let mut gate = Gate::new();
+    gate.open("s", json!({ "sessionId": "s" }));
+    gate.registry
+        .append_session_update(
+            "s",
+            json!({
+                "sessionUpdate": "tool_call", "toolCallId": "run", "title": "Run",
+                "content": [{ "type": "terminal", "terminalId": "t" }],
+            }),
+        )
+        .unwrap();
+    gate.registry
+        .upsert_terminal(EPOCH, "s", "t", json!({ "output": "abcd", "released": false }))
+        .unwrap();
+    gate.commit();
+    gate.registry
+        .upsert_terminal(EPOCH, "s", "t", json!({ "output": "abcd", "released": true }))
+        .unwrap();
+    gate.commit();
+    assert_eq!(
+        gate.live("session/s")["terminals"]["t"]["output"],
+        "abcd",
+        "its output stays while a tool embeds it"
+    );
+}
+
+#[test]
 fn url_flows_appear_on_accept_and_leave_on_completion() {
     let mut gate = Gate::new();
     gate.open("s", json!({ "sessionId": "s" }));

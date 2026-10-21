@@ -298,6 +298,28 @@ fn removing_an_unknown_plan_starts_a_removal_entry() {
     );
 }
 
+// --- Embedded terminals (§8.3) ----------------------------------------------------
+
+#[test]
+fn a_tool_that_embeds_a_terminal_references_it_until_its_content_is_replaced() {
+    let mut timeline = replay(&[json!({
+        "sessionUpdate": "tool_call", "toolCallId": "t", "title": "Run",
+        "content": [
+            { "type": "content", "content": text("log") },
+            { "type": "terminal", "terminalId": "term-1" },
+        ],
+    })]);
+    assert!(timeline.embeds_terminal("term-1"));
+    assert!(!timeline.embeds_terminal("term-2"), "another terminal's ID");
+    // Collections are replaced whole: new content that omits the terminal
+    // no longer references it.
+    timeline.reduce(
+        &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t", "content": [] }),
+        None,
+    );
+    assert!(!timeline.embeds_terminal("term-1"));
+}
+
 // --- Compactions (§3.2) -----------------------------------------------------------
 
 #[test]

@@ -2228,6 +2228,118 @@ mod tests {
         operation_id
     }
 
+    /// A tool entry that embeds `terminal` in its content, as the Agent sends it.
+    fn embed_terminal(state: &mut RuntimeState, terminal: &str) {
+        state
+            .append_session_update(
+                "session",
+                json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "run", "title": "Run",
+                    "content": [{ "type": "terminal", "terminalId": terminal }],
+                }),
+            )
+            .unwrap();
+    }
+
+    fn snapshot(output: &str, released: bool) -> Value {
+        json!({ "output": output, "released": released })
+    }
+
+    #[test]
+    fn a_released_terminal_a_tool_embeds_keeps_its_frozen_output() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "terminal");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept output", false))
+            .unwrap();
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept output", true))
+            .unwrap();
+
+        let live = state.live("session").unwrap();
+        assert!(live.terminals.is_empty(), "the handle is gone");
+        assert_eq!(live.frozen_terminals["terminal"]["output"], "kept output");
+        // A late snapshot of the released terminal changes nothing.
+        assert_eq!(
+            state
+                .upsert_terminal("epoch", "session", "terminal", snapshot("late", false))
+                .unwrap(),
+            TerminalUpsert::Stale
+        );
+        assert_eq!(
+            state.live("session").unwrap().frozen_terminals["terminal"]["output"],
+            "kept output"
+        );
+    }
+
+    #[test]
+    fn a_released_terminal_nothing_embeds_is_dropped() {
+        let mut state = state();
+        open(&mut state, "session");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("gone", true))
+            .unwrap();
+        let live = state.live("session").unwrap();
+        assert!(live.terminals.is_empty() && live.frozen_terminals.is_empty());
+    }
+
+    #[test]
+    fn frozen_output_does_not_keep_the_session_busy() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "terminal");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept", true))
+            .unwrap();
+        state
+            .start_reload("epoch", "session", "reload", SessionOperationKind::Load)
+            .expect("only a terminal with a handle makes the session busy");
+    }
+
+    #[test]
+    fn the_connection_ending_freezes_the_embedded_terminals_of_held_sessions() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "embedded");
+        for id in ["embedded", "loose"] {
+            state
+                .upsert_terminal("epoch", "session", id, snapshot(id, false))
+                .unwrap();
+        }
+        state.end_connection(crate::protocol::documents::ProtocolError::new(
+            crate::protocol::documents::ErrorCode::Unavailable,
+            "the connection ended",
+        ));
+        let live = state.live("session").unwrap();
+        assert!(live.terminals.is_empty(), "every handle is gone");
+        assert_eq!(live.frozen_terminals.len(), 1);
+        assert_eq!(live.frozen_terminals["embedded"]["output"], "embedded");
+    }
+
+    #[test]
+    fn a_load_frees_frozen_output_its_timeline_no_longer_embeds() {
+        let mut state = state();
+        open(&mut state, "session");
+        embed_terminal(&mut state, "terminal");
+        state
+            .upsert_terminal("epoch", "session", "terminal", snapshot("kept", true))
+            .unwrap();
+        let still = [json!({
+            "sessionUpdate": "tool_call", "toolCallId": "run", "title": "Run",
+            "content": [{ "type": "terminal", "terminalId": "terminal" }],
+        })];
+        state.replace_session_timeline(
+            "session",
+            crate::protocol::timeline::Timeline::from_replay(
+                still.iter().map(|update| (update, None)),
+            ),
+        );
+        assert!(state.live("session").unwrap().frozen_terminals.contains_key("terminal"));
+        state.replace_session_timeline("session", crate::protocol::timeline::Timeline::default());
+        assert!(state.live("session").unwrap().frozen_terminals.is_empty());
+    }
+
     #[test]
     fn a_session_waiting_for_the_next_connection_keeps_its_timeline() {
         let mut state = state();
