@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::history_replay::ReplayCandidate;
+use crate::history_replay::{Replay, ReplayCandidate};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HistoryCacheError {
@@ -78,16 +78,16 @@ impl HistoryCache {
         Ok(())
     }
 
-    /// Ends a load with its replay: the history the session's log is built
-    /// from.
+    /// Ends a load with its replay: the history the session's log and timeline
+    /// are built from.
     pub(crate) fn commit_candidate(
         &mut self,
         session_id: &str,
         attempt_id: &str,
-    ) -> Result<Vec<Value>, HistoryCacheError> {
-        let updates = self.candidate(session_id, attempt_id)?.take_history()?;
+    ) -> Result<Replay, HistoryCacheError> {
+        let replay = self.candidate(session_id, attempt_id)?.take_replay()?;
         self.candidates.remove(session_id);
-        Ok(updates)
+        Ok(replay)
     }
 
     pub(crate) fn abort_candidate(
@@ -172,7 +172,7 @@ mod tests {
         for update in &updates {
             cache.append_candidate(key, "load", update.clone()).unwrap();
         }
-        let replay = cache.commit_candidate(key, "load").unwrap();
+        let replay = cache.commit_candidate(key, "load").unwrap().updates;
         assert_eq!(replay.len(), 4);
         assert_eq!(replay[0], updates[0]);
         assert_eq!(replay[1], updates[1]);

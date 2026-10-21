@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use super::SessionControls;
 use super::canon::TurnLog;
+use super::timeline::Timeline;
 use super::documents::{
     End, EndReason, ErrorCode, ExitStatus, LoginTerminal, OperationKind, ProtocolError, Scope,
 };
@@ -37,6 +38,7 @@ pub(crate) struct WaitingSession {
     pub cwd: std::path::PathBuf,
     pub controls: SessionControls,
     pub log: SessionLog,
+    pub timeline: Option<Arc<Timeline>>,
     pub op: OpSlot,
 }
 
@@ -631,6 +633,7 @@ impl SessionRegistry {
             cwd: live.cwd.clone(),
             controls: live.controls.clone(),
             log: entry.state.log.clone(),
+            timeline: entry.state.timeline.clone(),
             op: live.op.clone(),
         })
     }
@@ -836,6 +839,24 @@ impl SessionRegistry {
     pub(crate) fn replace_session_log(&mut self, session_id: &str, replay: &[Value]) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
             entry.state.log = SessionLog::Known(Arc::new(TurnLog::from_replay(replay)));
+        }
+    }
+
+    /// A load completed: the session's timeline is the replay's, replacing the
+    /// retained one in one step (bridge memory model §6.2).
+    pub(crate) fn replace_session_timeline(&mut self, session_id: &str, timeline: Timeline) {
+        if let Some(entry) = self.sessions.get_mut(session_id) {
+            entry.state.timeline = Some(Arc::new(timeline));
+        }
+    }
+
+    /// A resume gave the session's context, which is no replay: it is the
+    /// timeline only of a session whose history is unknown (§6.1).
+    pub(crate) fn adopt_session_timeline(&mut self, session_id: &str, timeline: Timeline) {
+        if let Some(entry) = self.sessions.get_mut(session_id)
+            && entry.state.timeline.is_none()
+        {
+            entry.state.timeline = Some(Arc::new(timeline));
         }
     }
 

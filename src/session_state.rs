@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
 use crate::protocol::registry::SessionLog;
+use crate::protocol::timeline::Timeline;
 use crate::runtime_state::{
     SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
     SharedTurnUpdates, fold_shared_active_turn_update,
@@ -56,6 +57,11 @@ pub(crate) struct SessionState {
     /// The protocol v2 turn log: unknown until a load or creation.
     #[serde(skip)]
     pub(crate) log: SessionLog,
+    /// The session timeline of the bridge memory model: unknown (`None`) until a
+    /// load, a creation or a resume gives it. Held beside `log` until the wire
+    /// is derived from it.
+    #[serde(skip)]
+    pub(crate) timeline: Option<Arc<Timeline>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +126,7 @@ impl SessionState {
             load_attempt: None,
             load_origin: None,
             log: SessionLog::Unknown,
+            timeline: None,
         }
     }
 
@@ -127,6 +134,7 @@ impl SessionState {
         let mut session = Self::cold(session_id);
         session.phase = MirrorPhase::Ready;
         session.log = SessionLog::empty();
+        session.timeline = Some(Arc::default());
         session
     }
 

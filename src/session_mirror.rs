@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
-
+use crate::history_replay::Replay;
 use crate::protocol::canon::TurnLog;
 use crate::protocol::registry::SessionLog;
 use crate::runtime_state::SessionOperationKind;
@@ -134,7 +134,8 @@ impl SessionRegistry {
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
         let replay = self.commit_history(session_id, attempt_id)?;
-        self.replace_session_log(session_id, &replay);
+        self.replace_session_log(session_id, &replay.updates);
+        self.replace_session_timeline(session_id, replay.timeline);
         Ok(())
     }
 
@@ -143,7 +144,7 @@ impl SessionRegistry {
         &mut self,
         session_id: &str,
         attempt_id: &str,
-    ) -> Result<Vec<Value>, MirrorError> {
+    ) -> Result<Replay, MirrorError> {
         self.require_load(session_id, attempt_id)?;
         let replay = self.history.commit_candidate(session_id, attempt_id)?;
         self.require_state_mut(session_id)?.history_settled();
@@ -158,7 +159,8 @@ impl SessionRegistry {
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
         let replay = self.commit_history(session_id, attempt_id)?;
-        self.adopt_session_log(session_id, &replay);
+        self.adopt_session_log(session_id, &replay.updates);
+        self.adopt_session_timeline(session_id, replay.timeline);
         self.require_state_mut(session_id)?.phase = MirrorPhase::Cold;
         Ok(())
     }
@@ -176,6 +178,9 @@ impl SessionRegistry {
         }
         if matches!(session.log, SessionLog::Unknown) {
             session.log = SessionLog::Known(log.unwrap_or_default());
+        }
+        if session.timeline.is_none() {
+            session.timeline = Some(Arc::default());
         }
         session.history_settled();
         Ok(())
@@ -629,6 +634,114 @@ mod tests {
             "sessionUpdate": "user_message_chunk",
             "content": { "type": "text", "text": text }
         })
+    }
+
+    fn timeline_entries(mirror: &SessionMirror) -> Value {
+        let timeline = mirror
+            .state("session")
+            .unwrap()
+            .timeline
+            .as_ref()
+            .expect("the timeline is known");
+        serde_json::to_value(timeline.entries()).unwrap()
+    }
+
+    fn agent_update(text: &str, message_id: &str) -> Value {
+        json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": message_id,
+            "content": { "type": "text", "text": text }
+        })
+    }
+
+    #[test]
+    fn a_new_session_has_an_empty_known_timeline_and_a_cold_one_has_none() {
+        let mut mirror = mirror();
+        mirror.register_cold("cold");
+        mirror.register_new("new");
+        assert!(mirror.state("cold").unwrap().timeline.is_none());
+        let new = mirror.state("new").unwrap().timeline.as_ref().unwrap();
+        assert!(new.entries().is_empty());
+    }
+
+    #[test]
+    fn a_load_reduces_its_replay_as_received_into_the_timeline() {
+        let mut mirror = mirror();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "load").unwrap();
+        for update in [
+            agent_update("first", "a"),
+            agent_update("second", "b"),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "tool", "title": "Run" }),
+            user_update("next turn"),
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed" }),
+        ] {
+            mirror.append_load_update("session", "load", update).unwrap();
+        }
+        // The timeline is the candidate's until the load commits.
+        assert!(mirror.state("session").unwrap().timeline.is_none());
+        mirror.commit_load("session", "load").unwrap();
+        assert_eq!(
+            timeline_entries(&mirror),
+            json!([
+                { "kind": "message", "role": "agent", "messageId": "a",
+                  "chunks": [{ "content": { "type": "text", "text": "first" } }] },
+                { "kind": "message", "role": "agent", "messageId": "b",
+                  "chunks": [{ "content": { "type": "text", "text": "second" } }] },
+                { "kind": "tool", "call": { "toolCallId": "tool", "title": "Run", "kind": "other",
+                  "status": "completed", "content": [], "locations": [] } },
+                { "kind": "message", "role": "user",
+                  "chunks": [{ "content": { "type": "text", "text": "next turn" } }] },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_second_load_replaces_the_timeline_and_a_failed_one_keeps_it() {
+        let mut mirror = mirror();
+        load_initial(&mut mirror, "session");
+        let first = mirror.state("session").unwrap().timeline.clone().unwrap();
+
+        mirror.begin_load("session", "failing").unwrap();
+        mirror
+            .append_load_update("session", "failing", agent_update("partial", "x"))
+            .unwrap();
+        mirror
+            .fail_load("session", "failing", "boom", true)
+            .unwrap();
+        let kept = mirror.state("session").unwrap().timeline.clone().unwrap();
+        assert!(Arc::ptr_eq(&first, &kept), "a failed load changes nothing");
+
+        mirror.begin_load("session", "again").unwrap();
+        mirror
+            .append_load_update("session", "again", agent_update("new", "n"))
+            .unwrap();
+        mirror.commit_load("session", "again").unwrap();
+        assert_eq!(
+            timeline_entries(&mirror),
+            json!([{ "kind": "message", "role": "agent", "messageId": "n",
+                     "chunks": [{ "content": { "type": "text", "text": "new" } }] }])
+        );
+    }
+
+    #[test]
+    fn a_resume_gives_the_timeline_only_while_it_is_unknown() {
+        let mut mirror = mirror();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "resume").unwrap();
+        mirror
+            .append_load_update("session", "resume", user_update("cached"))
+            .unwrap();
+        mirror.commit_attachment_cache("session", "resume").unwrap();
+        let adopted = mirror.state("session").unwrap().timeline.clone().unwrap();
+        assert_eq!(adopted.entries().len(), 1);
+
+        mirror.begin_load("session", "again").unwrap();
+        mirror
+            .append_load_update("session", "again", user_update("other"))
+            .unwrap();
+        mirror.commit_attachment_cache("session", "again").unwrap();
+        let kept = mirror.state("session").unwrap().timeline.clone().unwrap();
+        assert!(Arc::ptr_eq(&adopted, &kept), "a known timeline stays");
     }
 
     #[test]
