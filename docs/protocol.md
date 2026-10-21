@@ -308,8 +308,8 @@ including fork history; the table below is its wire form, and its fork paragraph
 | `live.history` | The log holds | Set by |
 | --- | --- | --- |
 | (the log is unknown) | nothing; the client keeps its own log, unconfirmed | holding a session by subscription, until its first load or resume ends |
-| `complete` | the timeline from the session's beginning | `create`; a completed `session/load` (ACP: the entire history, `v1/agent.rs:4845–4848`); a fork only with an established complete history source (below) |
-| `partial` | the known timeline is not guaranteed to start at the session's beginning | a `session/resume` of a session whose log was unknown (ACP: no previous messages, `v1/agent.rs:1277`); fork conditions remain to be specified below |
+| `complete` | the timeline from the session's beginning | `create`; a completed `session/load` (ACP: the entire history, `v1/agent.rs:4845–4848`); a fork target's successful load (below) |
+| `partial` | the known timeline is not guaranteed to start at the session's beginning | a `session/resume` of a session whose log was unknown (ACP: no previous messages, `v1/agent.rs:1277`); a fork without load (below) |
 
 A resume of a session whose log is known keeps the log and its status. A `partial`
 history arises whenever the bridge resumes a session whose log it did not hold: after
@@ -318,13 +318,9 @@ the catalog. v0.2.8 showed the same case as a missing-history notice. A `partial
 is aligned like any other. A client that held earlier entries may keep them as its own
 UI state and show them as not confirmed by the bridge (C1).
 
-**Fork rule to finish before implementation.** Capturing a source for a fork must
-include its timeline at admission, including an idle tail and referenced resources,
-without mutating the source. A few target notifications during `session/fork` are
-not evidence of a full replay. The choice between inherited source content and
-target content, and its complete/partial status, needs an explicit rule (audit §9);
-the earlier shorthand “fork replay, else source log” is not sufficient. A successful
-`session/load` remains the explicit complete-replay path.
+**Fork.** A fork target never inherits source entries or resources
+([memory model §6.3](bridge-memory-model.md#63-fork)): it is loaded when the Agent
+advertises load (`complete`), else it holds only its own notifications (`partial`).
 
 ## 4. Live documents
 

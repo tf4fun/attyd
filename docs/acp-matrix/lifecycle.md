@@ -22,7 +22,7 @@
 ## 重要结果
 
 1. 生命周期 RPC 大多存在；主要差距是实验实现的数据归约/保留、close 入口与控制写准入。不能说 bridge 没有 close/mode/config RPC。
-2. `session/load` 才明确完整回放，`session/resume` 不回放；fork 的早到几条通知不证明完整历史。当前 partial、fork 源尾部、早期未知会话资源归属尚需既定目标规则落实。
+2. `session/load` 才明确完整回放，`session/resume` 不回放；fork 的早到几条通知不证明完整历史。目标规则见 [memory model](../bridge-memory-model.md)：fork 目标不继承源会话条目（§6.3，支持 load 则加载目标，否则只保留目标自己的通知并标 partial）；安装中的未知会话通知和资源按 §9 暂存归属。
 3. 参数覆盖并非每个字段都有前端任意透传：catalog 刻意不传 cwd filter，workspace/MCP 来自宿主配置，request envelope `_meta` 由 bridge 默认省略。这些需明示为产品边界，不应偷算“逐字段全部支持”。
 4. schema-defined metadata 的容器要单独追踪：setup 外层 `_meta` 在稳定版也未持久保留；`modes._meta` / 控制通知外层 `_meta` 是 D12 回退；catalog page 外层 `_meta` 在实验 wrapper 中另有损失。
 5. Zed 不能当规范：它版本更新且有 vendor workaround。采用其标准请求生命周期/资源隔离参考，不引入厂商分支或整套 ACP v2。
@@ -128,10 +128,10 @@
 - 语义：RPC carries absolute cwd, configured additionalDirectories and mcpServers. Additional roots are a complete replacement list, not an append; response modes/configOptions fold early notifications → provided response fields → later updates. Fork creates an independent session with the source conversation context; the pinned method does not promise a complete replay via its few early target notifications.
 - 能力门槛：unstable_session_fork compiled; agentCapabilities.sessionCapabilities.fork present.
 - Bridge: `991b0532:src/bridge.rs:3345–3408`; `991b0532:src/bridge.rs:3491–3509`; `991b0532:src/bridge.rs:3546–3594`.
-- 保留：Captures source completed TurnLog and chooses nonempty early target canon over it, then optional load. It does not capture a future r2 idle tail/resource snapshots. Target rule remains open: source cut at admission including tail and referenced resources; distinguish full replay from partial notifications.
+- 保留：Captures source completed TurnLog and chooses nonempty early target canon over it, then optional load. It does not capture a future r2 idle tail/resource snapshots. Target rule ([memory model §6.3](../bridge-memory-model.md#63-fork)): the target never inherits source entries or resources; with load advertised the target is loaded after the response (`complete`, failure → `partial` with its own notifications); otherwise only notifications for the target, staged during the fork, then later updates (`partial`).
 - 清理：Failed attempts clear their private replay/creation staging and reject/close newly returned invalid targets; installed session state ends on close/delete/release, or connection replacement under its retention policy.
 - 稳定版差异：rc5 captures source HistorySnapshot before fork and labels fallback possibly incomplete. Neither version proves arbitrary target updates are complete. Experimental inherited history has already lost process content.
-- 验收：(1) Fork receives only thought/plan/tool updates before response: do not drop the source prompt/reply or falsely assert complete replay. (2) Capture idle source tail plus referenced attachment/terminal content without mutating source; fork of partial source cannot become complete without evidence. (3) Source/target cleanup and optional load cannot race into a replacement.
+- 验收：(1) With load advertised: the target is loaded after the response and its entries equal the replay; a failed load leaves its staged notifications, `partial`. (2) Without load: notifications sent for the target before and after the response are kept, nothing from the source appears, `partial`; a target tool reusing a source tool ID changes neither session's other entity. (3) The source is not mutated and no source resource is copied. (4) Source/target cleanup and the optional load cannot race into a replacement.
 - Zed：此方法未找到对应 v1 caller / 不在本次引用的 adapter 范围；不据此推断整个 Zed 不支持。
 
 ### 8. `session/list` — ListSessionsRequest (request)
@@ -540,7 +540,7 @@
 
 ## 最小验收入口与未决
 
-- Target fork complete/partial derivation and early unknown-session resource attribution remain open decisions, not covered implementations.
+- Fork complete/partial derivation and early unknown-session attribution are specified by [memory model §6.3 and §9](../bridge-memory-model.md#9-concurrency); they are not yet implemented or covered.
 - D12 source-level controls metadata needs a concrete representation; no new raw event log is implied.
 - Current response/page metadata retention beyond displayable session state must be explicit; losing wrapper _meta is observed, not automatically an ACP wire violation.
 - No-session-only Agent reconnect needs an explicit recovery path (server.rs:222–237); do not resend unknown-outcome business commands.

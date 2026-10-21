@@ -199,7 +199,11 @@ kept without a notification log:
 
 When the bridge sends `session/prompt`, it first reduces the prompt as user content:
 one message entry, role `user`, no `messageId` (the pinned `PromptRequest` has none),
-one chunk per prompt block, with an internal flag `sent` (not part of content).
+with an internal flag `sent` (not part of content). Its chunks are the prompt blocks
+reduced by rule 3 (§3.2), like any other chunks: sending `[text("A"), text("B")]` stores
+one chunk `"AB"`, as a replay of the same two chunks would. While `sent` lasts, the
+bridge also keeps the original prompt blocks internally; echo matching uses them, not
+the joined chunks.
 
 Some Agents echo the prompt as `user_message_chunk`s; others do not. The **echo rule**
 keeps one entry when the echo is exact (after Zed, `handle_session_update`,
@@ -208,9 +212,11 @@ keeps one entry when the echo is exact (after Zed, `handle_session_update`,
 - While the last entry is the `sent` user message, an incoming user chunk is an echo
   when its content equals the next not-yet-matched prompt block **and** its
   `messageId` is compatible with the entry's (the entry has none yet, or they are
-  equal). An echo adds no chunk. It completes the matched chunk with what the echo
-  carries: the entry takes the echo's `messageId` if it has none, and the matched
-  chunk takes the echo's chunk `_meta` and `notificationMeta`.
+  equal). An echo adds no chunk. It completes the matched block with what the echo
+  carries: the entry takes the echo's `messageId` if it has none, and the matched block
+  takes the echo's chunk `_meta` and `notificationMeta`. The entry's chunks are then
+  the completed blocks reduced again by rule 3, so metadata that now differs between
+  blocks splits a joined chunk exactly as a replay would.
 - Any other user chunk is not an echo. It ends `sent` and starts a new user entry; it
   never joins the `sent` entry, so a mismatched echo cannot corrupt the sent text.
 - `sent` also ends when every block was matched or another entry follows.
@@ -251,8 +257,8 @@ interface Prompt {
 
 Live and replay use one structure and one reducer for every Agent. Their **entries are
 equal**, ignoring `prompts` and the internal `sent` flag, when the Agent's replay of
-each prompt is one user message whose chunks equal the sent blocks one to one, and live
-it either:
+each prompt is one user message whose chunks, before rule 3, equal the sent blocks one
+to one, and live it either:
 
 - echoes the prompt exactly that way (§4.1), or
 - does not echo, and its replay of the prompt carries no `messageId` and no chunk or
@@ -461,6 +467,9 @@ input, not computed by the reducer under test. This model adds:
 - **Fork.** With load: target entries come from its replay. Without load: only target
   notifications, `partial`; a target tool reusing a source tool ID does not touch any
   source content.
+- **Sent text joining.** `[text("A"), text("B")]` sent with an exact per-block echo,
+  without an echo, and replayed all give one chunk `"AB"`; echo metadata that differs
+  between the blocks gives two chunks in all three.
 - **Idle and late updates.** An update after the prompt's response, or between prompts,
   changes the existing entry by §3.2; no new structure appears.
 - **Load atomicity.** A failed load leaves the installed entries unchanged; a successful
