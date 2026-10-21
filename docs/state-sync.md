@@ -7,9 +7,9 @@ This document owns implementation structure, migration order and test gates.
 The [ACP source matrix](acp-bridge-matrix.md) defines the first-layer functionality
 and retained-memory scope. Source coverage is not evidence of completed behavior.
 
-Status: the experimental baseline is `experiment/protocol-v2` at `991b053`.
-Revision 2 is the target; step 11 is in draft PR #53, not merged. Stable `main`
-remains v1 at `v0.3.0-rc.5`. Section 7 records current work: complete ACP behavior
+Status: the experimental baseline is `experiment/protocol-v2`. Revision 3 of the
+protocol is the target and its implementation is in progress; §7.5 records what is
+merged. Stable `main` remains v1 at `v0.3.0-rc.5`. Section 7 records current work: complete ACP behavior
 and authoritative memory first, then finish client synchronization, verification
 and repair. Sections 1–4 identify reusable implementation, not proof that the
 baseline meets either milestone. Lifecycle/concurrency work follows the
@@ -240,7 +240,7 @@ the real outstanding request, without restoring a public owner/CAS/intent system
 
 ## 7. Fidelity migration (revision 2)
 
-Status: **step 10 (docs) merged; step 11 in draft PR #53; steps 12–20 planned.**
+Status: **the first layer is implemented in bridge memory except where §7.5 lists a gap; the second layer is being built beside the revision 2 engine, to be cut over at once.** (PR #53 was superseded by the flat timeline.)
 The current milestone is **ACP → bridge functionality and displayable memory**,
 defined in the [first-layer contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract)
 and specified by the [bridge memory model](bridge-memory-model.md) (proposed
@@ -506,6 +506,36 @@ mandatory ACP capabilities.
   [matrix](release-parity.md) has a passing case. Shared gaps and stronger target
   guarantees have their own cases and are not mislabeled as regressions. A test
   changed to assert a loss is changed back, not counted as fidelity coverage.
+
+### 7.5 Implementation status (2026-10-21)
+
+Each item is one merged pull request into `experiment/protocol-v2`, with its tests
+written first and run by CI only. The bridge is verified through its own memory
+(gate and unit tests that read it); the published rev 2 documents did not change
+while the first layer was built, so the browser suite kept passing.
+
+| Part | Merged | Not yet |
+| --- | --- | --- |
+| **Design** | memory model (#54), client protocol revision 3 (#55) | |
+| **Step 11 — timeline** | reducer over flat entries with the echo rule and derived turns (#56); entries shared structurally (#58); held through load, resume and reattach (#59); live prompts (#60); notification envelope `_meta` (#63); a new session's early notifications (#65) | |
+| **Step 12 — prompt outcomes** | response, Agent error, invalid response and interruption recorded; content kept (#61) | |
+| **Step 13 — idle updates** | updates outside a prompt reduced into the timeline (#62) | |
+| **Step 14 — history knowledge** | unknown / partial / complete (#64); a fork target never inherits source entries (#66); one installation at a time (#67); each timeline named by an epoch (#74) | catalog pages and cursors, setup/auth result metadata, zero-session recovery, session generations (with step 18) |
+| **Step 15 — terminals** | a released terminal a tool embeds keeps its frozen output, also across the connection's end (#68) | shown in its tool card: layer 2 |
+| **Step 16 — interactions** | | scope-based lifetimes, parent RPC, URL-flow outcomes, forms, request IDs |
+| **Step 18 — actions** | | controls and close during a prompt (R1, R2), controls metadata (D12) |
+| **Layer 2 — building blocks** | document digest, Rust and TypeScript, against independently computed vectors (#69, #70); the timeline as entries with attachment references (#71); the verifying replica (#72); the publisher with epoch, rev and differential snapshots (#73); the live facts of a session (#76); client-chosen operation IDs and repeats (#77); the global and catalog facts (#78); the operation a scope shows, with its scope and `after` (#80) | interactions and URL flows in `live`; subscriptions and delivery; actions; the client stream and writes; the projection into the UI; the cutover that replaces the rev 2 engine |
+| **Dependencies** | vite (#57), webpki crates (#57), vitest (#75) advisories | |
+
+Deviations from the plan, on purpose:
+
+- Layer-1 pull requests did not change the published documents. Frozen terminal
+  output is therefore memory only until the layer 2 wire carries entries (a first
+  attempt to project it left output on the page without its tool card; #68).
+- Step 11 did not extend the rev 2 turn log with items (the superseded #53). The
+  wire moves from the turn log to entries in one cutover.
+- Waiting on bridge memory, not on published documents, is how gate tests observe a
+  change that publishes nothing.
 
 ### 7.4 Second milestone: bridge-to-client replication
 
