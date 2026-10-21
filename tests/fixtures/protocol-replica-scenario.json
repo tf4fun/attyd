@@ -1,0 +1,788 @@
+{
+  "comment": "Events, the document after each and its digest, computed independently (docs/protocol.md §5.2–§5.5). Replayed by the TypeScript replica.",
+  "scenarios": {
+    "session": [
+      {
+        "name": "a full snapshot installs the document",
+        "event": {
+          "scope": "session/S",
+          "snapshot": {
+            "epoch": "E1",
+            "rev": 10,
+            "digest": "eSUXfJYERCZLxdAKRa0z-A",
+            "doc": {
+              "history": "complete",
+              "prompts": [
+                {
+                  "entry": 0
+                }
+              ],
+              "live": {
+                "sessionId": "S",
+                "cwd": "/w",
+                "closing": false,
+                "op": {
+                  "id": "op-2",
+                  "kind": "prompt",
+                  "status": "running",
+                  "input": null,
+                  "cancelRequested": false
+                },
+                "interactions": {},
+                "urlFlows": {},
+                "terminals": {}
+              }
+            },
+            "entries": {
+              "base": "replace",
+              "length": 1,
+              "changed": [
+                [
+                  0,
+                  {
+                    "kind": "message",
+                    "role": "user",
+                    "chunks": [
+                      {
+                        "content": {
+                          "type": "text",
+                          "text": "hi"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 10,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "eSUXfJYERCZLxdAKRa0z-A"
+      },
+      {
+        "name": "ops take the document to rev 11",
+        "event": {
+          "scope": "session/S",
+          "rev": 11,
+          "ops": [
+            {
+              "op": "append",
+              "path": "/entries",
+              "values": [
+                {
+                  "kind": "message",
+                  "role": "agent",
+                  "chunks": [
+                    {
+                      "content": {
+                        "type": "text",
+                        "text": ""
+                      }
+                    }
+                  ],
+                  "messageId": "m1"
+                }
+              ]
+            }
+          ]
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 11,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": ""
+                  }
+                }
+              ],
+              "messageId": "m1"
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "HxsVaWtm13RfvdCDeh9Lrg"
+      },
+      {
+        "name": "ops take the document to rev 12",
+        "event": {
+          "scope": "session/S",
+          "rev": 12,
+          "ops": [
+            {
+              "op": "append",
+              "path": "/entries/1/chunks/0/content/text",
+              "text": "Hel"
+            }
+          ]
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 12,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hel"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "6K24xI3S0tvsihI-hqqZpw"
+      },
+      {
+        "name": "ops take the document to rev 13",
+        "event": {
+          "scope": "session/S",
+          "rev": 13,
+          "ops": [
+            {
+              "op": "append",
+              "path": "/entries/1/chunks/0/content/text",
+              "text": "lo"
+            },
+            {
+              "op": "set",
+              "path": "/prompts/0/end",
+              "value": {
+                "response": {
+                  "stopReason": "end_turn"
+                }
+              }
+            },
+            {
+              "op": "set",
+              "path": "/live/op/status",
+              "value": "completed"
+            }
+          ]
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 13,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hello"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0,
+              "end": {
+                "response": {
+                  "stopReason": "end_turn"
+                }
+              }
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "completed",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "1RLItCNaOpuqgX0w8dtBSw"
+      },
+      {
+        "name": "a checkpoint at the current rev verifies the document",
+        "event": {
+          "scope": "session/S",
+          "rev": 13,
+          "digest": "1RLItCNaOpuqgX0w8dtBSw"
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 13,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hello"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0,
+              "end": {
+                "response": {
+                  "stopReason": "end_turn"
+                }
+              }
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "completed",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "1RLItCNaOpuqgX0w8dtBSw"
+      },
+      {
+        "name": "a differential snapshot replaces the changed entries and appends the new ones",
+        "event": {
+          "scope": "session/S",
+          "snapshot": {
+            "epoch": "E1",
+            "rev": 15,
+            "digest": "1Y9-ZzeESSZ-elm_-JuI2w",
+            "doc": {
+              "history": "complete",
+              "prompts": [
+                {
+                  "entry": 0,
+                  "end": {
+                    "response": {
+                      "stopReason": "end_turn"
+                    }
+                  }
+                },
+                {
+                  "entry": 2
+                }
+              ],
+              "live": {
+                "sessionId": "S",
+                "cwd": "/w",
+                "closing": false,
+                "op": {
+                  "id": "op-2",
+                  "kind": "prompt",
+                  "status": "completed",
+                  "input": null,
+                  "cancelRequested": false
+                },
+                "interactions": {},
+                "urlFlows": {},
+                "terminals": {}
+              }
+            },
+            "entries": {
+              "base": "update",
+              "length": 3,
+              "changed": [
+                [
+                  1,
+                  {
+                    "kind": "message",
+                    "role": "agent",
+                    "chunks": [
+                      {
+                        "content": {
+                          "type": "text",
+                          "text": "Hello there"
+                        }
+                      }
+                    ],
+                    "messageId": "m1"
+                  }
+                ],
+                [
+                  2,
+                  {
+                    "kind": "message",
+                    "role": "user",
+                    "chunks": [
+                      {
+                        "content": {
+                          "type": "text",
+                          "text": "again"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "doc": {
+          "epoch": "E1",
+          "rev": 15,
+          "history": "complete",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "hi"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "Hello there"
+                  }
+                }
+              ],
+              "messageId": "m1"
+            },
+            {
+              "kind": "message",
+              "role": "user",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "again"
+                  }
+                }
+              ]
+            }
+          ],
+          "prompts": [
+            {
+              "entry": 0,
+              "end": {
+                "response": {
+                  "stopReason": "end_turn"
+                }
+              }
+            },
+            {
+              "entry": 2
+            }
+          ],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-2",
+              "kind": "prompt",
+              "status": "completed",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "1Y9-ZzeESSZ-elm_-JuI2w"
+      },
+      {
+        "name": "a new epoch replaces the document",
+        "event": {
+          "scope": "session/S",
+          "snapshot": {
+            "epoch": "E2",
+            "rev": 0,
+            "digest": "sLL2QNZ-ec1WkgPYQHC_-A",
+            "doc": {
+              "history": "partial",
+              "prompts": [],
+              "live": {
+                "sessionId": "S",
+                "cwd": "/w",
+                "closing": false,
+                "op": {
+                  "id": "op-9",
+                  "kind": "open",
+                  "status": "completed",
+                  "input": null,
+                  "cancelRequested": false
+                },
+                "interactions": {},
+                "urlFlows": {},
+                "terminals": {}
+              }
+            },
+            "entries": {
+              "base": "replace",
+              "length": 1,
+              "changed": [
+                [
+                  0,
+                  {
+                    "kind": "message",
+                    "role": "agent",
+                    "chunks": [
+                      {
+                        "content": {
+                          "type": "text",
+                          "text": "resumed"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "doc": {
+          "epoch": "E2",
+          "rev": 0,
+          "history": "partial",
+          "entries": [
+            {
+              "kind": "message",
+              "role": "agent",
+              "chunks": [
+                {
+                  "content": {
+                    "type": "text",
+                    "text": "resumed"
+                  }
+                }
+              ]
+            }
+          ],
+          "prompts": [],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-9",
+              "kind": "open",
+              "status": "completed",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "sLL2QNZ-ec1WkgPYQHC_-A"
+      },
+      {
+        "name": "an unknown history has no entries",
+        "event": {
+          "scope": "session/S",
+          "snapshot": {
+            "epoch": "E3",
+            "rev": 0,
+            "digest": "42vsw3D47FspKiPYgBgBBw",
+            "doc": {
+              "prompts": [],
+              "live": {
+                "sessionId": "S",
+                "cwd": "/w",
+                "closing": false,
+                "op": {
+                  "id": "op-10",
+                  "kind": "load",
+                  "status": "running",
+                  "input": null,
+                  "cancelRequested": false
+                },
+                "interactions": {},
+                "urlFlows": {},
+                "terminals": {}
+              }
+            }
+          }
+        },
+        "doc": {
+          "epoch": "E3",
+          "rev": 0,
+          "prompts": [],
+          "live": {
+            "sessionId": "S",
+            "cwd": "/w",
+            "closing": false,
+            "op": {
+              "id": "op-10",
+              "kind": "load",
+              "status": "running",
+              "input": null,
+              "cancelRequested": false
+            },
+            "interactions": {},
+            "urlFlows": {},
+            "terminals": {}
+          }
+        },
+        "digest": "42vsw3D47FspKiPYgBgBBw"
+      }
+    ],
+    "global": [
+      {
+        "name": "a global snapshot",
+        "event": {
+          "scope": "global",
+          "snapshot": {
+            "epoch": "G1",
+            "rev": 0,
+            "digest": "4LzSUFjESsQYk8bimDraag",
+            "doc": {
+              "live": {
+                "op": {
+                  "id": "n",
+                  "kind": "none",
+                  "status": "completed"
+                },
+                "sessions": {}
+              }
+            }
+          }
+        },
+        "doc": {
+          "epoch": "G1",
+          "rev": 0,
+          "live": {
+            "op": {
+              "id": "n",
+              "kind": "none",
+              "status": "completed"
+            },
+            "sessions": {}
+          }
+        },
+        "digest": "4LzSUFjESsQYk8bimDraag"
+      },
+      {
+        "name": "an op adds a session summary",
+        "event": {
+          "scope": "global",
+          "rev": 1,
+          "ops": [
+            {
+              "op": "set",
+              "path": "/live/sessions/S",
+              "value": {
+                "sessionId": "S",
+                "title": null
+              }
+            }
+          ]
+        },
+        "doc": {
+          "epoch": "G1",
+          "rev": 1,
+          "live": {
+            "op": {
+              "id": "n",
+              "kind": "none",
+              "status": "completed"
+            },
+            "sessions": {
+              "S": {
+                "sessionId": "S",
+                "title": null
+              }
+            }
+          }
+        },
+        "digest": "_UvWLA-qBfelIQGneD5KBg"
+      },
+      {
+        "name": "a global checkpoint",
+        "event": {
+          "scope": "global",
+          "rev": 1,
+          "digest": "_UvWLA-qBfelIQGneD5KBg"
+        },
+        "doc": {
+          "epoch": "G1",
+          "rev": 1,
+          "live": {
+            "op": {
+              "id": "n",
+              "kind": "none",
+              "status": "completed"
+            },
+            "sessions": {
+              "S": {
+                "sessionId": "S",
+                "title": null
+              }
+            }
+          }
+        },
+        "digest": "_UvWLA-qBfelIQGneD5KBg"
+      }
+    ]
+  }
+}
