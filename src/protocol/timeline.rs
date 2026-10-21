@@ -141,14 +141,14 @@ enum Entity {
 }
 
 /// The prompt the bridge sent and the blocks an echo may still match (§4.1).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Sent {
     entry: usize,
     blocks: Vec<Chunk>,
     matched: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Timeline {
     entries: Vec<Arc<Entry>>,
     prompts: Vec<Prompt>,

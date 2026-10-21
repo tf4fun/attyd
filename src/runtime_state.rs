@@ -290,6 +290,7 @@ impl SessionRegistry {
             .get_mut(&waiting.session_id)
             .expect("the session was opened");
         entry.state.log = waiting.log;
+        entry.state.timeline = waiting.timeline;
         entry
             .state
             .live
@@ -2224,6 +2225,33 @@ mod tests {
             .start_prompt("epoch", session_id, operation_id.clone(), prompt)
             .unwrap();
         operation_id
+    }
+
+    #[test]
+    fn a_session_waiting_for_the_next_connection_keeps_its_timeline() {
+        let mut state = state();
+        open(&mut state, "session");
+        let replay = [json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": "m",
+            "content": { "type": "text", "text": "kept" }
+        })];
+        state.replace_session_timeline(
+            "session",
+            crate::protocol::timeline::Timeline::from_replay(
+                replay.iter().map(|update| (update, None)),
+            ),
+        );
+        let held = state.state("session").unwrap().timeline.clone().unwrap();
+
+        let waiting = state
+            .wait_for_next_connection("session")
+            .expect("a held session waits");
+        let mut next = RuntimeState::new("epoch-2");
+        next.seed_waiting(waiting).unwrap();
+
+        let restored = next.state("session").unwrap().timeline.clone().unwrap();
+        assert!(Arc::ptr_eq(&held, &restored));
+        assert_eq!(restored.entries().len(), 1);
     }
 
     #[test]

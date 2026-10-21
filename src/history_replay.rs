@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
+use crate::protocol::timeline::Timeline;
 use crate::runtime_state::{RuntimeStateError, fold_active_turn_update, fold_control_update};
 use crate::semantic::{SessionUpdateSemanticState, validate_history_update};
 
@@ -85,9 +86,20 @@ impl HistoryBuilder {
     }
 }
 
+/// A completed replay: the folded updates the turn log is built from, and the
+/// session timeline reduced from the same updates as received (bridge memory
+/// model §6.2).
+#[derive(Debug)]
+pub(crate) struct Replay {
+    pub(crate) updates: Vec<Value>,
+    pub(crate) timeline: Timeline,
+}
+
 #[derive(Default)]
 pub(crate) struct ReplayData {
     history: HistoryBuilder,
+    /// The candidate session timeline, private to this load attempt.
+    timeline: Timeline,
     validation: SessionUpdateSemanticState,
     controls: Vec<Value>,
     invalid: Option<HistoryCacheError>,
@@ -117,6 +129,7 @@ impl ReplayCandidate {
             return Err(HistoryCacheError::AttemptMismatch);
         }
         data.updates()?;
+        data.timeline.reduce(&update, None);
         if data.history.append(update).is_err() {
             data.invalid = Some(HistoryCacheError::InvalidReplay);
             return Err(HistoryCacheError::InvalidReplay);
@@ -134,6 +147,7 @@ impl ReplayCandidate {
         let result: Result<(), String> = (|| {
             validate_history_update(&mut data.validation, &update)?;
             if conversation {
+                data.timeline.reduce(&update, None);
                 data.history
                     .append(update)
                     .map_err(|_| "Invalid history fold".to_owned())?;
@@ -181,11 +195,14 @@ impl ReplayCandidate {
         )
     }
 
-    pub(crate) fn take_history(&self) -> Result<Vec<Value>, HistoryCacheError> {
+    pub(crate) fn take_replay(&self) -> Result<Replay, HistoryCacheError> {
         let mut data = self.lock();
         data.updates()?;
         data.sealed = true;
-        Ok(std::mem::take(&mut data.history).updates)
+        Ok(Replay {
+            updates: std::mem::take(&mut data.history).updates,
+            timeline: std::mem::take(&mut data.timeline),
+        })
     }
 
     pub(crate) fn discard(&self) {
@@ -276,7 +293,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(cache.commit_candidate(key, "new").unwrap().is_empty());
+        assert!(cache.commit_candidate(key, "new").unwrap().updates.is_empty());
     }
 
     #[test]
