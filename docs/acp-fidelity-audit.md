@@ -144,53 +144,16 @@ the baseline, not a newer upstream draft.
 
 ### 9.1 Basic rules
 
-1. **Execute the negotiated client contract.** Every supported request has its own
-   response, error and cancellation path. Preserve ACP data without vendor-specific
-   interpretation. Keep capability declarations consistent with actual behavior;
-   name unsupported subsets instead of calling them complete support.
-2. **Reduce content, not meaning.** Keep the Agent's displayable content, identities,
-   boundaries and metadata in bridge memory. Deltas may become current entities;
-   control notifications may become current controls. Neither reduction may discard
-   information merely because an operation ended or a field has no current UI.
-   Opaque `_meta` must be retained, not understood or obligatorily rendered.
-3. **Use the resource's real lifetime.** A request lives until its own answer or
-   cancellation; an interaction follows its ACP scope. An operation is not a proxy
-   for another RPC's lifetime. Keep only outstanding RPC correlation, and remove it
-   after the response. Answer one interaction independently and at most once.
-4. **Release handles separately from referenced content.** Ended work cannot remain
-   actionable, but its received content and known result remain while the containing
-   session is held. A referenced attachment or terminal result remains readable after
-   its producer ends. Releasing the session may free that memory; a later resume
-   cannot manufacture the missing history. Connection recovery must also work when
-   there is no held session.
-
-These rules constrain behavior, not a new storage architecture. They do not require
-an event archive, a historical request table, a completed-request journal or a second
-authoritative copy of session state.
+The rules now live in [bridge memory model §1](bridge-memory-model.md#1-principles).
+In particular, a load replay and live prompts build the same structure with one
+reducer, and `session/load` is the only history recovery path.
 
 ### 9.2 Displayable memory
 
-"Retained" below means available in bridge memory while its owning content or scope
-is held. It does not mean every field must have a UI widget or survive a restart.
-
-| Data | Required state and lifetime |
-| --- | --- |
-| Session inventory and current work | Session IDs, Agent-provided cwd/info and catalog pages/cursors; which sessions are held and what work is currently running or has just ended, with its result/error. Keep current state sufficient to choose an available action; this does not require a history of every command. Reading a catalog must not invent loaded conversation content. |
-| Session timeline | User, Agent and thought messages; tool calls with name, status, input, output, content, diffs and locations; plans and compactions with summaries. Keep ordering, message/entity IDs, block boundaries, annotations and `_meta`. Reduce updates into their entities, including updates outside a prompt or after its result. Preserve replayed tool/process content as well as live content. |
-| Prompt result | Associate the actual stop reason and usage, or structured ACP error, with the prompt whose output was received. A failed/cancelled prompt retains its content. A lost response is unknown/interrupted, never invented success. A later operation must not erase the result. |
-| Controls and session information | Current modes, configuration options, commands, title, usage and cost, with metadata at the source level it qualifies (D12). Fold early updates, response fields and later updates in order; distinguish absent, null and empty where ACP does. Preserve the established preference for config options over legacy modes. |
-| Interactions | Complete permission/form/URL request, actual session/tool association or outstanding parent RPC, and the original responder. Remove on its own answer/cancellation or scope end. A permission's carried tool patch also contributes to the timeline. An unrelated control or prompt result does not remove a session-scoped form. |
-| Accepted URL flow | Request, interaction identity, Agent elicitation ID and `waiting/completed/ended` outcome. Acceptance ends the interaction but not the external flow; the parent RPC's response does not end an accepted flow. A terminal outcome does not revert. Dismissal or scope release removes it; no separate finished table is needed. |
-| Attachments and session terminals | Referenced attachment blocks remain available as received, including compaction-summary attachments. A terminal keeps its actual output, truncation and exit status; release removes its handle, not output embedded by retained content. A connection ending freezes referenced output of sessions that remain held. Frozen output does not itself hold a session open. |
-| History knowledge | Distinguish unknown, partial and complete history; an actual empty replay is different from no replay. Load reflects the history the Agent supplied; cold resume preserves the fact that prior content is unknown rather than asserting complete empty history. No reconstruction of interactions or terminal bytes the Agent did not replay. |
-| Connection and authentication | Initialization/capabilities, current Agent state and structured failure; authentication's method and terminal state/results while retained. Pending calls finish when their connection ends. An explicit recovery from stopped/error state works before any session has been created, so create/auth/list are not permanently stranded. |
-
-File read/write results and MCP transport messages need correct execution and ACP
-responses, not automatic entries in this table. If the Agent publishes their results
-as session content, that content follows the timeline rule. MCP connection handles,
-pending messages and cancellation state are operational state; disconnect releases
-them. Agent/MCP stderr, activity inspectors and raw RPC logs are optional diagnostics,
-not this stage's acceptance gate.
+The retained state and its lifetimes are specified by the
+[bridge memory model](bridge-memory-model.md): timeline entries (§3), prompt outcomes
+(§4), history knowledge (§6), controls (§7) and resources (§8). This audit keeps the
+evidence and status below.
 
 ### 9.3 Implementation status at the comparison commits
 
@@ -201,7 +164,7 @@ not this stage's acceptance gate.
 | Shared gaps or restrictions | Form patterns are a subset (L5). Both rc5 and the experiment cancel pending session forms on prompt cancel; Q2's narrower rule is still to implement. Real parent-RPC lifetime management is not complete in rc5 either. Neither baseline's settled URL map retains the outcome: rc5 `runtime_state.rs:1597–1623` removes the flow and publishes the remaining map, as does the experiment `:1133–1158`. Do not infer a rc5 finished-flow table or completion-event guarantee from the older v0.2.8 comparison. Step 16 covers these interaction/form/outcome paths. |
 | History and recovery | rc5 also released resume-only history; D9 adds explicit knowledge instead of claiming empty completeness. Experimental recovery is triggered only by a followed session or login restart (`server.rs:222–236`), leaving no explicit recovery when neither exists. Step 14 must cover partial history and recovery with no session; the exact user-facing trigger is not prescribed here. |
 | Additional retention work | D12 belongs with the existing controls/actions work in step 18. This is preservation of current controls and their metadata, not a control-update archive. |
-| Still to decide or verify | Fork notifications arriving before the response, the provenance of inherited fork history, and resources naming an unknown session during concurrent creation need a clear supported boundary and tests; their routing must not be guessed. After close/reopen replaces a local session under the same ID, an old action's acknowledgement must settle only its original pending request and must not write into the replacement; verify that boundary, without changing the response-arrival ordering rule for actions of the current session. Late terminal callbacks after local session replacement also need targeted verification. These are not certified regressions or a reason to restore a public owner/CAS scheme. |
+| Still to decide or verify | Fork notifications arriving before the response, the provenance of inherited fork history, and resources naming an unknown session during concurrent creation need a clear supported boundary and tests; their routing must not be guessed. After close/reopen replaces a local session under the same ID, an old action's acknowledgement must settle only its original pending request and must not write into the replacement; verify that boundary, without changing the response-arrival ordering rule for actions of the current session. Late terminal callbacks after local session replacement also need targeted verification. These are not certified regressions or a reason to restore a public owner/CAS scheme. [Memory model §6.3 and §9](bridge-memory-model.md#9-concurrency) propose rules for fork history, installation attribution and late responses. |
 
 The installation promises in §4.4 of the protocol remain subject to the unresolved
 unknown-session association above. This stage does not invent a provisional-owner
@@ -219,6 +182,7 @@ or replica. These tests precede, and are independent of, later FE convergence te
 | --- | --- |
 | Negotiation and session operations | Check initialize/version/capabilities, supported authentication methods, and new/list/load/resume/fork/close/delete with actual ACP requests and replies. Preserve session metadata and opaque cursors; show current work and its real outcome. A refused or failed operation does not invent a session or successful result. Exercise mode/config and close while a prompt runs. |
 | Complete live turn and load replay | Send every supported timeline kind, multiple message IDs, mixed text/attachments and metadata. After completion and after replay, the expected content and boundaries remain; no tool/thought/plan/compaction kind disappears. |
+| Live/replay equivalence | The same content run live (with and without a prompt echo) and as a load replay gives equal entries, ignoring live-only prompt outcomes ([memory model §4.3](bridge-memory-model.md#43-equivalence-requirement)). |
 | Failure, cancel and idle/late update | After partial output followed by error, cancellation or connection loss, content remains with the actual or unknown result. An idle update is retained; a late update changes its existing entity. The next prompt does not remove the earlier result. |
 | Controls | Early update → response → later update produces the explicit expected values. Exercise sparse info, absent cost, null versus empty config, outer/nested metadata and successful action acknowledgements. Check stored state directly, including D12's metadata. |
 | Independent interactions | Two pending requests exist in memory. Answering one sends only its ACP response; the other remains. A repeated answer sends nothing. Ending `set_mode` does not cancel a session form. Permission tool content is retained even without a preceding tool notification. |

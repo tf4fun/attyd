@@ -242,7 +242,9 @@ the real outstanding request, without restoring a public owner/CAS/intent system
 
 Status: **step 10 (docs) merged; step 11 in draft PR #53; steps 12–20 planned.**
 The current milestone is **ACP → bridge functionality and displayable memory**,
-defined in the [first-layer contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract).
+defined in the [first-layer contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract)
+and specified by the [bridge memory model](bridge-memory-model.md) (proposed
+2026-10-21): load replay and live prompts build one flat entry list with one reducer.
 The [audit](acp-fidelity-audit.md) distinguishes runtime defects, shared v1
 limitations and open rules; the [release parity matrix](release-parity.md) compares
 the stable rc.5 baseline and keeps older release evidence separately. A draft PR or
@@ -450,7 +452,7 @@ but expired execution handles cannot become live again.
 | Step | Work | Removes | Acceptance (cases 1–37) |
 | --- | --- | --- | --- |
 | 10 | Docs: this revision, the audit, the release parity matrix, the coverage ledger | — | review (done) |
-| 11 | One timeline reducer and entry shape: items, `end`, message boundaries, block/entity/notification-source metadata, original attachments, hash over the entry; live commits and replay through it; complete PromptResponse for successful/cancelled turns; validate numeric-domain limits against the locked schema. Generated types and minimum item rendering accompany the change | D1, D2, D3, D6, D7; source matrix content fields | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36; content matrix CN/CB/TC/PL/EN cases |
+| 11 | One timeline reducer over a flat entry list ([memory model](bridge-memory-model.md) §3–§5), shared by load replay and live prompts, with the prompt echo rule and per-prompt outcomes; turns derived for the wire. Gate: the live/replay equivalence test (§4.3). Also: items, `end`, message boundaries, block/entity/notification-source metadata, original attachments, hash over the entry; live commits and replay through it; complete PromptResponse for successful/cancelled turns; validate numeric-domain limits against the locked schema. Generated types and minimum item rendering accompany the change | D1, D2, D3, D6, D7; source matrix content fields | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36; content matrix CN/CB/TC/PL/EN cases |
 | 12 | Settling of failed and interrupted prompts | D4 | 2, 22 |
 | 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |
 | 14 | Honest load/resume/fork knowledge and attempt-local rollback; fork source cut includes tail and referenced resources, not a guessed complete target replay; zero-session Agent recovery; retain current catalog pages/cursors and setup/auth/logout result metadata without request history. State the unknown-session association boundary | D9; source matrix lifecycle/metadata gaps and open rules | 23; direct history, fork-resource, catalog/current-result and zero-session recovery cases |
