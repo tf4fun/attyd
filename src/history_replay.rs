@@ -123,13 +123,23 @@ impl ReplayCandidate {
         self.0.lock().expect("history candidate lock poisoned")
     }
 
+    #[cfg(test)]
     pub(crate) fn append(&self, update: Value) -> Result<(), HistoryCacheError> {
+        self.append_with_meta(update, None)
+    }
+
+    /// `envelope` is the notification's `_meta` (memory model §3.5).
+    pub(crate) fn append_with_meta(
+        &self,
+        update: Value,
+        envelope: Option<&Value>,
+    ) -> Result<(), HistoryCacheError> {
         let mut data = self.lock();
         if data.sealed {
             return Err(HistoryCacheError::AttemptMismatch);
         }
         data.updates()?;
-        data.timeline.reduce(&update, None);
+        data.timeline.reduce(&update, envelope);
         if data.history.append(update).is_err() {
             data.invalid = Some(HistoryCacheError::InvalidReplay);
             return Err(HistoryCacheError::InvalidReplay);
@@ -139,7 +149,17 @@ impl ReplayCandidate {
 
     /// Validation is transactional at the replay level: any malformed record
     /// poisons the whole candidate, so no per-record copy of the entity map is needed.
+    #[cfg(test)]
     pub(crate) fn ingest(&self, update: Value, conversation: bool) -> Result<(), String> {
+        self.ingest_with_meta(update, conversation, None)
+    }
+
+    pub(crate) fn ingest_with_meta(
+        &self,
+        update: Value,
+        conversation: bool,
+        envelope: Option<&Value>,
+    ) -> Result<(), String> {
         let mut data = self.lock();
         if data.sealed || data.invalid.is_some() {
             return Ok(());
@@ -147,7 +167,7 @@ impl ReplayCandidate {
         let result: Result<(), String> = (|| {
             validate_history_update(&mut data.validation, &update)?;
             if conversation {
-                data.timeline.reduce(&update, None);
+                data.timeline.reduce(&update, envelope);
                 data.history
                     .append(update)
                     .map_err(|_| "Invalid history fold".to_owned())?;
@@ -253,6 +273,29 @@ mod tests {
             actual.append(update).unwrap();
             assert_eq!(actual.updates, expected);
         }
+    }
+
+    #[test]
+    fn a_replay_keeps_the_notification_envelope_beside_the_update() {
+        let replay = ReplayCandidate::default();
+        let envelope = json!({ "trace": "t1" });
+        replay
+            .ingest_with_meta(
+                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}),
+                true,
+                Some(&envelope),
+            )
+            .unwrap();
+        replay
+            .append_with_meta(
+                json!({"sessionUpdate":"tool_call","toolCallId":"t","title":"Run"}),
+                Some(&envelope),
+            )
+            .unwrap();
+        replay.seal();
+        let entries = serde_json::to_value(replay.take_replay().unwrap().timeline.entries()).unwrap();
+        assert_eq!(entries[0]["chunks"][0]["notificationMeta"], envelope);
+        assert_eq!(entries[1]["notificationMeta"], envelope);
     }
 
     #[test]

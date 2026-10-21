@@ -59,13 +59,25 @@ impl HistoryCache {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn append_candidate(
         &mut self,
         session_id: &str,
         attempt_id: &str,
         update: Value,
     ) -> Result<(), HistoryCacheError> {
-        self.candidate(session_id, attempt_id)?.append(update)
+        self.append_candidate_with_meta(session_id, attempt_id, update, None)
+    }
+
+    pub(crate) fn append_candidate_with_meta(
+        &mut self,
+        session_id: &str,
+        attempt_id: &str,
+        update: Value,
+        envelope: Option<&Value>,
+    ) -> Result<(), HistoryCacheError> {
+        self.candidate(session_id, attempt_id)?
+            .append_with_meta(update, envelope)
     }
 
     pub(crate) fn poison_candidate(

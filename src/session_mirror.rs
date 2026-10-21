@@ -104,15 +104,27 @@ impl SessionRegistry {
         Ok(self.history.candidate(session_id, attempt_id)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_load_update(
         &mut self,
         session_id: &str,
         attempt_id: &str,
         update: Value,
     ) -> Result<(), MirrorError> {
+        self.append_load_update_with_meta(session_id, attempt_id, update, None)
+    }
+
+    /// `envelope` is the notification's `_meta`, kept beside the update (§3.5).
+    pub(crate) fn append_load_update_with_meta(
+        &mut self,
+        session_id: &str,
+        attempt_id: &str,
+        update: Value,
+        envelope: Option<&Value>,
+    ) -> Result<(), MirrorError> {
         self.require_load(session_id, attempt_id)?;
         self.history
-            .append_candidate(session_id, attempt_id, update)?;
+            .append_candidate_with_meta(session_id, attempt_id, update, envelope)?;
         Ok(())
     }
 
@@ -233,32 +245,53 @@ impl SessionRegistry {
         Ok(operation_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_turn_update(
         &mut self,
         session_id: &str,
         operation_id: &str,
         update: Value,
     ) -> Result<(), MirrorError> {
+        self.append_turn_update_with_meta(session_id, operation_id, update, None)
+    }
+
+    pub(crate) fn append_turn_update_with_meta(
+        &mut self,
+        session_id: &str,
+        operation_id: &str,
+        update: Value,
+        envelope: Option<&Value>,
+    ) -> Result<(), MirrorError> {
         self.require_state_mut(session_id)?
-            .append_turn_update(operation_id, update)
+            .append_turn_update_with_meta(operation_id, update, envelope)
     }
 
     /// A conversation update outside a turn. A completed turn being reconciled
     /// keeps it in its overlay. The timeline reduces it in both cases; the log
     /// is still only appended by turns and rebuilt by loads.
+    #[cfg(test)]
     pub(crate) fn append_session_update(
         &mut self,
         session_id: &str,
         update: Value,
+    ) -> Result<(), MirrorError> {
+        self.append_session_update_with_meta(session_id, update, None)
+    }
+
+    pub(crate) fn append_session_update_with_meta(
+        &mut self,
+        session_id: &str,
+        update: Value,
+        envelope: Option<&Value>,
     ) -> Result<(), MirrorError> {
         let session = self.require_state_mut(session_id)?;
         if session.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);
         }
         match session.phase {
-            MirrorPhase::Reconciling => session.append_reconciling_update(update),
+            MirrorPhase::Reconciling => session.append_reconciling_update(update, envelope),
             MirrorPhase::Ready => {
-                session.append_idle_update(&update);
+                session.append_idle_update(&update, envelope);
                 Ok(())
             }
             _ => Err(MirrorError::WrongPhase),
@@ -1001,6 +1034,51 @@ mod tests {
                 .is_err()
         );
         assert!(mirror.state("session").unwrap().timeline.is_none());
+    }
+
+    #[test]
+    fn the_notification_envelope_is_kept_on_replayed_live_and_idle_updates() {
+        let mut mirror = mirror();
+        mirror.register_cold("session");
+        mirror.begin_load("session", "load").unwrap();
+        mirror
+            .append_load_update_with_meta(
+                "session",
+                "load",
+                agent_update("replayed", "r"),
+                Some(&json!({ "from": "replay" })),
+            )
+            .unwrap();
+        mirror.commit_load("session", "load").unwrap();
+        assert_eq!(
+            timeline_entries(&mirror)[0]["chunks"][0]["notificationMeta"],
+            json!({ "from": "replay" })
+        );
+
+        let operation = mirror
+            .start_turn("session", "intent", text_prompt("next"))
+            .unwrap();
+        mirror
+            .append_turn_update_with_meta(
+                "session",
+                &operation,
+                json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "Run" }),
+                Some(&json!({ "from": "live" })),
+            )
+            .unwrap();
+        mirror
+            .complete_turn("session", &operation, json!({ "stopReason": "end_turn" }))
+            .unwrap();
+        mirror
+            .append_session_update_with_meta(
+                "session",
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "completed" }),
+                Some(&json!({ "from": "late" })),
+            )
+            .unwrap();
+        let entries = timeline_entries(&mirror);
+        assert_eq!(entries[2]["notificationMeta"], json!({ "from": "late" }));
+        assert_eq!(entries[2]["call"]["status"], json!("completed"));
     }
 
     #[test]

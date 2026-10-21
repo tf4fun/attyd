@@ -2258,6 +2258,11 @@ async fn handle_session_update(
             return;
         }
     };
+    // The notification's own `_meta`, kept beside the update (memory model §3.5).
+    let envelope = notification
+        .meta
+        .as_ref()
+        .map(|meta| Value::Object(meta.clone()));
     let tool_update = matches!(
         update.get("sessionUpdate").and_then(Value::as_str),
         Some("tool_call" | "tool_call_update")
@@ -2351,7 +2356,12 @@ async fn handle_session_update(
                     .and_then(|attempt| {
                         state
                             .sessions
-                            .append_load_update(&session_id, &attempt, update.clone())
+                            .append_load_update_with_meta(
+                                &session_id,
+                                &attempt,
+                                update.clone(),
+                                envelope.as_ref(),
+                            )
                             .map_err(mirror_error)
                     })
             } else {
@@ -2371,12 +2381,13 @@ async fn handle_session_update(
         {
             let mirrored = if is_conversation_update(&update) {
                 session_mirror(&mut state)
-                    .append_load_update(
+                    .append_load_update_with_meta(
                         &session_id,
                         mirror_replay_attempt
                             .as_deref()
                             .expect("reconciliation has a load attempt"),
                         update.clone(),
+                        envelope.as_ref(),
                     )
                     .map_err(mirror_error)
             } else {
@@ -2413,14 +2424,23 @@ async fn handle_session_update(
                             .map(str::to_string)
                     {
                         session_mirror(&mut state)
-                            .append_turn_update(&session_id, &operation_id, update.clone())
+                            .append_turn_update_with_meta(
+                                &session_id,
+                                &operation_id,
+                                update.clone(),
+                                envelope.as_ref(),
+                            )
                             .map_err(mirror_error)
                     } else if matches!(
                         mirror_phase,
                         Some(MirrorPhase::Ready | MirrorPhase::Reconciling)
                     ) {
                         session_mirror(&mut state)
-                            .append_session_update(&session_id, update.clone())
+                            .append_session_update_with_meta(
+                                &session_id,
+                                update.clone(),
+                                envelope.as_ref(),
+                            )
                             .map_err(mirror_error)
                     } else {
                         Ok(())
