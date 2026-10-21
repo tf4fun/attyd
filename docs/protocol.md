@@ -127,8 +127,8 @@ type Block = ContentBlock /* with byte-carrying blocks as AttachmentRef */;
 type PromptBlock = ContentBlock | AttachmentRef;   // what a prompt may contain (§6.2)
 ```
 
-The `id` identifies the block exactly as received, `_meta` included, with no numeric
-rounding (§8); reading it returns that block unchanged, and a client can verify the
+The `id` identifies the block as layer 1 retains it, `_meta` included, without rounding
+its integers to doubles (§8); reading it returns that block unchanged, and a client can verify the
 read against the `id`. Two blocks that differ anywhere, also in an integer beyond
 ±2^53, have different IDs.
 Text and resource links stay inline.
@@ -646,10 +646,17 @@ epoch may return after it. Hence:
   stream is that scope's only source;
 - for a scope it does not follow, it installs only the result of its latest `GET` for
   that scope (a per-scope request counter discards older ones), and within the same
-  epoch only if `rev` is not older than the replica's.
-**Attachment identity.** The exact form of a block is JCS key order and string
-escaping with every number written as the decimal digits the bridge received, without
-conversion to double. `id` is the SHA-256 of these bytes. The attachment read's body is
+  epoch only if `rev` is not older than the replica's;
+- when a stream takes over a scope, every `GET` already issued for it loses its right
+  to install, permanently: unsubscribing later does not restore it. Only a `GET` issued
+  after the stream stopped following the scope may install.
+**Attachment identity.** The exact form of a block is a deterministic serialization of
+the typed block layer 1 retains (memory model §8.3), not of the raw RPC bytes: JCS key
+order and string escaping; integers the SDK parsed as `i64`/`u64` written exactly;
+every other number as its parsed finite `f64` in JCS number form. So two blocks that
+differ in an integer beyond ±2^53 differ in form, while a float the SDK already rounded
+(for example `Annotations.priority` `0.10000000000000001`, parsed as `0.1`) has the form
+of its parsed value. `id` is the SHA-256 of these bytes. The attachment read's body is
 exactly these bytes, so a client verifies it by hashing the raw body before parsing;
 a body whose hash is not the `id` is unverified (§5.5).
 
@@ -731,8 +738,8 @@ client's actual decode, apply, verify and install steps.
 | New epoch | load replacement, reopen and bridge restart give a full snapshot; earlier entries are not confirmed |
 | Several clients | two subscribers at equal `rev` have equal digests; their writes race as §6.6 states; two answers to one interaction deliver exactly one |
 | Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, and a multi-scope race (`authenticate` in `global` lost while a `fork` from a session replaces `global`'s `op`) resolved as unknown, never as not admitted |
-| Large integers | two attachments differing only in an integer beyond ±2^53 get different IDs and read back unchanged; document digests agree between bridge and client for such values |
-| Reconnect races | a superseded stream's late events cannot overwrite a newer replica; a `GET` from an older epoch returning after a new epoch's snapshot is not installed |
+| Large integers | two attachments differing only in an integer beyond ±2^53 get different IDs and read back unchanged; a float in an attachment hashes as its parsed `f64`; document digests agree between bridge and client for such values |
+| Reconnect races | a superseded stream's late events cannot overwrite a newer replica; a `GET` from an older epoch returning after a new epoch's snapshot is not installed, also after the client unsubscribes |
 | Ended scope in a slow queue | a `close` or `delete` `end` queued behind events reaches the slow subscriber; no snapshot is generated for that scope |
 | Bad attachment read | wrong bytes are not shown; a read racing a release yields `404`, not wrong content |
 
