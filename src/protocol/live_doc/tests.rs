@@ -117,8 +117,9 @@ fn a_session_closing_says_so_and_a_closed_one_is_not_published() {
             .lifecycle = lifecycle;
     };
     for closing in [SessionLifecycle::Closing, SessionLifecycle::ClosingForDelete] {
+        let what = format!("{closing:?}");
         lifecycle(&mut registry, closing);
-        assert_eq!(live(&registry)["closing"], true, "{closing:?}");
+        assert_eq!(live(&registry)["closing"], true, "{what}");
     }
     lifecycle(&mut registry, SessionLifecycle::Active);
     assert_eq!(live(&registry)["closing"], false);
