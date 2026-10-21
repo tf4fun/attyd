@@ -3589,6 +3589,15 @@ async fn handle_command_inner(
             }
 
             session_mirror(&mut state).register_cold(session_id.clone());
+            // The target never inherits the source's entries: tool, plan and
+            // compaction IDs are unique only within their own session, and the
+            // Agent promises no transcript. It holds what the Agent sent for it
+            // (partial); a load of the target, when the Agent supports one,
+            // replaces that with the replay (bridge memory model §6.3).
+            session_mirror(&mut state).adopt_session_timeline(
+                &session_id,
+                timeline_from_notifications(&early_updates),
+            );
             // The response claim is about to release subsequent target messages.
             // Give the target its log before making it routable.
             session_mirror(&mut state)
