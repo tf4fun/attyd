@@ -18,6 +18,7 @@ mod controls;
 #[cfg(test)]
 mod convergence_tests;
 pub(crate) mod diff;
+pub(crate) mod digest;
 pub(crate) mod documents;
 pub(crate) mod hub;
 #[cfg(test)]

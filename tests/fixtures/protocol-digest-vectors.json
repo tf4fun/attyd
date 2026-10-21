@@ -1,0 +1,292 @@
+{
+  "comment": "Digest vectors of docs/protocol.md §5.5, computed by an independent implementation (Python hashlib and its own canonical JSON). Both the Rust and the TypeScript digest must reproduce them.",
+  "cases": [
+    {
+      "name": "a session whose history is unknown has no entries",
+      "kind": "session",
+      "doc": {
+        "epoch": "e1",
+        "rev": 0,
+        "prompts": [],
+        "live": {
+          "sessionId": "s",
+          "op": {
+            "id": "o",
+            "kind": "load",
+            "status": "running"
+          }
+        }
+      },
+      "entryHashes": null,
+      "entriesDigest": "b23a6a8439c0dde5515893e7c90c1e3233b8616e634470f20dc4928bcf3609bc",
+      "digest": "6FLyZUd54lWb-KY6yCjxUw"
+    },
+    {
+      "name": "a known empty history is not the unknown one",
+      "kind": "session",
+      "doc": {
+        "epoch": "e1",
+        "rev": 0,
+        "history": "complete",
+        "entries": [],
+        "prompts": [],
+        "live": {
+          "sessionId": "s"
+        }
+      },
+      "entryHashes": [],
+      "entriesDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "digest": "GiwANvgubYXIqlhJRusY3w"
+    },
+    {
+      "name": "one message with a prompt outcome",
+      "kind": "session",
+      "doc": {
+        "epoch": "e1",
+        "rev": 3,
+        "history": "complete",
+        "entries": [
+          {
+            "kind": "message",
+            "role": "user",
+            "chunks": [
+              {
+                "content": {
+                  "type": "text",
+                  "text": "hi"
+                }
+              }
+            ]
+          },
+          {
+            "kind": "message",
+            "role": "agent",
+            "messageId": "m1",
+            "chunks": [
+              {
+                "content": {
+                  "type": "text",
+                  "text": "hello"
+                }
+              }
+            ]
+          }
+        ],
+        "prompts": [
+          {
+            "entry": 0,
+            "end": {
+              "response": {
+                "stopReason": "end_turn"
+              }
+            }
+          }
+        ],
+        "live": {
+          "sessionId": "s",
+          "cwd": "/w",
+          "closing": false
+        }
+      },
+      "entryHashes": [
+        "51ba9aa39b164702bd87796190826a0919dfd5ddfeb39bf5b592c711ac20baee",
+        "3c5ac4dbb5b5a4eae640c4ce94a31d023471cee83218debd8ffb81b84b0cde38"
+      ],
+      "entriesDigest": "4de4acbb483ed7e6269dbef89aec6b34cd9469cf3d5f542b2e50ffe07a7181b0",
+      "digest": "w_B0Co16SHaMr6Ik-MF3qw"
+    },
+    {
+      "name": "tools plans compactions metadata and escapes",
+      "kind": "session",
+      "doc": {
+        "epoch": "e2",
+        "rev": 41,
+        "history": "partial",
+        "entries": [
+          {
+            "kind": "tool",
+            "call": {
+              "toolCallId": "t",
+              "title": "Run \"x\"\n\\ é 日本",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "terminal",
+                  "terminalId": "term"
+                }
+              ],
+              "locations": []
+            },
+            "notificationMeta": {
+              "trace": "t1"
+            }
+          },
+          {
+            "kind": "plan",
+            "update": {
+              "plan": {
+                "planId": "p",
+                "entries": [
+                  "a",
+                  "b"
+                ]
+              }
+            }
+          },
+          {
+            "kind": "compaction",
+            "compactionId": "c",
+            "status": "completed",
+            "summary": [
+              {
+                "content": {
+                  "type": "text",
+                  "text": "short"
+                },
+                "_meta": {
+                  "k": 1
+                }
+              }
+            ]
+          }
+        ],
+        "prompts": [],
+        "live": {
+          "sessionId": "s",
+          "terminals": {
+            "term": {
+              "terminalId": "term",
+              "output": "ok\n",
+              "truncated": false,
+              "exitStatus": null
+            }
+          }
+        }
+      },
+      "entryHashes": [
+        "0dad88277e422d1ddb0ec887ee13ea1f3c3242fb248e45ed8e7fd451b5c46e60",
+        "f00a8636b2d8d864bf588b4a41cc246d7e5a3f5cb6ed0249b05bb5e76c8a271d",
+        "a10eedaf66facf04c2e30a9d82796e34fbff1a451cafcd399fa9acd3bf9ca201"
+      ],
+      "entriesDigest": "0981cf5a7cfa1e002982c6eaa9594c87879b2199dca95bfd142a81f295d5cf8e",
+      "digest": "rynvUFSDbxLzq7Ym6GuNXg"
+    },
+    {
+      "name": "the same entries in another order differ",
+      "kind": "session",
+      "doc": {
+        "epoch": "e1",
+        "rev": 3,
+        "history": "complete",
+        "entries": [
+          {
+            "kind": "message",
+            "role": "agent",
+            "messageId": "m1",
+            "chunks": [
+              {
+                "content": {
+                  "type": "text",
+                  "text": "hello"
+                }
+              }
+            ]
+          },
+          {
+            "kind": "message",
+            "role": "user",
+            "chunks": [
+              {
+                "content": {
+                  "type": "text",
+                  "text": "hi"
+                }
+              }
+            ]
+          }
+        ],
+        "prompts": [
+          {
+            "entry": 1,
+            "end": {
+              "response": {
+                "stopReason": "end_turn"
+              }
+            }
+          }
+        ],
+        "live": {
+          "sessionId": "s",
+          "cwd": "/w",
+          "closing": false
+        }
+      },
+      "entryHashes": [
+        "3c5ac4dbb5b5a4eae640c4ce94a31d023471cee83218debd8ffb81b84b0cde38",
+        "51ba9aa39b164702bd87796190826a0919dfd5ddfeb39bf5b592c711ac20baee"
+      ],
+      "entriesDigest": "861b16c7ea94178a441b0fd956ab417a6ce3f48c7e20edfd3f258d0028924a21",
+      "digest": "scuMREtKh-7L01UtWVxNAA"
+    },
+    {
+      "name": "integers up to two to the fifty three are exact",
+      "kind": "session",
+      "doc": {
+        "epoch": "e1",
+        "rev": 9007199254740991,
+        "history": "complete",
+        "entries": [],
+        "prompts": [],
+        "live": {
+          "usedBytes": 9007199254740991,
+          "negative": -7,
+          "zero": 0
+        }
+      },
+      "entryHashes": [],
+      "entriesDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "digest": "GOWKSS3WgGGOnYk7VdSVmA"
+    },
+    {
+      "name": "global with its first operation",
+      "kind": "scope",
+      "doc": {
+        "epoch": "g1",
+        "rev": 0,
+        "live": {
+          "op": {
+            "id": "n",
+            "kind": "none",
+            "status": "completed"
+          },
+          "sessions": {},
+          "terminals": {}
+        }
+      },
+      "digest": "EGHGYEISO_VVke4rr83JKA"
+    },
+    {
+      "name": "catalog with a listed page",
+      "kind": "scope",
+      "doc": {
+        "epoch": "c1",
+        "rev": 2,
+        "live": {
+          "revision": "r1",
+          "pages": [
+            {
+              "sessions": [
+                {
+                  "sessionId": "s",
+                  "cwd": "/w"
+                }
+              ],
+              "nextCursor": null
+            }
+          ]
+        }
+      },
+      "digest": "CzzJdA2QwAMaqGZBnxHRBQ"
+    }
+  ]
+}
