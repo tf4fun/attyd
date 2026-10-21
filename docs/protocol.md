@@ -13,6 +13,14 @@ then finalize this protocol's synchronization, verification and repair design.
 The current implementation and migration status live in [the plan](state-sync.md#7-fidelity-migration-revision-2);
 the [source matrix](acp-bridge-matrix.md#1-来源和版本) fixes the ACP versions in scope.
 
+**Layer split (2026-10-21).** What the bridge keeps in memory and how ACP input changes
+it is defined only by the [bridge memory model](bridge-memory-model.md): one flat entry
+list built by one reducer for load replay and live prompts, derived turns, prompt
+outcomes, history knowledge, controls and resource lifetimes. This document describes
+how that memory is carried to clients. Where the two disagree, the memory model wins.
+§3's turn-shaped log and hash chain are the current wire baseline, to be revised in the
+second stage.
+
 This is the single definition of the client contract. Related documents have
 separate roles: [design decisions](client-api-redesign.md),
 [numbered acceptance cases](protocol-acceptance.md),
@@ -108,7 +116,8 @@ synchronization design is final.
   that entity's ACP semantics (§3.2). Nothing else removes or rewrites content: not a
   turn's end, not an error, not a release, not a client's display. Every field is
   kept at the level it arrived on, `_meta` and annotations included; the bridge
-  interprets none of them.
+  interprets none of them. The reduction itself is
+  [memory model §3](bridge-memory-model.md#3-timeline-entries).
 
 **Client rules**
 
@@ -235,63 +244,18 @@ interface LogEntry {
 
 ### 3.2 Reduction
 
-Timeline kinds are the message, thought, tool, plan and compaction updates. Control
-updates (`available_commands_update`, `current_mode_update`, `config_option_update`,
-`session_info_update`, `usage_update`) are reduced into `live.controls` (§4.5) and are
-not items.
-
-Three rules decide every reduction. The table applies them per update.
-
-1. **Identity.** An entity with an ID unique in the session (tool call, ID-addressed
-   plan, compaction) has exactly one item, at the position of its first update; every
-   later update reduces into that item, wherever it is: in the tail, or in a settled
-   entry, which is then rewritten (§3.3). A message is identified by its role and
-   `messageId`; its chunks form one item while nothing else comes between them. An
-   item that comes between ends that run, and the message's next chunk starts a new
-   item with the same `messageId`: the timeline keeps the order, and the shared ID
-   keeps the message's identity. Chunks without a `messageId` belong to the message
-   their run continues.
-2. **Patch.** A sparse update applies by its pinned type. For tool calls this is the
-   field rule of `ToolCall::update`, applied to the `ToolCallUpdate` state: a field
-   absent **or `null`** keeps the value (or its absence), a value replaces it,
-   collections are replaced whole, so `content: []` and `locations: []` clear. A
-   compaction's `summary`, `error` and `_meta` are three-state: absent keeps, `null`
-   clears, a value replaces. A field the type gives no patch rule (`_meta` of a tool
-   call update) follows the same rule as the type's other optional fields: absent or
-   `null` keeps, a value replaces. Nothing is deep-merged.
-3. **Fragments.** Each received fragment keeps its own fields. A text chunk joins the
-   previous chunk of its item only when that chunk is text and every other field of
-   both (annotations, the block's `_meta`, the chunk's `_meta`) is equal; the text is
-   then appended. Otherwise it is a new chunk.
-
-| ACP update | Reduction | ACP basis (schema 1.7.0) |
-| --- | --- | --- |
-| `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk` | Joins the last item when that item is a message of the same role and `messageId` (both absent counts as the same), by rule 3; otherwise starts a message item. | chunks of one message share `messageId`; a change means a new message (`v1/client.rs:614–617`); `ContentChunk._meta` (`:622–631`) |
-| `tool_call` | Reduced as `ToolCallUpdate::from` the call, which carries every field it has, the schema's defaults for `kind`, `status`, `content` and `locations` included: it patches the item of its `toolCallId` by rule 2, or starts one. | `toolCallId` is unique within the session (`v1/tool_call.rs:30`); `From<ToolCall> for ToolCallUpdate` (`:434–465`) |
-| `tool_call_update` | Patches the tool item of its `toolCallId` by rule 2; an unknown ID starts an item that holds exactly the update's fields. | `ToolCall::update` applies only present values; collections "are overwritten, not extended" (`v1/tool_call.rs:177–205`); `name` absent or `null` "left unchanged" (`:295–296`); "only changed fields need to be included" (`:210–211`) |
-| `plan` | Replaces the legacy plan snapshot of the turn it arrives in, or starts one. | the client replaces the entire plan (`v1/plan.rs:36–37`); the schema gives the legacy plan no ID |
-| `plan_update` | Upserts the plan item of its `planId`: the update is the plan's state. | `PlanId` is unique within a session (`v1/plan.rs:79`) |
-| `plan_removed` | Sets the plan item of its `planId` to the removal, in place. A removed plan is no current plan; an unknown ID starts a removal item. A later `plan_update` with the ID makes it current again, in the same item. | removal notice for a plan identified by ID (`v1/plan.rs:353`) |
-| `compaction_update` | Upserts the compaction item of its `compactionId`; the first update fixes its position. `status` replaces; `summary`, `error` and `_meta` by rule 2; a `summary` value becomes chunks without chunk `_meta`. | `v1/client.rs:214–221`; `compactionId` "unique within the session" (`:231`) |
-| `compaction_summary_chunk` | Appends a chunk `{ content, _meta }` to the item's `summary`, by rule 3. | appended to the retained summary (`v1/client.rs:296–299`); "Metadata scoped to this chunk" (`:312–316`) |
-
-- **Current state** is read from the items: the current ID-addressed plans are the
-  plan items whose state is not a removal; the current legacy plan is the snapshot of
-  the latest turn that has one, unless a later `plan` emptied it. A legacy snapshot is
-  a record of that turn, not the current plan, and no update reduces into an older
-  turn's snapshot.
-- A permission request's `toolCall` is a `ToolCallUpdate` and is reduced like one,
-  where its session's timeline is; the first one for an ID starts an item with only
-  its fields.
-- The same updates give the same items however they were chunked, live or replayed.
-  Updates that differ in IDs, `_meta`, results or order give different items; the
-  bridge does not make them equal.
-- An update the bridge's validation rejects is dropped, as before, and reaches no
-  document.
+Timeline updates are reduced into entries by
+[memory model §3](bridge-memory-model.md#3-timeline-entries), identically for live
+prompts and load replays; control updates go to `live.controls` (§4.5). On the wire, a
+`Turn`'s `items` are the entries of one [derived turn](bridge-memory-model.md#5-derived-turns),
+and its `end` is that turn's [prompt outcome](bridge-memory-model.md#42-prompt-outcomes).
+Memory entry kinds map to items one to one: `message`, `tool`, `plan`, `compaction`.
 
 ### 3.3 Turns and settling
 
-A turn is the part of the timeline one prompt produced.
+A turn is the part of the timeline one prompt produced. In memory it is derived from
+the entries ([memory model §5](bridge-memory-model.md#5-derived-turns)); the settle points
+below are when this wire baseline publishes a derived turn to the log.
 
 - **Live.** When a `prompt` operation is admitted, the turn it starts is the tail. Its
   first item is the user message the bridge sends: one message item, role `user`,
@@ -338,11 +302,14 @@ Hashes serve alignment only. Admission never compares them.
 
 ### 3.5 History status
 
+Defined by [memory model §6](bridge-memory-model.md#6-history-knowledge-and-materialization),
+including fork history; the table below is its wire form, and its fork paragraph is superseded by memory model §6.3.
+
 | `live.history` | The log holds | Set by |
 | --- | --- | --- |
 | (the log is unknown) | nothing; the client keeps its own log, unconfirmed | holding a session by subscription, until its first load or resume ends |
-| `complete` | the timeline from the session's beginning | `create`; a completed `session/load` (ACP: the entire history, `v1/agent.rs:4845–4848`); a fork only with an established complete history source (below) |
-| `partial` | the known timeline is not guaranteed to start at the session's beginning | a `session/resume` of a session whose log was unknown (ACP: no previous messages, `v1/agent.rs:1277`); fork conditions remain to be specified below |
+| `complete` | the timeline from the session's beginning | `create`; a completed `session/load` (ACP: the entire history, `v1/agent.rs:4845–4848`); a fork target's successful load (below) |
+| `partial` | the known timeline is not guaranteed to start at the session's beginning | a `session/resume` of a session whose log was unknown (ACP: no previous messages, `v1/agent.rs:1277`); a fork without load (below) |
 
 A resume of a session whose log is known keeps the log and its status. A `partial`
 history arises whenever the bridge resumes a session whose log it did not hold: after
@@ -351,13 +318,9 @@ the catalog. v0.2.8 showed the same case as a missing-history notice. A `partial
 is aligned like any other. A client that held earlier entries may keep them as its own
 UI state and show them as not confirmed by the bridge (C1).
 
-**Fork rule to finish before implementation.** Capturing a source for a fork must
-include its timeline at admission, including an idle tail and referenced resources,
-without mutating the source. A few target notifications during `session/fork` are
-not evidence of a full replay. The choice between inherited source content and
-target content, and its complete/partial status, needs an explicit rule (audit §9);
-the earlier shorthand “fork replay, else source log” is not sufficient. A successful
-`session/load` remains the explicit complete-replay path.
+**Fork.** A fork target never inherits source entries or resources
+([memory model §6.3](bridge-memory-model.md#63-fork)): it is loaded when the Agent
+advertises load (`complete`), else it holds only its own notifications (`partial`).
 
 ## 4. Live documents
 
@@ -431,11 +394,16 @@ interface CatalogLive extends ScopeLive {
 
 ### 4.4 Operations and interactions
 
+Interaction scopes and lifetimes are defined by
+[memory model §8](bridge-memory-model.md#8-resources), and installation by its §9 (one
+installation at a time, so a resource naming a not-yet-installed session has one owner).
+This section shows where they appear on the wire.
+
 The installation rule below requires an unambiguous association with the installing
-request. When concurrent create/fork requests have not yet returned their session
-IDs, a resource naming an unknown session cannot be attributed by guessing. That
-association, including the boundary for pre-installation terminal/filesystem calls,
-is an open first-layer decision (audit §9), not an implemented guarantee.
+request. The memory model proposes serializing `create` and `fork` through `global`, so
+a resource naming a not-yet-installed session belongs to the one running installation
+([memory model §9](bridge-memory-model.md#9-concurrency)); this is under review and not
+implemented.
 
 ```ts
 type OperationStatus = "running" | "completed" | "failed" | "cancelled";
@@ -518,8 +486,9 @@ fields. A late action acknowledgement must also remain associated with the actua
 request that sent it, rather than mutate a replacement session merely sharing its
 ID (audit §9).
 
-`controls` is the **reduced current state** of the session's controls, folded from
-three sources in this order:
+`controls` is the **reduced current state** of the session's controls, reduced by
+[memory model §7](bridge-memory-model.md#7-controls). In summary, folded from three
+sources in this order:
 
 1. **Early updates**: control notifications that arrive before the `session/new`,
    `load`, `resume` or `fork` response, in arrival order.
@@ -555,6 +524,9 @@ interface SessionControls {
 | successful `set_config` | replaces `configOptions` with the response's `configOptions` |
 
 ### 4.6 Resources
+
+Lifetimes follow [memory model §8](bridge-memory-model.md#8-resources); this section is
+their wire form.
 
 ```ts
 interface UrlFlow {
@@ -782,7 +754,7 @@ POST /api/v2/scopes/{scope}/ops
 | Scope | Kind | `args` | Occupies | Allowed while | Result |
 | --- | --- | --- | --- | --- | --- |
 | session | `prompt` | `{ prompt: PromptBlock[] }` | the session | `op` ended, not `closing` | `{ stopReason, usage? }` |
-| session | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source | `op` ended | `{ sessionId }` |
+| session | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source and `global` ([memory model §9](bridge-memory-model.md#9-concurrency)) | `op` ended, `global` free | `{ sessionId }` |
 | global | `create` | `{ cwd }` | `global` | `op` ended | `{ sessionId }` |
 | global | `delete` | `{ sessionId }` | `global`, `session/<sessionId>` | `op` ended, and the session free | `{}` |
 | global | `authenticate` | `{ methodId }` | `global` | `op` ended | `{}` |

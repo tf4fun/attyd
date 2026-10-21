@@ -144,7 +144,7 @@ end a child interaction or release a session before its ordered completion.
 
 Load replay remains a private candidate until its matching successful response;
 a failed or stale attempt cannot replace installed content. Step 14 completes
-history knowledge, fork source capture and recovery. Controls, close and
+history knowledge, fork history per memory model §6.3 and recovery. Controls, close and
 interactions follow the target transitions in §7.1, replacing the baseline's
 operation-bound cleanup. Resource actions consume the actual responder at most
 once; unknown-result business writes are not automatically replayed.
@@ -242,7 +242,9 @@ the real outstanding request, without restoring a public owner/CAS/intent system
 
 Status: **step 10 (docs) merged; step 11 in draft PR #53; steps 12–20 planned.**
 The current milestone is **ACP → bridge functionality and displayable memory**,
-defined in the [first-layer contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract).
+defined in the [first-layer contract](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract)
+and specified by the [bridge memory model](bridge-memory-model.md) (proposed
+2026-10-21): load replay and live prompts build one flat entry list with one reducer.
 The [audit](acp-fidelity-audit.md) distinguishes runtime defects, shared v1
 limitations and open rules; the [release parity matrix](release-parity.md) compares
 the stable rc.5 baseline and keeps older release evidence separately. A draft PR or
@@ -294,9 +296,12 @@ Implementation order:
    resulting memory state. Existing filesystem, terminal, authentication and MCP
    services are retained, not rebuilt as a new request-history system.
 
-The outstanding rules in the audit's §9 must be settled before the affected path is
-implemented: fork source capture and target completeness, resources before a new
-session's ID can be attributed, and the destination of a late control response.
+The outstanding rules in the audit's §9 are settled by the
+[bridge memory model](bridge-memory-model.md) and must be reviewed before the affected
+path is implemented: fork history (§6.3: the target never inherits source entries),
+resources and notifications before a new session's ID is installed (§9: one
+installation at a time, staged), and the destination of a late control response (§9:
+session generations).
 State the required isolation using actual pending requests; no public owner token,
 intent table or retained request log is needed. An explicit recovery path must work
 without an open session, but may not resend a business command whose result is
@@ -341,9 +346,10 @@ each changed operation or resource so an intermediate version remains usable.
   Queued completion context lasts only until that completion is handled. Do not add
   an independent pending-request authority or a completed-request table. A response
   ends unanswered interactions that name that request. For a session being created,
-  assign or move interactions only when the association is known; concurrent new/fork
-  requests do not justify guessing a parent. The unsupported/temporarily unassigned
-  case must have an explicit rule and direct test before that path is extended.
+  the association follows [memory model §9](bridge-memory-model.md#9-concurrency):
+  `create` and `fork` share the global slot, so a resource or notification naming the
+  not-yet-installed session belongs to the one running installation; with none running
+  it is refused or dropped. That rule needs its direct test before the path is extended.
   The `answer` admission path
   becomes a resource action that resolves one interaction under the bridge guard.
   `agent_request` and its completion rule go.
@@ -450,10 +456,10 @@ but expired execution handles cannot become live again.
 | Step | Work | Removes | Acceptance (cases 1–37) |
 | --- | --- | --- | --- |
 | 10 | Docs: this revision, the audit, the release parity matrix, the coverage ledger | — | review (done) |
-| 11 | One timeline reducer and entry shape: items, `end`, message boundaries, block/entity/notification-source metadata, original attachments, hash over the entry; live commits and replay through it; complete PromptResponse for successful/cancelled turns; validate numeric-domain limits against the locked schema. Generated types and minimum item rendering accompany the change | D1, D2, D3, D6, D7; source matrix content fields | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36; content matrix CN/CB/TC/PL/EN cases |
+| 11 | One timeline reducer over a flat entry list ([memory model](bridge-memory-model.md) §3–§5), shared by load replay and live prompts, with the prompt echo rule and per-prompt outcomes; turns derived for the wire. Gate: the live/replay equivalence test (§4.3). Also: items, `end`, message boundaries, block/entity/notification-source metadata, original attachments, hash over the entry; live commits and replay through it; complete PromptResponse for successful/cancelled turns; validate numeric-domain limits against the locked schema. Generated types and minimum item rendering accompany the change | D1, D2, D3, D6, D7; source matrix content fields | 1, 13, 19, 20, 25, 26, 27, 30, 31, 36; content matrix CN/CB/TC/PL/EN cases |
 | 12 | Settling of failed and interrupted prompts | D4 | 2, 22 |
 | 13 | The tail between prompts; settle at prompt start and connection end; late updates rewrite their entry; the convergence gate gains rewrite and idle scenarios | D5 | 4, 21 |
-| 14 | Honest load/resume/fork knowledge and attempt-local rollback; fork source cut includes tail and referenced resources, not a guessed complete target replay; zero-session Agent recovery; retain current catalog pages/cursors and setup/auth/logout result metadata without request history. State the unknown-session association boundary | D9; source matrix lifecycle/metadata gaps and open rules | 23; direct history, fork-resource, catalog/current-result and zero-session recovery cases |
+| 14 | Honest load/resume/fork knowledge and attempt-local rollback; reattach by load on a new connection; fork per [memory model §6.3](bridge-memory-model.md#63-fork): the target never inherits source entries or resources, loads when advertised (`complete`), else keeps only its own staged and later notifications (`partial`); create/fork serialized through `global` with staged early notifications (§9); zero-session Agent recovery; retain current catalog pages/cursors and setup/auth/logout result metadata without request history. State the unknown-session association boundary | D9; source matrix lifecycle/metadata gaps and open rules | 23; direct history, fork (with/without load, colliding tool IDs, no source content), pre-installation notification, reattach, catalog/current-result and zero-session recovery cases |
 | 15 | Terminal handle and output separated: frozen output through release and the connection's end; the holding change | D8 | 12, 24 |
 | 16 | Independent scope interactions and original responders; actual parent-RPC lifetime using existing ingress registration; permission tool patch contributes to timeline; accepted URL outcomes; remove `agent_request`; form schema/value support, ordinary patterns, exact i64 request IDs and integer-bound validation | D10, D11; shared form, ID-domain and URL-result gaps | 7, 8, 11; services S01–S03/F01–F11, including two simultaneous answers and multi-RPC parent lifetime |
 | 17 | Close matrix-to-direct-test coverage alongside each change; exercise retained transport/fs/terminal/auth/MCP paths and extension fallback; keep optional exclusions explicit. This adds tests and evidence, not another runtime state system | Unverified coverage; audit Q5 | Matrix methods, fields, capabilities, replies/cancellation and cleanup; existing convergence remains a separate regression gate |
@@ -462,8 +468,8 @@ but expired execution handles cannot become live again.
 | 20 | Subsequent presentation work: Markdown export over items, `end` and terminal snapshots; browser cases of settled content and per-interaction answers | (D1, D4, D8 in the client) | 33, 34, 35 |
 
 Dependencies: 10 → 11 → 12 → 13; 15 follows 11. Step 14's history-knowledge and
-recovery work can start after 11, but its full fork gate requires 13's tail and 15's
-referenced terminal results. Step 16's interaction work can proceed alongside the
+recovery work can start after 11, and so can its fork gate: the target inherits no
+source tail or terminal output, so it no longer waits for 13 or 15. Step 16's interaction work can proceed alongside the
 content work, but its permission-only tool gate requires 11. Steps 16 and 18 reuse
 the same existing pending-RPC registration/completion foundation; whichever changes
 it first establishes the shared behavior, not a second map. Step 17 accompanies
