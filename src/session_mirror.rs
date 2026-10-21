@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::history_cache::HistoryCacheError;
 use crate::history_replay::Replay;
 use crate::protocol::canon::TurnLog;
+use crate::protocol::op::operation_id;
 use crate::protocol::registry::SessionLog;
 use crate::protocol::timeline::History;
 use crate::runtime_state::SessionOperationKind;
@@ -197,6 +198,7 @@ impl SessionRegistry {
             // known to be there (memory model §6.1).
             session.timeline = Some(Arc::default());
             session.history = Some(History::Partial);
+            session.timeline_epoch = Some(operation_id());
         }
         session.history_settled();
         Ok(())

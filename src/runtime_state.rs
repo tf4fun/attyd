@@ -296,6 +296,7 @@ impl SessionRegistry {
         entry.state.log = waiting.log;
         entry.state.timeline = waiting.timeline;
         entry.state.history = waiting.history;
+        entry.state.timeline_epoch = waiting.timeline_epoch;
         entry
             .state
             .live

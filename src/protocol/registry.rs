@@ -40,6 +40,7 @@ pub(crate) struct WaitingSession {
     pub log: SessionLog,
     pub timeline: Option<Arc<Timeline>>,
     pub history: Option<History>,
+    pub timeline_epoch: Option<String>,
     pub op: OpSlot,
 }
 
@@ -649,6 +650,7 @@ impl SessionRegistry {
             log: entry.state.log.clone(),
             timeline: entry.state.timeline.clone(),
             history: entry.state.history,
+            timeline_epoch: entry.state.timeline_epoch.clone(),
             op: live.op.clone(),
         })
     }
@@ -869,6 +871,7 @@ impl SessionRegistry {
             }
             entry.state.timeline = Some(timeline);
             entry.state.history = Some(History::Complete);
+            entry.state.timeline_epoch = Some(super::op::operation_id());
         }
     }
 
@@ -880,6 +883,7 @@ impl SessionRegistry {
         {
             entry.state.timeline = Some(Arc::new(timeline));
             entry.state.history = Some(History::Partial);
+            entry.state.timeline_epoch = Some(super::op::operation_id());
         }
     }
 
