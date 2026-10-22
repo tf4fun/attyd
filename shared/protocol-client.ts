@@ -222,7 +222,7 @@ function blocked(reason: string): WriteOutcome {
   return { kind: "blocked", reason };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -230,7 +230,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([
   "invalid_request", "not_found", "stale", "not_allowed", "catalog_changed", "unsupported", "unavailable", "agent_error",
 ]);
 
-function isProtocolError(value: unknown): value is ProtocolError {
+export function isProtocolError(value: unknown): value is ProtocolError {
   return isRecord(value) && typeof value.code === "string" && ERROR_CODES.has(value.code) && typeof value.message === "string";
 }
 
@@ -238,7 +238,7 @@ function isProtocolError(value: unknown): value is ProtocolError {
  * A non-success answer: refused when its body is the protocol's error (§9),
  * otherwise, as from a proxy, without a definite answer.
  */
-function refusal(status: number, body: unknown): { kind: "refused"; error: ProtocolError } | { kind: "uncertain" } {
+export function refusal(status: number, body: unknown): { kind: "refused"; error: ProtocolError } | { kind: "uncertain" } {
   if (status >= 200 && status < 300) return { kind: "uncertain" };
   return isRecord(body) && isProtocolError(body.error) ? { kind: "refused", error: body.error } : { kind: "uncertain" };
 }
@@ -400,11 +400,14 @@ export type ActionOutcome =
  */
 export class ResourceClient {
   readonly #fetch: HttpFetch;
+  readonly #base: string;
   /** The last input sent to each terminal; the next waits for its answer. */
   readonly #inputs = new Map<string, Promise<ActionOutcome>>();
 
-  constructor(fetch: HttpFetch) {
+  /** `base` is the API prefix; the revision 3 routes are served beside the revision 2 ones until the cutover. */
+  constructor(fetch: HttpFetch, base = "/api/v2") {
     this.#fetch = fetch;
+    this.#base = base;
   }
 
   input(scope: string, terminalId: string, data: string): Promise<ActionOutcome> {
@@ -431,7 +434,7 @@ export class ResourceClient {
     let response: Awaited<ReturnType<HttpFetch>>;
     try {
       response = await this.#fetch(
-        `/api/v2/scopes/${encodeURIComponent(scope)}/resources/${encodeURIComponent(resourceId)}/${action}`,
+        `${this.#base}/scopes/${encodeURIComponent(scope)}/resources/${encodeURIComponent(resourceId)}/${action}`,
         { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
       );
     } catch {
