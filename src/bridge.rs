@@ -61,6 +61,7 @@ mod coordinator_tests;
 mod inbound_requests;
 #[cfg(test)]
 mod memory_retention_tests;
+pub(crate) mod controls;
 pub(crate) mod operations;
 #[cfg(test)]
 mod protocol_gate_tests;
@@ -164,6 +165,8 @@ struct BridgeState {
     early_update_bytes: usize,
     request_elicitations: HashMap<String, ElicitationResponder>,
     in_flight_request_ids: HashSet<String>,
+    /// Where the end of a control action's command is answered, by its request ID.
+    action_replies: HashMap<String, oneshot::Sender<Result<(), crate::protocol::documents::ProtocolError>>>,
     sessions: SessionRegistry,
     observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
     observer_timeout: Option<i64>,
@@ -1273,6 +1276,15 @@ pub(crate) enum BridgeInput {
         action: resources::ResourceAction,
         reply: oneshot::Sender<Result<(), crate::protocol::documents::ProtocolError>>,
     },
+    /// A control action (protocol §7): checked under one bridge guard, then sent
+    /// to the Agent; the answer arrives when the Agent has answered.
+    Control {
+        session_id: String,
+        control: controls::Control,
+        reply: oneshot::Sender<
+            Result<controls::ControlAnswer, crate::protocol::documents::ProtocolError>,
+        >,
+    },
     /// The workspace of a held session, for its context reads (protocol §8);
     /// it holds, loads and renews nothing.
     Workspace {
@@ -1289,6 +1301,7 @@ impl BridgeInput {
             Self::Subscribe { .. }
             | Self::ServeStreams
             | Self::Resource { .. }
+            | Self::Control { .. }
             | Self::Workspace { .. } => None,
             Self::RetireUnobservedSession { session_id, .. } => Some(session_id),
             Self::FinishHistorySync { owner } => Some(&owner.session.session_id),
@@ -1315,6 +1328,7 @@ impl BridgeInput {
                 resources::ResourceAction::Input { data } => data.len(),
                 _ => 0,
             }),
+            Self::Control { control, .. } => serialized_value_len(&format!("{control:?}")),
             Self::Workspace { session_id, .. } => serialized_value_len(session_id),
         };
         payload.saturating_add(256)
@@ -1338,6 +1352,12 @@ impl BridgeInput {
                 )));
             }
             Self::Resource { reply, .. } => {
+                let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
+                    crate::protocol::documents::ErrorCode::Unavailable,
+                    error_message(error),
+                )));
+            }
+            Self::Control { reply, .. } => {
                 let _ = reply.send(Err(crate::protocol::documents::ProtocolError::new(
                     crate::protocol::documents::ErrorCode::Unavailable,
                     error_message(error),
@@ -1915,6 +1935,19 @@ where
                         }
                         continue;
                     }
+                    Some(BridgeInput::Control { session_id, control, reply }) => {
+                        let mut state = state.lock().await;
+                        match controls::admit(&mut state, &session_id, &control) {
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                            Ok((command, answer)) => {
+                                let _ = reply.send(Ok(answer));
+                                command
+                            }
+                        }
+                    }
                     Some(BridgeInput::Workspace { session_id, reply }) => {
                         let workspace = {
                             let state = state.lock().await;
@@ -2067,7 +2100,19 @@ where
                         }
                     }
                     if let Some(request_id) = request_id.as_deref() {
-                        context.state.lock().await.in_flight_request_ids.remove(request_id);
+                        let mut state = context.state.lock().await;
+                        state.in_flight_request_ids.remove(request_id);
+                        // A control action is answered with the end of its command.
+                        if let Some(reply) = state.action_replies.remove(request_id) {
+                            let _ = reply.send(match &result {
+                                Ok(_) => Ok(()),
+                                Err(error) => Err(operation_error(
+                                    error,
+                                    context.cancellation.is_cancelled()
+                                        || is_incoming_transport_closed(error),
+                                )),
+                            });
+                        }
                     }
                     Ok(())
                 })?;
