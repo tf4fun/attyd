@@ -364,7 +364,8 @@ export class Workspace {
         if (outcome.kind === "accepted") {
           this.#listing.mine.add(outcome.op);
         } else if (outcome.kind === "refused" && outcome.error.code === "catalog_changed") {
-          this.#listing = { ...this.#listing, refresh: true };
+          // A definite refusal changed nothing: the first page may be asked for against the same op.
+          this.#listing = { ...this.#listing, refresh: true, sentAgainst: undefined };
         } else if (outcome.kind === "refused" && (outcome.error.code === "stale" || outcome.error.code === "not_allowed")) {
           // Another list ran: list again once the document shows a later `op` ended.
           this.#listing = { ...this.#listing, refresh: cursor == null };
