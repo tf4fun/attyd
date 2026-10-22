@@ -145,7 +145,8 @@ export function projectEntries(
   // The last plan of a running prompt, while it has unfinished steps, is shown above the composer.
   let activeIndex = -1;
   if (running) {
-    const last = entries.findLastIndex((entry) => entry.kind === "plan");
+    let last = entries.length - 1;
+    while (last >= 0 && entries[last].kind !== "plan") last -= 1;
     const plan = entries[last];
     if (plan?.kind === "plan" && unfinished(plan)) activeIndex = last;
   }
