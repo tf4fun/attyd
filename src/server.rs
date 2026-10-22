@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 #[cfg(not(feature = "dev"))]
 use rust_embed::RustEmbed;
 use serde_json::{Value, json};
@@ -449,7 +449,13 @@ impl BridgeHub {
                 return admitted;
             }
         }
-        admission::admit(&self.publication.lock().publisher, &scope, &write)?;
+        let published = self.publication.lock();
+        admission::admit(
+            &|scope| published.feed.live(scope),
+            &|session, id| published.feed.attachment(session, id),
+            &scope,
+            &write,
+        )?;
         Err(ProtocolError::new(
             ErrorCode::Unavailable,
             "there is no Agent connection",
@@ -829,7 +835,7 @@ async fn read_session(
         .bridge
         .publication
         .lock()
-        .publisher
+        .feed
         .live(&session)
         .is_some();
     let scope = session.to_string();

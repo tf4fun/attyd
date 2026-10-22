@@ -274,7 +274,7 @@ async fn a_write_against_an_operation_that_is_not_the_current_one_is_stale() {
 #[tokio::test]
 async fn a_stream_that_follows_a_session_starts_the_next_connection_and_keeps_the_session() {
     let (mut server, mut link) = Server::start(json!({"loadSession": true})).await;
-    let (_, mut sse) = open(
+    let (_, sse) = open(
         &server,
         &format!(
             "scope=global&scope=session%2Fsaved&cwd={}",

@@ -228,6 +228,11 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
+    /// The published `live` of `scope`.
+    pub(crate) fn live(&self, scope: &str) -> Option<&Value> {
+        self.docs.get(scope).map(|doc| &doc.live)
+    }
+
     /// The version `scope` is published at, if it is.
     pub(crate) fn version(&self, scope: &str) -> Option<(&str, u64)> {
         self.docs.get(scope).map(|doc| (doc.epoch.as_str(), doc.rev))

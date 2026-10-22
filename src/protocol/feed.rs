@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use serde_json::Value;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
@@ -108,6 +109,16 @@ impl Feed {
         for subscriber in self.subscribers.values_mut() {
             subscriber.end(&scope, end.clone());
         }
+    }
+
+    /// The committed `live` of `scope`: what a write is admitted against.
+    pub(crate) fn live(&self, scope: &Scope) -> Option<Value> {
+        self.engine.live(&scope.to_string()).cloned()
+    }
+
+    /// The block an attachment of a held session names, while a published entry references it.
+    pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
+        self.engine.attachment(&format!("session/{session_id}"), id).cloned()
     }
 
     /// The whole document of `scope`, as a snapshot from nothing.
@@ -326,6 +337,16 @@ impl FeedHandle {
     pub(crate) fn end_waiting(&self, session_id: &str, end: &End) {
         self.feed().end_waiting(session_id, end);
         self.0.ready.notify_waiters();
+    }
+
+    /// The committed `live` of `scope`: what a write is admitted against.
+    pub(crate) fn live(&self, scope: &Scope) -> Option<Value> {
+        self.feed().live(scope)
+    }
+
+    /// The block an attachment of a held session names, while a published entry references it.
+    pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
+        self.feed().attachment(session_id, id)
     }
 
     /// The whole document of `scope` as the snapshot a stream is aligned with (protocol §8): none

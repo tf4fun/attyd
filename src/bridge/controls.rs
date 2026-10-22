@@ -46,7 +46,7 @@ pub(super) fn admit(
     let shown = {
         let published = state.protocol.publication.lock();
         published
-            .publisher
+            .feed
             .live(&scope)
             .map(|live| (live["op"]["kind"].clone(), live["op"]["status"].clone()))
     };
