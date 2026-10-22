@@ -860,7 +860,7 @@ async fn read_session(
                 .bridge
                 .publication
                 .lock()
-                .publisher
+                .feed
                 .attachment(session_id, attachment_id);
             match block {
                 Some(block) => axum::Json(block).into_response(),

@@ -118,8 +118,8 @@ fn waiting_for_load(publication: &Publication) -> BTreeMap<String, Vec<Option<St
 fn published(publication: &Publication, session_id: &str) -> bool {
     publication
         .lock()
-        .publisher
-        .document(&Scope::Session(session_id.to_string()).to_string())
+        .feed
+        .live(&Scope::Session(session_id.to_string()))
         .is_some()
 }
 
