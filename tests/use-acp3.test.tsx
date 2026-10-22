@@ -794,5 +794,115 @@ describe("revision 3 workspace, read side", () => {
     expect((error as { message: string } | undefined)?.message).toContain("Refused by the Agent");
     expect(hook.state.pendingSessionControl).toBeUndefined();
   });
+
+  // -- listing the catalog ------------------------------------------------------------------
+
+  const listable = () => globalLive({
+    agent: agent({ initialize: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { list: {} } } } }),
+  });
+  const lists = () => posts.filter((post) => post.body.kind === "list");
+  /** The catalog's `op` replaced, and anything else its events change. */
+  const catalogChanged = (rev: number, fields: Record<string, unknown>, more: unknown[] = []): StreamEvent => ({
+    scope: "catalog", rev, ops: [{ op: "set", path: "/live/op", value: op("catalog", fields) }, ...more],
+  } as StreamEvent);
+  const page = (ids: string[], nextCursor: string | null) => ({
+    sessions: ids.map((sessionId) => ({ sessionId, cwd: `/${sessionId}` })), nextCursor,
+  });
+
+  it("lists the first page when the Agent can list and the catalog has none, once per op", async () => {
+    await mount("/");
+    await emit(globalSnapshot(listable()));
+    await emit(catalogSnapshot());
+    expect(lists().map((post) => [post.url, post.body.expect, post.body.args])).toEqual([
+      ["/api/v3/scopes/catalog/ops", "c0", {}],
+    ]);
+    // Nothing is sent again against the same op, however often the page is told.
+    await emit({ scope: "global", rev: 1, ops: [{ op: "set", path: "/live/agent/error", value: null }] } as StreamEvent);
+    expect(lists()).toHaveLength(1);
+    // The list ran and its page is in the document: no more is listed on the home page.
+    const id = lists()[0].body.id!;
+    await emit(catalogChanged(1, { id, kind: "list", status: "completed", result: { revision: "1" } }, [
+      { op: "set", path: "/live/pages", value: [page(["a"], "c1")] },
+    ]));
+    expect(lists()).toHaveLength(1);
+    expect(hook.state.sessions.map(({ sessionId }) => sessionId)).toEqual(["a"]);
+    expect(hook.state.nextSessionCursor).toBe("c1");
+  });
+
+  it("lists nothing when the Agent cannot list", async () => {
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    expect(lists()).toEqual([]);
+  });
+
+  it("looks for a session on the later pages, with the revision it started at, until it is found", async () => {
+    await mount("/sessions/b");
+    await emit(globalSnapshot(listable()));
+    await emit(catalogSnapshot(catalogLive({ pages: [page(["a"], "c1")] })));
+    expect(lists().map((post) => post.body.args)).toEqual([{ cursor: "c1", revision: "1" }]);
+    expect(current().scopes).toEqual(["global", "catalog"]);
+    const id = lists()[0].body.id!;
+    await emit(catalogChanged(1, { id, kind: "list", status: "completed" }, [
+      { op: "set", path: "/live/pages", value: [page(["a"], "c1"), page(["b"], null)] },
+    ]));
+    expect(lists()).toHaveLength(1);
+    // Found: the session is loaded with the cwd the catalog gives.
+    expect(current().cwds).toEqual(["session/b:/b"]);
+  });
+
+  it("goes home when the last page does not hold the session", async () => {
+    await mount("/sessions/nowhere");
+    await emit(globalSnapshot(listable()));
+    await emit(catalogSnapshot(catalogLive({ pages: [page(["a"], null)] })));
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("does not list again at a revision a list failed at, until the user asks", async () => {
+    await mount("/");
+    await emit(globalSnapshot(listable()));
+    await emit(catalogSnapshot());
+    const id = lists()[0].body.id!;
+    await emit(catalogChanged(1, {
+      id, kind: "list", status: "failed", error: { code: "unavailable", message: "Listing is down" },
+    }));
+    expect(lists()).toHaveLength(1);
+    expect(hook.state.timeline.some((item) => item.type === "error")).toBe(true);
+    await act(async () => hook.listSessions());
+    await settle();
+    expect(lists()).toHaveLength(2);
+  });
+
+  it("lists again from the start when the catalog changed while a later page was asked for", async () => {
+    respond = (post) => post.body.kind === "list" && post.body.args.cursor != null
+      ? { status: 409, body: { error: { code: "catalog_changed", message: "The catalog is no longer at revision 1" } } }
+      : { status: 202, body: { op: post.body.id } };
+    await mount("/sessions/b");
+    await emit(globalSnapshot(listable()));
+    await emit(catalogSnapshot(catalogLive({ pages: [page(["a"], "c1")] })));
+    await settle();
+    expect(lists().map((post) => post.body.args)).toEqual([{ cursor: "c1", revision: "1" }, {}]);
+  });
+
+  it("lists the first page again when the revision changes", async () => {
+    await mount("/");
+    await emit(globalSnapshot(listable()));
+    await emit(catalogSnapshot(catalogLive({ pages: [page(["a"], null)] })));
+    expect(lists()).toEqual([]);
+    // A new revision publishes no pages until a list runs.
+    await emit({ scope: "catalog", rev: 1, ops: [
+      { op: "set", path: "/live/revision", value: "2" }, { op: "set", path: "/live/pages", value: [] },
+    ] } as StreamEvent);
+    expect(lists().map((post) => post.body.args)).toEqual([{}]);
+  });
+
+  it("lists a later page when the user asks for it", async () => {
+    await mount("/");
+    await emit(globalSnapshot(listable()));
+    await emit(catalogSnapshot(catalogLive({ pages: [page(["a"], "c1")] })));
+    await act(async () => hook.listSessions("c1"));
+    await settle();
+    expect(lists().map((post) => post.body.args)).toEqual([{ cursor: "c1", revision: "1" }]);
+  });
 });
 
