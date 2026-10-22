@@ -190,7 +190,7 @@ pub(super) fn deliver(
 
 /// The cancel outcome of each pending interaction of the operation that
 /// `scope` shows (protocol §6.2).
-fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(String, Answer)> {
+pub(super) fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(String, Answer)> {
     let published = state.protocol.publication.lock();
     let Some(live) = published.publisher.live(scope) else {
         return Vec::new();
