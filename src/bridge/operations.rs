@@ -200,7 +200,7 @@ pub(super) fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(Stri
     let Some(live) = published.feed.live(scope) else {
         return Vec::new();
     };
-    live["op"]["interactions"]
+    live["interactions"]
         .as_object()
         .into_iter()
         .flatten()

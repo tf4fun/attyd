@@ -96,7 +96,7 @@ fn answer(
         published
             .feed
             .live(scope)
-            .and_then(|live| live["op"]["interactions"].get(interaction_id).cloned())
+            .and_then(|live| live["interactions"].get(interaction_id).cloned())
     }
     .filter(|_| {
         state.sessions.permission(interaction_id).is_some()

@@ -159,7 +159,7 @@ pub(crate) fn admit(
             }
             return Ok(Admitted::Cancel { op: id, kind });
         }
-        let answers = answers(&op["interactions"], &write.args)?;
+        let answers = answers(&live["interactions"], &write.args)?;
         return Ok(Admitted::Answer { op: id, answers });
     };
     if running {
