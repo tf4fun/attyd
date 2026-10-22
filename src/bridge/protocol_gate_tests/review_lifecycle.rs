@@ -275,10 +275,10 @@ async fn review_filesystem_setup_failure_publishes_final_agent_error() {
         .protocol
         .publication
         .lock()
-        .publisher
-        .document("global")
+        .feed
+        .live(&crate::protocol::documents::Scope::Global)
         .expect("initial global published");
-    let agent = &global.live["agent"];
+    let agent = &global["agent"];
     assert_eq!(
         agent["phase"], "error",
         "setup failure left the published agent unfinished: {agent}"
