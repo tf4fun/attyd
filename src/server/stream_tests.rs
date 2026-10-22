@@ -21,6 +21,7 @@ use crate::protocol::stream_check::{Replica, log_values};
 
 use super::*;
 
+mod feed;
 mod ops;
 
 const WAIT: Duration = Duration::from_secs(10);
