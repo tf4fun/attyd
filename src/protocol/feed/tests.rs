@@ -5,7 +5,7 @@
 use serde_json::json;
 
 use super::*;
-use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase, EndReason};
+use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase};
 use crate::protocol::engine::StreamEvent;
 use crate::protocol::subscription::Subscribed;
 use crate::runtime_state::SessionLifecycle;
@@ -153,7 +153,6 @@ fn a_session_the_bridge_no_longer_holds_ends_its_scope_for_its_subscribers() {
     feed.commit(&registry, &agent(), 0);
     assert_eq!(drain(&mut feed, id), Vec::<String>::new());
     assert_eq!(feed.version("session/s"), None);
-    let _ = EndReason::Closed;
 }
 
 #[test]
