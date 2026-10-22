@@ -2364,13 +2364,14 @@ test("keeps the reading position after scrolling up during streamed output", asy
   await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
   await composer.fill("stream-follow-flow next turn");
   await composer.press("Enter");
-  await expect(thread.getByText("Streamed paragraph 4:", { exact: false })).toHaveCount(2);
+  // One paragraph per turn: the first turn's is in its folded process, still in the thread.
+  await expect(thread.locator("p", { hasText: "Streamed paragraph 4:" })).toHaveCount(2);
   const readingPosition = await thread.evaluate((element) => {
     element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -500 }));
     element.scrollTop -= 500;
     return element.scrollTop;
   });
-  const anchor = thread.getByText("Streamed paragraph 18:", { exact: false }).first();
+  const anchor = thread.locator("p", { hasText: "Streamed paragraph 18:" }).and(page.locator(":visible")).first();
   const anchorTop = await anchor.evaluate((element) => element.getBoundingClientRect().top);
   await expect(page.getByText("Stream follow complete.", { exact: true })).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
