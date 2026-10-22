@@ -666,5 +666,133 @@ describe("revision 3 workspace, read side", () => {
     await settle();
     expect(posts[3].url).toBe("/api/v3/scopes/global/resources/L/dismiss");
   });
+
+  // -- interactions, controls and URL flows -------------------------------------------------
+
+  const permissionOf = (interactionId: string) => ({
+    interactionId, kind: "permission",
+    request: {
+      sessionId: "s1", toolCall: { toolCallId: `tool-${interactionId}`, title: `Tool ${interactionId}` },
+      options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+    },
+  });
+  const allow = { outcome: "selected", optionId: "allow" } as const;
+  const gone = (rev: number, id: string, scope = "session/s1"): StreamEvent => ({
+    scope, rev, ops: [{ op: "remove", path: `/live/interactions/${id}` }],
+  } as StreamEvent);
+
+  it("answers one interaction alone, at its resource, whatever else is pending", async () => {
+    respond = () => ({ status: 204 });
+    await shownSession(sessionLive({ interactions: { A: permissionOf("A"), B: permissionOf("B") } }));
+    expect(hook.state.permissions.map(({ permissionId }) => permissionId)).toEqual(["A", "B"]);
+    await act(async () => hook.respondPermission("A", allow));
+    await settle();
+    expect(posts.map((post) => [post.url, post.body])).toEqual([
+      ["/api/v3/scopes/session%2Fs1/resources/A/answer", { outcome: allow }],
+    ]);
+    // Sent, awaiting the document; B is untouched.
+    const [a, b] = hook.state.permissions;
+    expect(a.responseRequestId).toBe("A");
+    expect(b.responseRequestId).toBeUndefined();
+    // An interaction is answered once.
+    await act(async () => hook.respondPermission("A", allow));
+    await settle();
+    expect(posts).toHaveLength(1);
+    await emit(gone(1, "A"));
+    expect(hook.state.permissions.map(({ permissionId }) => permissionId)).toEqual(["B"]);
+    expect(hook.state.permissions[0].responseRequestId).toBeUndefined();
+  });
+
+  it("keeps the input and shows why when the bridge refused an answer, and lets the user answer again", async () => {
+    respond = () => ({ status: 400, body: { error: { code: "invalid_request", message: "Option not offered" } } });
+    await shownSession(sessionLive({ interactions: { A: permissionOf("A") } }));
+    await act(async () => hook.respondPermission("A", allow));
+    await settle();
+    expect(hook.state.permissions[0].responseError).toContain("Option not offered");
+    expect(hook.state.permissions[0].responseRequestId).toBeUndefined();
+    respond = () => ({ status: 204 });
+    await act(async () => hook.respondPermission("A", allow));
+    await settle();
+    expect(posts).toHaveLength(2);
+  });
+
+  it("shows nothing for an answer that found the interaction gone", async () => {
+    respond = () => ({ status: 404, body: { error: { code: "not_found", message: "gone" } } });
+    await shownSession(sessionLive({ interactions: { A: permissionOf("A") } }));
+    await act(async () => hook.respondPermission("A", allow));
+    await settle();
+    expect(hook.state.permissions[0].responseError).toBeUndefined();
+  });
+
+  it("says an answer that may have been delivered is not known, and never sends it again", async () => {
+    respond = () => LOST;
+    await shownSession(sessionLive({ interactions: { A: permissionOf("A") } }));
+    await act(async () => hook.respondPermission("A", allow));
+    await settle();
+    expect(hook.state.permissions[0].responseStatus).toBeDefined();
+    await act(async () => hook.respondPermission("A", allow));
+    await settle();
+    expect(posts).toHaveLength(1);
+  });
+
+  it("answers an interaction of a global operation at global", async () => {
+    respond = () => ({ status: 204 });
+    const form = {
+      interactionId: "E", kind: "elicitation",
+      request: { mode: "form", message: "Pick", requestedSchema: { type: "object", properties: {} } },
+    };
+    await mount("/");
+    await emit(globalSnapshot(globalLive({ op: op("global", { id: "c1", kind: "create", status: "running" }), interactions: { E: form } })));
+    await emit(catalogSnapshot());
+    await act(async () => hook.respondElicitation("E", { action: "accept", content: {} }));
+    await settle();
+    expect(posts.map((post) => [post.url, post.body])).toEqual([
+      ["/api/v3/scopes/global/resources/E/answer", { response: { action: "accept", content: {} } }],
+    ]);
+  });
+
+  it("dismisses a URL flow in the scope that shows it", async () => {
+    respond = () => ({ status: 204 });
+    const flow = (id: string) => ({ interactionId: id, elicitationId: id, request: { mode: "url", message: "m", url: "https://example.test/", elicitationId: id } });
+    await mount("/sessions/s1");
+    await emit(globalSnapshot(globalLive({ sessions: held, urlFlows: { G: flow("G") } })));
+    await emit(catalogSnapshot());
+    await emit(sessionSnapshot([user("hi")], [], sessionLive({ urlFlows: { S: flow("S") } })));
+    await act(async () => hook.dismissExternalFlow("S"));
+    await act(async () => hook.dismissExternalFlow("G"));
+    await act(async () => hook.dismissExternalFlow("nope"));
+    await settle();
+    expect(posts.map((post) => post.url)).toEqual([
+      "/api/v3/scopes/session%2Fs1/resources/S/dismiss",
+      "/api/v3/scopes/global/resources/G/dismiss",
+    ]);
+  });
+
+  it("sets a mode, held until the Agent answers, also while a prompt runs", async () => {
+    let release!: () => void;
+    respond = () => new Promise((resolve) => { release = () => resolve({ status: 200, body: {} }); });
+    await shownSession(running(), [{ entry: 0 }]);
+    await act(async () => hook.setMode("plan"));
+    await settle();
+    expect(posts.map((post) => [post.url, post.body])).toEqual([
+      ["/api/v3/scopes/session%2Fs1/actions/set_mode", { modeId: "plan" }],
+    ]);
+    expect(hook.state.pendingSessionControl).toMatchObject({ sessionId: "s1", kind: "mode" });
+    expect(hook.state.running).toBe(true);
+    release();
+    await settle();
+    expect(hook.state.pendingSessionControl).toBeUndefined();
+  });
+
+  it("sets an option, and shows the error the Agent answered with, which changes nothing", async () => {
+    respond = () => ({ status: 200, body: { error: { code: "agent_error", message: "Refused by the Agent" } } });
+    await shownSession();
+    await act(async () => hook.setConfig("verbose", true));
+    await settle();
+    expect(posts[0].body).toEqual({ configId: "verbose", value: true });
+    const error = hook.state.timeline.find((item) => item.type === "error");
+    expect((error as { message: string } | undefined)?.message).toContain("Refused by the Agent");
+    expect(hook.state.pendingSessionControl).toBeUndefined();
+  });
 });
 
