@@ -66,6 +66,65 @@ pub(crate) fn session_live(registry: &SessionRegistry, session_id: &str) -> Opti
     }))
 }
 
+/// The interactions pending in `scope`, by interaction ID (protocol §4.4).
+/// They are a member of `live` beside the operation, not part of it.
+fn interactions_doc(registry: &SessionRegistry, scope: &Scope) -> Value {
+    let interactions = project::shown_operation(registry, scope)
+        .map(|(operation, _)| operation.interactions)
+        .unwrap_or_default();
+    serde_json::to_value(interactions).expect("interactions serialize")
+}
+
+/// The accepted URL flows of `scope`, by interaction ID (protocol §4.6). A
+/// flow is waiting until it is settled.
+fn url_flows_doc(registry: &SessionRegistry, scope: &Scope) -> Value {
+    let flows = match scope {
+        Scope::Session(session_id) => registry
+            .sessions
+            .get(session_id)
+            .and_then(|entry| entry.state.live.as_ref())
+            .filter(|live| held(live))
+            .map(|live| {
+                project::url_flows(
+                    live.url_flows
+                        .values()
+                        .chain(project::request_flows(registry, scope)),
+                )
+            })
+            .unwrap_or_default(),
+        _ => project::url_flows(project::request_flows(registry, scope)),
+    };
+    let mut flows = serde_json::to_value(flows).expect("flows serialize");
+    for flow in flows
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|flows| flows.values_mut())
+    {
+        flow["status"] = Value::String("waiting".into());
+    }
+    flows
+}
+
+/// The complete `live` of `scope` (protocol §4.1–§4.4): the members every scope
+/// has (`op`, `interactions`, `urlFlows`) and those of its kind. `None` when the
+/// bridge does not hold the session.
+pub(crate) fn scope_live(
+    registry: &SessionRegistry,
+    scope: &Scope,
+    agent: &AgentInfo,
+    catalog_revision: u64,
+) -> Option<Value> {
+    let mut live = match scope {
+        Scope::Session(session_id) => session_live(registry, session_id)?,
+        Scope::Global => global_live(registry, agent),
+        Scope::Catalog => catalog_live(registry, catalog_revision),
+    };
+    live["op"] = operation_doc(registry, scope)?;
+    live["interactions"] = interactions_doc(registry, scope);
+    live["urlFlows"] = url_flows_doc(registry, scope);
+    Some(live)
+}
+
 /// What `live` holds for `global` besides its operation, interactions and URL
 /// flows (protocol §4.3): the Agent, the sessions the bridge holds and the
 /// terminal logins. A login terminal is a terminal like any other, whose handle

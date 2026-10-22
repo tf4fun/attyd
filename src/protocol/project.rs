@@ -156,7 +156,7 @@ fn operation(slot: &OpSlot, interactions: BTreeMap<String, Interaction>) -> Oper
 }
 
 /// The scope whose slot `scope` shows.
-fn owner(registry: &SessionRegistry, scope: &Scope) -> Scope {
+pub(super) fn owner(registry: &SessionRegistry, scope: &Scope) -> Scope {
     match scope {
         Scope::Session(session_id) => registry
             .scopes
@@ -168,7 +168,10 @@ fn owner(registry: &SessionRegistry, scope: &Scope) -> Scope {
     }
 }
 
-fn shown_operation(registry: &SessionRegistry, scope: &Scope) -> Option<(Operation, Scope)> {
+pub(super) fn shown_operation(
+    registry: &SessionRegistry,
+    scope: &Scope,
+) -> Option<(Operation, Scope)> {
     let owner = owner(registry, scope);
     let slot = registry.shown_slot(scope)?;
     Some((
@@ -179,7 +182,7 @@ fn shown_operation(registry: &SessionRegistry, scope: &Scope) -> Option<(Operati
 
 /// The accepted request-scoped URL flows of `scope`; a flow of no known scope
 /// is global's.
-fn request_flows<'a>(
+pub(super) fn request_flows<'a>(
     registry: &'a SessionRegistry,
     scope: &'a Scope,
 ) -> impl Iterator<Item = &'a crate::runtime_state::UrlFlow> {
@@ -193,7 +196,7 @@ fn request_flows<'a>(
     })
 }
 
-fn url_flows<'a>(
+pub(super) fn url_flows<'a>(
     flows: impl IntoIterator<Item = &'a crate::runtime_state::UrlFlow>,
 ) -> BTreeMap<String, UrlFlow> {
     flows
