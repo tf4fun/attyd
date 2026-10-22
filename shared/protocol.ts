@@ -167,7 +167,11 @@ export type SessionSummary = { sessionId: string, cwd: string,
 /**
  * `controls.info.title`.
  */
-title: string | null, op: OperationSummary, pending: PendingCounts, };
+title: string | null, op: OperationSummary, pending: PendingCounts, 
+/**
+ * The `create` or `fork` that installed the session, while it is held.
+ */
+origin?: string, };
 
 export type OperationSummary = { kind: OperationKind, status: OperationStatus, };
 

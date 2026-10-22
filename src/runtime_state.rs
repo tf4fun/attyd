@@ -56,6 +56,8 @@ pub(crate) struct SessionLiveState {
     pub(crate) op: OpSlot,
     /// The reduced controls (protocol §4.5).
     pub(crate) controls: SessionControls,
+    /// The `create` or `fork` that installed the session (protocol §4.3).
+    pub(crate) origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,6 +372,7 @@ impl SessionRegistry {
                 attachment_candidate: Vec::new(),
                 op,
                 controls: SessionControls::default(),
+                origin: None,
             },
         );
         self.sessions
@@ -665,6 +668,7 @@ impl SessionRegistry {
                 attachment_candidate: Vec::new(),
                 op: OpSlot::completed(OperationKind::Open, serde_json::json!({})),
                 controls,
+                origin: None,
             },
         );
         self.settle_session_ops(&session_id);

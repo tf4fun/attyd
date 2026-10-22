@@ -334,6 +334,10 @@ pub(crate) struct SessionSummary {
     pub title: Option<String>,
     pub op: OperationSummary,
     pub pending: PendingCounts,
+    /// The `create` or `fork` that installed the session, while it is held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
