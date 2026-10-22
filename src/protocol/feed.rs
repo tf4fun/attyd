@@ -24,6 +24,14 @@ use crate::session_registry::SessionRegistry;
 
 pub(crate) type SubscriptionId = u64;
 
+/// A subscription that follows a session the bridge has not published yet, and
+/// the directory it gave for the session's load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Waiting {
+    pub id: SubscriptionId,
+    pub cwd: Option<String>,
+}
+
 pub(crate) struct Feed {
     engine: Engine,
     /// The epoch `global` and `catalog` are published under.
@@ -67,6 +75,39 @@ impl Feed {
 
     pub(crate) fn subscribers(&self) -> usize {
         self.subscribers.len()
+    }
+
+    /// The sessions some subscription follows, with the subscriptions that
+    /// follow each and wait for it to be published (protocol §5.1).
+    pub(crate) fn followed_sessions(&self) -> BTreeMap<String, Vec<Waiting>> {
+        let mut sessions: BTreeMap<String, Vec<Waiting>> = BTreeMap::new();
+        for (&id, subscriber) in &self.subscribers {
+            for (scope, cwd) in subscriber.followed() {
+                let Some(Scope::Session(session_id)) = Scope::parse(scope) else {
+                    continue;
+                };
+                let waiting = sessions.entry(session_id).or_default();
+                if self.engine.version(scope).is_none() {
+                    waiting.push(Waiting {
+                        id,
+                        cwd: cwd.map(String::from),
+                    });
+                }
+            }
+        }
+        sessions
+    }
+
+    /// Ends `session/<session_id>` for the subscriptions still waiting for it:
+    /// a subscription that has the session published is not ended by this.
+    pub(crate) fn end_waiting(&mut self, session_id: &str, end: &End) {
+        let scope = Scope::Session(session_id.to_string()).to_string();
+        if self.engine.version(&scope).is_some() {
+            return;
+        }
+        for subscriber in self.subscribers.values_mut() {
+            subscriber.end(&scope, end.clone());
+        }
     }
 
     /// The version `scope` is published at.
@@ -226,6 +267,18 @@ impl FeedHandle {
 
     pub(crate) fn subscribers(&self) -> usize {
         self.feed().subscribers()
+    }
+
+    /// The sessions some subscription follows (see `Feed::followed_sessions`).
+    pub(crate) fn followed_sessions(&self) -> BTreeMap<String, Vec<Waiting>> {
+        self.feed().followed_sessions()
+    }
+
+    /// Ends the session's scope for the subscriptions waiting for it, and wakes
+    /// their streams.
+    pub(crate) fn end_waiting(&self, session_id: &str, end: &End) {
+        self.feed().end_waiting(session_id, end);
+        self.0.ready.notify_waiters();
     }
 
     /// The epoch and rev `scope` is published at, if it is.
