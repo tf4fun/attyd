@@ -236,9 +236,8 @@ async fn attachments_are_served_while_their_own_session_references_them() {
     watch.converged(&bench).await;
 }
 
-/// A compaction summary's block is a process block: served while the running
-/// prompt's process references it, not found once the commit removes the
-/// process, and never in the log.
+/// A compaction summary's block is served while the running prompt's process references it, and
+/// after the commit as an entry of the session; never in the revision 2 log.
 #[tokio::test]
 async fn a_compaction_summary_block_is_served_until_its_turn_commits() {
     let (bench, mut link) = Bench::ws(json!({"promptCapabilities": {"image": true}})).await;
@@ -289,13 +288,8 @@ async fn a_compaction_summary_block_is_served_until_its_turn_commits() {
         references(&json!(watch.log("session/s"))).is_empty(),
         "the summary block never enters the log"
     );
-    assert_unserved(
-        &bench,
-        "s",
-        &in_process[0],
-        "a summary block after the commit",
-    )
-    .await;
+    // The summary is an entry of the session now, which the document keeps referencing.
+    assert_served(&bench, "s", &in_process[0], &summary).await;
     link.quiet(QUIET).await;
     watch.quiet(QUIET).await;
     watch.converged(&bench).await;
