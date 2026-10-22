@@ -314,6 +314,7 @@ fn summary(
             interactions: op.interactions.len(),
             url_flows,
         },
+        origin: live.origin.clone(),
     }
 }
 

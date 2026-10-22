@@ -512,8 +512,22 @@ impl SessionRegistry {
         if self.held_scope(scope) {
             let slot = self.slot_mut(scope);
             if slot.is_running_kind(kind) {
+                let id = slot.id.clone();
+                let created = (kind == OperationKind::Create)
+                    .then(|| result["sessionId"].as_str().map(String::from))
+                    .flatten();
                 slot.complete(result);
+                if let Some(session_id) = created {
+                    self.set_origin(&session_id, id);
+                }
             }
+        }
+    }
+
+    /// The session `create` or `fork` `origin` installed names that operation.
+    fn set_origin(&mut self, session_id: &str, origin: String) {
+        if let Some(live) = self.held_live_mut(session_id) {
+            live.origin = Some(origin);
         }
     }
 
@@ -725,18 +739,25 @@ impl SessionRegistry {
         let Some(kind) = session_kind(kind) else {
             return;
         };
+        let mut forked = None;
         if let Some(live) = self.held_live_mut(session_id)
             && live.op.is_running_kind(kind)
         {
+            let origin = live.op.id.clone();
             live.op.complete(match kind {
-                OperationKind::Fork => wire::value(&SessionCreated {
-                    session_id: result["sessionId"]
+                OperationKind::Fork => {
+                    let new = result["sessionId"]
                         .as_str()
                         .expect("a fork result is the Agent's ForkSessionResponse")
-                        .to_string(),
-                }),
+                        .to_string();
+                    forked = Some((new.clone(), origin));
+                    wire::value(&SessionCreated { session_id: new })
+                }
                 _ => wire::value(&Empty {}),
             });
+        }
+        if let Some((new, origin)) = forked {
+            self.set_origin(&new, origin);
         }
     }
 
