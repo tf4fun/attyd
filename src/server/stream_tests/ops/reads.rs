@@ -219,13 +219,8 @@ async fn attachments_are_served_while_their_own_session_references_them() {
         in_log,
         "the process block never enters the log"
     );
-    assert_unserved(
-        &bench,
-        "s",
-        &in_process[0],
-        "a process block after the commit",
-    )
-    .await;
+    // The tool call is an entry of the session in revision 3, which keeps referencing its block.
+    assert_served(&bench, "s", &in_process[0], &process).await;
     assert_served(&bench, "s", &in_log[0], &logged).await;
     link.quiet(QUIET).await;
     watch.quiet(QUIET).await;
