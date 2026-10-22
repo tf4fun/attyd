@@ -89,6 +89,7 @@ const controls = () => ({
   commands: [{ name: "plan", description: "Plan" }],
   info: { title: "One", updatedAt: null, meta: null },
   usage: null,
+  meta: {},
 });
 
 function sessionLive(fields: Record<string, unknown> = {}) {
