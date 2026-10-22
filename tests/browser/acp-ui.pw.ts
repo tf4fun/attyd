@@ -2027,7 +2027,7 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   await expect(thinking).toHaveAttribute("data-open", "true");
   await expect(thinkingDebug).toBeVisible();
   await expect(thinkingDebug).toContainText("activity-thought");
-  await expect(thinkingDebug.locator("pre")).toContainText("agent_thought_chunk");
+  await expect(thinkingDebug.locator("pre")).toContainText('"role": "thought"');
   await expect(thinkingDebug.locator(".raw-json")).toHaveCount(0);
   const userMessage = page.locator(".message-user").filter({ hasText: "activity-flow" });
   for (const width of [390, 320]) {
@@ -2775,7 +2775,8 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
   const markdown = await popupPromise;
   await markdown.waitForLoadState();
   await expect(markdown.locator("body")).toContainText("**Context menu response.**\n\n- first item\n- second item");
-  await expect(markdown.locator("body")).not.toContainText("Considering possible follow-up work.");
+  // The thread keeps the Agent's thoughts, under their own heading, in the faithful view.
+  await expect(markdown.locator("body")).toContainText("Considering possible follow-up work.");
   await markdown.close();
 
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);

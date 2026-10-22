@@ -31,13 +31,13 @@ const test = baseTest.extend<{ collapseFixture: CollapseFixture }>({
   baseURL: async ({ collapseFixture }, use) => use(collapseFixture.url),
 });
 
-// `turn-collapse-flow` streams twenty "Process paragraph" Agent messages, a
-// thought and a tool call, then the final answer. The paragraphs are
-// `agent_message_chunk`s: they are part of the reply, kept with the final answer. The
-// thought and the tool call are process, which the commit folds behind the disclosure and keeps
-// in the thread; no process page exists to fetch it.
+// `turn-collapse-flow` streams a message of twenty "Process paragraph"s, a thought and a tool call,
+// then the final answer as a message of its own. The commit shows the final answer and folds
+// everything before it (the first message, the thought, the tool call) behind the disclosure,
+// which keeps it in the thread; no process page exists to fetch it. While the user is reading
+// above the bottom, the process stays open and folds when they return.
 
-test("shows the live process and keeps every Agent message, with the process folded, after completion at the bottom", async ({ page, collapseFixture }, testInfo) => {
+test("shows the live process, and after completion at the bottom the final answer with the process folded", async ({ page, collapseFixture }, testInfo) => {
   await page.setViewportSize({ width: 900, height: 420 });
   const api = trackApi(page);
   const { turn, thread } = await startTurn(page);
@@ -102,9 +102,10 @@ for (const distance of [24, 500]) {
     expect(await anchor.evaluate((element) => element.getBoundingClientRect().top)).toBe(anchorTop);
     await collapseFixture.advance("finish");
     await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
-    await expectCommitted(turn);
-    // Removing process can shorten the scroll range past the old offset. The
-    // browser must clamp there; within the remaining range the offset stays put.
+    // The user is reading above the bottom: the process is not folded away under them.
+    await expectCommittedUnfolded(turn);
+    // The range does not change while it stays open; if it did, the browser would clamp.
+    // Within the remaining range the offset stays put.
     const maximum = await thread.evaluate((element) => element.scrollHeight - element.clientHeight);
     const expectedPosition = Math.min(readingPosition, maximum);
     expect(await thread.evaluate((element) => element.scrollTop)).toBe(expectedPosition);
@@ -115,10 +116,12 @@ for (const distance of [24, 500]) {
       await page.getByRole("button", { name: "Jump to bottom of thread", exact: true }).click();
     }
     await expectBottom(thread);
+    // Back at the bottom, the turn folds its process.
+    await expectCommitted(turn);
   });
 }
 
-test("searches and copies the whole committed reply, including the earlier Agent messages", async ({ page, context, collapseFixture }) => {
+test("copies the final answer, and searches the process only once it is expanded", async ({ page, context, collapseFixture }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   const { turn } = await startTurn(page);
   await collapseFixture.advance("append");
@@ -127,17 +130,20 @@ test("searches and copies the whole committed reply, including the earlier Agent
   await expectCommitted(turn);
   const copies = turn.getByRole("button", { name: "Copy agent response", exact: true });
   await copies.last().click();
-  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain("Process paragraph 18:");
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toMatch(/The final answer is ready\.$/u);
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain("The final answer is ready.");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).not.toContain("Process paragraph 18:");
 
+  // Search indexes what is visible: the folded process is not searched until it is expanded.
   await page.getByRole("button", { name: "Search Agent thread", exact: true }).click();
   const query = page.getByRole("searchbox", { name: "Search this thread", exact: true });
   const counter = page.locator(".thread-search-navigation output");
   await query.fill("Process paragraph 18:");
+  await expect(counter).toHaveText("0/0");
+  await turn.getByRole("button", { name: "Expand execution process", exact: true }).click();
   await expect(counter).toHaveText("1/1");
   await expect(turn.locator('[data-thread-search-active="true"]')).toBeInViewport();
   await query.fill("Inspect collapse fixture");
-  await expect(counter).toHaveText("0/0");
+  await expect(counter).toHaveText("1/1");
   await query.press("Escape");
 });
 
@@ -186,18 +192,25 @@ async function startTurn(page: Page) {
   return { turn, thread: page.getByRole("region", { name: "Conversation thread", exact: true }) };
 }
 
-/** The committed turn: every Agent message of the reply, and the process folded behind its disclosure. */
+/** The committed turn: the final answer, and everything before it folded behind the disclosure. */
 async function expectCommitted(turn: Locator) {
   const visible = turn.page().locator(":visible");
-  await expect(turn.locator(".message-content").getByText("Process paragraph 1:", { exact: false })).toBeVisible();
-  await expect(turn.locator(".message-content").getByText("Process paragraph 20:", { exact: false })).toBeVisible();
-  // canon merges the paragraphs and the final answer into one text block, so
-  // the committed reply is checked by content, not by message boundaries.
   await expect(turn.locator(".message-content").last()).toContainText("The final answer is ready.");
+  await expect(turn.getByText("Process paragraph 1:", { exact: false }).and(visible)).toHaveCount(0);
+  await expect(turn.getByText("Process paragraph 20:", { exact: false }).and(visible)).toHaveCount(0);
   await expect(turn.locator(".thinking-block").and(visible)).toHaveCount(0);
   await expect(turn.getByText("Inspect collapse fixture", { exact: true }).and(visible)).toHaveCount(0);
   await expect(turn.locator(".tool-card").and(visible)).toHaveCount(0);
   await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(1);
+  // Nothing is lost: the folded process is in the thread, and opening it shows it.
+  await expect(turn.getByText("Process paragraph 20:", { exact: false })).not.toHaveCount(0);
+}
+
+/** The committed turn while the user reads above the bottom: the final answer, and the process still open. */
+async function expectCommittedUnfolded(turn: Locator) {
+  await expect(turn.locator(".message-content").last()).toContainText("The final answer is ready.");
+  await expect(turn.getByText("Process paragraph 20:", { exact: false })).toBeVisible();
+  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
 }
 
 async function expectBottom(thread: Locator) {
