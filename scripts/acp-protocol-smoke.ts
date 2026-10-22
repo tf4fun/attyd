@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import type { Answer, Operation, PromptResult } from "../shared/protocol.js";
-import { globalLive, replyText, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
+import type { Answer, Interaction, PromptResult } from "../shared/protocol.js";
+import {
+  entriesOf, globalLive, replyText, sessionLive, sessionScope, SmokeClient,
+} from "./protocol-smoke-client.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
 // SDK Agent -> ACP client terminal/MCP services, with the same protocol v2
@@ -31,22 +33,18 @@ try {
   client.follow([{ scope: "global" }]);
   await client.until("global", (replica) => (globalLive(replica)?.agent.phase === "ready" ? true : undefined),
     "Agent initialization");
-  const created = await client.ops.write("global", { kind: "create", args: { cwd: sessionCwd } });
-  assert.ok(created.kind === "ended" && "result" in created.outcome, JSON.stringify(created));
-  const scope = sessionScope((created.outcome.result as { sessionId: string }).sessionId);
+  const created = await client.run("global", { kind: "create", args: { cwd: sessionCwd } });
+  assert.equal(created.status, "completed", JSON.stringify(created));
+  const scope = sessionScope((created.result as { sessionId: string }).sessionId);
   // The stream follows the session until every flow's result is read.
   client.follow([{ scope: "global" }, { scope }]);
 
-  const services = await runFlow(scope, "client-services-flow", (op) => {
-    const answers: Record<string, Answer> = {};
-    for (const [id, pending] of Object.entries(op.interactions)) {
-      assert.equal(pending.kind, "elicitation");
-      if (pending.kind !== "elicitation") continue;
-      answers[id] = { response: pending.request.mode === "form"
-        ? { action: "accept", content: { value: "😀" } }
-        : { action: pending.request.message === "Decline URL" ? "decline" : "accept" } };
-    }
-    return answers;
+  const services = await runFlow(scope, "client-services-flow", (id, pending) => {
+    assert.equal(pending.kind, "elicitation", id);
+    if (pending.kind !== "elicitation") throw new Error("not an elicitation");
+    return { response: pending.request.mode === "form"
+      ? { action: "accept", content: { value: "😀" } }
+      : { action: pending.request.message === "Decline URL" ? "decline" : "accept" } };
   });
   assert.deepEqual(services.read, { content: "session workspace input" });
   assert.equal(await readFile(join(sessionCwd, "output.txt"), "utf8"), "written in session workspace");
@@ -141,30 +139,31 @@ try {
 
 /**
  * Runs the prompt `flow` and returns the results its reply reports. While it
- * runs, `answer` gives the answers to its pending interactions, all at once.
+ * runs, `answer` gives the answer to each interaction it asks, one at a time.
  */
 async function runFlow(
   scope: string,
   flow: string,
-  answer?: (op: Operation) => Record<string, Answer>,
+  answer?: (id: string, interaction: Interaction) => Answer,
 ): Promise<Record<string, unknown>> {
   await client.ended(scope);
-  const held = client.replicas.get(scope)!.log.length;
+  const held = entriesOf(client.replicas.get(scope)).length;
   const started = await client.ops.write(scope, { kind: "prompt", args: { prompt: [{ type: "text", text: flow }] } });
   assert.ok(started.kind === "accepted", JSON.stringify(started));
   const answered = new Set<string>();
   const answers: Promise<void>[] = [];
   const ended = await client.until(scope, (replica) => {
-    const op = sessionLive(replica)?.op;
-    if (op?.id !== started.op) return undefined;
+    const live = sessionLive(replica);
+    const op = live?.op;
+    if (live == null || op?.id !== started.op) return undefined;
     if (op.status !== "running") return op;
-    const pending = Object.keys(op.interactions).sort().join(" ");
-    // Each set of pending interactions is answered once; nothing is resent.
-    if (pending !== "" && !answered.has(pending)) {
-      assert.ok(answer, `${flow} asked for input: ${JSON.stringify(op.interactions)}`);
-      answered.add(pending);
-      answers.push(client.ops.answer(scope, answer(op)).then((outcome) => {
-        assert.equal(outcome.kind, "accepted", `${flow} answer: ${JSON.stringify(outcome)}`);
+    // Each interaction is answered once; nothing is resent.
+    for (const [id, pending] of Object.entries(live.interactions)) {
+      if (answered.has(id)) continue;
+      assert.ok(answer, `${flow} asked for input: ${JSON.stringify(live.interactions)}`);
+      answered.add(id);
+      answers.push(client.actions.answer(scope, id, answer(id, pending)).then((outcome) => {
+        assert.equal(outcome.kind, "done", `${flow} answer: ${JSON.stringify(outcome)}`);
       }));
     }
     return undefined;
@@ -172,10 +171,11 @@ async function runFlow(
   await Promise.all(answers);
   assert.equal(ended.status, "completed", JSON.stringify(ended.error));
   assert.equal((ended.result as PromptResult).stopReason, "end_turn");
-  // The commit adds the turn with the operation's end; its reply carries the results.
-  const log = client.replicas.get(scope)!.log;
-  assert.equal(log.length, held + 1);
-  return asRecord(JSON.parse(replyText(log[held])));
+  // The turn's reply carries the results: the Agent messages the turn added, joined.
+  const reply = entriesOf(client.replicas.get(scope)).slice(held)
+    .filter((entry) => entry.kind === "message" && entry.role === "agent")
+    .map(replyText).join("");
+  return asRecord(JSON.parse(reply));
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

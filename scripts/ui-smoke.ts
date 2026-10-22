@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import type { CatalogPage, PromptResult } from "../shared/protocol.js";
-import { globalLive, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
+import type { PromptResult } from "../shared/protocol.js";
+import {
+  catalogLive, entriesOf, globalLive, promptsOf, sessionLive, sessionScope, SmokeClient,
+} from "./protocol-smoke-client.js";
 import { startRustTestServer } from "./rust-test-server.js";
 
 const cwd = process.cwd();
@@ -47,11 +49,10 @@ try {
     assert.equal(agent.initialize?.agentInfo?.name, "attyd-test-agent");
 
     client.follow([{ scope: "global" }, { scope: "catalog" }]);
-    await client.ended("catalog");
-    const catalog = await client.ops.write("catalog", { kind: "list", args: {} });
-    assert.ok(catalog.kind === "ended" && "result" in catalog.outcome, JSON.stringify(catalog));
-    await client.ended("catalog", catalog.op);
-    const sessions = (catalog.outcome.result as CatalogPage).sessions;
+    const catalog = await client.run("catalog", { kind: "list", args: {} });
+    assert.equal(catalog.status, "completed", JSON.stringify(catalog));
+    // The page is in the catalog's document, not in a held response.
+    const sessions = catalogLive(client.replicas.get("catalog"))!.pages.flatMap((page) => [...page.sessions]);
     assert.deepEqual(sessions.map(({ sessionId }) => sessionId), ["saved-session", "earlier-session"]);
 
     // Subscribing loads the session; the stream stays open to the end.
@@ -59,39 +60,42 @@ try {
     client.follow([{ scope: "global" }, { scope: "catalog" }, { scope, cwd: sessions[0].cwd }]);
     const loaded = await client.until(scope, (replica) => {
       const live = sessionLive(replica);
-      return replica?.confirmed && live?.op.status !== "running" ? { log: replica.log, op: live!.op } : undefined;
+      return replica?.doc.history === "complete" && live?.op.status !== "running"
+        ? { entries: entriesOf(replica), op: live!.op } : undefined;
     }, "history load");
     assert.equal(loaded.op.kind, "load");
     assert.equal(loaded.op.status, "completed");
-    assert.match(JSON.stringify(loaded.log), /Loaded history\./u);
+    assert.match(JSON.stringify(loaded.entries), /Loaded history\./u);
 
     const prompt = await client.ops.write(scope, {
       kind: "prompt",
       args: { prompt: [{ type: "text", text: "usage-flow" }] },
     });
     assert.ok(prompt.kind === "accepted", JSON.stringify(prompt));
-    // The commit ends the operation and adds its turn in one event.
     const completed = await client.ended(scope, prompt.op);
     assert.equal(completed.status, "completed");
     assert.equal((completed.result as PromptResult).stopReason, "max_tokens");
-    const log = client.replicas.get(scope)!.log;
-    assert.equal(log.length, loaded.log.length + 1);
-    assert.match(JSON.stringify(log.at(-1)?.turn.prompt), /usage-flow/u);
+    const entries = entriesOf(client.replicas.get(scope));
+    assert.ok(entries.length > loaded.entries.length);
+    assert.match(JSON.stringify(entries.slice(loaded.entries.length)), /usage-flow/u);
+    // The prompt keeps how it ended.
+    assert.deepEqual(promptsOf(client.replicas.get(scope)).at(-1)?.end, { response: completed.result });
 
     const deletion = await client.ops.write("global", { kind: "delete", args: { sessionId: "saved-session" } });
     assert.ok(deletion.kind === "accepted", JSON.stringify(deletion));
     await client.until(scope, (replica) => (replica === undefined ? true : undefined), "the deleted session's end");
     assert.equal((await client.ended("global", deletion.op)).status, "completed");
     assert.ok(!Object.hasOwn(globalLive(client.replicas.get("global"))!.sessions, "saved-session"));
-    const afterDelete = await client.ops.write("catalog", { kind: "list", args: {} });
-    assert.ok(afterDelete.kind === "ended" && "result" in afterDelete.outcome, JSON.stringify(afterDelete));
-    assert.ok(!(afterDelete.outcome.result as CatalogPage).sessions.some(({ sessionId }) => sessionId === "saved-session"));
+    const afterDelete = await client.run("catalog", { kind: "list", args: {} });
+    assert.equal(afterDelete.status, "completed", JSON.stringify(afterDelete));
+    const remaining = catalogLive(client.replicas.get("catalog"))!.pages.flatMap((page) => [...page.sessions]);
+    assert.ok(!remaining.some(({ sessionId }) => sessionId === "saved-session"));
     assert.deepEqual(client.streamErrors, []);
   } finally {
     client.close();
   }
 
-  console.log("Rust-hosted protocol v2 UI smoke passed");
+  console.log("Rust-hosted protocol revision 3 UI smoke passed");
 } finally {
   await server.close();
 }
