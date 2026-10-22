@@ -691,7 +691,7 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route("/api/v2/stream", get(protocol_stream))
         // The revision 3 stream, beside the revision 2 one until the cutover.
         .route("/api/v3/stream", get(feed_stream))
-        .route("/api/v3/scopes/{*scope}", post(write_scope_v3))
+        .route("/api/v3/scopes/{*scope}", get(read_scope_v3).post(write_scope_v3))
         // Writes share the read's wildcard; held `create`, `fork` and `list`
         // responses take no JSON deadline (protocol §6.3).
         .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
@@ -768,6 +768,26 @@ async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) ->
         log: document.log,
     })
     .into_response()
+}
+
+/// `GET /api/v3/scopes/{scope}` (protocol §8): the document as one snapshot, the one a stream
+/// aligns with. It starts, loads and holds nothing; a session the bridge does not hold is
+/// `not_found`.
+async fn read_scope_v3(Path(scope): Path<String>, State(state): State<AppState>) -> Response {
+    if Scope::parse(&scope).is_none() {
+        return protocol_error(
+            StatusCode::BAD_REQUEST,
+            ProtocolError::new(ErrorCode::InvalidRequest, format!("no scope {scope}")),
+        );
+    }
+    let snapshot = state.bridge.publication.lock().feed.snapshot(&scope);
+    match snapshot {
+        Some(snapshot) => axum::Json(snapshot).into_response(),
+        None => protocol_error(
+            StatusCode::NOT_FOUND,
+            ProtocolError::new(ErrorCode::NotFound, format!("{scope} is not held")),
+        ),
+    }
 }
 
 /// The reads of a held session (protocol §8): an attachment its published
