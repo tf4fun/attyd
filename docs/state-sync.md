@@ -507,7 +507,7 @@ mandatory ACP capabilities.
   guarantees have their own cases and are not mislabeled as regressions. A test
   changed to assert a loss is changed back, not counted as fidelity coverage.
 
-### 7.5 Implementation status (2026-10-21)
+### 7.5 Implementation status (2026-10-22)
 
 Each item is one merged pull request into `experiment/protocol-v2`, with its tests
 written first and run by CI only. The bridge is verified through its own memory
@@ -524,7 +524,7 @@ while the first layer was built, so the browser suite kept passing.
 | **Step 15 — terminals** | a released terminal a tool embeds keeps its frozen output, also across the connection's end (#68) | shown in its tool card: layer 2 |
 | **Step 16 — interactions** | | scope-based lifetimes, parent RPC, URL-flow outcomes, forms, request IDs |
 | **Step 18 — actions** | | controls and close during a prompt (R1, R2), controls metadata (D12) |
-| **Layer 2 — building blocks** | document digest, Rust and TypeScript, against independently computed vectors (#69, #70); the timeline as entries with attachment references (#71); the verifying replica (#72); the publisher with epoch, rev and differential snapshots (#73); the live facts of a session (#76); client-chosen operation IDs and repeats (#77); the global and catalog facts (#78); the operation a scope shows, with its scope and `after` (#80) | interactions and URL flows in `live`; subscriptions and delivery; actions; the client stream and writes; the projection into the UI; the cutover that replaces the rev 2 engine |
+| **Layer 2 — building blocks** | document digest, Rust and TypeScript, against independently computed vectors (#69, #70); the timeline as entries with attachment references (#71); the verifying replica (#72); the publisher with epoch, rev and differential snapshots (#73); the live facts of a session (#76); client-chosen operation IDs and repeats (#77); the global and catalog facts (#78); the operation a scope shows, with its scope and `after` (#80); interactions and URL flows in `live`, the whole `live` of a scope (#81), and the publisher's input (#82); the stream query (#83) and the per-subscriber queue that coalesces to snapshots (#84); the feed that publishes every commit (#85) behind a shared handle streams wait on (#86) and is committed to by the bridge beside the rev 2 publisher (#87); checkpoint pacing, 500 ms after a pause and at least every 2 s (#88, #89); `GET /api/v3/stream` with the heartbeat (#90); loading the session a stream follows with its `cwd`, and ending a scope with the reason the bridge recorded (#91, #92) | operations and actions over HTTP (every operation answers 202; results in the document); the client stream and writes; the projection into the UI; the cutover that moves `/api/v3/stream` to `/api/v2/stream` and replaces the rev 2 engine |
 | **Dependencies** | vite (#57), webpki crates (#57), vitest (#75) advisories | |
 
 Deviations from the plan, on purpose:
