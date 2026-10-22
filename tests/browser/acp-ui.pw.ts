@@ -397,11 +397,11 @@ for (const { kind, listState } of [
     try {
       // The pages the catalog's document holds stay while its revision stays; a list is needed again
       // only after it changed, which another client creating a session does. Listing stalls from here on.
-      const global = await (await page.request.get("/api/v2/scopes/global")).json();
-      const other = await page.request.post("/api/v2/scopes/global/ops", {
-        data: { expect: global.live.op.id, kind: "create", args: { cwd: process.cwd() } },
+      const global = await (await page.request.get("/api/v3/scopes/global")).json();
+      const other = await page.request.post("/api/v3/scopes/global/ops", {
+        data: { expect: global.snapshot.doc.live.op.id, kind: "create", args: { cwd: process.cwd() } },
       });
-      expect(other.status()).toBe(200);
+      expect(other.status()).toBe(202);
 
       await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
       await composer.press("Enter");
@@ -799,9 +799,9 @@ test("edits and resends ordered prompt blocks without moving attachments", async
     { type: "resource", resource: { uri: "attyd://attachment/note.txt", mimeType: 'text/plain; charset="utf-8"', text: "中文 context" } },
   ];
   const scope = encodeURIComponent("session/saved-session");
-  const document = await (await page.request.get(`/api/v2/scopes/${scope}`)).json();
-  const accepted = await page.request.post(`/api/v2/scopes/${scope}/ops`, {
-    data: { expect: document.live.op.id, kind: "prompt", args: { prompt: blocks } },
+  const document = await (await page.request.get(`/api/v3/scopes/${scope}`)).json();
+  const accepted = await page.request.post(`/api/v3/scopes/${scope}/ops`, {
+    data: { expect: document.snapshot.doc.live.op.id, kind: "prompt", args: { prompt: blocks } },
   });
   expect(accepted.status()).toBe(202);
   await expect(page.getByText("Received prompt blocks: text,image,text,resource.", { exact: true })).toBeVisible();
@@ -931,14 +931,17 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await expect(content.locator("pre, img, audio, iframe, object, embed")).toHaveCount(0);
   await expect(content).not.toContainText("# 完整的中文附件");
   // The log names each attachment by reference; its content is not in the document.
-  const view = await (await page.request.get("/api/v2/scopes/session%2Fsaved-session")).json();
-  expect(JSON.stringify(view.log)).toContain('"type":"attachment"');
+  const view = await (await page.request.get("/api/v3/scopes/session%2Fsaved-session")).json();
+  expect(JSON.stringify(view.snapshot.entries)).toContain('"type":"attachment"');
   expect(JSON.stringify(view)).not.toContain("# 完整的中文附件");
   expect(JSON.stringify(view)).not.toContain(wave.toString("base64"));
-  // The prompt's six attachments are `AttachmentRef`s in its log entry (§3.2).
-  const entry = (view.log as Array<{ turn: { prompt: Array<{ type: string; text?: string }> } }>)
-    .find(({ turn }) => turn.prompt.some((block) => block.type === "text" && block.text?.includes("attachment-input-flow")));
-  expect(entry?.turn.prompt.filter((block) => block.type === "attachment")).toHaveLength(6);
+  // The prompt's six attachments are `AttachmentRef`s in its user entry (§3.1).
+  type Block = { type: string; text?: string };
+  const entries = (view.snapshot.entries.changed as Array<[number, { kind: string; role?: string; chunks?: Array<{ content: Block }> }]>)
+    .map(([, entry]) => entry);
+  const entry = entries.find(({ kind, role, chunks }) => kind === "message" && role === "user"
+    && chunks?.some(({ content }) => content.type === "text" && content.text?.includes("attachment-input-flow")));
+  expect(entry?.chunks?.filter(({ content }) => content.type === "attachment")).toHaveLength(6);
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("attachment-chips-mobile.png") });
 
@@ -1574,9 +1577,9 @@ test("retires the open session after another client deletes it without subscribi
 
   // A separate API client deletes the session. This page gets no response of
   // its own: the stream's `end: deleted` must drive the exit.
-  const global = await (await page.request.get("/api/v2/scopes/global")).json();
-  const response = await page.request.post("/api/v2/scopes/global/ops", {
-    data: { expect: global.live.op.id, kind: "delete", args: { sessionId: "saved-session" } },
+  const global = await (await page.request.get("/api/v3/scopes/global")).json();
+  const response = await page.request.post("/api/v3/scopes/global/ops", {
+    data: { expect: global.snapshot.doc.live.op.id, kind: "delete", args: { sessionId: "saved-session" } },
   });
   expect(response.status()).toBe(202);
   await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
@@ -1697,9 +1700,9 @@ test("keeps the session and composer when deletion fails during close", async ({
     await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
     await expect(page.locator(".project-browser-path")).toHaveCount(0);
     // The close failed, so the session is still held, and this page still follows it.
-    const global = await (await page.request.get(`${origin}/api/v2/scopes/global`)).json();
-    expect(global.live.op).toMatchObject({ kind: "delete", status: "failed" });
-    const retained = await page.request.get(`${origin}/api/v2/scopes/${encodeURIComponent("session/saved-session")}`);
+    const global = await (await page.request.get(`${origin}/api/v3/scopes/global`)).json();
+    expect(global.snapshot.doc.live.op).toMatchObject({ kind: "delete", status: "failed" });
+    const retained = await page.request.get(`${origin}/api/v3/scopes/${encodeURIComponent("session/saved-session")}`);
     expect(retained.status()).toBe(200);
     expect(opsOf(api, "delete", "global")).toHaveLength(1);
     expect(api.v1).toEqual([]);
