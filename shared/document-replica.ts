@@ -210,6 +210,12 @@ export class DocumentReplicaSet {
   /** The scopes the current stream follows and has not ended. */
   #following = new Set<string>();
   #lastResubscribe: { readonly reason: string; readonly full: boolean } | undefined;
+  readonly #path: string;
+
+  /** `path` is the stream's URL path; the revision 3 stream is served beside the revision 2 one until the cutover. */
+  constructor(path = "/api/v2/stream") {
+    this.#path = path;
+  }
 
   /** Opens a new stream for `follow`; returns its ID and its URL, built from the versions held now. */
   open(follow: readonly Follow[]): { readonly stream: number; readonly url: string } {
@@ -225,7 +231,7 @@ export class DocumentReplicaSet {
     this.#stream += 1;
     this.#current = this.#stream;
     this.#following = new Set(follow.map(({ scope }) => scope));
-    return { stream: this.#stream, url: `/api/v2/stream?${params}` };
+    return { stream: this.#stream, url: `${this.#path}?${params}` };
   }
 
   /** Applies one event received on `stream`. */
