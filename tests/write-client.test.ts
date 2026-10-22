@@ -9,7 +9,7 @@ import {
   type ReplicaSource,
   type WriteOutcome,
 } from "../shared/write-client";
-import type { HttpFetch } from "../shared/protocol-client";
+import { WriteQueue, type HttpFetch } from "../shared/protocol-client";
 
 const S = "session/S";
 const OPS = "/api/v3/scopes/session%2FS/ops";
@@ -259,5 +259,63 @@ describe("actions (§7)", () => {
     expect(calls[2].url).toBe("/api/v3/scopes/global/resources/t1/dismiss");
     calls[2].respond(204);
     expect(await dismissed).toEqual({ kind: "done" });
+  });
+});
+
+describe("queued writes on revision 3 (C2, C3)", () => {
+  // The queue sends through the revision 3 client and reads the `live` of the documents.
+  function queued() {
+    const { calls, fetch } = http();
+    const { source, show } = shown();
+    const ids = ["AAAAAAAAAAAAAAAAAAAAAA", "BBBBBBBBBBBBBBBBBBBBBB", "CCCCCCCCCCCCCCCCCCCCCC"];
+    let n = 0;
+    const ops = new OpsClient(fetch, source, () => ids[n++]);
+    const queue = new WriteQueue(ops, { get: (scope) => {
+      const replica = source.get(scope);
+      return replica === undefined ? undefined : { live: replica.doc.live };
+    } });
+    return { calls, show, queue };
+  }
+
+  it("holds a write while the operation runs and sends it against the op that ended", async () => {
+    const { calls, show, queue } = queued();
+    show({ id: "op-A", kind: "prompt", status: "running" });
+    queue.enqueue(S, prompt);
+    expect(calls).toHaveLength(0);
+    show({ id: "op-A", kind: "prompt", status: "completed" });
+    queue.update(S);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body).toMatchObject({ id: "AAAAAAAAAAAAAAAAAAAAAA", expect: "op-A", kind: "prompt" });
+    calls[0].respond(202, { op: "AAAAAAAAAAAAAAAAAAAAAA" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(queue.items(S)).toEqual([]);
+  });
+
+  it("sends the next write only against a later op that ended", async () => {
+    const { calls, show, queue } = queued();
+    show({ id: "op-A", status: "completed" });
+    queue.enqueue(S, prompt);
+    queue.enqueue(S, prompt);
+    expect(calls).toHaveLength(1);
+    calls[0].respond(202, { op: "AAAAAAAAAAAAAAAAAAAAAA" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The same ended op: a second write against it could only be stale.
+    expect(calls).toHaveLength(1);
+    show({ id: "AAAAAAAAAAAAAAAAAAAAAA", status: "completed" });
+    queue.update(S);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].body).toMatchObject({ expect: "AAAAAAAAAAAAAAAAAAAAAA", id: "BBBBBBBBBBBBBBBBBBBBBB" });
+  });
+
+  it("never sends again a write without a definite answer", async () => {
+    const { calls, show, queue } = queued();
+    show({ id: "op-A", status: "completed" });
+    queue.enqueue(S, prompt);
+    calls[0].lose();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(queue.items(S).map((item) => item.state)).toEqual(["uncertain"]);
+    show({ id: "op-B", status: "completed" });
+    queue.update(S);
+    expect(calls).toHaveLength(1);
   });
 });
