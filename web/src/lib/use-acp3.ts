@@ -6,7 +6,7 @@
 
 import i18n from "../i18n";
 import { useEffect, useState, useSyncExternalStore } from "react";
-import type { SessionInfo } from "@agentclientprotocol/sdk";
+import type { CreateElicitationResponse, RequestPermissionResponse, SessionInfo } from "@agentclientprotocol/sdk";
 import type { TerminalSnapshot } from "../../../shared/bridge";
 import type {
   ContextAttachment,
@@ -79,6 +79,11 @@ interface Intent {
   lost?: Write;
   navigation: number;
   cwd: string;
+}
+
+/** Where the answer to one interaction is: sent and awaiting the document, or not known to have arrived. */
+interface AnswerState {
+  state: "sending" | "sent" | "uncertain";
 }
 
 interface HeldPrompt {
@@ -188,6 +193,12 @@ export class Workspace {
   readonly #seen = new Set<string>();
   #agentPhase: string | undefined;
   readonly #intents: Intent[] = [];
+  /** The answers this page sent, by interaction. */
+  readonly #answers = new Map<string, AnswerState>();
+  /** Why an answer was refused, by interaction: the form keeps its values (C2). */
+  readonly #answerErrors = new Map<string, string>();
+  /** A control in flight on the shown session: no operation holds it (§7). */
+  #control: { kind: "mode" | "config"; scope: string; sessionId: string; id: number } | undefined;
   readonly #held = new Map<string, HeldPrompt[]>();
   readonly #paused = new Set<string>();
   #nextId = 0;
@@ -339,6 +350,7 @@ export class Workspace {
     if (this.#closed) return;
     this.#settleAuth();
     this.#settleIntents();
+    this.#settleAnswers();
     this.#resolveRoute();
     this.#applyFollow();
     this.#feedQueue();
@@ -446,6 +458,33 @@ export class Workspace {
         this.#finishIntent(intent);
       }
     }
+  }
+
+  /** Drops what the page holds of interactions no document shows pending any more. */
+  #settleAnswers(): void {
+    const pending = new Set(this.#pendingInteractions().map(({ interaction }) => interaction.interactionId));
+    for (const id of [...this.#answers.keys()]) if (!pending.has(id)) this.#answers.delete(id);
+    for (const id of [...this.#answerErrors.keys()]) if (!pending.has(id)) this.#answerErrors.delete(id);
+  }
+
+  /** The interactions the shown session, `global` and `catalog` show, each once, with the scope that shows it. */
+  #pendingInteractions(): Array<{ scope: string; interaction: Interaction }> {
+    const shown = this.#shown();
+    const seen = new Set<string>();
+    const found: Array<{ scope: string; interaction: Interaction }> = [];
+    const sources: Array<[string, Readonly<Record<string, Interaction>> | undefined]> = [
+      ...(shown == null ? [] : [[shown.scope, shown.live.interactions] as [string, Readonly<Record<string, Interaction>>]]),
+      [GLOBAL, this.#global()?.interactions],
+      [CATALOG, this.#catalog()?.interactions],
+    ];
+    for (const [scope, interactions] of sources) {
+      for (const interaction of Object.values(interactions ?? {})) {
+        if (seen.has(interaction.interactionId)) continue;
+        seen.add(interaction.interactionId);
+        found.push({ scope, interaction });
+      }
+    }
+    return found;
   }
 
   #finishIntent(intent: Intent): void {
@@ -641,6 +680,101 @@ export class Workspace {
 
   dismissAuthTerminal = (terminalId: string): void => {
     void this.#actions.dismiss(GLOBAL, terminalId).then(() => this.#changed());
+  };
+
+  // -------------------------------------------------------------------------
+  // Answers and controls (§7)
+
+  /** Answers one interaction, alone: at most once, whatever else is pending. */
+  #respond(interactionId: string, answer: { outcome: unknown } | { response: unknown }): void {
+    const found = this.#pendingInteractions().find(({ interaction }) => interaction.interactionId === interactionId);
+    if (found == null || this.#answers.has(interactionId)) return;
+    const state: AnswerState = { state: "sending" };
+    this.#answers.set(interactionId, state);
+    this.#answerErrors.delete(interactionId);
+    void this.#actions.answer(found.scope, interactionId, answer).then((outcome) => {
+      if (this.#answers.get(interactionId) !== state) return;
+      if (outcome.kind === "done") {
+        // Delivered: the document shows it gone.
+        state.state = "sent";
+      } else if (outcome.kind === "uncertain") {
+        // It may have been delivered: the interaction stays pending until the document says
+        // otherwise, and nothing is sent again (C3).
+        state.state = "uncertain";
+      } else {
+        // The input stays with the user (C2): the form keeps its values.
+        this.#answers.delete(interactionId);
+        if (outcome.kind === "refused" && outcome.error.code !== "not_found") {
+          this.#answerErrors.set(interactionId, i18n.t("interaction.refused", { ns: "cards", message: outcome.error.message }));
+        }
+      }
+      this.#changed();
+    });
+    this.#changed();
+  }
+
+  respondPermission = (permissionId: string, outcome: RequestPermissionResponse["outcome"]): void =>
+    this.#respond(permissionId, { outcome });
+
+  respondElicitation = (elicitationId: string, response: CreateElicitationResponse): void =>
+    this.#respond(elicitationId, { response });
+
+  #interactionStatus(interactionId: string): Pick<PendingPermission, "responseRequestId" | "responseStatus" | "responseError"> {
+    const state = this.#answers.get(interactionId);
+    if (state != null) {
+      return {
+        responseRequestId: interactionId,
+        ...(state.state === "uncertain" ? { responseStatus: i18n.t("interaction.uncertain", { ns: "cards" }) } : {}),
+      };
+    }
+    const error = this.#answerErrors.get(interactionId);
+    return error == null ? {} : { responseError: error };
+  }
+
+  /** Sets a mode or an option; held until the Agent answers, also while a prompt runs. */
+  #control_(kind: "mode" | "config", label: string, send: (scope: string) => Promise<import("../../../shared/write-client").ActionOutcome>): void {
+    const shown = this.#shown();
+    if (shown == null) return;
+    this.#nextId += 1;
+    const control = { kind, scope: shown.scope, sessionId: shown.live.sessionId, id: this.#nextId };
+    this.#control = control;
+    void send(shown.scope).then((outcome) => {
+      if (this.#control === control) this.#control = undefined;
+      if (outcome.kind === "refused") {
+        this.#nextId += 1;
+        this.#errors = [...this.#errors, {
+          id: `local:${this.#nextId}`, type: "error", operation: label,
+          message: i18n.t("errors.refused", { operation: label, message: outcome.error.message }), data: outcome.error,
+        }];
+      } else if (outcome.kind === "uncertain") {
+        this.#nextId += 1;
+        this.#errors = [...this.#errors, {
+          id: `local:${this.#nextId}`, type: "error", operation: label, message: i18n.t("errors.uncertainWrite", { operation: label }),
+        }];
+      }
+      this.#changed();
+    });
+    this.#changed();
+  }
+
+  setMode = (modeId: string): void => {
+    this.#control_("mode", "set_mode", (scope) => this.#actions.setMode(scope, modeId));
+  };
+
+  setConfig = (configId: string, value: string | boolean): void => {
+    this.#control_("config", "set_config", (scope) => this.#actions.setConfig(scope, configId, value));
+  };
+
+  /** Dismisses the URL flow `interactionId`, wherever it is shown. */
+  dismissExternalFlow = (interactionId: string): void => {
+    for (const scope of [this.#shown()?.scope, GLOBAL, CATALOG]) {
+      if (scope == null) continue;
+      const flows = bodyFlows(this.#feed.get(scope));
+      if (flows != null && Object.hasOwn(flows, interactionId)) {
+        void this.#actions.dismiss(scope, interactionId).then(() => this.#changed());
+        return;
+      }
+    }
   };
 
   /** Stops the running turn; the queue waits until the user sends again. */
@@ -842,19 +976,14 @@ export class Workspace {
     // operation occupying several scopes is the `op` of each (§6.4): show its once.
     const permissions: PendingPermission[] = [];
     const elicitations: PendingElicitation[] = [];
-    const seen = new Set<string>();
-    const pending: Interaction[] = [
-      ...(visible && live != null ? Object.values(live.interactions) : []),
-      ...Object.values(global?.interactions ?? {}),
-      ...Object.values(catalog?.interactions ?? {}),
-    ];
-    for (const interaction of pending) {
-      if (seen.has(interaction.interactionId)) continue;
-      seen.add(interaction.interactionId);
+    for (const { scope: where, interaction } of this.#pendingInteractions()) {
+      // The shown session's own interactions wait until it is shown (a load may still fill it).
+      if (where === shown?.scope && !visible) continue;
+      const status = this.#interactionStatus(interaction.interactionId);
       if (interaction.kind === "permission") {
-        permissions.push({ permissionId: interaction.interactionId, request: interaction.request });
+        permissions.push({ permissionId: interaction.interactionId, request: interaction.request, ...status });
       } else {
-        elicitations.push({ elicitationId: interaction.interactionId, request: interaction.request });
+        elicitations.push({ elicitationId: interaction.interactionId, request: interaction.request, ...status });
       }
     }
     const externalFlows = [
@@ -937,6 +1066,9 @@ export class Workspace {
         kind: this.#transition.kind,
         requestId: `transition:${this.#transition.kind}`,
       },
+      pendingSessionControl: this.#control == null || this.#control.sessionId !== live?.sessionId ? undefined : {
+        requestId: `control:${this.#control.id}`, sessionId: this.#control.sessionId, kind: this.#control.kind,
+      },
       pendingPrompt: running ? { requestId: op!.id, sessionId: live!.sessionId, blocks: [], cancelRequested: op!.cancelRequested } : undefined,
       availableCommands: controls?.commands ?? [],
       modeId: controls?.modes?.currentModeId,
@@ -961,6 +1093,12 @@ export class Workspace {
       projectCwd: route.kind === "project" ? route.cwd : undefined,
     };
   }
+}
+
+/** The URL flows a replica's `live` holds. */
+function bodyFlows(replica: { readonly doc: Readonly<Record<string, unknown>> } | undefined): Readonly<Record<string, unknown>> | undefined {
+  const live = replica?.doc.live;
+  return isRecord(live) && isRecord(live.urlFlows) ? live.urlFlows : undefined;
 }
 
 /** The `live` of a replica, if it holds one. */
@@ -1016,6 +1154,11 @@ export function useAcp() {
     newSession: workspace.newSession,
     forkSession: workspace.forkSession,
     deleteSession: workspace.deleteSession,
+    respondPermission: workspace.respondPermission,
+    respondElicitation: workspace.respondElicitation,
+    dismissExternalFlow: workspace.dismissExternalFlow,
+    setMode: workspace.setMode,
+    setConfig: workspace.setConfig,
     prompt: workspace.prompt,
     cancel: workspace.cancel,
     pauseQueue: workspace.pauseQueue,
