@@ -237,6 +237,11 @@ impl Engine {
         self.docs.remove(scope);
     }
 
+    /// The scopes that are published.
+    pub(crate) fn scopes(&self) -> impl Iterator<Item = &str> {
+        self.docs.keys().map(String::as_str)
+    }
+
     /// Publishes the state of `scope` and returns what changed.
     pub(crate) fn commit(&mut self, scope: &str, input: &Input) -> Commit {
         let Some(doc) = self.docs.get_mut(scope) else {
