@@ -21,6 +21,7 @@ pub(crate) mod diff;
 pub(crate) mod digest;
 pub(crate) mod documents;
 pub(crate) mod engine;
+pub(crate) mod feed;
 pub(crate) mod hub;
 pub(crate) mod live_doc;
 #[cfg(test)]
