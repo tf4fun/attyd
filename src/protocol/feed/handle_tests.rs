@@ -165,3 +165,17 @@ async fn ending_the_wait_for_a_session_ends_the_stream_that_waits() {
     let event = timeout(WAIT, waiting).await.unwrap().unwrap();
     assert!(matches!(event, Some(StreamEvent::End { .. })), "{event:?}");
 }
+
+#[test]
+fn the_committed_live_of_a_scope_is_what_a_write_is_admitted_against() {
+    let handle = FeedHandle::new("process");
+    let registry = registry();
+    assert_eq!(handle.live(&Scope::Session("s".into())), None, "nothing is committed yet");
+    handle.commit(&registry, &agent(), 0);
+    let live = handle.live(&Scope::Session("s".into())).expect("a held session");
+    assert_eq!(live["sessionId"], "s");
+    assert_eq!(live["op"]["status"], "completed");
+    assert!(live["interactions"].is_object());
+    assert!(handle.live(&Scope::Global).is_some());
+    assert_eq!(handle.live(&Scope::Session("unheld".into())), None);
+}
