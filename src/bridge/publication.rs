@@ -199,6 +199,9 @@ impl BridgeState {
     /// every change since the last commit.
     pub(super) fn commit(&mut self) {
         self.retire_orphaned_interactions();
+        // The publisher takes the scopes the transitions ended; the feed ends
+        // them with the same reasons.
+        let ended = self.sessions.scopes.ended.clone();
         let mut published = self.protocol.publication.lock();
         let events = published.publisher.commit(
             &mut self.sessions,
@@ -212,9 +215,12 @@ impl BridgeState {
         published.hub.dispatch(&published.publisher, &events);
         // The revision 3 publication follows every commit too, so that no
         // transition changes what its clients see without publishing it.
-        published
-            .feed
-            .commit(&self.sessions, &self.protocol.agent, self.catalog_revision);
+        published.feed.commit_with(
+            &self.sessions,
+            &self.protocol.agent,
+            self.catalog_revision,
+            &ended,
+        );
         #[cfg(test)]
         if !events.is_empty()
             && let Some(tap) = &self.protocol.tap

@@ -270,6 +270,15 @@ impl BridgeHub {
         });
     }
 
+    /// Asks the current generation to serve the streams: a subscription of the
+    /// revision 3 feed may follow a session the bridge has to load. With no
+    /// generation, the next one serves them when it is ready.
+    async fn serve_streams(&self) {
+        if let Some(input) = &self.state.lock().await.input {
+            let _ = input.send(bridge::BridgeInput::ServeStreams);
+        }
+    }
+
     /// Opens a v2 stream (protocol §5.1). While a generation reads its
     /// inputs, it registers the subscription under the bridge guard; with
     /// none, the subscription is aligned from the published cut, and a
@@ -1070,6 +1079,7 @@ async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -
         );
     }
     let subscription = state.bridge.publication.lock().feed.subscribe(&follow);
+    state.bridge.serve_streams().await;
     let stream = futures::stream::unfold(subscription, |subscription| async move {
         let event = subscription.next().await?;
         let data = serde_json::to_string(&event).expect("a protocol event serializes");

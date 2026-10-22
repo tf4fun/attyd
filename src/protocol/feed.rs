@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
 use super::documents::{AgentInfo, End, EndReason, Scope};
@@ -135,6 +135,20 @@ impl Feed {
         catalog_revision: u64,
         now: Instant,
     ) {
+        self.commit_ending(registry, agent, catalog_revision, now, &[]);
+    }
+
+    /// `commit_at` with the scopes the transitions ended and why. A session the
+    /// bridge no longer holds ends with its reason, and one that ended before it
+    /// was published ends for the subscriptions that wait for it.
+    pub(crate) fn commit_ending(
+        &mut self,
+        registry: &SessionRegistry,
+        agent: &AgentInfo,
+        catalog_revision: u64,
+        now: Instant,
+        ended: &[(String, End)],
+    ) {
         let mut scopes = vec![Scope::Global, Scope::Catalog];
         scopes.extend(held_sessions(registry).into_iter().map(Scope::Session));
         for scope in &scopes {
@@ -165,6 +179,9 @@ impl Feed {
                 }
             }
         }
+        for (session_id, end) in ended {
+            self.end_waiting(session_id, end);
+        }
         // A session the bridge no longer holds is over.
         let gone: Vec<String> = self
             .engine
@@ -176,14 +193,18 @@ impl Feed {
         for scope in gone {
             self.engine.remove(&scope);
             self.pacer.settled(&scope);
-            for subscriber in self.subscribers.values_mut() {
-                subscriber.end(
-                    &scope,
+            let end = ended
+                .iter()
+                .find(|(session_id, _)| Scope::Session(session_id.clone()).to_string() == scope)
+                .map_or(
                     End {
                         reason: EndReason::Closed,
                         error: None,
                     },
+                    |(_, end)| end.clone(),
                 );
+            for subscriber in self.subscribers.values_mut() {
+                subscriber.end(&scope, end.clone());
             }
         }
         for subscriber in self.subscribers.values_mut() {
@@ -225,6 +246,8 @@ struct Shared {
     /// Wakes the streams waiting for an event.
     ready: Notify,
     closed: AtomicBool,
+    /// Changes whenever a subscription is dropped.
+    closes: watch::Sender<u64>,
 }
 
 impl FeedHandle {
@@ -233,6 +256,7 @@ impl FeedHandle {
             feed: Mutex::new(Feed::new(process_epoch)),
             ready: Notify::new(),
             closed: AtomicBool::new(false),
+            closes: watch::channel(0).0,
         }))
     }
 
@@ -247,7 +271,19 @@ impl FeedHandle {
         agent: &AgentInfo,
         catalog_revision: u64,
     ) {
-        self.feed().commit(registry, agent, catalog_revision);
+        self.commit_with(registry, agent, catalog_revision, &[]);
+    }
+
+    /// `commit` with the scopes the transitions ended and why.
+    pub(crate) fn commit_with(
+        &self,
+        registry: &SessionRegistry,
+        agent: &AgentInfo,
+        catalog_revision: u64,
+        ended: &[(String, End)],
+    ) {
+        self.feed()
+            .commit_ending(registry, agent, catalog_revision, Instant::now(), ended);
         self.0.ready.notify_waiters();
     }
 
@@ -267,6 +303,12 @@ impl FeedHandle {
 
     pub(crate) fn subscribers(&self) -> usize {
         self.feed().subscribers()
+    }
+
+    /// Changes whenever a subscription is dropped: a session may be needed no
+    /// longer.
+    pub(crate) fn closes(&self) -> watch::Receiver<u64> {
+        self.0.closes.subscribe()
     }
 
     /// The sessions some subscription follows (see `Feed::followed_sessions`).
@@ -301,6 +343,10 @@ struct SubscriptionGuard {
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
         self.handle.feed().unsubscribe(self.id);
+        self.handle
+            .0
+            .closes
+            .send_modify(|closes| *closes = closes.wrapping_add(1));
     }
 }
 
