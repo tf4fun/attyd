@@ -189,7 +189,7 @@ export type LiveChange = { replace: unknown, } | { patch: Array<Op>, };
 
 export type End = { reason: EndReason, error?: ProtocolError, };
 
-export type EndReason = "deleted" | "load_failed";
+export type EndReason = "deleted" | "closed" | "load_failed";
 
 export type OpRequest = { 
 /**
