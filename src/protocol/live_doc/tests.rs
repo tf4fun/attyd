@@ -447,3 +447,54 @@ fn global_and_catalog_are_published_under_the_process_epoch_without_a_timeline()
 fn an_unheld_session_has_no_input() {
     assert!(engine_input(&registry(), &Scope::Session("nope".into()), &agent(), 0, "p").is_none());
 }
+
+// -- The origin of a session (protocol §4.3, §6.2) ---------------------------------------
+
+fn summary_of(registry: &SessionRegistry, session_id: &str) -> Value {
+    global_live(registry, &agent())["sessions"][session_id].clone()
+}
+
+#[test]
+fn a_session_a_create_installed_names_that_operation_as_its_origin() {
+    let mut registry = registry();
+    assert!(summary_of(&registry, "s").get("origin").is_none(), "not made by an operation");
+
+    let scope = Scope::Global;
+    registry
+        .install_operation(&scope, OperationKind::Create, json!({ "cwd": "/work" }))
+        .unwrap();
+    let id = operation(&registry, &scope)["id"].clone();
+    registry.complete_scope_operation(&scope, OperationKind::Create, json!({ "sessionId": "s" }));
+    assert_eq!(summary_of(&registry, "s")["origin"], id);
+}
+
+#[test]
+fn a_session_a_fork_installed_names_the_fork_as_its_origin() {
+    let mut registry = registry();
+    registry
+        .open_new("epoch", "f", "/work", json!({ "sessionId": "f" }))
+        .unwrap();
+    let source = Scope::Session("s".into());
+    registry
+        .install_operation(&source, OperationKind::Fork, json!({}))
+        .unwrap();
+    let id = operation(&registry, &source)["id"].clone();
+    registry.complete_session_operation(
+        "s",
+        crate::runtime_state::SessionOperationKind::Fork,
+        &json!({ "sessionId": "f" }),
+    );
+    assert_eq!(summary_of(&registry, "f")["origin"], id);
+    assert!(summary_of(&registry, "s").get("origin").is_none(), "the source is not the fork's");
+}
+
+#[test]
+fn a_create_that_installed_a_session_not_held_names_no_origin() {
+    let mut registry = registry();
+    let scope = Scope::Global;
+    registry
+        .install_operation(&scope, OperationKind::Create, json!({ "cwd": "/work" }))
+        .unwrap();
+    registry.complete_scope_operation(&scope, OperationKind::Create, json!({ "sessionId": "gone" }));
+    assert!(summary_of(&registry, "s").get("origin").is_none());
+}
