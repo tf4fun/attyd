@@ -8,6 +8,7 @@
 use serde_json::{Value, json};
 
 use super::documents::{AgentInfo, Scope};
+use super::engine;
 use super::project;
 use crate::runtime_state::{SessionLifecycle, SessionLiveState};
 use crate::session_registry::SessionRegistry;
@@ -123,6 +124,41 @@ pub(crate) fn scope_live(
     live["interactions"] = interactions_doc(registry, scope);
     live["urlFlows"] = url_flows_doc(registry, scope);
     Some(live)
+}
+
+/// What the publisher is handed for `scope` (protocol §5.2): the epoch the
+/// document is published under, the history and timeline of a session (none
+/// while its history is unknown), and the complete `live`. `global` and
+/// `catalog` have no timeline and never change epoch while the bridge runs, so
+/// they are published under `process_epoch`.
+pub(crate) fn engine_input(
+    registry: &SessionRegistry,
+    scope: &Scope,
+    agent: &AgentInfo,
+    catalog_revision: u64,
+    process_epoch: &str,
+) -> Option<engine::Input> {
+    let live = scope_live(registry, scope, agent, catalog_revision)?;
+    let Scope::Session(session_id) = scope else {
+        return Some(engine::Input {
+            epoch: process_epoch.to_string(),
+            history: None,
+            timeline: None,
+            live,
+        });
+    };
+    let state = &registry.sessions.get(session_id)?.state;
+    Some(engine::Input {
+        // Only a known timeline has an epoch; an unknown one is published under
+        // the process's, until the history is learned and the document rebuilt.
+        epoch: state
+            .timeline_epoch
+            .clone()
+            .unwrap_or_else(|| process_epoch.to_string()),
+        history: state.history,
+        timeline: state.timeline.clone(),
+        live,
+    })
 }
 
 /// What `live` holds for `global` besides its operation, interactions and URL

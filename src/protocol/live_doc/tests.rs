@@ -394,3 +394,56 @@ fn an_accepted_url_flow_waits_with_its_status() {
 fn an_unknown_scope_has_no_live_document() {
     assert_eq!(scope_live(&registry(), &Scope::Session("unknown".into()), &agent(), 0), None);
 }
+
+// --- what the publisher is handed (engine input) ----------------------------------------
+
+use crate::protocol::timeline::History;
+
+#[test]
+fn a_sessions_input_carries_its_epoch_history_timeline_and_complete_live() {
+    let mut registry = registry();
+    registry
+        .append_session_update(
+            "s",
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m",
+                    "content": { "type": "text", "text": "hi" } }),
+        )
+        .unwrap();
+    let input = engine_input(&registry, &Scope::Session("s".into()), &agent(), 0, "process")
+        .expect("the session is held");
+    let state = &registry.sessions.get("s").unwrap().state;
+    assert_eq!(Some(input.epoch.clone()), state.timeline_epoch);
+    assert_ne!(input.epoch, "process", "a session's epoch is its timeline's");
+    assert_eq!(input.history, Some(History::Complete));
+    assert_eq!(input.timeline.as_ref().unwrap().entries().len(), 1);
+    assert_eq!(input.live["sessionId"], "s");
+    assert!(input.live.get("op").is_some() && input.live.get("interactions").is_some());
+}
+
+#[test]
+fn a_session_with_an_unknown_history_has_no_timeline() {
+    let mut registry = SessionRegistry::new("epoch");
+    registry
+        .open_new("epoch", "c", "/c", json!({ "sessionId": "c" }))
+        .unwrap();
+    // The session stays held, but what it knew of its history is gone.
+    registry.register_cold("c");
+    let input = engine_input(&registry, &Scope::Session("c".into()), &agent(), 0, "process").unwrap();
+    assert!(input.timeline.is_none());
+    assert_eq!(input.history, None);
+}
+
+#[test]
+fn global_and_catalog_are_published_under_the_process_epoch_without_a_timeline() {
+    let registry = registry();
+    for scope in [Scope::Global, Scope::Catalog] {
+        let input = engine_input(&registry, &scope, &agent(), 3, "process-epoch").unwrap();
+        assert_eq!(input.epoch, "process-epoch");
+        assert!(input.timeline.is_none() && input.history.is_none());
+    }
+}
+
+#[test]
+fn an_unheld_session_has_no_input() {
+    assert!(engine_input(&registry(), &Scope::Session("nope".into()), &agent(), 0, "p").is_none());
+}
