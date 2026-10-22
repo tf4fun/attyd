@@ -12,10 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use super::documents::{AgentInfo, End, EndReason, Scope};
 use super::engine::{Commit, Engine, StreamEvent};
 use super::live_doc::engine_input;
+use super::pacing::Pacer;
 use super::project::held_sessions;
 use super::subscription::{Subscribed, Subscriber};
 use crate::session_registry::SessionRegistry;
@@ -28,6 +30,8 @@ pub(crate) struct Feed {
     process_epoch: String,
     subscribers: BTreeMap<SubscriptionId, Subscriber>,
     next_id: SubscriptionId,
+    /// When a scope that changed is due its checkpoint.
+    pacer: Pacer,
 }
 
 impl Feed {
@@ -37,6 +41,7 @@ impl Feed {
             process_epoch: process_epoch.into(),
             subscribers: BTreeMap::new(),
             next_id: 1,
+            pacer: Pacer::default(),
         }
     }
 
@@ -78,6 +83,17 @@ impl Feed {
         agent: &AgentInfo,
         catalog_revision: u64,
     ) {
+        self.commit_at(registry, agent, catalog_revision, Instant::now());
+    }
+
+    /// `commit` at `now`, which paces the checkpoints of what changed.
+    pub(crate) fn commit_at(
+        &mut self,
+        registry: &SessionRegistry,
+        agent: &AgentInfo,
+        catalog_revision: u64,
+        now: Instant,
+    ) {
         let mut scopes = vec![Scope::Global, Scope::Catalog];
         scopes.extend(held_sessions(registry).into_iter().map(Scope::Session));
         for scope in &scopes {
@@ -94,11 +110,14 @@ impl Feed {
             match self.engine.commit(&name, &input) {
                 Commit::Unchanged => {}
                 Commit::Ops(event) => {
+                    self.pacer.changed(&name, now);
                     for subscriber in self.subscribers.values_mut() {
                         subscriber.publish(&event);
                     }
                 }
                 Commit::Rebuilt => {
+                    // A snapshot carries a digest of its own.
+                    self.pacer.settled(&name);
                     for subscriber in self.subscribers.values_mut() {
                         subscriber.rebuilt(&name, &self.engine);
                     }
@@ -115,6 +134,7 @@ impl Feed {
             .collect();
         for scope in gone {
             self.engine.remove(&scope);
+            self.pacer.settled(&scope);
             for subscriber in self.subscribers.values_mut() {
                 subscriber.end(
                     &scope,
@@ -130,6 +150,27 @@ impl Feed {
                 subscriber.coalesce(&self.engine);
             }
         }
+    }
+
+    /// Queues the checkpoints that are due at `now` for the subscribers that
+    /// follow their scopes; whether any was queued.
+    pub(crate) fn checkpoints(&mut self, now: Instant) -> bool {
+        let mut queued = false;
+        for scope in self.pacer.due(now) {
+            let Some(checkpoint) = self.engine.checkpoint(&scope) else {
+                continue;
+            };
+            queued = true;
+            for subscriber in self.subscribers.values_mut() {
+                subscriber.publish(&checkpoint);
+            }
+        }
+        queued
+    }
+
+    /// When the next checkpoint is due, if a scope waits for one.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.pacer.deadline()
     }
 }
 
@@ -219,20 +260,38 @@ impl FeedSubscription {
     /// The next event to write; waits when none is queued, and is `None` once
     /// the feed is closed and the queue is drained.
     pub(crate) async fn next(&self) -> Option<StreamEvent> {
+        let handle = &self.0.handle;
         loop {
             // Enabled before the queue is read, so a commit between the two wakes
             // this wait instead of being missed: `notify_waiters` reaches only
             // a wait that is registered.
-            let ready = self.0.handle.0.ready.notified();
+            let ready = handle.0.ready.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
-            if let Some(event) = self.0.handle.feed().next(self.0.id) {
-                return Some(event);
-            }
-            if self.0.handle.0.closed.load(Ordering::SeqCst) {
+            let deadline = {
+                let mut feed = handle.feed();
+                // The checkpoints due are queued for every stream, whichever one
+                // is waiting when they are.
+                if feed.checkpoints(Instant::now()) {
+                    handle.0.ready.notify_waiters();
+                }
+                if let Some(event) = feed.next(self.0.id) {
+                    return Some(event);
+                }
+                feed.deadline()
+            };
+            if handle.0.closed.load(Ordering::SeqCst) {
                 return None;
             }
-            ready.await;
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        () = ready => {}
+                        () = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
+                None => ready.await,
+            }
         }
     }
 }
