@@ -134,14 +134,15 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     expect(texts(net.calls)).toEqual(["one", "two"]);
   });
 
-  it("lets an operation that ended in failure leave the queue, never retried as a refusal", async () => {
+  it("lets an admitted write leave the queue although its operation later fails, never retried as a refusal", async () => {
     const { net, view, queue: q } = queue();
     q.enqueue(S, { kind: "fork", args: {} });
     view.show({ id: "op-A", status: "completed" });
     q.update(S);
-    net.calls[0].respond(200, { op: "op-F", error: { code: "agent_error", message: "fork failed" } });
+    net.calls[0].respond(202, { op: "op-F" });
     await flush();
     expect(q.items(S)).toEqual([]);
+    // The document shows the operation failed; that is its result, not a refusal to send again.
     view.show({ id: "op-F", kind: "fork", status: "failed" });
     q.update(S);
     view.show({ id: "op-G", status: "completed" });
@@ -186,7 +187,7 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     q.update(S);
     await flush();
     expect(net.calls).toHaveLength(1);
-    expect(view.source.get(S)?.live).toEqual(sessionLive({ id: "op-A", status: "completed" }));
+    expect(view.source.get(S)?.doc.live).toEqual(sessionLive({ id: "op-A", status: "completed" }));
 
     q.remove(S, refused);
     expect(q.items(S)).toEqual([]);
