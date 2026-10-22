@@ -356,59 +356,7 @@ pub(crate) struct PendingCounts {
 }
 
 // ---------------------------------------------------------------------------
-// Events (protocol §5.2)
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(untagged)]
-pub(crate) enum Event {
-    Log {
-        scope: String,
-        log: LogChange,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(test, ts(optional))]
-        live: Option<LiveChange>,
-    },
-    Live {
-        scope: String,
-        live: LiveChange,
-    },
-    End {
-        scope: String,
-        end: End,
-    },
-}
-
-impl Event {
-    pub(crate) fn scope(&self) -> &str {
-        match self {
-            Self::Log { scope, .. } | Self::Live { scope, .. } | Self::End { scope, .. } => scope,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub(crate) struct LogChange {
-    /// Truncate the log to this length, then append.
-    pub from: usize,
-    /// `h_from`, as the client must hold it.
-    pub prev: String,
-    pub entries: Vec<Arc<LogEntry>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(untagged)]
-pub(crate) enum LiveChange {
-    Replace {
-        #[cfg_attr(test, ts(type = "unknown"))]
-        replace: Value,
-    },
-    Patch {
-        patch: Vec<Op>,
-    },
-}
+// The end of a scope (protocol §5.2)
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]

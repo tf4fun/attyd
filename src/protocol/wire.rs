@@ -167,31 +167,6 @@ pub(crate) struct OpAccepted {
     pub op: String,
 }
 
-/// `200` of `create`, `fork` and `list`, sent when the operation ends (§6.3).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub(crate) struct OpEnded {
-    pub op: String,
-    #[serde(flatten)]
-    pub end: OpOutcome,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(untagged)]
-pub(crate) enum OpOutcome {
-    /// `SessionCreated` for `create` and `fork`, `CatalogPage` for `list`;
-    /// `op.result` is `PromptResult` for `prompt` and `ExitStatus` for
-    /// `terminal_login`.
-    Result {
-        #[cfg_attr(test, ts(type = "unknown"))]
-        result: Value,
-    },
-    Error {
-        error: ProtocolError,
-    },
-}
-
 /// The result of `create` and `fork`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -249,16 +224,6 @@ pub(crate) struct TerminalResize {
 // ---------------------------------------------------------------------------
 // Reads (protocol §8)
 
-/// `GET /api/v2/scopes/{scope}`: one cut; `log` is omitted while unknown.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub(crate) struct ScopeRead {
-    #[cfg_attr(test, ts(type = "SessionLive | GlobalLive | CatalogLive"))]
-    pub live: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub log: Option<Vec<Arc<LogEntry>>>,
-}
 
 /// `GET /api/v2/sessions/{id}/files?query=`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
