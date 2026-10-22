@@ -195,3 +195,76 @@ async fn a_load_the_agent_refuses_ends_the_scope_for_the_stream() {
     let end = end_of(&mut sse, "session/saved").await;
     assert_eq!(end["end"]["reason"], "load_failed", "{end}");
 }
+
+// -- Operations (protocol §6) ---------------------------------------------------------------
+
+/// A client-chosen operation id: 22 characters of base64url (protocol §6.5).
+const CREATE_ID: &str = "Cr3ateOperation_Id-001";
+
+/// The status and the JSON body of `POST /api/v3/scopes/{scope}/ops`.
+async fn write(server: &Server, scope: &str, body: Value) -> (StatusCode, Value) {
+    let path = format!("/api/v3/scopes/{}/ops", scope.replace('/', "%2F"));
+    let response = send(server.address, Method::POST, &path, Some(body)).await;
+    let status = response.status();
+    (status, json_of(response).await)
+}
+
+/// The document of `scope` as a new stream is aligned with it.
+async fn document(server: &Server, scope: &str) -> Value {
+    let (_, mut sse) = open(server, &format!("scope={}", scope.replace('/', "%2F"))).await;
+    event_of(&mut sse, scope).await["snapshot"]["doc"].clone()
+}
+
+#[tokio::test]
+async fn every_operation_is_answered_with_202_before_it_ends_and_its_result_is_in_the_document() {
+    let (server, mut link) = Server::start(json!({})).await;
+    let global = document(&server, "global").await;
+    let expect = global["live"]["op"]["id"].clone();
+
+    // The Agent has not answered `session/new`: the write is answered anyway.
+    let (status, body) = write(
+        &server,
+        "global",
+        json!({"id": CREATE_ID, "expect": expect, "kind": "create", "args": {"cwd": CWD}}),
+    )
+    .await;
+    assert_eq!((status, &body), (StatusCode::ACCEPTED, &json!({"op": CREATE_ID})));
+
+    // Repeating the write is harmless: it is the same operation.
+    let (status, body) = write(
+        &server,
+        "global",
+        json!({"id": CREATE_ID, "expect": expect, "kind": "create", "args": {"cwd": CWD}}),
+    )
+    .await;
+    assert_eq!((status, &body), (StatusCode::ACCEPTED, &json!({"op": CREATE_ID})));
+
+    let new = link.request("session/new").await;
+    link.reply(&new, json!({"sessionId": "s1"})).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let op = document(&server, "global").await["live"]["op"].clone();
+        if op["status"] == "completed" {
+            assert_eq!(op["id"], CREATE_ID);
+            assert_eq!(op["result"], json!({"sessionId": "s1"}), "{op}");
+            assert_eq!(op["after"], expect);
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never completed: {op}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    link.quiet(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn a_write_against_an_operation_that_is_not_the_current_one_is_stale() {
+    let (server, _link) = Server::start(json!({})).await;
+    let (status, body) = write(
+        &server,
+        "global",
+        json!({"id": "AAAAAAAAAAAAAAAAAAAAAA", "expect": "not-the-current-op", "kind": "create", "args": {"cwd": CWD}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "stale", "{body}");
+}
