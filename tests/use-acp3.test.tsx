@@ -128,6 +128,15 @@ const sessionSnapshot = (
   entries: Entry[] = [], prompts: PromptState[] = [], live = sessionLive(), history: "complete" | "partial" = "complete",
 ) => snapshot("session/s1", { history, prompts, live }, entries);
 
+interface Post {
+  url: string;
+  body: { id?: string; expect: string; kind: string; args: Record<string, unknown> };
+}
+
+const LOST = Symbol("lost");
+let posts: Post[];
+let respond: (post: Post) => { status: number; body?: unknown } | typeof LOST | Promise<{ status: number; body?: unknown } | typeof LOST>;
+
 let hook: ReturnType<typeof useAcp>;
 function Probe() {
   hook = useAcp();
@@ -140,8 +149,17 @@ describe("revision 3 workspace, read side", () => {
 
   beforeEach(() => {
     FakeEventSource.sources = [];
+    posts = [];
+    respond = (post) => ({ status: 202, body: { op: post.body.id } });
     vi.stubGlobal("EventSource", FakeEventSource);
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 404 })));
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
+      if (init?.method !== "POST") return new Response("{}", { status: 404 });
+      const post = { url, body: JSON.parse(init.body ?? "{}") as Post["body"] };
+      posts.push(post);
+      const answer = await respond(post);
+      if (answer === LOST) throw new TypeError("network error");
+      return new Response(answer.body === undefined ? null : JSON.stringify(answer.body), { status: answer.status });
+    }));
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -354,4 +372,111 @@ describe("revision 3 workspace, read side", () => {
     })));
     expect(hook.state.terminalSnapshots).toMatchObject([{ terminalId: "T", output: "done", released: true }]);
   });
+
+  // -- writes: prompts, the queue, cancel ---------------------------------------------------
+
+  const running = (id = "p1") => sessionLive({
+    op: op("session/s1", { id, kind: "prompt", status: "running" }),
+  });
+
+  /** A shown session, idle or with a prompt running. */
+  async function shownSession(live = sessionLive(), prompts: PromptState[] = []) {
+    await mount("/sessions/s1");
+    await emit(globalSnapshot(globalLive({ sessions: held })));
+    await emit(catalogSnapshot());
+    await emit(sessionSnapshot([user("earlier")], prompts, live));
+  }
+
+  /** The session's `op` replaced, as the bridge publishes it. */
+  const opChanged = (rev: number, fields: Record<string, unknown>): StreamEvent => ({
+    scope: "session/s1", rev, ops: [{ op: "set", path: "/live/op", value: op("session/s1", fields) }],
+  });
+
+  it("sends a prompt to an idle session with an id of its own, against the op the document shows", async () => {
+    await shownSession();
+    await act(async () => hook.prompt([text("hi")]));
+    await settle();
+    expect(posts).toHaveLength(1);
+    expect(posts[0].url).toBe("/api/v3/scopes/session%2Fs1/ops");
+    expect(posts[0].body).toMatchObject({ expect: "o1", kind: "prompt", args: { prompt: [text("hi")] } });
+    expect(posts[0].body.id).toMatch(/^[A-Za-z0-9_-]{22}$/u);
+    expect(hook.state.queue).toEqual([]);
+  });
+
+  it("holds a prompt typed while a turn runs, and sends it once the document shows the op ended", async () => {
+    await shownSession(running(), [{ entry: 0 }]);
+    await act(async () => hook.prompt([text("next")]));
+    await settle();
+    expect(posts).toEqual([]);
+    expect(hook.state.queue).toMatchObject([{ state: "queued", sessionId: "s1", blocks: [text("next")] }]);
+    await emit(opChanged(1, { id: "p1", kind: "prompt", status: "completed" }));
+    expect(posts.map((post) => post.body.expect)).toEqual(["p1"]);
+    expect(hook.state.queue).toEqual([]);
+  });
+
+  it("keeps a prompt the bridge refused, with the reason, and sends it again only against a later op", async () => {
+    respond = () => ({ status: 409, body: { error: { code: "stale", message: "Not the current operation" } } });
+    await shownSession();
+    await act(async () => hook.prompt([text("hi")]));
+    await settle();
+    expect(hook.state.queue).toMatchObject([{ state: "refused", error: "Not the current operation" }]);
+    expect(posts).toHaveLength(1);
+    await emit(opChanged(1, { id: "o2", kind: "prompt", status: "completed" }));
+    expect(posts.map((post) => post.body.expect)).toEqual(["o1", "o2"]);
+  });
+
+  it("never sends again a prompt whose answer was lost", async () => {
+    respond = () => LOST;
+    await shownSession();
+    await act(async () => hook.prompt([text("hi")]));
+    await settle();
+    expect(hook.state.queue).toMatchObject([{ state: "uncertain" }]);
+    await emit(opChanged(1, { id: "o2", kind: "prompt", status: "completed" }));
+    expect(posts).toHaveLength(1);
+  });
+
+  it("takes a queued prompt back, pauses the queue and clears it", async () => {
+    await shownSession(running(), [{ entry: 0 }]);
+    await act(async () => hook.prompt([text("one")]));
+    await act(async () => hook.prompt([text("two")]));
+    const [first, second] = hook.state.queue;
+    let taken: unknown;
+    await act(async () => { taken = hook.takeQueued(first.id); });
+    expect(taken).toEqual([text("one")]);
+    expect(hook.state.queue.map((entry) => entry.id)).toEqual([second.id]);
+
+    await act(async () => hook.pauseQueue());
+    expect(hook.state.queuePaused).toBe(true);
+    expect(hook.state.queue).toMatchObject([{ state: "paused" }]);
+    // A paused queue sends nothing when the turn ends.
+    await emit(opChanged(1, { id: "p1", kind: "prompt", status: "completed" }));
+    expect(posts).toEqual([]);
+
+    await act(async () => hook.clearQueue());
+    expect(hook.state.queue).toEqual([]);
+    expect(hook.state.queuePaused).toBe(false);
+  });
+
+  it("cancels the running turn against the op it shows, with no id of its own", async () => {
+    await shownSession(running(), [{ entry: 0 }]);
+    await act(async () => hook.cancel());
+    await settle();
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body).toEqual({ expect: "p1", kind: "cancel", args: {} });
+  });
+
+  it("does not cancel an idle session, and shows a cancel the bridge refused", async () => {
+    await shownSession();
+    await act(async () => hook.cancel());
+    expect(posts).toEqual([]);
+
+    respond = () => ({ status: 409, body: { error: { code: "not_allowed", message: "Nothing to cancel" } } });
+    await emit(opChanged(1, { id: "p2", kind: "prompt", status: "running" }));
+    await act(async () => hook.cancel());
+    await settle();
+    const error = hook.state.timeline.find((item) => item.type === "error");
+    expect(error).toMatchObject({ operation: "cancel" });
+    expect((error as { message: string }).message).toContain("Nothing to cancel");
+  });
 });
+
