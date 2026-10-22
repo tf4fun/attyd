@@ -268,3 +268,52 @@ async fn a_write_against_an_operation_that_is_not_the_current_one_is_stale() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "stale", "{body}");
 }
+
+// -- The connection a followed session needs (S6, Q2) ------------------------------------------
+
+#[tokio::test]
+async fn a_stream_that_follows_a_session_starts_the_next_connection_and_keeps_the_session() {
+    let (mut server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let (_, mut sse) = open(
+        &server,
+        &format!(
+            "scope=global&scope=session%2Fsaved&cwd={}",
+            query_scope(&format!("session/saved:{CWD}"))
+        ),
+    )
+    .await;
+    link.serve_load("saved", &turns(&[("one", "1")])).await;
+    // Wait until the session is held with its history.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (_, mut other) = open(&server, "scope=session%2Fsaved").await;
+        let snapshot = event_of(&mut other, "session/saved").await;
+        if snapshot["snapshot"]["doc"]["history"] == "complete" {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never loaded");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The Agent connection ends: the stream needs the next one, and the session is loaded on it.
+    link.close().await;
+    let mut next = server.agents.accept(json!({"loadSession": true})).await;
+    let load = next.serve_load("saved", &turns(&[("one", "1")])).await;
+    assert_eq!(load["params"]["sessionId"], "saved");
+    assert_eq!(server.agents.accepted(), 2);
+
+    // The stream never ended the session; its document is back to a completed load.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (_, mut other) = open(&server, "scope=session%2Fsaved").await;
+        let snapshot = event_of(&mut other, "session/saved").await;
+        assert!(snapshot.get("end").is_none(), "{snapshot}");
+        let op = &snapshot["snapshot"]["doc"]["live"]["op"];
+        if op["kind"] == "load" && op["status"] == "completed" {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never reattached: {snapshot}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(sse.body);
+}
