@@ -401,7 +401,7 @@ for (const { kind, listState } of [
       const other = await page.request.post("/api/v3/scopes/global/ops", {
         data: { expect: global.snapshot.doc.live.op.id, kind: "create", args: { cwd: process.cwd() } },
       });
-      expect(other.status()).toBe(200);
+      expect(other.status()).toBe(202);
 
       await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
       await composer.press("Enter");
