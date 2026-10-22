@@ -204,13 +204,9 @@ async fn attachments_are_served_while_their_own_session_references_them() {
     assert_eq!(in_process.len(), 1, "{in_process:?}");
     assert_served(&bench, "s", &in_process[0], &process).await;
     assert_served(&bench, "s", &in_log[0], &logged).await;
-    assert_unserved(
-        &bench,
-        "s",
-        &in_input[0],
-        "the replaced input's block, in s",
-    )
-    .await;
+    // The failed prompt's input is an entry of the session in revision 3, which the document keeps
+    // referencing after the next operation replaced it.
+    assert_served(&bench, "s", &in_input[0], &failed).await;
     assert_served(&bench, "t", &in_t[0], &failed).await;
 
     link.reply(&request, json!({"stopReason": "end_turn"}))

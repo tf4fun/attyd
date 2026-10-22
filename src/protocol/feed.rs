@@ -15,7 +15,6 @@ use serde_json::Value;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
-use super::canon::Attachments;
 use super::documents::{AgentInfo, End, EndReason, Scope};
 use super::engine::{Commit, Engine, StreamEvent};
 use super::live_doc::engine_input;
@@ -36,9 +35,6 @@ pub(crate) struct Waiting {
 
 pub(crate) struct Feed {
     engine: Engine,
-    /// The blocks the operation a session shows refers to by attachment (its input, say), which
-    /// stay readable while the document references them although no entry holds them.
-    input_attachments: BTreeMap<String, Attachments>,
     /// The epoch `global` and `catalog` are published under.
     process_epoch: String,
     subscribers: BTreeMap<SubscriptionId, Subscriber>,
@@ -51,7 +47,6 @@ impl Feed {
     pub(crate) fn new(process_epoch: impl Into<String>) -> Self {
         Self {
             engine: Engine::default(),
-            input_attachments: BTreeMap::new(),
             process_epoch: process_epoch.into(),
             subscribers: BTreeMap::new(),
             next_id: 1,
@@ -123,12 +118,7 @@ impl Feed {
 
     /// The block an attachment of a held session names, while a published entry references it.
     pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
-        let scope = format!("session/{session_id}");
-        self.engine.attachment(&scope, id).cloned().or_else(|| {
-            // Only while the session is published.
-            self.engine.version(&scope)?;
-            self.input_attachments.get(&scope)?.get(id).cloned()
-        })
+        self.engine.attachment(&format!("session/{session_id}"), id).cloned()
     }
 
     /// The whole document of `scope`, as a snapshot from nothing.
@@ -188,11 +178,6 @@ impl Feed {
                 continue;
             };
             let name = scope.to_string();
-            if let Scope::Session(_) = scope
-                && let Some(slot) = registry.shown_slot(scope)
-            {
-                self.input_attachments.insert(name.clone(), slot.attachments.clone());
-            }
             match self.engine.commit(&name, &input) {
                 Commit::Unchanged => {}
                 Commit::Ops(event) => {
@@ -223,7 +208,6 @@ impl Feed {
             .collect();
         for scope in gone {
             self.engine.remove(&scope);
-            self.input_attachments.remove(&scope);
             self.pacer.settled(&scope);
             let end = ended
                 .iter()
