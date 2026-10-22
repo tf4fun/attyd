@@ -135,6 +135,20 @@ impl Feed {
         catalog_revision: u64,
         now: Instant,
     ) {
+        self.commit_ending(registry, agent, catalog_revision, now, &[]);
+    }
+
+    /// `commit_at` with the scopes the transitions ended and why. A session the
+    /// bridge no longer holds ends with its reason, and one that ended before it
+    /// was published ends for the subscriptions that wait for it.
+    pub(crate) fn commit_ending(
+        &mut self,
+        registry: &SessionRegistry,
+        agent: &AgentInfo,
+        catalog_revision: u64,
+        now: Instant,
+        ended: &[(String, End)],
+    ) {
         let mut scopes = vec![Scope::Global, Scope::Catalog];
         scopes.extend(held_sessions(registry).into_iter().map(Scope::Session));
         for scope in &scopes {
@@ -165,6 +179,9 @@ impl Feed {
                 }
             }
         }
+        for (session_id, end) in ended {
+            self.end_waiting(session_id, end);
+        }
         // A session the bridge no longer holds is over.
         let gone: Vec<String> = self
             .engine
@@ -176,14 +193,18 @@ impl Feed {
         for scope in gone {
             self.engine.remove(&scope);
             self.pacer.settled(&scope);
-            for subscriber in self.subscribers.values_mut() {
-                subscriber.end(
-                    &scope,
+            let end = ended
+                .iter()
+                .find(|(session_id, _)| Scope::Session(session_id.clone()).to_string() == scope)
+                .map_or(
                     End {
                         reason: EndReason::Closed,
                         error: None,
                     },
+                    |(_, end)| end.clone(),
                 );
+            for subscriber in self.subscribers.values_mut() {
+                subscriber.end(&scope, end.clone());
             }
         }
         for subscriber in self.subscribers.values_mut() {
@@ -250,7 +271,19 @@ impl FeedHandle {
         agent: &AgentInfo,
         catalog_revision: u64,
     ) {
-        self.feed().commit(registry, agent, catalog_revision);
+        self.commit_with(registry, agent, catalog_revision, &[]);
+    }
+
+    /// `commit` with the scopes the transitions ended and why.
+    pub(crate) fn commit_with(
+        &self,
+        registry: &SessionRegistry,
+        agent: &AgentInfo,
+        catalog_revision: u64,
+        ended: &[(String, End)],
+    ) {
+        self.feed()
+            .commit_ending(registry, agent, catalog_revision, Instant::now(), ended);
         self.0.ready.notify_waiters();
     }
 
