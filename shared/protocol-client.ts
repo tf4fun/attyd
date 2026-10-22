@@ -149,6 +149,11 @@ export interface ReplicaSource {
   get(scope: string): Replica | undefined;
 }
 
+/** What the queue reads of a replica: its `live`, whichever revision of the protocol holds it. */
+export interface QueueSource {
+  get(scope: string): { readonly live?: unknown } | undefined;
+}
+
 /**
  * Sends operation writes against the `op` the replica shows. It waits for
  * the HTTP answer only, with no short timeout, and never for the stream.
@@ -212,7 +217,7 @@ export class OpsClient {
 }
 
 /** The `op` of the aligned replica of `scope`. */
-function shownOp(replicas: ReplicaSource, scope: string): Operation | undefined {
+function shownOp(replicas: QueueSource, scope: string): Operation | undefined {
   const live = replicas.get(scope)?.live;
   if (!isRecord(live) || !isRecord(live.op) || typeof live.op.id !== "string") return undefined;
   return live.op as unknown as Operation;
@@ -246,6 +251,20 @@ export function refusal(status: number, body: unknown): { kind: "refused"; error
 // ---------------------------------------------------------------------------
 // Queued writes (C2, C3)
 
+/**
+ * What the queue sends writes through: the revision 2 `OpsClient`, or the revision 3 one,
+ * whose outcomes have the same kinds the queue acts on.
+ */
+export interface QueueOps {
+  write(scope: string, write: StartingWrite): Promise<WriteOutcome | QueueOutcome>;
+}
+
+/** The outcomes of a write as the queue reads them. */
+export type QueueOutcome =
+  | { readonly kind: "accepted" | "ended" | "uncertain" }
+  | { readonly kind: "refused"; readonly error: ProtocolError }
+  | { readonly kind: "blocked"; readonly reason: string };
+
 /** A write that starts an operation; `cancel` and `answer` are sent at once, never queued. */
 export type StartingWrite = Exclude<OpArgs, { kind: "cancel" | "answer" }>;
 
@@ -269,12 +288,12 @@ export interface QueuedWrite {
  * resubmits it.
  */
 export class WriteQueue {
-  readonly #ops: OpsClient;
-  readonly #replicas: ReplicaSource;
+  readonly #ops: QueueOps;
+  readonly #replicas: QueueSource;
   readonly #scopes = new Map<string, ScopeQueue>();
   #next = 0;
 
-  constructor(ops: OpsClient, replicas: ReplicaSource) {
+  constructor(ops: QueueOps, replicas: QueueSource) {
     this.#ops = ops;
     this.#replicas = replicas;
   }
@@ -339,7 +358,7 @@ export class WriteQueue {
     return queue;
   }
 
-  #answered(scope: string, id: number, outcome: WriteOutcome): void {
+  #answered(scope: string, id: number, outcome: WriteOutcome | QueueOutcome): void {
     const queue = this.#queue(scope);
     const expect = queue.sending?.expect;
     queue.sending = undefined;
