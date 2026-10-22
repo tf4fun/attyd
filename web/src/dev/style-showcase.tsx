@@ -2,15 +2,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { AvailableCommand, CreateElicitationRequest, RequestPermissionRequest, SessionConfigOption, SessionModeState, SessionUpdate, ToolCall } from "@agentclientprotocol/sdk";
 import type { TerminalSnapshot } from "../../../shared/bridge";
-import type { Operation, ProcessUpdate } from "../../../shared/protocol";
+import type { Entry, PromptState } from "../../../shared/entries";
 import { Conversation } from "../components/acp/conversation";
 import { PermissionCard } from "../components/acp/permission";
 import { ElicitationCard } from "../components/acp/elicitation";
 import { PromptComposer } from "../components/acp/prompt-composer";
 import { SessionControls } from "../components/acp/session-controls";
 import { InterfaceSettings } from "../components/interface-settings";
-import type { AppState, AssistantMessageChunk, TimelineItem } from "../lib/state";
-import { projectProcess, projectTimeline } from "../lib/workspace-projection";
+import { projectEntries } from "../lib/entry-projection";
+import type { AppState, TimelineItem } from "../lib/state";
 import { initializeTheme } from "../lib/theme";
 import "../styles.css";
 import "./style-showcase.css";
@@ -71,54 +71,80 @@ function StyleShowcase() {
 }
 
 /**
- * The sample as the thread shows it: each prompt and what follows it is one
- * turn's process (§4.4), and the controls updates are what the session shows
- * beside the thread.
+ * The sample as the thread shows it: its updates become the entries a session's document
+ * holds, each turn ended, and the controls updates are what the session shows beside the
+ * thread.
  */
 function showcaseProjection(session: MockSession): ShowcaseProjection {
-  const turns: ProcessUpdate[][] = [];
   let availableCommands: AvailableCommand[] = [];
   let usage: AppState["usage"];
-  let previous: SessionUpdate | undefined;
+  const updates: SessionUpdate[] = [];
   for (const update of session.updates) {
     if (update.sessionUpdate === "usage_update") usage = { used: update.used, size: update.size, cost: update.cost };
     else if (update.sessionUpdate === "available_commands_update") availableCommands = update.availableCommands;
-    else {
-      if (turns.length === 0 || (update.sessionUpdate === "user_message_chunk" && previous?.sessionUpdate !== "user_message_chunk")) {
-        turns.push([]);
-      }
-      turns.at(-1)!.push(update as ProcessUpdate);
-    }
-    previous = update;
+    else updates.push(update);
   }
-  const timeline = turns.flatMap((process, index) => {
-    // A plan with unfinished entries is shown above the composer on the page;
-    // the sample shows it in its own turn.
-    const { items, activePlan } = projectProcess(session.sessionId, `showcase-${index}`, process);
-    return joinMessageBlocks(activePlan != null ? [...items, activePlan] : items);
-  });
-  return { timeline, availableCommands, usage };
+  const entries = entriesFromUpdates(updates);
+  const prompts: PromptState[] = entries.flatMap((entry, index) =>
+    entry.kind === "message" && entry.role === "user" && !(entries[index - 1]?.kind === "message" && (entries[index - 1] as { role: string }).role === "user")
+      ? [{ entry: index, end: { response: { stopReason: "end_turn" } } } as PromptState] : []);
+  return { timeline: projectEntries(session.sessionId, entries, prompts).timeline, availableCommands, usage };
 }
 
-/** One entry per message: the sample spreads a message's blocks over chunks. */
-function joinMessageBlocks(items: TimelineItem[]): TimelineItem[] {
-  const joined: TimelineItem[] = [];
-  for (const item of items) {
-    const last = joined.at(-1);
-    if (item.type === "message" && last?.type === "message" && item.messageId != null && item.messageId === last.messageId) {
-      joined[joined.length - 1] = { ...last, blocks: [...last.blocks, ...item.blocks] };
-    } else if (item.type === "assistant") {
-      const chunks: AssistantMessageChunk[] = [];
-      for (const chunk of item.chunks) {
-        const previous = chunks.at(-1);
-        if (previous != null && chunk.messageId != null && chunk.messageId === previous.messageId && chunk.role === previous.role) {
-          chunks[chunks.length - 1] = { ...previous, blocks: [...previous.blocks, ...chunk.blocks] };
-        } else chunks.push(chunk);
+/**
+ * The entries a document would hold for `updates`, by the reducer's rules: a message continues
+ * the last one of its role and ID, a tool call updates the entry of its ID, a plan or a
+ * compaction its own.
+ */
+function entriesFromUpdates(updates: readonly SessionUpdate[]): Entry[] {
+  const entries: Entry[] = [];
+  for (const update of updates) {
+    const last = entries.at(-1);
+    switch (update.sessionUpdate) {
+      case "user_message_chunk":
+      case "agent_message_chunk":
+      case "agent_thought_chunk": {
+        const role = update.sessionUpdate === "user_message_chunk" ? "user"
+          : update.sessionUpdate === "agent_message_chunk" ? "agent" : "thought";
+        const messageId = update.messageId ?? undefined;
+        const chunk = { content: update.content };
+        if (last?.kind === "message" && last.role === role && last.messageId === messageId) {
+          entries[entries.length - 1] = { ...last, chunks: [...last.chunks, chunk] };
+        } else {
+          entries.push({ kind: "message", role, ...(messageId != null ? { messageId } : {}), chunks: [chunk] });
+        }
+        break;
       }
-      joined.push({ ...item, chunks });
-    } else joined.push(item);
+      case "tool_call":
+      case "tool_call_update": {
+        const { sessionUpdate: _kind, ...call } = update;
+        const index = entries.findIndex((entry) => entry.kind === "tool" && entry.call.toolCallId === update.toolCallId);
+        const previous = index >= 0 ? entries[index] : undefined;
+        if (previous?.kind === "tool") {
+          entries[index] = { ...previous, call: { ...previous.call, ...Object.fromEntries(Object.entries(call).filter(([, value]) => value != null)) } as typeof previous.call };
+        } else entries.push({ kind: "tool", call: call as never });
+        break;
+      }
+      case "plan":
+        entries.push({ kind: "plan", legacy: { entries: update.entries } });
+        break;
+      case "compaction_update":
+      case "compaction_summary_chunk": {
+        const index = entries.findIndex((entry) => entry.kind === "compaction" && entry.compactionId === update.compactionId);
+        const previous = index >= 0 ? entries[index] : undefined;
+        const base = previous?.kind === "compaction" ? previous
+          : { kind: "compaction" as const, compactionId: update.compactionId, status: "in_progress", summary: [] };
+        const next = update.sessionUpdate === "compaction_summary_chunk"
+          ? { ...base, summary: [...base.summary, { content: update.content }] }
+          : { ...base, status: update.status, ...(update.error != null ? { error: update.error } : {}) };
+        if (index >= 0) entries[index] = next; else entries.push(next);
+        break;
+      }
+      default:
+        break;
+    }
   }
-  return joined;
+  return entries;
 }
 
 type ShowcaseProjection = Pick<AppState, "availableCommands" | "usage"> & { timeline: TimelineItem[] };
@@ -143,17 +169,20 @@ function InteractionExample({ example, session, projection }: { example: string;
   const [options, setOptions] = useState(session.examples.configOptions);
   const [mode, setMode] = useState(session.examples.modes.currentModeId);
   const [stage, setStage] = useState<"running" | "cancelling" | "late">("running");
-  // A cancel request does not end the turn or its tools (§4.4): only the
-  // Agent's later result does, folded into its call like the bridge folds it.
-  const running = useMemo((): Operation => ({
-    id: "showcase-turn", kind: "prompt", status: "running", cancelRequested: stage !== "running", interactions: {},
-    input: { prompt: [{ type: "text", text: "检查运行中工具，点击停止后再模拟迟到结果。" }] },
-    process: session.examples.runningUpdates.map((update) => (stage === "late" &&
+  // A cancel request does not end the turn or its tools (§4.4): only the Agent's later result
+  // does, folded into its call like the bridge folds it.
+  const runningTimeline = useMemo(() => {
+    const updates = session.examples.runningUpdates.map((update) => (stage === "late" &&
       update.sessionUpdate === "tool_call" && update.toolCallId === "running-tool" ? {
         ...update, status: "completed" as const,
         content: [{ type: "content" as const, content: { type: "text" as const, text: "工具返回了最终结果。" } }],
-      } : update) as ProcessUpdate),
-  }), [session, stage]);
+      } : update));
+    const entries: Entry[] = [
+      { kind: "message", role: "user", chunks: [{ content: { type: "text", text: "检查运行中工具，点击停止后再模拟迟到结果。" } }] },
+      ...entriesFromUpdates(updates),
+    ];
+    return projectEntries(session.sessionId, entries, [{ entry: 0 }]).timeline;
+  }, [session, stage]);
   const permission = example.startsWith("permission-") ? session.examples.permissions[Number(example.slice(11))] : undefined;
   const elicitation = example.startsWith("form-") ? session.examples.elicitations[Number(example.slice(5))] : undefined;
   const settings = <SessionControls options={options} modes={null} disabled={false} onMode={() => {}}
@@ -178,8 +207,8 @@ function InteractionExample({ example, session, projection }: { example: string;
         <button type="button" onClick={() => setStage("running")}>恢复运行</button>
         <button type="button" disabled={stage !== "cancelling"} onClick={() => setStage("late")}>模拟工具返回结果</button>
       </div>
-      <Conversation timeline={projectTimeline(session.sessionId, [], running)} />
-      <PromptComposer disabled={false} running cancelling={running.cancelRequested} commands={[]}
+      <Conversation timeline={runningTimeline} />
+      <PromptComposer disabled={false} running cancelling={stage !== "running"} commands={[]}
         onSubmit={() => false} onCancel={() => setStage("cancelling")} />
     </> : null}
     {result ? <p className="showcase-result" role="status">示例响应：<code>{result}</code></p> : null}
