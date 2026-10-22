@@ -81,6 +81,18 @@ interface Intent {
   cwd: string;
 }
 
+/** What the page remembers of listing the catalog; the pages themselves are in the document. */
+interface ListingState {
+  /** The revision a list failed at; it is not listed again until it changes or the user asks. */
+  failedRevision?: string;
+  /** The user (or a changed catalog) asks for a new first page. */
+  refresh: boolean;
+  /** The `op.id` the last list was sent against: nothing is sent against it again (C3). */
+  sentAgainst?: string;
+  /** The list operations this page wrote. */
+  readonly mine: Set<string>;
+}
+
 /** Where the answer to one interaction is: sent and awaiting the document, or not known to have arrived. */
 interface AnswerState {
   state: "sending" | "sent" | "uncertain";
@@ -193,6 +205,7 @@ export class Workspace {
   readonly #seen = new Set<string>();
   #agentPhase: string | undefined;
   readonly #intents: Intent[] = [];
+  #listing: ListingState = { refresh: false, mine: new Set() };
   /** The answers this page sent, by interaction. */
   readonly #answers = new Map<string, AnswerState>();
   /** Why an answer was refused, by interaction: the form keeps its values (C2). */
@@ -306,9 +319,76 @@ export class Workspace {
     if (catalog == null || global?.agent.initialize == null) return false;
     if (catalog.op.status === "running") return false;
     if (global.agent.initialize.agentCapabilities?.sessionCapabilities?.list == null) return true;
+    if (this.#listing.failedRevision === catalog.revision) return true;
     const last = catalog.pages.at(-1);
     return last != null && last.nextCursor == null;
   }
+
+  /** A list this page wrote that failed: not listed again at that revision, and shown. */
+  #settleListing(): void {
+    const catalog = this.#catalog();
+    if (catalog == null) return;
+    const op = catalog.op;
+    if (op.kind !== "list" || op.status !== "failed" || !this.#listing.mine.has(op.id) || this.#seen.has(op.id)) return;
+    this.#seen.add(op.id);
+    this.#listing = { ...this.#listing, failedRevision: catalog.revision };
+    if (needsAuthentication(op.error)) this.#authRequired = true;
+    if (op.error != null) this.#errors = [...this.#errors, operationError(`op:${op.id}:error`, op as never, op.error)];
+  }
+
+  /** Lists the first page when there is none, and later pages while a session is looked for. */
+  #listCatalog(): void {
+    const catalog = this.#catalog();
+    const global = this.#global();
+    if (catalog == null || global?.agent.initialize == null) return;
+    if (global.agent.initialize.agentCapabilities?.sessionCapabilities?.list == null) return;
+    if (catalog.op.status === "running" || catalog.op.id === this.#listing.sentAgainst) return;
+    const route = this.#route;
+    // A session the catalog has not listed yet is looked for on its later pages.
+    const looking = route.kind === "session" && global.sessions?.[route.sessionId] == null &&
+      !this.#catalogSessions().some((session) => session.sessionId === route.sessionId);
+    const last = catalog.pages.at(-1);
+    if (last == null) {
+      if (this.#listing.refresh || this.#listing.failedRevision !== catalog.revision) this.#list(catalog, undefined);
+    } else if (this.#listing.refresh) {
+      this.#list(catalog, undefined);
+    } else if (looking && last.nextCursor != null) {
+      this.#list(catalog, last.nextCursor);
+    }
+  }
+
+  #list(catalog: CatalogLive3, cursor: string | undefined): void {
+    this.#listing = { ...this.#listing, refresh: false, sentAgainst: catalog.op.id };
+    void this.#ops.write(CATALOG, { kind: "list", args: cursor == null ? {} : { cursor, revision: catalog.revision } })
+      .then((outcome) => {
+        if (outcome.kind === "accepted") {
+          this.#listing.mine.add(outcome.op);
+        } else if (outcome.kind === "refused" && outcome.error.code === "catalog_changed") {
+          this.#listing = { ...this.#listing, refresh: true };
+        } else if (outcome.kind === "refused" && (outcome.error.code === "stale" || outcome.error.code === "not_allowed")) {
+          // Another list ran: list again once the document shows a later `op` ended.
+          this.#listing = { ...this.#listing, refresh: cursor == null };
+        } else if (outcome.kind === "blocked") {
+          this.#listing = { ...this.#listing, refresh: cursor == null, sentAgainst: undefined };
+        } else {
+          this.#listing = { ...this.#listing, failedRevision: catalog.revision };
+          this.#report("list", outcome);
+        }
+        this.#changed();
+      });
+  }
+
+  listSessions = (cursor?: string): void => {
+    const catalog = this.#catalog();
+    if (cursor == null) {
+      // The user asks again: a new attempt, which may go against the same `op` a refused
+      // list was sent against. Nothing is resent without this (C3).
+      this.#listing = { ...this.#listing, refresh: true, failedRevision: undefined, sentAgainst: undefined };
+      this.#changed();
+    } else if (catalog != null && catalog.op.status !== "running") {
+      this.#list(catalog, cursor);
+    }
+  };
 
   /** The scopes the page follows: the global ones and the session it shows. */
   #desiredFollow(): Follow[] {
@@ -351,6 +431,8 @@ export class Workspace {
     this.#settleAuth();
     this.#settleIntents();
     this.#settleAnswers();
+    this.#settleListing();
+    this.#listCatalog();
     this.#resolveRoute();
     this.#applyFollow();
     this.#feedQueue();
@@ -1154,6 +1236,7 @@ export function useAcp() {
     newSession: workspace.newSession,
     forkSession: workspace.forkSession,
     deleteSession: workspace.deleteSession,
+    listSessions: workspace.listSessions,
     respondPermission: workspace.respondPermission,
     respondElicitation: workspace.respondElicitation,
     dismissExternalFlow: workspace.dismissExternalFlow,
