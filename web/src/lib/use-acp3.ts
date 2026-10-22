@@ -15,10 +15,13 @@ import type {
   ContextRead,
   End,
   Interaction,
+  PromptBlock,
 } from "../../../shared/protocol";
 import type { CatalogLive3, GlobalLive3, SessionBody, SessionLive3 } from "../../../shared/documents";
 import type { Follow } from "../../../shared/document-replica";
 import { FeedClient, type StreamSource } from "../../../shared/feed-client";
+import { WriteQueue, type HttpFetch } from "../../../shared/protocol-client";
+import { OpsClient, type StartingWrite, type WriteOutcome } from "../../../shared/write-client";
 import { createAttachmentReader, type AttachmentReader } from "./attachments";
 import { projectEntries } from "./entry-projection";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
@@ -41,7 +44,41 @@ type Route =
   | { kind: "project"; cwd: string }
   | { kind: "session"; sessionId: string; cwd?: string };
 
+/** A prompt in this page's queue; `state` says where it is (C2, C3). */
+export interface QueueEntry {
+  id: string;
+  sessionId: string;
+  blocks: PromptBlock[];
+  state: "queued" | "paused" | "sending" | "refused" | "uncertain";
+  error?: string;
+}
+
+interface HeldPrompt {
+  id: string;
+  blocks: PromptBlock[];
+}
+
+/** The operations client whose answers also notify the page: the write queue reports none. */
+class NotifyingOps extends OpsClient {
+  constructor(
+    fetch: HttpFetch,
+    replicas: ConstructorParameters<typeof OpsClient>[1],
+    private readonly answered: () => void,
+  ) {
+    super(fetch, replicas);
+  }
+
+  override write(scope: string, write: StartingWrite): Promise<WriteOutcome> {
+    const sent = super.write(scope, write);
+    void sent.then(() => setTimeout(this.answered, 0));
+    return sent;
+  }
+}
+
 export interface WorkspaceState extends AppState {
+  /** The queued prompts of the shown session, in the order they are sent. */
+  queue: QueueEntry[];
+  queuePaused: boolean;
   /** Login terminals, each its own resource (§4.6). */
   authTerminals: AuthTerminalState[];
   /** Sessions the bridge holds (`global.sessions`): they open without a load. */
@@ -103,6 +140,8 @@ export class Workspace {
   // The client of one connection: `start()` makes it, its cleanup closes it, so a
   // StrictMode remount gets a working stream again.
   #feed!: FeedClient;
+  #ops!: NotifyingOps;
+  #queue!: WriteQueue;
   #route: Route = readRoute();
   /** Counts navigations; a write's late result never moves a page the user moved since. */
   #navigation = 0;
@@ -111,6 +150,11 @@ export class Workspace {
   #aligned: string | undefined;
   readonly #ended = new Map<string, End>();
   #authRequired = false;
+  /** Failures of this page's own writes, shown in the thread. */
+  #errors: Array<Extract<TimelineItem, { type: "error" }>> = [];
+  readonly #held = new Map<string, HeldPrompt[]>();
+  readonly #paused = new Set<string>();
+  #nextId = 0;
   #reader: AttachmentReader | undefined;
   /** The cwd each session reported while shown, for leaving it once it is gone. */
   readonly #sessionCwd = new Map<string, string>();
@@ -122,8 +166,18 @@ export class Workspace {
   }
 
   #connect(): void {
+    const fetchJson: HttpFetch = (url, init) => fetch(url, init);
     const feed = new FeedClient(openEventSource);
     this.#feed = feed;
+    this.#ops = new NotifyingOps(fetchJson, feed, () => {
+      if (this.#feed === feed) this.#changed();
+    });
+    this.#queue = new WriteQueue(this.#ops, {
+      get: (scope) => {
+        const replica = feed.get(scope);
+        return replica === undefined ? undefined : { live: replica.doc.live };
+      },
+    });
     feed.subscribe((scope) => {
       if (this.#feed === feed) this.#received(scope);
     });
@@ -167,6 +221,7 @@ export class Workspace {
     } else if (scope.startsWith("session/")) {
       this.#aligned = scope;
     }
+    this.#queue.update(scope);
     this.#changed();
   }
 
@@ -248,6 +303,7 @@ export class Workspace {
     this.#settleAuth();
     this.#resolveRoute();
     this.#applyFollow();
+    this.#feedQueue();
     this.#canonicalize();
     const sessionId = this.#route.kind === "session" ? this.#route.sessionId : undefined;
     // Attachments are read per session; another session's reads are dropped with it.
@@ -327,6 +383,7 @@ export class Workspace {
       return;
     }
     this.#navigation += 1;
+    this.#errors = [];
     const previousScope = previous.kind === "session" ? `session/${previous.sessionId}` : undefined;
     if (previousScope != null && (route.kind !== "session" || `session/${route.sessionId}` !== previousScope)) {
       this.#ended.delete(previousScope);
@@ -370,6 +427,150 @@ export class Workspace {
   reconnect = (): void => {
     this.#applyFollow(true);
   };
+
+  // -------------------------------------------------------------------------
+  // Writes
+
+  /** Shows what a write's answer says when the page cannot leave it to the document. */
+  #report(operation: string, outcome: WriteOutcome): void {
+    let message: string | undefined;
+    let data: unknown;
+    if (outcome.kind === "refused") {
+      message = i18n.t("errors.refused", { operation, message: outcome.error.message });
+      data = outcome.error;
+    } else if (outcome.kind === "uncertain") {
+      message = i18n.t("errors.uncertainWrite", { operation });
+    }
+    if (message == null) return;
+    this.#nextId += 1;
+    this.#errors = [...this.#errors, {
+      id: `local:${this.#nextId}`, type: "error", message, operation, ...(data !== undefined ? { data } : {}),
+    }];
+  }
+
+  /** Stops the running turn; the queue waits until the user sends again. */
+  cancel = (): void => {
+    const shown = this.#shown();
+    if (shown == null || shown.live.op.status !== "running") return;
+    void this.#ops.cancel(shown.scope).then((outcome) => {
+      this.#report("cancel", outcome);
+      this.#changed();
+    });
+  };
+
+  // -------------------------------------------------------------------------
+  // Prompts (C2, C3)
+
+  /**
+   * Queues a prompt for the shown session. A prompt sent while the turn is
+   * idle goes ahead of paused ones; the queue sends one at a time, against the
+   * `op` the document shows ended.
+   */
+  prompt = (blocks: PromptBlock[], ahead = false): boolean => {
+    const scope = this.#shown()?.scope;
+    if (scope == null) return false;
+    this.#nextId += 1;
+    const held = this.#held.get(scope) ?? [];
+    const prompt = { id: `held:${this.#nextId}`, blocks };
+    this.#held.set(scope, ahead ? [prompt, ...held] : [...held, prompt]);
+    this.#paused.delete(scope);
+    this.#changed();
+    return true;
+  };
+
+  /** Sends prompts from the page's queue into the write queue, one at a time. */
+  #feedQueue(): void {
+    for (const [scope, held] of this.#held) {
+      if (held.length === 0 || this.#paused.has(scope)) continue;
+      if (this.#queue.items(scope).some(({ state }) => state !== "uncertain")) continue;
+      const [next, ...rest] = held;
+      this.#held.set(scope, rest);
+      this.#queue.enqueue(scope, { kind: "prompt", args: { prompt: next.blocks } });
+    }
+  }
+
+  /** Pauses the queue: nothing waiting is sent until the user sends again (Stop). */
+  pauseQueue = (): void => {
+    const scope = this.#shown()?.scope;
+    if (scope == null) return;
+    this.#paused.add(scope);
+    const back = this.#queue.items(scope).filter(({ state }) => state === "queued" || state === "refused");
+    for (const item of back) this.#queue.remove(scope, item.id);
+    if (back.length > 0) {
+      this.#held.set(scope, [
+        ...back.map((item) => ({ id: `held:${(this.#nextId += 1)}`, blocks: promptOf(item.write) })),
+        ...(this.#held.get(scope) ?? []),
+      ]);
+    }
+    this.#changed();
+  };
+
+  /** Takes a queued prompt back; returns its blocks. */
+  takeQueued = (id: string): PromptBlock[] | undefined => {
+    const scope = this.#shown()?.scope;
+    if (scope == null) return undefined;
+    const held = this.#held.get(scope) ?? [];
+    const prompt = held.find((item) => item.id === id);
+    if (prompt != null) {
+      this.#held.set(scope, held.filter((item) => item.id !== id));
+      this.#changed();
+      return prompt.blocks;
+    }
+    const queued = this.#queue.items(scope).find((item) => `queue:${item.id}` === id);
+    if (queued == null || queued.state === "sending") return undefined;
+    this.#queue.remove(scope, queued.id);
+    this.#changed();
+    return promptOf(queued.write);
+  };
+
+  clearQueue = (): void => {
+    const scope = this.#shown()?.scope;
+    if (scope == null) return;
+    this.#held.delete(scope);
+    for (const item of this.#queue.items(scope)) this.#queue.remove(scope, item.id);
+    this.#paused.delete(scope);
+    this.#changed();
+  };
+
+  /** Sends a queued prompt next: it goes first, and the running turn is cancelled. */
+  sendQueuedNow = (id: string): void => {
+    const scope = this.#shown()?.scope;
+    if (scope == null) return;
+    const blocks = this.takeQueued(id);
+    if (blocks == null) return;
+    this.#paused.add(scope);
+    this.pauseQueue();
+    this.#nextId += 1;
+    this.#held.set(scope, [{ id: `held:${this.#nextId}`, blocks }, ...(this.#held.get(scope) ?? [])]);
+    this.#paused.delete(scope);
+    this.cancel();
+    this.#changed();
+  };
+
+  /** The user sends an uncertain prompt again, as new input (C3). */
+  resendQueued = (id: string): void => {
+    const scope = this.#shown()?.scope;
+    const queued = scope == null ? undefined : this.#queue.items(scope).find((item) => `queue:${item.id}` === id);
+    if (scope == null || queued == null) return;
+    this.#queue.remove(scope, queued.id);
+    this.prompt(promptOf(queued.write));
+  };
+
+  #queueEntries(scope: string, sessionId: string): QueueEntry[] {
+    const paused = this.#paused.has(scope);
+    return [
+      ...this.#queue.items(scope).map((item): QueueEntry => ({
+        id: `queue:${item.id}`,
+        sessionId,
+        blocks: promptOf(item.write),
+        state: item.state,
+        ...(item.error ? { error: item.error.message } : {}),
+      })),
+      ...(this.#held.get(scope) ?? []).map((item): QueueEntry => ({
+        id: item.id, sessionId, blocks: item.blocks, state: paused ? "paused" : "queued",
+      })),
+    ];
+  }
 
   // -------------------------------------------------------------------------
   // Reads (§8)
@@ -478,6 +679,8 @@ export class Workspace {
       agentActivity = projected.activity;
     }
 
+    timeline = [...timeline, ...this.#errors];
+
     const terminalSnapshots: TerminalSnapshot[] = Object.values(live?.terminals ?? {}).map((terminal) => ({
       sessionId: live!.sessionId,
       terminalId: terminal.terminalId,
@@ -536,6 +739,8 @@ export class Workspace {
       sessionSyncPhase: !visible ? undefined : op?.status === "running" ? (running ? "running" : "reconciling") : "ready",
       agentActivity,
       activePlan,
+      queue: shown == null ? [] : this.#queueEntries(shown.scope, shown.live.sessionId),
+      queuePaused: shown != null && this.#paused.has(shown.scope),
       authTerminals,
       standaloneTerminals: standaloneTerminals(terminalSnapshots, timeline),
       attachments: this.#reader,
@@ -543,6 +748,10 @@ export class Workspace {
       projectCwd: route.kind === "project" ? route.cwd : undefined,
     };
   }
+}
+
+function promptOf(write: StartingWrite): PromptBlock[] {
+  return write.kind === "prompt" ? write.args.prompt : [];
 }
 
 async function readJson(path: string): Promise<unknown> {
@@ -579,6 +788,13 @@ export function useAcp() {
     openProject: workspace.openProject,
     attachSession: workspace.attachSession,
     closeSession: workspace.closeSession,
+    prompt: workspace.prompt,
+    cancel: workspace.cancel,
+    pauseQueue: workspace.pauseQueue,
+    takeQueued: workspace.takeQueued,
+    clearQueue: workspace.clearQueue,
+    sendQueuedNow: workspace.sendQueuedNow,
+    resendQueued: workspace.resendQueued,
     searchWorkspaceContext: workspace.searchWorkspaceContext,
     readWorkspaceContext: workspace.readWorkspaceContext,
   };
