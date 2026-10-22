@@ -17,16 +17,24 @@ import type {
   Interaction,
   PromptBlock,
 } from "../../../shared/protocol";
-import type { CatalogLive3, GlobalLive3, SessionBody, SessionLive3 } from "../../../shared/documents";
+import type { CatalogLive3, GlobalLive3, SessionBody, SessionLive3, ShownOp } from "../../../shared/documents";
 import type { Follow } from "../../../shared/document-replica";
 import { FeedClient, type StreamSource } from "../../../shared/feed-client";
 import { WriteQueue, type HttpFetch } from "../../../shared/protocol-client";
-import { OpsClient, type StartingWrite, type WriteOutcome } from "../../../shared/write-client";
+import {
+  ActionsClient,
+  OpsClient,
+  type StartingWrite,
+  type Write,
+  type WriteOutcome,
+} from "../../../shared/write-client";
+import { originOf } from "../../../shared/write-resolution";
 import { createAttachmentReader, type AttachmentReader } from "./attachments";
 import { projectEntries } from "./entry-projection";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
 import {
   initialState,
+  type AgentAuthResponse,
   type AgentAuthStatus,
   type AppState,
   type AuthTerminalState,
@@ -34,7 +42,14 @@ import {
   type PendingPermission,
   type TimelineItem,
 } from "./state";
-import { externalFlow, isRecord, listedSessions, needsAuthentication, standaloneTerminals } from "./workspace-projection";
+import {
+  externalFlow,
+  isRecord,
+  listedSessions,
+  needsAuthentication,
+  operationError,
+  standaloneTerminals,
+} from "./workspace-projection";
 
 const GLOBAL = "global";
 const CATALOG = "catalog";
@@ -51,6 +66,19 @@ export interface QueueEntry {
   blocks: PromptBlock[];
   state: "queued" | "paused" | "sending" | "refused" | "uncertain";
   error?: string;
+}
+
+/** A create or fork this page started, until the document shows what became of it. */
+interface Intent {
+  kind: "new" | "fork";
+  /** The scope the operation was written to. */
+  scope: string;
+  /** The id the operation was written with. */
+  id: string;
+  /** Present when the answer was lost: the write to resolve from the document. */
+  lost?: Write;
+  navigation: number;
+  cwd: string;
 }
 
 interface HeldPrompt {
@@ -141,6 +169,7 @@ export class Workspace {
   // StrictMode remount gets a working stream again.
   #feed!: FeedClient;
   #ops!: NotifyingOps;
+  #actions!: ActionsClient;
   #queue!: WriteQueue;
   #route: Route = readRoute();
   /** Counts navigations; a write's late result never moves a page the user moved since. */
@@ -150,8 +179,15 @@ export class Workspace {
   #aligned: string | undefined;
   readonly #ended = new Map<string, End>();
   #authRequired = false;
+  #transition: { kind: "new" | "fork"; navigation: number } | undefined;
   /** Failures of this page's own writes, shown in the thread. */
   #errors: Array<Extract<TimelineItem, { type: "error" }>> = [];
+  /** Operations this page started on `global`: their failures are its to show. */
+  readonly #mine = new Set<string>();
+  /** Operations whose end the page has acted on. */
+  readonly #seen = new Set<string>();
+  #agentPhase: string | undefined;
+  readonly #intents: Intent[] = [];
   readonly #held = new Map<string, HeldPrompt[]>();
   readonly #paused = new Set<string>();
   #nextId = 0;
@@ -172,6 +208,7 @@ export class Workspace {
     this.#ops = new NotifyingOps(fetchJson, feed, () => {
       if (this.#feed === feed) this.#changed();
     });
+    this.#actions = new ActionsClient(fetchJson);
     this.#queue = new WriteQueue(this.#ops, {
       get: (scope) => {
         const replica = feed.get(scope);
@@ -301,6 +338,7 @@ export class Workspace {
   #sync(): void {
     if (this.#closed) return;
     this.#settleAuth();
+    this.#settleIntents();
     this.#resolveRoute();
     this.#applyFollow();
     this.#feedQueue();
@@ -337,15 +375,83 @@ export class Workspace {
     const global = this.#global();
     if (global == null) return;
     const op = global.op;
-    if (op.status === "failed" && needsAuthentication(op.error)) this.#authRequired = true;
-    const shown = this.#shown();
-    if (shown?.live.op.status === "failed" && needsAuthentication(shown.live.op.error)) this.#authRequired = true;
-    if (global.agent.authenticatedMethodId != null) {
+    const phase = global.agent.phase;
+    const restarted = this.#agentPhase != null && this.#agentPhase !== "ready" && phase === "ready";
+    this.#agentPhase = phase;
+    let signedIn = global.agent.authenticatedMethodId != null;
+    if (!this.#seen.has(op.id) && op.status !== "running") {
+      this.#seen.add(op.id);
+      const login = op.kind === "terminal_login" && op.status === "completed" &&
+        isRecord(op.result) && op.result.exitCode === 0;
+      if ((op.kind === "authenticate" && op.status === "completed") || login) signedIn = true;
+      if (op.status === "failed" && needsAuthentication(op.error)) this.#authRequired = true;
+    }
+    const sessionOp = this.#shown()?.live.op;
+    if (sessionOp != null && !this.#seen.has(sessionOp.id) && sessionOp.status === "failed") {
+      this.#seen.add(sessionOp.id);
+      if (needsAuthentication(sessionOp.error)) this.#authRequired = true;
+    }
+    const waiting = this.#authRequired || [...this.#ended.values()].some((end) => needsAuthentication(end.error));
+    if ((signedIn || restarted) && waiting) {
       this.#authRequired = false;
+      // What failed for want of authentication is tried again (§5.4).
       for (const [scope, end] of this.#ended) {
         if (end.reason === "load_failed" && needsAuthentication(end.error)) this.#ended.delete(scope);
       }
     }
+  }
+
+  /**
+   * What became of the creates and forks this page started, read from the documents:
+   * the operation it wrote completed with the session (§6.2), or the session whose
+   * `origin` is its id is held (§6.6). A late result never moves a page the user moved
+   * since.
+   */
+  #settleIntents(): void {
+    const global = this.#global();
+    if (global == null) return;
+    for (const intent of [...this.#intents]) {
+      if (intent.lost != null) {
+        const resolution = this.#ops.resolve(intent.lost);
+        if (resolution !== "admitted") {
+          // Not admitted, or not knowable: the user decides (C3).
+          this.#finishIntent(intent);
+          this.#reportMessage(intent.kind === "new" ? "create" : "fork", i18n.t("errors.uncertainWrite", {
+            operation: intent.kind === "new" ? "create" : "fork",
+          }), intent);
+          continue;
+        }
+        intent.lost = undefined;
+      }
+      const shownOp = bodyLive(this.#feed.get(intent.scope))?.op;
+      const op = shownOp?.id === intent.id ? shownOp : undefined;
+      const origin = originOf(global.sessions ?? {}, intent.id);
+      if (op?.status === "running") continue;
+      if (op?.status === "completed" || origin != null) {
+        const sessionId = origin ?? (isRecord(op?.result) && typeof op.result.sessionId === "string" ? op.result.sessionId : undefined);
+        this.#finishIntent(intent);
+        if (sessionId != null && this.#navigation === intent.navigation) {
+          this.#navigate({ kind: "session", sessionId, cwd: intent.cwd });
+        }
+      } else if (op != null) {
+        // Failed or cancelled.
+        this.#finishIntent(intent);
+        if (needsAuthentication(op.error)) this.#authRequired = true;
+        if (this.#navigation === intent.navigation && op.error != null) {
+          this.#errors = [...this.#errors, operationError(`local:${(this.#nextId += 1)}`, op as never, op.error)];
+        }
+      } else if (shownOp != null && shownOp.scope === intent.scope && shownOp.after === intent.id) {
+        // Our operation was replaced before the page saw it end, and no held session names it.
+        // (An op the document does not show yet is waited for: the 202 comes before it.)
+        this.#finishIntent(intent);
+      }
+    }
+  }
+
+  #finishIntent(intent: Intent): void {
+    const index = this.#intents.indexOf(intent);
+    if (index >= 0) this.#intents.splice(index, 1);
+    this.#transition = undefined;
   }
 
   #resolveRoute(): void {
@@ -431,6 +537,12 @@ export class Workspace {
   // -------------------------------------------------------------------------
   // Writes
 
+  #reportMessage(operation: string, message: string, intent?: Intent): void {
+    if (intent != null && this.#navigation !== intent.navigation) return;
+    this.#nextId += 1;
+    this.#errors = [...this.#errors, { id: `local:${this.#nextId}`, type: "error", message, operation }];
+  }
+
   /** Shows what a write's answer says when the page cannot leave it to the document. */
   #report(operation: string, outcome: WriteOutcome): void {
     let message: string | undefined;
@@ -447,6 +559,89 @@ export class Workspace {
       id: `local:${this.#nextId}`, type: "error", message, operation, ...(data !== undefined ? { data } : {}),
     }];
   }
+
+  #write(scope: string, write: StartingWrite, label: string): Promise<WriteOutcome> {
+    return this.#ops.write(scope, write).then((outcome) => {
+      if (scope === GLOBAL && outcome.kind === "accepted") this.#mine.add(outcome.op);
+      this.#report(label, outcome);
+      this.#changed();
+      return outcome;
+    });
+  }
+
+  /** Starts a create or fork; its result is read from the documents (§6.2, §6.6). */
+  #start(kind: Intent["kind"], scope: string, write: StartingWrite, cwd: string): void {
+    const navigation = this.#navigation;
+    const label = kind === "new" ? "create" : "fork";
+    this.#transition = { kind, navigation };
+    void this.#ops.write(scope, write).then((outcome) => {
+      if (outcome.kind === "accepted") {
+        this.#intents.push({ kind, scope, id: outcome.op, navigation, cwd });
+        if (scope === GLOBAL) this.#mine.add(outcome.op);
+      } else if (outcome.kind === "uncertain" && outcome.write != null) {
+        this.#intents.push({ kind, scope, id: outcome.write.id, lost: outcome.write, navigation, cwd });
+      } else {
+        this.#transition = undefined;
+        if (this.#navigation === navigation) this.#report(label, outcome);
+      }
+      this.#changed();
+    });
+    this.#changed();
+  }
+
+  newSession = (cwd: string): boolean => {
+    const global = this.#global();
+    if (global == null || global.op.status === "running" || this.#transition != null) return false;
+    this.#start("new", GLOBAL, { kind: "create", args: { cwd } }, cwd);
+    return true;
+  };
+
+  forkSession = (): void => {
+    const shown = this.#shown();
+    if (shown == null || shown.live.op.status === "running" || this.#transition != null) return;
+    this.#start("fork", shown.scope, { kind: "fork", args: {} }, shown.live.cwd);
+  };
+
+  deleteSession = (sessionId: string): void => {
+    void this.#write(GLOBAL, { kind: "delete", args: { sessionId } }, "delete");
+  };
+
+  authenticate = (methodId: string): void => {
+    const global = this.#global();
+    const method = global?.agent.initialize?.authMethods?.find(({ id }) => id === methodId);
+    if (global == null || method == null || global.op.status === "running") return;
+    if ("type" in method && method.type === "terminal") {
+      void this.#write(GLOBAL, { kind: "terminal_login", args: { methodId, cols: 80, rows: 24 } }, "terminal_login");
+    } else {
+      void this.#write(GLOBAL, { kind: "authenticate", args: { methodId } }, "authenticate");
+    }
+  };
+
+  logout = (): void => {
+    void this.#write(GLOBAL, { kind: "logout", args: {} }, "logout");
+  };
+
+  /** Terminal input: in order, one request at a time per terminal, never resent (§7, C3). */
+  writeAuthTerminal = (terminalId: string, data: string): void => {
+    void this.#actions.input(GLOBAL, terminalId, data);
+  };
+
+  resizeAuthTerminal = (terminalId: string, cols: number, rows: number): void => {
+    void this.#actions.resize(GLOBAL, terminalId, cols, rows);
+  };
+
+  cancelAuthTerminal = (terminalId: string): void => {
+    const op = this.#global()?.op;
+    if (op?.id !== terminalId || op.status !== "running") return;
+    void this.#ops.cancel(GLOBAL).then((outcome) => {
+      this.#report("cancel", outcome);
+      this.#changed();
+    });
+  };
+
+  dismissAuthTerminal = (terminalId: string): void => {
+    void this.#actions.dismiss(GLOBAL, terminalId).then(() => this.#changed());
+  };
 
   /** Stops the running turn; the queue waits until the user sends again. */
   cancel = (): void => {
@@ -679,6 +874,11 @@ export class Workspace {
       agentActivity = projected.activity;
     }
 
+    // Failures of the global operations this page started, and its own write answers.
+    if (globalOp != null && globalOp.status === "failed" && globalOp.error != null && this.#mine.has(globalOp.id) &&
+      authOp == null) {
+      timeline = [...timeline, operationError(`op:${globalOp.id}:error`, globalOp as never, globalOp.error)];
+    }
     timeline = [...timeline, ...this.#errors];
 
     const terminalSnapshots: TerminalSnapshot[] = Object.values(live?.terminals ?? {}).map((terminal) => ({
@@ -691,6 +891,9 @@ export class Workspace {
     }));
     const controls = live?.controls;
     const running = visible && op?.kind === "prompt" && op.status === "running";
+    const runtimeKind = op?.status === "running" && op.kind === "fork" ? op.kind : undefined;
+    const deleting = globalOp?.kind === "delete" && globalOp.status === "running" && isRecord(globalOp.input) &&
+      typeof globalOp.input.sessionId === "string" ? globalOp.input.sessionId : undefined;
 
     const summaries = Object.values(global?.sessions ?? {});
     const sessions = listedSessions(this.#catalogSessions(), global as never);
@@ -714,6 +917,10 @@ export class Workspace {
         ...(isRecord(authOp.input) && typeof authOp.input.methodId === "string" ? { methodId: authOp.input.methodId } : {}),
       } : undefined,
       authError: authOp?.status === "failed" ? authOp.error?.message : undefined,
+      lastAuthResponse: authOp?.status === "completed" && authOp.kind !== "terminal_login" ? {
+        kind: authOp.kind === "logout" ? "logout" : "authenticate",
+        response: (isRecord(authOp.result) ? authOp.result : {}) as AgentAuthResponse["response"],
+      } : undefined,
       session: visible && live != null ? {
         sessionId: live.sessionId,
         ...(controls?.modes != null ? { modes: controls.modes } : {}),
@@ -724,6 +931,12 @@ export class Workspace {
       busySessionIds: summaries.filter(({ op: summary }) => summary.status === "running").map(({ sessionId: id }) => id),
       attentionSessionIds: summaries.filter(({ pending: counts }) => counts.interactions > 0 || counts.urlFlows > 0)
         .map(({ sessionId: id }) => id),
+      pendingSessionDeletions: deleting != null ? [{ requestId: globalOp!.id, sessionId: deleting }] : [],
+      runtimeOperation: runtimeKind != null ? { requestId: op!.id, operation: "fork" } : undefined,
+      sessionTransition: this.#transition == null || this.#transition.navigation !== this.#navigation ? undefined : {
+        kind: this.#transition.kind,
+        requestId: `transition:${this.#transition.kind}`,
+      },
       pendingPrompt: running ? { requestId: op!.id, sessionId: live!.sessionId, blocks: [], cancelRequested: op!.cancelRequested } : undefined,
       availableCommands: controls?.commands ?? [],
       modeId: controls?.modes?.currentModeId,
@@ -748,6 +961,12 @@ export class Workspace {
       projectCwd: route.kind === "project" ? route.cwd : undefined,
     };
   }
+}
+
+/** The `live` of a replica, if it holds one. */
+function bodyLive(replica: { readonly doc: Readonly<Record<string, unknown>> } | undefined): { op?: ShownOp } | undefined {
+  const live = replica?.doc.live;
+  return isRecord(live) ? (live as { op?: ShownOp }) : undefined;
 }
 
 function promptOf(write: StartingWrite): PromptBlock[] {
@@ -788,6 +1007,15 @@ export function useAcp() {
     openProject: workspace.openProject,
     attachSession: workspace.attachSession,
     closeSession: workspace.closeSession,
+    authenticate: workspace.authenticate,
+    writeAuthTerminal: workspace.writeAuthTerminal,
+    resizeAuthTerminal: workspace.resizeAuthTerminal,
+    cancelAuthTerminal: workspace.cancelAuthTerminal,
+    dismissAuthTerminal: workspace.dismissAuthTerminal,
+    logout: workspace.logout,
+    newSession: workspace.newSession,
+    forkSession: workspace.forkSession,
+    deleteSession: workspace.deleteSession,
     prompt: workspace.prompt,
     cancel: workspace.cancel,
     pauseQueue: workspace.pauseQueue,
