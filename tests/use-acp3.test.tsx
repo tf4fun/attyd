@@ -479,5 +479,192 @@ describe("revision 3 workspace, read side", () => {
     expect(error).toMatchObject({ operation: "cancel" });
     expect((error as { message: string }).message).toContain("Nothing to cancel");
   });
+
+  // -- writes: create, fork, delete, authentication ---------------------------------------
+
+  /** The `op` of `global` replaced, as the bridge publishes it. */
+  const globalOpChanged = (rev: number, fields: Record<string, unknown>, more: unknown[] = []): StreamEvent => ({
+    scope: "global", rev, ops: [{ op: "set", path: "/live/op", value: op("global", fields) }, ...more],
+  } as StreamEvent);
+
+  it("creates a session and goes to it when the document shows the create completed with it", async () => {
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    let started = false;
+    await act(async () => { started = hook.state.phase === "ready" && true; });
+    expect(started).toBe(true);
+    let accepted = false;
+    await act(async () => { accepted = hook.newSession("/proj"); });
+    await settle();
+    expect(accepted).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].url).toBe("/api/v3/scopes/global/ops");
+    expect(posts[0].body).toMatchObject({ expect: "g0", kind: "create", args: { cwd: "/proj" } });
+    expect(hook.state.sessionTransition).toEqual({ kind: "new", requestId: "transition:new" });
+    const id = posts[0].body.id!;
+
+    await emit(globalOpChanged(1, { id, kind: "create", status: "running" }));
+    expect(window.location.pathname).toBe("/");
+    await emit(globalOpChanged(2, { id, kind: "create", status: "completed", result: { sessionId: "new1" } }));
+    expect(window.location.pathname).toMatch(/\/sessions\/new1$/u);
+    expect(hook.state.sessionTransition).toBeUndefined();
+  });
+
+  it("finds the created session by its origin when the operation was replaced before the page saw it end", async () => {
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    await act(async () => { hook.newSession("/proj"); });
+    await settle();
+    const id = posts[0].body.id!;
+    await emit(globalOpChanged(1, { id: "someone-else", kind: "delete", status: "running" }, [
+      { op: "set", path: "/live/sessions", value: { new2: { ...held.s1, sessionId: "new2", origin: id } } },
+    ]));
+    expect(window.location.pathname).toMatch(/\/sessions\/new2$/u);
+  });
+
+  it("does not move a page the user has left since the create was started", async () => {
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    await act(async () => { hook.newSession("/proj"); });
+    await settle();
+    const id = posts[0].body.id!;
+    await act(async () => hook.openProject("/elsewhere"));
+    expect(hook.state.sessionTransition).toBeUndefined();
+    await emit(globalOpChanged(1, { id, kind: "create", status: "completed", result: { sessionId: "new1" } }));
+    expect(window.location.pathname).not.toMatch(/new1/u);
+  });
+
+  it("shows why a create failed, and asks for sign-in when the Agent needs it", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({
+      agent: agent({ initialize: { protocolVersion: 1, agentCapabilities: {}, authMethods: [{ id: "m", name: "Login" }] } }),
+    })));
+    await emit(catalogSnapshot());
+    await act(async () => { hook.newSession("/proj"); });
+    await settle();
+    const id = posts[0].body.id!;
+    await emit(globalOpChanged(1, {
+      id, kind: "create", status: "failed",
+      error: { code: "agent_error", message: "no", data: { code: -32_000, message: "Authentication required" } },
+    }));
+    expect(hook.state.authStatus).toBe("required");
+    expect(hook.state.sessionTransition).toBeUndefined();
+  });
+
+  it("shows a create the bridge refused, and starts no second create while one is in flight", async () => {
+    respond = () => ({ status: 409, body: { error: { code: "stale", message: "Another operation runs" } } });
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    await act(async () => { hook.newSession("/proj"); });
+    await settle();
+    expect(hook.state.sessionTransition).toBeUndefined();
+    const error = hook.state.timeline.find((item) => item.type === "error");
+    expect((error as { message: string } | undefined)?.message).toContain("Another operation runs");
+
+    respond = () => new Promise(() => undefined);
+    let second = true;
+    await act(async () => { hook.newSession("/proj"); second = hook.newSession("/proj"); });
+    expect(second).toBe(false);
+  });
+
+  it("does not start a create while the Agent runs another global operation", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({ op: op("global", { id: "g1", kind: "authenticate", status: "running" }) })));
+    await emit(catalogSnapshot());
+    let accepted = true;
+    await act(async () => { accepted = hook.newSession("/proj"); });
+    expect(accepted).toBe(false);
+    expect(posts).toEqual([]);
+  });
+
+  it("says a create whose answer was lost is not known, and does not hold the page", async () => {
+    respond = () => LOST;
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    await act(async () => { hook.newSession("/proj"); });
+    await settle();
+    expect(hook.state.sessionTransition).toBeUndefined();
+    expect(hook.state.timeline.some((item) => item.type === "error")).toBe(true);
+  });
+
+  it("forks the shown session and goes to the fork in the source's project", async () => {
+    await shownSession();
+    await act(async () => hook.forkSession());
+    await settle();
+    expect(posts[0].url).toBe("/api/v3/scopes/session%2Fs1/ops");
+    expect(posts[0].body).toMatchObject({ expect: "o1", kind: "fork", args: {} });
+    expect(hook.state.sessionTransition).toEqual({ kind: "fork", requestId: "transition:fork" });
+    const id = posts[0].body.id!;
+    await emit(opChanged(1, { id, kind: "fork", status: "running" }));
+    expect(hook.state.runtimeOperation).toEqual({ requestId: id, operation: "fork" });
+    await emit(opChanged(2, { id, kind: "fork", status: "completed", result: { sessionId: "forked" } }));
+    expect(window.location.pathname).toMatch(/\/sessions\/forked$/u);
+    expect(window.location.pathname).toContain("w");
+  });
+
+  it("deletes a session and hides it while the delete runs", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({ sessions: held })));
+    await emit(catalogSnapshot());
+    await act(async () => hook.deleteSession("s1"));
+    await settle();
+    expect(posts[0].body).toMatchObject({ kind: "delete", args: { sessionId: "s1" } });
+    const id = posts[0].body.id!;
+    await emit(globalOpChanged(1, { id, kind: "delete", status: "running", input: { sessionId: "s1" } }));
+    expect(hook.state.pendingSessionDeletions).toEqual([{ requestId: id, sessionId: "s1" }]);
+    expect(hook.state.sessions.map(({ sessionId }) => sessionId)).not.toContain("s1");
+  });
+
+  it("starts a sign-in the Agent offers, as the kind of method it is", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({
+      agent: agent({ initialize: {
+        protocolVersion: 1, agentCapabilities: {},
+        authMethods: [{ id: "plain", name: "Plain" }, { id: "term", name: "Terminal", type: "terminal" }],
+      } }),
+    })));
+    await emit(catalogSnapshot());
+    await act(async () => hook.authenticate("plain"));
+    await settle();
+    expect(posts[0].body).toMatchObject({ kind: "authenticate", args: { methodId: "plain" } });
+    await act(async () => hook.authenticate("nope"));
+    await settle();
+    expect(posts).toHaveLength(1);
+
+    await emit(globalOpChanged(1, { id: posts[0].body.id!, kind: "authenticate", status: "completed", result: {} }));
+    await act(async () => hook.authenticate("term"));
+    await settle();
+    expect(posts[1].body).toMatchObject({ kind: "terminal_login", args: { methodId: "term", cols: 80, rows: 24 } });
+  });
+
+  it("writes, resizes, cancels and dismisses a login terminal", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({
+      op: op("global", { id: "L", kind: "terminal_login", status: "running" }),
+      terminals: { L: { terminalId: "L", output: "", truncated: false, exitStatus: null, methodId: "term", released: false } },
+    })));
+    await emit(catalogSnapshot());
+    respond = () => ({ status: 204 });
+    await act(async () => hook.writeAuthTerminal("L", "x"));
+    await act(async () => hook.resizeAuthTerminal("L", 100, 30));
+    await settle();
+    expect(posts.map((post) => [post.url, post.body])).toEqual([
+      ["/api/v3/scopes/global/resources/L/input", { data: "x" }],
+      ["/api/v3/scopes/global/resources/L/resize", { cols: 100, rows: 30 }],
+    ]);
+    respond = (post) => ({ status: 202, body: { op: post.body.expect } });
+    await act(async () => hook.cancelAuthTerminal("L"));
+    await settle();
+    expect(posts[2].body).toEqual({ expect: "L", kind: "cancel", args: {} });
+    respond = () => ({ status: 204 });
+    await act(async () => hook.dismissAuthTerminal("L"));
+    await settle();
+    expect(posts[3].url).toBe("/api/v3/scopes/global/resources/L/dismiss");
+  });
 });
 
