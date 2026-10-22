@@ -14,7 +14,7 @@
 
 pub(crate) mod admission;
 pub(crate) mod canon;
-mod controls;
+pub(crate) mod controls;
 #[cfg(test)]
 mod convergence_tests;
 pub(crate) mod diff;
@@ -59,6 +59,47 @@ pub(crate) struct SessionControls {
     pub commands: Vec<Value>,
     pub info: SessionInfo,
     pub usage: Option<SessionUsage>,
+    /// The source metadata of the latest source that set each control (D12).
+    #[serde(default)]
+    pub meta: ControlMeta,
+}
+
+/// Where each control's metadata came from: the update's own `_meta`, and that of the
+/// notification that carried it, separately (memory model §7).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub modes: Option<ControlSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub config_options: Option<ControlSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub commands: Option<ControlSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub info: Option<ControlSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub usage: Option<ControlSource>,
+}
+
+/// The `_meta` of one source of a control.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlSource {
+    /// The update's own `_meta` (for example `CurrentModeUpdate._meta`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "unknown"))]
+    pub update: Option<Value>,
+    /// `SessionNotification._meta` of the notification that carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "unknown"))]
+    pub notification: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

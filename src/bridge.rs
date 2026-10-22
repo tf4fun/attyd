@@ -16,6 +16,8 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::protocol::controls::with_notification_meta;
+
 #[cfg(test)]
 use self::publication::PublishedCommit;
 use self::publication::{BridgeLock, ProtocolState, agent_launch, operation_error};
@@ -2445,7 +2447,11 @@ async fn handle_session_update(
                 let epoch = state.sessions.epoch().to_string();
                 state
                     .sessions
-                    .append_attachment_candidate(&epoch, &session_id, update.clone())
+                    .append_attachment_candidate(
+                        &epoch,
+                        &session_id,
+                        with_notification_meta(&update, envelope.as_ref()),
+                    )
                     .map_err(runtime_state_error)
             }
         } else if active
@@ -2474,7 +2480,7 @@ async fn handle_session_update(
                     .attachment
                     .control_candidate;
                 candidate.bytes = candidate.bytes.saturating_add(bytes);
-                candidate.updates.push(update.clone());
+                candidate.updates.push(with_notification_meta(&update, envelope.as_ref()));
                 Ok(())
             };
             mirrored
@@ -2525,7 +2531,11 @@ async fn handle_session_update(
                 } else {
                     state
                         .sessions
-                        .update_control_state(&epoch, &session_id, update.clone())
+                        .update_control_state(
+                            &epoch,
+                            &session_id,
+                            with_notification_meta(&update, envelope.as_ref()),
+                        )
                         .map_err(runtime_state_error)
                 }
             } else {

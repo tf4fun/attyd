@@ -1881,6 +1881,8 @@ pub(crate) fn fold_control_update(previous: Option<&Value>, update: Value) -> Va
     let Some(mut merged) = previous.and_then(Value::as_object).cloned() else {
         return update;
     };
+    // The metadata of a notification belongs to the update that carried it (D12).
+    merged.remove(crate::protocol::controls::NOTIFICATION_META);
     if let Some(fields) = update.as_object() {
         for (key, value) in fields {
             // Session info uses absent/clear/set patches. Usage's optional cost
@@ -1897,7 +1899,10 @@ pub(crate) fn fold_control_update(previous: Option<&Value>, update: Value) -> Va
 fn retain_control_update(entry: Value) -> Option<Value> {
     let update = entry.get("update").unwrap_or(&entry);
     let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
-    (!is_conversation_update_kind(kind)).then(|| update.clone())
+    // A notification keeps its own `_meta` beside the update it carries (D12).
+    let notification = entry.get("update").and_then(|_| entry.get("_meta"));
+    (!is_conversation_update_kind(kind))
+        .then(|| crate::protocol::controls::with_notification_meta(update, notification))
 }
 
 fn is_conversation_update_kind(kind: &str) -> bool {
