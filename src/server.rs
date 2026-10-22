@@ -535,7 +535,9 @@ impl BridgeHub {
             let _ = tokio::time::timeout(BRIDGE_SHUTDOWN_GRACE_PERIOD, wait).await;
         }
         // The v2 streams deliver the final commit, then end.
-        self.publication.lock().hub.close();
+        let mut published = self.publication.lock();
+        published.hub.close();
+        published.feed.close();
     }
 }
 
@@ -649,6 +651,8 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/v2/stream", get(protocol_stream))
+        // The revision 3 stream, beside the revision 2 one until the cutover.
+        .route("/api/v3/stream", get(feed_stream))
         // Writes share the read's wildcard; held `create`, `fork` and `list`
         // responses take no JSON deadline (protocol §6.3).
         .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
@@ -1038,6 +1042,34 @@ async fn protocol_stream(RawQuery(query): RawQuery, State(state): State<AppState
             ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
         );
     };
+    let stream = futures::stream::unfold(subscription, |subscription| async move {
+        let event = subscription.next().await?;
+        let data = serde_json::to_string(&event).expect("a protocol event serializes");
+        Some((
+            Ok::<_, Infallible>(SseEvent::default().data(data)),
+            subscription,
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(HEARTBEAT))
+        .into_response()
+}
+
+/// `GET /api/v3/stream` (protocol §5): the events of the scopes it follows from
+/// the revision 3 feed, without SSE ids, with a heartbeat while idle. Dropping
+/// the body closes the subscription.
+async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -> Response {
+    let follow = match crate::protocol::subscription::parse_stream_query(query.as_deref().unwrap_or("")) {
+        Ok(follow) => follow,
+        Err(error) => return protocol_error(StatusCode::BAD_REQUEST, error),
+    };
+    if state.bridge.state.lock().await.shutting_down {
+        return protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
+        );
+    }
+    let subscription = state.bridge.publication.lock().feed.subscribe(&follow);
     let stream = futures::stream::unfold(subscription, |subscription| async move {
         let event = subscription.next().await?;
         let data = serde_json::to_string(&event).expect("a protocol event serializes");
