@@ -253,3 +253,88 @@ async fn a_control_of_a_session_that_is_not_held_is_not_found() {
     let (status, body) = control(&server, "nowhere", "set_mode", json!({"modeId": "plan"})).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
+
+// -- Close (protocol §7, R2): also while a prompt runs --------------------------------------
+
+const CLOSEABLE: fn() -> Value = || json!({"sessionCapabilities": {"close": {}}});
+
+#[tokio::test]
+async fn a_session_is_closed_when_the_agent_closes_it_and_leaves_the_bridge() {
+    let (server, mut link) = Server::start(CLOSEABLE()).await;
+    create_with_controls(&server, &mut link, "s").await;
+    let close = spawn_control(&server, "s", "close", json!({}));
+    let request = link.request("session/close").await;
+    assert_eq!(request["params"]["sessionId"], "s");
+
+    // While it is in flight, the session is closing and refuses another close.
+    let (status, body) = control(&server, "s", "close", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "not_allowed", "{body}");
+    assert!(!close.is_finished(), "held until the Agent answers");
+
+    link.reply(&request, json!({})).await;
+    let (status, body) = close.await.unwrap();
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+
+    // The bridge holds nothing of it any more; it stays in the Agent's catalog.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while server.read("session/s").await.0 != StatusCode::NOT_FOUND {
+        assert!(tokio::time::Instant::now() < deadline, "still held");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let (_, global) = server.read("global").await;
+    assert!(global["live"]["sessions"].get("s").is_none(), "{global}");
+    let (status, body) = control(&server, "s", "close", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "after a success: {body}");
+}
+
+#[tokio::test]
+async fn an_agent_error_leaves_the_session_held_and_not_closing() {
+    let (server, mut link) = Server::start(CLOSEABLE()).await;
+    create_with_controls(&server, &mut link, "s").await;
+    let close = spawn_control(&server, "s", "close", json!({}));
+    let request = link.request("session/close").await;
+    link.refuse(&request).await;
+    let (status, body) = close.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"]["code"].is_string(), "{body}");
+    let (status, document) = server.read("session/s").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document["live"]["closing"], false, "closing clears on an Agent error");
+}
+
+#[tokio::test]
+async fn an_agent_that_does_not_advertise_close_is_refused_as_unsupported() {
+    let (server, mut link) = Server::start(json!({})).await;
+    create_with_controls(&server, &mut link, "s").await;
+    let (status, body) = control(&server, "s", "close", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["error"]["code"], "unsupported", "{body}");
+    link.quiet(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn closing_during_a_prompt_answers_its_pending_permissions_cancelled() {
+    let (server, mut link) = Server::start(CLOSEABLE()).await;
+    create_with_controls(&server, &mut link, "s").await;
+    let (_, document) = server.read("session/s").await;
+    let body = json!({
+        "id": "Pr0mptThenClose-000001", "expect": document["live"]["op"]["id"],
+        "kind": "prompt", "args": {"prompt": [text("work")]},
+    });
+    let response = send(server.address, Method::POST, "/api/v3/scopes/session%2Fs/ops", Some(body)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let prompt = link.request("session/prompt").await;
+    link.agent_request("one", "session/request_permission", permission("s", "one"))
+        .await;
+    pending(&server, "s").await;
+
+    let close = spawn_control(&server, "s", "close", json!({}));
+    let answered = link.response("one").await;
+    assert_eq!(answered["result"]["outcome"]["outcome"], "cancelled", "{answered}");
+    let request = link.request("session/close").await;
+    link.reply(&prompt, json!({"stopReason": "cancelled"})).await;
+    link.reply(&request, json!({})).await;
+    let (status, body) = close.await.unwrap();
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+}
