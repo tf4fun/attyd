@@ -8,6 +8,10 @@
 //! the next rev as ops. A session the bridge no longer holds ends its scope. A
 //! subscriber whose queue went past its budget is sent snapshots instead.
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use tokio::sync::Notify;
 
 use super::documents::{AgentInfo, End, EndReason, Scope};
 use super::engine::{Commit, Engine, StreamEvent};
@@ -129,5 +133,106 @@ impl Feed {
     }
 }
 
+/// The feed shared between the bridge, which commits to it under its lock, and
+/// the streams, which wait for what their subscription is queued.
+#[derive(Clone)]
+pub(crate) struct FeedHandle(Arc<Shared>);
+
+struct Shared {
+    feed: Mutex<Feed>,
+    /// Wakes the streams waiting for an event.
+    ready: Notify,
+    closed: AtomicBool,
+}
+
+impl FeedHandle {
+    pub(crate) fn new(process_epoch: impl Into<String>) -> Self {
+        Self(Arc::new(Shared {
+            feed: Mutex::new(Feed::new(process_epoch)),
+            ready: Notify::new(),
+            closed: AtomicBool::new(false),
+        }))
+    }
+
+    fn feed(&self) -> MutexGuard<'_, Feed> {
+        self.0.feed.lock().expect("the feed is poisoned")
+    }
+
+    /// Publishes what changed (see `Feed::commit`) and wakes the streams.
+    pub(crate) fn commit(
+        &self,
+        registry: &SessionRegistry,
+        agent: &AgentInfo,
+        catalog_revision: u64,
+    ) {
+        self.feed().commit(registry, agent, catalog_revision);
+        self.0.ready.notify_waiters();
+    }
+
+    /// A subscription to `follow`, aligned with what is published now. Once the
+    /// feed is closed there is nothing to align or to wait for.
+    pub(crate) fn subscribe(&self, follow: &[Subscribed]) -> FeedSubscription {
+        let id = if self.0.closed.load(Ordering::SeqCst) {
+            self.feed().subscribe(&[])
+        } else {
+            self.feed().subscribe(follow)
+        };
+        FeedSubscription(Arc::new(SubscriptionGuard {
+            id,
+            handle: self.clone(),
+        }))
+    }
+
+    pub(crate) fn subscribers(&self) -> usize {
+        self.feed().subscribers()
+    }
+
+    /// Ends every subscription: the streams drain what is queued and finish.
+    pub(crate) fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.0.ready.notify_waiters();
+    }
+}
+
+struct SubscriptionGuard {
+    id: SubscriptionId,
+    handle: FeedHandle,
+}
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.handle.feed().unsubscribe(self.id);
+    }
+}
+
+/// One stream's side of a subscription. It forgets the subscription when the
+/// last clone is dropped.
+#[derive(Clone)]
+pub(crate) struct FeedSubscription(Arc<SubscriptionGuard>);
+
+impl FeedSubscription {
+    /// The next event to write; waits when none is queued, and is `None` once
+    /// the feed is closed and the queue is drained.
+    pub(crate) async fn next(&self) -> Option<StreamEvent> {
+        loop {
+            // Enabled before the queue is read, so a commit between the two wakes
+            // this wait instead of being missed: `notify_waiters` reaches only
+            // a wait that is registered.
+            let ready = self.0.handle.0.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if let Some(event) = self.0.handle.feed().next(self.0.id) {
+                return Some(event);
+            }
+            if self.0.handle.0.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            ready.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod handle_tests;
 #[cfg(test)]
 mod tests;
