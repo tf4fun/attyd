@@ -298,8 +298,9 @@ export class Workspace {
       this.#authRequired = true;
       return;
     }
-    // A session nothing knows of is not one to report: send the page home (§5.1).
-    if (this.#knownCwd(route.sessionId) == null) this.#navigate({ kind: "home" }, true);
+    // A session nothing knows of is not one to report: send the page home (§5.1). The cwd the
+    // link itself names counts: the load of a session it names may fail, and the page says so.
+    if ((this.#knownCwd(route.sessionId) ?? route.cwd) == null) this.#navigate({ kind: "home" }, true);
   }
 
   #catalogSessions(): SessionInfo[] {
@@ -489,10 +490,11 @@ export class Workspace {
     const waiting = this.#authRequired || [...this.#ended.values()].some((end) => needsAuthentication(end.error));
     if ((signedIn || restarted) && waiting) {
       this.#authRequired = false;
-      // What failed for want of authentication is tried again (§5.4).
+      // What failed for want of authentication is tried again (§5.4), the listing included.
       for (const [scope, end] of this.#ended) {
         if (end.reason === "load_failed" && needsAuthentication(end.error)) this.#ended.delete(scope);
       }
+      this.#listing = { ...this.#listing, refresh: true, failedRevision: undefined, sentAgainst: undefined };
     }
   }
 

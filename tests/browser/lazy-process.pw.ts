@@ -19,15 +19,12 @@ const test = baseTest.extend<{ fixtureUrl: string }>({
   baseURL: async ({ fixtureUrl }, use) => use(fixtureUrl),
 });
 
-// Protocol v2 keeps only final messages in the log (S2, §10): a loaded turn's
-// tools and thoughts are not part of any document, and no process page exists.
-// The former paging tests ("pages of ten", "release after five minutes", the
-// pagination footer through loading, timeout and retry) had nothing left to
-// page; their replacement is that the history arrives without process and the
-// page never asks for it. Running process layout stays covered below and in
-// turn-collapse.pw.ts, before the turn ends.
+// Revision 3 keeps every entry of a session in its document (memory model §3): a loaded turn's
+// tools and thoughts arrive with its messages on the stream, folded behind the turn's disclosure,
+// and no process page exists to ask for. The former paging tests have nothing left to page; their
+// replacement is that the whole history arrives at once and the page never asks for more.
 
-test("loads history as final messages only and never requests execution details", async ({ page }) => {
+test("loads the whole history, tools included, folded in its turns, and never requests execution details", async ({ page }) => {
   const api = trackApi(page);
   await page.goto("/sessions/lazy-process-session");
   const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
@@ -36,17 +33,16 @@ test("loads history as final messages only and never requests execution details"
   expect(api.streams.map((url) => url.searchParams.getAll("scope"))).toContainEqual(
     expect.arrayContaining([`session/${SESSION_ID}`]),
   );
-  const document = await (await page.request.get(`/api/v2/scopes/${encodeURIComponent(`session/${SESSION_ID}`)}`)).text();
-  expect(document).toContain(FINAL_ANSWER);
-  expect(document).not.toContain("HIDDEN_PROCESS_PAYLOAD_");
-  expect(document).not.toContain("Inspect process item");
-  await expect(turn.locator(".tool-card")).toHaveCount(0);
-  await expect(turn.locator(".turn-process-count")).toHaveCount(0);
-  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
-  await expect(page.getByText("Inspect process item 01", { exact: true })).toHaveCount(0);
+  // The tools are in the thread, folded behind the disclosure, and nothing was asked for them.
+  await expect(turn.locator(".tool-card")).not.toHaveCount(0);
+  await expect(turn.locator(".tool-card").and(page.locator(":visible"))).toHaveCount(0);
+  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(1);
+  await expect(turn.locator(".turn-process-count")).toHaveCount(1);
+  await turn.getByRole("button", { name: "Expand execution process", exact: true }).click();
+  await expect(turn.getByText("Inspect process item 01", { exact: true })).toBeVisible();
   await page.reload();
   await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
-  await expect(turn.locator(".tool-card")).toHaveCount(0);
+  await expect(turn.locator(".tool-card")).not.toHaveCount(0);
   expect(api.process).toEqual([]);
   expect(api.v1).toEqual([]);
 });
@@ -94,7 +90,7 @@ test("keeps task progress on the left and recovers composer space when the mobil
   await expect(plan.locator(".plan-body")).toBeVisible();
   await page.getByRole("button", { name: "Stop current turn", exact: true }).click();
   await expect.poll(() => opsOf(api, "cancel", `session/${SESSION_ID}`)).toHaveLength(1);
-  // The cancelled turn commits; its plan was process and leaves with it.
+  // The cancelled turn commits; the plan leaves the dock and stays in the turn's folded process.
   await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
   await expect(plan).toHaveCount(0);
   expect(api.v1).toEqual([]);

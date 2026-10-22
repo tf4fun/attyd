@@ -33,11 +33,11 @@ const test = baseTest.extend<{ collapseFixture: CollapseFixture }>({
 
 // `turn-collapse-flow` streams twenty "Process paragraph" Agent messages, a
 // thought and a tool call, then the final answer. The paragraphs are
-// `agent_message_chunk`s: they are part of the reply, so the log keeps them with
-// the final answer. Only the thought and the tool call are process, which the
-// commit removes (protocol S2); no process page exists to fetch it back.
+// `agent_message_chunk`s: they are part of the reply, kept with the final answer. The
+// thought and the tool call are process, which the commit folds behind the disclosure and keeps
+// in the thread; no process page exists to fetch it.
 
-test("shows the live process and keeps every Agent message, without process, after completion at the bottom", async ({ page, collapseFixture }, testInfo) => {
+test("shows the live process and keeps every Agent message, with the process folded, after completion at the bottom", async ({ page, collapseFixture }, testInfo) => {
   await page.setViewportSize({ width: 900, height: 420 });
   const api = trackApi(page);
   const { turn, thread } = await startTurn(page);
@@ -68,7 +68,7 @@ test("keeps the committed reply after five idle minutes without fetching process
   await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
   const api = trackApi(page);
   const { turn } = await startTurn(page);
-  // Process layout is checked while the turn still runs; nothing of it survives the commit.
+  // Process layout is checked while the turn still runs; the commit folds it away.
   const running = await processGeometry(turn);
   expect(running.agentThoughtGap).toBeCloseTo(9, 0);
   expect(running.thoughtToolGap).toBeCloseTo(18, 0);
@@ -186,17 +186,18 @@ async function startTurn(page: Page) {
   return { turn, thread: page.getByRole("region", { name: "Conversation thread", exact: true }) };
 }
 
-/** The committed turn: every Agent message of the reply, and no process. */
+/** The committed turn: every Agent message of the reply, and the process folded behind its disclosure. */
 async function expectCommitted(turn: Locator) {
+  const visible = turn.page().locator(":visible");
   await expect(turn.locator(".message-content").getByText("Process paragraph 1:", { exact: false })).toBeVisible();
   await expect(turn.locator(".message-content").getByText("Process paragraph 20:", { exact: false })).toBeVisible();
   // canon merges the paragraphs and the final answer into one text block, so
   // the committed reply is checked by content, not by message boundaries.
   await expect(turn.locator(".message-content").last()).toContainText("The final answer is ready.");
-  await expect(turn.locator(".thinking-block")).toHaveCount(0);
-  await expect(turn.getByText("Inspect collapse fixture", { exact: true })).toHaveCount(0);
-  await expect(turn.locator(".tool-card")).toHaveCount(0);
-  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
+  await expect(turn.locator(".thinking-block").and(visible)).toHaveCount(0);
+  await expect(turn.getByText("Inspect collapse fixture", { exact: true }).and(visible)).toHaveCount(0);
+  await expect(turn.locator(".tool-card").and(visible)).toHaveCount(0);
+  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(1);
 }
 
 async function expectBottom(thread: Locator) {
