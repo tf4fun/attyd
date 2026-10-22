@@ -89,6 +89,13 @@ impl Feed {
     }
 }
 
+impl FeedSubscription {
+    /// The next event if one is queued now.
+    pub(crate) fn try_next(&self) -> Option<StreamEvent> {
+        self.0.handle.feed().next(self.0.id)
+    }
+}
+
 impl FeedHandle {
     /// Taps every later commit and returns the published documents now.
     pub(crate) fn tap(&self, sender: UnboundedSender<TapCommit>) -> BTreeMap<String, Value> {

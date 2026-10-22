@@ -15,82 +15,18 @@ use clap::Parser;
 use futures::{SinkExt, StreamExt};
 
 use super::*;
-use crate::protocol::Op;
 use crate::protocol::admission::OpWrite;
-use crate::protocol::diff;
 use crate::protocol::documents::{OperationKind, ProtocolError, Scope};
 use crate::protocol::feed::FeedSubscription;
 use crate::protocol::feed::tap::TapCommit;
 use crate::protocol::subscription::Subscribed;
-use crate::protocol::hub::Publication;
+use crate::protocol::publication::Publication;
+use crate::protocol::replica::Replica;
 use crate::protocol::op::OpEnd;
 
 const WAIT: Duration = Duration::from_secs(5);
 
 type Documents = BTreeMap<String, Value>;
-
-/// A client's copy of one scope's document, built from wire events only.
-#[derive(Debug, Clone, Default)]
-struct Replica {
-    epoch: String,
-    rev: u64,
-    /// `{ history?, prompts, live, entries? }`: the paths the ops address.
-    doc: Value,
-}
-
-impl Replica {
-    /// The replica a snapshot event installs.
-    fn from_snapshot(event: &Value) -> Self {
-        let snapshot = &event["snapshot"];
-        let mut doc = snapshot["doc"].clone();
-        if let Some(entries) = snapshot.get("entries") {
-            let mut list = vec![Value::Null; entries["length"].as_u64().unwrap() as usize];
-            for pair in entries["changed"].as_array().unwrap() {
-                list[pair[0].as_u64().unwrap() as usize] = pair[1].clone();
-            }
-            doc["entries"] = Value::Array(list);
-        }
-        Self {
-            epoch: snapshot["epoch"].as_str().unwrap().to_string(),
-            rev: snapshot["rev"].as_u64().unwrap(),
-            doc,
-        }
-    }
-
-    fn apply(&mut self, event: &Value) -> Result<(), String> {
-        if event.get("snapshot").is_some() {
-            *self = Self::from_snapshot(event);
-            return Ok(());
-        }
-        let rev = event["rev"].as_u64().ok_or("an ops event names its rev")?;
-        if rev != self.rev + 1 {
-            return Err(format!("rev {rev} does not follow {}: {event}", self.rev));
-        }
-        let ops: Vec<Op> = serde_json::from_value(event["ops"].clone())
-            .map_err(|error| format!("ops: {error}"))?;
-        for op in &ops {
-            diff::apply(&mut self.doc, op)
-                .map_err(|error| format!("{op:?} does not apply: {error:?}"))?;
-        }
-        self.rev = rev;
-        Ok(())
-    }
-
-    fn live(&self) -> Value {
-        self.doc["live"].clone()
-    }
-
-    fn entries(&self) -> Vec<Value> {
-        self.doc["entries"].as_array().cloned().unwrap_or_default()
-    }
-
-    /// How many prompts of the document have ended.
-    fn ended_prompts(&self) -> usize {
-        self.doc["prompts"]
-            .as_array()
-            .map_or(0, |prompts| prompts.iter().filter(|prompt| prompt.get("end").is_some()).count())
-    }
-}
 
 /// One step of a scope as a replica saw it: the event (none for the initial cut) and the
 /// document after it.

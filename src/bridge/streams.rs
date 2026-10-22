@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::protocol::documents::{End, EndReason, ErrorCode, ProtocolError, Scope};
-use crate::protocol::hub::{Publication, Subscribed, Subscription};
+use crate::protocol::feed::FeedSubscription;
+use crate::protocol::publication::Publication;
+use crate::protocol::subscription::Subscribed;
 
 /// Registers a subscription under the bridge guard, from the cut the guard
 /// sees, and starts what it waits for. The guard's commit, on its release,
@@ -18,7 +20,7 @@ use crate::protocol::hub::{Publication, Subscribed, Subscription};
 pub(super) fn subscribe(
     state: &mut BridgeState,
     scopes: &[Subscribed],
-) -> (Subscription, Option<Value>) {
+) -> (FeedSubscription, Option<Value>) {
     let subscription = register(state, scopes);
     let command = serve(state);
     refresh_observer_timers(state);
@@ -28,9 +30,8 @@ pub(super) fn subscribe(
 /// Registers a subscription under the bridge guard, from the cut the guard
 /// sees, without starting a load: while the Agent initializes, its
 /// capabilities are not known yet. Its readiness serves the streams.
-pub(super) fn register(state: &BridgeState, scopes: &[Subscribed]) -> Subscription {
-    let published = &mut *state.protocol.publication.lock();
-    published.hub.subscribe(&published.publisher, scopes)
+pub(super) fn register(state: &BridgeState, scopes: &[Subscribed]) -> FeedSubscription {
+    state.protocol.publication.lock().feed.subscribe(scopes)
 }
 
 /// Asks the actor to serve the streams again.
@@ -100,12 +101,6 @@ pub(super) fn serve(state: &mut BridgeState) -> Option<Value> {
 fn waiting_for_load(publication: &Publication) -> BTreeMap<String, Vec<Option<String>>> {
     let published = publication.lock();
     let mut sessions: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
-    for (session_id, waiting) in published.hub.followed_sessions() {
-        sessions
-            .entry(session_id)
-            .or_default()
-            .extend(waiting.into_iter().map(|waiting| waiting.cwd));
-    }
     for (session_id, waiting) in published.feed.followed_sessions() {
         sessions
             .entry(session_id)
@@ -130,30 +125,13 @@ pub(super) fn end_waiting(
     reason: EndReason,
     error: Option<ProtocolError>,
 ) {
-    let published = &mut *state.protocol.publication.lock();
-    published.feed.end_waiting(
+    state.protocol.publication.lock().feed.end_waiting(
         session_id,
         &End {
             reason,
             error: error.clone(),
         },
     );
-    let waiting = published
-        .hub
-        .followed_sessions()
-        .remove(session_id)
-        .unwrap_or_default();
-    let scope = Scope::Session(session_id.to_string()).to_string();
-    for waiting in waiting {
-        published.hub.end(
-            waiting.id,
-            &scope,
-            End {
-                reason,
-                error: error.clone(),
-            },
-        );
-    }
 }
 
 /// A load a subscription started ended. A failure the registry published
@@ -209,12 +187,7 @@ pub(super) fn releasable(state: &BridgeState) -> bool {
 /// The sessions some subscription follows.
 pub(super) fn followed(state: &BridgeState) -> std::collections::BTreeSet<String> {
     let published = state.protocol.publication.lock();
-    published
-        .hub
-        .followed_sessions()
-        .into_keys()
-        .chain(published.feed.followed_sessions().into_keys())
-        .collect()
+    published.feed.followed_sessions().into_keys().collect()
 }
 
 /// Whether a held session is needed (S6): a subscription follows it, an

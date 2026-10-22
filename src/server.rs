@@ -29,7 +29,8 @@ use crate::dev_proxy::{DevProxy, reject_self_proxy};
 use crate::options::{Options, normalize_origin};
 use crate::protocol::admission::{self, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
-use crate::protocol::hub::{HEARTBEAT, Publication, Subscribed, Subscription};
+use crate::protocol::publication::Publication;
+use crate::protocol::subscription::HEARTBEAT;
 use crate::protocol::wire;
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -164,23 +165,8 @@ struct BridgeHub {
     /// The published documents and the v2 streams, shared by the
     /// generations (protocol §5.4).
     publication: Publication,
-    // Per-host test barrier for a subscription crossing Agent generations.
-    #[cfg(test)]
-    after_subscribe_input: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
-    // Per-host test barrier for the next `create`, `fork` or `list` response.
-    #[cfg(test)]
-    before_op_response: std::sync::Mutex<Option<ResponseHold>>,
     state: Mutex<BridgeHubState>,
     stopped: Notify,
-}
-
-/// The next `create`, `fork` or `list` write, once admitted, tells its op ID
-/// through `admitted` and waits for `resume` before its response takes the
-/// operation's result.
-#[cfg(test)]
-struct ResponseHold {
-    admitted: oneshot::Sender<String>,
-    resume: oneshot::Receiver<()>,
 }
 
 struct BridgeRuntime {
@@ -196,10 +182,6 @@ impl BridgeHub {
         Arc::new(Self {
             options,
             publication: Publication::default(),
-            #[cfg(test)]
-            after_subscribe_input: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            before_op_response: std::sync::Mutex::new(None),
             state: Mutex::new(BridgeHubState::default()),
             stopped: Notify::new(),
         })
@@ -223,7 +205,7 @@ impl BridgeHub {
     /// scope that has not ended (S6, Q2). Global and catalog alone do not.
     fn streams_need_connection(&self) -> bool {
         let published = self.publication.lock();
-        !published.hub.followed_sessions().is_empty() || !published.feed.followed_sessions().is_empty()
+        !published.feed.followed_sessions().is_empty()
     }
 
     /// Schedules the one recovery task when no generation runs and a stream
@@ -277,78 +259,6 @@ impl BridgeHub {
     async fn serve_streams(&self) {
         if let Some(input) = &self.state.lock().await.input {
             let _ = input.send(bridge::BridgeInput::ServeStreams);
-        }
-    }
-
-    /// Opens a v2 stream (protocol §5.1). While a generation reads its
-    /// inputs, it registers the subscription under the bridge guard; with
-    /// none, the subscription is aligned from the published cut, and a
-    /// session it follows starts the next connection (Q2).
-    async fn subscribe(self: &Arc<Self>, scopes: Vec<Subscribed>) -> Option<Subscription> {
-        let input = {
-            let state = self.state.lock().await;
-            if state.shutting_down {
-                return None;
-            }
-            state.input.clone()
-        };
-        #[cfg(test)]
-        {
-            let pause = self.after_subscribe_input.lock().unwrap().take();
-            if let Some((reached, resume)) = pause {
-                let _ = reached.send(());
-                resume
-                    .await
-                    .expect("the generation-race test releases its pause");
-            }
-        }
-        // The input the request took, then the current generation's when
-        // that one went with the old generation.
-        let mut attempt = input;
-        let mut failed: Option<mpsc::UnboundedSender<bridge::BridgeInput>> = None;
-        loop {
-            if let Some(current) = attempt.take() {
-                let (reply, subscribed) = oneshot::channel();
-                if current
-                    .send(bridge::BridgeInput::Subscribe {
-                        scopes: scopes.clone(),
-                        reply,
-                    })
-                    .is_ok()
-                    && let Ok(subscription) = subscribed.await
-                {
-                    return Some(subscription);
-                }
-                failed = Some(current);
-            }
-            let subscription = {
-                let state = self.state.lock().await;
-                if state.shutting_down {
-                    return None;
-                }
-                match (&state.input, &failed) {
-                    // A generation started after the input the request
-                    // took: it registers the subscription and serves it.
-                    (Some(current), Some(old)) if !current.same_channel(old) => {
-                        attempt = Some(current.clone());
-                        continue;
-                    }
-                    (Some(current), None) => {
-                        attempt = Some(current.clone());
-                        continue;
-                    }
-                    // No generation, or the ending one: the subscription
-                    // registers from the published cut; the next generation
-                    // serves it once it is ready.
-                    _ => {
-                        let published = &mut *self.publication.lock();
-                        published.hub.subscribe(&published.publisher, &scopes)
-                    }
-                }
-            };
-            // Both guards are released before recovery reads them again.
-            self.recover().await;
-            return Some(subscription);
         }
     }
 
@@ -543,19 +453,6 @@ impl BridgeHub {
         ))
     }
 
-    /// The test barrier of the next held response, once admitted.
-    #[cfg(test)]
-    async fn before_op_response(&self, op: &str) {
-        let hold = self.before_op_response.lock().unwrap().take();
-        if let Some(hold) = hold {
-            let _ = hold.admitted.send(op.to_string());
-            let _ = hold.resume.await;
-        }
-    }
-
-    #[cfg(not(test))]
-    async fn before_op_response(&self, _op: &str) {}
-
     async fn shutdown(&self) {
         let cancellation = {
             let mut state = self.state.lock().await;
@@ -578,10 +475,8 @@ impl BridgeHub {
             };
             let _ = tokio::time::timeout(BRIDGE_SHUTDOWN_GRACE_PERIOD, wait).await;
         }
-        // The v2 streams deliver the final commit, then end.
-        let mut published = self.publication.lock();
-        published.hub.close();
-        published.feed.close();
+        // The streams deliver the final commit, then end.
+        self.publication.lock().feed.close();
     }
 }
 
@@ -694,13 +589,8 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
     let dev_proxy = options.dev_server.as_deref().map(DevProxy::new);
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/v2/stream", get(protocol_stream))
-        // The revision 3 stream, beside the revision 2 one until the cutover.
         .route("/api/v3/stream", get(feed_stream))
         .route("/api/v3/scopes/{*scope}", get(read_scope_v3).post(write_scope_v3))
-        // Writes share the read's wildcard; held `create`, `fork` and `list`
-        // responses take no JSON deadline (protocol §6.3).
-        .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
         .route("/api/v2/sessions/{*read}", get(read_session))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
@@ -751,29 +641,6 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// A protocol error body `{ error: { code, message } }` (protocol §9).
 fn protocol_error(status: StatusCode, error: ProtocolError) -> Response {
     (status, axum::Json(wire::ErrorBody { error })).into_response()
-}
-
-/// `GET /api/v2/scopes/{scope}` (protocol §8): the published document. It
-/// starts, loads and holds nothing; an unknown log is omitted.
-async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) -> Response {
-    if Scope::parse(&scope).is_none() {
-        return protocol_error(
-            StatusCode::BAD_REQUEST,
-            ProtocolError::new(ErrorCode::InvalidRequest, format!("no scope {scope}")),
-        );
-    }
-    let document = state.bridge.publication.lock().publisher.document(&scope);
-    let Some(document) = document else {
-        return protocol_error(
-            StatusCode::NOT_FOUND,
-            ProtocolError::new(ErrorCode::NotFound, format!("{scope} is not held")),
-        );
-    };
-    axum::Json(wire::ScopeRead {
-        live: document.live,
-        log: document.log,
-    })
-    .into_response()
 }
 
 /// `GET /api/v3/scopes/{scope}` (protocol §8): the document as one snapshot, the one a stream
@@ -1050,18 +917,6 @@ fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
     })
 }
 
-/// `POST /api/v2/scopes/{scope}/ops` (protocol §6) and the resource actions
-/// (§7). The raw path is split before decoding, so an encoded session ID
-/// keeps its `/`.
-async fn write_scope(
-    State(state): State<AppState>,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    write_scope_at(state, uri, headers, body, "/api/v2/scopes/", true).await
-}
-
 /// `POST /api/v3/scopes/{scope}/ops` (protocol §6.3): every operation is
 /// answered `202` when it is admitted, none holds its response open; the result
 /// arrives in the document.
@@ -1071,22 +926,9 @@ async fn write_scope_v3(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    write_scope_at(state, uri, headers, body, "/api/v3/scopes/", false).await
-}
-
-/// A write under `prefix`; `hold` answers `create`, `fork` and `list` when they
-/// end (revision 2) instead of when they are admitted.
-async fn write_scope_at(
-    state: AppState,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-    prefix: &str,
-    hold: bool,
-) -> Response {
     let segments: Option<Vec<String>> = uri
         .path()
-        .strip_prefix(prefix)
+        .strip_prefix("/api/v3/scopes/")
         .unwrap_or_default()
         .split('/')
         .map(path_segment)
@@ -1149,49 +991,7 @@ async fn write_scope_at(
         Err(error) => return refused(error),
     };
     let op = admission.op;
-    let Some(end) = admission.end.filter(|_| hold) else {
-        return (StatusCode::ACCEPTED, axum::Json(wire::OpAccepted { op })).into_response();
-    };
-    state.bridge.before_op_response(&op).await;
-    // A dropped response drops only this receiver; the operation runs on.
-    let end = match end.await {
-        Ok(Ok(result)) => wire::OpOutcome::Result { result },
-        Ok(Err(error)) => wire::OpOutcome::Error { error },
-        Err(_) => wire::OpOutcome::Error {
-            error: ProtocolError::new(
-                ErrorCode::Unavailable,
-                "the operation ended without a result",
-            ),
-        },
-    };
-    axum::Json(wire::OpEnded { op, end }).into_response()
-}
-
-/// `GET /api/v2/stream` (protocol §5): the events of the scopes it follows,
-/// without SSE ids, with a heartbeat while idle. Dropping the body closes
-/// the subscription.
-async fn protocol_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -> Response {
-    let scopes = match crate::protocol::hub::parse_stream_query(query.as_deref().unwrap_or("")) {
-        Ok(scopes) => scopes,
-        Err(error) => return protocol_error(StatusCode::BAD_REQUEST, error),
-    };
-    let Some(subscription) = state.bridge.subscribe(scopes).await else {
-        return protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
-        );
-    };
-    let stream = futures::stream::unfold(subscription, |subscription| async move {
-        let event = subscription.next().await?;
-        let data = serde_json::to_string(&event).expect("a protocol event serializes");
-        Some((
-            Ok::<_, Infallible>(SseEvent::default().data(data)),
-            subscription,
-        ))
-    });
-    Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(HEARTBEAT))
-        .into_response()
+    (StatusCode::ACCEPTED, axum::Json(wire::OpAccepted { op })).into_response()
 }
 
 /// `GET /api/v3/stream` (protocol §5): the events of the scopes it follows from
@@ -1541,21 +1341,18 @@ mod tests {
     #[tokio::test]
     async fn shutdown_closes_event_streams_without_an_active_agent() {
         let hub = test_hub();
-        let subscription = hub
-            .subscribe(crate::protocol::hub::parse_stream_query("scope=global").unwrap())
-            .await
-            .expect("a stream opens before shutdown");
+        let follow =
+            crate::protocol::subscription::parse_stream_query("scope=global").unwrap();
+        let subscription = hub.publication.lock().feed.subscribe(&follow);
         hub.shutdown().await;
         tokio::time::timeout(Duration::from_millis(100), async {
             while subscription.next().await.is_some() {}
         })
         .await
         .expect("shutdown must close every SSE source before HTTP draining");
-        assert!(
-            hub.subscribe(crate::protocol::hub::parse_stream_query("scope=global").unwrap())
-                .await
-                .is_none()
-        );
+        // A stream opened after the shutdown has nothing to follow.
+        let late = hub.publication.lock().feed.subscribe(&follow);
+        assert!(late.next().await.is_none());
     }
 
     #[tokio::test]

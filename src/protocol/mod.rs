@@ -8,31 +8,26 @@
 //! So far: the control reduction (`controls`), the JSON Pointer ops (`diff`),
 //! `canon` with the hash chain and the turn log (`canon`), the documents and
 //! events (`documents`), operation slots (`op`, `registry`), the projections
-//! (`project`), the commit step (`publish`) and the Hub (`hub`). The bridge actor
-//! runs the commit step from migration step 4b on (docs/state-sync.md §5).
+//! (`project`) and the feed (`feed`, `engine`, `subscription`) the bridge actor
+//! commits to (docs/state-sync.md §5).
 #![allow(dead_code)]
 
 pub(crate) mod admission;
 pub(crate) mod canon;
 pub(crate) mod controls;
-#[cfg(test)]
-mod convergence_tests;
 pub(crate) mod diff;
 pub(crate) mod digest;
 pub(crate) mod documents;
 pub(crate) mod engine;
 pub(crate) mod feed;
-pub(crate) mod hub;
 pub(crate) mod live_doc;
-#[cfg(test)]
-mod hub_tests;
 pub(crate) mod op;
 pub(crate) mod pacing;
 pub(crate) mod project;
-pub(crate) mod publish;
+pub(crate) mod publication;
 pub(crate) mod registry;
 #[cfg(test)]
-pub(crate) mod stream_check;
+pub(crate) mod replica;
 pub(crate) mod subscription;
 pub(crate) mod timeline;
 pub(crate) mod timeline_doc;
