@@ -6,6 +6,8 @@
 //! is written by the bridge's own transitions and published by the commit; the
 //! actor only ends a scope on one subscription when no transition can, as when
 //! the subscription gave no directory or its session was deleted unheld.
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::protocol::documents::{End, EndReason, ErrorCode, ProtocolError, Scope};
 use crate::protocol::hub::{Publication, Subscribed, Subscription};
@@ -62,9 +64,8 @@ pub(super) fn serve(state: &mut BridgeState) -> Option<Value> {
             "sessionId": session_id, "cwd": cwd,
         }));
     }
-    let followed = state.protocol.publication.lock().hub.followed_sessions();
     let mut command = None;
-    for (session_id, waiting) in followed {
+    for (session_id, waiting) in waiting_for_load(&state.protocol.publication) {
         // An operation occupies the session from its admission, before its
         // ACP request (S5): the subscription waits for it.
         if waiting.is_empty()
@@ -81,7 +82,7 @@ pub(super) fn serve(state: &mut BridgeState) -> Option<Value> {
         }
         // A held session ignores the directory; an unheld one needs it, and a
         // missing one is never replaced by a default (protocol §5.1).
-        let Some(cwd) = waiting.iter().find_map(|waiting| waiting.cwd.clone()) else {
+        let Some(cwd) = waiting.iter().find_map(|cwd| cwd.clone()) else {
             let error = ProtocolError::new(
                 ErrorCode::InvalidRequest,
                 format!("the session {session_id} is not held: its subscription needs a cwd"),
@@ -92,6 +93,26 @@ pub(super) fn serve(state: &mut BridgeState) -> Option<Value> {
         command = prepare_session_load(state, session_id, Some(cwd));
     }
     command
+}
+
+/// The sessions some subscription, of either stream, waits to have published,
+/// with the directories the subscriptions gave for their load.
+fn waiting_for_load(publication: &Publication) -> BTreeMap<String, Vec<Option<String>>> {
+    let published = publication.lock();
+    let mut sessions: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+    for (session_id, waiting) in published.hub.followed_sessions() {
+        sessions
+            .entry(session_id)
+            .or_default()
+            .extend(waiting.into_iter().map(|waiting| waiting.cwd));
+    }
+    for (session_id, waiting) in published.feed.followed_sessions() {
+        sessions
+            .entry(session_id)
+            .or_default()
+            .extend(waiting.into_iter().map(|waiting| waiting.cwd));
+    }
+    sessions
 }
 
 fn published(publication: &Publication, session_id: &str) -> bool {
@@ -110,6 +131,13 @@ pub(super) fn end_waiting(
     error: Option<ProtocolError>,
 ) {
     let published = &mut *state.protocol.publication.lock();
+    published.feed.end_waiting(
+        session_id,
+        &End {
+            reason,
+            error: error.clone(),
+        },
+    );
     let waiting = published
         .hub
         .followed_sessions()
@@ -180,13 +208,12 @@ pub(super) fn releasable(state: &BridgeState) -> bool {
 
 /// The sessions some subscription follows.
 pub(super) fn followed(state: &BridgeState) -> std::collections::BTreeSet<String> {
-    state
-        .protocol
-        .publication
-        .lock()
+    let published = state.protocol.publication.lock();
+    published
         .hub
         .followed_sessions()
         .into_keys()
+        .chain(published.feed.followed_sessions().into_keys())
         .collect()
 }
 

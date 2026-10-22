@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
 use super::documents::{AgentInfo, End, EndReason, Scope};
@@ -225,6 +225,8 @@ struct Shared {
     /// Wakes the streams waiting for an event.
     ready: Notify,
     closed: AtomicBool,
+    /// Changes whenever a subscription is dropped.
+    closes: watch::Sender<u64>,
 }
 
 impl FeedHandle {
@@ -233,6 +235,7 @@ impl FeedHandle {
             feed: Mutex::new(Feed::new(process_epoch)),
             ready: Notify::new(),
             closed: AtomicBool::new(false),
+            closes: watch::channel(0).0,
         }))
     }
 
@@ -269,6 +272,12 @@ impl FeedHandle {
         self.feed().subscribers()
     }
 
+    /// Changes whenever a subscription is dropped: a session may be needed no
+    /// longer.
+    pub(crate) fn closes(&self) -> watch::Receiver<u64> {
+        self.0.closes.subscribe()
+    }
+
     /// The sessions some subscription follows (see `Feed::followed_sessions`).
     pub(crate) fn followed_sessions(&self) -> BTreeMap<String, Vec<Waiting>> {
         self.feed().followed_sessions()
@@ -301,6 +310,10 @@ struct SubscriptionGuard {
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
         self.handle.feed().unsubscribe(self.id);
+        self.handle
+            .0
+            .closes
+            .send_modify(|closes| *closes = closes.wrapping_add(1));
     }
 }
 

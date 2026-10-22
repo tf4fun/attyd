@@ -1602,7 +1602,11 @@ where
         state.observer_timeout = Some(options.session_unobserved_timeout);
     }
     // A closed v2 subscription may leave a session unneeded (S6).
-    let mut stream_closes = state.lock().await.protocol.publication.lock().hub.closes();
+    let (mut stream_closes, mut feed_closes) = {
+        let state = state.lock().await;
+        let published = state.protocol.publication.lock();
+        (published.hub.closes(), published.feed.closes())
+    };
     let filesystem = (options.transport == Transport::Stdio)
         .then(|| {
             WorkspaceFileSystem::new(
@@ -1762,6 +1766,9 @@ where
                         // cleanup below drain already accepted deliveries.
                         _ = connection.incoming_closed() => break None,
                         Ok(()) = stream_closes.changed() => {
+                            refresh_observer_timers(&mut *state.lock().await);
+                        }
+                        Ok(()) = feed_closes.changed() => {
                             refresh_observer_timers(&mut *state.lock().await);
                         }
                         input = observer_rx.recv() => {
