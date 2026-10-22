@@ -51,3 +51,203 @@ prompts instead of the turn log and the process): `a_streamed_prompt_with_an_ans
 `the_same_history_gives_the_same_entries_after_a_restart`, and the gate's own counterexamples
 (`the_gate_rejects_an_entry_change_without_its_event`,
 `the_atomic_check_rejects_a_prompt_that_ends_before_its_operation`).
+
+## Server streams and reads (`src/server/stream_tests.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. The revision 2 stream and scope reads over HTTP: alignment, `have`, resumption across Agent EOF, recovery and login restart. `stream_tests/feed.rs` covers the revision 3 stream, loads and the next connection; the recovery cases below are to be restored there.
+
+- [ ] reads_return_one_cut_hold_nothing_and_tell_an_unknown_log_from_an_empty_one
+- [ ] a_stream_aligns_several_scopes_without_ids_and_heartbeats_while_idle
+- [ ] have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_log
+- [ ] each_session_uses_its_own_have_and_cwd_on_a_multi_scope_stream
+- [ ] an_invalid_stream_query_is_refused
+- [ ] after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_restarts_nothing
+- [ ] a_session_stream_waits_through_an_agent_eof_and_converges_on_the_next_connection
+- [ ] a_session_stream_applies_a_diverging_replay_after_an_agent_eof
+- [ ] a_successful_terminal_login_starts_the_next_connection_for_a_global_only_stream
+- [ ] a_new_global_stream_aligns_while_initialize_is_unanswered
+- [ ] a_known_session_aligns_on_a_new_stream_while_the_next_initialize_is_unanswered
+- [ ] an_initialization_failure_keeps_recovering_while_a_session_stream_needs_it
+- [ ] recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_leaves
+- [ ] a_cold_load_cut_by_an_eof_keeps_the_cache_and_converges_on_the_next_connection
+- [ ] a_session_ended_with_load_failed_is_no_recovery_need_behind_a_global_stream
+- [ ] a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing
+- [ ] review_a_subscription_crossing_generations_loads_on_the_current_agent
+- [ ] review_shutdown_during_initialize_publishes_a_final_agent_before_closing_streams
+- [ ] review_an_http_transport_construction_error_is_published_to_v2
+- [ ] review_a_cold_subscription_registered_during_initialize_is_served_after_reloads
+
+## Writes over HTTP (`src/server/stream_tests/ops/actions.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] a_permission_is_answered_alone_and_at_most_once
+- [ ] an_interaction_that_does_not_exist_is_not_found
+- [ ] a_mode_is_set_when_the_agent_answers_and_the_answer_is_the_response
+- [ ] an_agent_error_is_the_response_and_changes_nothing
+- [ ] a_boolean_option_is_set_and_one_not_offered_is_refused_before_the_agent_hears
+- [ ] a_control_runs_while_a_prompt_runs
+- [ ] a_control_of_a_session_that_is_not_held_is_not_found
+- [ ] a_session_is_closed_when_the_agent_closes_it_and_leaves_the_bridge
+- [ ] an_agent_error_leaves_the_session_held_and_not_closing
+- [ ] an_agent_that_does_not_advertise_close_is_refused_as_unsupported
+- [ ] closing_during_a_prompt_answers_its_pending_permissions_cancelled
+
+## Writes over HTTP (`src/server/stream_tests/ops/admission.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] session_writes_need_the_current_ended_op_and_replace_it
+- [ ] global_writes_need_the_current_ended_op_and_replace_it
+- [ ] a_fork_is_refused_while_a_global_operation_runs
+- [ ] a_global_write_is_refused_while_a_fork_runs
+- [ ] a_write_with_a_client_id_is_installed_under_that_id
+- [ ] a_malformed_client_id_is_refused_before_anything_happens
+- [ ] a_repeated_write_is_accepted_again_and_does_nothing_more
+- [ ] a_write_that_is_not_a_repeat_is_judged_by_expect_and_status_as_before
+- [ ] a_list_needs_the_current_ended_catalog_op
+- [ ] of_two_writes_with_one_expect_only_one_is_admitted
+- [ ] a_refused_write_can_be_submitted_again_on_the_same_expect
+- [ ] refusals_follow_the_admission_order
+- [ ] without_a_connection_writes_are_unavailable_after_expect_and_arguments
+- [ ] malformed_and_foreign_writes_are_refused_with_the_protocol_error_body
+- [ ] a_session_id_with_slashes_is_written_through_its_encoded_scope
+
+## Writes over HTTP (`src/server/stream_tests/ops/execution.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] a_prompt_answers_202_with_its_op_and_commits_its_result
+- [ ] create_fork_and_list_answer_with_their_result_or_error_when_they_end
+- [ ] a_fork_uses_its_explicit_cwd_and_otherwise_the_source_cwd
+- [ ] a_fork_response_survives_its_replacement_by_an_agent_request
+- [ ] a_create_response_survives_its_replacement_and_a_late_reader_converges
+- [ ] a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscription
+- [ ] admitted_create_fork_and_list_keep_their_errors_when_the_agent_disconnects
+- [ ] a_dropped_create_response_does_not_withdraw_the_create
+- [ ] prompt_attachment_references_are_resolved_and_an_unknown_one_is_refused
+- [ ] review_setup_config_options_are_used_for_admission_and_execution
+- [ ] control_acknowledgements_fold_into_the_ending_event_and_failures_change_nothing
+- [ ] a_list_returns_its_page_and_a_stale_revision_is_catalog_changed
+
+## Writes over HTTP (`src/server/stream_tests/ops/interactions.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] interactions_of_create_fork_set_config_and_list_are_answered_in_their_scope
+- [ ] a_load_interaction_is_answered_in_the_loading_session
+- [ ] an_agent_request_without_a_running_op_starts_one_that_completes_with_its_last_interaction
+- [ ] an_answer_is_refused_whole_unless_it_covers_exactly_the_pending_interactions
+- [ ] a_prompt_cancel_asks_the_agent_once_and_keeps_the_session_occupied
+- [ ] a_cancelled_agent_request_answers_its_interactions_with_their_cancel_outcomes
+- [ ] other_kinds_refuse_a_cancel
+
+## Writes over HTTP (`src/server/stream_tests/ops/login_terminals.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] a_login_terminal_takes_input_in_order_and_is_dismissed_after_it_exits
+- [ ] a_signalled_login_completes_and_a_dismissal_removes_only_its_terminal
+- [ ] a_successful_login_completes_and_a_global_only_stream_sees_the_next_connection
+
+## Writes over HTTP (`src/server/stream_tests/ops/long_requests.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] create_fork_and_list_responses_outlive_the_json_deadline
+
+## Writes over HTTP (`src/server/stream_tests/ops/occupation.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] a_held_sessions_prompt_and_its_delete_are_never_both_admitted
+- [ ] a_close_interaction_is_answered_through_either_scope_that_shows_it
+- [ ] a_failed_held_delete_keeps_its_error_and_the_subscription
+- [ ] a_subscription_during_the_first_load_keeps_its_recovery_directory
+- [ ] a_new_subscription_after_a_partially_failed_delete_still_needs_cwd
+- [ ] a_cold_delete_holds_back_the_load_until_it_ends
+
+## Writes over HTTP (`src/server/stream_tests/ops/reads.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] attachments_are_served_while_their_own_session_references_them
+- [ ] a_compaction_summary_block_is_served_until_its_turn_commits
+- [ ] reads_hold_nothing_and_a_released_session_serves_no_attachment
+- [ ] context_reads_follow_each_sessions_own_workspace
+
+## Writes over HTTP (`src/server/stream_tests/ops/retired_v1.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] v1_reads_writes_and_event_streams_are_unknown_routes_that_reach_no_agent
+
+## Writes over HTTP (`src/server/stream_tests/ops/review_terminal_io.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] terminal_input_backpressure_does_not_block_its_output_observer
+
+## Writes over HTTP (`src/server/stream_tests/ops/url_flows.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
+
+- [ ] flows_outlive_their_operation_and_end_by_their_own_lifecycle
+- [ ] a_reused_elicitation_id_names_a_new_flow
+- [ ] the_connection_end_clears_the_global_flow
+
+## Hub (`src/protocol/hub_tests.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. The revision 2 Hub: queues, coalescing, heartbeat. The feed has its own (`feed/tests.rs`, `subscription/queue_tests.rs`).
+
+- [ ] a_subscription_aligns_held_sessions_with_a_known_an_unknown_and_an_empty_log
+- [ ] have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_log
+- [ ] a_scope_published_later_is_aligned_when_it_appears
+- [ ] a_first_load_sends_each_subscription_its_log_from_its_own_baseline
+- [ ] an_unknown_log_keeps_the_declared_baseline_through_live_only_changes
+- [ ] queued_log_changes_follow_the_tail_and_only_the_output_advances_the_baseline
+- [ ] an_undelivered_reload_to_the_same_length_is_followed_by_the_next_append
+- [ ] an_undelivered_shrink_is_followed_by_the_next_append
+- [ ] an_equal_reload_of_a_known_log_changes_no_log
+- [ ] a_coalesced_queue_aligns_an_unsent_log_from_the_baseline_and_applies_directly
+- [ ] a_coalesce_after_a_partial_delivery_aligns_from_the_advanced_baseline
+- [ ] a_coalesce_keeps_a_queued_end_and_nothing_of_its_scope_follows
+- [ ] a_turn_completion_and_a_reload_coalesce_to_the_same_cut_a_follower_reaches
+- [ ] session_subscribers_count_open_subscriptions_only
+- [ ] a_replica_rejects_a_log_change_or_patch_that_does_not_apply
+- [ ] a_stream_query_names_scopes_heads_and_load_directories
+- [ ] review_an_uncoalesced_first_event_is_the_subscription_cut_before_later_commits
+- [ ] review_end_filters_later_same_scope_events_before_and_after_delivery
+
+## Registry convergence (`src/protocol/convergence_tests.rs`)
+
+Retired with the removal of the revision 2 engine. Read them at `9906369`. Registry transitions checked against the revision 2 publisher with a hash-chain replica. The same transitions are checked through the bridge gate and the engine tests.
+
+- [ ] global_and_catalog_start_with_a_completed_none_and_an_empty_log
+- [ ] a_created_session_starts_with_a_completed_open_and_a_known_empty_log
+- [ ] a_first_load_runs_with_an_unknown_log_and_ends_with_the_replayed_log
+- [ ] a_failed_first_load_ends_the_scope_with_load_failed
+- [ ] a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one_event
+- [ ] a_failed_turn_appends_nothing_and_keeps_its_prompt_and_error_on_op
+- [ ] a_requested_cancel_shows_on_the_running_prompt_and_a_cancelled_stop_completes_it
+- [ ] interactions_and_controls_change_in_live_while_the_log_stays
+- [ ] an_interaction_joins_the_running_prompt
+- [ ] attachments_are_readable_while_log_or_live_references_them
+- [ ] a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_ends
+- [ ] a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options
+- [ ] a_failed_set_mode_changes_no_control
+- [ ] control_updates_fold_after_the_response
+- [ ] a_delete_occupies_its_session_and_ends_it_with_deleted
+- [ ] a_failed_delete_frees_its_session_and_keeps_its_error_on_global
+- [ ] a_running_operation_is_not_replaced
+- [ ] reloads_with_an_equal_replay_change_no_log_and_a_diverging_one_rebuilds_from_the_common_prefix
+- [ ] terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release
+- [ ] an_installed_operation_remembers_its_scope_and_the_operation_it_replaced
+- [ ] url_flows_appear_on_accept_and_leave_on_completion
+- [ ] request_scoped_elicitations_run_as_an_agent_request_of_global
+- [ ] the_gate_reports_a_transition_that_was_not_committed
+- [ ] every_event_round_trips_its_documented_wire_shape
+- [ ] later_identical_mode_notification_overrides_setup_response
+- [ ] later_identical_config_notification_overrides_setup_response
+- [ ] streamed_text_publishes_only_the_new_suffix
+

@@ -1,5 +1,4 @@
-//! `GET /api/v3/stream` over real HTTP (docs/protocol.md §5): the stream of the
-//! revision 3 feed, beside the revision 2 one until the cutover replaces it.
+//! `GET /api/v3/stream` over real HTTP (docs/protocol.md §5): the stream of the feed.
 
 use super::*;
 
@@ -13,9 +12,6 @@ async fn open(server: &Server, query: &str) -> (StatusCode, Sse) {
     let sse = Sse {
         body: Body::new(response.into_body()).into_data_stream(),
         buffer: String::new(),
-        replicas: BTreeMap::new(),
-        aligned: BTreeSet::new(),
-        ended: BTreeSet::new(),
     };
     (status, sse)
 }

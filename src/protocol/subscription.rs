@@ -100,6 +100,9 @@ pub(crate) fn parse_stream_query(query: &str) -> Result<Vec<Subscribed>, Protoco
     Ok(scopes)
 }
 
+/// How often a stream that has nothing to send says it is alive.
+pub(crate) const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// A queue past this many bytes is replaced by snapshots (protocol §5.4).
 pub(crate) const QUEUE_BUDGET: usize = 1 << 20;
 

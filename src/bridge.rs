@@ -18,8 +18,6 @@ use uuid::Uuid;
 
 use crate::protocol::controls::with_notification_meta;
 
-#[cfg(test)]
-use self::publication::PublishedCommit;
 use self::publication::{BridgeLock, ProtocolState, agent_launch, operation_error};
 use self::scheduling::{ExecutionTurn, IngressSender};
 use crate::agent_process::StdioAcpAgent;
@@ -1256,8 +1254,8 @@ pub(crate) enum BridgeInput {
     /// loads its unheld sessions, and joins distribution under one bridge
     /// guard.
     Subscribe {
-        scopes: Vec<crate::protocol::hub::Subscribed>,
-        reply: oneshot::Sender<crate::protocol::hub::Subscription>,
+        scopes: Vec<crate::protocol::subscription::Subscribed>,
+        reply: oneshot::Sender<crate::protocol::feed::FeedSubscription>,
     },
     /// Starts the next load v2 streams wait for.
     ServeStreams,
@@ -1420,7 +1418,7 @@ pub async fn run_with_cancellation(
         commands,
         events,
         cancellation,
-        crate::protocol::hub::Publication::default(),
+        crate::protocol::publication::Publication::default(),
     )
     .await
 }
@@ -1432,7 +1430,7 @@ pub(crate) async fn run_publishing(
     commands: mpsc::UnboundedReceiver<BridgeInput>,
     events: EventSender,
     cancellation: CancellationToken,
-    publication: crate::protocol::hub::Publication,
+    publication: crate::protocol::publication::Publication,
 ) {
     let sink = EventSink { tx: events };
     let result = match options.transport {
@@ -1543,7 +1541,7 @@ where
         commands,
         sink,
         cancellation,
-        crate::protocol::hub::Publication::default(),
+        crate::protocol::publication::Publication::default(),
     )
     .await
 }
@@ -1558,7 +1556,7 @@ async fn run_generation<T>(
     commands: mpsc::UnboundedReceiver<BridgeInput>,
     sink: EventSink,
     cancellation: CancellationToken,
-    publication: crate::protocol::hub::Publication,
+    publication: crate::protocol::publication::Publication,
 ) -> Result<(), Error>
 where
     T: ConnectTo<Client>,
@@ -1566,14 +1564,6 @@ where
     let mut state = BridgeState::default();
     state.protocol.publication = publication;
     state.seed_from_previous_connection();
-    // A test's tap for this generation, set before its first commit.
-    #[cfg(test)]
-    {
-        let tap = state.protocol.publication.lock().next_tap.take();
-        if let Some(tap) = tap {
-            state.protocol.set_tap(tap);
-        }
-    }
     let state = Arc::new(BridgeLock::new(state));
     state.lock().await.protocol.agent.launch = agent_launch(&options);
     #[cfg(test)]
@@ -1624,10 +1614,10 @@ where
         state.observer_timeout = Some(options.session_unobserved_timeout);
     }
     // A closed v2 subscription may leave a session unneeded (S6).
-    let (mut stream_closes, mut feed_closes) = {
+    let mut feed_closes = {
         let state = state.lock().await;
         let published = state.protocol.publication.lock();
-        (published.hub.closes(), published.feed.closes())
+        published.feed.closes()
     };
     let filesystem = (options.transport == Transport::Stdio)
         .then(|| {
@@ -1787,9 +1777,6 @@ where
                         // SDK foreground future. Stop admission and let the
                         // cleanup below drain already accepted deliveries.
                         _ = connection.incoming_closed() => break None,
-                        Ok(()) = stream_closes.changed() => {
-                            refresh_observer_timers(&mut *state.lock().await);
-                        }
                         Ok(()) = feed_closes.changed() => {
                             refresh_observer_timers(&mut *state.lock().await);
                         }
@@ -6121,7 +6108,7 @@ mod tests {
     }
 
     async fn verify_stdio_clean_eof(exit_mode: &str, large: bool) {
-        use crate::protocol::stream_check::Replica;
+        use crate::protocol::replica::Replica;
         let cwd = env!("CARGO_MANIFEST_DIR");
         let fixture = format!("{cwd}/tests/fixtures/burst-prompt-agent.mjs");
         let options = options(&["attyd", "--cwd", cwd, "--", "node", &fixture, exit_mode]);
@@ -6144,12 +6131,12 @@ mod tests {
             fn apply(
                 replica: &mut Replica,
                 ops: &mut Vec<Value>,
-                event: crate::protocol::documents::Event,
+                event: crate::protocol::engine::StreamEvent,
             ) {
                 let event = serde_json::to_value(event).unwrap();
                 assert!(event.get("end").is_none(), "the stream ended: {event}");
                 replica.apply(&event).unwrap();
-                ops.push(replica.live["op"].clone());
+                ops.push(replica.live()["op"].clone());
             }
             let mut replica = Replica::default();
             let mut ops = Vec::new();
@@ -6159,22 +6146,22 @@ mod tests {
                 let (reply, subscribed) = oneshot::channel();
                 commands
                     .send(BridgeInput::Subscribe {
-                        scopes: vec![crate::protocol::hub::Subscribed {
+                        scopes: vec![crate::protocol::subscription::Subscribed {
                             scope: scope.clone(),
-                            have: crate::protocol::hub::Head::zero(),
+                            have: None,
                             cwd: Some(cwd.into()),
                         }],
                         reply,
                     })
                     .unwrap();
                 let stream = subscribed.await.unwrap();
-                while !(replica.live["op"]["kind"] == "load"
-                    && replica.live["op"]["status"] == "completed")
+                while !(replica.live()["op"]["kind"] == "load"
+                    && replica.live()["op"]["status"] == "completed")
                 {
                     let event = stream.next().await.expect("the stream closed");
                     apply(&mut replica, &mut ops, event);
                 }
-                let expect = replica.live["op"]["id"].as_str().unwrap().to_string();
+                let expect = replica.live()["op"]["id"].as_str().unwrap().to_string();
                 let (reply, admitted) = oneshot::channel();
                 commands
                     .send(BridgeInput::Operation {
@@ -6233,7 +6220,10 @@ mod tests {
                 "exit-idle" => assert!(prompts.is_empty()),
                 "exit-pending" => {
                     assert_eq!(prompts.last(), Some(&json!("failed")), "{ops:?}");
-                    assert!(replica.log.is_empty(), "a failed turn commits nothing");
+                    assert!(
+                        replica.entries().iter().all(|entry| entry["role"] != "agent"),
+                        "a failed turn keeps no reply it never received"
+                    );
                 }
                 "exit-completed" => {
                     assert_eq!(prompts.last(), Some(&json!("completed")), "{ops:?}");
@@ -6244,12 +6234,12 @@ mod tests {
                             .map(|index| format!("片段{index}🙂\n"))
                             .collect::<String>()
                     };
-                    let turn = &replica.log.last().expect("the committed turn")["turn"];
-                    let text = turn["reply"]
-                        .as_array()
-                        .unwrap()
+                    let text = replica
+                        .entries()
                         .iter()
-                        .filter_map(|block| block["text"].as_str())
+                        .filter(|entry| entry["role"] == "agent")
+                        .flat_map(|entry| entry["chunks"].as_array().cloned().unwrap_or_default())
+                        .filter_map(|chunk| chunk["content"]["text"].as_str().map(str::to_owned))
                         .collect::<String>();
                     assert_eq!(text, expected, "output preceding EOF was truncated");
                 }
@@ -6269,8 +6259,8 @@ mod tests {
 
     /// One v2 stream of a real bridge connection, read as a browser reads it.
     pub(super) struct V2Stream {
-        stream: crate::protocol::hub::Subscription,
-        replicas: HashMap<String, crate::protocol::stream_check::Replica>,
+        stream: crate::protocol::feed::FeedSubscription,
+        replicas: HashMap<String, crate::protocol::replica::Replica>,
     }
 
     impl V2Stream {
@@ -6283,9 +6273,9 @@ mod tests {
                 .send(BridgeInput::Subscribe {
                     scopes: scopes
                         .iter()
-                        .map(|(scope, cwd)| crate::protocol::hub::Subscribed {
+                        .map(|(scope, cwd)| crate::protocol::subscription::Subscribed {
                             scope: OpScope::parse(scope).unwrap(),
-                            have: crate::protocol::hub::Head::zero(),
+                            have: None,
                             cwd: cwd.map(String::from),
                         })
                         .collect(),
@@ -6321,10 +6311,11 @@ mod tests {
         pub(super) fn live(&self, scope: &str) -> Value {
             self.replicas
                 .get(scope)
-                .map_or(Value::Null, |replica| replica.live.clone())
+                .map_or(Value::Null, |replica| replica.live())
         }
 
         /// Writes an operation of `kind` in `scope` after the one it shows.
+
         pub(super) async fn write(
             &self,
             commands: &mpsc::UnboundedSender<BridgeInput>,
@@ -6426,7 +6417,7 @@ mod tests {
                     _ => {}
                 }
             }
-            let log = Value::Array(stream.replicas[scope].log.clone());
+            let log = Value::Array(stream.replicas[scope].entries());
             let mut found = Vec::new();
             texts(&log, &mut found);
             let replayed = found.concat();
@@ -6500,8 +6491,8 @@ mod tests {
         let scope = "session/test-session";
         let mut session = V2Stream::open(&commands, &[(scope, None)]).await;
         session.until(|stream| stream.live(scope).is_object()).await;
-        assert!(session.replicas[scope].log.is_empty());
-        let initial_head = session.replicas[scope].head();
+        assert!(session.replicas[scope].entries().is_empty());
+        let initial_rev = session.replicas[scope].rev;
 
         let prompt = session
             .write(
@@ -6536,13 +6527,14 @@ mod tests {
             ops.iter().all(|op| op["id"] == prompt),
             "a completed turn must stay in memory instead of issuing session/load: {ops:?}"
         );
-        let log = &session.replicas[scope].log;
-        assert_eq!(log.len(), 1, "history commit redispatched the prompt");
+        let entries = session.replicas[scope].entries();
+        let prompts: Vec<_> = entries.iter().filter(|entry| entry["role"] == "user").collect();
+        assert_eq!(prompts.len(), 1, "history commit redispatched the prompt");
         assert_eq!(
-            log[0]["turn"]["prompt"],
-            json!([{ "type": "text", "text": "message-actions-flow" }])
+            prompts[0]["chunks"][0]["content"],
+            json!({ "type": "text", "text": "message-actions-flow" })
         );
-        assert_ne!(session.replicas[scope].head(), initial_head);
+        assert_ne!(session.replicas[scope].rev, initial_rev);
 
         cancellation.cancel();
         tokio::time::timeout(Duration::from_secs(5), bridge)
