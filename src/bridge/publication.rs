@@ -210,6 +210,11 @@ impl BridgeState {
         // commit without events may still have released a session.
         let published = &mut *published;
         published.hub.dispatch(&published.publisher, &events);
+        // The revision 3 publication follows every commit too, so that no
+        // transition changes what its clients see without publishing it.
+        published
+            .feed
+            .commit(&self.sessions, &self.protocol.agent, self.catalog_revision);
         #[cfg(test)]
         if !events.is_empty()
             && let Some(tap) = &self.protocol.tap

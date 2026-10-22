@@ -680,10 +680,12 @@ impl Drop for Subscription {
 
 /// The published documents and the Hub: bridge memory shared by the actor's
 /// generations. The commit step is their only writer.
-#[derive(Default)]
 pub(crate) struct Published {
     pub publisher: Publisher,
     pub hub: Hub,
+    /// The revision 3 publication, committed to beside the revision 2 one until
+    /// the cutover replaces it.
+    pub feed: super::feed::FeedHandle,
     /// The held sessions an ended connection left for the next one to load
     /// again, because a subscription follows them (S6, §5.4).
     pub waiting: Vec<super::registry::WaitingSession>,
@@ -692,6 +694,22 @@ pub(crate) struct Published {
     #[cfg(test)]
     pub next_tap:
         Option<tokio::sync::mpsc::UnboundedSender<crate::bridge::publication::PublishedCommit>>,
+}
+
+impl Default for Published {
+    fn default() -> Self {
+        Self {
+            publisher: Publisher::default(),
+            hub: Hub::default(),
+            // Names the epoch `global` and `catalog` are published under: new
+            // for every bridge process, so that a client of an earlier one
+            // asks for the whole document.
+            feed: super::feed::FeedHandle::new(super::op::operation_id()),
+            waiting: Vec::new(),
+            #[cfg(test)]
+            next_tap: None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
