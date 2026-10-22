@@ -39,6 +39,7 @@ export const session = {
     commands: [],
     info: { title: null, updatedAt: null, meta: null },
     usage: null,
+    meta: {},
   },
   terminals: {
     t: { terminalId: "t", output: "cdefgh", truncated: false, exitStatus: null },

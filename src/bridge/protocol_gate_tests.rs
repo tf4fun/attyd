@@ -2346,3 +2346,55 @@ async fn a_subscription_to_the_feed_is_aligned_and_then_follows_the_bridge() {
     );
     peer.settled().await;
 }
+
+// -- Source metadata of the controls (D12) ----------------------------------------------------
+
+impl Peer {
+    /// The controls of a session, read from bridge memory.
+    async fn controls(&self, session_id: &str) -> Value {
+        let lock = self.lock();
+        let state = lock.lock().await;
+        let live = state
+            .sessions
+            .state(session_id)
+            .and_then(|session| session.live.as_ref())
+            .expect("the session is held");
+        serde_json::to_value(&live.controls).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_control_update_keeps_its_own_metadata_and_that_of_its_notification() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create("created", json!({"modes": {"currentModeId": "ask", "availableModes": [
+        {"id": "ask", "name": "Ask"}, {"id": "plan", "name": "Plan"},
+    ]}})).await;
+    peer.update_with_meta(
+        "created",
+        json!({"sessionUpdate": "current_mode_update", "currentModeId": "plan", "_meta": {"update": 1}}),
+        json!({"envelope": "a"}),
+    )
+    .await;
+    peer.update_with_meta(
+        "created",
+        json!({"sessionUpdate": "usage_update", "used": 2, "size": 8}),
+        json!({"envelope": "u"}),
+    )
+    .await;
+    let mut controls = peer.controls("created").await;
+    for _ in 0..200 {
+        if controls["meta"]["usage"].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        controls = peer.controls("created").await;
+    }
+    assert_eq!(controls["modes"]["currentModeId"], "plan");
+    assert_eq!(
+        controls["meta"]["modes"],
+        json!({"update": {"update": 1}, "notification": {"envelope": "a"}})
+    );
+    assert_eq!(controls["meta"]["usage"], json!({"notification": {"envelope": "u"}}));
+    peer.settled().await;
+}
+

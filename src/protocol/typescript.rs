@@ -48,6 +48,8 @@ fn declarations(cfg: &Config) -> Vec<String> {
         SessionModes,
         SessionInfo,
         SessionUsage,
+        ControlMeta,
+        ControlSource,
         Op,
         AppendTail,
         Turn,

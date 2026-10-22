@@ -6,7 +6,32 @@
 //! `settle` at each response, then `fold_update` for every later update.
 use serde_json::Value;
 
-use super::{SessionControls, SessionModes, SessionUsage};
+use super::{ControlSource, SessionControls, SessionModes, SessionUsage};
+
+/// The key under which a control update carries the `_meta` of its notification while it is
+/// held for folding. It is attyd's own and never an ACP field.
+pub(crate) const NOTIFICATION_META: &str = "notificationMeta";
+
+/// `update` with the `_meta` of the notification that carried it, for a control update that is
+/// held until it is folded.
+pub(crate) fn with_notification_meta(update: &Value, notification: Option<&Value>) -> Value {
+    let mut held = update.clone();
+    if let (Some(meta), Some(object)) = (notification.filter(|meta| !meta.is_null()), held.as_object_mut()) {
+        object.insert(NOTIFICATION_META.to_string(), meta.clone());
+    }
+    held
+}
+
+/// The metadata `update` brings: its own `_meta` and its notification's. The latest source
+/// that set a control decides, so one that brings none leaves none.
+fn source_of(update: &Value) -> Option<ControlSource> {
+    let kept = |key: &str| update.get(key).filter(|meta| !meta.is_null()).cloned();
+    let source = ControlSource {
+        update: kept("_meta"),
+        notification: kept(NOTIFICATION_META),
+    };
+    (source.update.is_some() || source.notification.is_some()).then_some(source)
+}
 
 impl SessionControls {
     /// Folds one `SessionUpdate`. Returns `false` for non-control kinds, which
@@ -26,12 +51,14 @@ impl SessionControls {
                         })
                     }
                 }
+                self.meta.modes = source_of(update);
             }
             Some("config_option_update") => {
                 let Some(options) = update.get("configOptions").and_then(Value::as_array) else {
                     return false;
                 };
                 self.config_options = Some(options.clone());
+                self.meta.config_options = source_of(update);
             }
             Some("available_commands_update") => {
                 let Some(commands) = update.get("availableCommands").and_then(Value::as_array)
@@ -39,6 +66,7 @@ impl SessionControls {
                     return false;
                 };
                 self.commands = commands.clone();
+                self.meta.commands = source_of(update);
             }
             Some("session_info_update") => {
                 // Absent keeps the field, `null` clears it, a value sets it.
@@ -51,6 +79,7 @@ impl SessionControls {
                 if let Some(meta) = update.get("_meta") {
                     self.info.meta = (!meta.is_null()).then(|| meta.clone());
                 }
+                self.meta.info = source_of(update);
             }
             Some("usage_update") => {
                 let (Some(used), Some(size)) = (
@@ -66,6 +95,7 @@ impl SessionControls {
                     .cloned()
                     .or_else(|| self.usage.as_ref().and_then(|usage| usage.cost.clone()));
                 self.usage = Some(SessionUsage { used, size, cost });
+                self.meta.usage = source_of(update);
             }
             _ => return false,
         }
@@ -86,6 +116,8 @@ impl SessionControls {
                     .cloned()
                     .unwrap_or_default(),
             });
+            // The response is the latest source of the modes it provides: the object's `_meta`.
+            self.meta.modes = source_of(modes);
         }
         if let Some(options) = response.get("configOptions").and_then(Value::as_array) {
             self.config_options = Some(options.clone());
@@ -290,5 +322,78 @@ mod tests {
             SessionControls::settle([], &json!({ "sessionId": "s" })),
             SessionControls::default()
         );
+    }
+
+    // -- Source metadata (D12) ------------------------------------------------------------
+
+    fn source(update: Value, notification: Value) -> ControlSource {
+        ControlSource {
+            update: (!update.is_null()).then_some(update),
+            notification: (!notification.is_null()).then_some(notification),
+        }
+    }
+
+    #[test]
+    fn each_control_keeps_the_metadata_of_the_latest_source_that_set_it() {
+        let controls = fold(&[
+            json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan",
+                    "_meta": { "mode": 1 }, "notificationMeta": { "env": "a" } }),
+            json!({ "sessionUpdate": "available_commands_update", "availableCommands": [],
+                    "_meta": { "cmd": 1 } }),
+            json!({ "sessionUpdate": "usage_update", "used": 1, "size": 9,
+                    "notificationMeta": { "env": "u" } }),
+            json!({ "sessionUpdate": "config_option_update", "configOptions": [],
+                    "_meta": { "cfg": 2 }, "notificationMeta": { "env": "c" } }),
+            json!({ "sessionUpdate": "session_info_update", "title": "T",
+                    "notificationMeta": { "env": "i" } }),
+        ]);
+        assert_eq!(controls.meta.modes, Some(source(json!({ "mode": 1 }), json!({ "env": "a" }))));
+        assert_eq!(controls.meta.commands, Some(source(json!({ "cmd": 1 }), Value::Null)));
+        assert_eq!(controls.meta.usage, Some(source(Value::Null, json!({ "env": "u" }))));
+        assert_eq!(
+            controls.meta.config_options,
+            Some(source(json!({ "cfg": 2 }), json!({ "env": "c" })))
+        );
+        assert_eq!(controls.meta.info, Some(source(Value::Null, json!({ "env": "i" }))));
+    }
+
+    #[test]
+    fn a_later_source_replaces_the_metadata_and_one_without_clears_it() {
+        let mut controls = fold(&[json!({
+            "sessionUpdate": "current_mode_update", "currentModeId": "a",
+            "_meta": { "first": true }, "notificationMeta": { "first": true },
+        })]);
+        controls.fold_update(&json!({
+            "sessionUpdate": "current_mode_update", "currentModeId": "b", "_meta": { "second": true },
+        }));
+        assert_eq!(controls.meta.modes, Some(source(json!({ "second": true }), Value::Null)));
+        // A source with no metadata (an acknowledgement, say) leaves none.
+        controls.fold_update(&json!({ "sessionUpdate": "current_mode_update", "currentModeId": "c" }));
+        assert_eq!(controls.meta.modes, None);
+    }
+
+    #[test]
+    fn the_modes_of_a_setup_response_keep_their_own_metadata() {
+        let controls = SessionControls::settle(
+            [],
+            &json!({ "modes": { "currentModeId": "ask", "availableModes": [], "_meta": { "m": 1 } } }),
+        );
+        assert_eq!(controls.meta.modes, Some(source(json!({ "m": 1 }), Value::Null)));
+        // A response that provides no modes leaves what was there.
+        let mut kept = fold(&[json!({
+            "sessionUpdate": "current_mode_update", "currentModeId": "x", "_meta": { "e": 1 },
+        })]);
+        kept.apply_response(&json!({ "configOptions": [] }));
+        assert_eq!(kept.meta.modes, Some(source(json!({ "e": 1 }), Value::Null)));
+    }
+
+    #[test]
+    fn metadata_is_on_the_wire_only_where_a_source_gave_it() {
+        let controls = fold(&[json!({
+            "sessionUpdate": "usage_update", "used": 1, "size": 2, "_meta": { "u": 1 },
+        })]);
+        let wire = serde_json::to_value(&controls).unwrap();
+        assert_eq!(wire["meta"], json!({ "usage": { "update": { "u": 1 } } }));
+        assert_eq!(serde_json::to_value(SessionControls::default()).unwrap()["meta"], json!({}));
     }
 }

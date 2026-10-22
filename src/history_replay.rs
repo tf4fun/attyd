@@ -177,6 +177,7 @@ impl ReplayCandidate {
                     .iter()
                     .position(|previous| previous["sessionUpdate"] == update["sessionUpdate"]);
                 let previous = position.map(|position| &data.controls[position]);
+                let update = crate::protocol::controls::with_notification_meta(&update, envelope);
                 let update = fold_control_update(previous, update);
                 if let Some(position) = position {
                     data.controls[position] = update;
