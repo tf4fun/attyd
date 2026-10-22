@@ -110,6 +110,11 @@ impl Feed {
         }
     }
 
+    /// The whole document of `scope`, as a snapshot from nothing.
+    pub(crate) fn snapshot(&self, scope: &str) -> Option<StreamEvent> {
+        self.engine.snapshot(scope, None)
+    }
+
     /// The version `scope` is published at.
     pub(crate) fn version(&self, scope: &str) -> Option<(String, u64)> {
         self.engine
@@ -321,6 +326,12 @@ impl FeedHandle {
     pub(crate) fn end_waiting(&self, session_id: &str, end: &End) {
         self.feed().end_waiting(session_id, end);
         self.0.ready.notify_waiters();
+    }
+
+    /// The whole document of `scope` as the snapshot a stream is aligned with (protocol §8): none
+    /// while the bridge does not hold it. It holds, loads and renews nothing.
+    pub(crate) fn snapshot(&self, scope: &str) -> Option<StreamEvent> {
+        self.feed().snapshot(scope)
     }
 
     /// The epoch and rev `scope` is published at, if it is.
