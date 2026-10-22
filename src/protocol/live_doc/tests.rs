@@ -199,7 +199,7 @@ fn global_lists_only_the_sessions_the_bridge_holds() {
 
 #[test]
 fn the_catalog_names_the_revision_of_the_agents_list() {
-    assert_eq!(catalog_live(&registry(), 7), json!({ "revision": "7" }));
+    assert_eq!(catalog_live(&registry(), 7), json!({ "revision": "7", "pages": [] }));
 }
 
 // --- the operation a scope shows (§4.4) ----------------------------------------------
@@ -365,7 +365,7 @@ fn global_and_catalog_have_the_scope_members_too() {
     let catalog = scope_live(&registry, &Scope::Catalog, &agent(), 4).unwrap();
     let mut members: Vec<&str> = catalog.as_object().unwrap().keys().map(String::as_str).collect();
     members.sort_unstable();
-    assert_eq!(members, ["interactions", "op", "revision", "urlFlows"]);
+    assert_eq!(members, ["interactions", "op", "pages", "revision", "urlFlows"]);
     assert_eq!(catalog["revision"], "4");
 }
 
