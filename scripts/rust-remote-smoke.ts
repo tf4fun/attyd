@@ -125,7 +125,7 @@ for (const transport of ["http", "ws"] as const) {
       text: "keep running while the browser reconnects",
     }] });
 
-    const cancel = await client.ops.write(first, { kind: "cancel", args: {} });
+    const cancel = await client.ops.cancel(first);
     assert.ok(cancel.kind === "accepted" && cancel.op === firstTurn, JSON.stringify(cancel));
     await waitUntil(() => cancellationObserved, `${transport} explicit cancellation after reconnect`);
     // A requested cancel ends nothing: the turn runs until the Agent answers.
@@ -142,7 +142,7 @@ for (const transport of ["http", "ws"] as const) {
     assert.equal(answered.status, "completed");
     assert.equal((answered.result as PromptResult).stopReason, "cancelled");
     assert.equal(promptsOf(client.replicas.get(first)).length, 1);
-    assert.deepEqual(promptsOf(client.replicas.get(first))[0]?.end, { response: { stopReason: "cancelled" } });
+    assert.deepEqual(promptsOf(client.replicas.get(first))[0]?.end, { response: answered.result });
     assert.ok(entriesOf(client.replicas.get(first)).length >= 1);
 
     // Remote workspaces belong to the Agent host, including Windows Agents

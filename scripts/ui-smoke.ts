@@ -79,7 +79,7 @@ try {
     assert.ok(entries.length > loaded.entries.length);
     assert.match(JSON.stringify(entries.slice(loaded.entries.length)), /usage-flow/u);
     // The prompt keeps how it ended.
-    assert.deepEqual(promptsOf(client.replicas.get(scope)).at(-1)?.end, { response: { stopReason: "max_tokens" } });
+    assert.deepEqual(promptsOf(client.replicas.get(scope)).at(-1)?.end, { response: completed.result });
 
     const deletion = await client.ops.write("global", { kind: "delete", args: { sessionId: "saved-session" } });
     assert.ok(deletion.kind === "accepted", JSON.stringify(deletion));
