@@ -119,6 +119,16 @@ async fn event_of(sse: &mut Sse, scope: &str) -> Value {
     }
 }
 
+/// The next event of `scope` that ends it.
+async fn end_of(sse: &mut Sse, scope: &str) -> Value {
+    loop {
+        let event = event_of(sse, scope).await;
+        if event.get("end").is_some() {
+            return event;
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_stream_loads_a_session_the_bridge_does_not_hold_with_the_cwd_it_gave() {
     let (server, mut link) = Server::start(json!({"loadSession": true})).await;
@@ -134,17 +144,31 @@ async fn a_stream_loads_a_session_the_bridge_does_not_hold_with_the_cwd_it_gave(
     let load = link.serve_load("saved", &turns(&[("hello", "hi there")])).await;
     assert_eq!(load["params"]["cwd"], CWD);
 
-    let snapshot = event_of(&mut sse, "session/saved").await;
-    let entries = &snapshot["snapshot"]["doc"]["entries"];
-    assert_eq!(snapshot["snapshot"]["doc"]["history"], "complete", "{snapshot}");
-    assert_eq!(entries.as_array().map(Vec::len), Some(2), "{snapshot}");
+    // The stream is aligned while the load runs.
+    let first = event_of(&mut sse, "session/saved").await;
+    assert_eq!(first["snapshot"]["doc"]["live"]["op"]["kind"], "load", "{first}");
+
+    // Once the load ended the session is held with its replayed history: a
+    // stream that follows it now is aligned with the whole of it.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (_, mut other) = open(&server, "scope=session%2Fsaved").await;
+        let snapshot = event_of(&mut other, "session/saved").await;
+        let doc = &snapshot["snapshot"]["doc"];
+        if doc["history"] == "complete" {
+            assert_eq!(doc["entries"].as_array().map(Vec::len), Some(2), "{snapshot}");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never loaded: {snapshot}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
 async fn a_stream_that_gave_no_cwd_for_an_unheld_session_is_ended_for_it() {
     let (server, mut link) = Server::start(json!({"loadSession": true})).await;
     let (_, mut sse) = open(&server, "scope=global&scope=session%2Fsaved").await;
-    let end = event_of(&mut sse, "session/saved").await;
+    let end = end_of(&mut sse, "session/saved").await;
     assert_eq!(end["end"]["reason"], "load_failed", "{end}");
     assert_eq!(end["end"]["error"]["code"], "invalid_request", "{end}");
     // The Agent is never asked to load a session the stream gave no directory for.
@@ -168,6 +192,6 @@ async fn a_load_the_agent_refuses_ends_the_scope_for_the_stream() {
         "error": {"code": -32002, "message": "no such session"},
     }))
     .await;
-    let end = event_of(&mut sse, "session/saved").await;
+    let end = end_of(&mut sse, "session/saved").await;
     assert_eq!(end["end"]["reason"], "load_failed", "{end}");
 }
