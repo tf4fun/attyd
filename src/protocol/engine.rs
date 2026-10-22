@@ -228,6 +228,21 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
+    /// Whether committing `input` to `scope` now would change what is published.
+    #[cfg(test)]
+    pub(crate) fn diverges(&self, scope: &str, input: &Input) -> bool {
+        let Some(doc) = self.docs.get(scope) else {
+            return true;
+        };
+        let fresh = ScopeDoc::build(scope, input);
+        let values = |doc: &ScopeDoc| {
+            doc.entries
+                .as_ref()
+                .map(|entries| entries.iter().map(|entry| entry.value.clone()).collect::<Vec<_>>())
+        };
+        doc.epoch != fresh.epoch || doc.body() != fresh.body() || values(doc) != values(&fresh)
+    }
+
     /// The published `live` of `scope`.
     pub(crate) fn live(&self, scope: &str) -> Option<&Value> {
         self.docs.get(scope).map(|doc| &doc.live)

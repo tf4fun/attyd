@@ -41,6 +41,8 @@ pub(crate) struct Feed {
     next_id: SubscriptionId,
     /// When a scope that changed is due its checkpoint.
     pacer: Pacer,
+    #[cfg(test)]
+    tap: tap::Tap,
 }
 
 impl Feed {
@@ -51,6 +53,8 @@ impl Feed {
             subscribers: BTreeMap::new(),
             next_id: 1,
             pacer: Pacer::default(),
+            #[cfg(test)]
+            tap: tap::Tap::default(),
         }
     }
 
@@ -181,12 +185,16 @@ impl Feed {
             match self.engine.commit(&name, &input) {
                 Commit::Unchanged => {}
                 Commit::Ops(event) => {
+                    #[cfg(test)]
+                    self.tap_event(&event);
                     self.pacer.changed(&name, now);
                     for subscriber in self.subscribers.values_mut() {
                         subscriber.publish(&event);
                     }
                 }
                 Commit::Rebuilt => {
+                    #[cfg(test)]
+                    self.tap_rebuilt(&name);
                     // A snapshot carries a digest of its own.
                     self.pacer.settled(&name);
                     for subscriber in self.subscribers.values_mut() {
@@ -219,6 +227,11 @@ impl Feed {
                     },
                     |(_, end)| end.clone(),
                 );
+            #[cfg(test)]
+            self.tap_event(&StreamEvent::End {
+                scope: scope.clone(),
+                end: end.clone(),
+            });
             for subscriber in self.subscribers.values_mut() {
                 subscriber.end(&scope, end.clone());
             }
@@ -228,6 +241,8 @@ impl Feed {
                 subscriber.coalesce(&self.engine);
             }
         }
+        #[cfg(test)]
+        self.tap_flush();
     }
 
     /// Queues the checkpoints that are due at `now` for the subscribers that
@@ -429,5 +444,7 @@ impl FeedSubscription {
 
 #[cfg(test)]
 mod handle_tests;
+#[cfg(test)]
+pub(crate) mod tap;
 #[cfg(test)]
 mod tests;
