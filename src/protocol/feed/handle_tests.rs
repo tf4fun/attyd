@@ -107,3 +107,38 @@ async fn a_subscription_sees_only_what_it_follows() {
     assert_eq!(event.scope(), "global");
     assert!(timeout(Duration::from_millis(50), global.next()).await.is_err());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_subscription_is_sent_the_checkpoint_when_it_is_due() {
+    let handle = FeedHandle::new("process");
+    let mut registry = registry();
+    handle.commit(&registry, &agent(), 0);
+    let subscription = handle.subscribe(&follow(Scope::Session("s".into())));
+    let _ = subscription.next().await;
+
+    registry
+        .append_session_update(
+            "s",
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m",
+                    "content": { "type": "text", "text": "hi" } }),
+        )
+        .unwrap();
+    handle.commit(&registry, &agent(), 0);
+    assert!(matches!(
+        subscription.next().await,
+        Some(StreamEvent::Ops { rev: 1, .. })
+    ));
+
+    let waiting = tokio::spawn({
+        let subscription = subscription.clone();
+        async move { subscription.next().await }
+    });
+    tokio::time::advance(Duration::from_millis(499)).await;
+    assert!(!waiting.is_finished(), "not yet: the scope changed 499 ms ago");
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let event = waiting.await.unwrap();
+    assert!(
+        matches!(event, Some(StreamEvent::Checkpoint { rev: 1, .. })),
+        "{event:?}"
+    );
+}

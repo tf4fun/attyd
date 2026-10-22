@@ -186,3 +186,130 @@ fn a_closed_subscription_is_forgotten() {
     assert_eq!(feed.next(id), None);
     assert_eq!(feed.subscribers(), 0);
 }
+
+// -- Checkpoints (protocol §5.5) --------------------------------------------------------
+
+fn changed(registry: &mut SessionRegistry, text: &str) {
+    registry
+        .append_session_update(
+            "s",
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m",
+                    "content": { "type": "text", "text": text } }),
+        )
+        .unwrap();
+}
+
+fn after(base: tokio::time::Instant, millis: u64) -> tokio::time::Instant {
+    base + std::time::Duration::from_millis(millis)
+}
+
+#[test]
+fn a_scope_that_changed_is_checkpointed_for_its_subscribers_after_a_pause() {
+    let base = tokio::time::Instant::now();
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit_at(&registry, &agent(), 0, base);
+    let id = feed.subscribe(&follow(&[session()]));
+    drain(&mut feed, id);
+
+    changed(&mut registry, "hi");
+    feed.commit_at(&registry, &agent(), 0, after(base, 10));
+    assert_eq!(drain(&mut feed, id), ["ops session/s rev 1"]);
+    assert_eq!(feed.deadline(), Some(after(base, 510)));
+
+    assert!(!feed.checkpoints(after(base, 509)));
+    assert_eq!(drain(&mut feed, id), Vec::<String>::new());
+    assert!(feed.checkpoints(after(base, 510)));
+    assert_eq!(drain(&mut feed, id), ["checkpoint session/s rev 1"]);
+    // One checkpoint covers the change: no more are due.
+    assert_eq!(feed.deadline(), None);
+    assert!(!feed.checkpoints(after(base, 10_000)));
+}
+
+#[test]
+fn a_checkpoint_names_the_rev_it_covers_and_carries_a_digest() {
+    let base = tokio::time::Instant::now();
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit_at(&registry, &agent(), 0, base);
+    let id = feed.subscribe(&follow(&[session()]));
+    drain(&mut feed, id);
+    changed(&mut registry, "hi");
+    feed.commit_at(&registry, &agent(), 0, base);
+    feed.checkpoints(after(base, 500));
+    let events: Vec<StreamEvent> = std::iter::from_fn(|| feed.next(id)).collect();
+    let Some(StreamEvent::Checkpoint { digest, rev, .. }) = events.last() else {
+        panic!("a checkpoint is queued last: {events:?}");
+    };
+    assert_eq!(*rev, 1);
+    assert_eq!(digest.len(), 22);
+}
+
+#[test]
+fn a_scope_that_keeps_changing_is_checkpointed_every_two_seconds() {
+    let base = tokio::time::Instant::now();
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit_at(&registry, &agent(), 0, base);
+    let id = feed.subscribe(&follow(&[session()]));
+    drain(&mut feed, id);
+    for step in 0..5u64 {
+        changed(&mut registry, &format!("t{step}"));
+        feed.commit_at(&registry, &agent(), 0, after(base, step * 400));
+        assert!(!feed.checkpoints(after(base, step * 400)), "step {step}");
+    }
+    assert_eq!(feed.deadline(), Some(after(base, 2_000)));
+    drain(&mut feed, id);
+    assert!(feed.checkpoints(after(base, 2_000)));
+    assert_eq!(drain(&mut feed, id), ["checkpoint session/s rev 5"]);
+}
+
+#[test]
+fn a_snapshot_settles_the_scope_and_nothing_is_checkpointed_for_a_scope_that_ended() {
+    let base = tokio::time::Instant::now();
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit_at(&registry, &agent(), 0, base);
+    let id = feed.subscribe(&follow(&[session()]));
+    drain(&mut feed, id);
+
+    changed(&mut registry, "hi");
+    feed.commit_at(&registry, &agent(), 0, base);
+    // A new epoch is a snapshot, which carries a digest of its own.
+    registry.replace_session_timeline("s", crate::protocol::timeline::Timeline::default());
+    feed.commit_at(&registry, &agent(), 0, after(base, 10));
+    assert_eq!(feed.deadline(), None);
+
+    changed(&mut registry, "again");
+    feed.commit_at(&registry, &agent(), 0, after(base, 20));
+    registry
+        .sessions
+        .get_mut("s")
+        .unwrap()
+        .state
+        .live
+        .as_mut()
+        .unwrap()
+        .lifecycle = SessionLifecycle::Closed;
+    feed.commit_at(&registry, &agent(), 0, after(base, 30));
+    drain(&mut feed, id);
+    // `global` lists the session, so it changed too: its checkpoint is due, the
+    // ended session's is not.
+    feed.checkpoints(after(base, 10_000));
+    assert_eq!(drain(&mut feed, id), Vec::<String>::new());
+    assert_eq!(feed.deadline(), None);
+}
+
+#[test]
+fn only_the_subscribers_that_follow_a_scope_are_sent_its_checkpoint() {
+    let base = tokio::time::Instant::now();
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit_at(&registry, &agent(), 0, base);
+    let other = feed.subscribe(&follow(&[Scope::Global]));
+    drain(&mut feed, other);
+    changed(&mut registry, "hi");
+    feed.commit_at(&registry, &agent(), 0, base);
+    feed.checkpoints(after(base, 500));
+    assert_eq!(drain(&mut feed, other), Vec::<String>::new());
+}
