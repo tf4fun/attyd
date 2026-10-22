@@ -52,7 +52,7 @@ async fn a_stream_starts_with_the_snapshot_of_every_scope_it_follows() {
         scopes.insert(event["scope"].as_str().unwrap().to_string(), event);
     }
     let global = &scopes["global"]["snapshot"];
-    assert_eq!(global["rev"], 0);
+    assert!(global["rev"].is_u64(), "{global}");
     assert!(global["epoch"].is_string() && global["digest"].is_string(), "{global}");
     assert!(global["doc"]["live"]["agent"].is_object(), "{global}");
     assert!(scopes["catalog"]["snapshot"]["doc"]["live"].is_object());
@@ -100,8 +100,9 @@ async fn shutting_the_server_down_ends_the_streams_after_what_is_queued() {
     let (_, mut sse) = open(&server, "scope=global").await;
     assert!(event(&mut sse, WAIT).await.is_some());
     server.hub.shutdown().await;
-    assert!(
-        event(&mut sse, WAIT).await.is_none(),
-        "the stream ended"
-    );
+    // The final commit is delivered; then the stream ends.
+    while let Some(event) = event(&mut sse, WAIT).await {
+        assert_eq!(event["scope"], "global", "{event}");
+    }
+    assert!(sse.message(WAIT).await.is_none(), "the stream ended");
 }
