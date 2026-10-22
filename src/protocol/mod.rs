@@ -31,6 +31,7 @@ pub(crate) mod publish;
 pub(crate) mod registry;
 #[cfg(test)]
 pub(crate) mod stream_check;
+pub(crate) mod subscription;
 pub(crate) mod timeline;
 pub(crate) mod timeline_doc;
 #[cfg(test)]
