@@ -8,7 +8,9 @@ import { pathToFileURL } from "node:url";
 import * as acp from "@agentclientprotocol/sdk";
 import { startRustTestServer } from "./rust-test-server.js";
 import type { OpArgs } from "../shared/protocol.js";
-import { globalLive, replyText, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
+import {
+  agentMessages, globalLive, replyText, sessionLive, sessionScope, SmokeClient,
+} from "./protocol-smoke-client.js";
 
 // Real HTTP and process-lifecycle checks; no model, account, or user workspace.
 const cwd = process.cwd();
@@ -56,13 +58,11 @@ try {
   // with the Agent's own auth-required error, carried verbatim.
   const authRequired = acp.RequestError.authRequired({ hint: "Use agent-login" });
   const listed = async () => {
-    await live.ended("catalog");
-    const outcome = await live.ops.write("catalog", { kind: "list", args: {} });
-    assert.ok(outcome.kind === "ended", JSON.stringify(outcome));
-    await live.ended("catalog", outcome.op);
-    if ("result" in outcome.outcome) return true;
-    assert.equal(outcome.outcome.error.code, "agent_error", JSON.stringify(outcome));
-    assert.deepEqual(outcome.outcome.error.data, {
+    const op = await live.run("catalog", { kind: "list", args: {} });
+    if (op.status === "completed") return true;
+    assert.equal(op.status, "failed", JSON.stringify(op));
+    assert.equal(op.error?.code, "agent_error", JSON.stringify(op));
+    assert.deepEqual(op.error?.data, {
       code: authRequired.code, message: authRequired.message, data: authRequired.data,
     });
     return false;
@@ -71,7 +71,7 @@ try {
   const globalOp = async () => (await live.ended("global")).id;
   /** A global write with `headers`: admitted, then shown completed. */
   const writeGlobal = async (write: OpArgs, headers: Record<string, string>) => {
-    const response = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+    const response = await fetch(`${origin}/api/v3/scopes/global/ops`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify({ expect: await globalOp(), ...write }),
@@ -103,20 +103,20 @@ try {
 
   for (const attackOrigin of ["http://127.0.0.1:1", "https://evil.example", "null"]) {
     // A real write and real reads, refused for their origin alone.
-    const attack = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+    const attack = await fetch(`${origin}/api/v3/scopes/global/ops`, {
       method: "POST",
       headers: { Origin: attackOrigin, "Content-Type": "application/x-www-form-urlencoded" },
       body: "unused=1",
     });
     assert.equal(attack.status, 403, `unexpected acceptance of ${attackOrigin}`);
-    const forged = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+    const forged = await fetch(`${origin}/api/v3/scopes/global/ops`, {
       method: "POST",
       headers: { Origin: attackOrigin, "Content-Type": "application/json" },
       body: JSON.stringify({ expect: await globalOp(), kind: "logout", args: {} }),
     });
     assert.equal(forged.status, 403, `unexpected acceptance of a JSON write from ${attackOrigin}`);
-    assert.equal((await fetch(`${origin}/api/v2/scopes/global`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin reads must also be denied");
-    assert.equal((await fetch(`${origin}/api/v2/stream?scope=global`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin streams must also be denied");
+    assert.equal((await fetch(`${origin}/api/health`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin reads must also be denied");
+    assert.equal((await fetch(`${origin}/api/v3/stream?scope=global`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin streams must also be denied");
     assert.equal(await listed(), true, "a rejected logout must not change Agent authentication");
   }
 
@@ -139,7 +139,7 @@ try {
   await verifyLargeRequestBody(origin, live);
 
   live.close();
-  const events = await fetch(`${origin}/api/v2/stream?scope=global`, { signal: observer.signal });
+  const events = await fetch(`${origin}/api/v3/stream?scope=global`, { signal: observer.signal });
   assert.equal(events.status, 200);
   const reader = events.body!.getReader();
   assert.equal((await reader.read()).done, false);
@@ -212,7 +212,7 @@ async function verifyWildcardOrigin(): Promise<void> {
 
 function statusWithHost(origin: string, headers: Record<string, string | undefined>): Promise<number> {
   return new Promise((resolve, reject) => {
-    const req = request(`${origin}/api/v2/scopes/global`, { headers }, (response) => {
+    const req = request(`${origin}/api/health`, { headers }, (response) => {
       response.resume();
       response.once("end", () => resolve(response.statusCode!));
     });
@@ -222,10 +222,9 @@ function statusWithHost(origin: string, headers: Record<string, string | undefin
 }
 
 async function verifyLargeRequestBody(origin: string, client: SmokeClient): Promise<void> {
-  await client.ended("global");
-  const created = await client.ops.write("global", { kind: "create", args: { cwd } });
-  assert.ok(created.kind === "ended" && "result" in created.outcome, JSON.stringify(created));
-  const sessionId = (created.outcome.result as { sessionId: string }).sessionId;
+  const created = await client.run("global", { kind: "create", args: { cwd } });
+  assert.equal(created.status, "completed", JSON.stringify(created));
+  const sessionId = (created.result as { sessionId: string }).sessionId;
   const scope = sessionScope(sessionId);
   // The stream holds and follows the session until its result is read.
   client.follow([{ scope: "global" }, { scope: "catalog" }, { scope }]);
@@ -243,14 +242,14 @@ async function verifyLargeRequestBody(origin: string, client: SmokeClient): Prom
     { type: "audio", mimeType: "audio/wav", data: wav.toString("base64") },
   ] } });
   assert.ok(Buffer.byteLength(body) > 5 * 1024 * 1024);
-  const accepted = await postJson(`${origin}/api/v2/scopes/${encodeURIComponent(scope)}/ops`, { "Content-Type": "application/json" }, body);
+  const accepted = await postJson(`${origin}/api/v3/scopes/${encodeURIComponent(scope)}/ops`, { "Content-Type": "application/json" }, body);
   assert.equal(accepted.status, 202, "a supported attachment must reach the prompt");
   const op = (JSON.parse(accepted.body) as { op: string }).op;
   const completed = await client.ended(scope, op);
   assert.equal(completed.status, "completed", JSON.stringify(completed.error));
-  const log = client.replicas.get(scope)!.log;
-  assert.equal(log.length, 1);
-  assert.deepEqual(JSON.parse(replyText(log[0])), [{ mimeType: "audio/wav", bytes: wav.length }]);
+  const replies = agentMessages(client.replicas.get(scope));
+  assert.equal(replies.length, 1);
+  assert.deepEqual(JSON.parse(replyText(replies[0])), [{ mimeType: "audio/wav", bytes: wav.length }]);
   assert.equal(sessionLive(client.replicas.get(scope))?.sessionId, sessionId);
   assert.deepEqual(client.streamErrors, []);
 }

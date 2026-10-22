@@ -11,7 +11,9 @@ import {
 import { AcpServer } from "@agentclientprotocol/sdk/experimental/server";
 import { WebSocketServer } from "ws";
 import type { PromptResult } from "../shared/protocol.js";
-import { globalLive, sessionLive, sessionScope, SmokeClient } from "./protocol-smoke-client.js";
+import {
+  entriesOf, globalLive, promptsOf, sessionLive, sessionScope, SmokeClient,
+} from "./protocol-smoke-client.js";
 
 type RecordEvent = (event: string, details?: unknown) => void;
 
@@ -104,7 +106,7 @@ for (const transport of ["http", "ws"] as const) {
     record("concurrent.turn.accepted", { op: concurrentTurn });
     await waitUntil(() => concurrentPromptReceived, `${transport} concurrent session prompt`);
     assert.equal((await client.ended(second, concurrentTurn)).status, "completed");
-    assert.equal(client.replicas.get(second)?.log.length, 1);
+    assert.equal(promptsOf(client.replicas.get(second)).length, 1);
 
     // No stream follows the first session now; leaving it cancels nothing.
     client.follow([{ scope: "global" }]);
@@ -139,7 +141,9 @@ for (const transport of ["http", "ws"] as const) {
     assert.equal(answered.id, firstTurn);
     assert.equal(answered.status, "completed");
     assert.equal((answered.result as PromptResult).stopReason, "cancelled");
-    assert.equal(client.replicas.get(first)?.log.length, 1);
+    assert.equal(promptsOf(client.replicas.get(first)).length, 1);
+    assert.deepEqual(promptsOf(client.replicas.get(first))[0]?.end, { response: { stopReason: "cancelled" } });
+    assert.ok(entriesOf(client.replicas.get(first)).length >= 1);
 
     // Remote workspaces belong to the Agent host, including Windows Agents
     // reached from a POSIX client. Preserve both drive-letter and UNC paths.
@@ -161,7 +165,7 @@ for (const transport of ["http", "ws"] as const) {
       sessionScope(`${transport}-session-1`),
       sessionScope(`${transport}-session-2`),
     ].map(async (scope) => {
-      const path = `/api/v2/scopes/${encodeURIComponent(scope)}`;
+      const path = `/api/v3/scopes/${encodeURIComponent(scope)}`;
       const response = await fetch(`${origin}${path}`, { signal: AbortSignal.timeout(1_000) });
       return { path, status: response.status, body: await response.json() };
     }));
@@ -189,13 +193,11 @@ for (const transport of ["http", "ws"] as const) {
 
 console.log("Rust remote ACP smoke passed (HTTP/SSE and WebSocket Agent transports)");
 
-/** Creates a session in `cwd`; `create` answers at its end with the session ID. */
+/** Creates a session in `cwd`; `create` is answered 202 and its result is in the document. */
 async function createSession(client: SmokeClient, cwd: string): Promise<string> {
-  await client.ended("global");
-  const created = await client.ops.write("global", { kind: "create", args: { cwd } });
-  assert.ok(created.kind === "ended" && "result" in created.outcome, JSON.stringify(created));
-  await client.ended("global", created.op);
-  return (created.outcome.result as { sessionId: string }).sessionId;
+  const created = await client.run("global", { kind: "create", args: { cwd } });
+  assert.equal(created.status, "completed", JSON.stringify(created));
+  return (created.result as { sessionId: string }).sessionId;
 }
 
 /** Starts a prompt of `text`; returns its operation ID. */

@@ -1,24 +1,29 @@
-// The protocol v2 client the smokes drive a real server with: the shared
-// `ReplicaClient` and `OpsClient`, fed by a fetch-based SSE reader, since
-// Node has no `EventSource`. It adds a wait on a replica and nothing else.
+// The revision 3 client the smokes drive a real server with: the shared `FeedClient` and
+// `OpsClient`, fed by a fetch-based SSE reader, since Node has no `EventSource`. It adds
+// a wait on a replica, and a write that is read to its end, and nothing else.
 
-import type { GlobalLive, LogEntry, Operation, SessionLive } from "../shared/protocol.js";
-import { OpsClient, ReplicaClient, type HttpFetch, type StreamSource } from "../shared/protocol-client.js";
-import type { Follow, Replica } from "../shared/replica.js";
+import type { DocumentReplica, Follow } from "../shared/document-replica.js";
+import type { CatalogLive3, GlobalLive3, SessionLive3, ShownOp } from "../shared/documents.js";
+import type { Entry, PromptState } from "../shared/entries.js";
+import { FeedClient, type StreamSource } from "../shared/feed-client.js";
+import type { HttpFetch } from "../shared/protocol-client.js";
+import { ActionsClient, OpsClient, type StartingWrite } from "../shared/write-client.js";
 
 export class SmokeClient {
-  readonly replicas: ReplicaClient;
+  readonly replicas: FeedClient;
   readonly ops: OpsClient;
+  readonly actions: ActionsClient;
   /** Each stream that failed, with why; a smoke that keeps its stream expects none. */
   readonly streamErrors: string[] = [];
 
   constructor(readonly origin: string) {
-    this.replicas = new ReplicaClient(
+    this.replicas = new FeedClient(
       (url) => openStream(new URL(url, origin), (error) => this.streamErrors.push(error)),
       (reconnect) => void setTimeout(reconnect, 100),
     );
     const http: HttpFetch = (url, init) => fetch(new URL(url, origin), init);
     this.ops = new OpsClient(http, this.replicas);
+    this.actions = new ActionsClient(http);
   }
 
   follow(follow: readonly Follow[]): void {
@@ -26,7 +31,7 @@ export class SmokeClient {
   }
 
   /** Waits until `read` gives a value for the replica of `scope` as the stream changes it. */
-  until<T>(scope: string, read: (replica: Replica | undefined) => T | undefined, label: string, timeout = 10_000): Promise<T> {
+  until<T>(scope: string, read: (replica: DocumentReplica | undefined) => T | undefined, label: string, timeout = 10_000): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const check = () => {
         let value: T | undefined;
@@ -46,7 +51,7 @@ export class SmokeClient {
       });
       const timer = setTimeout(() => {
         finish();
-        reject(new Error(`Timed out waiting for ${label}: ${JSON.stringify(this.replicas.get(scope) ?? null)}`));
+        reject(new Error(`Timed out waiting for ${label}: ${JSON.stringify(this.replicas.get(scope)?.doc ?? null)}`));
       }, timeout);
       const finish = () => {
         clearTimeout(timer);
@@ -60,11 +65,19 @@ export class SmokeClient {
    * Waits until the replica of `scope` shows its `op` ended, as a write
    * starting the next needs; with `id`, that operation.
    */
-  ended(scope: string, id?: string): Promise<Operation> {
+  ended(scope: string, id?: string): Promise<ShownOp> {
     return this.until(scope, (replica) => {
-      const op = (replica?.live as { op?: Operation } | undefined)?.op;
+      const op = (replica?.doc.live as { op?: ShownOp } | undefined)?.op;
       return op !== undefined && op.status !== "running" && (id === undefined || op.id === id) ? op : undefined;
     }, `${scope} to show ${id ?? "its operation"} ended`);
+  }
+
+  /** Writes an operation that starts one, and reads it to its end from the document of `scope`. */
+  async run(scope: string, write: StartingWrite): Promise<ShownOp> {
+    await this.ended(scope);
+    const outcome = await this.ops.write(scope, write);
+    if (outcome.kind !== "accepted") throw new Error(`${write.kind} was not admitted: ${JSON.stringify(outcome)}`);
+    return this.ended(scope, outcome.op);
   }
 
   close(): void {
@@ -76,17 +89,39 @@ export function sessionScope(sessionId: string): string {
   return `session/${sessionId}`;
 }
 
-export function sessionLive(replica: Replica | undefined): SessionLive | undefined {
-  return replica?.live as SessionLive | undefined;
+export function sessionLive(replica: DocumentReplica | undefined): SessionLive3 | undefined {
+  return replica?.doc.live as SessionLive3 | undefined;
 }
 
-export function globalLive(replica: Replica | undefined): GlobalLive | undefined {
-  return replica?.live as GlobalLive | undefined;
+export function globalLive(replica: DocumentReplica | undefined): GlobalLive3 | undefined {
+  return replica?.doc.live as GlobalLive3 | undefined;
 }
 
-/** The text of a log entry's reply, its text blocks joined. */
-export function replyText(entry: LogEntry): string {
-  return entry.turn.reply.map((block) => (block.type === "text" ? block.text : "")).join("");
+export function catalogLive(replica: DocumentReplica | undefined): CatalogLive3 | undefined {
+  return replica?.doc.live as CatalogLive3 | undefined;
+}
+
+/** The entries of a session's document; none while its history is unknown. */
+export function entriesOf(replica: DocumentReplica | undefined): readonly Entry[] {
+  return (replica?.doc.entries as readonly Entry[] | undefined) ?? [];
+}
+
+export function promptsOf(replica: DocumentReplica | undefined): readonly PromptState[] {
+  return (replica?.doc.prompts as readonly PromptState[] | undefined) ?? [];
+}
+
+/** The text of an Agent message entry, its text chunks joined. */
+export function replyText(entry: Entry): string {
+  if (entry.kind !== "message") return "";
+  return entry.chunks.map((chunk) => {
+    const content = chunk.content as { type?: string; text?: string };
+    return content.type === "text" ? content.text ?? "" : "";
+  }).join("");
+}
+
+/** The Agent messages of a document, in order. */
+export function agentMessages(replica: DocumentReplica | undefined): Entry[] {
+  return entriesOf(replica).filter((entry) => entry.kind === "message" && entry.role === "agent");
 }
 
 /** One SSE stream as `EventSource` offers it; it reports a failure once, through `onerror`. */
