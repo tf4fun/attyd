@@ -68,6 +68,16 @@ pub(crate) struct ScopeOps {
     pub flow_scopes: BTreeMap<String, Scope>,
     /// Terminal logins, by operation ID (protocol §4.6).
     pub login_terminals: BTreeMap<String, LoginTerminal>,
+    /// The pages `list` produced since the catalog revision last changed.
+    pub catalog_pages: CatalogPages,
+}
+
+/// The pages of a listing and the catalog revision they were listed at; they
+/// are shown only while the catalog is still at that revision (protocol §4.3).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CatalogPages {
+    pub revision: u64,
+    pub pages: Vec<Value>,
 }
 
 /// The operation a request-scoped interaction joined.
@@ -90,6 +100,7 @@ impl Default for ScopeOps {
             joined: BTreeMap::new(),
             flow_scopes: BTreeMap::new(),
             login_terminals: BTreeMap::new(),
+            catalog_pages: CatalogPages::default(),
         }
     }
 }
@@ -513,6 +524,11 @@ impl SessionRegistry {
             let slot = self.slot_mut(scope);
             if slot.is_running_kind(kind) {
                 let id = slot.id.clone();
+                let continued = slot.input.get("cursor").is_some_and(|cursor| !cursor.is_null());
+                if kind == OperationKind::List {
+                    self.record_page(&result, continued);
+                }
+                let slot = self.slot_mut(scope);
                 let created = (kind == OperationKind::Create)
                     .then(|| result["sessionId"].as_str().map(String::from))
                     .flatten();
@@ -521,6 +537,24 @@ impl SessionRegistry {
                     self.set_origin(&session_id, id);
                 }
             }
+        }
+    }
+
+    /// A listed page: the first page of a new listing replaces the pages, a
+    /// page after a cursor joins those of the same revision (protocol §6.2).
+    fn record_page(&mut self, result: &Value, continued: bool) {
+        let Some(revision) = result["revision"].as_str().and_then(|r| r.parse::<u64>().ok()) else {
+            return;
+        };
+        let page = json!({ "sessions": result["sessions"], "nextCursor": result["nextCursor"] });
+        let pages = &mut self.scopes.catalog_pages;
+        if continued && pages.revision == revision {
+            pages.pages.push(page);
+        } else {
+            *pages = CatalogPages {
+                revision,
+                pages: vec![page],
+            };
         }
     }
 

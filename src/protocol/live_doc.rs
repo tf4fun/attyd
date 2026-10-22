@@ -184,11 +184,18 @@ pub(crate) fn global_live(registry: &SessionRegistry, agent: &AgentInfo) -> Valu
 }
 
 /// What `live` holds for `catalog` besides its operation, interactions and URL
-/// flows (protocol §4.3): the revision of the Agent's list.
+/// flows (protocol §4.3): the revision of the Agent's list and the pages listed
+/// since it last changed.
 pub(crate) fn catalog_live(registry: &SessionRegistry, revision: u64) -> Value {
     let catalog = serde_json::to_value(project::project_catalog(registry, revision))
         .expect("the catalog live document serializes");
-    json!({ "revision": catalog["revision"] })
+    let listed = &registry.scopes.catalog_pages;
+    let pages = if listed.revision == revision {
+        listed.pages.clone()
+    } else {
+        Vec::new()
+    };
+    json!({ "revision": catalog["revision"], "pages": pages })
 }
 
 /// The operation `scope` shows (protocol §4.4): that of the scope whose
