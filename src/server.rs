@@ -662,6 +662,7 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route("/api/v2/stream", get(protocol_stream))
         // The revision 3 stream, beside the revision 2 one until the cutover.
         .route("/api/v3/stream", get(feed_stream))
+        .route("/api/v3/scopes/{*scope}", post(write_scope_v3))
         // Writes share the read's wildcard; held `create`, `fork` and `list`
         // responses take no JSON deadline (protocol §6.3).
         .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
@@ -971,9 +972,34 @@ async fn write_scope(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    write_scope_at(state, uri, headers, body, "/api/v2/scopes/", true).await
+}
+
+/// `POST /api/v3/scopes/{scope}/ops` (protocol §6.3): every operation is
+/// answered `202` when it is admitted, none holds its response open; the result
+/// arrives in the document.
+async fn write_scope_v3(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    write_scope_at(state, uri, headers, body, "/api/v3/scopes/", false).await
+}
+
+/// A write under `prefix`; `hold` answers `create`, `fork` and `list` when they
+/// end (revision 2) instead of when they are admitted.
+async fn write_scope_at(
+    state: AppState,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    prefix: &str,
+    hold: bool,
+) -> Response {
     let segments: Option<Vec<String>> = uri
         .path()
-        .strip_prefix("/api/v2/scopes/")
+        .strip_prefix(prefix)
         .unwrap_or_default()
         .split('/')
         .map(path_segment)
@@ -1019,7 +1045,7 @@ async fn write_scope(
         Err(error) => return refused(error),
     };
     let op = admission.op;
-    let Some(end) = admission.end else {
+    let Some(end) = admission.end.filter(|_| hold) else {
         return (StatusCode::ACCEPTED, axum::Json(wire::OpAccepted { op })).into_response();
     };
     state.bridge.before_op_response(&op).await;
