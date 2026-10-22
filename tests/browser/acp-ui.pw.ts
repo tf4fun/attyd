@@ -377,7 +377,7 @@ for (const { kind, listState } of [
     await expect(interaction).toBeVisible();
     const sessionUrl = page.url();
     const browserErrors = collectBrowserErrors(page, listState === "failed"
-      ? [{ status: 503, pathname: "/api/v2/scopes/catalog/ops" }]
+      ? [{ status: 503, pathname: "/api/v3/scopes/catalog/ops" }]
       : []);
     const api = trackApi(page);
 
@@ -387,7 +387,7 @@ for (const { kind, listState } of [
     const listStarted = new Promise<void>((resolve) => { notifyListStarted = resolve; });
     const listError = "Session listing failed during reload";
     // The catalog is listed by a `list` operation on `catalog` (protocol §6.2).
-    await page.route("**/api/v2/scopes/catalog/ops", async (route) => {
+    await page.route("**/api/v3/scopes/catalog/ops", async (route) => {
       if (route.request().postDataJSON()?.kind !== "list") {
         await route.continue();
         return;
@@ -764,7 +764,7 @@ test("pastes and drops negotiated ACP context into the Zed-style composer", asyn
   await expect(page.locator(".composer-document")).toContainText("context.md");
   await expect(page.locator(".composer-bar")).toContainText(/previous prompts/);
   const resend = page.waitForRequest((request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
+    new URL(request.url()).pathname === "/api/v3/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
   await editor.press("Enter");
   // The resend names the session's attachments by reference (protocol §6.2).
   const resent = (await resend).postDataJSON().args;
@@ -829,7 +829,7 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   }
   await testInfo.attach("ordered-prompt-mobile", { body: await page.locator(".composer").screenshot(), contentType: "image/png" });
   const isPrompt = (request: import("@playwright/test").Request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === `/api/v2/scopes/${scope}/ops` && request.postDataJSON()?.kind === "prompt";
+    new URL(request.url()).pathname === `/api/v3/scopes/${scope}/ops` && request.postDataJSON()?.kind === "prompt";
   const submitted = page.waitForRequest(isPrompt);
   await fields.nth(1).press("Enter");
   // The log holds the normalized prompt (protocol §3.2): `_meta` dropped, media
@@ -906,7 +906,7 @@ test("opens attachment chips with native browser viewing and automatic downloads
   ]);
   await expect(page.locator(".attachment-list > span")).toHaveCount(6);
   const request = page.waitForRequest((request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
+    new URL(request.url()).pathname === "/api/v3/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
   await editor.fill("attachment-input-flow");
   await editor.press("Enter");
   const sent = (await request).postDataJSON().args;
@@ -1461,7 +1461,7 @@ test("deletes an unopened session from its project without creating or opening a
     await expect(dialog).toContainText("Saved ACP session");
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/global/ops" &&
       response.request().postDataJSON()?.kind === "delete"
     );
     await dialog.getByRole("button", { name: "Delete session", exact: true }).click();
@@ -1580,7 +1580,7 @@ test("retires the open session after another client deletes it without subscribi
   });
   const listed = page.waitForResponse((candidate) =>
     candidate.request().method() === "POST" &&
-    new URL(candidate.url()).pathname === "/api/v2/scopes/catalog/ops" &&
+    new URL(candidate.url()).pathname === "/api/v3/scopes/catalog/ops" &&
     candidate.request().postDataJSON()?.kind === "list" && candidate.status() === 200
   );
   await page.getByRole("button", { name: "Refresh projects and sessions", exact: true }).click();
@@ -1610,7 +1610,7 @@ test("keeps the user's later navigation when an earlier fork response arrives la
   const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
   let notifyForked!: (status: number) => void;
   const forkedOnAgent = new Promise<number>((resolve) => { notifyForked = resolve; });
-  await page.route("**/api/v2/scopes/session%2Fsaved-session/ops", async (route) => {
+  await page.route("**/api/v3/scopes/session%2Fsaved-session/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "fork") {
       await route.continue();
       return;
@@ -1634,7 +1634,7 @@ test("keeps the user's later navigation when an earlier fork response arrives la
     await composer.fill("Keep the later session's draft");
     const lateResponse = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops"
+      new URL(response.url()).pathname === "/api/v3/scopes/session%2Fsaved-session/ops"
     );
     releaseResponse();
     await (await lateResponse).finished();
@@ -1671,7 +1671,7 @@ test("keeps the session and composer when deletion fails during close", async ({
     await page.getByRole("button", { name: "Delete thread", exact: true }).click();
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/global/ops" &&
       response.request().postDataJSON()?.kind === "delete"
     );
     await page.getByRole("alertdialog", { name: "Delete session?" })
@@ -2594,7 +2594,7 @@ test("keeps live terminal output across reconnect and drops it for every observe
     await writeFile(gatePath, "finish");
     // The fixture releases its terminal and ends the turn back to back; the
     // tool card was process and the released terminal keeps no output record
-    // (protocol S2, §4.6). protocol-ui.pw.ts holds the two apart with separate
+    // (protocol S2, §4.6). the protocol browser cases (docs/protocol-browser-cases.md) hold the two apart with separate
     // barriers ("keeps a session terminal after its operation ends ...").
     for (const tab of [page, observer]) {
       await expect(tab.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
@@ -2879,7 +2879,7 @@ test("keeps the homepage selected when a previous create response arrives late",
   let notifyCreated!: () => void;
   const createdUpstream = new Promise<void>((resolve) => { notifyCreated = resolve; });
   // `create` is an operation on `global`; its response is held until it ends (§6.3).
-  await page.route("**/api/v2/scopes/global/ops", async (route) => {
+  await page.route("**/api/v3/scopes/global/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "create") {
       await route.continue();
       return;
@@ -2908,7 +2908,7 @@ test("keeps the homepage selected when a previous create response arrives late",
 
     const delivered = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/global/ops" &&
       response.request().postDataJSON()?.kind === "create"
     );
     releaseCreate();
@@ -2938,7 +2938,7 @@ test("serializes session list requests while startup and route refreshes overlap
   let inFlight = 0;
   let maximumInFlight = 0;
   // The catalog is listed by `list` operations on `catalog` (protocol §6.2).
-  await page.route("**/api/v2/scopes/catalog/ops", async (route) => {
+  await page.route("**/api/v3/scopes/catalog/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "list") {
       await route.continue();
       return;
@@ -3003,7 +3003,7 @@ for (const width of [1280, 390]) {
     await dialog.getByLabel("Project working directory", { exact: true }).fill(cwd);
     await page.screenshot({ path: test.info().outputPath("new-project-dialog.png") });
     const created = page.waitForRequest((request) =>
-      request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/scopes/global/ops" &&
+      request.method() === "POST" && new URL(request.url()).pathname === "/api/v3/scopes/global/ops" &&
       request.postDataJSON()?.kind === "create"
     );
     await dialog.getByRole("button", { name: "Create project", exact: true }).click();
@@ -3180,7 +3180,7 @@ test("leaves a running session without cancelling it and allows configuration on
   // Listing the catalog while its revision changes is refused `catalog_changed` (409, protocol §6.2); the
   // project browser lists again, and the browser logs the refusal. Whether the revision moves between two
   // pages depends on timing, so the refusal is expected here, and nothing else is.
-  const errors = collectBrowserErrors(page, [{ status: 409, pathname: "/api/v2/scopes/catalog/ops" }]);
+  const errors = collectBrowserErrors(page, [{ status: 409, pathname: "/api/v3/scopes/catalog/ops" }]);
   const api = trackApi(page);
   let closeRequests = 0;
   page.on("request", (request) => {
@@ -3235,7 +3235,7 @@ test("creates a session in the selected project instead of the startup directory
   const dialog = page.getByRole("dialog", { name: "New thread" });
   await expect(dialog.getByLabel("Agent workspace", { exact: true })).toHaveValue(cwd);
   const created = page.waitForRequest((request) =>
-    request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/scopes/global/ops" &&
+    request.method() === "POST" && new URL(request.url()).pathname === "/api/v3/scopes/global/ops" &&
     request.postDataJSON()?.kind === "create"
   );
   await dialog.getByRole("button", { name: "Create thread" }).click();
@@ -3291,7 +3291,7 @@ test("reloads a created session URL even when the Agent list is empty", async ({
     await page.getByRole("button", { name: "New project", exact: true }).click();
     const refreshedList = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/catalog/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/catalog/ops" &&
       response.request().postDataJSON()?.kind === "list" &&
       response.status() === 200
     );
@@ -3657,7 +3657,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   });
   // A catalog refresh can race the login's Agent restart. Only its explicit
   // stale refusal is allowed, and below it must recover using the newer op.
-  const catalogPath = "/api/v2/scopes/catalog/ops";
+  const catalogPath = "/api/v3/scopes/catalog/ops";
   const browserErrors = collectBrowserErrors(page, [{ status: 409, pathname: catalogPath }]);
   const catalogResponses: Array<{
     method: string;
@@ -3679,7 +3679,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   const firstInputGate = new Promise<void>((resolve) => { releaseFirstInput = resolve; });
   const inputChunks: string[] = [];
   // Terminal input is a resource action on the login terminal (protocol §7).
-  await page.route("**/api/v2/scopes/global/resources/*/input", async (route) => {
+  await page.route("**/api/v3/scopes/global/resources/*/input", async (route) => {
     inputChunks.push(route.request().postDataJSON().data);
     if (inputChunks.length === 1) await firstInputGate;
     await route.continue();

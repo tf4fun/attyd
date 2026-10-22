@@ -93,7 +93,7 @@ export default function App() {
     searchWorkspaceContext,
     readWorkspaceContext,
   } = useAcp();
-  // The queue and the login terminals belong to the v2 projection; a state
+  // The queue and the login terminals belong to the store's projection; a state
   // without them (as a test double provides) shows none.
   const queuedPrompts = state.queue ?? [];
   const queuePaused = state.queuePaused ?? false;
@@ -1086,7 +1086,7 @@ function showThreadMarkdown(tab: Window, markdown: string): void {
 function findToolCall(timeline: TimelineItem[], toolCallId: string): ViewToolCall | undefined {
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     const item = timeline[index];
-    if (item.historyTurnId == null && item.type === "tool" && item.call.toolCallId === toolCallId) return item.call;
+    if (item.type === "tool" && item.call.toolCallId === toolCallId) return item.call;
   }
   return undefined;
 }

@@ -3,9 +3,9 @@ import type { Page, Request } from "@playwright/test";
 export interface ApiRequests {
   /** Every `/api/v1` request the page sent. */
   v1: string[];
-  /** Every `/api/v2/stream` subscription the page opened. */
+  /** Every stream subscription the page opened. */
   streams: URL[];
-  /** One-off `GET /api/v2/scopes/…` reads. */
+  /** One-off `GET …/scopes/…` reads. */
   reads: URL[];
   /** Operation writes: the scope and the request body. */
   ops: Array<{ scope: string; kind: string; body: Record<string, unknown> }>;
@@ -27,16 +27,16 @@ export function trackApi(page: Page): ApiRequests {
     const path = url.pathname;
     if (path.startsWith("/api/v1")) requests.v1.push(`${request.method()} ${path}`);
     if (path.includes("/process")) requests.process.push(path);
-    if (path === "/api/v2/stream") requests.streams.push(url);
-    if (!path.startsWith("/api/v2/scopes/")) return;
-    const ops = /^\/api\/v2\/scopes\/(.+)\/ops$/u.exec(path);
-    const action = /^\/api\/v2\/scopes\/(.+)\/resources\/([^/]+)\/([^/]+)$/u.exec(path);
+    if (path === "/api/v3/stream") requests.streams.push(url);
+    if (!path.startsWith("/api/v3/scopes/")) return;
+    const ops = /^\/api\/v3\/scopes\/(.+)\/ops$/u.exec(path);
+    const action = /^\/api\/v3\/scopes\/(.+)\/(?:resources\/([^/]+)|actions)\/([^/]+)$/u.exec(path);
     if (request.method() === "GET") requests.reads.push(url);
     else if (ops != null) {
       const body = request.postDataJSON() as Record<string, unknown>;
       requests.ops.push({ scope: decodeURIComponent(ops[1]!), kind: String(body.kind), body });
     } else if (action != null) {
-      requests.actions.push(`${decodeURIComponent(action[1]!)} ${decodeURIComponent(action[2]!)} ${action[3]}`);
+      requests.actions.push(`${decodeURIComponent(action[1]!)} ${action[2] === undefined ? "-" : decodeURIComponent(action[2])} ${action[3]}`);
     }
   });
   return requests;

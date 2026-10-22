@@ -1,49 +1,36 @@
-// The web UI on protocol v2 (docs/protocol.md, migration step 7).
+// The web UI on protocol revision 3 (docs/protocol.md).
 //
-// One stream follows `global`, `catalog` and the session the page shows; the
-// generic replica engine applies its events, and the page is a projection of
-// the replicas' `log` and `live` plus this page's own UI state (C1). Writes go
-// over HTTP: their answers settle only this page's own requests (a refusal
-// keeps the input, C2; a write without a definite answer is never resent, C3),
-// and a create or fork navigates with its own result. Nothing an HTTP answer
-// says is written into a replica.
+// One stream follows `global`, `catalog` and the session the page shows; the verifying
+// replica engine applies its events, and the page is a projection of the replicas'
+// documents plus this page's own UI state (C1). Nothing here writes into a replica.
 
 import i18n from "../i18n";
 import { useEffect, useState, useSyncExternalStore } from "react";
-import type {
-  CreateElicitationResponse,
-  RequestPermissionResponse,
-  SessionInfo,
-} from "@agentclientprotocol/sdk";
+import type { CreateElicitationResponse, RequestPermissionResponse, SessionInfo } from "@agentclientprotocol/sdk";
 import type { TerminalSnapshot } from "../../../shared/bridge";
 import type {
-  Answer,
-  CatalogPage,
   ContextAttachment,
   ContextMatch,
   ContextMatches,
   ContextRead,
   End,
-  GlobalLive,
   Interaction,
-  LogEntry,
-  Operation,
-  OpArgs,
   PromptBlock,
-  ProtocolError,
-  SessionLive,
 } from "../../../shared/protocol";
+import type { CatalogLive3, GlobalLive3, SessionBody, SessionLive3, ShownOp } from "../../../shared/documents";
+import type { Follow } from "../../../shared/document-replica";
+import { FeedClient, type StreamSource } from "../../../shared/feed-client";
+import { WriteQueue, type HttpFetch } from "../../../shared/protocol-client";
 import {
+  ActionsClient,
   OpsClient,
-  ReplicaClient,
-  ResourceClient,
-  WriteQueue,
-  type HttpFetch,
-  type StreamSource,
+  type StartingWrite,
+  type Write,
   type WriteOutcome,
-} from "../../../shared/protocol-client";
-import type { Follow } from "../../../shared/replica";
+} from "../../../shared/write-client";
+import { originOf } from "../../../shared/write-resolution";
 import { createAttachmentReader, type AttachmentReader } from "./attachments";
+import { projectEntries } from "./entry-projection";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
 import {
   initialState,
@@ -51,25 +38,16 @@ import {
   type AgentAuthStatus,
   type AppState,
   type AuthTerminalState,
-  type BridgeError,
   type PendingElicitation,
   type PendingPermission,
   type TimelineItem,
 } from "./state";
 import {
-  catalogLive,
   externalFlow,
-  globalLive,
   isRecord,
   listedSessions,
   needsAuthentication,
   operationError,
-  pendingInteractions,
-  projectProcess,
-  projectTimeline,
-  promptInput,
-  sessionLive,
-  sessionTerminals,
   standaloneTerminals,
 } from "./workspace-projection";
 
@@ -90,6 +68,58 @@ export interface QueueEntry {
   error?: string;
 }
 
+/** A create or fork this page started, until the document shows what became of it. */
+interface Intent {
+  kind: "new" | "fork";
+  /** The scope the operation was written to. */
+  scope: string;
+  /** The id the operation was written with. */
+  id: string;
+  /** Present when the answer was lost: the write to resolve from the document. */
+  lost?: Write;
+  navigation: number;
+  cwd: string;
+}
+
+/** What the page remembers of listing the catalog; the pages themselves are in the document. */
+interface ListingState {
+  /** The revision a list failed at; it is not listed again until it changes or the user asks. */
+  failedRevision?: string;
+  /** The user (or a changed catalog) asks for a new first page. */
+  refresh: boolean;
+  /** The `op.id` the last list was sent against: nothing is sent against it again (C3). */
+  sentAgainst?: string;
+  /** The list operations this page wrote. */
+  readonly mine: Set<string>;
+}
+
+/** Where the answer to one interaction is: sent and awaiting the document, or not known to have arrived. */
+interface AnswerState {
+  state: "sending" | "sent" | "uncertain";
+}
+
+interface HeldPrompt {
+  id: string;
+  blocks: PromptBlock[];
+}
+
+/** The operations client whose answers also notify the page: the write queue reports none. */
+class NotifyingOps extends OpsClient {
+  constructor(
+    fetch: HttpFetch,
+    replicas: ConstructorParameters<typeof OpsClient>[1],
+    private readonly answered: () => void,
+  ) {
+    super(fetch, replicas);
+  }
+
+  override write(scope: string, write: StartingWrite): Promise<WriteOutcome> {
+    const sent = super.write(scope, write);
+    void sent.then(() => setTimeout(this.answered, 0));
+    return sent;
+  }
+}
+
 export interface WorkspaceState extends AppState {
   /** The queued prompts of the shown session, in the order they are sent. */
   queue: QueueEntry[];
@@ -108,80 +138,86 @@ export interface WorkspaceState extends AppState {
   projectCwd?: string;
 }
 
-interface CatalogState {
-  sessions: SessionInfo[];
-  nextCursor: string | null;
-  /** The revision the first page was listed at. */
-  revision?: string;
-  /** The revision a list failed at; it is not listed again until it changes or the user asks. */
-  failedRevision?: string;
-  listing: boolean;
-  refresh: boolean;
-  /** Whether the first page has been listed, has failed, or cannot be listed. */
-  settled: boolean;
-  /** The `op.id` the last list was sent against. */
-  sentAgainst?: string;
+/** The document of a scope as the page reads it. */
+function bodyOf(replica: { readonly doc: Readonly<Record<string, unknown>> } | undefined): Readonly<Record<string, unknown>> | undefined {
+  return replica?.doc;
 }
 
-interface AnswerState {
-  /** Answers the user gave, by interaction, not yet sent. */
-  drafts: Map<string, Answer>;
-  /** The answer write in flight or sent, and the interactions it covered. */
-  sent?: { ids: string[]; state: "sending" | "sent" | "uncertain" };
-  errors: Map<string, string>;
+function globalLive(body: Readonly<Record<string, unknown>> | undefined): GlobalLive3 | undefined {
+  const live = body?.live;
+  return isRecord(live) && isRecord(live.op) && isRecord(live.agent) ? (live as unknown as GlobalLive3) : undefined;
 }
 
-interface HeldPrompt {
-  id: string;
-  blocks: PromptBlock[];
+function catalogLive(body: Readonly<Record<string, unknown>> | undefined): CatalogLive3 | undefined {
+  const live = body?.live;
+  return isRecord(live) && isRecord(live.op) && typeof live.revision === "string" ? (live as unknown as CatalogLive3) : undefined;
 }
 
-/** The ops client whose answers also notify the page: the write queue reports none. */
-class NotifyingOps extends OpsClient {
-  constructor(fetch: HttpFetch, replicas: ReplicaClient, private readonly answered: () => void) {
-    super(fetch, replicas);
-  }
+function sessionBody(body: Readonly<Record<string, unknown>> | undefined): SessionBody | undefined {
+  const live = body?.live;
+  return isRecord(live) && isRecord(live.op) && typeof live.sessionId === "string" && Array.isArray(body?.prompts)
+    ? (body as unknown as SessionBody)
+    : undefined;
+}
 
-  override write(scope: string, write: OpArgs): Promise<WriteOutcome> {
-    const sent = super.write(scope, write);
-    void sent.then(() => setTimeout(this.answered, 0));
-    return sent;
-  }
+/** An `EventSource` as the feed client uses it. */
+function openEventSource(url: string): StreamSource {
+  const source = new EventSource(url);
+  let message: StreamSource["onmessage"] = null;
+  let error: StreamSource["onerror"] = null;
+  return {
+    get onmessage() { return message; },
+    set onmessage(handler) {
+      message = handler;
+      source.onmessage = handler == null ? null : (event: MessageEvent<string>) => handler({ data: event.data });
+    },
+    get onerror() { return error; },
+    set onerror(handler) {
+      error = handler;
+      source.onerror = handler == null ? null : () => handler();
+    },
+    close: () => source.close(),
+  };
 }
 
 export class Workspace {
   readonly #listeners = new Set<() => void>();
-  // The clients of one connection: `start()` makes them, its cleanup closes them,
-  // so a StrictMode remount gets a working stream again.
-  #replicas!: ReplicaClient;
+  // The client of one connection: `start()` makes it, its cleanup closes it, so a
+  // StrictMode remount gets a working stream again.
+  #feed!: FeedClient;
   #ops!: NotifyingOps;
+  #actions!: ActionsClient;
   #queue!: WriteQueue;
-  #resources!: ResourceClient;
   #route: Route = readRoute();
   /** Counts navigations; a write's late result never moves a page the user moved since. */
   #navigation = 0;
   #follow = "";
   /** The session scope aligned on the current stream. */
   #aligned: string | undefined;
-  #lastEnd: { scope: string; end: End } | undefined;
   readonly #ended = new Map<string, End>();
-  #catalog: CatalogState = { sessions: [], nextCursor: null, listing: false, refresh: false, settled: false };
   #authRequired = false;
-  /** Operations whose end the page has acted on. */
-  readonly #seen = new Set<string>();
+  #transition: { kind: "new" | "fork"; navigation: number } | undefined;
+  /** Failures of this page's own writes, shown in the thread. */
+  #errors: Array<Extract<TimelineItem, { type: "error" }>> = [];
   /** Operations this page started on `global`: their failures are its to show. */
   readonly #mine = new Set<string>();
-  #errors: Array<Extract<TimelineItem, { type: "error" }>> = [];
-  #transition: { kind: "new" | "fork"; navigation: number } | undefined;
-  /** Answer state by `op.id`: a global and a session scope may show the same operation. */
+  /** Operations whose end the page has acted on. */
+  readonly #seen = new Set<string>();
+  #agentPhase: string | undefined;
+  readonly #intents: Intent[] = [];
+  #listing: ListingState = { refresh: false, mine: new Set() };
+  /** The answers this page sent, by interaction. */
   readonly #answers = new Map<string, AnswerState>();
+  /** Why an answer was refused, by interaction: the form keeps its values (C2). */
+  readonly #answerErrors = new Map<string, string>();
+  /** A control in flight on the shown session: no operation holds it (§7). */
+  #control: { kind: "mode" | "config"; scope: string; sessionId: string; id: number } | undefined;
   readonly #held = new Map<string, HeldPrompt[]>();
   readonly #paused = new Set<string>();
   #nextId = 0;
   #reader: AttachmentReader | undefined;
   /** The cwd each session reported while shown, for leaving it once it is gone. */
   readonly #sessionCwd = new Map<string, string>();
-  #agentPhase: string | undefined;
   #snapshot: WorkspaceState | undefined;
   #closed = false;
 
@@ -191,15 +227,20 @@ export class Workspace {
 
   #connect(): void {
     const fetchJson: HttpFetch = (url, init) => fetch(url, init);
-    const replicas = new ReplicaClient((url) => this.#open(url));
-    this.#replicas = replicas;
-    this.#ops = new NotifyingOps(fetchJson, replicas, () => {
-      if (this.#replicas === replicas) this.#changed();
+    const feed = new FeedClient(openEventSource);
+    this.#feed = feed;
+    this.#ops = new NotifyingOps(fetchJson, feed, () => {
+      if (this.#feed === feed) this.#changed();
     });
-    this.#queue = new WriteQueue(this.#ops, replicas);
-    this.#resources = new ResourceClient(fetchJson);
-    replicas.subscribe((scope) => {
-      if (this.#replicas === replicas) this.#received(scope);
+    this.#actions = new ActionsClient(fetchJson);
+    this.#queue = new WriteQueue(this.#ops, {
+      get: (scope) => {
+        const replica = feed.get(scope);
+        return replica === undefined ? undefined : { live: replica.doc.live };
+      },
+    });
+    feed.subscribe((scope) => {
+      if (this.#feed === feed) this.#received(scope);
     });
     this.#follow = "";
     this.#aligned = undefined;
@@ -216,7 +257,7 @@ export class Workspace {
     return () => {
       this.#closed = true;
       window.removeEventListener("popstate", popstate);
-      this.#replicas.close();
+      this.#feed.close();
     };
   }
 
@@ -233,50 +274,14 @@ export class Workspace {
   // -------------------------------------------------------------------------
   // Stream
 
-  /** Opens an `EventSource`, noting each `end` it carries before the replica engine applies it. */
-  #open(url: string): StreamSource {
-    const source = new EventSource(url);
-    const noteEnd = (data: string) => this.#noteEnd(data);
-    let message: StreamSource["onmessage"] = null;
-    let error: StreamSource["onerror"] = null;
-    return {
-      get onmessage() { return message; },
-      set onmessage(handler) {
-        message = handler;
-        source.onmessage = handler == null ? null : (event: MessageEvent<string>) => {
-          noteEnd(event.data);
-          handler({ data: event.data });
-        };
-      },
-      get onerror() { return error; },
-      set onerror(handler) {
-        error = handler;
-        source.onerror = handler == null ? null : () => handler();
-      },
-      close: () => source.close(),
-    };
-  }
-
-  #noteEnd(data: string): void {
-    try {
-      const event: unknown = JSON.parse(data);
-      if (isRecord(event) && typeof event.scope === "string" && isRecord(event.end)) {
-        this.#lastEnd = { scope: event.scope, end: event.end as unknown as End };
-      }
-    } catch {
-      // The replica engine treats it as a broken stream.
-    }
-  }
-
   #received(scope: string): void {
-    if (this.#replicas.get(scope) == null) {
-      const end = this.#lastEnd?.scope === scope ? this.#lastEnd.end : { reason: "load_failed" as const };
+    if (this.#feed.get(scope) == null) {
+      const end = this.#feed.endOf(scope) ?? { reason: "load_failed" as const };
       this.#ended.set(scope, end);
       this.#scopeEnded(scope, end);
     } else if (scope.startsWith("session/")) {
       this.#aligned = scope;
     }
-    this.#lastEnd = undefined;
     this.#queue.update(scope);
     this.#changed();
   }
@@ -297,11 +302,94 @@ export class Workspace {
     if (this.#knownCwd(route.sessionId) == null) this.#navigate({ kind: "home" }, true);
   }
 
+  #catalogSessions(): SessionInfo[] {
+    return (this.#catalog()?.pages ?? []).flatMap((page) => [...page.sessions]);
+  }
+
   /** The cwd the bridge or the catalog reports for a session. */
   #knownCwd(sessionId: string): string | undefined {
     return this.#global()?.sessions?.[sessionId]?.cwd ??
-      this.#catalog.sessions.find((session) => session.sessionId === sessionId)?.cwd;
+      this.#catalogSessions().find((session) => session.sessionId === sessionId)?.cwd;
   }
+
+  /** Whether the catalog has nothing more to tell about the sessions: listed to its end, or not listable. */
+  #catalogSettled(): boolean {
+    const catalog = this.#catalog();
+    const global = this.#global();
+    if (catalog == null || global?.agent.initialize == null) return false;
+    if (catalog.op.status === "running") return false;
+    if (global.agent.initialize.agentCapabilities?.sessionCapabilities?.list == null) return true;
+    if (this.#listing.failedRevision === catalog.revision) return true;
+    const last = catalog.pages.at(-1);
+    return last != null && last.nextCursor == null;
+  }
+
+  /** A list this page wrote that failed: not listed again at that revision, and shown. */
+  #settleListing(): void {
+    const catalog = this.#catalog();
+    if (catalog == null) return;
+    const op = catalog.op;
+    if (op.kind !== "list" || op.status !== "failed" || !this.#listing.mine.has(op.id) || this.#seen.has(op.id)) return;
+    this.#seen.add(op.id);
+    this.#listing = { ...this.#listing, failedRevision: catalog.revision };
+    if (needsAuthentication(op.error)) this.#authRequired = true;
+    if (op.error != null) this.#errors = [...this.#errors, operationError(`op:${op.id}:error`, op as never, op.error)];
+  }
+
+  /** Lists the first page when there is none, and later pages while a session is looked for. */
+  #listCatalog(): void {
+    const catalog = this.#catalog();
+    const global = this.#global();
+    if (catalog == null || global?.agent.initialize == null) return;
+    if (global.agent.initialize.agentCapabilities?.sessionCapabilities?.list == null) return;
+    if (catalog.op.status === "running" || catalog.op.id === this.#listing.sentAgainst) return;
+    const route = this.#route;
+    // A session the catalog has not listed yet is looked for on its later pages.
+    const looking = route.kind === "session" && global.sessions?.[route.sessionId] == null &&
+      !this.#catalogSessions().some((session) => session.sessionId === route.sessionId);
+    const last = catalog.pages.at(-1);
+    if (last == null) {
+      if (this.#listing.refresh || this.#listing.failedRevision !== catalog.revision) this.#list(catalog, undefined);
+    } else if (this.#listing.refresh) {
+      this.#list(catalog, undefined);
+    } else if (looking && last.nextCursor != null) {
+      this.#list(catalog, last.nextCursor);
+    }
+  }
+
+  #list(catalog: CatalogLive3, cursor: string | undefined): void {
+    this.#listing = { ...this.#listing, refresh: false, sentAgainst: catalog.op.id };
+    void this.#ops.write(CATALOG, { kind: "list", args: cursor == null ? {} : { cursor, revision: catalog.revision } })
+      .then((outcome) => {
+        if (outcome.kind === "accepted") {
+          this.#listing.mine.add(outcome.op);
+        } else if (outcome.kind === "refused" && outcome.error.code === "catalog_changed") {
+          // A definite refusal changed nothing: the first page may be asked for against the same op.
+          this.#listing = { ...this.#listing, refresh: true, sentAgainst: undefined };
+        } else if (outcome.kind === "refused" && (outcome.error.code === "stale" || outcome.error.code === "not_allowed")) {
+          // Another list ran: list again once the document shows a later `op` ended.
+          this.#listing = { ...this.#listing, refresh: cursor == null };
+        } else if (outcome.kind === "blocked") {
+          this.#listing = { ...this.#listing, refresh: cursor == null, sentAgainst: undefined };
+        } else {
+          this.#listing = { ...this.#listing, failedRevision: catalog.revision };
+          this.#report("list", outcome);
+        }
+        this.#changed();
+      });
+  }
+
+  listSessions = (cursor?: string): void => {
+    const catalog = this.#catalog();
+    if (cursor == null) {
+      // The user asks again: a new attempt, which may go against the same `op` a refused
+      // list was sent against. Nothing is resent without this (C3).
+      this.#listing = { ...this.#listing, refresh: true, failedRevision: undefined, sentAgainst: undefined };
+      this.#changed();
+    } else if (catalog != null && catalog.op.status !== "running") {
+      this.#list(catalog, cursor);
+    }
+  };
 
   /** The scopes the page follows: the global ones and the session it shows. */
   #desiredFollow(): Follow[] {
@@ -314,10 +402,10 @@ export class Workspace {
     if (global == null) return follow;
     const held = global.sessions?.[route.sessionId];
     if (held != null) return [...follow, { scope, cwd: held.cwd }];
-    const listed = this.#catalog.sessions.find((session) => session.sessionId === route.sessionId);
+    const listed = this.#catalogSessions().find((session) => session.sessionId === route.sessionId);
     if (listed != null) return [...follow, { scope, cwd: listed.cwd }];
     // An unheld session is loaded with its own cwd: look for it in the catalog first.
-    if (!this.#catalog.settled || this.#catalog.listing || this.#catalog.nextCursor != null) return follow;
+    if (!this.#catalogSettled()) return follow;
     if (route.cwd != null) return [...follow, { scope, cwd: route.cwd }];
     return follow;
   }
@@ -329,7 +417,7 @@ export class Workspace {
     if (!force && key === this.#follow) return;
     this.#follow = key;
     this.#aligned = undefined;
-    this.#replicas.follow(follow);
+    this.#feed.follow(follow);
   }
 
   // -------------------------------------------------------------------------
@@ -342,11 +430,13 @@ export class Workspace {
   #sync(): void {
     if (this.#closed) return;
     this.#settleAuth();
+    this.#settleIntents();
+    this.#settleAnswers();
+    this.#settleListing();
     this.#listCatalog();
     this.#resolveRoute();
     this.#applyFollow();
-    this.#settleAnswers();
-    this.#feed();
+    this.#feedQueue();
     this.#canonicalize();
     const sessionId = this.#route.kind === "session" ? this.#route.sessionId : undefined;
     // Attachments are read per session; another session's reads are dropped with it.
@@ -356,8 +446,12 @@ export class Workspace {
     for (const listener of [...this.#listeners]) listener();
   }
 
-  #global(): GlobalLive | undefined {
-    return globalLive(this.#replicas.get(GLOBAL)?.live);
+  #global(): GlobalLive3 | undefined {
+    return globalLive(bodyOf(this.#feed.get(GLOBAL)));
+  }
+
+  #catalog(): CatalogLive3 | undefined {
+    return catalogLive(bodyOf(this.#feed.get(CATALOG)));
   }
 
   #sessionScope(): string | undefined {
@@ -365,13 +459,11 @@ export class Workspace {
   }
 
   /** The session the page shows: aligned on the current stream. */
-  #shown(): { scope: string; live: SessionLive; log: readonly LogEntry[]; confirmed: boolean } | undefined {
+  #shown(): { scope: string; body: SessionBody; live: SessionLive3 } | undefined {
     const scope = this.#sessionScope();
     if (scope == null || this.#aligned !== scope) return undefined;
-    const replica = this.#replicas.get(scope);
-    const live = sessionLive(replica?.live);
-    if (replica == null || live == null) return undefined;
-    return { scope, live, log: replica.log, confirmed: replica.confirmed };
+    const body = sessionBody(bodyOf(this.#feed.get(scope)));
+    return body == null ? undefined : { scope, body, live: body.live };
   }
 
   #settleAuth(): void {
@@ -388,10 +480,8 @@ export class Workspace {
         isRecord(op.result) && op.result.exitCode === 0;
       if ((op.kind === "authenticate" && op.status === "completed") || login) signedIn = true;
       if (op.status === "failed" && needsAuthentication(op.error)) this.#authRequired = true;
-      if (op.kind === "create" && op.status === "failed" && needsAuthentication(op.error)) this.#authRequired = true;
     }
-    const shown = this.#shown();
-    const sessionOp = shown?.live.op;
+    const sessionOp = this.#shown()?.live.op;
     if (sessionOp != null && !this.#seen.has(sessionOp.id) && sessionOp.status === "failed") {
       this.#seen.add(sessionOp.id);
       if (needsAuthentication(sessionOp.error)) this.#authRequired = true;
@@ -403,76 +493,96 @@ export class Workspace {
       for (const [scope, end] of this.#ended) {
         if (end.reason === "load_failed" && needsAuthentication(end.error)) this.#ended.delete(scope);
       }
-      this.#catalog = { ...this.#catalog, refresh: true, failedRevision: undefined };
     }
   }
 
-  #listCatalog(): void {
-    const catalog = catalogLive(this.#replicas.get(CATALOG)?.live);
+  /**
+   * What became of the creates and forks this page started, read from the documents:
+   * the operation it wrote completed with the session (§6.2), or the session whose
+   * `origin` is its id is held (§6.6). A late result never moves a page the user moved
+   * since.
+   */
+  #settleIntents(): void {
     const global = this.#global();
-    if (catalog == null || global == null || this.#catalog.listing) return;
-    const capabilities = global.agent.initialize?.agentCapabilities?.sessionCapabilities;
-    if (global.agent.initialize == null) return;
-    if (capabilities?.list == null) {
-      if (!this.#catalog.settled) this.#catalog = { ...this.#catalog, settled: true, nextCursor: null };
-      return;
-    }
-    if (catalog.op.status === "running" || catalog.op.id === this.#catalog.sentAgainst) return;
-    const route = this.#route;
-    // A session the catalog has not listed yet is looked for on its later pages.
-    const looking = route.kind === "session" &&
-      !this.#catalog.sessions.some((session) => session.sessionId === route.sessionId);
-    const stale = this.#catalog.revision !== catalog.revision && this.#catalog.failedRevision !== catalog.revision;
-    if (this.#catalog.refresh || stale) {
-      this.#list(undefined);
-    } else if (looking && this.#catalog.nextCursor != null && this.#catalog.revision === catalog.revision) {
-      this.#list(this.#catalog.nextCursor);
+    if (global == null) return;
+    for (const intent of [...this.#intents]) {
+      if (intent.lost != null) {
+        const resolution = this.#ops.resolve(intent.lost);
+        if (resolution !== "admitted") {
+          // Not admitted, or not knowable: the user decides (C3).
+          this.#finishIntent(intent);
+          this.#reportMessage(intent.kind === "new" ? "create" : "fork", i18n.t("errors.uncertainWrite", {
+            operation: intent.kind === "new" ? "create" : "fork",
+          }), intent);
+          continue;
+        }
+        intent.lost = undefined;
+      }
+      const shownOp = bodyLive(this.#feed.get(intent.scope))?.op;
+      const op = shownOp?.id === intent.id ? shownOp : undefined;
+      const origin = originOf(global.sessions ?? {}, intent.id);
+      if (op?.status === "running") continue;
+      if (op?.status === "completed" || origin != null) {
+        const sessionId = origin ?? (isRecord(op?.result) && typeof op.result.sessionId === "string" ? op.result.sessionId : undefined);
+        this.#finishIntent(intent);
+        if (sessionId != null && this.#navigation === intent.navigation) {
+          this.#navigate({ kind: "session", sessionId, cwd: intent.cwd });
+        }
+      } else if (op != null) {
+        // Failed or cancelled.
+        this.#finishIntent(intent);
+        if (needsAuthentication(op.error)) this.#authRequired = true;
+        if (this.#navigation === intent.navigation && op.error != null) {
+          this.#errors = [...this.#errors, operationError(`local:${(this.#nextId += 1)}`, op as never, op.error)];
+        }
+      } else if (shownOp != null && shownOp.scope === intent.scope && shownOp.after === intent.id) {
+        // Our operation was replaced before the page saw it end, and no held session names it.
+        // (An op the document does not show yet is waited for: the 202 comes before it.)
+        this.#finishIntent(intent);
+      }
     }
   }
 
-  #list(cursor: string | undefined): void {
-    const catalog = catalogLive(this.#replicas.get(CATALOG)?.live);
-    if (catalog == null) return;
-    const revision = cursor == null ? undefined : this.#catalog.revision;
-    this.#catalog = { ...this.#catalog, listing: true, refresh: false, sentAgainst: catalog.op.id };
-    void this.#ops.write(CATALOG, { kind: "list", args: cursor == null ? {} : { cursor, ...(revision ? { revision } : {}) } })
-      .then((outcome) => {
-        const listed = { ...this.#catalog, listing: false };
-        if (outcome.kind === "ended" && "result" in outcome.outcome && isRecord(outcome.outcome.result)) {
-          const page = outcome.outcome.result as unknown as CatalogPage;
-          this.#catalog = {
-            ...listed,
-            sessions: cursor == null ? page.sessions : mergeSessions(this.#catalog.sessions, page.sessions),
-            nextCursor: page.nextCursor,
-            revision: page.revision,
-            failedRevision: undefined,
-            settled: true,
-          };
-        } else if (outcome.kind === "refused" && outcome.error.code === "catalog_changed") {
-          this.#catalog = { ...listed, refresh: true };
-        } else if (outcome.kind === "refused" && (outcome.error.code === "stale" || outcome.error.code === "not_allowed")) {
-          // Another list ran: list again once the replica shows a later `op` ended.
-          this.#catalog = { ...listed, refresh: cursor == null };
-        } else if (outcome.kind === "blocked") {
-          this.#catalog = { ...listed, refresh: cursor == null, sentAgainst: undefined };
-        } else {
-          const error = outcome.kind === "ended" && "error" in outcome.outcome ? outcome.outcome.error
-            : outcome.kind === "refused" ? outcome.error : undefined;
-          if (needsAuthentication(error)) this.#authRequired = true;
-          this.#catalog = { ...listed, settled: true, nextCursor: null, failedRevision: catalog.revision };
-          this.#report("list", outcome);
-        }
-        this.#changed();
-      });
+  /** Drops what the page holds of interactions no document shows pending any more. */
+  #settleAnswers(): void {
+    const pending = new Set(this.#pendingInteractions().map(({ interaction }) => interaction.interactionId));
+    for (const id of [...this.#answers.keys()]) if (!pending.has(id)) this.#answers.delete(id);
+    for (const id of [...this.#answerErrors.keys()]) if (!pending.has(id)) this.#answerErrors.delete(id);
+  }
+
+  /** The interactions the shown session, `global` and `catalog` show, each once, with the scope that shows it. */
+  #pendingInteractions(): Array<{ scope: string; interaction: Interaction }> {
+    const shown = this.#shown();
+    const seen = new Set<string>();
+    const found: Array<{ scope: string; interaction: Interaction }> = [];
+    const sources: Array<[string, Readonly<Record<string, Interaction>> | undefined]> = [
+      ...(shown == null ? [] : [[shown.scope, shown.live.interactions] as [string, Readonly<Record<string, Interaction>>]]),
+      [GLOBAL, this.#global()?.interactions],
+      [CATALOG, this.#catalog()?.interactions],
+    ];
+    for (const [scope, interactions] of sources) {
+      for (const interaction of Object.values(interactions ?? {})) {
+        if (seen.has(interaction.interactionId)) continue;
+        seen.add(interaction.interactionId);
+        found.push({ scope, interaction });
+      }
+    }
+    return found;
+  }
+
+  #finishIntent(intent: Intent): void {
+    const index = this.#intents.indexOf(intent);
+    if (index >= 0) this.#intents.splice(index, 1);
+    this.#transition = undefined;
   }
 
   #resolveRoute(): void {
     const route = this.#route;
     if (route.kind !== "session" || this.#global() == null) return;
     const scope = `session/${route.sessionId}`;
-    if (this.#ended.has(scope) || this.#replicas.get(scope) != null) return;
+    if (this.#ended.has(scope) || this.#feed.get(scope) != null) return;
     if (this.#knownCwd(route.sessionId) != null || route.cwd != null || this.#authRequired) return;
-    if (!this.#catalog.settled || this.#catalog.listing || this.#catalog.nextCursor != null) return;
+    if (!this.#catalogSettled()) return;
     // No cwd anywhere: the session does not exist for this Agent.
     this.#navigate({ kind: "home" }, true);
   }
@@ -549,116 +659,215 @@ export class Workspace {
   // -------------------------------------------------------------------------
   // Writes
 
-  /** Shows what a write's answer says when the page cannot leave it to the replica. */
+  #reportMessage(operation: string, message: string, intent?: Intent): void {
+    if (intent != null && this.#navigation !== intent.navigation) return;
+    this.#nextId += 1;
+    this.#errors = [...this.#errors, { id: `local:${this.#nextId}`, type: "error", message, operation }];
+  }
+
+  /** Shows what a write's answer says when the page cannot leave it to the document. */
   #report(operation: string, outcome: WriteOutcome): void {
     let message: string | undefined;
-    let code: number | undefined;
     let data: unknown;
     if (outcome.kind === "refused") {
       message = i18n.t("errors.refused", { operation, message: outcome.error.message });
       data = outcome.error;
     } else if (outcome.kind === "uncertain") {
       message = i18n.t("errors.uncertainWrite", { operation });
-    } else if (outcome.kind === "ended" && "error" in outcome.outcome) {
-      const error: ProtocolError = outcome.outcome.error;
-      const agent = isRecord(error.data) ? error.data : undefined;
-      message = agent != null && typeof agent.message === "string" ? agent.message : error.message;
-      code = agent != null && typeof agent.code === "number" ? agent.code : undefined;
-      data = agent?.data ?? error.data;
     }
     if (message == null) return;
     this.#nextId += 1;
     this.#errors = [...this.#errors, {
-      id: `local:${this.#nextId}`, type: "error", message, operation,
-      ...(code != null ? { code } : {}), ...(data !== undefined ? { data } : {}),
+      id: `local:${this.#nextId}`, type: "error", message, operation, ...(data !== undefined ? { data } : {}),
     }];
   }
 
-  #write(scope: string, write: OpArgs, label: string): Promise<WriteOutcome> {
+  #write(scope: string, write: StartingWrite, label: string): Promise<WriteOutcome> {
     return this.#ops.write(scope, write).then((outcome) => {
-      if (scope === GLOBAL && (outcome.kind === "accepted" || outcome.kind === "ended")) this.#mine.add(outcome.op);
+      if (scope === GLOBAL && outcome.kind === "accepted") this.#mine.add(outcome.op);
       this.#report(label, outcome);
       this.#changed();
       return outcome;
     });
   }
 
-  newSession = (cwd: string): boolean => {
-    const global = this.#global();
-    if (global == null || global.op.status === "running" || this.#transition != null) return false;
+  /** Starts a create or fork; its result is read from the documents (§6.2, §6.6). */
+  #start(kind: Intent["kind"], scope: string, write: StartingWrite, cwd: string): void {
     const navigation = this.#navigation;
-    this.#transition = { kind: "new", navigation };
-    void this.#ops.write(GLOBAL, { kind: "create", args: { cwd } }).then((outcome) => {
-      this.#transition = undefined;
-      if (outcome.kind === "ended" && "result" in outcome.outcome && isRecord(outcome.outcome.result) &&
-        typeof outcome.outcome.result.sessionId === "string") {
-        // The create's own result names the session (§6.3); a later operation does not matter.
-        if (this.#navigation === navigation) {
-          this.#navigate({ kind: "session", sessionId: outcome.outcome.result.sessionId, cwd });
-        }
+    const label = kind === "new" ? "create" : "fork";
+    this.#transition = { kind, navigation };
+    void this.#ops.write(scope, write).then((outcome) => {
+      if (outcome.kind === "accepted") {
+        this.#intents.push({ kind, scope, id: outcome.op, navigation, cwd });
+        if (scope === GLOBAL) this.#mine.add(outcome.op);
+      } else if (outcome.kind === "uncertain" && outcome.write != null) {
+        this.#intents.push({ kind, scope, id: outcome.write.id, lost: outcome.write, navigation, cwd });
       } else {
-        if (outcome.kind === "ended" && "error" in outcome.outcome && needsAuthentication(outcome.outcome.error)) {
-          this.#authRequired = true;
-        }
-        if (this.#navigation === navigation) this.#report("create", outcome);
+        this.#transition = undefined;
+        if (this.#navigation === navigation) this.#report(label, outcome);
       }
       this.#changed();
     });
     this.#changed();
+  }
+
+  newSession = (cwd: string): boolean => {
+    const global = this.#global();
+    if (global == null || global.op.status === "running" || this.#transition != null) return false;
+    this.#start("new", GLOBAL, { kind: "create", args: { cwd } }, cwd);
     return true;
   };
 
   forkSession = (): void => {
     const shown = this.#shown();
     if (shown == null || shown.live.op.status === "running" || this.#transition != null) return;
-    const navigation = this.#navigation;
-    const cwd = shown.live.cwd;
-    this.#transition = { kind: "fork", navigation };
-    void this.#ops.write(shown.scope, { kind: "fork", args: {} }).then((outcome) => {
-      this.#transition = undefined;
-      if (outcome.kind === "ended" && "result" in outcome.outcome && isRecord(outcome.outcome.result) &&
-        typeof outcome.outcome.result.sessionId === "string") {
-        if (this.#navigation === navigation) {
-          this.#navigate({ kind: "session", sessionId: outcome.outcome.result.sessionId, cwd });
-        }
-      } else if (this.#navigation === navigation) {
-        this.#report("fork", outcome);
-      }
-      this.#changed();
-    });
-    this.#changed();
+    this.#start("fork", shown.scope, { kind: "fork", args: {} }, shown.live.cwd);
   };
 
   deleteSession = (sessionId: string): void => {
     void this.#write(GLOBAL, { kind: "delete", args: { sessionId } }, "delete");
   };
 
+  authenticate = (methodId: string): void => {
+    const global = this.#global();
+    const method = global?.agent.initialize?.authMethods?.find(({ id }) => id === methodId);
+    if (global == null || method == null || global.op.status === "running") return;
+    if ("type" in method && method.type === "terminal") {
+      void this.#write(GLOBAL, { kind: "terminal_login", args: { methodId, cols: 80, rows: 24 } }, "terminal_login");
+    } else {
+      void this.#write(GLOBAL, { kind: "authenticate", args: { methodId } }, "authenticate");
+    }
+  };
+
+  logout = (): void => {
+    void this.#write(GLOBAL, { kind: "logout", args: {} }, "logout");
+  };
+
+  /** Terminal input: in order, one request at a time per terminal, never resent (§7, C3). */
+  writeAuthTerminal = (terminalId: string, data: string): void => {
+    void this.#actions.input(GLOBAL, terminalId, data);
+  };
+
+  resizeAuthTerminal = (terminalId: string, cols: number, rows: number): void => {
+    void this.#actions.resize(GLOBAL, terminalId, cols, rows);
+  };
+
+  cancelAuthTerminal = (terminalId: string): void => {
+    const op = this.#global()?.op;
+    if (op?.id !== terminalId || op.status !== "running") return;
+    void this.#ops.cancel(GLOBAL).then((outcome) => {
+      this.#report("cancel", outcome);
+      this.#changed();
+    });
+  };
+
+  dismissAuthTerminal = (terminalId: string): void => {
+    void this.#actions.dismiss(GLOBAL, terminalId).then(() => this.#changed());
+  };
+
+  // -------------------------------------------------------------------------
+  // Answers and controls (§7)
+
+  /** Answers one interaction, alone: at most once, whatever else is pending. */
+  #respond(interactionId: string, answer: { outcome: unknown } | { response: unknown }): void {
+    const found = this.#pendingInteractions().find(({ interaction }) => interaction.interactionId === interactionId);
+    if (found == null || this.#answers.has(interactionId)) return;
+    const state: AnswerState = { state: "sending" };
+    this.#answers.set(interactionId, state);
+    this.#answerErrors.delete(interactionId);
+    void this.#actions.answer(found.scope, interactionId, answer).then((outcome) => {
+      if (this.#answers.get(interactionId) !== state) return;
+      if (outcome.kind === "done") {
+        // Delivered: the document shows it gone.
+        state.state = "sent";
+      } else if (outcome.kind === "uncertain") {
+        // It may have been delivered: the interaction stays pending until the document says
+        // otherwise, and nothing is sent again (C3).
+        state.state = "uncertain";
+      } else {
+        // The input stays with the user (C2): the form keeps its values.
+        this.#answers.delete(interactionId);
+        if (outcome.kind === "refused" && outcome.error.code !== "not_found") {
+          this.#answerErrors.set(interactionId, i18n.t("interaction.refused", { ns: "cards", message: outcome.error.message }));
+        }
+      }
+      this.#changed();
+    });
+    this.#changed();
+  }
+
+  respondPermission = (permissionId: string, outcome: RequestPermissionResponse["outcome"]): void =>
+    this.#respond(permissionId, { outcome });
+
+  respondElicitation = (elicitationId: string, response: CreateElicitationResponse): void =>
+    this.#respond(elicitationId, { response });
+
+  #interactionStatus(interactionId: string): Pick<PendingPermission, "responseRequestId" | "responseStatus" | "responseError"> {
+    const state = this.#answers.get(interactionId);
+    if (state != null) {
+      return {
+        responseRequestId: interactionId,
+        ...(state.state === "uncertain" ? { responseStatus: i18n.t("interaction.uncertain", { ns: "cards" }) } : {}),
+      };
+    }
+    const error = this.#answerErrors.get(interactionId);
+    return error == null ? {} : { responseError: error };
+  }
+
+  /** Sets a mode or an option; held until the Agent answers, also while a prompt runs. */
+  #control_(kind: "mode" | "config", label: string, send: (scope: string) => Promise<import("../../../shared/write-client").ActionOutcome>): void {
+    const shown = this.#shown();
+    if (shown == null) return;
+    this.#nextId += 1;
+    const control = { kind, scope: shown.scope, sessionId: shown.live.sessionId, id: this.#nextId };
+    this.#control = control;
+    void send(shown.scope).then((outcome) => {
+      if (this.#control === control) this.#control = undefined;
+      if (outcome.kind === "refused") {
+        this.#nextId += 1;
+        this.#errors = [...this.#errors, {
+          id: `local:${this.#nextId}`, type: "error", operation: label,
+          message: i18n.t("errors.refused", { operation: label, message: outcome.error.message }), data: outcome.error,
+        }];
+      } else if (outcome.kind === "uncertain") {
+        this.#nextId += 1;
+        this.#errors = [...this.#errors, {
+          id: `local:${this.#nextId}`, type: "error", operation: label, message: i18n.t("errors.uncertainWrite", { operation: label }),
+        }];
+      }
+      this.#changed();
+    });
+    this.#changed();
+  }
+
   setMode = (modeId: string): void => {
-    const scope = this.#shown()?.scope;
-    if (scope != null) void this.#write(scope, { kind: "set_mode", args: { modeId } }, "set_mode");
+    this.#control_("mode", "set_mode", (scope) => this.#actions.setMode(scope, modeId));
   };
 
   setConfig = (configId: string, value: string | boolean): void => {
-    const scope = this.#shown()?.scope;
-    if (scope != null) void this.#write(scope, { kind: "set_config", args: { configId, value } }, "set_config");
+    this.#control_("config", "set_config", (scope) => this.#actions.setConfig(scope, configId, value));
+  };
+
+  /** Dismisses the URL flow `interactionId`, wherever it is shown. */
+  dismissExternalFlow = (interactionId: string): void => {
+    for (const scope of [this.#shown()?.scope, GLOBAL, CATALOG]) {
+      if (scope == null) continue;
+      const flows = bodyFlows(this.#feed.get(scope));
+      if (flows != null && Object.hasOwn(flows, interactionId)) {
+        void this.#actions.dismiss(scope, interactionId).then(() => this.#changed());
+        return;
+      }
+    }
   };
 
   /** Stops the running turn; the queue waits until the user sends again. */
   cancel = (): void => {
     const shown = this.#shown();
     if (shown == null || shown.live.op.status !== "running") return;
-    void this.#write(shown.scope, { kind: "cancel", args: {} }, "cancel");
-  };
-
-  listSessions = (cursor?: string): void => {
-    if (cursor == null) {
-      // The user asks again: a new attempt, which may go against the same `op`
-      // a refused list was sent against. Nothing is resent without this (C3).
-      this.#catalog = { ...this.#catalog, refresh: true, failedRevision: undefined, sentAgainst: undefined };
+    void this.#ops.cancel(shown.scope).then((outcome) => {
+      this.#report("cancel", outcome);
       this.#changed();
-    } else if (!this.#catalog.listing) {
-      this.#list(cursor);
-    }
+    });
   };
 
   // -------------------------------------------------------------------------
@@ -667,7 +876,7 @@ export class Workspace {
   /**
    * Queues a prompt for the shown session. A prompt sent while the turn is
    * idle goes ahead of paused ones; the queue sends one at a time, against the
-   * `op` the replica shows ended.
+   * `op` the document shows ended.
    */
   prompt = (blocks: PromptBlock[], ahead = false): boolean => {
     const scope = this.#shown()?.scope;
@@ -682,7 +891,7 @@ export class Workspace {
   };
 
   /** Sends prompts from the page's queue into the write queue, one at a time. */
-  #feed(): void {
+  #feedQueue(): void {
     for (const [scope, held] of this.#held) {
       if (held.length === 0 || this.#paused.has(scope)) continue;
       if (this.#queue.items(scope).some(({ state }) => state !== "uncertain")) continue;
@@ -759,176 +968,21 @@ export class Workspace {
     this.prompt(promptOf(queued.write));
   };
 
-  // -------------------------------------------------------------------------
-  // Answers (§6.2: one write answers every pending interaction)
-
-  /** The scopes whose running `op` asks; one operation may occupy several (§6.4). */
-  #answerScopes(): string[] {
-    const shown = this.#shown()?.scope;
-    return [...(shown == null ? [] : [shown]), GLOBAL, CATALOG];
+  #queueEntries(scope: string, sessionId: string): QueueEntry[] {
+    const paused = this.#paused.has(scope);
+    return [
+      ...this.#queue.items(scope).map((item): QueueEntry => ({
+        id: `queue:${item.id}`,
+        sessionId,
+        blocks: promptOf(item.write),
+        state: item.state,
+        ...(item.error ? { error: item.error.message } : {}),
+      })),
+      ...(this.#held.get(scope) ?? []).map((item): QueueEntry => ({
+        id: item.id, sessionId, blocks: item.blocks, state: paused ? "paused" : "queued",
+      })),
+    ];
   }
-
-  /** A scope showing the running operation `opId`; any of them takes its answers. */
-  #opScope(opId: string): string | undefined {
-    return this.#answerScopes().find((scope) => {
-      const op = this.#scopeOp(scope);
-      return op?.status === "running" && op.id === opId;
-    });
-  }
-
-  #interactionOp(interactionId: string): Operation | undefined {
-    for (const scope of this.#answerScopes()) {
-      const op = this.#scopeOp(scope);
-      if (op?.status === "running" && Object.hasOwn(op.interactions ?? {}, interactionId)) return op;
-    }
-    return undefined;
-  }
-
-  #scopeOp(scope: string): Operation | undefined {
-    const live = this.#replicas.get(scope)?.live;
-    return isRecord(live) && isRecord(live.op) ? live.op as unknown as Operation : undefined;
-  }
-
-  #respond(interactionId: string, answer: Answer): void {
-    const op = this.#interactionOp(interactionId);
-    if (op == null) return;
-    // Answers belong to the operation, whichever scope shows it.
-    let state = this.#answers.get(op.id);
-    if (state == null) {
-      state = { drafts: new Map(), errors: new Map() };
-      this.#answers.set(op.id, state);
-    }
-    state.drafts.set(interactionId, answer);
-    state.errors.delete(interactionId);
-    this.#sendAnswers(op.id);
-    this.#changed();
-  }
-
-  respondPermission = (permissionId: string, outcome: RequestPermissionResponse["outcome"]): void =>
-    this.#respond(permissionId, { outcome });
-
-  respondElicitation = (elicitationId: string, response: CreateElicitationResponse): void =>
-    this.#respond(elicitationId, { response });
-
-  #sendAnswers(opId: string): void {
-    const scope = this.#opScope(opId);
-    const op = scope == null ? undefined : this.#scopeOp(scope);
-    const state = this.#answers.get(opId);
-    if (scope == null || op == null || state == null || state.sent != null) return;
-    const pending = Object.keys(op.interactions ?? {});
-    if (pending.length === 0 || !pending.every((id) => state.drafts.has(id))) return;
-    const answers = Object.fromEntries(pending.map((id) => [id, state.drafts.get(id)!]));
-    const sent = { ids: pending, state: "sending" as "sending" | "sent" | "uncertain" };
-    state.sent = sent;
-    void this.#ops.answer(scope, answers).then((outcome) => {
-      if (state.sent !== sent) return;
-      switch (outcome.kind) {
-        case "accepted":
-        case "ended":
-          sent.state = "sent";
-          break;
-        case "uncertain":
-          // It may have been delivered: the interactions stay pending here
-          // until the replica shows otherwise, and nothing is sent again (C3).
-          sent.state = "uncertain";
-          break;
-        case "refused":
-          // The input stays with the user (C2): the form keeps its values.
-          state.sent = undefined;
-          for (const id of sent.ids) {
-            state.drafts.delete(id);
-            state.errors.set(id, i18n.t("interaction.refused", { ns: "cards", message: outcome.error.message }));
-          }
-          break;
-        case "blocked":
-          state.sent = undefined;
-          break;
-      }
-      this.#changed();
-    });
-  }
-
-  /** Drops answers to interactions the replica no longer shows pending. */
-  #settleAnswers(): void {
-    for (const [opId, state] of this.#answers) {
-      const scope = this.#opScope(opId);
-      const op = scope == null ? undefined : this.#scopeOp(scope);
-      if (op == null) {
-        // Until the routed session aligns, its operation is unknown, not ended.
-        if (this.#sessionScope() == null || this.#shown() != null) this.#answers.delete(opId);
-        continue;
-      }
-      const pending = new Set(Object.keys(op.interactions ?? {}));
-      for (const id of [...state.drafts.keys()]) if (!pending.has(id)) state.drafts.delete(id);
-      for (const id of [...state.errors.keys()]) if (!pending.has(id)) state.errors.delete(id);
-      if (state.sent != null && !state.sent.ids.some((id) => pending.has(id))) state.sent = undefined;
-      // The pending set may have shrunk to what the user answered already.
-      this.#sendAnswers(opId);
-    }
-  }
-
-  #interactionStatus(opId: string, interactionId: string): Pick<PendingPermission, "responseRequestId" | "responseStatus" | "responseError"> {
-    const state = this.#answers.get(opId);
-    if (state == null) return {};
-    const error = state.errors.get(interactionId);
-    if (state.sent?.ids.includes(interactionId)) {
-      return {
-        responseRequestId: opId,
-        ...(state.sent.state === "uncertain" ? { responseStatus: i18n.t("interaction.uncertain", { ns: "cards" }) } : {}),
-      };
-    }
-    if (state.drafts.has(interactionId)) {
-      return { responseRequestId: "draft", responseStatus: i18n.t("interaction.waitingOthers", { ns: "cards" }) };
-    }
-    return error == null ? {} : { responseError: error };
-  }
-
-  // -------------------------------------------------------------------------
-  // Resources (§7)
-
-  dismissExternalFlow = (interactionId: string): void => {
-    for (const scope of [this.#shown()?.scope, GLOBAL, CATALOG]) {
-      if (scope == null) continue;
-      const live = this.#replicas.get(scope)?.live;
-      if (isRecord(live) && isRecord(live.urlFlows) && Object.hasOwn(live.urlFlows, interactionId)) {
-        void this.#resources.dismiss(scope, interactionId).then(() => this.#changed());
-        return;
-      }
-    }
-  };
-
-  authenticate = (methodId: string): void => {
-    const global = this.#global();
-    const method = global?.agent.initialize?.authMethods?.find(({ id }) => id === methodId);
-    if (global == null || method == null || global.op.status === "running") return;
-    if ("type" in method && method.type === "terminal") {
-      void this.#write(GLOBAL, { kind: "terminal_login", args: { methodId, cols: 80, rows: 24 } }, "terminal_login");
-    } else {
-      void this.#write(GLOBAL, { kind: "authenticate", args: { methodId } }, "authenticate");
-    }
-  };
-
-  logout = (): void => {
-    void this.#write(GLOBAL, { kind: "logout", args: {} }, "logout");
-  };
-
-  /** Terminal input: in order, one request at a time per terminal, never resent (§7, C3). */
-  writeAuthTerminal = (terminalId: string, data: string): void => {
-    void this.#resources.input(GLOBAL, terminalId, data);
-  };
-
-  resizeAuthTerminal = (terminalId: string, cols: number, rows: number): void => {
-    void this.#resources.resize(GLOBAL, terminalId, cols, rows);
-  };
-
-  cancelAuthTerminal = (terminalId: string): void => {
-    const op = this.#global()?.op;
-    if (op?.id === terminalId && op.status === "running") void this.#write(GLOBAL, { kind: "cancel", args: {} }, "cancel");
-  };
-
-  dismissAuthTerminal = (terminalId: string): void => {
-    void this.#resources.dismiss(GLOBAL, terminalId).then(() => this.#changed());
-  };
 
   // -------------------------------------------------------------------------
   // Reads (§8)
@@ -953,17 +1007,16 @@ export class Workspace {
 
   #project(): WorkspaceState {
     const global = this.#global();
+    const catalog = this.#catalog();
     const agent = global?.agent;
     const route = this.#route;
     const shown = this.#shown();
     const live = shown?.live;
     const op = live?.op;
-    const sessionId = route.kind === "session" ? route.sessionId : undefined;
-    const scope = shown?.scope;
-
-    // A session is shown once aligned, unless a first load is still filling an empty log.
-    const loading = live != null && op?.kind === "load" && op.status === "running" && shown!.log.length === 0 &&
-      !shown!.confirmed && pendingInteractions(op).length === 0;
+    // A session is shown once aligned, unless a first load is still filling an empty thread.
+    const entries = shown?.body.entries;
+    const loading = live != null && op?.kind === "load" && op.status === "running" &&
+      (entries?.length ?? 0) === 0 && shown!.body.history !== "complete" && Object.keys(live.interactions).length === 0;
     const visible = live != null && !loading;
     // The end of the route's session: its replica is gone once it ended.
     const routeScope = this.#sessionScope();
@@ -1002,64 +1055,61 @@ export class Workspace {
       };
     }).filter((terminal) => terminal.status !== "succeeded");
 
-    // Interactions: the shown session's operation, and the global and catalog ones.
+    // Interactions: those the shown session, `global` and `catalog` show. One
+    // operation occupying several scopes is the `op` of each (§6.4): show its once.
     const permissions: PendingPermission[] = [];
     const elicitations: PendingElicitation[] = [];
-    const interactionScopes = [
-      ...(visible && scope != null && op != null ? [[scope, op] as const] : []),
-      ...(globalOp != null ? [[GLOBAL, globalOp] as const] : []),
-      ...(() => {
-        const catalog = catalogLive(this.#replicas.get(CATALOG)?.live);
-        return catalog != null ? [[CATALOG, catalog.op] as const] : [];
-      })(),
-    ];
-    // One operation occupying several scopes is the `op` of each (§6.4): show its interactions once.
-    const projectedOps = new Set<string>();
-    for (const [, ownerOp] of interactionScopes) {
-      if (projectedOps.has(ownerOp.id)) continue;
-      projectedOps.add(ownerOp.id);
-      for (const interaction of pendingInteractions(ownerOp)) {
-        const status = this.#interactionStatus(ownerOp.id, interaction.interactionId);
-        pushInteraction(interaction, status, permissions, elicitations);
+    for (const { scope: where, interaction } of this.#pendingInteractions()) {
+      // The shown session's own interactions wait until it is shown (a load may still fill it).
+      if (where === shown?.scope && !visible) continue;
+      const status = this.#interactionStatus(interaction.interactionId);
+      if (interaction.kind === "permission") {
+        permissions.push({ permissionId: interaction.interactionId, request: interaction.request, ...status });
+      } else {
+        elicitations.push({ elicitationId: interaction.interactionId, request: interaction.request, ...status });
       }
     }
     const externalFlows = [
       ...(visible && live != null ? Object.values(live.urlFlows ?? {}).map((flow) => externalFlow(flow, live.sessionId)) : []),
       ...Object.values(global?.urlFlows ?? {}).map((flow) => externalFlow(flow)),
-      ...Object.values(catalogLive(this.#replicas.get(CATALOG)?.live)?.urlFlows ?? {}).map((flow) => externalFlow(flow)),
+      ...Object.values(catalog?.urlFlows ?? {}).map((flow) => externalFlow(flow)),
     ];
 
     // The thread.
     let timeline: TimelineItem[] = [];
     let activePlan: AppState["activePlan"];
     let agentActivity: AppState["agentActivity"];
-    if (visible && live != null && op != null) {
-      timeline = projectTimeline(live.sessionId, shown!.log, op);
-      if (op.kind === "prompt" && op.status === "running") {
-        const process = projectProcess(live.sessionId, op.id, op.process ?? [], promptInput(op));
-        activePlan = process.activePlan;
-        agentActivity = process.activity ?? { kind: "waiting" };
-      }
+    if (visible && live != null && shown != null) {
+      const projected = projectEntries(live.sessionId, entries ?? [], shown.body.prompts);
+      timeline = projected.timeline;
+      activePlan = projected.activePlan;
+      agentActivity = projected.activity;
     }
+
     // Failures of the global operations this page started, and its own write answers.
     if (globalOp != null && globalOp.status === "failed" && globalOp.error != null && this.#mine.has(globalOp.id) &&
       authOp == null) {
-      timeline = [...timeline, operationError(`op:${globalOp.id}:error`, globalOp, globalOp.error)];
+      timeline = [...timeline, operationError(`op:${globalOp.id}:error`, globalOp as never, globalOp.error)];
     }
     timeline = [...timeline, ...this.#errors];
 
-    const terminalSnapshots = live != null ? sessionTerminals(live) : [];
+    const terminalSnapshots: TerminalSnapshot[] = Object.values(live?.terminals ?? {}).map((terminal) => ({
+      sessionId: live!.sessionId,
+      terminalId: terminal.terminalId,
+      output: terminal.output,
+      truncated: terminal.truncated,
+      exitStatus: terminal.exitStatus,
+      released: terminal.released,
+    }));
     const controls = live?.controls;
     const running = visible && op?.kind === "prompt" && op.status === "running";
-    const runtimeKind = op?.status === "running" && (op.kind === "fork" || op.kind === "set_mode" || op.kind === "set_config")
-      ? op.kind : undefined;
-
-    const summaries = Object.values(global?.sessions ?? {});
-    const sessions = listedSessions(this.#catalog.sessions, global);
+    const runtimeKind = op?.status === "running" && op.kind === "fork" ? op.kind : undefined;
     const deleting = globalOp?.kind === "delete" && globalOp.status === "running" && isRecord(globalOp.input) &&
       typeof globalOp.input.sessionId === "string" ? globalOp.input.sessionId : undefined;
 
-    const queue = scope == null ? [] : this.#queueEntries(scope, sessionId!);
+    const summaries = Object.values(global?.sessions ?? {});
+    const sessions = listedSessions(this.#catalogSessions(), global as never);
+    const last = catalog?.pages.at(-1);
 
     return {
       ...initialState,
@@ -1088,21 +1138,19 @@ export class Workspace {
         ...(controls?.modes != null ? { modes: controls.modes } : {}),
       } : undefined,
       sessions,
-      nextSessionCursor: this.#catalog.nextCursor,
+      nextSessionCursor: last?.nextCursor ?? null,
       openSessionIds: summaries.map(({ sessionId: id }) => id),
       busySessionIds: summaries.filter(({ op: summary }) => summary.status === "running").map(({ sessionId: id }) => id),
-      attentionSessionIds: summaries.filter(({ pending }) => pending.interactions > 0 || pending.urlFlows > 0)
+      attentionSessionIds: summaries.filter(({ pending: counts }) => counts.interactions > 0 || counts.urlFlows > 0)
         .map(({ sessionId: id }) => id),
       pendingSessionDeletions: deleting != null ? [{ requestId: globalOp!.id, sessionId: deleting }] : [],
-      pendingSessionControl: runtimeKind === "set_mode" || runtimeKind === "set_config" ? {
-        requestId: op!.id, sessionId: live!.sessionId, kind: runtimeKind === "set_mode" ? "mode" : "config",
-      } : undefined,
-      runtimeOperation: runtimeKind != null ? {
-        requestId: op!.id, operation: runtimeKind === "fork" ? "fork" : runtimeKind === "set_mode" ? "mode" : "config",
-      } : undefined,
+      runtimeOperation: runtimeKind != null ? { requestId: op!.id, operation: "fork" } : undefined,
       sessionTransition: this.#transition == null || this.#transition.navigation !== this.#navigation ? undefined : {
         kind: this.#transition.kind,
         requestId: `transition:${this.#transition.kind}`,
+      },
+      pendingSessionControl: this.#control == null || this.#control.sessionId !== live?.sessionId ? undefined : {
+        requestId: `control:${this.#control.id}`, sessionId: this.#control.sessionId, kind: this.#control.kind,
       },
       pendingPrompt: running ? { requestId: op!.id, sessionId: live!.sessionId, blocks: [], cancelRequested: op!.cancelRequested } : undefined,
       availableCommands: controls?.commands ?? [],
@@ -1119,8 +1167,8 @@ export class Workspace {
       sessionSyncPhase: !visible ? undefined : op?.status === "running" ? (running ? "running" : "reconciling") : "ready",
       agentActivity,
       activePlan,
-      queue,
-      queuePaused: scope != null && this.#paused.has(scope),
+      queue: shown == null ? [] : this.#queueEntries(shown.scope, shown.live.sessionId),
+      queuePaused: shown != null && this.#paused.has(shown.scope),
       authTerminals,
       standaloneTerminals: standaloneTerminals(terminalSnapshots, timeline),
       attachments: this.#reader,
@@ -1128,45 +1176,22 @@ export class Workspace {
       projectCwd: route.kind === "project" ? route.cwd : undefined,
     };
   }
-
-  #queueEntries(scope: string, sessionId: string): QueueEntry[] {
-    const paused = this.#paused.has(scope);
-    return [
-      ...this.#queue.items(scope).map((item): QueueEntry => ({
-        id: `queue:${item.id}`,
-        sessionId,
-        blocks: promptOf(item.write),
-        state: item.state,
-        ...(item.error ? { error: item.error.message } : {}),
-      })),
-      ...(this.#held.get(scope) ?? []).map((item): QueueEntry => ({
-        id: item.id, sessionId, blocks: item.blocks, state: paused ? "paused" : "queued",
-      })),
-    ];
-  }
 }
 
-function pushInteraction(
-  interaction: Interaction,
-  status: Pick<PendingPermission, "responseRequestId" | "responseStatus" | "responseError">,
-  permissions: PendingPermission[],
-  elicitations: PendingElicitation[],
-): void {
-  if (interaction.kind === "permission") {
-    permissions.push({ permissionId: interaction.interactionId, request: interaction.request, ...status });
-  } else {
-    elicitations.push({ elicitationId: interaction.interactionId, request: interaction.request, ...status });
-  }
+/** The URL flows a replica's `live` holds. */
+function bodyFlows(replica: { readonly doc: Readonly<Record<string, unknown>> } | undefined): Readonly<Record<string, unknown>> | undefined {
+  const live = replica?.doc.live;
+  return isRecord(live) && isRecord(live.urlFlows) ? live.urlFlows : undefined;
 }
 
-function promptOf(write: OpArgs): PromptBlock[] {
+/** The `live` of a replica, if it holds one. */
+function bodyLive(replica: { readonly doc: Readonly<Record<string, unknown>> } | undefined): { op?: ShownOp } | undefined {
+  const live = replica?.doc.live;
+  return isRecord(live) ? (live as { op?: ShownOp }) : undefined;
+}
+
+function promptOf(write: StartingWrite): PromptBlock[] {
   return write.kind === "prompt" ? write.args.prompt : [];
-}
-
-function mergeSessions(current: SessionInfo[], incoming: SessionInfo[]): SessionInfo[] {
-  const sessions = new Map(current.map((session) => [session.sessionId, session]));
-  for (const session of incoming) sessions.set(session.sessionId, session);
-  return [...sessions.values()];
 }
 
 async function readJson(path: string): Promise<unknown> {
@@ -1199,12 +1224,25 @@ export function useAcp() {
     projectCwd: state.projectCwd,
     retrySessionOpening: workspace.retrySessionOpening,
     reconnect: workspace.reconnect,
+    goHome: workspace.goHome,
+    openProject: workspace.openProject,
+    attachSession: workspace.attachSession,
+    closeSession: workspace.closeSession,
     authenticate: workspace.authenticate,
     writeAuthTerminal: workspace.writeAuthTerminal,
     resizeAuthTerminal: workspace.resizeAuthTerminal,
     cancelAuthTerminal: workspace.cancelAuthTerminal,
     dismissAuthTerminal: workspace.dismissAuthTerminal,
     logout: workspace.logout,
+    newSession: workspace.newSession,
+    forkSession: workspace.forkSession,
+    deleteSession: workspace.deleteSession,
+    listSessions: workspace.listSessions,
+    respondPermission: workspace.respondPermission,
+    respondElicitation: workspace.respondElicitation,
+    dismissExternalFlow: workspace.dismissExternalFlow,
+    setMode: workspace.setMode,
+    setConfig: workspace.setConfig,
     prompt: workspace.prompt,
     cancel: workspace.cancel,
     pauseQueue: workspace.pauseQueue,
@@ -1212,19 +1250,6 @@ export function useAcp() {
     clearQueue: workspace.clearQueue,
     sendQueuedNow: workspace.sendQueuedNow,
     resendQueued: workspace.resendQueued,
-    setMode: workspace.setMode,
-    setConfig: workspace.setConfig,
-    respondPermission: workspace.respondPermission,
-    respondElicitation: workspace.respondElicitation,
-    dismissExternalFlow: workspace.dismissExternalFlow,
-    newSession: workspace.newSession,
-    listSessions: workspace.listSessions,
-    attachSession: workspace.attachSession,
-    goHome: workspace.goHome,
-    openProject: workspace.openProject,
-    forkSession: workspace.forkSession,
-    closeSession: workspace.closeSession,
-    deleteSession: workspace.deleteSession,
     searchWorkspaceContext: workspace.searchWorkspaceContext,
     readWorkspaceContext: workspace.readWorkspaceContext,
   };

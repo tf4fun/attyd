@@ -93,5 +93,5 @@ test("replaces loading with the load failure and subscribes again on manual retr
 const SCOPE = "session/lazy-process-session";
 
 function isSessionStream(url: URL): boolean {
-  return url.pathname === "/api/v2/stream" && url.searchParams.getAll("scope").includes(SCOPE);
+  return url.pathname === "/api/v3/stream" && url.searchParams.getAll("scope").includes(SCOPE);
 }
