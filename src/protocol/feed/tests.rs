@@ -313,3 +313,74 @@ fn only_the_subscribers_that_follow_a_scope_are_sent_its_checkpoint() {
     feed.checkpoints(after(base, 500));
     assert_eq!(drain(&mut feed, other), Vec::<String>::new());
 }
+
+// -- The sessions subscriptions follow (protocol §5.1, S6) --------------------------------
+
+fn follow_in(scope: &Scope, cwd: Option<&str>) -> Vec<Subscribed> {
+    vec![Subscribed {
+        scope: scope.clone(),
+        have: None,
+        cwd: cwd.map(String::from),
+    }]
+}
+
+#[test]
+fn a_session_a_subscription_follows_waits_for_its_load_until_it_is_published() {
+    let mut registry = SessionRegistry::new("epoch");
+    let mut feed = Feed::new("process");
+    feed.commit(&registry, &agent(), 0);
+    let first = feed.subscribe(&follow_in(&session(), Some("/work")));
+    let second = feed.subscribe(&follow_in(&session(), None));
+    let only_global = feed.subscribe(&follow(&[Scope::Global]));
+
+    let followed = feed.followed_sessions();
+    assert_eq!(followed.keys().collect::<Vec<_>>(), ["s"], "only sessions are followed");
+    let waiting = &followed["s"];
+    assert_eq!(
+        waiting.iter().map(|w| (w.id, w.cwd.as_deref())).collect::<Vec<_>>(),
+        [(first, Some("/work")), (second, None)]
+    );
+    assert!(!waiting.iter().any(|w| w.id == only_global));
+
+    // Published, the session is still followed but nobody waits for it.
+    registry
+        .open_new("epoch", "s", "/work", json!({ "sessionId": "s" }))
+        .unwrap();
+    feed.commit(&registry, &agent(), 0);
+    assert_eq!(feed.followed_sessions()["s"].len(), 0);
+
+    // A subscription that is gone follows nothing.
+    feed.unsubscribe(first);
+    feed.unsubscribe(second);
+    assert!(feed.followed_sessions().is_empty());
+}
+
+#[test]
+fn ending_the_waiting_ends_the_scope_for_those_that_wait_only() {
+    let mut registry = SessionRegistry::new("epoch");
+    let mut feed = Feed::new("process");
+    feed.commit(&registry, &agent(), 0);
+    let waiting = feed.subscribe(&follow_in(&session(), None));
+    let end = End {
+        reason: EndReason::LoadFailed,
+        error: Some(crate::protocol::documents::ProtocolError::new(
+            crate::protocol::documents::ErrorCode::InvalidRequest,
+            "needs a cwd",
+        )),
+    };
+    feed.end_waiting("s", &end);
+    assert_eq!(drain(&mut feed, waiting), ["end session/s LoadFailed"]);
+    // The end is final: it is not waiting any more, and nothing follows.
+    assert!(feed.followed_sessions().get("s").is_none_or(|w| w.is_empty()));
+    registry
+        .open_new("epoch", "s", "/work", json!({ "sessionId": "s" }))
+        .unwrap();
+    feed.commit(&registry, &agent(), 0);
+    assert_eq!(drain(&mut feed, waiting), Vec::<String>::new());
+
+    // A subscription that already has the session published is not ended.
+    let aligned = feed.subscribe(&follow_in(&session(), None));
+    drain(&mut feed, aligned);
+    feed.end_waiting("s", &end);
+    assert_eq!(drain(&mut feed, aligned), Vec::<String>::new());
+}
