@@ -292,8 +292,12 @@ fn a_snapshot_settles_the_scope_and_nothing_is_checkpointed_for_a_scope_that_end
         .unwrap()
         .lifecycle = SessionLifecycle::Closed;
     feed.commit_at(&registry, &agent(), 0, after(base, 30));
+    drain(&mut feed, id);
+    // `global` lists the session, so it changed too: its checkpoint is due, the
+    // ended session's is not.
+    feed.checkpoints(after(base, 10_000));
+    assert_eq!(drain(&mut feed, id), Vec::<String>::new());
     assert_eq!(feed.deadline(), None);
-    assert!(!feed.checkpoints(after(base, 10_000)));
 }
 
 #[test]
