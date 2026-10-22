@@ -931,8 +931,11 @@ fn resource_action(
                 .map_err(|error| refused(bridge::resources::refusal(error)))?;
             Ok(ResourceAction::Resize { cols, rows })
         }
+        "answer" if body.is_object() => Ok(ResourceAction::Answer { body }),
         _ if body.is_object() => Ok(ResourceAction::Dismiss),
-        _ => Err(invalid_request("dismiss: the body must be an object")),
+        _ => Err(invalid_request(format!(
+            "{action}: the body must be an object"
+        ))),
     }
 }
 
@@ -1018,7 +1021,7 @@ async fn write_scope_at(
         [
             "resources",
             resource,
-            action @ ("input" | "resize" | "dismiss"),
+            action @ ("input" | "resize" | "dismiss" | "answer"),
         ] => {
             let action = match resource_action(action, &headers, &body) {
                 Ok(action) => action,

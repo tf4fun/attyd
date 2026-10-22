@@ -92,7 +92,7 @@ fn report(sink: &EventSink, operation: &str, error: Error) {
 }
 
 /// Where a pending interaction waits, and what it is answered with.
-enum Delivery {
+pub(super) enum Delivery {
     Permission(SessionResourceOwner, RequestPermissionResponse),
     Elicitation {
         owner: Option<SessionResourceOwner>,
@@ -104,7 +104,7 @@ enum Delivery {
 /// Finds the responder of every answered interaction by its ID, wherever it
 /// waits (a session or the connection's request-scoped elicitations); one
 /// that is gone refuses the whole answer before anything is delivered.
-fn deliveries(
+pub(super) fn deliveries(
     state: &BridgeState,
     answers: Vec<(String, Answer)>,
 ) -> Result<Vec<(String, Delivery)>, ProtocolError> {
@@ -143,7 +143,11 @@ fn deliveries(
 
 /// Delivers every answer of an admitted `answer` under this guard, so the
 /// commit publishes them, and an accepted URL elicitation's flow, at once.
-fn deliver(state: &mut BridgeState, sink: &EventSink, deliveries: Vec<(String, Delivery)>) {
+pub(super) fn deliver(
+    state: &mut BridgeState,
+    sink: &EventSink,
+    deliveries: Vec<(String, Delivery)>,
+) {
     for (id, delivery) in deliveries {
         let epoch = state.sessions.epoch().to_string();
         let delivered = match delivery {

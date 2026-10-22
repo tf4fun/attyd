@@ -13,6 +13,7 @@ use super::*;
 use crate::bridge::publication::{PublishedCommit, documents};
 use crate::protocol::stream_check::Documents;
 
+mod actions;
 mod admission;
 mod execution;
 mod interactions;
