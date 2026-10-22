@@ -18,7 +18,7 @@ import type {
 } from "../../../shared/protocol";
 import type { CatalogLive3, GlobalLive3, SessionBody, SessionLive3 } from "../../../shared/documents";
 import type { Follow } from "../../../shared/document-replica";
-import { FeedClient } from "../../../shared/feed-client";
+import { FeedClient, type StreamSource } from "../../../shared/feed-client";
 import { createAttachmentReader, type AttachmentReader } from "./attachments";
 import { projectEntries } from "./entry-projection";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
@@ -78,6 +78,26 @@ function sessionBody(body: Readonly<Record<string, unknown>> | undefined): Sessi
     : undefined;
 }
 
+/** An `EventSource` as the feed client uses it. */
+function openEventSource(url: string): StreamSource {
+  const source = new EventSource(url);
+  let message: StreamSource["onmessage"] = null;
+  let error: StreamSource["onerror"] = null;
+  return {
+    get onmessage() { return message; },
+    set onmessage(handler) {
+      message = handler;
+      source.onmessage = handler == null ? null : (event: MessageEvent<string>) => handler({ data: event.data });
+    },
+    get onerror() { return error; },
+    set onerror(handler) {
+      error = handler;
+      source.onerror = handler == null ? null : () => handler();
+    },
+    close: () => source.close(),
+  };
+}
+
 export class Workspace {
   readonly #listeners = new Set<() => void>();
   // The client of one connection: `start()` makes it, its cleanup closes it, so a
@@ -102,7 +122,7 @@ export class Workspace {
   }
 
   #connect(): void {
-    const feed = new FeedClient((url) => new EventSource(url));
+    const feed = new FeedClient(openEventSource);
     this.#feed = feed;
     feed.subscribe((scope) => {
       if (this.#feed === feed) this.#received(scope);
