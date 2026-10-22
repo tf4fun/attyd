@@ -27,6 +27,7 @@ pub(crate) mod live_doc;
 #[cfg(test)]
 mod hub_tests;
 pub(crate) mod op;
+pub(crate) mod pacing;
 pub(crate) mod project;
 pub(crate) mod publish;
 pub(crate) mod registry;
