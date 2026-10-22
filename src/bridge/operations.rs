@@ -39,7 +39,12 @@ pub(super) fn admit(
 ) -> Result<Write, ProtocolError> {
     let admitted = {
         let published = state.protocol.publication.lock();
-        admission::admit(&published.publisher, scope, write)?
+        admission::admit(
+            &|scope| published.feed.live(scope),
+            &|session, id| published.feed.attachment(session, id),
+            scope,
+            write,
+        )?
     };
     if let Admitted::Repeat { op } = admitted {
         return Ok(Write::Repeat(OperationAdmission { op, end: None }));
@@ -192,7 +197,7 @@ pub(super) fn deliver(
 /// `scope` shows (protocol §6.2).
 pub(super) fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(String, Answer)> {
     let published = state.protocol.publication.lock();
-    let Some(live) = published.publisher.live(scope) else {
+    let Some(live) = published.feed.live(scope) else {
         return Vec::new();
     };
     live["op"]["interactions"]

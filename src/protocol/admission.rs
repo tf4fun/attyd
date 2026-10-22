@@ -13,7 +13,11 @@ use serde_json::{Value, json};
 
 use super::canon::AttachmentRef;
 use super::documents::{ErrorCode, OperationKind, ProtocolError, Scope};
-use super::publish::Publisher;
+
+/// The committed `live` of a scope.
+pub(crate) type LiveOf<'a> = &'a dyn Fn(&Scope) -> Option<Value>;
+/// The block an attachment of a session names: `(session ID, attachment ID)`.
+pub(crate) type AttachmentOf<'a> = &'a dyn Fn(&str, &str) -> Option<Value>;
 
 /// `POST /api/v2/scopes/{scope}/ops` (protocol §6.1).
 #[derive(Debug, Clone)]
@@ -96,7 +100,8 @@ fn started_kind(scope: &Scope, kind: &str) -> Option<OperationKind> {
 
 /// Checks `write` in `scope` against the published documents.
 pub(crate) fn admit(
-    publisher: &Publisher,
+    live_of: LiveOf,
+    attachment_of: AttachmentOf,
     scope: &Scope,
     write: &OpWrite,
 ) -> Result<Admitted, ProtocolError> {
@@ -114,8 +119,7 @@ pub(crate) fn admit(
             "an operation ID is 22 characters of base64url, not {id:?}"
         )));
     }
-    let live = publisher
-        .live(scope)
+    let live = live_of(scope)
         .ok_or_else(|| refuse(ErrorCode::NotFound, format!("{scope} is not held")))?;
     let op = &live["op"];
     // A write whose ID is the current operation's repeats one whose answer was
@@ -166,8 +170,7 @@ pub(crate) fn admit(
     }
     if kind == OperationKind::Delete
         && let Some(session_id) = write.args["sessionId"].as_str()
-        && publisher
-            .live(&Scope::Session(session_id.to_string()))
+        && live_of(&Scope::Session(session_id.to_string()))
             .is_some_and(|session| session["op"]["status"] == "running")
     {
         return Err(refuse(
@@ -179,14 +182,17 @@ pub(crate) fn admit(
     // installed at a time, so what it receives before its ID is known has one
     // owner (bridge memory model §9). A fork needs `global` free, and a write
     // in `global` needs no fork running.
-    let global = publisher.live(&Scope::Global);
+    let global = live_of(&Scope::Global);
     if kind == OperationKind::Fork
-        && global.is_some_and(|global| global["op"]["status"] == "running")
+        && global
+            .as_ref()
+            .is_some_and(|global| global["op"]["status"] == "running")
     {
         return Err(refuse(ErrorCode::NotAllowed, "global is not free"));
     }
     if matches!(scope, Scope::Global)
         && global
+            .as_ref()
             .and_then(|global| global["sessions"].as_object())
             .is_some_and(|sessions| {
                 sessions.values().any(|session| {
@@ -200,10 +206,11 @@ pub(crate) fn admit(
         ));
     }
     let initialize = global
+        .as_ref()
         .map(|global| &global["agent"]["initialize"])
         .filter(|initialize| !initialize.is_null());
     capability(initialize, kind)?;
-    let input = arguments(publisher, initialize, scope, live, kind, &write.args)?;
+    let input = arguments(attachment_of, initialize, scope, &live, kind, &write.args)?;
     Ok(Admitted::Start {
         kind,
         input,
@@ -328,7 +335,7 @@ fn auth_method<'a>(initialize: Option<&'a Value>, id: &str) -> Option<&'a Value>
 }
 
 fn arguments(
-    publisher: &Publisher,
+    attachment_of: AttachmentOf,
     initialize: Option<&Value>,
     scope: &Scope,
     live: &Value,
@@ -347,7 +354,7 @@ fn arguments(
             prompt_capabilities(initialize, blocks)?;
             let prompt = blocks
                 .iter()
-                .map(|block| prompt_block(publisher, session_id, block))
+                .map(|block| prompt_block(attachment_of, session_id, block))
                 .collect::<Result<Vec<_>, _>>()?;
             prompt_capabilities(initialize, &prompt)?;
             Ok(json!({ "prompt": prompt }))
@@ -441,15 +448,14 @@ fn arguments(
 /// A prompt block: an ACP content block, or a reference to an attachment of
 /// the session, resolved to the block it names.
 fn prompt_block(
-    publisher: &Publisher,
+    attachment_of: AttachmentOf,
     session_id: &str,
     block: &Value,
 ) -> Result<Value, ProtocolError> {
     if block["type"] == "attachment" {
         let reference: AttachmentRef = serde_json::from_value(block.clone())
             .map_err(|error| invalid(format!("invalid attachment reference: {error}")))?;
-        return publisher
-            .attachment(session_id, &reference.id)
+        return attachment_of(session_id, &reference.id)
             .ok_or_else(|| invalid(format!("the session has no attachment {}", reference.id)));
     }
     serde_json::from_value::<agent_client_protocol::schema::v1::ContentBlock>(block.clone())

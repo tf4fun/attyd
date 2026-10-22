@@ -110,6 +110,16 @@ impl Feed {
         }
     }
 
+    /// The committed `live` of `scope`: what a write is admitted against.
+    pub(crate) fn live(&self, scope: &Scope) -> Option<Value> {
+        self.engine.live(&scope.to_string()).cloned()
+    }
+
+    /// The block an attachment of a held session names, while a published entry references it.
+    pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
+        self.engine.attachment(&format!("session/{session_id}"), id).cloned()
+    }
+
     /// The whole document of `scope`, as a snapshot from nothing.
     pub(crate) fn snapshot(&self, scope: &str) -> Option<StreamEvent> {
         self.engine.snapshot(scope, None)
@@ -326,6 +336,16 @@ impl FeedHandle {
     pub(crate) fn end_waiting(&self, session_id: &str, end: &End) {
         self.feed().end_waiting(session_id, end);
         self.0.ready.notify_waiters();
+    }
+
+    /// The committed `live` of `scope`: what a write is admitted against.
+    pub(crate) fn live(&self, scope: &Scope) -> Option<Value> {
+        self.feed().live(scope)
+    }
+
+    /// The block an attachment of a held session names, while a published entry references it.
+    pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
+        self.feed().attachment(session_id, id)
     }
 
     /// The whole document of `scope` as the snapshot a stream is aligned with (protocol §8): none

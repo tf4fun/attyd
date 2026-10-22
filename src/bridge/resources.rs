@@ -94,7 +94,7 @@ fn answer(
     let interaction = {
         let published = state.protocol.publication.lock();
         published
-            .publisher
+            .feed
             .live(scope)
             .and_then(|live| live["op"]["interactions"].get(interaction_id).cloned())
     }
