@@ -1905,7 +1905,8 @@ test("shows file changes only in the running turn that reported them", async ({ 
   await expect(page.locator(".composer-dock .change-review")).toHaveCount(0);
   await turnEnd.release("second");
   await expectProcessFolded(page, reviews);
-  await expect(page.getByText("Reported two workspace changes.", { exact: false })).toHaveCount(2);
+  // Both turns' replies are in the thread (the debug panels hold the entries as JSON, hidden).
+  await expect(page.getByText("Reported two workspace changes.", { exact: false }).and(page.locator(":visible"))).toHaveCount(2);
   expect(browserErrors).toEqual([]);
 });
 
@@ -2064,7 +2065,8 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   }
   // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("activity");
-  await expectProcessFolded(page, page.locator(".thinking-block, .tool-card"));
+  // The user opened the tool card and resized the page, so the process stays open.
+  await expectProcessKept(page, page.locator(".thinking-block, .tool-card"));
   expect(browserErrors).toEqual([]);
 });
 
@@ -3837,6 +3839,15 @@ function toolSummaryLayout(tool: Locator) {
 async function expectRunningProcess(page: Page, entry: Locator): Promise<void> {
   await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeVisible();
   await expect(entry.first()).toBeVisible();
+}
+
+/**
+ * The turn committed and the Agent stopped, but the user has been reading the thread: the process stays
+ * where it was and is not folded away under them.
+ */
+async function expectProcessKept(page: Page, process: Locator): Promise<void> {
+  await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+  await expect(process).not.toHaveCount(0);
 }
 
 /**

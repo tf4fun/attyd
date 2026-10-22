@@ -177,7 +177,7 @@ test("keeps the committed reply after reload and fits mobile in both themes", as
   await page.getByRole("combobox", { name: "Language", exact: true }).selectOption("zh-CN");
   await page.keyboard.press("Escape");
   await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
-  await expectCommitted(turn);
+  await expectCommitted(turn, "展开执行过程");
   await page.screenshot({ path: testInfo.outputPath("turn-reply-mobile-chinese.png"), animations: "disabled" });
 });
 
@@ -193,7 +193,7 @@ async function startTurn(page: Page) {
 }
 
 /** The committed turn: the final answer, and everything before it folded behind the disclosure. */
-async function expectCommitted(turn: Locator) {
+async function expectCommitted(turn: Locator, expandName = "Expand execution process") {
   const visible = turn.page().locator(":visible");
   await expect(turn.locator(".message-content").last()).toContainText("The final answer is ready.");
   await expect(turn.getByText("Process paragraph 1:", { exact: false }).and(visible)).toHaveCount(0);
@@ -201,7 +201,7 @@ async function expectCommitted(turn: Locator) {
   await expect(turn.locator(".thinking-block").and(visible)).toHaveCount(0);
   await expect(turn.getByText("Inspect collapse fixture", { exact: true }).and(visible)).toHaveCount(0);
   await expect(turn.locator(".tool-card").and(visible)).toHaveCount(0);
-  await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(1);
+  await expect(turn.getByRole("button", { name: expandName, exact: true })).toHaveCount(1);
   // Nothing is lost: the folded process is in the thread, and opening it shows it.
   await expect(turn.getByText("Process paragraph 20:", { exact: false })).not.toHaveCount(0);
 }
@@ -209,7 +209,7 @@ async function expectCommitted(turn: Locator) {
 /** The committed turn while the user reads above the bottom: the final answer, and the process still open. */
 async function expectCommittedUnfolded(turn: Locator) {
   await expect(turn.locator(".message-content").last()).toContainText("The final answer is ready.");
-  await expect(turn.getByText("Process paragraph 20:", { exact: false })).toBeVisible();
+  await expect(turn.getByRole("paragraph").filter({ hasText: "Process paragraph 20:" })).toBeVisible();
   await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
 }
 
