@@ -455,6 +455,34 @@ impl BridgeHub {
         ))
     }
 
+    /// A control action (protocol §7): refused before anything is sent, or
+    /// answered when the Agent answers. Without an Agent connection there is
+    /// nothing to set.
+    async fn control(
+        &self,
+        session_id: String,
+        control: bridge::controls::Control,
+    ) -> Result<Result<(), ProtocolError>, ProtocolError> {
+        let unavailable =
+            || ProtocolError::new(ErrorCode::Unavailable, "there is no Agent connection");
+        let input = self.state.lock().await.input.clone().ok_or_else(unavailable)?;
+        let (reply, admitted) = oneshot::channel();
+        input
+            .send(bridge::BridgeInput::Control {
+                session_id,
+                control,
+                reply,
+            })
+            .map_err(|_| unavailable())?;
+        let answer = admitted.await.map_err(|_| unavailable())??;
+        Ok(answer.await.unwrap_or_else(|_| {
+            Err(ProtocolError::new(
+                ErrorCode::Unavailable,
+                "the Agent connection ended before it answered",
+            ))
+        }))
+    }
+
     /// A resource action (protocol §7), applied under one bridge guard.
     /// Without an Agent connection its resources are gone with it.
     async fn act(
@@ -939,6 +967,34 @@ fn resource_action(
     }
 }
 
+/// The control action in a request body (protocol §7).
+fn control_action(
+    action: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<bridge::controls::Control, Response> {
+    use bridge::controls::Control;
+    let body = json_body(headers, body)?;
+    let text = |name: &str| {
+        body[name]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| invalid_request(format!("{name} must be a string")))
+    };
+    match action {
+        "set_mode" => Ok(Control::SetMode {
+            mode_id: text("modeId")?,
+        }),
+        _ => Ok(Control::SetConfig {
+            config_id: text("configId")?,
+            value: body
+                .get("value")
+                .cloned()
+                .ok_or_else(|| invalid_request("value is required"))?,
+        }),
+    }
+}
+
 /// The operation write in a request body (protocol §6.1).
 fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
     let body = json_body(headers, body)?;
@@ -1018,6 +1074,23 @@ async fn write_scope_at(
     };
     match segments[1..].iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["ops"] => {}
+        ["actions", action @ ("set_mode" | "set_config")] => {
+            let Scope::Session(session_id) = &scope else {
+                return refused(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!("no such action in {scope}"),
+                ));
+            };
+            let control = match control_action(action, &headers, &body) {
+                Ok(control) => control,
+                Err(response) => return response,
+            };
+            return match state.bridge.control(session_id.clone(), control).await {
+                Ok(Ok(())) => axum::Json(json!({})).into_response(),
+                Ok(Err(error)) => axum::Json(wire::ErrorBody { error }).into_response(),
+                Err(error) => refused(error),
+            };
+        }
         [
             "resources",
             resource,
