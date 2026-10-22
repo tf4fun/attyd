@@ -1,7 +1,10 @@
 //! Subscriptions to a stream (docs/protocol.md §5.1): which scopes a stream
 //! follows and what version of each a client already holds.
-use super::documents::{ErrorCode, ProtocolError, Scope};
+use std::collections::{BTreeMap, VecDeque};
+
+use super::documents::{End, ErrorCode, ProtocolError, Scope};
 pub(crate) use super::engine::Have;
+use super::engine::{Engine, StreamEvent};
 
 /// One scope a stream follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,5 +100,190 @@ pub(crate) fn parse_stream_query(query: &str) -> Result<Vec<Subscribed>, Protoco
     Ok(scopes)
 }
 
+/// A queue past this many bytes is replaced by snapshots (protocol §5.4).
+pub(crate) const QUEUE_BUDGET: usize = 1 << 20;
+
+/// What the stream of one scope holds on behalf of a subscriber.
+struct ScopeState {
+    /// The version of the replica the subscriber is known to hold: what the
+    /// client said it held, then what was last written to its stream. An event
+    /// still in the queue is not delivered and never advances it.
+    written: Option<Have>,
+    /// An `end` was queued: nothing follows it for this scope.
+    ended: bool,
+}
+
+struct Queued {
+    event: StreamEvent,
+    bytes: usize,
+}
+
+/// The events one stream has yet to write, per subscriber (protocol §5.1, §5.4).
+///
+/// It keeps no log: a subscriber that cannot keep up is not sent the events it
+/// missed but a snapshot of each scope from the version it last was written.
+pub(crate) struct Subscriber {
+    scopes: BTreeMap<String, ScopeState>,
+    queue: VecDeque<Queued>,
+    queued_bytes: usize,
+}
+
+impl Subscriber {
+    pub(crate) fn new(follow: &[Subscribed]) -> Self {
+        Self {
+            scopes: follow
+                .iter()
+                .map(|subscribed| {
+                    (
+                        subscribed.scope.to_string(),
+                        ScopeState {
+                            written: subscribed.have.clone(),
+                            ended: false,
+                        },
+                    )
+                })
+                .collect(),
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, event: StreamEvent) {
+        let bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len());
+        self.queued_bytes += bytes;
+        self.queue.push_back(Queued { event, bytes });
+    }
+
+    /// Drops what is queued of `scope`.
+    fn clear(&mut self, scope: &str) {
+        let mut removed = 0;
+        self.queue.retain(|queued| {
+            let keep = queued.event.scope() != scope;
+            if !keep {
+                removed += queued.bytes;
+            }
+            keep
+        });
+        self.queued_bytes -= removed;
+    }
+
+    /// Queues the snapshot `engine` has for `scope`, from the version held.
+    fn queue_snapshot(&mut self, scope: &str, engine: &Engine) {
+        let held = self.scopes.get(scope).and_then(|state| state.written.clone());
+        if let Some(snapshot) = engine.snapshot(scope, held.as_ref()) {
+            self.push(snapshot);
+        }
+    }
+
+    /// Aligns every scope published now (the cut); a scope not published yet is
+    /// aligned when it is (`rebuilt`).
+    pub(crate) fn align(&mut self, engine: &Engine) {
+        let scopes: Vec<String> = self.scopes.keys().cloned().collect();
+        for scope in scopes {
+            self.queue_snapshot(&scope, engine);
+        }
+    }
+
+    /// A commit's event: queued for a subscriber that follows its scope.
+    pub(crate) fn publish(&mut self, event: &StreamEvent) {
+        if self
+            .scopes
+            .get(event.scope())
+            .is_some_and(|state| !state.ended)
+        {
+            self.push(event.clone());
+        }
+    }
+
+    /// `scope` was published anew (a first publication or a new epoch): what was
+    /// queued of it is replaced by the whole document.
+    pub(crate) fn rebuilt(&mut self, scope: &str, engine: &Engine) {
+        let Some(state) = self.scopes.get_mut(scope) else {
+            return;
+        };
+        if state.ended {
+            return;
+        }
+        state.written = None;
+        self.clear(scope);
+        self.queue_snapshot(scope, engine);
+    }
+
+    /// `scope` is over: what was queued of it is replaced by its end, and
+    /// nothing follows.
+    pub(crate) fn end(&mut self, scope: &str, end: End) {
+        let Some(state) = self.scopes.get_mut(scope) else {
+            return;
+        };
+        if state.ended {
+            return;
+        }
+        state.ended = true;
+        self.clear(scope);
+        self.push(StreamEvent::End {
+            scope: scope.to_string(),
+            end,
+        });
+    }
+
+    /// The next event to write; a snapshot or a version advances what the
+    /// subscriber is known to hold.
+    pub(crate) fn next(&mut self) -> Option<StreamEvent> {
+        let queued = self.queue.pop_front()?;
+        self.queued_bytes -= queued.bytes;
+        let event = queued.event;
+        if let Some(state) = self.scopes.get_mut(event.scope()) {
+            match &event {
+                StreamEvent::Snapshot { snapshot, .. } => {
+                    state.written = Some(Have {
+                        epoch: snapshot.epoch.clone(),
+                        rev: snapshot.rev,
+                    });
+                }
+                StreamEvent::Ops { rev, .. } => {
+                    if let Some(written) = &mut state.written {
+                        written.rev = *rev;
+                    }
+                }
+                StreamEvent::Checkpoint { .. } | StreamEvent::End { .. } => {}
+            }
+        }
+        Some(event)
+    }
+
+    /// The subscriber could not keep up: for each scope still followed, what is
+    /// queued is replaced by a snapshot from the version last written. A scope
+    /// with an `end` keeps only the end, and one that no longer has a document
+    /// gets nothing.
+    pub(crate) fn coalesce(&mut self, engine: &Engine) {
+        let scopes: Vec<(String, bool)> = self
+            .scopes
+            .iter()
+            .map(|(scope, state)| (scope.clone(), state.ended))
+            .collect();
+        for (scope, ended) in scopes {
+            if ended {
+                continue;
+            }
+            self.clear(&scope);
+            self.queue_snapshot(&scope, engine);
+        }
+    }
+
+    pub(crate) fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    pub(crate) fn over_budget(&self) -> bool {
+        self.queued_bytes > QUEUE_BUDGET
+    }
+}
+
+#[cfg(test)]
+mod queue_tests;
 #[cfg(test)]
 mod tests;

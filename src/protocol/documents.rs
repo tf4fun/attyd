@@ -420,5 +420,7 @@ pub(crate) struct End {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EndReason {
     Deleted,
+    /// A `close` action succeeded (protocol §7).
+    Closed,
     LoadFailed,
 }

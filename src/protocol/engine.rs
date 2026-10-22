@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::diff::{self, Text};
+use super::documents::End;
 use super::digest::{self, Hash};
 use super::timeline::{Entry, History, Timeline};
 use super::timeline_doc::{AttachmentIndex, publish_entry};
@@ -71,6 +72,23 @@ pub(crate) enum StreamEvent {
         rev: u64,
         digest: String,
     },
+    /// The scope is over: the client drops the document (§5.2).
+    End {
+        scope: String,
+        end: End,
+    },
+}
+
+impl StreamEvent {
+    /// The scope the event belongs to.
+    pub(crate) fn scope(&self) -> &str {
+        match self {
+            Self::Snapshot { scope, .. }
+            | Self::Ops { scope, .. }
+            | Self::Checkpoint { scope, .. }
+            | Self::End { scope, .. } => scope,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
