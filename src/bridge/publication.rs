@@ -235,7 +235,7 @@ impl BridgeState {
     /// Whether a commit now would publish anything (the gate's check, §4.1).
     #[cfg(test)]
     pub(super) fn unpublished(&self) -> bool {
-        self.protocol.publication.lock().publisher.diverges(
+        self.protocol.publication.lock().feed.diverges(
             &self.sessions,
             &self.protocol.agent,
             self.catalog_revision,

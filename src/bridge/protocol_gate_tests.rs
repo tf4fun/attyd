@@ -1,13 +1,11 @@
 //! The per-event convergence gate through the real coordinator and ACP
-//! transport (docs/state-sync.md §4.1, migration step 4b).
+//! transport (docs/state-sync.md §4.1).
 //!
-//! A scripted Agent drives `run_connection` over an in-memory transport. The
-//! bridge state's protocol tap hands every commit to the test with the
-//! documents it published; one replica per scope applies each event at the
-//! wire level and is compared with the published document after every event.
-//! Operations start through the bridge's admission of v2 writes (protocol
-//! §6); a test that only needs an occupied scope installs one through the
-//! registry's internal entry point.
+//! A scripted Agent drives `run_connection` over an in-memory transport. The feed's tap hands
+//! every commit to the test with the documents it published; one replica per scope applies each
+//! event at the wire level and is compared with the published document after every event.
+//! Operations start through the bridge's admission of writes (protocol §6); a test that only
+//! needs an occupied scope installs one through the registry's internal entry point.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::Weak;
@@ -19,93 +17,102 @@ use futures::{SinkExt, StreamExt};
 use super::*;
 use crate::protocol::Op;
 use crate::protocol::admission::OpWrite;
-use crate::protocol::canon::ChainHash;
 use crate::protocol::diff;
 use crate::protocol::documents::{OperationKind, ProtocolError, Scope};
-use crate::protocol::hub::{Publication, Subscribed, Subscription};
+use crate::protocol::feed::FeedSubscription;
+use crate::protocol::feed::tap::TapCommit;
+use crate::protocol::subscription::Subscribed;
+use crate::protocol::hub::Publication;
 use crate::protocol::op::OpEnd;
 
 const WAIT: Duration = Duration::from_secs(5);
 
-/// A client's copy of one scope, built from wire events only.
+type Documents = BTreeMap<String, Value>;
+
+/// A client's copy of one scope's document, built from wire events only.
 #[derive(Debug, Clone, Default)]
 struct Replica {
-    live: Value,
-    log: Vec<Value>,
+    epoch: String,
+    rev: u64,
+    /// `{ history?, prompts, live, entries? }`: the paths the ops address.
+    doc: Value,
 }
 
 impl Replica {
-    fn aligned(document: &crate::protocol::publish::Document) -> Self {
+    /// The replica a snapshot event installs.
+    fn from_snapshot(event: &Value) -> Self {
+        let snapshot = &event["snapshot"];
+        let mut doc = snapshot["doc"].clone();
+        if let Some(entries) = snapshot.get("entries") {
+            let mut list = vec![Value::Null; entries["length"].as_u64().unwrap() as usize];
+            for pair in entries["changed"].as_array().unwrap() {
+                list[pair[0].as_u64().unwrap() as usize] = pair[1].clone();
+            }
+            doc["entries"] = Value::Array(list);
+        }
         Self {
-            live: document.live.clone(),
-            log: document
-                .log
-                .as_ref()
-                .map(|log| {
-                    serde_json::to_value(log)
-                        .unwrap()
-                        .as_array()
-                        .unwrap()
-                        .clone()
-                })
-                .unwrap_or_default(),
+            epoch: snapshot["epoch"].as_str().unwrap().to_string(),
+            rev: snapshot["rev"].as_u64().unwrap(),
+            doc,
         }
-    }
-
-    fn hash_at(&self, index: usize) -> Option<String> {
-        if index == 0 {
-            return Some(ChainHash::ZERO.wire());
-        }
-        self.log
-            .get(index - 1)
-            .and_then(|entry| entry["hash"].as_str())
-            .map(String::from)
     }
 
     fn apply(&mut self, event: &Value) -> Result<(), String> {
-        if let Some(log) = event.get("log") {
-            let from = log["from"].as_u64().ok_or("log.from")? as usize;
-            if from > self.log.len() || self.hash_at(from).as_deref() != log["prev"].as_str() {
-                return Err(format!("log change does not follow the replica: {event}"));
-            }
-            self.log.truncate(from);
-            self.log
-                .extend(log["entries"].as_array().ok_or("entries")?.iter().cloned());
+        if event.get("snapshot").is_some() {
+            *self = Self::from_snapshot(event);
+            return Ok(());
         }
-        if let Some(live) = event.get("live") {
-            if let Some(replace) = live.get("replace") {
-                self.live = replace.clone();
-            } else {
-                let ops: Vec<Op> = serde_json::from_value(live["patch"].clone())
-                    .map_err(|error| format!("patch: {error}"))?;
-                for op in &ops {
-                    diff::apply(&mut self.live, op)
-                        .map_err(|error| format!("{op:?} does not apply: {error:?}"))?;
-                }
-            }
+        let rev = event["rev"].as_u64().ok_or("an ops event names its rev")?;
+        if rev != self.rev + 1 {
+            return Err(format!("rev {rev} does not follow {}: {event}", self.rev));
         }
+        let ops: Vec<Op> = serde_json::from_value(event["ops"].clone())
+            .map_err(|error| format!("ops: {error}"))?;
+        for op in &ops {
+            diff::apply(&mut self.doc, op)
+                .map_err(|error| format!("{op:?} does not apply: {error:?}"))?;
+        }
+        self.rev = rev;
         Ok(())
+    }
+
+    fn live(&self) -> Value {
+        self.doc["live"].clone()
+    }
+
+    fn entries(&self) -> Vec<Value> {
+        self.doc["entries"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// How many prompts of the document have ended.
+    fn ended_prompts(&self) -> usize {
+        self.doc["prompts"]
+            .as_array()
+            .map_or(0, |prompts| prompts.iter().filter(|prompt| prompt.get("end").is_some()).count())
     }
 }
 
-/// One step of a scope as a replica saw it: the event (none for the initial
-/// cut) and the document after it.
+/// One step of a scope as a replica saw it: the event (none for the initial cut) and the
+/// document after it.
 #[derive(Debug, Clone)]
 struct Step {
     event: Option<Value>,
-    live: Value,
+    doc: Value,
+    ended_prompts: usize,
 }
 
-type Documents = BTreeMap<String, crate::protocol::publish::Document>;
+impl Step {
+    fn of(event: Option<Value>, replica: &Replica) -> Self {
+        Self {
+            event,
+            doc: replica.doc.clone(),
+            ended_prompts: replica.ended_prompts(),
+        }
+    }
 
-fn log_value(document: &crate::protocol::publish::Document) -> Option<Vec<Value>> {
-    document.log.as_ref().map(|log| {
-        serde_json::to_value(log)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .clone()
-    })
+    fn live(&self) -> &Value {
+        &self.doc["live"]
+    }
 }
 
 /// The replicas of every scope, fed one commit at a time.
@@ -116,8 +123,8 @@ struct Gate {
     history: Vec<Vec<Value>>,
     /// Every scope's documents, from the cut on, after each of its events.
     timeline: BTreeMap<String, Vec<Step>>,
-    /// Scopes the bridge stopped publishing without an `end` (a release, S6).
-    /// Their replicas stay, as a client keeps its copy.
+    /// Scopes the bridge stopped publishing without an `end` (a release, S6). Their replicas
+    /// stay, as a client keeps its copy.
     released: BTreeSet<String>,
 }
 
@@ -126,22 +133,17 @@ impl Gate {
     fn new(cut: &Documents) -> Self {
         let mut gate = Self::default();
         for (scope, document) in cut {
-            let replica = Replica::aligned(document);
-            gate.timeline.insert(
-                scope.clone(),
-                vec![Step {
-                    event: None,
-                    live: replica.live.clone(),
-                }],
-            );
+            let replica = Replica::from_snapshot(document);
+            gate.timeline
+                .insert(scope.clone(), vec![Step::of(None, &replica)]);
             gate.replicas.insert(scope.clone(), replica);
         }
         gate
     }
 
-    /// Applies one commit's events, one at a time, checking each scope's
-    /// replica against the document the commit published. Then every
-    /// published scope is checked, so a change without its event is caught.
+    /// Applies one commit's events, one at a time, checking each scope's replica against the
+    /// document the commit published. Then every published scope is checked, so a change
+    /// without its event is caught.
     fn apply(&mut self, events: Vec<Value>, documents: &Documents) {
         let mut seen = BTreeSet::new();
         for event in &events {
@@ -170,31 +172,37 @@ impl Gate {
             let document = documents
                 .get(&scope)
                 .unwrap_or_else(|| panic!("{scope} changed but is not published"));
-            assert_eq!(replica.live, document.live, "live of {scope} after {event}");
-            if let Some(log) = log_value(document) {
-                assert_eq!(replica.log, log, "log of {scope} after {event}");
-            }
-            self.timeline.entry(scope).or_default().push(Step {
-                event: Some(event.clone()),
-                live: replica.live.clone(),
-            });
+            let expected = Replica::from_snapshot(document);
+            assert_eq!(replica.doc, expected.doc, "{scope} after {event}");
+            assert_eq!(
+                (&replica.epoch, replica.rev),
+                (&expected.epoch, expected.rev),
+                "the version of {scope} after {event}"
+            );
+            self.timeline
+                .entry(scope)
+                .or_default()
+                .push(Step::of(Some(event.clone()), replica));
         }
         self.history.push(events);
         self.check(documents);
     }
 
-    /// Every published scope's replica equals its document, live and known
-    /// log; a replica whose scope is no longer published was released.
+    /// Every published scope's replica equals its document; a replica whose scope is no longer
+    /// published was released.
     fn check(&mut self, documents: &Documents) {
         for (scope, document) in documents {
             let replica = self
                 .replicas
                 .get(scope)
                 .unwrap_or_else(|| panic!("{scope} is published but never reached the replica"));
-            assert_eq!(replica.live, document.live, "live of {scope}");
-            if let Some(log) = log_value(document) {
-                assert_eq!(replica.log, log, "log of {scope}");
-            }
+            let expected = Replica::from_snapshot(document);
+            assert_eq!(replica.doc, expected.doc, "{scope}");
+            assert_eq!(
+                (&replica.epoch, replica.rev),
+                (&expected.epoch, expected.rev),
+                "the version of {scope}"
+            );
         }
         for scope in self.replicas.keys() {
             if !documents.contains_key(scope) {
@@ -217,45 +225,26 @@ impl Gate {
     fn ever(&self, scope: &str, predicate: impl Fn(&Value) -> bool) -> bool {
         self.timeline
             .get(scope)
-            .is_some_and(|steps| steps.iter().any(|step| predicate(&step.live)))
+            .is_some_and(|steps| steps.iter().any(|step| predicate(step.live())))
     }
 
-    /// The prompt `op` ran until one event appended its turn, removed its
-    /// process and ended it (S2).
-    fn assert_committed_atomically(&self, scope: &str, op: &Value) {
+    /// The prompt `op` ran until one event ended it and its prompt together: the operation
+    /// never completes before the prompt's end is in the document, nor the other way round.
+    fn assert_ended_atomically(&self, scope: &str, op: &Value) {
         let steps = &self.timeline[scope];
-        let commit = steps
+        let ended = steps
             .iter()
-            .position(|step| {
-                step.event.as_ref().is_some_and(|event| {
-                    event["log"]["entries"]
-                        .as_array()
-                        .is_some_and(|entries| !entries.is_empty())
-                })
-            })
-            .expect("the turn was committed");
-        for step in &steps[..commit] {
-            if step.live["op"]["id"] == *op {
-                assert_eq!(
-                    step.live["op"]["status"], "running",
-                    "{scope} ended {op} before committing its turn: {step:?}"
-                );
-            }
-        }
-        let before = &steps[commit - 1].live["op"];
-        assert_eq!(before["id"], *op, "the prompt ran until its commit");
-        assert!(before.get("process").is_some(), "the prompt had a process");
-        let after = &steps[commit];
-        assert!(
-            after.event.as_ref().unwrap().get("live").is_some(),
-            "the commit's event also patches live"
+            .position(|step| step.live()["op"]["id"] == *op && step.live()["op"]["status"] != "running")
+            .expect("the prompt's operation ended");
+        assert!(ended > 0, "the prompt ran before it ended");
+        assert_eq!(
+            steps[ended].ended_prompts,
+            steps[ended - 1].ended_prompts + 1,
+            "{scope}: the operation and its prompt end in one event: {:?}",
+            steps[ended]
         );
-        assert_eq!(after.live["op"]["id"], *op);
-        assert_eq!(after.live["op"]["status"], "completed");
-        assert!(
-            after.live["op"].get("process").is_none(),
-            "the commit's event removes the process"
-        );
+        assert_eq!(steps[ended - 1].live()["op"]["id"], *op, "the prompt ran until its end");
+        assert_eq!(steps[ended - 1].live()["op"]["status"], "running");
     }
 }
 
@@ -268,14 +257,11 @@ struct Peer {
     cancellation: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
     state: Weak<BridgeLock>,
-    commits: mpsc::UnboundedReceiver<PublishedCommit>,
+    commits: mpsc::UnboundedReceiver<TapCommit>,
     gate: Gate,
-    /// The published documents and the Hub, shared with the generations
-    /// before and after this connection.
+    /// The published documents and the feed, shared with the generations before and after
+    /// this connection.
     publication: Publication,
-    /// The published documents after every commit, from the first
-    /// generation's cut on: what streams are checked against.
-    timeline: Vec<Documents>,
 }
 
 fn options(configure: impl FnOnce(&mut Options)) -> Options {
@@ -291,31 +277,20 @@ fn options(configure: impl FnOnce(&mut Options)) -> Options {
 impl Peer {
     /// A connection whose `initialize` the test has not answered yet.
     async fn connect(configure: impl FnOnce(&mut Options)) -> Self {
-        Self::connect_on(Publication::default(), Vec::new(), configure).await
+        Self::connect_on(Publication::default(), configure).await
     }
 
-    /// The next generation's connection, publishing into `publication` after
-    /// the documents `timeline` recorded.
-    async fn connect_on(
-        publication: Publication,
-        mut timeline: Vec<Documents>,
-        configure: impl FnOnce(&mut Options),
-    ) -> Self {
+    /// A connection publishing into `publication`, after what earlier generations published.
+    async fn connect_on(publication: Publication, configure: impl FnOnce(&mut Options)) -> Self {
         let (outgoing, requests) = futures::channel::mpsc::channel::<String>(64);
         let (responses, incoming) = futures::channel::mpsc::channel::<io::Result<String>>(64);
         let transport = Lines::new(outgoing.sink_map_err(io::Error::other), incoming);
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
-        // The next generation is tapped from its first commit on, after the
-        // documents the previous one left: a stream that crosses the two
-        // sees every commit the timeline holds.
+        // The tap is taken before the generation's first commit, with the cut it follows.
         let (tap, commits) = mpsc::unbounded_channel();
-        let next_cut = (!timeline.is_empty()).then(|| {
-            let mut published = publication.lock();
-            published.next_tap = Some(tap.clone());
-            super::publication::documents(&published.publisher)
-        });
+        let cut = publication.lock().feed.tap(tap);
         let probe = super::memory_retention_tests::probe_coordinator_state();
         let task = tokio::spawn(run_generation(
             Ok(transport),
@@ -326,20 +301,6 @@ impl Peer {
             publication.clone(),
         ));
         let state = probe.await.unwrap();
-        // The tap and the cut are taken under one guard, so no commit falls
-        // between the aligned replicas and the first tapped event.
-        let cut = match next_cut {
-            Some(cut) => {
-                drop(tap);
-                cut
-            }
-            None => {
-                let lock = state.upgrade().unwrap();
-                let mut guard = lock.lock().await;
-                guard.protocol.tap(tap)
-            }
-        };
-        timeline.push(cut.clone());
         Self {
             commands,
             requests,
@@ -352,7 +313,6 @@ impl Peer {
             commits,
             gate: Gate::new(&cut),
             publication,
-            timeline,
         }
     }
 
@@ -365,25 +325,7 @@ impl Peer {
         auth_methods: Value,
         configure: impl FnOnce(&mut Options),
     ) -> Self {
-        Self::start_on(
-            Publication::default(),
-            Vec::new(),
-            capabilities,
-            auth_methods,
-            configure,
-        )
-        .await
-    }
-
-    /// The next generation, started and ready.
-    async fn start_on(
-        publication: Publication,
-        timeline: Vec<Documents>,
-        capabilities: Value,
-        auth_methods: Value,
-        configure: impl FnOnce(&mut Options),
-    ) -> Self {
-        let mut peer = Self::connect_on(publication, timeline, configure).await;
+        let mut peer = Self::connect(configure).await;
         let initialize = peer.next_request().await;
         assert_eq!(initialize["method"], "initialize");
         peer.reply(
@@ -525,16 +467,11 @@ impl Peer {
 
     // -- Client side ---------------------------------------------------------
 
-    /// Opens a v2 stream through the bridge actor (protocol §5.1).
-    async fn subscribe(&self, scopes: Vec<Subscribed>) -> Subscription {
-        let (reply, subscribed) = oneshot::channel();
-        self.commands
-            .send(BridgeInput::Subscribe { scopes, reply })
-            .unwrap();
-        tokio::time::timeout(WAIT, subscribed)
-            .await
-            .expect("the subscription was not registered")
-            .expect("the bridge dropped the subscription")
+    /// Follows `scopes` on the feed (protocol §5.1) and asks the bridge to serve the streams.
+    fn subscribe(&self, scopes: Vec<Subscribed>) -> FeedSubscription {
+        let subscription = self.publication.lock().feed.subscribe(&scopes);
+        self.commands.send(BridgeInput::ServeStreams).unwrap();
+        subscription
     }
 
     /// A v2 operation write in `scope` through the bridge's admission
@@ -550,7 +487,7 @@ impl Peer {
             let lock = self.lock();
             let state = lock.lock().await;
             let published = state.protocol.publication.lock();
-            published.publisher.live(&scope).expect("a published scope")["op"]["id"]
+            published.feed.live(&scope).expect("a published scope")["op"]["id"]
                 .as_str()
                 .unwrap()
                 .to_string()
@@ -678,22 +615,16 @@ impl Peer {
             .protocol
             .publication
             .lock()
-            .publisher
+            .feed
             .attachment(session_id, attachment_id)
     }
 
     // -- The gate ----------------------------------------------------------------
 
     /// Applies one tapped commit to the gate.
-    fn apply(&mut self, commit: PublishedCommit) {
-        self.timeline.push(commit.documents.clone());
-        let events: Vec<Value> = commit
-            .events
-            .iter()
-            .map(|event| serde_json::to_value(event).unwrap())
-            .collect();
-        assert!(!events.is_empty(), "a commit without changes sends nothing");
-        self.gate.apply(events, &commit.documents);
+    fn apply(&mut self, commit: TapCommit) {
+        assert!(!commit.events.is_empty(), "a commit without changes sends nothing");
+        self.gate.apply(commit.events, &commit.documents);
     }
 
     fn drain(&mut self) {
@@ -737,7 +668,7 @@ impl Peer {
         );
         // Every commit before this guard is already in the tap.
         self.drain();
-        let documents = publication::documents(&state.protocol.publication.lock().publisher);
+        let documents = state.protocol.publication.lock().feed.documents();
         self.gate.check(&documents);
     }
 
@@ -775,38 +706,32 @@ impl Peer {
         self.finish().await
     }
 
-    /// What the next generation takes over once this connection ended.
-    fn handover(&mut self) -> (Publication, Vec<Documents>) {
-        assert!(self.task.is_none(), "the connection ended");
-        (self.publication.clone(), std::mem::take(&mut self.timeline))
-    }
-
     /// Waits for the connection to end on its own and applies its last commits.
     async fn finish(&mut self) -> Result<(), Error> {
         let task = self.task.take().unwrap();
-        tokio::time::timeout(WAIT, async {
-            let result = task.await.unwrap();
-            while let Some(commit) = self.commits.recv().await {
-                self.apply(commit);
-            }
-            result
-        })
-        .await
-        .expect("the connection and its tap did not finish")
+        let result = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("the connection did not finish")
+            .unwrap();
+        // The feed outlives the connection, so its tap stays open: every commit of the
+        // connection is queued by now.
+        self.drain();
+        result
     }
 
     fn live(&self, scope: &str) -> Value {
         self.gate
             .replicas
             .get(scope)
-            .map_or(Value::Null, |replica| replica.live.clone())
+            .map_or(Value::Null, Replica::live)
     }
 
-    fn log(&self, scope: &str) -> Vec<Value> {
+    /// The entries the scope's replica holds.
+    fn entries(&self, scope: &str) -> Vec<Value> {
         self.gate
             .replicas
             .get(scope)
-            .map_or_else(Vec::new, |replica| replica.log.clone())
+            .map_or_else(Vec::new, Replica::entries)
     }
 
     fn has(&self, scope: &str) -> bool {
@@ -886,14 +811,14 @@ fn result(request: &Value, result: Value) -> Value {
 }
 
 fn interaction_ids(live: &Value) -> Vec<String> {
-    live["op"]["interactions"]
+    live["interactions"]
         .as_object()
         .map(|interactions| interactions.keys().cloned().collect())
         .unwrap_or_default()
 }
 
 fn patch_paths(event: &Value) -> Vec<(String, String)> {
-    event["live"]["patch"]
+    event["ops"]
         .as_array()
         .map(|ops| {
             ops.iter()
@@ -906,6 +831,16 @@ fn patch_paths(event: &Value) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The text of the agent messages among `entries`, chunk after chunk.
+fn agent_text(entries: &[Value]) -> String {
+    entries
+        .iter()
+        .filter(|entry| entry["kind"] == "message" && entry["role"] == "agent")
+        .flat_map(|entry| entry["chunks"].as_array().cloned().unwrap_or_default())
+        .filter_map(|chunk| chunk["content"]["text"].as_str().map(str::to_owned))
+        .collect()
 }
 
 const CREATED: &str = "created";
@@ -996,44 +931,47 @@ fn ready_agent() -> crate::protocol::documents::AgentInfo {
     }
 }
 
-/// One commit of `registry`: its events and every published document.
+/// One commit of `registry` to `feed`: its events and every published document.
 fn publish(
-    publisher: &mut crate::protocol::publish::Publisher,
-    registry: &mut SessionRegistry,
+    feed: &crate::protocol::feed::FeedHandle,
+    commits: &mut mpsc::UnboundedReceiver<TapCommit>,
+    registry: &SessionRegistry,
 ) -> (Vec<Value>, Documents) {
-    let events = publisher
-        .commit(registry, &ready_agent(), 0)
-        .iter()
-        .map(|event| serde_json::to_value(event).unwrap())
-        .collect();
-    let documents = publisher
-        .scopes()
-        .into_iter()
-        .map(|scope| {
-            let document = publisher.document(&scope).unwrap();
-            (scope, document)
-        })
-        .collect();
-    (events, documents)
+    feed.commit(registry, &ready_agent(), 0);
+    match commits.try_recv() {
+        Ok(commit) => (commit.events, commit.documents),
+        Err(_) => (Vec::new(), feed.documents()),
+    }
+}
+
+fn tapped_feed() -> (
+    crate::protocol::feed::FeedHandle,
+    mpsc::UnboundedReceiver<TapCommit>,
+    Documents,
+) {
+    let feed = crate::protocol::feed::FeedHandle::new("process");
+    let (tap, commits) = mpsc::unbounded_channel();
+    let cut = feed.tap(tap);
+    (feed, commits, cut)
 }
 
 #[test]
 fn ever_sees_a_change_of_a_scope_aligned_by_the_cut() {
     let mut registry = SessionRegistry::new("epoch");
-    let mut publisher = crate::protocol::publish::Publisher::default();
-    let (_, cut) = publish(&mut publisher, &mut registry);
+    let (feed, mut commits, _) = tapped_feed();
+    let (_, cut) = publish(&feed, &mut commits, &registry);
     let mut gate = Gate::new(&cut);
     registry
         .upsert_elicitation("epoch", None, "brief", json!({"mode": "form"}))
         .unwrap();
-    let (events, documents) = publish(&mut publisher, &mut registry);
+    let (events, documents) = publish(&feed, &mut commits, &registry);
     gate.apply(events, &documents);
     registry
         .resolve_elicitation("epoch", None, "brief", None)
         .unwrap();
-    let (events, documents) = publish(&mut publisher, &mut registry);
+    let (events, documents) = publish(&feed, &mut commits, &registry);
     gate.apply(events, &documents);
-    assert!(interaction_ids(&gate.replicas["global"].live).is_empty());
+    assert!(interaction_ids(&gate.replicas["global"].live()).is_empty());
     assert!(
         gate.ever("global", |live| interaction_ids(live) == ["brief"]),
         "a brief interaction on a scope from the cut is seen"
@@ -1041,28 +979,25 @@ fn ever_sees_a_change_of_a_scope_aligned_by_the_cut() {
 }
 
 #[test]
-#[should_panic(expected = "log of session/s")]
-fn the_gate_rejects_a_log_change_without_its_event() {
+#[should_panic(expected = "session/s")]
+fn the_gate_rejects_an_entry_change_without_its_event() {
     let mut registry = SessionRegistry::new("epoch");
-    let mut publisher = crate::protocol::publish::Publisher::default();
+    let (feed, mut commits, _) = tapped_feed();
     registry
         .open_new("epoch", "s", "/s", json!({"sessionId": "s"}))
         .unwrap();
-    let (_, cut) = publish(&mut publisher, &mut registry);
+    let (_, cut) = publish(&feed, &mut commits, &registry);
     let mut gate = Gate::new(&cut);
-    registry.replace_session_log(
-        "s",
-        &[
-            json!({"sessionUpdate": "user_message_chunk", "content": text("hi")}),
-            chunk("answer", text("hello")),
-        ],
-    );
-    let (events, documents) = publish(&mut publisher, &mut registry);
+    registry
+        .append_session_update(
+            "s",
+            json!({"sessionUpdate": "agent_message_chunk", "messageId": "m", "content": text("hi")}),
+        )
+        .unwrap();
+    let (events, documents) = publish(&feed, &mut commits, &registry);
     assert!(
-        events
-            .iter()
-            .any(|event| event["scope"] == "session/s" && event.get("live").is_none()),
-        "the change is log-only: {events:?}"
+        events.iter().any(|event| event["scope"] == "session/s"),
+        "the change is session-only: {events:?}"
     );
     let dropped = events
         .into_iter()
@@ -1071,66 +1006,68 @@ fn the_gate_rejects_a_log_change_without_its_event() {
     gate.apply(dropped, &documents);
 }
 
-fn synthetic(live: Value) -> crate::protocol::publish::Document {
-    crate::protocol::publish::Document { live, log: None }
+fn synthetic(rev: u64, doc: Value) -> Value {
+    json!({"scope": "session/s", "snapshot": {
+        "epoch": "e", "rev": rev, "digest": "d", "doc": doc,
+    }})
 }
 
 #[test]
-#[should_panic(expected = "before committing its turn")]
-fn the_atomic_check_rejects_a_prompt_that_ends_before_its_log() {
-    let running = json!({"op": {"id": "p", "status": "running", "process": []}});
-    let ended = json!({"op": {"id": "p", "status": "completed"}});
+#[should_panic(expected = "in one event")]
+fn the_atomic_check_rejects_a_prompt_that_ends_before_its_operation() {
+    let prompts = json!([{"entry": 0}]);
+    let running = json!({"prompts": prompts, "live": {"op": {"id": "p", "status": "running"}}});
+    let ended = json!({"prompts": prompts, "live": {"op": {"id": "p", "status": "completed"}}});
     let scope = "session/s".to_string();
-    let mut gate = Gate::new(&BTreeMap::from([(scope.clone(), synthetic(running))]));
-    let end = json!({"scope": scope, "live": {"patch": [
-        {"op": "set", "path": "/op/status", "value": "completed"},
-        {"op": "remove", "path": "/op/process"},
-    ]}});
+    let mut gate = Gate::new(&BTreeMap::from([(scope.clone(), synthetic(0, running))]));
+    let completes = json!({"scope": scope, "rev": 1, "ops": [
+        {"op": "set", "path": "/live/op/status", "value": "completed"},
+    ]});
+    gate.apply(
+        vec![completes],
+        &BTreeMap::from([(scope.clone(), synthetic(1, ended.clone()))]),
+    );
+    let mut with_end = ended;
+    with_end["prompts"][0]["end"] = json!({"response": {"stopReason": "end_turn"}});
+    let end = json!({"scope": scope, "rev": 2, "ops": [
+        {"op": "set", "path": "/prompts/0/end", "value": {"response": {"stopReason": "end_turn"}}},
+    ]});
     gate.apply(
         vec![end],
-        &BTreeMap::from([(scope.clone(), synthetic(ended.clone()))]),
+        &BTreeMap::from([(scope.clone(), synthetic(2, with_end))]),
     );
-    let log = json!({"scope": scope, "log": {
-        "from": 0, "prev": ChainHash::ZERO.wire(), "entries": [{"hash": "h"}],
-    }});
-    gate.apply(
-        vec![log],
-        &BTreeMap::from([(scope.clone(), synthetic(ended))]),
-    );
-    gate.assert_committed_atomically(&scope, &json!("p"));
+    gate.assert_ended_atomically(&scope, &json!("p"));
 }
 
 // ---------------------------------------------------------------------------
 // 2. The session path
 
 #[tokio::test]
-async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
+async fn a_streamed_prompt_with_an_answered_permission_ends_in_one_event() {
     let mut peer = Peer::start(json!({})).await;
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     assert_eq!(peer.live(&scope)["op"]["kind"], "open");
-    assert_eq!(peer.log(&scope), Vec::<Value>::new());
+    assert!(peer.entries(&scope).is_empty());
 
     let prompt = vec![text("hi")];
     let (op, request) = peer.prompt(CREATED, prompt).await;
     peer.update(CREATED, chunk("answer", text("hel"))).await;
     peer.until("the first chunk streams", |peer| {
-        peer.live(&scope)["op"]["process"][0]["content"]["text"] == "hel"
+        agent_text(&peer.entries(&scope)) == "hel"
     })
     .await;
     peer.update(CREATED, chunk("answer", text("lo"))).await;
-    peer.until("the chunk folds", |peer| {
-        peer.live(&scope)["op"]["process"][0]["content"]["text"] == "hello"
+    peer.until("the next chunk follows", |peer| {
+        agent_text(&peer.entries(&scope)) == "hello"
     })
     .await;
     let streamed = peer.events_of(&scope).pop().unwrap();
     assert!(
-        streamed["live"]["patch"]
-            .as_array()
-            .unwrap()
+        patch_paths(&streamed)
             .iter()
-            .any(|op| op["op"] == "append" && op["text"] == "lo"),
-        "streamed text appends its suffix: {streamed}"
+            .all(|(_, path)| path.starts_with("/entries/")),
+        "a streamed chunk changes its entry alone: {streamed}"
     );
 
     peer.agent_request(
@@ -1146,10 +1083,7 @@ async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
     let live = peer.live(&scope);
     let interaction = interaction_ids(&live).remove(0);
     assert_eq!(live["op"]["id"], op);
-    assert_eq!(
-        live["op"]["interactions"][&interaction]["kind"],
-        "permission"
-    );
+    assert_eq!(live["interactions"][&interaction]["kind"], "permission");
     assert_eq!(
         peer.live("global")["sessions"][CREATED]["pending"]["interactions"],
         1
@@ -1173,31 +1107,30 @@ async fn a_streamed_prompt_with_an_answered_permission_commits_in_one_event() {
         peer.live(&scope)["op"]["status"] == "completed"
     })
     .await;
-    let commit = peer.events_of(&scope).pop().unwrap();
-    assert_eq!(commit["log"]["from"], 0);
-    assert_eq!(
-        commit["log"]["entries"][0]["turn"],
-        json!({ "prompt": [text("hi")], "reply": [text("hello")] })
-    );
-    peer.gate.assert_committed_atomically(&scope, &json!(op));
+    peer.gate.assert_ended_atomically(&scope, &json!(op));
     let live = peer.live(&scope);
     assert_eq!(live["op"]["id"], op);
     assert_eq!(live["op"]["result"], json!({ "stopReason": "end_turn" }));
-    assert!(live["op"].get("process").is_none());
-    assert_eq!(peer.log(&scope).len(), 1);
+    let entries = peer.entries(&scope);
+    assert_eq!(entries.len(), 2, "the prompt's message and the reply: {entries:?}");
+    assert_eq!(entries[0]["role"], "user");
+    assert_eq!(entries[0]["chunks"][0]["content"], text("hi"));
+    let prompts = &peer.gate.replicas[&scope].doc["prompts"];
+    assert_eq!(prompts[0]["entry"], 0);
+    assert_eq!(prompts[0]["end"]["response"]["stopReason"], "end_turn");
     peer.settled().await;
 }
 
 #[tokio::test]
-async fn a_failed_prompt_appends_nothing_and_keeps_its_error() {
+async fn a_failed_prompt_keeps_what_streamed_and_ends_with_its_error() {
     let mut peer = Peer::start(json!({})).await;
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let prompt = vec![text("hi")];
-    let (_, request) = peer.prompt(CREATED, prompt).await;
+    let (op, request) = peer.prompt(CREATED, prompt).await;
     peer.update(CREATED, chunk("answer", text("partial"))).await;
     peer.until("the chunk streams", |peer| {
-        peer.live(&scope)["op"]["process"][0]["content"]["text"] == "partial"
+        agent_text(&peer.entries(&scope)) == "partial"
     })
     .await;
     peer.refuse(&request).await;
@@ -1205,18 +1138,17 @@ async fn a_failed_prompt_appends_nothing_and_keeps_its_error() {
         peer.live(&scope)["op"]["status"] == "failed"
     })
     .await;
+    peer.gate.assert_ended_atomically(&scope, &json!(op));
     let live = peer.live(&scope);
     assert_eq!(live["op"]["error"]["code"], "agent_error");
     assert_eq!(live["op"]["input"], json!({ "prompt": [text("hi")] }));
-    assert!(live["op"].get("process").is_none());
-    assert!(peer.log(&scope).is_empty(), "a failed turn appends nothing");
-    assert!(
-        peer.events_of(&scope)
-            .iter()
-            .all(|event| event.get("log").is_none()
-                || event["log"]["entries"].as_array().unwrap().is_empty()),
-        "no log change for a failed turn"
+    assert_eq!(
+        agent_text(&peer.entries(&scope)),
+        "partial",
+        "a failed turn keeps what the Agent sent"
     );
+    let prompts = &peer.gate.replicas[&scope].doc["prompts"];
+    assert!(prompts[0]["end"]["error"].is_object(), "{prompts}");
     peer.settled().await;
 }
 
@@ -1240,7 +1172,7 @@ async fn a_cancelled_stop_reason_completes_the_prompt() {
 }
 
 #[tokio::test]
-async fn attachments_follow_the_documents_that_reference_them() {
+async fn attachments_are_served_while_the_entries_that_reference_them_are_published() {
     let mut peer = Peer::start(json!({"promptCapabilities": {"image": true}})).await;
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
@@ -1266,14 +1198,17 @@ async fn attachments_follow_the_documents_that_reference_them() {
         }),
     )
     .await;
-    peer.until("the tool call streams", |peer| {
-        peer.live(&scope)["op"]["process"][0]["content"][0]["content"]["type"] == "attachment"
-    })
-    .await;
-    let tool_attachment = peer.live(&scope)["op"]["process"][0]["content"][0]["content"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let tool = |peer: &Peer| {
+        peer.entries(&scope)
+            .into_iter()
+            .find(|entry| entry["kind"] == "tool")
+    };
+    peer.until("the tool call is published", |peer| tool(peer).is_some())
+        .await;
+    let tool = tool(&peer).unwrap();
+    let reference = &tool["call"]["content"][0]["content"];
+    assert_eq!(reference["type"], "attachment", "{tool}");
+    let tool_attachment = reference["id"].as_str().unwrap().to_string();
     assert_eq!(
         peer.attachment(CREATED, &tool_attachment).await.unwrap()["data"],
         "dG9vbA=="
@@ -1287,11 +1222,11 @@ async fn attachments_follow_the_documents_that_reference_them() {
     .await;
     assert!(
         peer.attachment(CREATED, &prompt_attachment).await.is_some(),
-        "the log keeps the prompt's attachment"
+        "the user entry keeps the prompt's attachment"
     );
     assert!(
-        peer.attachment(CREATED, &tool_attachment).await.is_none(),
-        "the committed process released its attachment"
+        peer.attachment(CREATED, &tool_attachment).await.is_some(),
+        "the tool entry keeps its attachment: entries are never removed"
     );
     peer.settled().await;
 }
@@ -1326,8 +1261,8 @@ async fn a_set_mode_folds_its_acknowledgement_when_it_completes() {
     let end = peer.events_of(&scope).pop().unwrap();
     let paths = patch_paths(&end);
     assert!(
-        paths.iter().any(|(_, path)| path.starts_with("/controls/"))
-            && paths.iter().any(|(_, path)| path.starts_with("/op/")),
+        paths.iter().any(|(_, path)| path.starts_with("/live/controls/"))
+            && paths.iter().any(|(_, path)| path.starts_with("/live/op/")),
         "the acknowledgement and the end are one event: {end}"
     );
     peer.settled().await;
@@ -1362,7 +1297,7 @@ async fn a_create_completes_with_its_session_and_advances_the_catalog() {
             .any(|event| event["scope"] == "global"
                 && patch_paths(event)
                     .iter()
-                    .any(|(_, path)| path.starts_with("/op"))),
+                    .any(|(_, path)| path.starts_with("/live/op"))),
         "the target appears in the commit that completes the create"
     );
     assert_ne!(peer.live("catalog")["revision"], revision);
@@ -1404,12 +1339,10 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
             && peer.live("session/source")["op"]["status"] == "completed"
     })
     .await;
-    let source_log = peer.log("session/source");
-    assert_eq!(source_log.len(), 1);
-    assert_eq!(
-        source_log[0]["turn"],
-        json!({"prompt": [text("source prompt")], "reply": [text("source reply")]})
-    );
+    let source_entries = peer.entries("session/source");
+    assert_eq!(source_entries.len(), 2);
+    assert_eq!(source_entries[0]["chunks"][0]["content"], text("source prompt"));
+    assert_eq!(agent_text(&source_entries), "source reply");
     let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
     let request = peer.request("session/fork").await;
     // The target's update follows its response in one physical ACP batch.
@@ -1434,14 +1367,13 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
     assert_eq!(source["op"]["id"], op);
     assert_eq!(source["op"]["result"], json!({"sessionId": "forked"}));
     assert_eq!(source["controls"]["info"]["title"], "Source title");
-    assert_eq!(peer.log("session/source"), source_log);
+    assert_eq!(peer.entries("session/source"), source_entries);
     let target = peer.live("session/forked");
     assert_eq!(target["op"]["kind"], "open");
     assert_eq!(target["op"]["status"], "completed");
-    assert_eq!(
-        peer.log("session/forked"),
-        source_log,
-        "without load support the target keeps the source's completed messages"
+    assert!(
+        peer.entries("session/forked").is_empty(),
+        "the target never inherits the source's entries"
     );
     peer.settled().await;
 }
@@ -1461,8 +1393,8 @@ async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
             && peer.live("session/source")["op"]["status"] == "completed"
     })
     .await;
-    let source_log = peer.log("session/source");
-    assert_eq!(source_log.len(), 1);
+    let source_entries = peer.entries("session/source");
+    assert_eq!(source_entries.len(), 2);
     let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
     let request = peer.request("session/fork").await;
     peer.update(
@@ -1485,10 +1417,16 @@ async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
             && peer.has("session/forked")
     })
     .await;
+    assert_eq!(peer.entries("session/source"), source_entries);
+    let kinds: Vec<_> = peer
+        .entries("session/forked")
+        .iter()
+        .map(|entry| entry["kind"].as_str().unwrap().to_string())
+        .collect();
     assert_eq!(
-        peer.log("session/forked"),
-        source_log,
-        "process updates alone do not replace the source's messages"
+        kinds,
+        ["message", "plan"],
+        "the target holds what the Agent sent for it, and the source's entries stay"
     );
     peer.settled().await;
 }
@@ -1516,16 +1454,13 @@ async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
             && peer.has("session/forked")
     })
     .await;
-    let expected = crate::protocol::canon::TurnLog::from_replay(&early);
+    let entries = peer.entries("session/forked");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["messageId"], "welcome");
     assert_eq!(
-        peer.log("session/forked"),
-        crate::protocol::stream_check::log_values(expected.entries()),
-        "the target's log is its early messages, as one turn with an empty prompt"
-    );
-    assert_eq!(
-        peer.log("session/forked")[0]["turn"],
-        json!({"prompt": [], "reply": [text("Forked session.")]}),
-        "adjacent plain text blocks merge (protocol §3.2)"
+        entries[0]["chunks"],
+        json!([{"content": text("Forked session.")}]),
+        "the target's entries are its early messages, adjacent plain text merged"
     );
     peer.settled().await;
 }
@@ -2224,8 +2159,8 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
     // and URL flow gone, nothing needs it, and the connection's end releases
     // it from the final documents (S6).
     let published = peer.publication.lock();
-    assert!(published.publisher.document(&scope).is_none());
-    let summary = &published.publisher.document("global").unwrap().live;
+    assert!(published.feed.live(&Scope::parse(&scope).unwrap()).is_none());
+    let summary = published.feed.live(&Scope::Global).unwrap();
     assert!(summary["sessions"].get(CREATED).is_none(), "{summary}");
     assert!(global["sessions"].get(CREATED).is_none(), "{global}");
 }
@@ -2247,17 +2182,14 @@ async fn a_failed_connection_publishes_the_agent_error() {
 }
 
 #[tokio::test]
-async fn the_same_history_gives_the_same_log_after_a_restart() {
+async fn the_same_history_gives_the_same_entries_after_a_restart() {
     async fn load(replay: &[Value]) -> Vec<Value> {
         let mut peer = Peer::start(json!({"loadSession": true})).await;
-        let _stream = peer
-            .subscribe(
-                crate::protocol::hub::parse_stream_query(
-                    "scope=session%2Fsaved&cwd=session%2Fsaved%3A%2Fworkspace",
-                )
-                .unwrap(),
-            )
-            .await;
+        let _stream = peer.subscribe(vec![Subscribed {
+            scope: Scope::Session("saved".into()),
+            have: None,
+            cwd: Some("/workspace".into()),
+        }]);
         let request = peer.request("session/load").await;
         for update in replay {
             peer.update("saved", update.clone()).await;
@@ -2268,9 +2200,9 @@ async fn the_same_history_gives_the_same_log_after_a_restart() {
         })
         .await;
         peer.settled().await;
-        let log = peer.log("session/saved");
+        let entries = peer.entries("session/saved");
         peer.stop().await.unwrap();
-        log
+        entries
     }
     let replay = [
         json!({"sessionUpdate": "user_message_chunk", "content": text("hi")}),
@@ -2278,12 +2210,11 @@ async fn the_same_history_gives_the_same_log_after_a_restart() {
         chunk("answer", text("lo")),
     ];
     let first = load(&replay).await;
-    assert_eq!(first.len(), 1);
-    assert_eq!(first, load(&replay).await, "a restart keeps the same log");
+    assert_eq!(first.len(), 2);
+    assert_eq!(first, load(&replay).await, "a restart keeps the same entries");
 }
 
 mod review_lifecycle;
-mod stream;
 
 // -- The revision 3 feed (docs/protocol.md §5) ----------------------------------------
 
