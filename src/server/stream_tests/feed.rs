@@ -317,3 +317,52 @@ async fn a_stream_that_follows_a_session_starts_the_next_connection_and_keeps_th
     }
     drop(sse.body);
 }
+
+// -- Reads (protocol §8) ----------------------------------------------------------------------
+
+/// `GET /api/v3/scopes/{scope}`: the status and the JSON body.
+async fn read_snapshot(server: &Server, scope: &str) -> (StatusCode, Value) {
+    let path = format!("/api/v3/scopes/{}", scope.replace('/', "%2F"));
+    let response = server.send(&path).await;
+    let status = response.status();
+    (status, json_of(response).await)
+}
+
+#[tokio::test]
+async fn a_scope_is_read_as_one_snapshot_that_is_the_one_a_stream_aligns_with() {
+    let (server, mut link) = Server::start(json!({})).await;
+    server.create(&mut link, "s1").await;
+
+    let (status, global) = read_snapshot(&server, "global").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(global["scope"], "global");
+    let snapshot = &global["snapshot"];
+    assert!(snapshot["epoch"].is_string() && snapshot["digest"].is_string(), "{global}");
+    assert!(snapshot["doc"]["live"]["sessions"].get("s1").is_some(), "{global}");
+
+    let (status, session) = read_snapshot(&server, "session/s1").await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    assert_eq!(session["snapshot"]["entries"]["base"], "replace");
+
+    // A stream that follows the session is aligned with the same document.
+    let (_, mut sse) = open(&server, "scope=session%2Fs1").await;
+    let aligned = event_of(&mut sse, "session/s1").await;
+    let (_, again) = read_snapshot(&server, "session/s1").await;
+    assert_eq!(aligned["snapshot"]["digest"], again["snapshot"]["digest"]);
+    assert_eq!(aligned["snapshot"]["rev"], again["snapshot"]["rev"]);
+}
+
+#[tokio::test]
+async fn reading_an_unheld_session_holds_nothing_and_a_bad_scope_is_refused() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let (status, body) = read_snapshot(&server, "session/unheld").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "not_found");
+    // Nothing was loaded for it.
+    link.quiet(Duration::from_millis(300)).await;
+    assert_eq!(read_snapshot(&server, "session/unheld").await.0, StatusCode::NOT_FOUND);
+
+    let (status, body) = read_snapshot(&server, "nowhere").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_request");
+}
