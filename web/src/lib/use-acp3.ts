@@ -440,8 +440,9 @@ export class Workspace {
         if (this.#navigation === intent.navigation && op.error != null) {
           this.#errors = [...this.#errors, operationError(`local:${(this.#nextId += 1)}`, op as never, op.error)];
         }
-      } else if (this.#feed.get(intent.scope) != null && shownOpReplaced(this.#feed.get(intent.scope), intent.id)) {
-        // The operation was replaced before the page saw it end, and no held session names it.
+      } else if (shownOp != null && shownOp.scope === intent.scope && shownOp.after === intent.id) {
+        // Our operation was replaced before the page saw it end, and no held session names it.
+        // (An op the document does not show yet is waited for: the 202 comes before it.)
         this.#finishIntent(intent);
       }
     }
@@ -450,6 +451,7 @@ export class Workspace {
   #finishIntent(intent: Intent): void {
     const index = this.#intents.indexOf(intent);
     if (index >= 0) this.#intents.splice(index, 1);
+    this.#transition = undefined;
   }
 
   #resolveRoute(): void {
@@ -965,12 +967,6 @@ export class Workspace {
 function bodyLive(replica: { readonly doc: Readonly<Record<string, unknown>> } | undefined): { op?: ShownOp } | undefined {
   const live = replica?.doc.live;
   return isRecord(live) ? (live as { op?: ShownOp }) : undefined;
-}
-
-/** Whether the operation `id` is no longer the one the replica shows. */
-function shownOpReplaced(replica: { readonly doc: Readonly<Record<string, unknown>> } | undefined, id: string): boolean {
-  const op = bodyLive(replica)?.op;
-  return op != null && op.id !== id;
 }
 
 function promptOf(write: StartingWrite): PromptBlock[] {
