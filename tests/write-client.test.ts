@@ -287,8 +287,7 @@ describe("queued writes on revision 3 (C2, C3)", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].body).toMatchObject({ id: "AAAAAAAAAAAAAAAAAAAAAA", expect: "op-A", kind: "prompt" });
     calls[0].respond(202, { op: "AAAAAAAAAAAAAAAAAAAAAA" });
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(queue.items(S)).toEqual([]);
   });
 
