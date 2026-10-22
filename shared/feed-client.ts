@@ -10,6 +10,7 @@
 // synchronized or retrying.
 
 import { DocumentReplicaSet, type DocumentReplica, type Follow, type StreamEvent } from "./document-replica";
+import type { End } from "./protocol";
 
 /** One SSE connection, as `EventSource` offers it. */
 export interface StreamSource {
@@ -44,6 +45,8 @@ export class FeedClient {
   #closed = false;
   #failures = 0;
   #status: FeedStatus | undefined;
+  /** Why each scope that ended on the current set ended. */
+  readonly #ends = new Map<string, End>();
 
   constructor(
     openStream: OpenStream,
@@ -56,11 +59,17 @@ export class FeedClient {
   follow(follow: readonly Follow[]): void {
     if (this.#closed) return;
     this.#follow = follow;
+    this.#ends.clear();
     this.#connect();
   }
 
   get(scope: string): DocumentReplica | undefined {
     return this.#set.get(scope);
+  }
+
+  /** Why `scope` ended, if it did since the set was followed. */
+  endOf(scope: string): End | undefined {
+    return this.#ends.get(scope);
   }
 
   /** Calls `listener` with a scope each time its replica changes or ends. */
@@ -124,6 +133,7 @@ export class FeedClient {
     if (received === "resubscribe") {
       this.#broken(this.#set.lastResubscribe?.reason ?? "the replica could not be applied");
     } else if (received !== "ignored") {
+      if (received === "ended") this.#ends.set(scope, (JSON.parse(data) as { end: End }).end);
       this.#failures = 0;
       this.#report({ state: "synchronized" });
       this.#listeners.forEach((listener) => listener(scope));
