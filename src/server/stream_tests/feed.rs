@@ -156,7 +156,7 @@ async fn a_stream_loads_a_session_the_bridge_does_not_hold_with_the_cwd_it_gave(
         let snapshot = event_of(&mut other, "session/saved").await;
         let doc = &snapshot["snapshot"]["doc"];
         if doc["history"] == "complete" {
-            assert_eq!(doc["entries"].as_array().map(Vec::len), Some(2), "{snapshot}");
+            assert_eq!(snapshot["snapshot"]["entries"]["length"], 2, "{snapshot}");
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "never loaded: {snapshot}");

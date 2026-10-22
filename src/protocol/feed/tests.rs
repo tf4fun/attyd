@@ -384,3 +384,50 @@ fn ending_the_waiting_ends_the_scope_for_those_that_wait_only() {
     feed.end_waiting("s", &end);
     assert_eq!(drain(&mut feed, aligned), Vec::<String>::new());
 }
+
+// -- Why a scope ended -----------------------------------------------------------------------
+
+fn failed_load() -> End {
+    End {
+        reason: EndReason::LoadFailed,
+        error: Some(crate::protocol::documents::ProtocolError::new(
+            crate::protocol::documents::ErrorCode::NotFound,
+            "no such session",
+        )),
+    }
+}
+
+#[test]
+fn a_session_gone_with_a_reason_ends_its_scope_with_that_reason() {
+    let base = tokio::time::Instant::now();
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit_at(&registry, &agent(), 0, base);
+    let id = feed.subscribe(&follow(&[session()]));
+    drain(&mut feed, id);
+    registry
+        .sessions
+        .get_mut("s")
+        .unwrap()
+        .state
+        .live
+        .as_mut()
+        .unwrap()
+        .lifecycle = SessionLifecycle::Closed;
+    feed.commit_ending(&registry, &agent(), 0, base, &[("s".to_string(), failed_load())]);
+    assert_eq!(drain(&mut feed, id), ["end session/s LoadFailed"]);
+}
+
+#[test]
+fn a_scope_that_ended_before_it_was_published_ends_for_the_subscriptions_that_wait() {
+    let base = tokio::time::Instant::now();
+    let registry = SessionRegistry::new("epoch");
+    let mut feed = Feed::new("process");
+    feed.commit_at(&registry, &agent(), 0, base);
+    let waiting = feed.subscribe(&follow(&[session()]));
+    let other = feed.subscribe(&follow(&[Scope::Session("other".into())]));
+    feed.commit_ending(&registry, &agent(), 0, base, &[("s".to_string(), failed_load())]);
+    assert_eq!(drain(&mut feed, waiting), ["end session/s LoadFailed"]);
+    assert_eq!(drain(&mut feed, other), Vec::<String>::new());
+    assert!(feed.followed_sessions().get("s").is_none());
+}
