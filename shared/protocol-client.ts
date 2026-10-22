@@ -1,13 +1,10 @@
-// The HTTP and stream client of protocol v2 (docs/protocol.md §5–§7,
-// migration step 7). The stream feeds the replicas; writes and resource
-// actions go over HTTP and never change a replica: the stream alone does
-// (C1). A write sent without a definite answer is never resent
-// automatically (C3); queued input that was never sent, or was refused with
-// a definite answer, is submitted once the replica shows the operation
-// ended (C2).
+// What the HTTP clients of revision 3 share (docs/protocol.md §6, §7): the transport, the
+// write queue and the resource client. Writes and actions go over HTTP and never change a
+// replica: the stream alone does (C1). A write sent without a definite answer is never
+// resent automatically (C3); queued input that was never sent, or was refused with a
+// definite answer, is submitted once the document shows the operation ended (C2).
 
-import type { Answer, ErrorCode, Event, OpArgs, OpOutcome, Operation, ProtocolError } from "./protocol";
-import { ReplicaSet, type Follow, type Received, type Replica } from "./replica";
+import type { ErrorCode, OpArgs, Operation, ProtocolError } from "./protocol";
 
 // ---------------------------------------------------------------------------
 // Transport
@@ -18,202 +15,9 @@ export type HttpFetch = (
   init: { method: "POST"; headers: Record<string, string>; body: string },
 ) => Promise<{ status: number; json(): Promise<unknown> }>;
 
-/** One SSE connection, as `EventSource` offers it. */
-export interface StreamSource {
-  onmessage: ((message: { data: string }) => void) | null;
-  onerror: (() => void) | null;
-  close(): void;
-}
-
-export type OpenStream = (url: string) => StreamSource;
-
-/** Runs `reconnect` later; the delay is the scheduler's. */
-export type Schedule = (reconnect: () => void) => void;
-
-// ---------------------------------------------------------------------------
-// Stream (§5)
-
-/**
- * Follows a set of scopes on one stream at a time. A new set closes the
- * stream it replaces; a broken stream or an event that does not apply closes
- * it too, and a new one subscribes with the heads held then. It reads
- * nothing over HTTP.
- */
-export class ReplicaClient {
-  readonly #set = new ReplicaSet();
-  readonly #listeners = new Set<(scope: string) => void>();
-  readonly #openStream: OpenStream;
-  readonly #schedule: Schedule;
-  #follow: readonly Follow[] = [];
-  #source: StreamSource | undefined;
-  /** Counts connections; a callback or reconnect of an earlier one changes nothing. */
-  #generation = 0;
-  #closed = false;
-
-  constructor(openStream: OpenStream, schedule: Schedule = (reconnect) => void setTimeout(reconnect, 1000)) {
-    this.#openStream = openStream;
-    this.#schedule = schedule;
-  }
-
-  follow(follow: readonly Follow[]): void {
-    if (this.#closed) return;
-    this.#follow = follow;
-    this.#connect();
-  }
-
-  get(scope: string): Replica | undefined {
-    return this.#set.get(scope);
-  }
-
-  /** Calls `listener` with a scope each time its replica changes or ends. */
-  subscribe(listener: (scope: string) => void): () => void {
-    this.#listeners.add(listener);
-    return () => {
-      this.#listeners.delete(listener);
-    };
-  }
-
-  close(): void {
-    this.#closed = true;
-    this.#disconnect();
-  }
-
-  #connect(): void {
-    this.#disconnect();
-    const generation = this.#generation;
-    const { stream, url } = this.#set.open(this.#follow);
-    const source = this.#openStream(url);
-    this.#source = source;
-    source.onmessage = ({ data }) => {
-      if (generation === this.#generation) this.#receive(stream, data);
-    };
-    source.onerror = () => {
-      if (generation === this.#generation) this.#broken();
-    };
-  }
-
-  /** Closes the current stream, if any, and lets nothing of it through. */
-  #disconnect(): void {
-    this.#generation += 1;
-    const source = this.#source;
-    this.#source = undefined;
-    if (source === undefined) return;
-    source.onmessage = null;
-    source.onerror = null;
-    source.close();
-  }
-
-  #receive(stream: number, data: string): void {
-    let scope: string;
-    let received: Received;
-    try {
-      const event = JSON.parse(data) as Event;
-      scope = event.scope;
-      received = this.#set.receive(stream, event);
-    } catch {
-      // Not an event of the protocol: the stream cannot be trusted further.
-      this.#broken();
-      return;
-    }
-    if (received === "resubscribe") this.#broken();
-    else if (received !== "ignored") this.#listeners.forEach((listener) => listener(scope));
-  }
-
-  /** The stream failed: close it, and subscribe again later with the heads held then (§5.4). */
-  #broken(): void {
-    this.#disconnect();
-    const generation = this.#generation;
-    this.#schedule(() => {
-      if (!this.#closed && generation === this.#generation) this.#connect();
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Operation writes (§6)
-
-export type WriteOutcome =
-  /** `202`: admitted, nothing more; the replica shows what follows. */
-  | { readonly kind: "accepted"; readonly op: string }
-  /** `200` of `create`, `fork` and `list`, at the operation's end. */
-  | { readonly kind: "ended"; readonly op: string; readonly outcome: OpOutcome }
-  /** A definite refusal: the write changed nothing (§6.4). */
-  | { readonly kind: "refused"; readonly error: ProtocolError }
-  /** No definite answer: the write may have taken effect (C3). */
-  | { readonly kind: "uncertain" }
-  /** Not sent: the replica does not allow it as it stands. */
-  | { readonly kind: "blocked"; readonly reason: string };
-
-/** The replicas a writer reads `expect` and the pending interactions from. */
-export interface ReplicaSource {
-  get(scope: string): Replica | undefined;
-}
-
-/** What the queue reads of a replica: its `live`, whichever revision of the protocol holds it. */
+/** What the queue reads of a replica: its `live`, from the document the feed holds. */
 export interface QueueSource {
   get(scope: string): { readonly live?: unknown } | undefined;
-}
-
-/**
- * Sends operation writes against the `op` the replica shows. It waits for
- * the HTTP answer only, with no short timeout, and never for the stream.
- */
-export class OpsClient {
-  readonly #fetch: HttpFetch;
-  readonly #replicas: ReplicaSource;
-
-  constructor(fetch: HttpFetch, replicas: ReplicaSource) {
-    this.#fetch = fetch;
-    this.#replicas = replicas;
-  }
-
-  /** Sends `write` with `expect` set to the replica's `op.id`. */
-  write(scope: string, write: OpArgs): Promise<WriteOutcome> {
-    const op = shownOp(this.#replicas, scope);
-    if (op === undefined) return Promise.resolve(blocked(`no aligned replica of ${scope}`));
-    return this.#send(scope, op.id, write);
-  }
-
-  /**
-   * Answers the running operation's pending interactions, all of them at
-   * once; it is blocked, unsent, unless `answers` covers exactly those the
-   * replica shows.
-   */
-  answer(scope: string, answers: Readonly<Record<string, Answer>>): Promise<WriteOutcome> {
-    const op = shownOp(this.#replicas, scope);
-    if (op === undefined) return Promise.resolve(blocked(`no aligned replica of ${scope}`));
-    if (op.status !== "running") return Promise.resolve(blocked(`${op.id} is not running`));
-    const pending = Object.keys(op.interactions ?? {});
-    const given = Object.keys(answers);
-    if (given.length !== pending.length || !pending.every((id) => Object.hasOwn(answers, id))) {
-      return Promise.resolve(blocked("the answers do not cover exactly the pending interactions"));
-    }
-    return this.#send(scope, op.id, { kind: "answer", args: { answers: { ...answers } } });
-  }
-
-  async #send(scope: string, expect: string, write: OpArgs): Promise<WriteOutcome> {
-    let response: Awaited<ReturnType<HttpFetch>>;
-    try {
-      response = await this.#fetch(`/api/v2/scopes/${encodeURIComponent(scope)}/ops`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ expect, kind: write.kind, args: write.args }),
-      });
-    } catch {
-      return { kind: "uncertain" };
-    }
-    const body = await response.json().catch(() => undefined);
-    if (response.status === 202) {
-      return isRecord(body) && typeof body.op === "string" ? { kind: "accepted", op: body.op } : { kind: "uncertain" };
-    }
-    if (response.status === 200) {
-      if (!isRecord(body) || typeof body.op !== "string") return { kind: "uncertain" };
-      if ("result" in body) return { kind: "ended", op: body.op, outcome: { result: body.result } };
-      if (isProtocolError(body.error)) return { kind: "ended", op: body.op, outcome: { error: body.error } };
-      return { kind: "uncertain" };
-    }
-    return refusal(response.status, body);
-  }
 }
 
 /** The `op` of the aligned replica of `scope`. */
@@ -221,10 +25,6 @@ function shownOp(replicas: QueueSource, scope: string): Operation | undefined {
   const live = replicas.get(scope)?.live;
   if (!isRecord(live) || !isRecord(live.op) || typeof live.op.id !== "string") return undefined;
   return live.op as unknown as Operation;
-}
-
-function blocked(reason: string): WriteOutcome {
-  return { kind: "blocked", reason };
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -256,7 +56,7 @@ export function refusal(status: number, body: unknown): { kind: "refused"; error
  * whose outcomes have the same kinds the queue acts on.
  */
 export interface QueueOps {
-  write(scope: string, write: StartingWrite): Promise<WriteOutcome | QueueOutcome>;
+  write(scope: string, write: StartingWrite): Promise<QueueOutcome>;
 }
 
 /** The outcomes of a write as the queue reads them. */
@@ -358,7 +158,7 @@ export class WriteQueue {
     return queue;
   }
 
-  #answered(scope: string, id: number, outcome: WriteOutcome | QueueOutcome): void {
+  #answered(scope: string, id: number, outcome: QueueOutcome): void {
     const queue = this.#queue(scope);
     const expect = queue.sending?.expect;
     queue.sending = undefined;
