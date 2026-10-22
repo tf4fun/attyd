@@ -79,7 +79,7 @@ describe("following scopes", () => {
     const changed: string[] = [];
     client.subscribe((scope) => changed.push(scope));
     client.follow([{ scope: S }]);
-    expect(new URL(last().url, "http://bridge.test").pathname).toBe("/api/v3/stream");
+    expect(new URL(last().url, "http://bridge.test").pathname).toBe("/api/v2/stream");
     expect(params(last().url).getAll("scope")).toEqual([S]);
     expect(params(last().url).has("have")).toBe(false);
 

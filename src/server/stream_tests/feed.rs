@@ -1,10 +1,10 @@
-//! `GET /api/v3/stream` over real HTTP (docs/protocol.md §5): the stream of the feed.
+//! `GET /api/v2/stream` over real HTTP (docs/protocol.md §5): the stream of the feed.
 
 use super::*;
 
-/// `GET /api/v3/stream?…`: the status and the SSE body.
+/// `GET /api/v2/stream?…`: the status and the SSE body.
 async fn open(server: &Server, query: &str) -> (StatusCode, Sse) {
-    let response = server.send(&format!("/api/v3/stream?{query}")).await;
+    let response = server.send(&format!("/api/v2/stream?{query}")).await;
     let status = response.status();
     if status == StatusCode::OK {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/event-stream");
@@ -197,9 +197,9 @@ async fn a_load_the_agent_refuses_ends_the_scope_for_the_stream() {
 /// A client-chosen operation id: 22 characters of base64url (protocol §6.5).
 const CREATE_ID: &str = "Cr3ateOperation_Id-001";
 
-/// The status and the JSON body of `POST /api/v3/scopes/{scope}/ops`.
+/// The status and the JSON body of `POST /api/v2/scopes/{scope}/ops`.
 async fn write(server: &Server, scope: &str, body: Value) -> (StatusCode, Value) {
-    let path = format!("/api/v3/scopes/{}/ops", scope.replace('/', "%2F"));
+    let path = format!("/api/v2/scopes/{}/ops", scope.replace('/', "%2F"));
     let response = send(server.address, Method::POST, &path, Some(body)).await;
     let status = response.status();
     (status, json_of(response).await)
@@ -316,9 +316,9 @@ async fn a_stream_that_follows_a_session_starts_the_next_connection_and_keeps_th
 
 // -- Reads (protocol §8) ----------------------------------------------------------------------
 
-/// `GET /api/v3/scopes/{scope}`: the status and the JSON body.
+/// `GET /api/v2/scopes/{scope}`: the status and the JSON body.
 async fn read_snapshot(server: &Server, scope: &str) -> (StatusCode, Value) {
-    let path = format!("/api/v3/scopes/{}", scope.replace('/', "%2F"));
+    let path = format!("/api/v2/scopes/{}", scope.replace('/', "%2F"));
     let response = server.send(&path).await;
     let status = response.status();
     (status, json_of(response).await)

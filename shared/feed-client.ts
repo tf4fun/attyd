@@ -33,7 +33,7 @@ const FIRST_DELAY_MS = 1000;
 const LAST_DELAY_MS = 30_000;
 
 export class FeedClient {
-  readonly #set = new DocumentReplicaSet("/api/v3/stream");
+  readonly #set = new DocumentReplicaSet("/api/v2/stream");
   readonly #listeners = new Set<(scope: string) => void>();
   readonly #statusListeners = new Set<(status: FeedStatus) => void>();
   readonly #openStream: OpenStream;

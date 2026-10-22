@@ -1,4 +1,4 @@
-//! `GET /api/v3/stream` and `GET /api/v3/scopes/{scope}` over real HTTP (protocol §5, §8).
+//! `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}` over real HTTP (protocol §5, §8).
 //!
 //! The server listens on a TCP port and its bridge connects to a scripted
 //! Agent over the WebSocket transport, so each Agent connection is a real ACP
@@ -240,9 +240,9 @@ impl Server {
         send(self.address, Method::GET, path, None).await
     }
 
-    /// `GET /api/v3/scopes/{scope}`: the status and the JSON body.
+    /// `GET /api/v2/scopes/{scope}`: the status and the JSON body.
     async fn read(&self, scope: &str) -> (StatusCode, Value) {
-        let path = format!("/api/v3/scopes/{}", scope.replace('/', "%2F"));
+        let path = format!("/api/v2/scopes/{}", scope.replace('/', "%2F"));
         let response = self.send(&path).await;
         let status = response.status();
         let bytes = axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
@@ -267,7 +267,7 @@ impl Server {
         let created = send(
             self.address,
             Method::POST,
-            "/api/v3/scopes/global/ops",
+            "/api/v2/scopes/global/ops",
             Some(body),
         )
         .await;

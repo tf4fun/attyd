@@ -12,7 +12,7 @@ import {
 import { WriteQueue, type HttpFetch } from "../shared/protocol-client";
 
 const S = "session/S";
-const OPS = "/api/v3/scopes/session%2FS/ops";
+const OPS = "/api/v2/scopes/session%2FS/ops";
 const ID = "AAAAAAAAAAAAAAAAAAAAAA";
 
 interface Call {
@@ -187,7 +187,7 @@ describe("actions (§7)", () => {
     const { calls, client } = actions();
     const outcome = client.answer(S, "int 1", { outcome: { outcome: "selected", optionId: "allow" } });
     expect(calls[0]).toMatchObject({
-      url: "/api/v3/scopes/session%2FS/resources/int%201/answer",
+      url: "/api/v2/scopes/session%2FS/resources/int%201/answer",
       body: { outcome: { outcome: "selected", optionId: "allow" } },
     });
     calls[0].respond(204);
@@ -212,13 +212,13 @@ describe("actions (§7)", () => {
   it("sets a mode and an option, held until the Agent answers", async () => {
     const { calls, client } = actions();
     const mode = client.setMode(S, "plan");
-    expect(calls[0]).toMatchObject({ url: "/api/v3/scopes/session%2FS/actions/set_mode", body: { modeId: "plan" } });
+    expect(calls[0]).toMatchObject({ url: "/api/v2/scopes/session%2FS/actions/set_mode", body: { modeId: "plan" } });
     calls[0].respond(200, {});
     expect(await mode).toEqual({ kind: "done" });
 
     const option = client.setConfig(S, "verbose", true);
     expect(calls[1]).toMatchObject({
-      url: "/api/v3/scopes/session%2FS/actions/set_config",
+      url: "/api/v2/scopes/session%2FS/actions/set_config",
       body: { configId: "verbose", value: true },
     });
     calls[1].respond(200, {});
@@ -236,7 +236,7 @@ describe("actions (§7)", () => {
   it("closes a session, and a refusal before anything was sent is refused", async () => {
     const { calls, client } = actions();
     const closed = client.close(S);
-    expect(calls[0]).toMatchObject({ url: "/api/v3/scopes/session%2FS/actions/close", body: {} });
+    expect(calls[0]).toMatchObject({ url: "/api/v2/scopes/session%2FS/actions/close", body: {} });
     calls[0].respond(409, { error: { code: "not_allowed", message: "closing" } });
     expect(await closed).toEqual({ kind: "refused", error: { code: "not_allowed", message: "closing" } });
   });
@@ -246,7 +246,7 @@ describe("actions (§7)", () => {
     const first = client.input("global", "t1", "a");
     const second = client.input("global", "t1", "b");
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe("/api/v3/scopes/global/resources/t1/input");
+    expect(calls[0].url).toBe("/api/v2/scopes/global/resources/t1/input");
     calls[0].respond(204);
     await first;
     await Promise.resolve();
@@ -256,7 +256,7 @@ describe("actions (§7)", () => {
     expect(await second).toEqual({ kind: "done" });
 
     const dismissed = client.dismiss("global", "t1");
-    expect(calls[2].url).toBe("/api/v3/scopes/global/resources/t1/dismiss");
+    expect(calls[2].url).toBe("/api/v2/scopes/global/resources/t1/dismiss");
     calls[2].respond(204);
     expect(await dismissed).toEqual({ kind: "done" });
   });

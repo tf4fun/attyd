@@ -2,7 +2,7 @@
 
 `tests/browser/protocol-ui.pw.ts` and its harness `tests/browser/protocol-harness.ts` drove the real server
 through a barrier proxy that held, lost and injected events of the revision 2 stream. The app now runs on
-revision 3 (`/api/v3/stream`), whose events are snapshots, ops and checkpoints, so those files were removed in the
+revision 3 (`/api/v2/stream`), whose events are snapshots, ops and checkpoints, so those files were removed in the
 change that switched the app; they are in git history at `bcf9bce`. Each case below has to come back for revision 3,
 with the harness reading `StreamEvent`s through the verifying replica set instead of the revision 2 replica. Cases that
 assert the revision 2 model (a single write answering every pending interaction, a create or fork result taken from a

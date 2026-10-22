@@ -165,7 +165,7 @@ for (const transport of ["http", "ws"] as const) {
       sessionScope(`${transport}-session-1`),
       sessionScope(`${transport}-session-2`),
     ].map(async (scope) => {
-      const path = `/api/v3/scopes/${encodeURIComponent(scope)}`;
+      const path = `/api/v2/scopes/${encodeURIComponent(scope)}`;
       const response = await fetch(`${origin}${path}`, { signal: AbortSignal.timeout(1_000) });
       return { path, status: response.status, body: await response.json() };
     }));

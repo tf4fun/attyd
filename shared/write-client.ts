@@ -76,7 +76,7 @@ export class OpsClient {
   async #send(scope: string, body: unknown, write: Write | undefined): Promise<WriteOutcome> {
     let response: Awaited<ReturnType<HttpFetch>>;
     try {
-      response = await this.#fetch(`/api/v3/scopes/${encodeURIComponent(scope)}/ops`, {
+      response = await this.#fetch(`/api/v2/scopes/${encodeURIComponent(scope)}/ops`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
@@ -126,7 +126,7 @@ export class ActionsClient {
 
   constructor(fetch: HttpFetch) {
     this.#fetch = fetch;
-    this.#resources = new ResourceClient(fetch, "/api/v3");
+    this.#resources = new ResourceClient(fetch, "/api/v2");
   }
 
   /** Answers one pending interaction, at most once. */
@@ -183,5 +183,5 @@ export class ActionsClient {
 }
 
 function base(scope: string): string {
-  return `/api/v3/scopes/${encodeURIComponent(scope)}`;
+  return `/api/v2/scopes/${encodeURIComponent(scope)}`;
 }

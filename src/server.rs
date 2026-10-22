@@ -589,8 +589,8 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
     let dev_proxy = options.dev_server.as_deref().map(DevProxy::new);
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/v3/stream", get(feed_stream))
-        .route("/api/v3/scopes/{*scope}", get(read_scope_v3).post(write_scope_v3))
+        .route("/api/v2/stream", get(feed_stream))
+        .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
         .route("/api/v2/sessions/{*read}", get(read_session))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
@@ -643,10 +643,10 @@ fn protocol_error(status: StatusCode, error: ProtocolError) -> Response {
     (status, axum::Json(wire::ErrorBody { error })).into_response()
 }
 
-/// `GET /api/v3/scopes/{scope}` (protocol §8): the document as one snapshot, the one a stream
+/// `GET /api/v2/scopes/{scope}` (protocol §8): the document as one snapshot, the one a stream
 /// aligns with. It starts, loads and holds nothing; a session the bridge does not hold is
 /// `not_found`.
-async fn read_scope_v3(Path(scope): Path<String>, State(state): State<AppState>) -> Response {
+async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) -> Response {
     if Scope::parse(&scope).is_none() {
         return protocol_error(
             StatusCode::BAD_REQUEST,
@@ -917,10 +917,10 @@ fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
     })
 }
 
-/// `POST /api/v3/scopes/{scope}/ops` (protocol §6.3): every operation is
+/// `POST /api/v2/scopes/{scope}/ops` (protocol §6.3): every operation is
 /// answered `202` when it is admitted, none holds its response open; the result
 /// arrives in the document.
-async fn write_scope_v3(
+async fn write_scope(
     State(state): State<AppState>,
     uri: axum::http::Uri,
     headers: HeaderMap,
@@ -928,7 +928,7 @@ async fn write_scope_v3(
 ) -> Response {
     let segments: Option<Vec<String>> = uri
         .path()
-        .strip_prefix("/api/v3/scopes/")
+        .strip_prefix("/api/v2/scopes/")
         .unwrap_or_default()
         .split('/')
         .map(path_segment)
@@ -994,7 +994,7 @@ async fn write_scope_v3(
     (StatusCode::ACCEPTED, axum::Json(wire::OpAccepted { op })).into_response()
 }
 
-/// `GET /api/v3/stream` (protocol §5): the events of the scopes it follows from
+/// `GET /api/v2/stream` (protocol §5): the events of the scopes it follows from
 /// the revision 3 feed, without SSE ids, with a heartbeat while idle. Dropping
 /// the body closes the subscription.
 async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -> Response {
