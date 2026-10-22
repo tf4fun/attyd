@@ -182,7 +182,7 @@ describe("revision 3 workspace, read side", () => {
   it("follows global and catalog on the revision 3 stream and shows the Agent", async () => {
     await mount("/");
     const source = current();
-    expect(new URL(source.url, "http://test").pathname).toBe("/api/v3/stream");
+    expect(new URL(source.url, "http://test").pathname).toBe("/api/v2/stream");
     expect(source.scopes).toEqual(["global", "catalog"]);
     expect(hook.state.phase).toBe("starting");
     await emit(globalSnapshot());
@@ -398,7 +398,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.prompt([text("hi")]));
     await settle();
     expect(posts).toHaveLength(1);
-    expect(posts[0].url).toBe("/api/v3/scopes/session%2Fs1/ops");
+    expect(posts[0].url).toBe("/api/v2/scopes/session%2Fs1/ops");
     expect(posts[0].body).toMatchObject({ expect: "o1", kind: "prompt", args: { prompt: [text("hi")] } });
     expect(posts[0].body.id).toMatch(/^[A-Za-z0-9_-]{22}$/u);
     expect(hook.state.queue).toEqual([]);
@@ -500,7 +500,7 @@ describe("revision 3 workspace, read side", () => {
     await settle();
     expect(accepted).toBe(true);
     expect(posts).toHaveLength(1);
-    expect(posts[0].url).toBe("/api/v3/scopes/global/ops");
+    expect(posts[0].url).toBe("/api/v2/scopes/global/ops");
     expect(posts[0].body).toMatchObject({ expect: "g0", kind: "create", args: { cwd: "/proj" } });
     expect(hook.state.sessionTransition).toEqual({ kind: "new", requestId: "transition:new" });
     const id = posts[0].body.id!;
@@ -597,7 +597,7 @@ describe("revision 3 workspace, read side", () => {
     await shownSession();
     await act(async () => hook.forkSession());
     await settle();
-    expect(posts[0].url).toBe("/api/v3/scopes/session%2Fs1/ops");
+    expect(posts[0].url).toBe("/api/v2/scopes/session%2Fs1/ops");
     expect(posts[0].body).toMatchObject({ expect: "o1", kind: "fork", args: {} });
     expect(hook.state.sessionTransition).toEqual({ kind: "fork", requestId: "transition:fork" });
     const id = posts[0].body.id!;
@@ -655,8 +655,8 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.resizeAuthTerminal("L", 100, 30));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v3/scopes/global/resources/L/input", { data: "x" }],
-      ["/api/v3/scopes/global/resources/L/resize", { cols: 100, rows: 30 }],
+      ["/api/v2/scopes/global/resources/L/input", { data: "x" }],
+      ["/api/v2/scopes/global/resources/L/resize", { cols: 100, rows: 30 }],
     ]);
     respond = (post) => ({ status: 202, body: { op: post.body.expect } });
     await act(async () => hook.cancelAuthTerminal("L"));
@@ -665,7 +665,7 @@ describe("revision 3 workspace, read side", () => {
     respond = () => ({ status: 204 });
     await act(async () => hook.dismissAuthTerminal("L"));
     await settle();
-    expect(posts[3].url).toBe("/api/v3/scopes/global/resources/L/dismiss");
+    expect(posts[3].url).toBe("/api/v2/scopes/global/resources/L/dismiss");
   });
 
   // -- interactions, controls and URL flows -------------------------------------------------
@@ -689,7 +689,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.respondPermission("A", allow));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v3/scopes/session%2Fs1/resources/A/answer", { outcome: allow }],
+      ["/api/v2/scopes/session%2Fs1/resources/A/answer", { outcome: allow }],
     ]);
     // Sent, awaiting the document; B is untouched.
     const [a, b] = hook.state.permissions;
@@ -748,7 +748,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.respondElicitation("E", { action: "accept", content: {} }));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v3/scopes/global/resources/E/answer", { response: { action: "accept", content: {} } }],
+      ["/api/v2/scopes/global/resources/E/answer", { response: { action: "accept", content: {} } }],
     ]);
   });
 
@@ -764,8 +764,8 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.dismissExternalFlow("nope"));
     await settle();
     expect(posts.map((post) => post.url)).toEqual([
-      "/api/v3/scopes/session%2Fs1/resources/S/dismiss",
-      "/api/v3/scopes/global/resources/G/dismiss",
+      "/api/v2/scopes/session%2Fs1/resources/S/dismiss",
+      "/api/v2/scopes/global/resources/G/dismiss",
     ]);
   });
 
@@ -776,7 +776,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.setMode("plan"));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v3/scopes/session%2Fs1/actions/set_mode", { modeId: "plan" }],
+      ["/api/v2/scopes/session%2Fs1/actions/set_mode", { modeId: "plan" }],
     ]);
     expect(hook.state.pendingSessionControl).toMatchObject({ sessionId: "s1", kind: "mode" });
     expect(hook.state.running).toBe(true);
@@ -815,7 +815,7 @@ describe("revision 3 workspace, read side", () => {
     await emit(globalSnapshot(listable()));
     await emit(catalogSnapshot());
     expect(lists().map((post) => [post.url, post.body.expect, post.body.args])).toEqual([
-      ["/api/v3/scopes/catalog/ops", "c0", {}],
+      ["/api/v2/scopes/catalog/ops", "c0", {}],
     ]);
     // Nothing is sent again against the same op, however often the page is told.
     await emit({ scope: "global", rev: 1, ops: [{ op: "set", path: "/live/agent/error", value: null }] } as StreamEvent);

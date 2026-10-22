@@ -29,11 +29,11 @@ export function trackApi(page: Page): ApiRequests {
     const path = url.pathname;
     if (path.startsWith("/api/v1")) requests.v1.push(`${request.method()} ${path}`);
     if (path.includes("/process")) requests.process.push(path);
-    if (path === "/api/v3/stream") requests.streams.push(url);
-    if (!path.startsWith("/api/v3/scopes/")) return;
-    const ops = /^\/api\/v3\/scopes\/(.+)\/ops$/u.exec(path);
-    const action = /^\/api\/v3\/scopes\/(.+)\/resources\/([^/]+)\/([^/]+)$/u.exec(path);
-    const control = /^\/api\/v3\/scopes\/(.+)\/actions\/([^/]+)$/u.exec(path);
+    if (path === "/api/v2/stream") requests.streams.push(url);
+    if (!path.startsWith("/api/v2/scopes/")) return;
+    const ops = /^\/api\/v2\/scopes\/(.+)\/ops$/u.exec(path);
+    const action = /^\/api\/v2\/scopes\/(.+)\/resources\/([^/]+)\/([^/]+)$/u.exec(path);
+    const control = /^\/api\/v2\/scopes\/(.+)\/actions\/([^/]+)$/u.exec(path);
     if (request.method() === "GET") requests.reads.push(url);
     else if (ops != null) {
       const body = request.postDataJSON() as Record<string, unknown>;
