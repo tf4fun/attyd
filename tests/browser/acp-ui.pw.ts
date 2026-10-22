@@ -366,32 +366,16 @@ for (const { kind, listState } of [
   { kind: "elicitation", listState: "failed" },
 ] as const) {
   test(`restores a pending ${kind} after reload while session listing is ${listState}`, async ({ page }) => {
-    await page.goto("/sessions/saved-session");
-    const composer = page.locator('textarea[role="combobox"]');
-    await expect(composer).toBeEnabled();
-    await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
-    await composer.press("Enter");
-    const interaction = kind === "permission"
-      ? page.getByRole("alertdialog", { name: "Agent permission request" })
-      : page.getByRole("dialog", { name: "Agent input request" });
-    await expect(interaction).toBeVisible();
-    const sessionUrl = page.url();
-    // The catalog's pages stay in its document while the revision stays: a list is needed again
-    // only after it changed, which another client creating a session does.
-    const global = await (await page.request.get("/api/v2/scopes/global")).json();
-    const other = await page.request.post("/api/v2/scopes/global/ops", {
-      data: { expect: global.live.op.id, kind: "create", args: { cwd: process.cwd() } },
-    });
-    expect(other.status()).toBe(200);
     const browserErrors = collectBrowserErrors(page, listState === "failed"
       ? [{ status: 503, pathname: "/api/v3/scopes/catalog/ops" }]
       : []);
-    const api = trackApi(page);
+    await page.goto("/sessions/saved-session");
+    const composer = page.locator('textarea[role="combobox"]');
+    await expect(composer).toBeEnabled();
 
     let releaseList!: () => void;
     const listGate = new Promise<void>((resolve) => { releaseList = resolve; });
-    let notifyListStarted!: () => void;
-    const listStarted = new Promise<void>((resolve) => { notifyListStarted = resolve; });
+    let listRequests = 0;
     const listError = "Session listing failed during reload";
     // The catalog is listed by a `list` operation on `catalog` (protocol §6.2).
     await page.route("**/api/v3/scopes/catalog/ops", async (route) => {
@@ -399,7 +383,7 @@ for (const { kind, listState } of [
         await route.continue();
         return;
       }
-      notifyListStarted();
+      listRequests += 1;
       await listGate;
       if (listState === "failed") {
         await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({
@@ -411,8 +395,26 @@ for (const { kind, listState } of [
     });
 
     try {
+      // The pages the catalog's document holds stay while its revision stays; a list is needed again
+      // only after it changed, which another client creating a session does. Listing stalls from here on.
+      const global = await (await page.request.get("/api/v2/scopes/global")).json();
+      const other = await page.request.post("/api/v2/scopes/global/ops", {
+        data: { expect: global.live.op.id, kind: "create", args: { cwd: process.cwd() } },
+      });
+      expect(other.status()).toBe(200);
+
+      await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
+      await composer.press("Enter");
+      const interaction = kind === "permission"
+        ? page.getByRole("alertdialog", { name: "Agent permission request" })
+        : page.getByRole("dialog", { name: "Agent input request" });
+      await expect(interaction).toBeVisible();
+      const sessionUrl = page.url();
+      const api = trackApi(page);
+      const listedBefore = listRequests;
+
       await page.reload({ waitUntil: "domcontentloaded" });
-      await listStarted;
+      await expect.poll(() => listRequests).toBeGreaterThan(listedBefore);
       await expect(interaction).toBeVisible();
       await expect(page).toHaveURL(sessionUrl);
       await expect(page.locator(".composer-reconnect")).toBeHidden();
@@ -439,7 +441,7 @@ for (const { kind, listState } of [
       await expect(composer).toBeEnabled();
       await expect(page.locator(".composer-reconnect")).toBeHidden();
       // The pending interaction belongs to the running prompt; reloading only
-      // subscribes again, and the answer goes to that same operation.
+      // subscribes again, and the answer goes to that interaction alone.
       expect(api.streams.length).toBeGreaterThan(0);
       expect(opsOf(api, "prompt")).toEqual([]);
       expect(api.actions.filter((action) => action.endsWith(" answer"))).toHaveLength(1);
@@ -447,7 +449,7 @@ for (const { kind, listState } of [
       expect(browserErrors).toEqual([]);
     } finally {
       releaseList();
-      await page.unrouteAll({ behavior: "wait" });
+      await page.unrouteAll({ behavior: "ignoreErrors" });
     }
   });
 }
@@ -861,8 +863,8 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   await fields.nth(1).press("Enter");
   const remaining = (await removed).postDataJSON().args.prompt;
   expect(remaining.map((block: { type: string }) => block.type)).toEqual(["text", "text", "attachment"]);
-  expect(remaining[0]).toEqual(text(blocks[0]));
-  expect(remaining[1]).toEqual({ type: "text", text: edited });
+  expect(remaining[0]).toEqual({ ...text(blocks[0]), _meta: { source: "first" } });
+  expect(remaining[1]).toMatchObject({ type: "text", text: edited });
   await expect(page.getByText("Received prompt blocks: text,text,resource.", { exact: true })).toBeVisible();
   expect(browserErrors).toEqual([]);
 });
@@ -1870,13 +1872,15 @@ test("shows file changes only in the running turn that reported them", async ({ 
   const thread = page.getByRole("region", { name: "Conversation thread" });
   const composer = page.locator('textarea[role="combobox"]');
   const reviews = thread.getByLabel("Agent-reported changes");
+  // A committed turn folds its changes with the rest of its process: they stay in the thread, hidden.
+  const shown = reviews.and(page.locator(":visible"));
   const turnOf = (text: string) => page.locator(".conversation-turn")
     .filter({ has: page.locator(".message-user", { hasText: text }) });
   await expect(composer).toBeEnabled();
   await composer.fill("review-flow first edit [hold:first]");
   await composer.press("Enter");
   await turnEnd.reached("first");
-  await expect(reviews).toHaveCount(1);
+  await expect(shown).toHaveCount(1);
   await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes")).toHaveCount(1);
   await reviews.first().locator(".change-review-trigger").click();
   await expect(reviews.first().locator(".change-review-panel")).toBeVisible();
@@ -1887,17 +1891,17 @@ test("shows file changes only in the running turn that reported them", async ({ 
   await composer.fill("stream-follow-flow without edits");
   await composer.press("Enter");
   await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
-  await expect(reviews).toHaveCount(0);
+  await expect(shown).toHaveCount(0);
 
   await composer.fill("review-flow second edit [hold:second]");
   await composer.press("Enter");
   await turnEnd.reached("second");
-  await expect(reviews).toHaveCount(1);
-  await expect(turnOf("review-flow second edit").getByLabel("Agent-reported changes")).toHaveCount(1);
-  await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes")).toHaveCount(0);
-  await expect(reviews.first().locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "false");
-  await expect(reviews.first().locator(".change-review-trigger")).toContainText("2 files");
-  await expect(reviews.first().locator(".change-review-trigger")).toContainText("+4");
+  await expect(shown).toHaveCount(1);
+  await expect(turnOf("review-flow second edit").getByLabel("Agent-reported changes").and(page.locator(":visible"))).toHaveCount(1);
+  await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes").and(page.locator(":visible"))).toHaveCount(0);
+  await expect(shown.first().locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "false");
+  await expect(shown.first().locator(".change-review-trigger")).toContainText("2 files");
+  await expect(shown.first().locator(".change-review-trigger")).toContainText("+4");
   await expect(page.locator(".composer-dock .change-review")).toHaveCount(0);
   await turnEnd.release("second");
   await expectProcessFolded(page, reviews);
@@ -1996,7 +2000,7 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
     has: page.locator(".debug-info-label > span", { hasText: "Latest source event" }),
   });
   expect(JSON.parse(await toolSourceEvents.locator("pre").innerText())).toHaveLength(1);
-  await expect(toolDebug.locator("pre")).toContainText('"sessionUpdate": "tool_call"');
+  await expect(toolDebug.locator("pre")).toContainText('"toolCallId": "activity-tool"');
   await expect(toolDebug.locator("pre")).toContainText('"status": "completed"');
   await expect(toolDebug.locator(".raw-json")).toHaveCount(0);
   await expect(
@@ -2561,12 +2565,11 @@ test("preserves terminal content beside additional output and searches only expa
   await expect(info).toContainText("Locations");
   await expect(info).toContainText('"terminalId"');
   await expect(search.locator("output")).toHaveText("1/1");
-  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
-  // Release, then the turn ends: the tool card is folded with the process, and the released
-  // terminal keeps its output in it (memory model §8.3).
+  // Release, then the turn ends: the released terminal keeps its output in the tool card (memory
+  // model §8.3). The user is reading the thread (search is open), so the process is not folded away under them.
   await turnEnd.release("terminal");
-  await expectProcessFolded(page, page.locator(".tool-card"));
-  await expect(page.getByText("TERMINAL_FLOW_OUTPUT").and(page.locator(":visible"))).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+  await expect(tool).toHaveCount(1);
   await expect(page.getByText("TERMINAL_FLOW_OUTPUT")).not.toHaveCount(0);
   expect(browserErrors).toEqual([]);
 });
@@ -2732,7 +2735,7 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
       position: getComputedStyle(footer.querySelector(".debug-info-panel")!).position,
     };
   })).toEqual({ debugBelowActions: true, debugWithinMessage: true, position: "static" });
-  await expect(infoPanel.locator("pre")).toContainText("agent_message_chunk");
+  await expect(infoPanel.locator("pre")).toContainText('"role": "agent"');
   await expect(infoPanel.locator(".raw-json")).toHaveCount(0);
   await answerInfo.click();
   expect(await inlineCopy.evaluate((button) => Boolean(button.closest(".assistant-chunk"))))
@@ -3732,9 +3735,8 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
       expect(response.method).toBe("POST");
       expect(response.request?.kind).toBe("list");
       expect(response.body?.error?.code).toBe("stale");
-      expect(catalog.slice(index + 1).some((later) => later.status === 200 && later.method === "POST" &&
-        later.request?.kind === "list" && later.request.expect !== response.request?.expect &&
-        later.body?.result != null)).toBe(true);
+      expect(catalog.slice(index + 1).some((later) => later.status === 202 && later.method === "POST" &&
+        later.request?.kind === "list" && later.request.expect !== response.request?.expect)).toBe(true);
     }
     expect(browserErrors).toEqual([]);
   } finally {
@@ -3787,12 +3789,15 @@ async function expectTurnOrder(page: Page): Promise<void> {
   const firstPrompt = entries.indexOf("user:context-window-flow");
   const firstAnswer = entries.indexOf("agent:Context usage updated.");
   const secondPrompt = entries.indexOf("user:usage-flow");
+  const firstStop = entries.indexOf("stop:end_turn");
   const secondStop = entries.indexOf("stop:max_tokens");
   expect(firstPrompt).toBeGreaterThanOrEqual(0);
   expect(firstAnswer).toBeGreaterThan(firstPrompt);
-  expect(secondPrompt).toBeGreaterThan(firstAnswer);
+  // Each prompt keeps how it ended: the first turn's stop reason closes it before the next prompt.
+  expect(firstStop).toBeGreaterThan(firstAnswer);
+  expect(secondPrompt).toBeGreaterThan(firstStop);
   expect(secondStop).toBeGreaterThan(secondPrompt);
-  expect(entries.filter((entry) => entry.startsWith("stop:"))).toEqual(["stop:max_tokens"]);
+  expect(entries.filter((entry) => entry.startsWith("stop:"))).toEqual(["stop:end_turn", "stop:max_tokens"]);
 }
 
 async function readMarker(path: string): Promise<string> {
