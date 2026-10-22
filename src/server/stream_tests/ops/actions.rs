@@ -298,9 +298,14 @@ async fn an_agent_error_leaves_the_session_held_and_not_closing() {
     let (status, body) = close.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["error"]["code"].is_string(), "{body}");
-    let (status, document) = server.read("session/s").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(document["live"]["closing"], false, "closing clears on an Agent error");
+    let (status, _) = server.read("session/s").await;
+    assert_eq!(status, StatusCode::OK, "still held");
+
+    // `closing` cleared: a close is admitted again and reaches the Agent.
+    let again = spawn_control(&server, "s", "close", json!({}));
+    let request = link.request("session/close").await;
+    link.reply(&request, json!({})).await;
+    assert_eq!(again.await.unwrap(), (StatusCode::OK, json!({})));
 }
 
 #[tokio::test]

@@ -31,9 +31,10 @@ pub(super) fn admit(
     control: &Control,
 ) -> Result<(Value, ControlAnswer), ProtocolError> {
     let scope = OpScope::Session(session_id.to_string());
+    // Any phase but gone: a closing session is held, and refuses with 409 below.
     let session = state
         .sessions
-        .active_session(session_id)
+        .session_ref(session_id)
         .ok_or_else(|| refusal(ErrorCode::NotFound, format!("{scope} is not held")))?;
     if matches!(
         session.live.lifecycle,
