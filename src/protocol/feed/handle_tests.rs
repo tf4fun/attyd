@@ -142,3 +142,26 @@ async fn a_waiting_subscription_is_sent_the_checkpoint_when_it_is_due() {
         "{event:?}"
     );
 }
+
+#[tokio::test]
+async fn ending_the_wait_for_a_session_ends_the_stream_that_waits() {
+    let handle = FeedHandle::new("process");
+    handle.commit(&SessionRegistry::new("epoch"), &agent(), 0);
+    let subscription = handle.subscribe(&follow(Scope::Session("s".into())));
+    assert_eq!(handle.followed_sessions()["s"].len(), 1);
+    let waiting = tokio::spawn({
+        let subscription = subscription.clone();
+        async move { subscription.next().await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+    handle.end_waiting(
+        "s",
+        &crate::protocol::documents::End {
+            reason: crate::protocol::documents::EndReason::LoadFailed,
+            error: None,
+        },
+    );
+    let event = timeout(WAIT, waiting).await.unwrap().unwrap();
+    assert!(matches!(event, Some(StreamEvent::End { .. })), "{event:?}");
+}

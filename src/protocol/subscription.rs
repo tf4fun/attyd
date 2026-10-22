@@ -111,6 +111,8 @@ struct ScopeState {
     written: Option<Have>,
     /// An `end` was queued: nothing follows it for this scope.
     ended: bool,
+    /// The working directory to load the session with, if it is not held.
+    cwd: Option<String>,
 }
 
 struct Queued {
@@ -139,6 +141,7 @@ impl Subscriber {
                         ScopeState {
                             written: subscribed.have.clone(),
                             ended: false,
+                            cwd: subscribed.cwd.clone(),
                         },
                     )
                 })
@@ -146,6 +149,15 @@ impl Subscriber {
             queue: VecDeque::new(),
             queued_bytes: 0,
         }
+    }
+
+    /// The scopes still followed (no `end` was queued for them) and the
+    /// directory each was given for its load.
+    pub(crate) fn followed(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.scopes
+            .iter()
+            .filter(|(_, state)| !state.ended)
+            .map(|(scope, state)| (scope.as_str(), state.cwd.as_deref()))
     }
 
     fn push(&mut self, event: StreamEvent) {
