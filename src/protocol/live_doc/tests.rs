@@ -498,3 +498,82 @@ fn a_create_that_installed_a_session_not_held_names_no_origin() {
     registry.complete_scope_operation(&scope, OperationKind::Create, json!({ "sessionId": "gone" }));
     assert!(summary_of(&registry, "s").get("origin").is_none());
 }
+
+// -- The pages of the catalog (protocol §4.3, §6.2) ----------------------------------------
+
+fn list(registry: &mut SessionRegistry, input: Value, revision: &str, sessions: Value, next: Value) {
+    registry
+        .install_operation(&Scope::Catalog, OperationKind::List, input)
+        .unwrap();
+    registry.complete_scope_operation(
+        &Scope::Catalog,
+        OperationKind::List,
+        json!({ "revision": revision, "sessions": sessions, "nextCursor": next }),
+    );
+}
+
+fn pages(registry: &SessionRegistry, revision: u64) -> Value {
+    catalog_live(registry, revision)["pages"].clone()
+}
+
+#[test]
+fn the_catalog_has_no_pages_before_it_is_listed() {
+    assert_eq!(pages(&registry(), 0), json!([]));
+}
+
+#[test]
+fn a_listing_without_a_cursor_starts_over_and_a_cursor_appends_the_next_page() {
+    let mut registry = registry();
+    list(&mut registry, json!({}), "1", json!([{ "sessionId": "a" }]), json!("c1"));
+    assert_eq!(
+        pages(&registry, 1),
+        json!([{ "sessions": [{ "sessionId": "a" }], "nextCursor": "c1" }])
+    );
+
+    list(&mut registry, json!({ "cursor": "c1" }), "1", json!([{ "sessionId": "b" }]), Value::Null);
+    assert_eq!(
+        pages(&registry, 1),
+        json!([
+            { "sessions": [{ "sessionId": "a" }], "nextCursor": "c1" },
+            { "sessions": [{ "sessionId": "b" }], "nextCursor": null },
+        ])
+    );
+
+    list(&mut registry, json!({}), "1", json!([{ "sessionId": "c" }]), Value::Null);
+    assert_eq!(
+        pages(&registry, 1),
+        json!([{ "sessions": [{ "sessionId": "c" }], "nextCursor": null }]),
+        "a new listing replaces the pages"
+    );
+}
+
+#[test]
+fn pages_listed_before_the_revision_changed_are_not_shown() {
+    let mut registry = registry();
+    list(&mut registry, json!({}), "1", json!([{ "sessionId": "a" }]), Value::Null);
+    assert_eq!(pages(&registry, 2), json!([]), "listed at revision 1, shown at 2");
+    // A cursor listed after the change does not continue the old pages.
+    list(&mut registry, json!({ "cursor": "c" }), "2", json!([{ "sessionId": "b" }]), Value::Null);
+    assert_eq!(
+        pages(&registry, 2),
+        json!([{ "sessions": [{ "sessionId": "b" }], "nextCursor": null }])
+    );
+}
+
+#[test]
+fn a_failed_listing_leaves_the_pages() {
+    let mut registry = registry();
+    list(&mut registry, json!({}), "1", json!([{ "sessionId": "a" }]), Value::Null);
+    registry
+        .install_operation(&Scope::Catalog, OperationKind::List, json!({}))
+        .unwrap();
+    registry.fail_scope_operation(
+        &Scope::Catalog,
+        OperationKind::List,
+        crate::protocol::documents::ProtocolError::new(
+            crate::protocol::documents::ErrorCode::Unavailable,
+            "gone",
+        ),
+    );
+    assert_eq!(pages(&registry, 1).as_array().map(Vec::len), Some(1));
+}
