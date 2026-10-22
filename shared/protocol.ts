@@ -33,15 +33,8 @@ export type SessionInfo = { title: string | null, updatedAt: string | null, meta
 
 export type SessionUsage = { used: number, size: number, cost: Cost | null, };
 
-/**
- * Where each control's metadata came from: the update's own `_meta`, and that of the
- * notification that carried it, separately (memory model §7).
- */
 export type ControlMeta = { modes?: ControlSource, configOptions?: ControlSource, commands?: ControlSource, info?: ControlSource, usage?: ControlSource, };
 
-/**
- * The `_meta` of one source of a control.
- */
 export type ControlSource = { 
 /**
  * The update's own `_meta` (for example `CurrentModeUpdate._meta`).
