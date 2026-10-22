@@ -106,3 +106,68 @@ async fn shutting_the_server_down_ends_the_streams_after_what_is_queued() {
     }
     assert!(sse.message(WAIT).await.is_none(), "the stream ended");
 }
+
+/// The next event of `scope`, skipping those of other scopes.
+async fn event_of(sse: &mut Sse, scope: &str) -> Value {
+    loop {
+        let event = event(sse, WAIT)
+            .await
+            .unwrap_or_else(|| panic!("no event of {scope}"));
+        if event["scope"] == scope {
+            return event;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_stream_loads_a_session_the_bridge_does_not_hold_with_the_cwd_it_gave() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let (status, mut sse) = open(
+        &server,
+        &format!(
+            "scope=global&scope=session%2Fsaved&cwd={}",
+            query_scope(&format!("session/saved:{CWD}"))
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let load = link.serve_load("saved", &turns(&[("hello", "hi there")])).await;
+    assert_eq!(load["params"]["cwd"], CWD);
+
+    let snapshot = event_of(&mut sse, "session/saved").await;
+    let entries = &snapshot["snapshot"]["doc"]["entries"];
+    assert_eq!(snapshot["snapshot"]["doc"]["history"], "complete", "{snapshot}");
+    assert_eq!(entries.as_array().map(Vec::len), Some(2), "{snapshot}");
+}
+
+#[tokio::test]
+async fn a_stream_that_gave_no_cwd_for_an_unheld_session_is_ended_for_it() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let (_, mut sse) = open(&server, "scope=global&scope=session%2Fsaved").await;
+    let end = event_of(&mut sse, "session/saved").await;
+    assert_eq!(end["end"]["reason"], "load_failed", "{end}");
+    assert_eq!(end["end"]["error"]["code"], "invalid_request", "{end}");
+    // The Agent is never asked to load a session the stream gave no directory for.
+    link.quiet(Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn a_load_the_agent_refuses_ends_the_scope_for_the_stream() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let (_, mut sse) = open(
+        &server,
+        &format!(
+            "scope=session%2Fsaved&cwd={}",
+            query_scope(&format!("session/saved:{CWD}"))
+        ),
+    )
+    .await;
+    let load = link.request("session/load").await;
+    link.send(json!({
+        "jsonrpc": "2.0", "id": load["id"],
+        "error": {"code": -32002, "message": "no such session"},
+    }))
+    .await;
+    let end = event_of(&mut sse, "session/saved").await;
+    assert_eq!(end["end"]["reason"], "load_failed", "{end}");
+}
