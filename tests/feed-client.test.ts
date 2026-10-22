@@ -111,6 +111,17 @@ describe("following scopes", () => {
     expect(changed).toEqual([S, S]);
   });
 
+  it("remembers why a scope ended, until it is followed again", () => {
+    const { client, last } = harness();
+    client.follow([{ scope: S }]);
+    last().emit(event(0));
+    expect(client.endOf(S)).toBeUndefined();
+    last().emit({ scope: S, end: { reason: "load_failed", error: { code: "not_found", message: "no session" } } });
+    expect(client.endOf(S)).toEqual({ reason: "load_failed", error: { code: "not_found", message: "no session" } });
+    client.follow([{ scope: S }]);
+    expect(client.endOf(S)).toBeUndefined();
+  });
+
   it("opens nothing after it is closed", () => {
     const { client, sources, scheduled } = harness();
     client.follow([{ scope: S }]);
