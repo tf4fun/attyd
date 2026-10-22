@@ -2284,3 +2284,65 @@ async fn the_same_history_gives_the_same_log_after_a_restart() {
 
 mod review_lifecycle;
 mod stream;
+
+// -- The revision 3 feed (docs/protocol.md §5) ----------------------------------------
+
+/// The versions the feed publishes, by scope.
+fn feed_versions(peer: &Peer) -> std::collections::BTreeMap<String, u64> {
+    let feed = peer.publication.lock().feed.clone();
+    ["global", "catalog", "session/created", "session/other"]
+        .into_iter()
+        .filter_map(|scope| feed.version(scope).map(|(_, rev)| (scope.to_string(), rev)))
+        .collect()
+}
+
+#[tokio::test]
+async fn every_commit_of_the_bridge_is_published_by_the_feed_too() {
+    let mut peer = Peer::start(json!({})).await;
+    let versions = feed_versions(&peer);
+    assert!(versions.contains_key("global") && versions.contains_key("catalog"), "{versions:?}");
+
+    peer.create("created", json!({})).await;
+    let versions = feed_versions(&peer);
+    assert_eq!(versions.get("session/created"), Some(&0), "the session is published: {versions:?}");
+
+    // A later change of the session is the next rev of the same document.
+    peer.update("created", chunk("m", text("hello"))).await;
+    peer.timeline_len("created", 1).await;
+    for _ in 0..200 {
+        if feed_versions(&peer).get("session/created").is_some_and(|rev| *rev >= 1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        feed_versions(&peer).get("session/created").is_some_and(|rev| *rev >= 1),
+        "an update that changed the timeline is a later rev"
+    );
+    peer.settled().await;
+}
+
+#[tokio::test]
+async fn a_subscription_to_the_feed_is_aligned_and_then_follows_the_bridge() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create("created", json!({})).await;
+    let feed = peer.publication.lock().feed.clone();
+    let subscription = feed.subscribe(&[crate::protocol::subscription::Subscribed {
+        scope: Scope::Session("created".into()),
+        have: None,
+        cwd: None,
+    }]);
+    let aligned = tokio::time::timeout(WAIT, subscription.next()).await.unwrap().unwrap();
+    let crate::protocol::engine::StreamEvent::Snapshot { snapshot, .. } = aligned else {
+        panic!("the first event is a snapshot");
+    };
+    assert_eq!(snapshot.doc["live"]["sessionId"], "created");
+
+    peer.update("created", chunk("m", text("hello"))).await;
+    let next = tokio::time::timeout(WAIT, subscription.next()).await.unwrap().unwrap();
+    assert!(
+        matches!(next, crate::protocol::engine::StreamEvent::Ops { .. }),
+        "the bridge's change reaches the subscriber: {next:?}"
+    );
+    peer.settled().await;
+}

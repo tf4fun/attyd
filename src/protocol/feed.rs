@@ -187,6 +187,11 @@ impl FeedHandle {
         self.feed().subscribers()
     }
 
+    /// The epoch and rev `scope` is published at, if it is.
+    pub(crate) fn version(&self, scope: &str) -> Option<(String, u64)> {
+        self.feed().version(scope)
+    }
+
     /// Ends every subscription: the streams drain what is queued and finish.
     pub(crate) fn close(&self) {
         self.0.closed.store(true, Ordering::SeqCst);
