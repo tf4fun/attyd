@@ -227,7 +227,7 @@ async fn a_control_runs_while_a_prompt_runs() {
     create_with_controls(&server, &mut link, "s").await;
     let (_, document) = server.read("session/s").await;
     let body = json!({
-        "id": "Pr0mptWhileControl-01", "expect": document["live"]["op"]["id"],
+        "id": "Pr0mptWhileControl-001", "expect": document["live"]["op"]["id"],
         "kind": "prompt", "args": {"prompt": [text("work")]},
     });
     let response = send(server.address, Method::POST, "/api/v3/scopes/session%2Fs/ops", Some(body)).await;
