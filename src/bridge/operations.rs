@@ -92,7 +92,7 @@ fn report(sink: &EventSink, operation: &str, error: Error) {
 }
 
 /// Where a pending interaction waits, and what it is answered with.
-enum Delivery {
+pub(super) enum Delivery {
     Permission(SessionResourceOwner, RequestPermissionResponse),
     Elicitation {
         owner: Option<SessionResourceOwner>,
