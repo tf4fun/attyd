@@ -21,13 +21,36 @@ export type SessionControls = { modes: SessionModes | null,
  * `null`: never provided; `[]`: provided empty. Preferred over `modes`
  * whenever non-null.
  */
-configOptions: SessionConfigOption[] | null, commands: AvailableCommand[], info: SessionInfo, usage: SessionUsage | null, };
+configOptions: SessionConfigOption[] | null, commands: AvailableCommand[], info: SessionInfo, usage: SessionUsage | null, 
+/**
+ * The source metadata of the latest source that set each control (D12).
+ */
+meta: ControlMeta, };
 
 export type SessionModes = { currentModeId: string, availableModes: SessionMode[], };
 
 export type SessionInfo = { title: string | null, updatedAt: string | null, meta: unknown | null, };
 
 export type SessionUsage = { used: number, size: number, cost: Cost | null, };
+
+/**
+ * Where each control's metadata came from: the update's own `_meta`, and that of the
+ * notification that carried it, separately (memory model §7).
+ */
+export type ControlMeta = { modes?: ControlSource, configOptions?: ControlSource, commands?: ControlSource, info?: ControlSource, usage?: ControlSource, };
+
+/**
+ * The `_meta` of one source of a control.
+ */
+export type ControlSource = { 
+/**
+ * The update's own `_meta` (for example `CurrentModeUpdate._meta`).
+ */
+update?: unknown, 
+/**
+ * `SessionNotification._meta` of the notification that carried it.
+ */
+notification?: unknown, };
 
 export type Op = { "op": "set", path: string, value: unknown, } | { "op": "remove", path: string, } | { "op": "append", path: string, } & ({ values: unknown[], } | { text: string, }) | { "op": "trim", path: string, count: number, };
 
