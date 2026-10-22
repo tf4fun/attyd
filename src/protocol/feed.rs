@@ -215,9 +215,12 @@ impl FeedSubscription {
     /// the feed is closed and the queue is drained.
     pub(crate) async fn next(&self) -> Option<StreamEvent> {
         loop {
-            // Registered before the queue is read, so a commit between the two
-            // wakes this wait instead of being missed.
+            // Enabled before the queue is read, so a commit between the two wakes
+            // this wait instead of being missed: `notify_waiters` reaches only
+            // a wait that is registered.
             let ready = self.0.handle.0.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
             if let Some(event) = self.0.handle.feed().next(self.0.id) {
                 return Some(event);
             }
