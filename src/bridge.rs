@@ -1905,7 +1905,7 @@ where
                     }) => {
                         let acted = {
                             let mut state = state.lock().await;
-                            resources::act(&mut state, &scope, &resource, action)
+                            resources::act(&mut state, &sink, &scope, &resource, action)
                         };
                         match acted {
                             Ok(Some(io)) => resources::perform(&auth_terminal, io, reply),

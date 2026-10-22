@@ -15,6 +15,9 @@ pub(crate) enum ResourceAction {
     Input { data: String },
     Resize { cols: u16, rows: u16 },
     Dismiss,
+    /// An answer to the interaction the resource names: `{ outcome }` or
+    /// `{ response }`.
+    Answer { body: Value },
 }
 
 /// The terminal I/O of a checked action, run after the guard is released.
@@ -39,10 +42,15 @@ fn not_allowed(message: impl Into<String>) -> ProtocolError {
 /// once the guard is released.
 pub(super) fn act(
     state: &mut BridgeState,
+    sink: &EventSink,
     scope: &OpScope,
     resource: &str,
     action: ResourceAction,
 ) -> Result<Option<TerminalIo>, ProtocolError> {
+    if let ResourceAction::Answer { body } = &action {
+        answer(state, sink, scope, resource, body)?;
+        return Ok(None);
+    }
     if action == ResourceAction::Dismiss && dismiss_url_flow(state, scope, resource) {
         return Ok(None);
     }
@@ -71,6 +79,34 @@ pub(super) fn act(
             action,
         })),
     }
+}
+
+/// Answers the pending interaction `interaction_id` of `scope` alone (protocol
+/// §7): at most once, because it is checked, delivered and removed under one
+/// guard. One that is not pending, in this scope or at all, is not found.
+fn answer(
+    state: &mut BridgeState,
+    sink: &EventSink,
+    scope: &OpScope,
+    interaction_id: &str,
+    body: &Value,
+) -> Result<(), ProtocolError> {
+    let interaction = {
+        let published = state.protocol.publication.lock();
+        published
+            .publisher
+            .live(scope)
+            .and_then(|live| live["op"]["interactions"].get(interaction_id).cloned())
+    }
+    .filter(|_| {
+        state.sessions.permission(interaction_id).is_some()
+            || pending_elicitation(state, interaction_id).is_some()
+    })
+    .ok_or_else(|| not_found(scope, interaction_id))?;
+    let answer = crate::protocol::admission::answer_one(&interaction, body)?;
+    let deliveries = operations::deliveries(state, vec![(interaction_id.to_string(), answer)])?;
+    operations::deliver(state, sink, deliveries);
+    Ok(())
 }
 
 /// Runs a checked action's terminal I/O, without the bridge guard, and
@@ -108,7 +144,9 @@ pub(super) fn perform(
                     .map_err(refused),
             );
         }
-        ResourceAction::Dismiss => unreachable!("a dismissal is applied under the guard"),
+        ResourceAction::Dismiss | ResourceAction::Answer { .. } => {
+            unreachable!("a dismissal and an answer are applied under the guard")
+        }
     }
 }
 

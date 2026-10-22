@@ -272,6 +272,16 @@ fn answers(pending: &Value, args: &Value) -> Result<Vec<(String, Answer)>, Proto
         .collect()
 }
 
+/// The answer to one pending `interaction` from `body`: `{ outcome }` for a
+/// permission, `{ response }` for an elicitation (protocol §7).
+pub(crate) fn answer_one(interaction: &Value, body: &Value) -> Result<Answer, ProtocolError> {
+    let request = &interaction["request"];
+    Ok(match interaction["kind"].as_str() {
+        Some("permission") => Answer::Permission(permission_answer(request, body)?),
+        _ => Answer::Elicitation(elicitation_answer(request, body)?),
+    })
+}
+
 /// `{ outcome }`, selecting an option the request offers, if any.
 fn permission_answer(
     request: &Value,
