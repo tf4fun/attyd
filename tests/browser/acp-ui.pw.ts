@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer, type RustTestServer } from "../../scripts/rust-test-server";
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
-import { opsOf, scopesOf, trackApi } from "./api-requests";
+import { controlsOf, opsOf, scopesOf, trackApi } from "./api-requests";
 import { collectBrowserErrors } from "./browser-errors";
 
 /** The PID of the current Agent process, as the fake Agent writes it at start. */
@@ -19,7 +19,7 @@ type AgentPid = () => Promise<string>;
 interface TurnEnd {
   /** Waits until a `[hold:<name>]` turn is ready to end. */
   reached(name: string): Promise<void>;
-  /** Lets it end; the commit then removes its process (protocol S2). */
+  /** Lets it end; the commit then folds its process behind the disclosure. */
   release(name: string): Promise<void>;
 }
 
@@ -366,33 +366,24 @@ for (const { kind, listState } of [
   { kind: "elicitation", listState: "failed" },
 ] as const) {
   test(`restores a pending ${kind} after reload while session listing is ${listState}`, async ({ page }) => {
+    const browserErrors = collectBrowserErrors(page, listState === "failed"
+      ? [{ status: 503, pathname: "/api/v3/scopes/catalog/ops" }]
+      : []);
     await page.goto("/sessions/saved-session");
     const composer = page.locator('textarea[role="combobox"]');
     await expect(composer).toBeEnabled();
-    await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
-    await composer.press("Enter");
-    const interaction = kind === "permission"
-      ? page.getByRole("alertdialog", { name: "Agent permission request" })
-      : page.getByRole("dialog", { name: "Agent input request" });
-    await expect(interaction).toBeVisible();
-    const sessionUrl = page.url();
-    const browserErrors = collectBrowserErrors(page, listState === "failed"
-      ? [{ status: 503, pathname: "/api/v2/scopes/catalog/ops" }]
-      : []);
-    const api = trackApi(page);
 
     let releaseList!: () => void;
     const listGate = new Promise<void>((resolve) => { releaseList = resolve; });
-    let notifyListStarted!: () => void;
-    const listStarted = new Promise<void>((resolve) => { notifyListStarted = resolve; });
+    let listRequests = 0;
     const listError = "Session listing failed during reload";
     // The catalog is listed by a `list` operation on `catalog` (protocol §6.2).
-    await page.route("**/api/v2/scopes/catalog/ops", async (route) => {
+    await page.route("**/api/v3/scopes/catalog/ops", async (route) => {
       if (route.request().postDataJSON()?.kind !== "list") {
         await route.continue();
         return;
       }
-      notifyListStarted();
+      listRequests += 1;
       await listGate;
       if (listState === "failed") {
         await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({
@@ -404,8 +395,26 @@ for (const { kind, listState } of [
     });
 
     try {
+      // The pages the catalog's document holds stay while its revision stays; a list is needed again
+      // only after it changed, which another client creating a session does. Listing stalls from here on.
+      const global = await (await page.request.get("/api/v2/scopes/global")).json();
+      const other = await page.request.post("/api/v2/scopes/global/ops", {
+        data: { expect: global.live.op.id, kind: "create", args: { cwd: process.cwd() } },
+      });
+      expect(other.status()).toBe(200);
+
+      await composer.fill(kind === "permission" ? "browser permission flow" : "form-flow");
+      await composer.press("Enter");
+      const interaction = kind === "permission"
+        ? page.getByRole("alertdialog", { name: "Agent permission request" })
+        : page.getByRole("dialog", { name: "Agent input request" });
+      await expect(interaction).toBeVisible();
+      const sessionUrl = page.url();
+      const api = trackApi(page);
+      const listedBefore = listRequests;
+
       await page.reload({ waitUntil: "domcontentloaded" });
-      await listStarted;
+      await expect.poll(() => listRequests).toBeGreaterThan(listedBefore);
       await expect(interaction).toBeVisible();
       await expect(page).toHaveURL(sessionUrl);
       await expect(page.locator(".composer-reconnect")).toBeHidden();
@@ -432,21 +441,21 @@ for (const { kind, listState } of [
       await expect(composer).toBeEnabled();
       await expect(page.locator(".composer-reconnect")).toBeHidden();
       // The pending interaction belongs to the running prompt; reloading only
-      // subscribes again, and the answer goes to that same operation.
+      // subscribes again, and the answer goes to that interaction alone.
       expect(api.streams.length).toBeGreaterThan(0);
       expect(opsOf(api, "prompt")).toEqual([]);
-      expect(opsOf(api, "answer")).toHaveLength(1);
+      expect(api.actions.filter((action) => action.endsWith(" answer"))).toHaveLength(1);
       expect(api.v1).toEqual([]);
       expect(browserErrors).toEqual([]);
     } finally {
       releaseList();
-      await page.unrouteAll({ behavior: "wait" });
+      await page.unrouteAll({ behavior: "ignoreErrors" });
     }
   });
 }
 
 for (const action of ["complete", "cancel"] as const) {
-  test(`removes the unfinished plan when a turn ${action}s and keeps it out of the thread after reload`, async ({ page }, testInfo) => {
+  test(`moves the unfinished plan from the dock into the folded process when a turn ${action}s, also after reload`, async ({ page }, testInfo) => {
     const browserErrors = collectBrowserErrors(page);
     await page.goto("/sessions/saved-session");
     const composer = page.locator('textarea[role="combobox"]');
@@ -465,14 +474,15 @@ for (const action of ["complete", "cancel"] as const) {
     await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
     await expect(dockPlan).toHaveCount(0);
-    // The plan was the turn's process: the commit removes it (protocol S2).
+    // The plan is part of the turn's process: the commit folds it with the rest, and it stays in the thread.
     const turn = page.locator(".conversation-turn").last();
-    await expect(turn.locator(".plan-card")).toHaveCount(0);
+    await expect(turn.locator(".plan-card").and(page.locator(":visible"))).toHaveCount(0);
+    await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(1);
     await page.reload();
     await expect(page.getByText("ACP works.", { exact: true })).toBeVisible();
     await expect(dockPlan).toHaveCount(0);
-    await expect(turn.locator(".plan-card")).toHaveCount(0);
-    await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
+    await expect(turn.locator(".plan-card").and(page.locator(":visible"))).toHaveCount(0);
+    await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(1);
     await page.screenshot({ path: testInfo.outputPath(`plan-${action}-committed.png`) });
     await composer.fill("usage-flow");
     await composer.press("Enter");
@@ -764,7 +774,7 @@ test("pastes and drops negotiated ACP context into the Zed-style composer", asyn
   await expect(page.locator(".composer-document")).toContainText("context.md");
   await expect(page.locator(".composer-bar")).toContainText(/previous prompts/);
   const resend = page.waitForRequest((request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
+    new URL(request.url()).pathname === "/api/v3/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
   await editor.press("Enter");
   // The resend names the session's attachments by reference (protocol §6.2).
   const resent = (await resend).postDataJSON().args;
@@ -829,16 +839,16 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   }
   await testInfo.attach("ordered-prompt-mobile", { body: await page.locator(".composer").screenshot(), contentType: "image/png" });
   const isPrompt = (request: import("@playwright/test").Request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === `/api/v2/scopes/${scope}/ops` && request.postDataJSON()?.kind === "prompt";
+    new URL(request.url()).pathname === `/api/v3/scopes/${scope}/ops` && request.postDataJSON()?.kind === "prompt";
   const submitted = page.waitForRequest(isPrompt);
   await fields.nth(1).press("Enter");
-  // The log holds the normalized prompt (protocol §3.2): `_meta` dropped, media
-  // as `AttachmentRef`s of the session, which the resend names as they are.
+  // The entry keeps the prompt's blocks as it was sent, `_meta` included, with media as
+  // `AttachmentRef`s of the session, which the resend names as they are.
   const body = (await submitted).postDataJSON().args;
   const text = ({ type, text }: { type: string; text?: string }) => ({ type, text });
   expect(body.prompt.map((block: { type: string }) => block.type)).toEqual(["text", "attachment", "text", "attachment"]);
-  expect(body.prompt[0]).toEqual(text(blocks[0]));
-  expect(body.prompt[2]).toEqual({ type: "text", text: edited });
+  expect(body.prompt[0]).toEqual({ ...text(blocks[0]), _meta: { source: "first" } });
+  expect(body.prompt[2]).toMatchObject({ type: "text", text: edited });
   expect(body.prompt[1]).toMatchObject({ type: "attachment", block: "image", mimeType: "image/png", id: expect.stringMatching(/^[0-9a-f]{64}$/u) });
   expect(body.prompt[3]).toMatchObject({ type: "attachment", block: "resource", uri: "attyd://attachment/note.txt" });
   await expect(page.getByText("Received prompt blocks: text,image,text,resource.", { exact: true })).toHaveCount(2);
@@ -853,8 +863,8 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   await fields.nth(1).press("Enter");
   const remaining = (await removed).postDataJSON().args.prompt;
   expect(remaining.map((block: { type: string }) => block.type)).toEqual(["text", "text", "attachment"]);
-  expect(remaining[0]).toEqual(text(blocks[0]));
-  expect(remaining[1]).toEqual({ type: "text", text: edited });
+  expect(remaining[0]).toEqual({ ...text(blocks[0]), _meta: { source: "first" } });
+  expect(remaining[1]).toMatchObject({ type: "text", text: edited });
   await expect(page.getByText("Received prompt blocks: text,text,resource.", { exact: true })).toBeVisible();
   expect(browserErrors).toEqual([]);
 });
@@ -906,7 +916,7 @@ test("opens attachment chips with native browser viewing and automatic downloads
   ]);
   await expect(page.locator(".attachment-list > span")).toHaveCount(6);
   const request = page.waitForRequest((request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
+    new URL(request.url()).pathname === "/api/v3/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
   await editor.fill("attachment-input-flow");
   await editor.press("Enter");
   const sent = (await request).postDataJSON().args;
@@ -1220,15 +1230,15 @@ test("renders structured ACP errors and retries the exact failed prompt", async 
   await failure.getByRole("button", { name: "Retry" }).click();
   await expect(page.getByText("Recovered after structured ACP error.", { exact: true }))
     .toBeVisible();
-  // A failed prompt adds no log entry (protocol §3.1); its prompt and error
-  // lived on the operation the retry replaced, so one turn remains.
+  // A failed prompt stays in the history with its error (memory model §4.2), and the retry is
+  // a turn of its own: two turns, the first with the error, also after a reload.
   await expect(page.locator(".message-user").filter({ hasText: "structured-error-flow" }))
-    .toHaveCount(1);
+    .toHaveCount(2);
   await page.reload();
   await expect(page.getByText("Recovered after structured ACP error.", { exact: true })).toBeVisible();
   await expect(page.locator(".message-user").filter({ hasText: "structured-error-flow" }))
-    .toHaveCount(1);
-  await expect(page.getByRole("alert").filter({ hasText: "Agent turn failed" })).toHaveCount(0);
+    .toHaveCount(2);
+  await expect(page.getByRole("alert").filter({ hasText: "Agent turn failed" })).toHaveCount(1);
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   expect(browserErrors).toEqual([]);
 });
@@ -1461,7 +1471,7 @@ test("deletes an unopened session from its project without creating or opening a
     await expect(dialog).toContainText("Saved ACP session");
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/global/ops" &&
       response.request().postDataJSON()?.kind === "delete"
     );
     await dialog.getByRole("button", { name: "Delete session", exact: true }).click();
@@ -1580,12 +1590,13 @@ test("retires the open session after another client deletes it without subscribi
   });
   const listed = page.waitForResponse((candidate) =>
     candidate.request().method() === "POST" &&
-    new URL(candidate.url()).pathname === "/api/v2/scopes/catalog/ops" &&
-    candidate.request().postDataJSON()?.kind === "list" && candidate.status() === 200
+    new URL(candidate.url()).pathname === "/api/v3/scopes/catalog/ops" &&
+    candidate.request().postDataJSON()?.kind === "list" && candidate.status() === 202
   );
   await page.getByRole("button", { name: "Refresh projects and sessions", exact: true }).click();
-  const page1 = await (await listed).json();
-  expect(page1.result.sessions.some((session: { sessionId: string }) => session.sessionId === "saved-session")).toBe(false);
+  await listed;
+  // The listing is in the catalog's document: the deleted session is not on its pages.
+  await expect(page.locator(".project-session-link").filter({ hasText: "Saved ACP session" })).toHaveCount(0);
   await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
   await expect(composer).toHaveCount(0);
   expect(api.streams.filter((url) => scopesOf(url).includes("session/saved-session"))).toHaveLength(following);
@@ -1610,7 +1621,7 @@ test("keeps the user's later navigation when an earlier fork response arrives la
   const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
   let notifyForked!: (status: number) => void;
   const forkedOnAgent = new Promise<number>((resolve) => { notifyForked = resolve; });
-  await page.route("**/api/v2/scopes/session%2Fsaved-session/ops", async (route) => {
+  await page.route("**/api/v3/scopes/session%2Fsaved-session/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "fork") {
       await route.continue();
       return;
@@ -1623,7 +1634,7 @@ test("keeps the user's later navigation when an earlier fork response arrives la
   try {
     await page.getByRole("button", { name: "Thread actions", exact: true }).click();
     await page.getByRole("button", { name: "Fork thread", exact: true }).click();
-    expect(await forkedOnAgent).toBe(200);
+    expect(await forkedOnAgent).toBe(202);
     await expect.poll(() => new URL(page.url()).pathname).toBe(sessionPath("saved-session", cwd));
 
     // In-page navigation: the earlier request's callback is still pending.
@@ -1634,7 +1645,7 @@ test("keeps the user's later navigation when an earlier fork response arrives la
     await composer.fill("Keep the later session's draft");
     const lateResponse = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops"
+      new URL(response.url()).pathname === "/api/v3/scopes/session%2Fsaved-session/ops"
     );
     releaseResponse();
     await (await lateResponse).finished();
@@ -1671,7 +1682,7 @@ test("keeps the session and composer when deletion fails during close", async ({
     await page.getByRole("button", { name: "Delete thread", exact: true }).click();
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/global/ops" &&
       response.request().postDataJSON()?.kind === "delete"
     );
     await page.getByRole("alertdialog", { name: "Delete session?" })
@@ -1846,14 +1857,14 @@ test("reviews Agent-reported ACP diffs without inventing editor actions", async 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(review.locator(".change-review-panel")).toBeVisible();
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("review");
-  await expectProcessRemoved(page, page.locator(".change-review, .tool-card"));
+  await expectProcessFolded(page, page.locator(".change-review, .tool-card"));
   expect(browserErrors).toEqual([]);
 });
 
 // Reported changes come from tool calls, which are process: a turn shows them
-// while it runs, and its commit removes them (protocol S2). They never move to
+// while it runs, and its commit folds them with the rest of the process. They never move to
 // another turn or to the composer dock.
 test("shows file changes only in the running turn that reported them", async ({ page, turnEnd }) => {
   const browserErrors = collectBrowserErrors(page);
@@ -1861,38 +1872,41 @@ test("shows file changes only in the running turn that reported them", async ({ 
   const thread = page.getByRole("region", { name: "Conversation thread" });
   const composer = page.locator('textarea[role="combobox"]');
   const reviews = thread.getByLabel("Agent-reported changes");
+  // A committed turn folds its changes with the rest of its process: they stay in the thread, hidden.
+  const shown = reviews.and(page.locator(":visible"));
   const turnOf = (text: string) => page.locator(".conversation-turn")
     .filter({ has: page.locator(".message-user", { hasText: text }) });
   await expect(composer).toBeEnabled();
   await composer.fill("review-flow first edit [hold:first]");
   await composer.press("Enter");
   await turnEnd.reached("first");
-  await expect(reviews).toHaveCount(1);
+  await expect(shown).toHaveCount(1);
   await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes")).toHaveCount(1);
   await reviews.first().locator(".change-review-trigger").click();
   await expect(reviews.first().locator(".change-review-panel")).toBeVisible();
   await turnEnd.release("first");
-  await expectProcessRemoved(page, reviews);
+  await expectProcessFolded(page, reviews);
   await expect(turnOf("review-flow first edit")).toContainText("Reported two workspace changes.");
 
   await composer.fill("stream-follow-flow without edits");
   await composer.press("Enter");
   await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
-  await expect(reviews).toHaveCount(0);
+  await expect(shown).toHaveCount(0);
 
   await composer.fill("review-flow second edit [hold:second]");
   await composer.press("Enter");
   await turnEnd.reached("second");
-  await expect(reviews).toHaveCount(1);
-  await expect(turnOf("review-flow second edit").getByLabel("Agent-reported changes")).toHaveCount(1);
-  await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes")).toHaveCount(0);
-  await expect(reviews.first().locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "false");
-  await expect(reviews.first().locator(".change-review-trigger")).toContainText("2 files");
-  await expect(reviews.first().locator(".change-review-trigger")).toContainText("+4");
+  await expect(shown).toHaveCount(1);
+  await expect(turnOf("review-flow second edit").getByLabel("Agent-reported changes").and(page.locator(":visible"))).toHaveCount(1);
+  await expect(turnOf("review-flow first edit").getByLabel("Agent-reported changes").and(page.locator(":visible"))).toHaveCount(0);
+  await expect(shown.first().locator(".change-review-trigger")).toHaveAttribute("aria-expanded", "false");
+  await expect(shown.first().locator(".change-review-trigger")).toContainText("2 files");
+  await expect(shown.first().locator(".change-review-trigger")).toContainText("+4");
   await expect(page.locator(".composer-dock .change-review")).toHaveCount(0);
   await turnEnd.release("second");
-  await expectProcessRemoved(page, reviews);
-  await expect(page.getByText("Reported two workspace changes.", { exact: false })).toHaveCount(2);
+  await expectProcessFolded(page, reviews);
+  // Both turns' replies are in the thread (the debug panels hold the entries as JSON, hidden).
+  await expect(page.getByText("Reported two workspace changes.", { exact: false }).and(page.locator(":visible"))).toHaveCount(2);
   expect(browserErrors).toEqual([]);
 });
 
@@ -1987,7 +2001,7 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
     has: page.locator(".debug-info-label > span", { hasText: "Latest source event" }),
   });
   expect(JSON.parse(await toolSourceEvents.locator("pre").innerText())).toHaveLength(1);
-  await expect(toolDebug.locator("pre")).toContainText('"sessionUpdate": "tool_call"');
+  await expect(toolDebug.locator("pre")).toContainText('"toolCallId": "activity-tool"');
   await expect(toolDebug.locator("pre")).toContainText('"status": "completed"');
   await expect(toolDebug.locator(".raw-json")).toHaveCount(0);
   await expect(
@@ -2014,7 +2028,7 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
   await expect(thinking).toHaveAttribute("data-open", "true");
   await expect(thinkingDebug).toBeVisible();
   await expect(thinkingDebug).toContainText("activity-thought");
-  await expect(thinkingDebug.locator("pre")).toContainText("agent_thought_chunk");
+  await expect(thinkingDebug.locator("pre")).toContainText('"role": "thought"');
   await expect(thinkingDebug.locator(".raw-json")).toHaveCount(0);
   const userMessage = page.locator(".message-user").filter({ hasText: "activity-flow" });
   for (const width of [390, 320]) {
@@ -2049,9 +2063,10 @@ test("follows ACP thought and tool activity with responsive Zed-style disclosure
     expect(expandedLayout.titleHeightOverflow).toBe(false);
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   }
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("activity");
-  await expectProcessRemoved(page, page.locator(".thinking-block, .tool-card"));
+  // The user opened the tool card and resized the page, so the process stays open.
+  await expectProcessKept(page, page.locator(".thinking-block, .tool-card"));
   expect(browserErrors).toEqual([]);
 });
 
@@ -2085,9 +2100,9 @@ test("uses one visual language for structured tool input and Markdown tool outpu
   expect(outputAppearance).toEqual(inputAppearance);
   expect(inputAppearance.background).not.toBe("rgba(0, 0, 0, 0)");
   expect(inputAppearance.radius).toBe("6px");
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("tool-content");
-  await expectProcessRemoved(page, page.locator(".tool-card"));
+  await expectProcessFolded(page, page.locator(".tool-card"));
   expect(browserErrors).toEqual([]);
 });
 
@@ -2155,9 +2170,9 @@ test("keeps wide tool tables scrollable and long resource names compact with ful
     expect(resourceLayout.textOverflow).toBe("ellipsis");
     expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
   }
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("tool-layout");
-  await expectProcessRemoved(page, page.locator(".tool-card"));
+  await expectProcessFolded(page, page.locator(".tool-card"));
   expect(browserErrors).toEqual([]);
 });
 
@@ -2349,13 +2364,14 @@ test("keeps the reading position after scrolling up during streamed output", asy
   await expect(page.getByText("Stream follow complete.", { exact: true })).toBeVisible();
   await composer.fill("stream-follow-flow next turn");
   await composer.press("Enter");
-  await expect(thread.getByText("Streamed paragraph 4:", { exact: false })).toHaveCount(2);
+  // One paragraph per turn: the first turn's is in its folded process, still in the thread.
+  await expect(thread.locator("p", { hasText: "Streamed paragraph 4:" })).toHaveCount(2);
   const readingPosition = await thread.evaluate((element) => {
     element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -500 }));
     element.scrollTop -= 500;
     return element.scrollTop;
   });
-  const anchor = thread.getByText("Streamed paragraph 18:", { exact: false }).first();
+  const anchor = thread.locator("p", { hasText: "Streamed paragraph 18:" }).and(page.locator(":visible")).first();
   const anchorTop = await anchor.evaluate((element) => element.getBoundingClientRect().top);
   await expect(page.getByText("Stream follow complete.", { exact: true })).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
@@ -2498,9 +2514,9 @@ test("searches the visible ACP Agent thread with Zed-style match navigation", as
   await page.getByRole("button", { name: "Search Agent thread" }).click();
   await expect(page.getByRole("search", { name: "Search this Agent thread" })).toBeVisible();
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("search");
-  await expectProcessRemoved(page, page.locator(".thinking-block, .tool-card"));
+  await expectProcessFolded(page, page.locator(".thinking-block, .tool-card"));
   expect(browserErrors).toEqual([]);
 });
 
@@ -2552,12 +2568,12 @@ test("preserves terminal content beside additional output and searches only expa
   await expect(info).toContainText("Locations");
   await expect(info).toContainText('"terminalId"');
   await expect(search.locator("output")).toHaveText("1/1");
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
-  // Release, then the turn ends: the tool card was process and the released
-  // terminal keeps no output record.
+  // Release, then the turn ends: the released terminal keeps its output in the tool card (memory
+  // model §8.3). The user is reading the thread (search is open), so the process is not folded away under them.
   await turnEnd.release("terminal");
-  await expectProcessRemoved(page, page.locator(".tool-card"));
-  await expect(page.getByText("TERMINAL_FLOW_OUTPUT")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+  await expect(tool).toHaveCount(1);
+  await expect(page.getByText("TERMINAL_FLOW_OUTPUT")).not.toHaveCount(0);
   expect(browserErrors).toEqual([]);
 });
 
@@ -2592,22 +2608,24 @@ test("keeps live terminal output across reconnect and drops it for every observe
     await observer.goto(page.url());
     await openRunningCard(observer);
     await writeFile(gatePath, "finish");
-    // The fixture releases its terminal and ends the turn back to back; the
-    // tool card was process and the released terminal keeps no output record
-    // (protocol S2, §4.6). protocol-ui.pw.ts holds the two apart with separate
-    // barriers ("keeps a session terminal after its operation ends ...").
+    // The fixture releases its terminal and ends the turn back to back; the tool card is folded
+    // with the process, and the released terminal keeps its output in it for every observer
+    // (memory model §8.3).
     for (const tab of [page, observer]) {
       await expect(tab.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
-      await expect(cardFor(tab)).toHaveCount(0);
-      await expect(tab.getByText(/LIVE_START/u)).toHaveCount(0);
+      await expect(cardFor(tab)).toHaveCount(1);
+      await expect(cardFor(tab).and(tab.locator(":visible"))).toHaveCount(0);
+      await tab.getByRole("button", { name: "Expand execution process", exact: true }).click();
+      await expect(cardFor(tab)).toBeVisible();
     }
 
     const api = trackApi(page);
     await page.reload();
     const restoredPrompt = page.locator(".message-user").filter({ hasText: `terminal-live-flow ${gatePath}` });
     await expect(restoredPrompt).toBeVisible();
-    await expect(cardFor(page)).toHaveCount(0);
-    await expect(page.getByText(/LIVE_START/u)).toHaveCount(0);
+    await expect(cardFor(page)).toHaveCount(1);
+    await page.getByRole("button", { name: "Expand execution process", exact: true }).click();
+    await expect(cardFor(page)).toBeVisible();
     expect(api.streams.length).toBeGreaterThan(0);
     expect(api.process).toEqual([]);
     expect(api.v1).toEqual([]);
@@ -2656,9 +2674,9 @@ test("collapses completed ACP compaction summaries into a Zed-style thread discl
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(compaction).toBeVisible();
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("compaction");
-  await expectProcessRemoved(page, page.locator(".compaction-card"));
+  await expectProcessFolded(page, page.locator(".compaction-card"));
   expect(browserErrors).toEqual([]);
 });
 
@@ -2720,7 +2738,7 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
       position: getComputedStyle(footer.querySelector(".debug-info-panel")!).position,
     };
   })).toEqual({ debugBelowActions: true, debugWithinMessage: true, position: "static" });
-  await expect(infoPanel.locator("pre")).toContainText("agent_message_chunk");
+  await expect(infoPanel.locator("pre")).toContainText('"role": "agent"');
   await expect(infoPanel.locator(".raw-json")).toHaveCount(0);
   await answerInfo.click();
   expect(await inlineCopy.evaluate((button) => Boolean(button.closest(".assistant-chunk"))))
@@ -2748,9 +2766,9 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
   await page.keyboard.press("Escape");
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
 
-  // The process was shown while the turn ran; the commit removes it (protocol S2).
+  // The process was shown while the turn ran; the commit folds it behind the disclosure and keeps it in the thread.
   await turnEnd.release("actions");
-  await expectProcessRemoved(page, page.locator(".thinking-block"));
+  await expectProcessFolded(page, page.locator(".thinking-block"));
   await response.focus();
   await page.keyboard.press("Shift+F10");
   menu = page.getByRole("menu", { name: "Agent response actions" });
@@ -2760,7 +2778,8 @@ test("offers Zed-style context actions on an ACP Agent response", async ({ page,
   const markdown = await popupPromise;
   await markdown.waitForLoadState();
   await expect(markdown.locator("body")).toContainText("**Context menu response.**\n\n- first item\n- second item");
-  await expect(markdown.locator("body")).not.toContainText("Considering possible follow-up work.");
+  // The thread keeps the Agent's thoughts, under their own heading, in the faithful view.
+  await expect(markdown.locator("body")).toContainText("Considering possible follow-up work.");
   await markdown.close();
 
   expect(await horizontalOverflow(page)).toBeLessThanOrEqual(1);
@@ -2878,8 +2897,8 @@ test("keeps the homepage selected when a previous create response arrives late",
   const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
   let notifyCreated!: () => void;
   const createdUpstream = new Promise<void>((resolve) => { notifyCreated = resolve; });
-  // `create` is an operation on `global`; its response is held until it ends (§6.3).
-  await page.route("**/api/v2/scopes/global/ops", async (route) => {
+  // `create` is an operation on `global`; it is answered when admitted (§6.3), and what became of it is in the document.
+  await page.route("**/api/v3/scopes/global/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "create") {
       await route.continue();
       return;
@@ -2908,11 +2927,11 @@ test("keeps the homepage selected when a previous create response arrives late",
 
     const delivered = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/global/ops" &&
       response.request().postDataJSON()?.kind === "create"
     );
     releaseCreate();
-    expect((await delivered).status()).toBe(200);
+    expect((await delivered).status()).toBe(202);
     await page.evaluate(() => new Promise<void>((resolve) => {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
     }));
@@ -2938,7 +2957,7 @@ test("serializes session list requests while startup and route refreshes overlap
   let inFlight = 0;
   let maximumInFlight = 0;
   // The catalog is listed by `list` operations on `catalog` (protocol §6.2).
-  await page.route("**/api/v2/scopes/catalog/ops", async (route) => {
+  await page.route("**/api/v3/scopes/catalog/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "list") {
       await route.continue();
       return;
@@ -3003,7 +3022,7 @@ for (const width of [1280, 390]) {
     await dialog.getByLabel("Project working directory", { exact: true }).fill(cwd);
     await page.screenshot({ path: test.info().outputPath("new-project-dialog.png") });
     const created = page.waitForRequest((request) =>
-      request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/scopes/global/ops" &&
+      request.method() === "POST" && new URL(request.url()).pathname === "/api/v3/scopes/global/ops" &&
       request.postDataJSON()?.kind === "create"
     );
     await dialog.getByRole("button", { name: "Create project", exact: true }).click();
@@ -3180,7 +3199,7 @@ test("leaves a running session without cancelling it and allows configuration on
   // Listing the catalog while its revision changes is refused `catalog_changed` (409, protocol §6.2); the
   // project browser lists again, and the browser logs the refusal. Whether the revision moves between two
   // pages depends on timing, so the refusal is expected here, and nothing else is.
-  const errors = collectBrowserErrors(page, [{ status: 409, pathname: "/api/v2/scopes/catalog/ops" }]);
+  const errors = collectBrowserErrors(page, [{ status: 409, pathname: "/api/v3/scopes/catalog/ops" }]);
   const api = trackApi(page);
   let closeRequests = 0;
   page.on("request", (request) => {
@@ -3198,7 +3217,7 @@ test("leaves a running session without cancelling it and allows configuration on
     await expect(page.getByText("Waiting for close.", { exact: true })).toBeVisible();
     const verbose = page.getByRole("switch", { name: "Verbose" });
     await expect(verbose).toBeDisabled();
-    expect(opsOf(api, "set_config")).toEqual([]);
+    expect(controlsOf(api, "set_config")).toEqual([]);
 
     await page.getByRole("button", { name: "Thread actions" }).click();
     await page.getByRole("button", { name: "Close thread" }).click();
@@ -3216,7 +3235,7 @@ test("leaves a running session without cancelling it and allows configuration on
     await expect(verbose).toBeEnabled();
     await verbose.click();
     await expect(verbose).toHaveAttribute("aria-checked", "true");
-    expect(opsOf(api, "set_config").map((body) => body.args)).toEqual([{ configId: "verbose", value: true }]);
+    expect(controlsOf(api, "set_config")).toEqual([{ configId: "verbose", value: true }]);
     expect(closeRequests).toBe(0);
     expect(api.v1).toEqual([]);
     expect(errors).toEqual([]);
@@ -3235,7 +3254,7 @@ test("creates a session in the selected project instead of the startup directory
   const dialog = page.getByRole("dialog", { name: "New thread" });
   await expect(dialog.getByLabel("Agent workspace", { exact: true })).toHaveValue(cwd);
   const created = page.waitForRequest((request) =>
-    request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/scopes/global/ops" &&
+    request.method() === "POST" && new URL(request.url()).pathname === "/api/v3/scopes/global/ops" &&
     request.postDataJSON()?.kind === "create"
   );
   await dialog.getByRole("button", { name: "Create thread" }).click();
@@ -3291,9 +3310,9 @@ test("reloads a created session URL even when the Agent list is empty", async ({
     await page.getByRole("button", { name: "New project", exact: true }).click();
     const refreshedList = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/catalog/ops" &&
+      new URL(response.url()).pathname === "/api/v3/scopes/catalog/ops" &&
       response.request().postDataJSON()?.kind === "list" &&
-      response.status() === 200
+      response.status() === 202
     );
     await page.getByRole("dialog", { name: "New project" })
       .getByLabel("Project working directory", { exact: true }).fill(process.cwd());
@@ -3301,8 +3320,7 @@ test("reloads a created session URL even when the Agent list is empty", async ({
       .getByRole("button", { name: "Create project" }).click();
     await expect(page).toHaveURL(/\/sessions\/test-session$/u);
     await expect(page.locator('textarea[role="combobox"]')).toBeEnabled();
-    const listed = await refreshedList;
-    expect((await listed.json()).result.sessions).toEqual([]);
+    await refreshedList;
     const picker = await openSessionPicker(page);
     const workspaceGroup = picker.locator(".session-group").filter({
       has: page.getByRole("heading", { name: process.cwd(), exact: true }),
@@ -3362,7 +3380,7 @@ test("browses cross-workspace projects and restores a shared session with its ow
 
     await page.reload();
     await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(otherCwd));
-    await page.getByRole("button", { name: "Load more sessions", exact: true }).click();
+    // The pages already listed are in the catalog's document: nothing more to load.
     await expect(page.locator(".project-session-link")).toHaveCount(1);
     await expect(page.locator(".project-session-link")).toContainText("Earlier Agent thread");
     await page.locator(".project-session-link").click();
@@ -3440,10 +3458,9 @@ test("restores the session in a directly opened URL on reload and in a fresh bro
   expect(browserErrors).toEqual([]);
 });
 
-// The log keeps prompt, reply and hash only (protocol §3.1): earlier turns have
-// no stop reason to show. The current operation keeps its result until the next
-// one replaces it (§4.4), so the last turn's stop reason stays visible.
-test("keeps turn boundaries across reload and shows only the current operation's stop reason", async ({ page }) => {
+// Each prompt keeps how it ended (memory model §4.2), so every turn shows its own stop reason,
+// also after a reload.
+test("keeps turn boundaries across reload and shows each turn's own stop reason", async ({ page }) => {
   const browserErrors = collectBrowserErrors(page);
   await page.goto("/sessions/saved-session");
 
@@ -3456,13 +3473,13 @@ test("keeps turn boundaries across reload and shows only the current operation's
   await composer.fill("usage-flow");
   await composer.press("Enter");
   await expect(page.locator('.turn-stop[data-stop-reason="max_tokens"]')).toHaveCount(1);
-  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(0);
+  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).not.toHaveCount(0);
   await expectTurnOrder(page);
 
   await page.reload();
   await expect(page.getByText("Context usage updated.", { exact: true })).toBeVisible();
   await expect(page.locator('.turn-stop[data-stop-reason="max_tokens"]')).toHaveCount(1);
-  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).toHaveCount(0);
+  await expect(page.locator('.turn-stop[data-stop-reason="end_turn"]')).not.toHaveCount(0);
   await expectTurnOrder(page);
   expect(browserErrors).toEqual([]);
 });
@@ -3657,7 +3674,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   });
   // A catalog refresh can race the login's Agent restart. Only its explicit
   // stale refusal is allowed, and below it must recover using the newer op.
-  const catalogPath = "/api/v2/scopes/catalog/ops";
+  const catalogPath = "/api/v3/scopes/catalog/ops";
   const browserErrors = collectBrowserErrors(page, [{ status: 409, pathname: catalogPath }]);
   const catalogResponses: Array<{
     method: string;
@@ -3679,7 +3696,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   const firstInputGate = new Promise<void>((resolve) => { releaseFirstInput = resolve; });
   const inputChunks: string[] = [];
   // Terminal input is a resource action on the login terminal (protocol §7).
-  await page.route("**/api/v2/scopes/global/resources/*/input", async (route) => {
+  await page.route("**/api/v3/scopes/global/resources/*/input", async (route) => {
     inputChunks.push(route.request().postDataJSON().data);
     if (inputChunks.length === 1) await firstInputGate;
     await route.continue();
@@ -3722,9 +3739,8 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
       expect(response.method).toBe("POST");
       expect(response.request?.kind).toBe("list");
       expect(response.body?.error?.code).toBe("stale");
-      expect(catalog.slice(index + 1).some((later) => later.status === 200 && later.method === "POST" &&
-        later.request?.kind === "list" && later.request.expect !== response.request?.expect &&
-        later.body?.result != null)).toBe(true);
+      expect(catalog.slice(index + 1).some((later) => later.status === 202 && later.method === "POST" &&
+        later.request?.kind === "list" && later.request.expect !== response.request?.expect)).toBe(true);
     }
     expect(browserErrors).toEqual([]);
   } finally {
@@ -3777,12 +3793,15 @@ async function expectTurnOrder(page: Page): Promise<void> {
   const firstPrompt = entries.indexOf("user:context-window-flow");
   const firstAnswer = entries.indexOf("agent:Context usage updated.");
   const secondPrompt = entries.indexOf("user:usage-flow");
+  const firstStop = entries.indexOf("stop:end_turn");
   const secondStop = entries.indexOf("stop:max_tokens");
   expect(firstPrompt).toBeGreaterThanOrEqual(0);
   expect(firstAnswer).toBeGreaterThan(firstPrompt);
-  expect(secondPrompt).toBeGreaterThan(firstAnswer);
+  // Each prompt keeps how it ended: the first turn's stop reason closes it before the next prompt.
+  expect(firstStop).toBeGreaterThan(firstAnswer);
+  expect(secondPrompt).toBeGreaterThan(firstStop);
   expect(secondStop).toBeGreaterThan(secondPrompt);
-  expect(entries.filter((entry) => entry.startsWith("stop:"))).toEqual(["stop:max_tokens"]);
+  expect(entries.filter((entry) => entry.startsWith("stop:"))).toEqual(["stop:end_turn", "stop:max_tokens"]);
 }
 
 async function readMarker(path: string): Promise<string> {
@@ -3823,9 +3842,21 @@ async function expectRunningProcess(page: Page, entry: Locator): Promise<void> {
   await expect(entry.first()).toBeVisible();
 }
 
-/** The turn committed and its process left the thread with it. */
-async function expectProcessRemoved(page: Page, process: Locator): Promise<void> {
+/**
+ * The turn committed and the Agent stopped, but the user has been reading the thread: the process stays
+ * where it was and is not folded away under them.
+ */
+async function expectProcessKept(page: Page, process: Locator): Promise<void> {
   await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
-  await expect(process).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
+  await expect(process).not.toHaveCount(0);
+}
+
+/**
+ * The turn committed: its process is folded behind the disclosure and stays in the thread, so none
+ * of it is visible until the disclosure is opened.
+ */
+async function expectProcessFolded(page: Page, process: Locator): Promise<void> {
+  await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toBeHidden();
+  await expect(process.and(page.locator(":visible"))).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Expand execution process", exact: true })).not.toHaveCount(0);
 }

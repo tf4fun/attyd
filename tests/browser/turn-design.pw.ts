@@ -39,9 +39,9 @@ test("distinguishes historical prompts, code, and turn boundaries in both deskto
     await expectDistinctCode(turns.nth(1));
     await alignTurn(page, turns.nth(1));
     await page.screenshot({ path: testInfo.outputPath(`turn-design-desktop-${theme}.png`), animations: "disabled" });
-    // A committed turn keeps its final messages only (protocol S2).
-    await expect(turns.nth(1).locator(".turn-process-trigger")).toHaveCount(0);
-    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true })).toHaveCount(0);
+    // A committed turn folds its process behind the disclosure and keeps it in the thread.
+    await expect(turns.nth(1).locator(".turn-process-trigger")).toHaveCount(1);
+    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true }).and(page.locator(":visible"))).toHaveCount(0);
   }
   expect(errors).toEqual([]);
 });
@@ -70,8 +70,8 @@ test("keeps turn landmarks and message actions readable on a phone in Chinese", 
     ))).toBeLessThanOrEqual(1);
     await alignTurn(page, turns.nth(1));
     await page.screenshot({ path: testInfo.outputPath(`turn-design-mobile-${theme}.png`), animations: "disabled" });
-    await expect(turns.nth(1).getByRole("button", { name: "展开执行过程", exact: true })).toHaveCount(0);
-    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true })).toHaveCount(0);
+    await expect(turns.nth(1).getByRole("button", { name: "展开执行过程", exact: true })).toHaveCount(1);
+    await expect(turns.nth(1).getByText("Read quick-start instructions", { exact: true }).and(page.locator(":visible"))).toHaveCount(0);
   }
 
   const prompt = turns.nth(1).locator(".message-user");
@@ -116,7 +116,6 @@ async function createConversation(page: Page) {
     await expect(turn.locator(".message-agent")).not.toHaveCount(0);
     await expect(page.getByRole("button", { name: "Stop current turn", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Send prompt", exact: true })).toBeVisible();
-    await expect(turn.getByRole("button", { name: "Expand execution process", exact: true })).toHaveCount(0);
   }
 }
 
@@ -181,9 +180,6 @@ async function expectTurnHierarchy(turn: Locator, user: string, agent: string) {
   expect(layout.actionsOpacity).toBe("1");
   expect(layout.targetSizes.every((size) => size >= 26)).toBe(true);
   expect(layout.separator).not.toBe("none");
-  // A committed turn has no process to disclose (protocol S2); the former
-  // process trigger layout checks went with it.
-  await expect(turn.locator(".turn-process-trigger")).toHaveCount(0);
 }
 
 async function expectDistinctCode(turn: Locator) {

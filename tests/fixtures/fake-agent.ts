@@ -1548,7 +1548,8 @@ const agent = acp
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "tool_call",
-          toolCallId: "review-workspace-files",
+          // ACP tool call ids are unique within a session: a second turn is a second call.
+          toolCallId: `review-workspace-files-${requestId}`,
           title: "Edit workspace files",
           kind: "edit",
           status: "completed",

@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { entryHash, scopeDigest, sessionDigest } from "../shared/digest";
 import type { StreamEvent } from "../shared/document-replica";
 import type { Entry, PromptState } from "../shared/entries";
-import { useAcp } from "../web/src/lib/use-acp3";
+import { useAcp } from "../web/src/lib/use-acp";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
