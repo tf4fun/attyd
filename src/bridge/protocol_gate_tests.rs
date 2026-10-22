@@ -709,15 +709,14 @@ impl Peer {
     /// Waits for the connection to end on its own and applies its last commits.
     async fn finish(&mut self) -> Result<(), Error> {
         let task = self.task.take().unwrap();
-        tokio::time::timeout(WAIT, async {
-            let result = task.await.unwrap();
-            while let Some(commit) = self.commits.recv().await {
-                self.apply(commit);
-            }
-            result
-        })
-        .await
-        .expect("the connection and its tap did not finish")
+        let result = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("the connection did not finish")
+            .unwrap();
+        // The feed outlives the connection, so its tap stays open: every commit of the
+        // connection is queued by now.
+        self.drain();
+        result
     }
 
     fn live(&self, scope: &str) -> Value {
@@ -1460,8 +1459,8 @@ async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
     assert_eq!(entries[0]["messageId"], "welcome");
     assert_eq!(
         entries[0]["chunks"],
-        json!([{"content": text("Forked ")}, {"content": text("session.")}]),
-        "the target's entries are its early messages, chunk by chunk"
+        json!([{"content": text("Forked session.")}]),
+        "the target's entries are its early messages, adjacent plain text merged"
     );
     peer.settled().await;
 }
