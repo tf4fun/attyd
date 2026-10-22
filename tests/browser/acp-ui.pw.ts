@@ -3177,7 +3177,10 @@ test("leaves a running session without cancelling it and allows configuration on
     command: [process.execPath, "--import", "tsx", join(process.cwd(), "tests/fixtures/session-capabilities-agent.ts"), "--no-load", "--close"],
   });
   const origin = `http://127.0.0.1:${server.port}`;
-  const errors = collectBrowserErrors(page);
+  // Listing the catalog while its revision changes is refused `catalog_changed` (409, protocol §6.2); the
+  // project browser lists again, and the browser logs the refusal. Whether the revision moves between two
+  // pages depends on timing, so the refusal is expected here, and nothing else is.
+  const errors = collectBrowserErrors(page, [{ status: 409, pathname: "/api/v2/scopes/catalog/ops" }]);
   const api = trackApi(page);
   let closeRequests = 0;
   page.on("request", (request) => {
