@@ -439,11 +439,12 @@ describe("revision 3 workspace, read side", () => {
     await shownSession(running(), [{ entry: 0 }]);
     await act(async () => hook.prompt([text("one")]));
     await act(async () => hook.prompt([text("two")]));
-    const [first, second] = hook.state.queue;
+    const [first] = hook.state.queue;
     let taken: unknown;
     await act(async () => { taken = hook.takeQueued(first.id); });
     expect(taken).toEqual([text("one")]);
-    expect(hook.state.queue.map((entry) => entry.id)).toEqual([second.id]);
+    // The next prompt moves up to the write queue once the first left it.
+    expect(hook.state.queue.map((entry) => entry.blocks)).toEqual([[text("two")]]);
 
     await act(async () => hook.pauseQueue());
     expect(hook.state.queuePaused).toBe(true);
