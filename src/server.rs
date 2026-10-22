@@ -222,7 +222,8 @@ impl BridgeHub {
     /// Whether an open v2 stream needs a connection: it follows a session
     /// scope that has not ended (S6, Q2). Global and catalog alone do not.
     fn streams_need_connection(&self) -> bool {
-        !self.publication.lock().hub.followed_sessions().is_empty()
+        let published = self.publication.lock();
+        !published.hub.followed_sessions().is_empty() || !published.feed.followed_sessions().is_empty()
     }
 
     /// Schedules the one recovery task when no generation runs and a stream
