@@ -982,6 +982,7 @@ fn control_action(
             .ok_or_else(|| invalid_request(format!("{name} must be a string")))
     };
     match action {
+        "close" => Ok(Control::Close),
         "set_mode" => Ok(Control::SetMode {
             mode_id: text("modeId")?,
         }),
@@ -1074,7 +1075,7 @@ async fn write_scope_at(
     };
     match segments[1..].iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["ops"] => {}
-        ["actions", action @ ("set_mode" | "set_config")] => {
+        ["actions", action @ ("set_mode" | "set_config" | "close")] => {
             let Scope::Session(session_id) = &scope else {
                 return refused(ProtocolError::new(
                     ErrorCode::NotFound,

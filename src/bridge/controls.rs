@@ -10,6 +10,8 @@ use crate::protocol::documents::{ErrorCode, ProtocolError};
 pub(crate) enum Control {
     SetMode { mode_id: String },
     SetConfig { config_id: String, value: Value },
+    /// Ends the session at the Agent and releases everything the bridge held.
+    Close,
 }
 
 /// What the Agent answered: nothing, or the error it answered with.
@@ -24,6 +26,7 @@ fn refusal(code: ErrorCode, message: impl Into<String>) -> ProtocolError {
 /// A refusal before anything is sent changes nothing.
 pub(super) fn admit(
     state: &mut BridgeState,
+    sink: &EventSink,
     session_id: &str,
     control: &Control,
 ) -> Result<(Value, ControlAnswer), ProtocolError> {
@@ -46,9 +49,14 @@ pub(super) fn admit(
             .live(&scope)
             .map(|live| (live["op"]["kind"].clone(), live["op"]["status"].clone()))
     };
+    let running_other = |kind: &Value| match control {
+        // A close may interrupt a running prompt, and nothing else (protocol §7).
+        Control::Close => kind != "prompt",
+        _ => kind == "load" || kind == "delete",
+    };
     if let Some((kind, status)) = shown
         && status == "running"
-        && (kind == "load" || kind == "delete")
+        && running_other(&kind)
     {
         return Err(refusal(
             ErrorCode::NotAllowed,
@@ -57,6 +65,19 @@ pub(super) fn admit(
     }
     let request_id = format!("action-{}", Uuid::new_v4());
     let command = match control {
+        Control::Close => {
+            if !state
+                .agent_capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.session_capabilities.close.is_some())
+            {
+                return Err(refusal(
+                    ErrorCode::Unsupported,
+                    "the Agent does not advertise session/close",
+                ));
+            }
+            json!({ "type": "session/close", "requestId": request_id, "sessionId": session_id })
+        }
         Control::SetMode { mode_id } => {
             let modes = serde_json::to_value(&session.live.controls.modes)
                 .map_err(|error| refusal(ErrorCode::InvalidRequest, error.to_string()))?;
@@ -86,6 +107,13 @@ pub(super) fn admit(
             })
         }
     };
+    if matches!(control, Control::Close) {
+        // Like a cancel, a close answers the session's pending permissions
+        // cancelled before the Agent hears of it.
+        let cancelled = operations::cancel_outcomes(state, &scope);
+        let deliveries = operations::deliveries(state, cancelled)?;
+        operations::deliver(state, sink, deliveries);
+    }
     let (reply, answer) = oneshot::channel();
     state.action_replies.insert(request_id, reply);
     Ok((command, answer))

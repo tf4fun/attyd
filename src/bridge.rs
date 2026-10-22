@@ -1937,7 +1937,7 @@ where
                     }
                     Some(BridgeInput::Control { session_id, control, reply }) => {
                         let mut state = state.lock().await;
-                        match controls::admit(&mut state, &session_id, &control) {
+                        match controls::admit(&mut state, &sink, &session_id, &control) {
                             Err(error) => {
                                 let _ = reply.send(Err(error));
                                 continue;
