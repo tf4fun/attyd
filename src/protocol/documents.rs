@@ -103,8 +103,6 @@ impl ProtocolError {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OperationKind {
     Prompt,
-    SetMode,
-    SetConfig,
     Fork,
     Create,
     Delete,

@@ -298,12 +298,6 @@ fn command(state: &BridgeState, scope: &OpScope, kind: OpKind, op: &str, input: 
                 "prompt": input["prompt"],
             })
         }
-        OpKind::SetMode => json!({ "type": "session/set_mode", "modeId": input["modeId"] }),
-        OpKind::SetConfig => json!({
-            "type": "session/set_config_option",
-            "configId": input["configId"],
-            "value": input["value"],
-        }),
         OpKind::Fork => {
             let mut command = json!({ "type": "session/fork" });
             if let Some(cwd) = input.get("cwd") {

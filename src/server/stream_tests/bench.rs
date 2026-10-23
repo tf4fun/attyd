@@ -192,6 +192,19 @@ impl Bench {
     /// The same write, sent from a task, which then waits for the operation's end in the
     /// document: for `create`, `fork` and `list`, whose result is there. It answers `200` and
     /// `{ op, result }` or `{ op, error }`; a refused write answers its refusal.
+    /// A session action (protocol §7: `set_mode`, `set_config`, `close`), started now and answered
+    /// when the Agent answers: `200 {}`, `200 { error }` or its refusal.
+    fn spawn_action(
+        &self,
+        session_id: &str,
+        action: &str,
+        body: Value,
+    ) -> JoinHandle<(StatusCode, Value)> {
+        let address = self.address;
+        let path = format!("/api/v2/scopes/{}/actions/{action}", encoded(&format!("session/{session_id}")));
+        tokio::spawn(async move { body_of(send(address, Method::POST, &path, Some(body)).await).await })
+    }
+
     fn spawn_op(
         &self,
         scope: &str,

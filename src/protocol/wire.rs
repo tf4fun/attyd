@@ -30,8 +30,6 @@ pub(crate) struct OpRequest {
 #[serde(tag = "kind", content = "args", rename_all = "snake_case")]
 pub(crate) enum OpArgs {
     Prompt(PromptArgs),
-    SetMode(SetModeArgs),
-    SetConfig(SetConfigArgs),
     Fork(ForkArgs),
     Create(CreateArgs),
     Delete(DeleteArgs),
@@ -56,30 +54,6 @@ pub(crate) fn value<T: Serialize>(dto: &T) -> Value {
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub(crate) struct PromptArgs {
     pub prompt: Vec<PromptBlock>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SetModeArgs {
-    pub mode_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SetConfigArgs {
-    pub config_id: String,
-    pub value: ConfigValue,
-}
-
-/// A select option's value ID, or a boolean option's value.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(untagged)]
-pub(crate) enum ConfigValue {
-    Id(String),
-    Boolean(bool),
 }
 
 /// Default `cwd`: the source session's.

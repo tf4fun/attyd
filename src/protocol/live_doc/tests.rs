@@ -232,8 +232,8 @@ fn an_operation_names_its_scope_the_operation_it_replaced_and_its_input() {
     registry
         .install_operation_as(
             &scope,
-            OperationKind::SetMode,
-            json!({ "modeId": "plan" }),
+            OperationKind::Fork,
+            json!({ "cwd": "/w" }),
             Some("Zm9yLXRoZS1jbGllbnQtMQ".into()),
             Some(open.clone()),
         )
@@ -242,7 +242,7 @@ fn an_operation_names_its_scope_the_operation_it_replaced_and_its_input() {
         operation(&registry, &scope),
         json!({
             "id": "Zm9yLXRoZS1jbGllbnQtMQ", "scope": "session/s", "after": open,
-            "kind": "set_mode", "status": "running", "input": { "modeId": "plan" },
+            "kind": "fork", "status": "running", "input": { "cwd": "/w" },
             "cancelRequested": false,
         })
     );

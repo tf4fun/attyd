@@ -1216,7 +1216,7 @@ async fn attachments_are_served_while_the_entries_that_reference_them_are_publis
 }
 
 #[tokio::test]
-async fn a_set_mode_folds_its_acknowledgement_when_it_completes() {
+async fn a_set_mode_action_folds_its_acknowledgement_and_installs_no_operation() {
     let mut peer = Peer::start(json!({})).await;
     peer.create(
         CREATED,
@@ -1230,24 +1230,27 @@ async fn a_set_mode_folds_its_acknowledgement_when_it_completes() {
         peer.live(&scope)["controls"]["modes"]["currentModeId"],
         "ask"
     );
-    let (op, _) = peer
-        .start_op(&scope, "set_mode", json!({"modeId": "plan"}))
+    let shown = peer.live(&scope)["op"].clone();
+    let answer = peer
+        .control(
+            CREATED,
+            crate::bridge::controls::Control::SetMode { mode_id: "plan".into() },
+        )
         .await;
     let request = peer.request("session/set_mode").await;
     peer.reply(&request, json!({})).await;
-    peer.until("the set_mode completes", |peer| {
-        peer.live(&scope)["op"]["status"] == "completed"
+    answer.await.unwrap().unwrap();
+    peer.until("the mode is folded", |peer| {
+        peer.live(&scope)["controls"]["modes"]["currentModeId"] == "plan"
     })
     .await;
     let live = peer.live(&scope);
-    assert_eq!(live["op"]["id"], op);
-    assert_eq!(live["controls"]["modes"]["currentModeId"], "plan");
-    let end = peer.events_of(&scope).pop().unwrap();
-    let paths = patch_paths(&end);
+    assert_eq!(live["op"], shown, "a control installs no operation");
+    let event = peer.events_of(&scope).pop().unwrap();
+    let paths = patch_paths(&event);
     assert!(
-        paths.iter().any(|(_, path)| path.starts_with("/live/controls/"))
-            && paths.iter().any(|(_, path)| path.starts_with("/live/op/")),
-        "the acknowledgement and the end are one event: {end}"
+        paths.iter().all(|(_, path)| path.starts_with("/live/controls/")),
+        "the acknowledgement changes controls and nothing else: {event}"
     );
     peer.settled().await;
 }
@@ -1717,7 +1720,7 @@ async fn a_failed_delete_frees_the_session_it_occupied() {
             .all(|event| event.get("end").is_none())
     );
     // The freed session takes a new operation.
-    peer.install(&scope, OperationKind::SetMode, json!({"modeId": "x"}))
+    peer.install(&scope, OperationKind::Fork, json!({}))
         .await;
     peer.settled().await;
 }

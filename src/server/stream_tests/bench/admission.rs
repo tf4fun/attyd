@@ -9,8 +9,6 @@ use super::*;
 fn session_writes() -> Vec<(&'static str, Value)> {
     vec![
         ("prompt", json!({"prompt": [text("again")]})),
-        ("set_mode", json!({"modeId": "plan"})),
-        ("set_config", json!({"configId": "verbose", "value": true})),
         ("fork", json!({})),
     ]
 }
@@ -67,52 +65,27 @@ async fn session_writes_need_the_current_ended_op_and_replace_it() {
     // stale.
     let mut expect = first;
     let (status, body) = bench
-        .op("session/s", &expect, "set_mode", json!({"modeId": "plan"}))
+        .op(
+            "session/s",
+            &expect,
+            "prompt",
+            json!({"prompt": [text("second")]}),
+        )
         .await;
-    let mode = assert_accepted(status, &body, "set_mode");
-    let request = link.request("session/set_mode").await;
-    assert_eq!(request["params"]["modeId"], "plan");
-    link.reply(&request, json!({})).await;
-    watch
-        .until_live("session/s", "the set_mode completes", |live| {
-            live["op"]["id"] == mode && live["op"]["status"] == "completed"
-        })
-        .await;
-    let (status, body) = bench
-        .op("session/s", &expect, "set_mode", json!({"modeId": "ask"}))
-        .await;
-    stale(status, &body, "set_mode on the replaced prompt");
-    expect = mode;
-
+    let second = assert_accepted(status, &body, "a prompt on the ended prompt");
+    let request = link.request("session/prompt").await;
+    link.reply(&request, json!({"stopReason": "end_turn"})).await;
+    watch.until_op("session/s", &second, "completed").await;
     let (status, body) = bench
         .op(
             "session/s",
             &expect,
-            "set_config",
-            json!({"configId": "verbose", "value": true}),
+            "prompt",
+            json!({"prompt": [text("again")]}),
         )
         .await;
-    let config = assert_accepted(status, &body, "set_config");
-    let request = link.request("session/set_config_option").await;
-    assert_eq!(request["params"]["configId"], "verbose");
-    assert_eq!(request["params"]["value"], true);
-    link.reply(&request, json!({"configOptions": verbose(true)}))
-        .await;
-    watch
-        .until_live("session/s", "the set_config completes", |live| {
-            live["op"]["id"] == config && live["op"]["status"] == "completed"
-        })
-        .await;
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &expect,
-            "set_config",
-            json!({"configId": "verbose", "value": false}),
-        )
-        .await;
-    stale(status, &body, "set_config on the replaced set_mode");
-    expect = config;
+    stale(status, &body, "a prompt on the replaced prompt");
+    expect = second;
 
     let forked = bench.spawn_op("session/s", &expect, "fork", json!({}));
     let request = link.request("session/fork").await;
@@ -127,7 +100,7 @@ async fn session_writes_need_the_current_ended_op_and_replace_it() {
         })
         .await;
     let (status, body) = bench.op("session/s", &expect, "fork", json!({})).await;
-    stale(status, &body, "fork on the replaced set_config");
+    stale(status, &body, "fork on the replaced prompt");
     expect = fork;
 
     let (status, body) = bench
@@ -613,15 +586,20 @@ async fn a_refused_write_can_be_submitted_again_on_the_same_expect() {
         .await;
 
     // An argument refusal does not consume it either.
-    let (status, body) = bench.op("session/s", &second, "set_mode", json!({})).await;
-    invalid(status, &body, "set_mode without modeId");
+    let (status, body) = bench.op("session/s", &second, "prompt", json!({})).await;
+    invalid(status, &body, "a prompt without blocks");
     let (status, body) = bench
-        .op("session/s", &second, "set_mode", json!({"modeId": "plan"}))
+        .op(
+            "session/s",
+            &second,
+            "prompt",
+            json!({"prompt": [text("corrected")]}),
+        )
         .await;
-    let mode = assert_accepted(status, &body, "the corrected set_mode");
-    let request = link.request("session/set_mode").await;
-    link.reply(&request, json!({})).await;
-    watch.until_op("session/s", &mode, "completed").await;
+    let third = assert_accepted(status, &body, "the corrected prompt");
+    let request = link.request("session/prompt").await;
+    link.reply(&request, json!({"stopReason": "end_turn"})).await;
+    watch.until_op("session/s", &third, "completed").await;
     watch.converged(&bench).await;
 }
 
@@ -746,20 +724,12 @@ async fn refusals_follow_the_admission_order() {
         "image support before malformed image data",
     );
 
-    // Arguments, including ACP block structure and offered config value types.
+    // Arguments, including ACP block structure.
     for (kind, args) in [
         ("prompt", json!({})),
         ("prompt", json!({"prompt": [{"type": "nope"}]})),
         ("prompt", json!({"prompt": [{"type": "text"}]})),
         ("prompt", json!({"prompt": [{"type": "text", "text": 7}]})),
-        ("set_mode", json!({"modeId": 1})),
-        ("set_mode", json!({"modeId": "missing"})),
-        ("set_config", json!({"configId": "missing", "value": true})),
-        ("set_config", json!({"configId": "verbose"})),
-        (
-            "set_config",
-            json!({"configId": "verbose", "value": "true"}),
-        ),
     ] {
         let (status, body) = bench.op("session/s", &running, kind, args.clone()).await;
         invalid(status, &body, &format!("{kind} {args}"));
