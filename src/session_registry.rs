@@ -410,7 +410,6 @@ pub(crate) enum HistorySyncStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     use agent_client_protocol::schema::v1::{
         CreateElicitationResponse, ElicitationAction, RequestPermissionOutcome,
@@ -525,7 +524,6 @@ mod tests {
             "permission".to_string(),
             PermissionResponder {
                 tool_call_id: "tool".to_string(),
-                option_ids: HashSet::from(["allow".to_string()]),
                 sender: permission_sender,
             },
         );
@@ -534,7 +532,6 @@ mod tests {
             "elicitation".to_string(),
             ElicitationResponder {
                 url_elicitation_id: Some("url".to_string()),
-                request: json!({ "message": "input" }),
                 sender: elicitation_sender,
             },
         );

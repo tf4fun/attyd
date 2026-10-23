@@ -360,11 +360,8 @@ async fn permission(
         let mut state = context.state.lock().await;
         context.require_owner(&state, &session_id)?;
         validate_terminal_references(&state, &session_id, tool_call)?;
-        let option_ids = validate_permission_request(
-            ensure_session_validation(&mut state, &session_id)?,
-            &request,
-        )
-        .map_err(semantic_error)?;
+        validate_permission_request(ensure_session_validation(&mut state, &session_id)?, &request)
+            .map_err(semantic_error)?;
         {
             if state
                 .sessions
@@ -397,7 +394,6 @@ async fn permission(
                     permission_id.clone(),
                     PermissionResponder {
                         tool_call_id,
-                        option_ids,
                         sender,
                     },
                 )
@@ -535,7 +531,6 @@ async fn elicitation(
                 .map_err(runtime_state_error)?;
             let pending = ElicitationResponder {
                 url_elicitation_id,
-                request: request_value.clone(),
                 sender,
             };
             if let Some(owner) = &owner {
@@ -947,7 +942,6 @@ mod tests {
                             allocation.to_owned(),
                             PermissionResponder {
                                 tool_call_id: "tool".to_owned(),
-                                option_ids: HashSet::new(),
                                 sender,
                             },
                         )
@@ -966,7 +960,6 @@ mod tests {
                         .unwrap();
                     let responder = ElicitationResponder {
                         url_elicitation_id: None,
-                        request: json!({"mode":"form"}),
                         sender,
                     };
                     if let Some(owner) = owner {

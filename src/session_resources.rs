@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use agent_client_protocol::schema::v1::{
     CreateElicitationResponse, ElicitationAction, RequestPermissionOutcome,
@@ -66,13 +66,11 @@ pub(crate) struct HistorySyncOwner {
 
 pub(crate) struct PermissionResponder {
     pub(crate) tool_call_id: String,
-    pub(crate) option_ids: HashSet<String>,
     pub(crate) sender: oneshot::Sender<RequestPermissionResponse>,
 }
 
 pub(crate) struct ElicitationResponder {
     pub(crate) url_elicitation_id: Option<String>,
-    pub(crate) request: Value,
     pub(crate) sender: oneshot::Sender<CreateElicitationResponse>,
 }
 
