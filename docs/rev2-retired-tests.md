@@ -12,14 +12,14 @@ Retired with the port of the gate to the feed. Read them at `e4033d6`. They driv
 `Subscription` and check the S6 hold/release rules, loads started by subscriptions and the
 reconnection of a stream; on revision 3 the same rules run behind `FeedSubscription`.
 
-- [ ] a_stream_aligns_each_scope_at_once_and_follows_a_prompt_through_its_commit
+- [x] a_stream_aligns_each_scope_at_once_and_follows_a_prompt_through_its_commit — `feed/tests.rs` (aligned, then follows commits), the gate's `a_streamed_prompt_…_ends_in_one_event` (the prompt ends in one event)
 - [x] a_held_session_ignores_the_load_directory (`protocol_gate_tests/loads.rs`)
-- [ ] a_cold_reopen_keeps_the_client_log_and_confirms_it_when_the_load_ends
-- [ ] a_cold_reopen_with_a_changed_history_replaces_the_client_log
+- [x] a_cold_reopen_keeps_the_client_log_and_confirms_it_when_the_load_ends — `stream_harness` reopen with `have` in `holding.rs`/`reconnection.rs` (an update snapshot keeps the entries held); `queue_tests`
+- [x] a_cold_reopen_with_a_changed_history_replaces_the_client_log — `reconnection.rs` `the_next_connections_diverging_replay_replaces_what_differs`
 - [x] two_subscriptions_share_one_load_and_each_gets_its_log_from_its_own_head → two_subscriptions_share_one_load_and_both_end_with_the_replayed_entries (`protocol_gate_tests/loads.rs`)
 - [x] reconnecting_before_during_and_after_a_load_keeps_one_load_and_converges (`protocol_gate_tests/loads.rs`)
 - [x] an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed (`protocol_gate_tests/loads.rs`)
-- [ ] a_paused_stream_follows_its_tail_and_is_coalesced_past_its_budget
+- [x] a_paused_stream_follows_its_tail_and_is_coalesced_past_its_budget — `feed/tests.rs` `a_slow_subscriber_is_sent_a_snapshot_…`, `queue_tests` budget cases
 - [x] subscribers_hold_a_loadable_session_and_the_last_one_leaving_releases_it (`protocol_gate_tests/holding.rs`)
 - [x] a_loadable_session_without_close_is_released_locally (`protocol_gate_tests/holding.rs`)
 - [x] a_session_released_before_its_first_subscription_is_loaded_by_it (`protocol_gate_tests/holding.rs`)
@@ -36,7 +36,7 @@ reconnection of a stream; on revision 3 the same rules run behind `FeedSubscript
 - [x] the_next_connection_s_diverging_replay_rebuilds_from_the_common_prefix → the_next_connections_diverging_replay_replaces_what_differs (`protocol_gate_tests/reconnection.rs`)
 - [x] review_an_unfollowed_session_is_released_when_the_agent_connection_ends (`protocol_gate_tests/reconnection.rs`)
 - [x] a_session_the_agent_cannot_load_again_ends_with_load_failed_at_the_connection_end (`protocol_gate_tests/reconnection.rs`)
-- [ ] four_consumers_converge_one_by_one_lagging_reconnecting_and_paused
+- [x] four_consumers_converge_one_by_one_lagging_reconnecting_and_paused — `feed/tests.rs` `four_consumers_converge_one_by_one_lagging_reconnecting_and_paused`
 - [x] review_resume_only_session_waits_across_eof_and_preserves_its_known_log → …known_entries (`protocol_gate_tests/reconnection.rs`)
 - [x] review_waiting_session_uses_the_new_connections_resume_capability (`protocol_gate_tests/reconnection.rs`)
 - [x] review_refused_automatic_close_waits_for_a_new_subscription_cycle (`protocol_gate_tests/reconnection.rs`)
@@ -220,54 +220,54 @@ Restored in `src/server/stream_tests/bench/url_flows.rs`.
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. The revision 2 Hub: queues, coalescing, heartbeat. The feed has its own (`feed/tests.rs`, `subscription/queue_tests.rs`).
 
-- [ ] a_subscription_aligns_held_sessions_with_a_known_an_unknown_and_an_empty_log
-- [ ] have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_log
-- [ ] a_scope_published_later_is_aligned_when_it_appears
-- [ ] a_first_load_sends_each_subscription_its_log_from_its_own_baseline
-- [ ] an_unknown_log_keeps_the_declared_baseline_through_live_only_changes
-- [ ] queued_log_changes_follow_the_tail_and_only_the_output_advances_the_baseline
-- [ ] an_undelivered_reload_to_the_same_length_is_followed_by_the_next_append
-- [ ] an_undelivered_shrink_is_followed_by_the_next_append
-- [ ] an_equal_reload_of_a_known_log_changes_no_log
-- [ ] a_coalesced_queue_aligns_an_unsent_log_from_the_baseline_and_applies_directly
-- [ ] a_coalesce_after_a_partial_delivery_aligns_from_the_advanced_baseline
-- [ ] a_coalesce_keeps_a_queued_end_and_nothing_of_its_scope_follows
-- [ ] a_turn_completion_and_a_reload_coalesce_to_the_same_cut_a_follower_reaches
-- [ ] session_subscribers_count_open_subscriptions_only
-- [ ] a_replica_rejects_a_log_change_or_patch_that_does_not_apply
-- [ ] a_stream_query_names_scopes_heads_and_load_directories
-- [ ] review_an_uncoalesced_first_event_is_the_subscription_cut_before_later_commits
-- [ ] review_end_filters_later_same_scope_events_before_and_after_delivery
+- [x] a_subscription_aligns_held_sessions_with_a_known_an_unknown_and_an_empty_log — `queue_tests` `a_subscriber_is_aligned_with_a_snapshot_of_every_scope_published`; `engine/tests` `an_unknown_history_has_no_entries_…`
+- [x] have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_log — `queue_tests` `a_subscriber_holding_the_epoch_is_sent_only_what_changed_…` and `a_subscriber_holding_another_epoch_or_a_rev_the_document_has_not_reached_is_sent_it_whole`
+- [x] a_scope_published_later_is_aligned_when_it_appears — `queue_tests` `a_scope_not_published_yet_is_aligned_when_it_is`; `feed/tests` `a_session_published_after_a_subscription_is_aligned_when_it_appears`
+- [x] a_first_load_sends_each_subscription_its_log_from_its_own_baseline — `loads.rs` `two_subscriptions_share_one_load_and_both_end_with_the_replayed_entries`
+- [x] an_unknown_log_keeps_the_declared_baseline_through_live_only_changes — `engine/tests` `an_unknown_history_has_no_entries_and_becoming_known_is_a_new_epoch`
+- [x] queued_log_changes_follow_the_tail_and_only_the_output_advances_the_baseline — `queue_tests` `an_event_still_queued_never_counts_as_delivered`
+- [x] an_undelivered_reload_to_the_same_length_is_followed_by_the_next_append — `queue_tests` `a_new_epoch_replaces_what_was_queued_with_a_whole_snapshot`; `feed/tests` `a_replaced_timeline_is_a_new_epoch_…`
+- [x] an_undelivered_shrink_is_followed_by_the_next_append — as above (a shrink is a new epoch)
+- [x] an_equal_reload_of_a_known_log_changes_no_log — `engine/tests` `an_entry_the_memory_replaced_without_changing_it_is_not_published_again`; `reconnection.rs` equal replay
+- [x] a_coalesced_queue_aligns_an_unsent_log_from_the_baseline_and_applies_directly — `queue_tests` `a_queue_past_its_budget_is_replaced_by_a_snapshot_from_the_last_rev_written`
+- [x] a_coalesce_after_a_partial_delivery_aligns_from_the_advanced_baseline — `queue_tests` `an_event_still_queued_never_counts_as_delivered` with the budget case
+- [x] a_coalesce_keeps_a_queued_end_and_nothing_of_its_scope_follows — `queue_tests` `an_end_replaces_everything_queued_of_its_scope_and_is_never_coalesced_away`
+- [x] a_turn_completion_and_a_reload_coalesce_to_the_same_cut_a_follower_reaches — `feed/tests` `four_consumers_converge_…`
+- [x] session_subscribers_count_open_subscriptions_only — `feed/handle_tests` `dropping_a_subscription_forgets_it`; `holding.rs` followers
+- [x] a_replica_rejects_a_log_change_or_patch_that_does_not_apply — `tests/document-replica.test.ts` (refused events leave the replica unchanged) and the gate's `Replica::apply`
+- [x] a_stream_query_names_scopes_heads_and_load_directories — `subscription/tests.rs` (the query parser, kept through the cutover)
+- [x] review_an_uncoalesced_first_event_is_the_subscription_cut_before_later_commits — `feed/tests` `a_subscriber_is_aligned_with_everything_published_and_then_follows_commits`
+- [x] review_end_filters_later_same_scope_events_before_and_after_delivery — `queue_tests` `an_end_replaces_everything_queued_of_its_scope_…`
 
 ## Registry convergence (`src/protocol/convergence_tests.rs`)
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Registry transitions checked against the revision 2 publisher with a hash-chain replica. The same transitions are checked through the bridge gate and the engine tests.
 
-- [ ] global_and_catalog_start_with_a_completed_none_and_an_empty_log
-- [ ] a_created_session_starts_with_a_completed_open_and_a_known_empty_log
-- [ ] a_first_load_runs_with_an_unknown_log_and_ends_with_the_replayed_log
-- [ ] a_failed_first_load_ends_the_scope_with_load_failed
-- [ ] a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one_event
-- [ ] a_failed_turn_appends_nothing_and_keeps_its_prompt_and_error_on_op
-- [ ] a_requested_cancel_shows_on_the_running_prompt_and_a_cancelled_stop_completes_it
-- [ ] interactions_and_controls_change_in_live_while_the_log_stays
-- [ ] an_interaction_joins_the_running_prompt
-- [ ] attachments_are_readable_while_log_or_live_references_them
-- [ ] a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_ends
-- [ ] a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options
-- [ ] a_failed_set_mode_changes_no_control
-- [ ] control_updates_fold_after_the_response
-- [ ] a_delete_occupies_its_session_and_ends_it_with_deleted
-- [ ] a_failed_delete_frees_its_session_and_keeps_its_error_on_global
-- [ ] a_running_operation_is_not_replaced
-- [ ] reloads_with_an_equal_replay_change_no_log_and_a_diverging_one_rebuilds_from_the_common_prefix
-- [ ] terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release
-- [ ] an_installed_operation_remembers_its_scope_and_the_operation_it_replaced
-- [ ] url_flows_appear_on_accept_and_leave_on_completion
-- [ ] request_scoped_elicitations_run_as_an_agent_request_of_global
-- [ ] the_gate_reports_a_transition_that_was_not_committed
-- [ ] every_event_round_trips_its_documented_wire_shape
-- [ ] later_identical_mode_notification_overrides_setup_response
-- [ ] later_identical_config_notification_overrides_setup_response
-- [ ] streamed_text_publishes_only_the_new_suffix
+- [x] global_and_catalog_start_with_a_completed_none_and_an_empty_log — `live_doc/tests` `a_scopes_first_operation_is_over_and_replaced_nothing`, `global_and_catalog_have_the_scope_members_too`
+- [x] a_created_session_starts_with_a_completed_open_and_a_known_empty_log — `live_doc/tests` `a_new_session_names_itself_…`; gate `a_create_completes_with_its_session_…`
+- [x] a_first_load_runs_with_an_unknown_log_and_ends_with_the_replayed_log — `loads.rs`; `engine/tests` unknown history
+- [x] a_failed_first_load_ends_the_scope_with_load_failed — `loads.rs` `an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed`
+- [x] a_completed_turn_appends_its_entry_removes_its_process_and_ends_its_op_in_one_event — gate `a_streamed_prompt_with_an_answered_permission_ends_in_one_event`
+- [x] a_failed_turn_appends_nothing_and_keeps_its_prompt_and_error_on_op — gate `a_failed_prompt_keeps_what_streamed_and_ends_with_its_error`
+- [x] a_requested_cancel_shows_on_the_running_prompt_and_a_cancelled_stop_completes_it — gate `a_cancelled_stop_reason_completes_the_prompt`; `bench/interactions.rs` cancel cases
+- [x] interactions_and_controls_change_in_live_while_the_log_stays — `live_doc/tests` `pending_interactions_are_a_member_of_live_beside_the_operation`; gate request-scoped cases
+- [x] an_interaction_joins_the_running_prompt — gate `request_scoped_interactions_of_a_prompt_join_its_session`
+- [x] attachments_are_readable_while_log_or_live_references_them — `bench/reads.rs`; gate `attachments_are_served_while_the_entries_that_reference_them_are_published`; `engine/tests`
+- [x] a_set_mode_acknowledged_without_a_notification_shows_the_mode_when_its_op_ends — gate `a_set_mode_folds_its_acknowledgement_when_it_completes`; `bench/execution.rs` `control_acknowledgements_fold_…`
+- [x] a_set_config_acknowledged_without_a_notification_shows_the_confirmed_options — `bench/execution.rs` `control_acknowledgements_fold_into_the_ending_event_and_failures_change_nothing`
+- [x] a_failed_set_mode_changes_no_control — as above
+- [x] control_updates_fold_after_the_response — `controls.rs` `response_overrides_only_its_fields_between_early_and_later_updates`, `settling_lets_the_response_override_only_its_fields`
+- [x] a_delete_occupies_its_session_and_ends_it_with_deleted — gate `a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted`; `bench/occupation.rs`
+- [x] a_failed_delete_frees_its_session_and_keeps_its_error_on_global — gate `a_failed_delete_frees_the_session_it_occupied`; `bench/occupation.rs`
+- [x] a_running_operation_is_not_replaced — `bench/admission.rs`
+- [x] reloads_with_an_equal_replay_change_no_log_and_a_diverging_one_rebuilds_from_the_common_prefix — `reconnection.rs`
+- [x] terminals_roll_their_bounded_tail_with_trim_and_append_and_leave_on_release — `engine/tests` `a_terminals_output_rolls_as_a_bounded_tail`; `diff.rs` bounded tails
+- [x] an_installed_operation_remembers_its_scope_and_the_operation_it_replaced — `live_doc/tests` `an_operation_names_its_scope_the_operation_it_replaced_and_its_input`
+- [x] url_flows_appear_on_accept_and_leave_on_completion — `live_doc/tests` `an_accepted_url_flow_waits_with_its_status`; `bench/url_flows.rs`
+- [x] request_scoped_elicitations_run_as_an_agent_request_of_global — gate `a_request_scoped_elicitation_followed_by_its_response_joins_the_catalog`, `a_request_scoped_url_flow_on_global_outlives_its_operation`
+- [x] the_gate_reports_a_transition_that_was_not_committed — gate `the_gate_reports_a_transition_that_skipped_the_commit`
+- [~] every_event_round_trips_its_documented_wire_shape — not applicable: the revision 2 events are gone; the revision 3 events are checked by `document-replica.test.ts` and the gate
+- [x] later_identical_mode_notification_overrides_setup_response — `controls.rs` `response_overrides_only_its_fields_between_early_and_later_updates`
+- [x] later_identical_config_notification_overrides_setup_response — as above
+- [x] streamed_text_publishes_only_the_new_suffix — gate `a_streamed_prompt_…_ends_in_one_event` (a streamed chunk changes its entry alone); `diff.rs` `text_growth_appends_and_other_changes_set`
 
