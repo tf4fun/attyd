@@ -86,6 +86,22 @@ fn a_subscriber_holding_the_epoch_is_sent_only_what_changed_after_its_version() 
 }
 
 #[test]
+fn a_subscriber_holding_another_epoch_or_a_rev_the_document_has_not_reached_is_sent_it_whole() {
+    let mut engine = Engine::default();
+    published(&mut engine, "E1", &["a"]);
+    published(&mut engine, "E1", &["a", "b"]);
+    for have in [
+        Have { epoch: "E0".into(), rev: 1 },
+        // Longer than the document: the replica is not a prefix of what the bridge holds.
+        Have { epoch: "E1".into(), rev: 9 },
+    ] {
+        let mut subscriber = Subscriber::new(&subscribed(Some(have.clone())));
+        subscriber.align(&engine);
+        assert_eq!(kinds(&mut subscriber), ["snapshot E1 rev 1 Replace [0, 1]"], "{have:?}");
+    }
+}
+
+#[test]
 fn a_scope_not_published_yet_is_aligned_when_it_is() {
     let mut engine = Engine::default();
     let mut subscriber = Subscriber::new(&subscribed(None));

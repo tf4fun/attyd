@@ -472,3 +472,116 @@ fn a_scope_that_ended_before_it_was_published_ends_for_the_subscriptions_that_wa
     assert_eq!(drain(&mut feed, other), Vec::<String>::new());
     assert!(feed.followed_sessions().get("s").is_none());
 }
+
+// -- Consumers that converge (docs/state-sync.md §4.1) -----------------------------------------
+
+/// A consumer of the feed: a subscription and the replica its events build.
+struct Consumer {
+    id: SubscriptionId,
+    replica: crate::protocol::replica::Replica,
+}
+
+impl Consumer {
+    fn new(feed: &mut Feed) -> Self {
+        let id = feed.subscribe(&follow(&[session()]));
+        Self {
+            id,
+            replica: Default::default(),
+        }
+    }
+
+    /// Takes every event queued for it.
+    fn take(&mut self, feed: &mut Feed) {
+        while let Some(event) = feed.next(self.id) {
+            let event = serde_json::to_value(event).unwrap();
+            if event["scope"] == "session/s" {
+                self.replica
+                    .apply(&event)
+                    .unwrap_or_else(|error| panic!("{error}: {event}"));
+            }
+        }
+    }
+
+    /// Closes the subscription and subscribes again with the version it holds.
+    fn reconnect(&mut self, feed: &mut Feed) {
+        feed.unsubscribe(self.id);
+        let have = (!self.replica.epoch.is_empty()).then(|| crate::protocol::engine::Have {
+            epoch: self.replica.epoch.clone(),
+            rev: self.replica.rev,
+        });
+        self.id = feed.subscribe(&[Subscribed {
+            scope: session(),
+            have,
+            cwd: None,
+        }]);
+    }
+}
+
+/// A deterministic generator for the reconnecting consumer.
+struct Lcg(u64);
+
+impl Lcg {
+    fn draw(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+}
+
+#[test]
+fn four_consumers_converge_one_by_one_lagging_reconnecting_and_paused() {
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit(&registry, &agent(), 0);
+    let mut following = Consumer::new(&mut feed);
+    let mut lagging = Consumer::new(&mut feed);
+    let mut reconnecting = Consumer::new(&mut feed);
+    let mut paused = Consumer::new(&mut feed);
+    let mut random = Lcg(7);
+
+    for step in 0..60u32 {
+        // Every ninth update is big: two of them pass a queue's budget, so a consumer that
+        // does not keep up is sent a snapshot instead of the events it missed.
+        let text = if step % 9 == 8 {
+            "x".repeat(crate::protocol::subscription::QUEUE_BUDGET * 3 / 5)
+        } else {
+            format!("update {step}")
+        };
+        registry
+            .append_session_update(
+                "s",
+                json!({ "sessionUpdate": "agent_message_chunk",
+                        "messageId": format!("m{}", step / 4),
+                        "content": { "type": "text", "text": text } }),
+            )
+            .unwrap();
+        feed.commit(&registry, &agent(), 0);
+        following.take(&mut feed);
+        if step % 7 == 6 {
+            lagging.take(&mut feed);
+        }
+        if random.draw() % 3 == 0 {
+            reconnecting.take(&mut feed);
+            reconnecting.reconnect(&mut feed);
+        }
+    }
+
+    for consumer in [&mut following, &mut lagging, &mut reconnecting, &mut paused] {
+        consumer.take(&mut feed);
+    }
+    let published = crate::protocol::replica::Replica::from_snapshot(
+        &serde_json::to_value(feed.snapshot("session/s").unwrap()).unwrap(),
+    );
+    for (name, consumer) in [
+        ("following", &following),
+        ("lagging", &lagging),
+        ("reconnecting", &reconnecting),
+        ("paused", &paused),
+    ] {
+        assert_eq!(consumer.replica.doc, published.doc, "{name}");
+        assert_eq!(consumer.replica.rev, published.rev, "{name}");
+    }
+    assert!(published.entries().len() > 10, "the updates reached the document");
+}
