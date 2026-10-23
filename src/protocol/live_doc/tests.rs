@@ -224,6 +224,28 @@ fn a_scopes_first_operation_is_over_and_replaced_nothing() {
     assert_eq!(global["after"], Value::Null);
 }
 
+/// The generated `Operation` type is the shape of the wire's: every member the document shows
+/// is a member of the type.
+#[test]
+fn the_operation_type_has_every_member_of_the_operation_document() {
+    let mut registry = registry();
+    let scope = Scope::Session("s".into());
+    let open = operation(&registry, &scope)["id"].as_str().unwrap().to_string();
+    registry
+        .install_operation_as(
+            &scope,
+            OperationKind::SetMode,
+            json!({ "modeId": "plan" }),
+            Some("Zm9yLXRoZS1jbGllbnQtMQ".into()),
+            Some(open),
+        )
+        .unwrap();
+    let (dto, _) = crate::protocol::project::shown_operation(&registry, &scope).unwrap();
+    let mut typed = serde_json::to_value(&dto).unwrap();
+    typed.as_object_mut().unwrap().remove("interactions");
+    assert_eq!(typed, operation(&registry, &scope));
+}
+
 #[test]
 fn an_operation_names_its_scope_the_operation_it_replaced_and_its_input() {
     let mut registry = registry();
