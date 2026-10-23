@@ -33,8 +33,18 @@ impl Replica {
     }
 
     pub(crate) fn apply(&mut self, event: &Value) -> Result<(), String> {
-        if event.get("snapshot").is_some() {
-            *self = Self::from_snapshot(event);
+        if let Some(snapshot) = event.get("snapshot") {
+            let mut installed = Self::from_snapshot(event);
+            // `update` keeps the entries held in the same epoch; those listed changed.
+            if snapshot["entries"]["base"] == "update" && snapshot["epoch"] == self.epoch.as_str() {
+                let mut held = self.entries();
+                held.resize(installed.entries().len(), Value::Null);
+                for pair in snapshot["entries"]["changed"].as_array().into_iter().flatten() {
+                    held[pair[0].as_u64().unwrap() as usize] = pair[1].clone();
+                }
+                installed.doc["entries"] = Value::Array(held);
+            }
+            *self = installed;
             return Ok(());
         }
         if event.get("digest").is_some() {
