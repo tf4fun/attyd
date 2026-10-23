@@ -17,6 +17,7 @@ mod login_terminals;
 mod occupation;
 mod reads;
 mod recovery;
+mod restart;
 mod retired_v1;
 #[cfg(unix)]
 mod review_terminal_io;
