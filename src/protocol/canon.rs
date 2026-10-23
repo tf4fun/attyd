@@ -999,8 +999,7 @@ mod tests {
         );
     }
 
-    // Mirrored by tests/fixtures/protocol-canon.ts, which checks it against the
-    // generated types.
+    // The wire shape of a log entry of the turn log.
     #[test]
     fn entries_use_the_documented_wire_shape() {
         let mut log = TurnLog::default();
