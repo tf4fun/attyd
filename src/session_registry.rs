@@ -22,7 +22,6 @@ pub(crate) struct SessionEntry {
 }
 
 pub(crate) struct SessionRef<'a> {
-    pub(crate) state: &'a SessionState,
     pub(crate) live: &'a SessionLiveState,
 }
 
@@ -57,7 +56,6 @@ impl SessionRegistry {
     pub(crate) fn session_ref(&self, session_id: &str) -> Option<SessionRef<'_>> {
         let state = &self.sessions.get(session_id)?.state;
         Some(SessionRef {
-            state,
             live: state.live.as_ref()?,
         })
     }

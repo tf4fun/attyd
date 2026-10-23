@@ -18,7 +18,7 @@ use super::documents::{
 use super::op::OpSlot;
 use super::wire::{self, Empty, PromptResult, SessionCreated};
 use crate::runtime_state::{
-    PendingInteraction, SessionLiveState, SessionOperationKind, UrlFlow, UrlFlowStatus,
+    SessionLiveState, SessionOperationKind, UrlFlow, UrlFlowStatus,
 };
 use crate::session_registry::SessionRegistry;
 
@@ -142,10 +142,6 @@ pub(crate) fn agent_error(error: &Value) -> ProtocolError {
     ProtocolError::agent(error)
 }
 
-fn held(live: &SessionLiveState) -> bool {
-    live.lifecycle != crate::runtime_state::SessionLifecycle::Closed
-}
-
 /// The ACP method of a request names the scope it belongs to: a list is the
 /// catalog's, a session's request is the session's, the rest are global.
 pub(crate) fn request_scope(session_id: Option<&str>, method: &str) -> Scope {
@@ -210,15 +206,6 @@ impl SessionRegistry {
         }
         slot.after = after;
         self.install(scope, slot)
-    }
-
-    /// Installs a running prompt with its normalized input.
-    pub(crate) fn install_prompt(
-        &mut self,
-        session_id: &str,
-        prompt: &[Value],
-    ) -> Result<String, InstallError> {
-        self.install_prompt_as(session_id, prompt, None, None)
     }
 
     pub(crate) fn install_prompt_as(
@@ -326,31 +313,6 @@ impl SessionRegistry {
 
     // -----------------------------------------------------------------------
     // Transitions, called by the registry's v1 transitions.
-
-    /// Every pending interaction: request-scoped ones, and each held
-    /// session's, with the session they wait in.
-    fn pending_interactions(&self) -> impl Iterator<Item = (&PendingInteraction, Pending)> {
-        let requests = self
-            .request_elicitations
-            .values()
-            .map(|pending| (pending, Pending::Request));
-        let sessions = self.sessions.iter().flat_map(|(session_id, entry)| {
-            entry
-                .state
-                .live
-                .iter()
-                .filter(|live| held(live))
-                .flat_map(move |live| {
-                    live.permissions
-                        .values()
-                        .map(move |pending| (pending, Pending::Permission(session_id.clone())))
-                        .chain(live.elicitations.values().map(move |pending| {
-                            (pending, Pending::Elicitation(session_id.clone()))
-                        }))
-                })
-        });
-        requests.chain(sessions)
-    }
 
     /// An interaction arrived in `scope`: it joins the operation shown there
     /// unless it already joined one.
@@ -920,25 +882,6 @@ impl SessionRegistry {
                     .is_some_and(|live| live.op.is_running_kind(OperationKind::Load))
         })
     }
-
-    /// A test's control update of a held session.
-    #[cfg(test)]
-    pub(crate) fn fold_session_controls(&mut self, session_id: &str, update: &Value) {
-        if let Some(live) = self.held_live_mut(session_id) {
-            live.controls.fold_update(update);
-        }
-    }
-}
-
-/// Where a pending interaction waits.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Pending {
-    /// A request-scoped elicitation, kept by the connection.
-    Request,
-    /// A permission of this session.
-    Permission(String),
-    /// A session-scoped elicitation of this session.
-    Elicitation(String),
 }
 
 /// How a login terminal's process ended.
