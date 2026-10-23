@@ -630,3 +630,34 @@ async fn a_create_runs_to_its_end_without_its_response_being_read() {
     assert!(live["sessions"].get("kept").is_some());
     watch.converged(&bench).await;
 }
+
+/// Audit Q5: a notification the bridge does not know, an extension (`_`-prefixed) one among
+/// them, is ignored. It tears down nothing: the connection stays up and the next update of the
+/// same Agent still reaches the session.
+#[tokio::test]
+async fn unknown_agent_notifications_are_ignored_and_the_connection_goes_on() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create_with(&mut link, "s", json!({})).await;
+    let mut watch = bench.watch(&scopes(&["global", "session/s"])).await;
+    watch
+        .until("the alignments", |watch| {
+            watch.has("global") && watch.has("session/s")
+        })
+        .await;
+
+    link.notify("_vendor/event", json!({"anything": [1, 2, 3]})).await;
+    link.notify("test/unknown_notification", json!({})).await;
+    link.update(
+        "s",
+        json!({"sessionUpdate": "agent_message_chunk", "messageId": "m", "content": text("still here")}),
+    )
+    .await;
+    watch
+        .until("the update after them arrives", |watch| {
+            json!(watch.entries("session/s")).to_string().contains("still here")
+        })
+        .await;
+    assert_eq!(watch.live("global")["agent"]["phase"], "ready");
+    assert_eq!(bench.accepted(), 1, "no second connection was needed");
+    watch.converged(&bench).await;
+}
