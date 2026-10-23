@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::*;
 
+mod actions;
 mod feed;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -195,6 +196,95 @@ impl Link {
     async fn close(mut self) {
         let _ = self.socket.close(None).await;
     }
+}
+
+// -- The scripted Agent, continued -----------------------------------------------------------
+
+impl Link {
+    async fn refuse(&mut self, request: &Value) {
+        self.send(json!({
+            "jsonrpc": "2.0", "id": request["id"],
+            "error": {"code": -32600, "message": "Refused by the Agent"},
+        }))
+        .await;
+    }
+
+    async fn agent_request(&mut self, id: &str, method: &str, params: Value) {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .await;
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) {
+        self.send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
+            .await;
+    }
+
+    /// The bridge's response to the Agent request `id`.
+    async fn response(&mut self, id: &str) -> Value {
+        self.responses(&[id]).await.remove(id).unwrap()
+    }
+
+    /// The bridge's responses to the Agent requests `ids`, in whatever order
+    /// they arrive. Responses to other requests stay queued, in order, for a
+    /// later call.
+    async fn responses(&mut self, ids: &[&str]) -> BTreeMap<String, Value> {
+        let mut found = BTreeMap::new();
+        let mut kept = Vec::new();
+        while found.len() < ids.len() {
+            let message = self.next(WAIT).await.unwrap_or_else(|| {
+                panic!("the responses to {ids:?} did not all reach the Agent: {found:?}")
+            });
+            if message.get("method").is_none() {
+                match message["id"].as_str().filter(|id| ids.contains(id)) {
+                    Some(id) => {
+                        assert!(
+                            found.insert(id.to_string(), message.clone()).is_none(),
+                            "two responses to {id}"
+                        );
+                    }
+                    None => kept.push(message),
+                }
+                continue;
+            }
+            assert!(
+                message.get("id").is_none(),
+                "unexpected Agent request {message} while waiting for the responses to {ids:?}"
+            );
+        }
+        for message in kept.into_iter().rev() {
+            self.buffered.push_front(message);
+        }
+        found
+    }
+}
+
+
+fn permission(session_id: &str, tool: &str) -> Value {
+    json!({
+        "sessionId": session_id,
+        "toolCall": {"toolCallId": tool, "title": "Confirm", "status": "pending"},
+        "options": [
+            {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+        ],
+    })
+}
+
+/// Session controls offered by `session/new`: two modes and one boolean
+/// config option.
+fn controls() -> Value {
+    json!({
+        "modes": {"currentModeId": "ask", "availableModes": [
+            {"id": "ask", "name": "Ask"}, {"id": "plan", "name": "Plan"},
+        ]},
+        "configOptions": [
+            {"type": "boolean", "id": "verbose", "name": "Verbose", "currentValue": false},
+        ],
+    })
+}
+
+fn verbose(value: bool) -> Value {
+    json!([{"type": "boolean", "id": "verbose", "name": "Verbose", "currentValue": value}])
 }
 
 // ---------------------------------------------------------------------------
