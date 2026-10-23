@@ -50,6 +50,7 @@ fn declarations(cfg: &Config) -> Vec<String> {
         Operation,
         Interaction,
         UrlFlow,
+        UrlFlowState,
         Terminal,
         ExitStatus,
         LoginTerminal,

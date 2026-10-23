@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::documents::{
     AgentInfo, CatalogLive, GlobalLive, Interaction, Operation, OperationSummary, PendingCounts,
-    Scope, SessionSummary, UrlFlow,
+    Scope, SessionSummary, UrlFlow, UrlFlowState,
 };
 use super::op::OpSlot;
 use crate::runtime_state::{PendingInteraction, SessionLifecycle, SessionLiveState, UrlFlowStatus};
@@ -183,6 +183,7 @@ pub(super) fn url_flows<'a>(
                     interaction_id: flow.registration_id.clone(),
                     elicitation_id: flow.elicitation_id.clone(),
                     request: flow.request.clone(),
+                    status: UrlFlowState::Waiting,
                 },
             )
         })

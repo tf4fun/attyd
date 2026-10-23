@@ -7,7 +7,7 @@
 //! embeds) and whether a close is outstanding.
 use serde_json::{Value, json};
 
-use super::documents::{AgentInfo, Scope};
+use super::documents::{AgentInfo, ExitStatus, Scope, Terminal};
 use super::engine;
 use super::project;
 use crate::runtime_state::{SessionLifecycle, SessionLiveState};
@@ -19,19 +19,18 @@ fn terminal(terminal_id: &str, snapshot: &Value, released: bool) -> Value {
     let exit_status = snapshot
         .get("exitStatus")
         .filter(|status| status.is_object())
-        .map(|status| {
-            json!({
-                "exitCode": status.get("exitCode").and_then(Value::as_i64),
-                "signal": status.get("signal").and_then(Value::as_str),
-            })
+        .map(|status| ExitStatus {
+            exit_code: status.get("exitCode").and_then(Value::as_i64),
+            signal: status.get("signal").and_then(Value::as_str).map(String::from),
         });
-    json!({
-        "terminalId": terminal_id,
-        "output": snapshot["output"].as_str().unwrap_or_default(),
-        "truncated": snapshot["truncated"].as_bool().unwrap_or(false),
-        "exitStatus": exit_status,
-        "released": released,
+    serde_json::to_value(Terminal {
+        terminal_id: terminal_id.to_string(),
+        output: snapshot["output"].as_str().unwrap_or_default().to_string(),
+        truncated: snapshot["truncated"].as_bool().unwrap_or(false),
+        exit_status,
+        released,
     })
+    .expect("a terminal serializes")
 }
 
 fn held(live: &SessionLiveState) -> bool {
@@ -76,8 +75,7 @@ fn interactions_doc(registry: &SessionRegistry, scope: &Scope) -> Value {
     serde_json::to_value(interactions).expect("interactions serialize")
 }
 
-/// The accepted URL flows of `scope`, by interaction ID (protocol §4.6). A
-/// flow is waiting until it is settled.
+/// The accepted URL flows of `scope`, by interaction ID (protocol §4.6).
 fn url_flows_doc(registry: &SessionRegistry, scope: &Scope) -> Value {
     let flows = match scope {
         Scope::Session(session_id) => registry
@@ -95,15 +93,7 @@ fn url_flows_doc(registry: &SessionRegistry, scope: &Scope) -> Value {
             .unwrap_or_default(),
         _ => project::url_flows(project::request_flows(registry, scope)),
     };
-    let mut flows = serde_json::to_value(flows).expect("flows serialize");
-    for flow in flows
-        .as_object_mut()
-        .into_iter()
-        .flat_map(|flows| flows.values_mut())
-    {
-        flow["status"] = Value::String("waiting".into());
-    }
-    flows
+    serde_json::to_value(flows).expect("flows serialize")
 }
 
 /// The complete `live` of `scope` (protocol §4.1–§4.4): the members every scope

@@ -104,7 +104,9 @@ interactionId: string,
 /**
  * Agent-chosen; may be reused after the flow ends.
  */
-elicitationId: string, request: CreateElicitationRequest, };
+elicitationId: string, request: CreateElicitationRequest, status: UrlFlowState, };
+
+export type UrlFlowState = "waiting" | "completed" | "ended";
 
 export type Terminal = { 
 /**
@@ -114,7 +116,11 @@ terminalId: string,
 /**
  * A bounded tail (`trim`, protocol §5.3).
  */
-output: string, truncated: boolean, exitStatus: ExitStatus | null, };
+output: string, truncated: boolean, exitStatus: ExitStatus | null, 
+/**
+ * Its handle is gone and the output frozen.
+ */
+released: boolean, };
 
 export type ExitStatus = { exitCode: number | null, signal: string | null, };
 
