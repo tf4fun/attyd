@@ -21,7 +21,7 @@ async fn until_phase(stream: &mut Watch, phases: &[&str]) {
 /// connection; `restart` starts one and `global`'s phase follows to `ready`.
 #[tokio::test]
 async fn restart_starts_the_connection_nothing_passive_would() {
-    let (server, link) = Bench::start(json!({})).await;
+    let (mut server, link) = Bench::start(json!({})).await;
     let mut stream = server.watch("scope=global&scope=catalog").await;
     stream.event().await;
     stream.event().await;
