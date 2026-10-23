@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Content blocks and attachment references
@@ -121,10 +120,7 @@ pub(crate) fn normalize(blocks: &[Value], attachments: &mut Attachments) -> Vec<
             AttachmentKind::Resource => source["uri"].as_str().map(String::from),
             AttachmentKind::Image | AttachmentKind::Audio => None,
         };
-        let id = Sha256::digest(canonical_json(&block))
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let id = super::timeline_doc::attachment_id(&block);
         attachments
             .0
             .entry(id.clone())
@@ -463,6 +459,27 @@ mod tests {
                 "resource": { "uri": "file:///x.txt", "mimeType": "text/plain", "text": "t" },
             }))
         );
+    }
+
+    #[test]
+    fn blocks_differing_in_an_integer_beyond_two_to_the_53_get_different_ids() {
+        let with = |number: &str| {
+            serde_json::from_str::<Value>(&format!(
+                r#"{{"type":"image","mimeType":"image/png","data":"aGk=","count":{number}}}"#
+            ))
+            .unwrap()
+        };
+        let id = |block: Value| {
+            let mut attachments = Attachments::default();
+            match normalize(&[block], &mut attachments).remove(0) {
+                Block::Attachment(reference) => reference.id,
+                other => panic!("an image is referenced: {other:?}"),
+            }
+        };
+        let (a, b) = (with("9007199254740993"), with("9007199254740992"));
+        assert_ne!(id(a.clone()), id(b), "integers are written exactly, not rounded to a double");
+        // The same definition as the published timeline's attachments.
+        assert_eq!(id(a.clone()), crate::protocol::timeline_doc::attachment_id(&a));
     }
 
     #[test]
