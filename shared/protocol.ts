@@ -128,19 +128,31 @@ export type LoginTerminal = { terminalId: string, output: string, truncated: boo
 /**
  * The authentication method it runs.
  */
-methodId: string, };
+methodId: string, 
+/**
+ * Always `false`: a login's handle lasts until it is dismissed.
+ */
+released: boolean, };
 
 export type SessionLive = { op: Operation, 
+/**
+ * Pending, by interaction ID (protocol §4.4): beside the operation, not part of it.
+ */
+interactions: { [key in string]: Interaction }, 
 /**
  * By interaction ID.
  */
 urlFlows: { [key in string]: UrlFlow }, sessionId: string, cwd: string, controls: SessionControls, 
 /**
- * Agent terminals not yet released.
+ * Agent terminals, those with a handle and those released whose output an entry embeds.
  */
-terminals: { [key in string]: Terminal }, };
+terminals: { [key in string]: Terminal }, 
+/**
+ * A close request is outstanding.
+ */
+closing: boolean, };
 
-export type GlobalLive = { op: Operation, urlFlows: { [key in string]: UrlFlow }, agent: AgentInfo, 
+export type GlobalLive = { op: Operation, interactions: { [key in string]: Interaction }, urlFlows: { [key in string]: UrlFlow }, agent: AgentInfo, 
 /**
  * Sessions the bridge holds.
  */
@@ -150,11 +162,15 @@ sessions: { [key in string]: SessionSummary },
  */
 terminals: { [key in string]: LoginTerminal }, };
 
-export type CatalogLive = { op: Operation, urlFlows: { [key in string]: UrlFlow }, 
+export type CatalogLive = { op: Operation, interactions: { [key in string]: Interaction }, urlFlows: { [key in string]: UrlFlow }, 
 /**
  * Changes when the Agent's list may have changed.
  */
-revision: string, };
+revision: string, 
+/**
+ * The pages listed since `revision` last changed, in order.
+ */
+pages: Array<{ sessions: Array<import("@agentclientprotocol/sdk").SessionInfo>; nextCursor: string | null; _meta?: unknown }>, };
 
 export type AgentInfo = { phase: AgentPhase, error: ProtocolError | null, launch: AgentLaunch, initialize: InitializeResponse | null, authenticatedMethodId: string | null, };
 
@@ -190,6 +206,7 @@ export type OpRequest = {
 /**
  * The `op.id` the write expects the scope to show.
  */
+error: test failed, to rerun pass `--bin attyd`
 expect: string, } & ({ "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty });
 
 export type OpArgs = { "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty };
