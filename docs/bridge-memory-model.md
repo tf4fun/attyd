@@ -501,9 +501,13 @@ input, not computed by the reducer under test. This model adds:
 | Legacy plan | one session-level plan | per derived turn (§3.4) |
 | Terminal release | handle removed, entity kept by tool content | handle/output split (§8.3) |
 | Stale responses | `turn_id` check | session generation (§9) |
+| Connection lost, no thread | the dead connection stays in the store and a new thread fails with `incoming_transport_closed`; expected: the next new thread starts the Agent again, or an "agent exited — restart" affordance ([#62828](https://github.com/zed-industries/zed/issues/62828)); idle connections reaped after 30–40 s ([#62922](https://github.com/zed-industries/zed/pull/62922)) | `restart` action on `global`; a followed session or a login still starts the next connection (audit Q8) |
+| Closing a session | `close_session`; `should_close_sessions_on_release` defaults to `supports_close_session` ([connection.rs](https://raw.githubusercontent.com/zed-industries/zed/main/crates/acp_thread/src/connection.rs)) | an unneeded session is closed at the Agent when released (§8.4); `close` is an action for API clients and R2; no extra button (audit Q9) |
+| Accepted URL entries | kept after success so a late completion arrives; cancelling an accepted flow emits no second response ([#64609](https://github.com/zed-industries/zed/pull/64609)); a disconnect wakes the waiters and retries nothing ([#65646](https://github.com/zed-industries/zed/pull/65646)) | a flow `ended` by the connection's end stays in the final documents; the next connection starts without it (audit Q10) |
 
 Zed's editor services, local thread storage, checkpoints and vendor `_meta`
-interpretation are not adopted.
+interpretation are not adopted. The last three rows were compared on 2026-10-23 from Zed's
+trait documentation and from its issues and pull requests; #62828 and #62922 were still open.
 
 ## 12. Open items
 
