@@ -226,7 +226,11 @@ export type OpAccepted = { op: string, };
 
 export type SessionCreated = { sessionId: string, };
 
-export type CatalogPage = { revision: string, sessions: Array<import("@agentclientprotocol/sdk").SessionInfo>, nextCursor: string | null, };
+export type CatalogPage = { revision: string, sessions: Array<import("@agentclientprotocol/sdk").SessionInfo>, nextCursor: string | null, 
+/**
+ * The Agent's `_meta` of this page.
+ */
+_meta?: unknown, };
 
 export type PromptResult = { stopReason: PromptResponse["stopReason"], usage?: PromptResponse["usage"], };
 
