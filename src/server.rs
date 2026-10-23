@@ -730,7 +730,12 @@ async fn read_session(
                 .feed
                 .attachment(session_id, attachment_id);
             match block {
-                Some(block) => axum::Json(block).into_response(),
+                // The bytes the ID hashes, so a client verifies the read by hashing its body.
+                Some(block) => (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    crate::protocol::timeline_doc::exact_form(&block),
+                )
+                    .into_response(),
                 None => refused(ProtocolError::new(
                     ErrorCode::NotFound,
                     format!("{scope} references no attachment {attachment_id}"),
