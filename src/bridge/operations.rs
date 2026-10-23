@@ -280,15 +280,6 @@ fn cancel(
         (OpKind::TerminalLogin, _) => {
             let _ = auth_terminal.cancel(op);
         }
-        (OpKind::AgentRequest, _) => {
-            // An interaction the Agent cancelled meanwhile needs no outcome.
-            let deliveries = cancel_outcomes(state, scope)
-                .into_iter()
-                .filter_map(|outcome| deliveries(state, vec![outcome]).ok())
-                .flatten()
-                .collect();
-            deliver(state, sink, deliveries);
-        }
         _ => unreachable!("admission refuses a cancel of other kinds"),
     }
 }
@@ -344,7 +335,7 @@ fn command(state: &BridgeState, scope: &OpScope, kind: OpKind, op: &str, input: 
             }
             command
         }
-        OpKind::Load | OpKind::Open | OpKind::None | OpKind::AgentRequest => {
+        OpKind::Load | OpKind::Open | OpKind::None => {
             unreachable!("bridge-started kinds are never admitted")
         }
     };

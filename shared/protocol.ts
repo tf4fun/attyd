@@ -72,7 +72,7 @@ data?: unknown, };
 
 export type ErrorCode = "invalid_request" | "not_found" | "stale" | "not_allowed" | "catalog_changed" | "unsupported" | "unavailable" | "agent_error";
 
-export type OperationKind = "prompt" | "set_mode" | "set_config" | "fork" | "create" | "delete" | "authenticate" | "logout" | "terminal_login" | "list" | "load" | "open" | "none" | "agent_request";
+export type OperationKind = "prompt" | "set_mode" | "set_config" | "fork" | "create" | "delete" | "authenticate" | "logout" | "terminal_login" | "list" | "load" | "open" | "none";
 
 export type OperationStatus = "running" | "completed" | "failed" | "cancelled";
 

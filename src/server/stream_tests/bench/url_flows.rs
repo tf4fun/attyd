@@ -117,7 +117,7 @@ async fn dismiss(
 }
 
 /// Flows accepted in `global` (an authenticate), `catalog` (a list) and a
-/// session (a prompt, and an `agent_request`) outlive their operation and its
+/// session (a prompt, and none) outlive their operation and its
 /// replacement, and each ends only by its own lifecycle.
 #[tokio::test]
 async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
@@ -273,8 +273,8 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
     }
     drop(second);
 
-    // session: an Agent request with no running operation starts an
-    // `agent_request`; its accepted flow outlives it and the next prompt.
+    // session: an Agent request with no running operation starts no operation; its accepted
+    // flow outlives the next prompt.
     // The Agent's `elicitation/complete` ends that one flow.
     let asked = accept_flow(
         &bench,
@@ -286,10 +286,7 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
     )
     .await;
     let asking = watch.live("session/s")["op"].clone();
-    assert_eq!(asking["kind"], "agent_request");
-    watch
-        .until_op("session/s", &asking["id"], "completed")
-        .await;
+    assert_ne!(asking["status"], "running", "no operation started");
     let asked_kept = flow(&watch.live("session/s"), &asked);
     assert!(!asked_kept.is_null());
     watch

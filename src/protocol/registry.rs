@@ -145,21 +145,6 @@ pub(crate) fn request_scope(session_id: Option<&str>, method: &str) -> Scope {
     }
 }
 
-/// Starts an `agent_request` for interactions that joined no operation, and
-/// completes one whose interactions are gone (protocol §6.2). An interaction
-/// that joined an operation which ended is cancelled, not re-homed.
-fn settle_agent_request(slot: &mut OpSlot, unjoined: bool, joined: bool) {
-    if unjoined && !slot.is_running() {
-        *slot = OpSlot::running(OperationKind::AgentRequest, json!({}));
-    } else if !unjoined && !joined && slot.is_running_kind(OperationKind::AgentRequest) {
-        if slot.cancel_requested {
-            slot.status = super::documents::OperationStatus::Cancelled;
-        } else {
-            slot.complete(wire::value(&Empty {}));
-        }
-    }
-}
-
 impl SessionRegistry {
     fn held_live(&self, session_id: &str) -> Option<&SessionLiveState> {
         self.sessions.get(session_id)?.state.live.as_ref()
@@ -356,61 +341,6 @@ impl SessionRegistry {
         requests.chain(sessions)
     }
 
-    /// Whether a pending interaction joined `op`.
-    fn has_joined(&self, op: &str) -> bool {
-        self.pending_interactions().any(|(pending, _)| {
-            self.scopes
-                .joined
-                .get(&pending.interaction_id)
-                .is_some_and(|joined| joined.op == op)
-        })
-    }
-
-    /// A transition of `session_id` ended: settle its `agent_request`.
-    pub(crate) fn settle_session_ops(&mut self, session_id: &str) {
-        if self.scopes.occupied.contains_key(session_id) {
-            return;
-        }
-        let Some(live) = self.held_live(session_id) else {
-            return;
-        };
-        let op = &live.op.id;
-        let own = live
-            .permissions
-            .values()
-            .chain(live.elicitations.values())
-            .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id));
-        let joined = self.has_joined(op);
-        let live = self.held_live_mut(session_id).expect("held session");
-        settle_agent_request(&mut live.op, own, joined);
-    }
-
-    /// A connection-level transition ended: settle the `agent_request` of
-    /// `global` (its own interactions are those that joined no operation) and
-    /// of every scope a request-scoped interaction joined.
-    pub(crate) fn settle_global_ops(&mut self) {
-        let unjoined = self
-            .request_elicitations
-            .values()
-            .any(|pending| !self.scopes.joined.contains_key(&pending.interaction_id));
-        let joined = self.has_joined(&self.scopes.global.id);
-        settle_agent_request(&mut self.scopes.global, unjoined, joined);
-        let joined = self.has_joined(&self.scopes.catalog.id);
-        settle_agent_request(&mut self.scopes.catalog, false, joined);
-        let sessions: Vec<String> = self
-            .scopes
-            .joined
-            .values()
-            .filter_map(|joined| match &joined.scope {
-                Scope::Session(session_id) => Some(session_id.clone()),
-                _ => None,
-            })
-            .collect();
-        for session_id in sessions {
-            self.settle_session_ops(&session_id);
-        }
-    }
-
     /// An interaction arrived in `scope`: it joins the operation shown there
     /// unless it already joined one.
     pub(crate) fn bind_interaction(&mut self, interaction_id: &str, scope: Scope) {
@@ -419,8 +349,8 @@ impl SessionRegistry {
         }
     }
 
-    /// A request-scoped interaction arrived for `scope`: it joins the running
-    /// operation shown there, or starts an `agent_request` (protocol §6.2).
+    /// A request-scoped interaction arrived for `scope`: it joins the operation shown there,
+    /// which its parent request was sent for (protocol §6.2).
     /// An unheld session's request falls back to `global`.
     pub(crate) fn join_interaction(&mut self, interaction_id: &str, scope: Scope) {
         let scope = match &scope {
@@ -436,11 +366,7 @@ impl SessionRegistry {
                 .unwrap_or_else(|| scope.clone()),
             _ => scope.clone(),
         };
-        let slot = self.slot_mut(&owner);
-        if !slot.is_running() {
-            *slot = OpSlot::running(OperationKind::AgentRequest, json!({}));
-        }
-        let op = slot.id.clone();
+        let op = self.slot_mut(&owner).id.clone();
         self.scopes
             .joined
             .insert(interaction_id.to_string(), Joined { scope, op });

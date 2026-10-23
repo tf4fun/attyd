@@ -192,7 +192,7 @@ async fn a_session_scoped_interaction_outlives_the_control_operation_it_arrived_
     let live = peer.live(&scope);
     assert_eq!(
         live["op"]["id"], op,
-        "completion must not re-home its interaction in a new agent_request"
+        "completion must not re-home its interaction in a new operation"
     );
     assert_eq!(live["op"]["status"], "completed");
     assert_eq!(live["controls"]["modes"]["currentModeId"], "plan");
