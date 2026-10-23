@@ -28,19 +28,16 @@ const WAIT: Duration = Duration::from_secs(5);
 
 type Documents = BTreeMap<String, Value>;
 
-/// One step of a scope as a replica saw it: the event (none for the initial cut) and the
-/// document after it.
+/// One step of a scope as a replica saw it: the document after an event (or the initial cut).
 #[derive(Debug, Clone)]
 struct Step {
-    event: Option<Value>,
     doc: Value,
     ended_prompts: usize,
 }
 
 impl Step {
-    fn of(event: Option<Value>, replica: &Replica) -> Self {
+    fn of(replica: &Replica) -> Self {
         Self {
-            event,
             doc: replica.doc.clone(),
             ended_prompts: replica.ended_prompts(),
         }
@@ -71,7 +68,7 @@ impl Gate {
         for (scope, document) in cut {
             let replica = Replica::from_snapshot(document);
             gate.timeline
-                .insert(scope.clone(), vec![Step::of(None, &replica)]);
+                .insert(scope.clone(), vec![Step::of(&replica)]);
             gate.replicas.insert(scope.clone(), replica);
         }
         gate
@@ -118,7 +115,7 @@ impl Gate {
             self.timeline
                 .entry(scope)
                 .or_default()
-                .push(Step::of(Some(event.clone()), replica));
+                .push(Step::of(replica));
         }
         self.history.push(events);
         self.check(documents);
