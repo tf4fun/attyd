@@ -24,7 +24,6 @@ const ACP_TYPES: &[&str] = &[
     "RequestPermissionRequest",
     "SessionConfigOption",
     "SessionMode",
-    "SessionUpdate",
 ];
 
 fn declarations(cfg: &Config) -> Vec<String> {

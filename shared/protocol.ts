@@ -13,7 +13,6 @@ import type {
   RequestPermissionRequest,
   SessionConfigOption,
   SessionMode,
-  SessionUpdate,
 } from "@agentclientprotocol/sdk";
 
 export type SessionControls = { modes: SessionModes | null, 
@@ -49,16 +48,6 @@ export type Op = { "op": "set", path: string, value: unknown, } | { "op": "remov
 
 export type AppendTail = { values: unknown[], } | { text: string, };
 
-export type Turn = { 
-/**
- * The user's message, normalized.
- */
-prompt: Array<Block>, 
-/**
- * The Agent's message content, in order, normalized.
- */
-reply: Array<Block>, };
-
 export type Block = AttachmentRef | Extract<ContentBlock, { type: "text" | "resource_link" }>;
 
 export type PromptBlock = AttachmentRef | ContentBlock;
@@ -74,12 +63,6 @@ id: string, block: AttachmentKind, mimeType?: string,
 uri?: string, };
 
 export type AttachmentKind = "image" | "audio" | "resource";
-
-export type LogEntry = { turn: Turn, 
-/**
- * `h_i` in its wire form (protocol §3.3).
- */
-hash: string, };
 
 export type ProtocolError = { code: ErrorCode, message: string, 
 /**
@@ -193,20 +176,6 @@ export type OperationSummary = { kind: OperationKind, status: OperationStatus, }
 
 export type PendingCounts = { interactions: number, urlFlows: number, };
 
-export type Event = { scope: string, log: LogChange, live?: LiveChange, } | { scope: string, live: LiveChange, } | { scope: string, end: End, };
-
-export type LogChange = { 
-/**
- * Truncate the log to this length, then append.
- */
-from: number, 
-/**
- * `h_from`, as the client must hold it.
- */
-prev: string, entries: Array<LogEntry>, };
-
-export type LiveChange = { replace: unknown, } | { patch: Array<Op>, };
-
 export type End = { reason: EndReason, error?: ProtocolError, };
 
 export type EndReason = "deleted" | "closed" | "load_failed";
@@ -251,10 +220,6 @@ export type Answer = { outcome: RequestPermissionOutcome, } | { response: Create
 
 export type OpAccepted = { op: string, };
 
-export type OpEnded = { op: string, } & ({ result: unknown, } | { error: ProtocolError, });
-
-export type OpOutcome = { result: unknown, } | { error: ProtocolError, };
-
 export type SessionCreated = { sessionId: string, };
 
 export type CatalogPage = { revision: string, sessions: Array<import("@agentclientprotocol/sdk").SessionInfo>, nextCursor: string | null, };
@@ -264,8 +229,6 @@ export type PromptResult = { stopReason: PromptResponse["stopReason"], usage?: P
 export type TerminalInput = { data: string, };
 
 export type TerminalResize = { cols: number, rows: number, };
-
-export type ScopeRead = { live: SessionLive | GlobalLive | CatalogLive, log?: Array<LogEntry>, };
 
 export type ContextMatches = { matches: Array<ContextMatch>, };
 
@@ -284,15 +247,3 @@ export type ErrorBody = { error: ProtocolError, };
 export type HostError = { error: string, };
 
 export type Health = { ok: boolean, protocol: string, backend: string, };
-
-export type ProcessUpdate = ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" }>, "content"> | ProjectedFields<Extract<SessionUpdate, { sessionUpdate: "compaction_update" }>, "summary"> | ProjectedToolCall<Extract<SessionUpdate, { sessionUpdate: "tool_call" | "tool_call_update" }>> | Exclude<SessionUpdate, { sessionUpdate: "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "compaction_summary_chunk" | "compaction_update" | "tool_call" | "tool_call_update" }>;
-
-export type ProjectedFields<T, K extends PropertyKey> = T extends unknown ? { [P in keyof T]: P extends K ? ProjectedBlocks<T[P]> : T[P] } : never;
-
-export type ProjectedBlocks<V> = V extends ContentBlock ? Block : V extends Array<infer B> ? Array<ProjectedBlocks<B>> : V;
-
-export type ProjectedToolCall<T> = T extends unknown ? { [P in keyof T]: P extends "content" ? ProjectedToolCallContents<T[P]> : T[P] } : never;
-
-export type ProjectedToolCallContents<V> = V extends Array<infer C> ? Array<ProjectedToolCallContent<C>> : V;
-
-export type ProjectedToolCallContent<C> = C extends { type: "content" } ? ProjectedFields<C, "content"> : C;
