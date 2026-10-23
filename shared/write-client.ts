@@ -142,6 +142,11 @@ export class ActionsClient {
     return this.#post(`${base(scope)}/actions/set_config`, { configId, value }, true);
   }
 
+  /** Starts the Agent connection when none runs (`global`, §7); done once it is started. */
+  restart(): Promise<ActionOutcome> {
+    return this.#post(`${base("global")}/actions/restart`, {}, false);
+  }
+
   close(scope: string): Promise<ActionOutcome> {
     return this.#post(`${base(scope)}/actions/close`, {}, true);
   }

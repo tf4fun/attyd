@@ -654,7 +654,13 @@ export class Workspace {
     this.#changed();
   };
 
+  /**
+   * Follows again, and starts the Agent when it is stopped or failed: with no session followed,
+   * nothing else would (protocol §7, audit Q8). A connection that is already starting refuses it.
+   */
   reconnect = (): void => {
+    const phase = this.#global()?.agent.phase;
+    if (phase === "stopped" || phase === "error") void this.#actions.restart().then(() => this.#changed());
     this.#applyFollow(true);
   };
 

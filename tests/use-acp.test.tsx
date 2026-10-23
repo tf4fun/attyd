@@ -192,6 +192,25 @@ describe("revision 3 workspace, read side", () => {
     expect(hook.state.defaultCwd).toBe("/w");
   });
 
+  it("restarts the Agent when the page reconnects and the Agent is stopped", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({ agent: agent({ phase: "stopped" }) })));
+    await emit(catalogSnapshot());
+    expect(hook.state.phase).toBe("stopped");
+    respond = () => ({ status: 204 });
+    await act(async () => hook.reconnect());
+    expect(posts.map(({ url }) => url)).toEqual(["/api/v2/scopes/global/actions/restart"]);
+    expect(posts[0].body).toEqual({});
+  });
+
+  it("only follows again when the Agent is ready: no restart is sent", async () => {
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    await act(async () => hook.reconnect());
+    expect(posts).toEqual([]);
+  });
+
   it("keeps one working stream across a StrictMode effect replay and closes it on unmount", async () => {
     await mount("/", true);
     expect(current().scopes).toEqual(["global", "catalog"]);
