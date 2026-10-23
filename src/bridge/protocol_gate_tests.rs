@@ -476,6 +476,28 @@ impl Peer {
             .expect("the operation's end was dropped")
     }
 
+    /// Answers one interaction at its resource (protocol §7), as the route does.
+    async fn answer_resource(
+        &self,
+        scope: &str,
+        interaction: &str,
+        body: Value,
+    ) -> Result<(), ProtocolError> {
+        let (reply, acted) = oneshot::channel();
+        self.commands
+            .send(BridgeInput::Resource {
+                scope: Scope::parse(scope).unwrap(),
+                resource: interaction.to_string(),
+                action: resources::ResourceAction::Answer { body },
+                reply,
+            })
+            .unwrap();
+        tokio::time::timeout(WAIT, acted)
+            .await
+            .expect("the answer was not handled")
+            .expect("the bridge dropped the answer")
+    }
+
     /// Answers `interaction`, the one pending interaction of the operation
     /// running in `scope`.
     async fn answer(&mut self, scope: &str, interaction: &str, answer: Value) {

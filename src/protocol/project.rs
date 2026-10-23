@@ -71,44 +71,38 @@ fn interaction(pending: &PendingInteraction, permission: bool) -> (String, Inter
     (interaction_id, interaction)
 }
 
-/// A session's pending interactions that belong to `op`.
-fn session_interactions(
-    registry: &SessionRegistry,
-    live: &SessionLiveState,
-    op: &str,
-    into: &mut BTreeMap<String, Interaction>,
-) {
-    let belongs = |pending: &&PendingInteraction| registry.belongs_to(&pending.interaction_id, op);
+/// A session's pending interactions. An operation's end ends none of them (memory model §8.2).
+fn session_interactions(live: &SessionLiveState, into: &mut BTreeMap<String, Interaction>) {
     into.extend(
         live.permissions
             .values()
-            .filter(belongs)
             .map(|pending| interaction(pending, true)),
     );
     into.extend(
         live.elicitations
             .values()
-            .filter(belongs)
             .map(|pending| interaction(pending, false)),
     );
 }
 
-/// The pending interactions of the operation `op` in `owner`'s slot: its own
-/// scope's, those of the scopes it occupies, and the request-scoped ones that
-/// joined it (protocol §6.2).
-fn interactions(
-    registry: &SessionRegistry,
-    owner: &Scope,
-    op: &str,
-) -> BTreeMap<String, Interaction> {
+/// The pending interactions `owner`'s slot shows: its own scope's, those of the scopes it
+/// occupies, and the request-scoped ones that were sent for a write or a load of those scopes
+/// (protocol §6.2). Whether an operation runs does not matter: an interaction is the scope's
+/// until it is answered or ends by its own lifetime.
+fn interactions(registry: &SessionRegistry, owner: &Scope) -> BTreeMap<String, Interaction> {
     let mut interactions = BTreeMap::new();
+    let shown = |scope: &Scope| {
+        scope == owner
+            || matches!(scope, Scope::Session(session_id)
+                if registry.scopes.occupied.get(session_id) == Some(owner))
+    };
     let joined =
         |pending: &&PendingInteraction| registry.scopes.joined.get(&pending.interaction_id);
     interactions.extend(
         registry
             .request_elicitations
             .values()
-            .filter(|pending| joined(pending).is_some_and(|joined| joined.op == op))
+            .filter(|pending| joined(pending).is_some_and(|joined| shown(&joined.scope)))
             .map(|pending| interaction(pending, false)),
     );
     match owner {
@@ -122,7 +116,7 @@ fn interactions(
         Scope::Catalog => {}
         Scope::Session(session_id) => {
             if let Some(live) = held_live(registry, session_id) {
-                session_interactions(registry, live, op, &mut interactions);
+                session_interactions(live, &mut interactions);
             }
         }
     }
@@ -130,7 +124,7 @@ fn interactions(
         if occupier == owner
             && let Some(live) = held_live(registry, session_id)
         {
-            session_interactions(registry, live, op, &mut interactions);
+            session_interactions(live, &mut interactions);
         }
     }
     interactions
@@ -143,12 +137,7 @@ fn operation(slot: &OpSlot, interactions: BTreeMap<String, Interaction>) -> Oper
         status: slot.status,
         input: slot.input.clone(),
         cancel_requested: slot.cancel_requested,
-        // An operation's end clears its pending interactions (S7).
-        interactions: if slot.is_running() {
-            interactions
-        } else {
-            BTreeMap::new()
-        },
+        interactions,
         process: None,
         result: slot.result.clone(),
         error: slot.error.clone(),
@@ -175,7 +164,7 @@ pub(super) fn shown_operation(
     let owner = owner(registry, scope);
     let slot = registry.shown_slot(scope)?;
     Some((
-        operation(slot, interactions(registry, &owner, &slot.id)),
+        operation(slot, interactions(registry, &owner)),
         owner,
     ))
 }
@@ -322,7 +311,7 @@ pub(crate) fn project_global(registry: &SessionRegistry, agent: &AgentInfo) -> G
     GlobalLive {
         op: operation(
             &registry.scopes.global,
-            interactions(registry, &Scope::Global, &registry.scopes.global.id),
+            interactions(registry, &Scope::Global),
         ),
         url_flows: url_flows(request_flows(registry, &Scope::Global)),
         agent: agent.clone(),
@@ -342,7 +331,7 @@ pub(crate) fn project_catalog(registry: &SessionRegistry, revision: u64) -> Cata
     CatalogLive {
         op: operation(
             &registry.scopes.catalog,
-            interactions(registry, &Scope::Catalog, &registry.scopes.catalog.id),
+            interactions(registry, &Scope::Catalog),
         ),
         url_flows: url_flows(request_flows(registry, &Scope::Catalog)),
         revision: revision.to_string(),

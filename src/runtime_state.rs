@@ -883,22 +883,8 @@ impl SessionRegistry {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let owner = self.live_owner_mut(session_id)?;
-        let retired = session_live::seal_turn(owner, operation_id, terminal)?;
+        session_live::seal_turn(owner, operation_id, terminal)?;
         self.end_session_turn(session_id, end);
-        self.effects
-            .extend(retired.permissions.into_iter().map(|interaction_id| {
-                RuntimeEffect::CancelPermissionResponder {
-                    session_id: session_id.to_string(),
-                    interaction_id,
-                }
-            }));
-        self.effects
-            .extend(retired.elicitations.into_iter().map(|interaction_id| {
-                RuntimeEffect::CancelElicitationResponder {
-                    session_id: Some(session_id.to_string()),
-                    interaction_id,
-                }
-            }));
         self.settle_session_ops(session_id);
         Ok(())
     }
@@ -1633,11 +1619,6 @@ mod session_live {
         SessionState, TurnTerminal, remember_resolved_interaction, remember_resolved_permission,
     };
 
-    pub(super) struct TurnRetirement {
-        pub(super) permissions: Vec<String>,
-        pub(super) elicitations: Vec<String>,
-    }
-
     pub(super) fn start_operation(
         owner: &mut SessionState,
         operation_id: String,
@@ -1712,7 +1693,7 @@ mod session_live {
         owner: &mut SessionState,
         operation_id: &str,
         terminal: TurnTerminal,
-    ) -> Result<TurnRetirement, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         let session = owner
             .live
             .as_mut()
@@ -1733,30 +1714,9 @@ mod session_live {
         if let Some(lifecycle) = lifecycle {
             session.lifecycle = lifecycle;
         }
-        let resolved_permissions = session
-            .permissions
-            .iter()
-            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
-            .map(|(interaction_id, _)| interaction_id.clone())
-            .collect::<Vec<_>>();
-        for interaction_id in &resolved_permissions {
-            session.permissions.remove(interaction_id);
-            remember_resolved_permission(session, interaction_id);
-        }
-        let resolved_elicitations = session
-            .elicitations
-            .iter()
-            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
-            .map(|(interaction_id, _)| interaction_id.clone())
-            .collect::<Vec<_>>();
-        for interaction_id in &resolved_elicitations {
-            session.elicitations.remove(interaction_id);
-            remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
-        }
-        Ok(TurnRetirement {
-            permissions: resolved_permissions,
-            elicitations: resolved_elicitations,
-        })
+        // The turn's end ends no interaction (memory model §8.2): a session-scoped one is
+        // answered, cancelled by the Agent or the user, or goes with the session.
+        Ok(())
     }
 
     pub(super) fn upsert_permission(
@@ -2517,13 +2477,9 @@ mod tests {
         state
             .complete_prompt("epoch", "session", "intent", json!({}))
             .unwrap();
-        assert_eq!(
-            state.take_effects(),
-            vec![RuntimeEffect::CancelPermissionResponder {
-                session_id: "session".to_string(),
-                interaction_id: "permission".to_string()
-            }]
-        );
+        // The turn's end ends no interaction: the permission is still pending, with no effect.
+        assert!(state.take_effects().is_empty());
+        assert!(state.session("session").unwrap().permissions.contains_key("permission"));
         state
             .complete_turn(
                 "session",
@@ -4061,7 +4017,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_turn_drops_cancel_flag_and_cleans_owned_interactions() {
+    fn a_sealed_turn_drops_its_cancel_flag_and_ends_no_interaction() {
         let mut state = state();
         open(&mut state, "session");
         state
@@ -4094,23 +4050,12 @@ mod tests {
             )
             .unwrap();
 
+        // The turn is over; the interactions the Agent asked of the session are still its own
+        // (memory model §8.2), and nothing answers their responders.
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
-        assert!(session.permissions.is_empty());
-        assert!(session.elicitations.is_empty());
-        assert_eq!(
-            state.take_effects(),
-            vec![
-                RuntimeEffect::CancelPermissionResponder {
-                    session_id: "session".to_string(),
-                    interaction_id: "permission".to_string(),
-                },
-                RuntimeEffect::CancelElicitationResponder {
-                    session_id: Some("session".to_string()),
-                    interaction_id: "elicitation".to_string(),
-                },
-            ]
-        );
+        assert!(session.permissions.contains_key("permission"));
+        assert!(session.elicitations.contains_key("elicitation"));
         assert!(state.take_effects().is_empty());
     }
 
