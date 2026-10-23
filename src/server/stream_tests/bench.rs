@@ -11,6 +11,8 @@ use super::*;
 use crate::protocol::replica::Replica;
 
 mod admission;
+mod execution;
+mod interactions;
 
 const QUIET: Duration = Duration::from_millis(300);
 
