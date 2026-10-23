@@ -1,5 +1,6 @@
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { createContext, useContext, useEffect, useState } from "react";
+import { hex, sha256 } from "../../../shared/digest";
 import type { AttachmentRef, PromptBlock } from "../../../shared/protocol";
 import type { TimelineItem } from "./state";
 
@@ -30,7 +31,10 @@ export function createAttachmentReader(
         const read = fetch(`/api/v2/sessions/${encodeURIComponent(sessionId)}/attachments/${reference.id}`)
           .then(async (response) => {
             if (!response.ok) throw new Error(`attachment ${reference.id} is not available (${response.status})`);
-            const block: unknown = await response.json();
+            // The body is the bytes the ID hashes (protocol §8): bytes that do not are not shown.
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            if (hex(sha256(bytes)) !== reference.id) throw new Error(`attachment ${reference.id} did not verify`);
+            const block: unknown = JSON.parse(new TextDecoder().decode(bytes));
             if (!isAttachedBlock(block)) throw new Error(`attachment ${reference.id} is not a media block`);
             return block;
           });
