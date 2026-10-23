@@ -402,6 +402,9 @@ async fn permission(
                     },
                 )
                 .map_err(mirror_error)?;
+            // Its tool call is an entry while the permission waits.
+            let _ = super::session_mirror(&mut state)
+                .reduce_permission_tool_call(&session_id, tool_call);
             refresh_observer_timers(&mut state);
             true
         }

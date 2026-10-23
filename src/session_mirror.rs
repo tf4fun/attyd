@@ -272,6 +272,23 @@ impl SessionRegistry {
         self.append_session_update_with_meta(session_id, update, None)
     }
 
+    /// A permission request's `toolCall` joins the session's entries like a tool update
+    /// (memory model §3.2). A session being loaded keeps its own history and ignores it.
+    pub(crate) fn reduce_permission_tool_call(
+        &mut self,
+        session_id: &str,
+        tool_call: &Value,
+    ) -> Result<(), MirrorError> {
+        let session = self.require_state_mut(session_id)?;
+        if session.load_attempt.is_some() {
+            return Err(MirrorError::WrongPhase);
+        }
+        if let Some(timeline) = session.timeline.as_mut() {
+            Arc::make_mut(timeline).reduce_permission_tool_call(tool_call);
+        }
+        Ok(())
+    }
+
     pub(crate) fn append_session_update_with_meta(
         &mut self,
         session_id: &str,
