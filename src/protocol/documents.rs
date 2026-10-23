@@ -149,10 +149,6 @@ pub(crate) struct Operation {
     /// (protocol §4.4), so the generated type leaves them out.
     #[cfg_attr(test, ts(skip))]
     pub interactions: BTreeMap<String, Interaction>,
-    /// Revision 2 showed a running prompt's updates here; entries carry them now.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(skip))]
-    pub process: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "unknown"))]
     pub result: Option<Value>,
