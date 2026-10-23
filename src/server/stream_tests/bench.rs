@@ -356,37 +356,45 @@ struct Watch {
 }
 
 impl Watch {
+    /// The event an SSE message carries, if it carries one (a heartbeat does not).
+    fn parse(message: &str) -> Option<Value> {
+        assert!(
+            message.lines().all(|line| !line.starts_with("id:")),
+            "events carry no SSE id: {message:?}"
+        );
+        let data: Vec<&str> = message
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        (!data.is_empty()).then(|| serde_json::from_str(&data.join("\n")).unwrap())
+    }
+
+    /// Applies `event` to the replicas.
+    fn take(&mut self, event: &Value) {
+        let scope = event["scope"].as_str().expect("an event names its scope").to_string();
+        assert!(!self.ended.contains_key(&scope), "an event after end: {event}");
+        if let Some(end) = event.get("end") {
+            self.replicas.remove(&scope);
+            self.ended.insert(scope, end.clone());
+        } else {
+            self.replicas
+                .entry(scope)
+                .or_default()
+                .apply(event)
+                .unwrap_or_else(|error| panic!("invalid HTTP SSE event: {error}"));
+        }
+        self.events.push(event.clone());
+    }
+
     /// The next event, skipping comments (the heartbeat), applied.
     async fn event(&mut self) -> Value {
         loop {
             let message = self.sse.message(WAIT).await.expect("the stream sent no event");
-            assert!(
-                message.lines().all(|line| !line.starts_with("id:")),
-                "events carry no SSE id: {message:?}"
-            );
-            let data: Vec<&str> = message
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect();
-            if data.is_empty() {
-                continue;
+            if let Some(event) = Self::parse(&message) {
+                self.take(&event);
+                return event;
             }
-            let event: Value = serde_json::from_str(&data.join("\n")).unwrap();
-            let scope = event["scope"].as_str().expect("an event names its scope").to_string();
-            assert!(!self.ended.contains_key(&scope), "an event after end: {event}");
-            if let Some(end) = event.get("end") {
-                self.replicas.remove(&scope);
-                self.ended.insert(scope, end.clone());
-            } else {
-                self.replicas
-                    .entry(scope)
-                    .or_default()
-                    .apply(&event)
-                    .unwrap_or_else(|error| panic!("invalid HTTP SSE event: {error}"));
-            }
-            self.events.push(event.clone());
-            return event;
         }
     }
 
@@ -439,8 +447,15 @@ impl Watch {
         .await;
     }
 
-    /// No event arrives for `period`; heartbeats are not events.
+    /// Nothing more is published for `period`: what the bridge published already is taken
+    /// first, as a client reads it all; then only heartbeats and checkpoints (which change
+    /// nothing, protocol §5.3) may arrive.
     async fn quiet(&mut self, period: Duration) {
+        while let Some(message) = self.sse.message(Duration::from_millis(100)).await {
+            if let Some(event) = Self::parse(&message) {
+                self.take(&event);
+            }
+        }
         let deadline = tokio::time::Instant::now() + period;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -450,10 +465,13 @@ impl Watch {
             let Some(message) = self.sse.message(remaining).await else {
                 return;
             };
-            assert!(
-                message.lines().all(|line| line.starts_with(':')),
-                "unexpected event {message:?}"
-            );
+            if let Some(event) = Self::parse(&message) {
+                assert!(
+                    event.get("digest").is_some() && event.get("ops").is_none(),
+                    "unexpected event {message:?}"
+                );
+                self.take(&event);
+            }
         }
     }
 
