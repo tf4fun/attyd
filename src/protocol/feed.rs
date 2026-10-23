@@ -217,20 +217,24 @@ impl Feed {
         for scope in gone {
             self.engine.remove(&scope);
             self.pacer.settled(&scope);
-            let end = ended
+            let recorded = ended
                 .iter()
                 .find(|(session_id, _)| Scope::Session(session_id.clone()).to_string() == scope)
-                .map_or(
-                    End {
-                        reason: EndReason::Closed,
-                        error: None,
-                    },
-                    |(_, end)| end.clone(),
-                );
+                .map(|(_, end)| end.clone());
             #[cfg(test)]
-            self.tap_event(&StreamEvent::End {
-                scope: scope.clone(),
-                end: end.clone(),
+            self.tap_released();
+            // A session released with no reason ends nothing for the tap: a client keeps its
+            // copy and subscribes again (S6). A follower it still has is told it closed.
+            #[cfg(test)]
+            if let Some(end) = &recorded {
+                self.tap_event(&StreamEvent::End {
+                    scope: scope.clone(),
+                    end: end.clone(),
+                });
+            }
+            let end = recorded.unwrap_or(End {
+                reason: EndReason::Closed,
+                error: None,
             });
             for subscriber in self.subscribers.values_mut() {
                 subscriber.end(&scope, end.clone());
