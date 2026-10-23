@@ -559,7 +559,6 @@ impl Peer {
 
     /// Applies one tapped commit to the gate.
     fn apply(&mut self, commit: TapCommit) {
-        assert!(!commit.events.is_empty(), "a commit without changes sends nothing");
         self.gate.apply(commit.events, &commit.documents);
     }
 

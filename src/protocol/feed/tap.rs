@@ -18,6 +18,8 @@ pub(crate) struct TapCommit {
 pub(super) struct Tap {
     sender: Option<UnboundedSender<TapCommit>>,
     pending: Vec<Value>,
+    /// A session left the published documents in this commit.
+    released: bool,
 }
 
 impl Feed {
@@ -60,11 +62,17 @@ impl Feed {
         }
     }
 
-    /// Hands the commit's events and documents to the tap, if it published any.
+    pub(super) fn tap_released(&mut self) {
+        self.tap.released = true;
+    }
+
+    /// Hands the commit's events and documents to the tap, if it published any or released a
+    /// session (which sends no event).
     pub(super) fn tap_flush(&mut self) {
-        if self.tap.pending.is_empty() {
+        if self.tap.pending.is_empty() && !self.tap.released {
             return;
         }
+        self.tap.released = false;
         let events = std::mem::take(&mut self.tap.pending);
         let documents = self.documents();
         if let Some(sender) = &self.tap.sender {
