@@ -1090,9 +1090,15 @@ async fn a_streamed_prompt_with_an_answered_permission_ends_in_one_event() {
     assert_eq!(live["op"]["id"], op);
     assert_eq!(live["op"]["result"], json!({ "stopReason": "end_turn" }));
     let entries = peer.entries(&scope);
-    assert_eq!(entries.len(), 2, "the prompt's message and the reply: {entries:?}");
+    // The prompt's message, the reply, and the tool call the permission request named.
+    assert_eq!(entries.len(), 3, "{entries:?}");
     assert_eq!(entries[0]["role"], "user");
     assert_eq!(entries[0]["chunks"][0]["content"], text("hi"));
+    assert_eq!(
+        entries.iter().filter(|entry| entry["call"]["toolCallId"] == "tool").count(),
+        1,
+        "the permission's tool call is one entry: {entries:?}"
+    );
     let prompts = &peer.gate.replicas[&scope].doc["prompts"];
     assert_eq!(prompts[0]["entry"], 0);
     assert_eq!(prompts[0]["end"]["response"]["stopReason"], "end_turn");
