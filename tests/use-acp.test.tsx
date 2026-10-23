@@ -796,6 +796,63 @@ describe("revision 3 workspace, read side", () => {
     expect(hook.state.pendingSessionControl).toBeUndefined();
   });
 
+  // -- what the Agent changes while the page watches -----------------------------------------
+
+  /** The ops of the session document at `rev`. */
+  const sessionOps = (rev: number, ops: unknown[]): StreamEvent => ({ scope: "session/s1", rev, ops } as StreamEvent);
+
+  it("shows the mode, usage, commands and title the Agent changes without a refresh, also while a prompt runs", async () => {
+    await shownSession(running(), [{ entry: 0 }]);
+    expect(hook.state.modeId).toBe("ask");
+    expect(hook.state.running).toBe(true);
+    await emit(sessionOps(1, [
+      { op: "set", path: "/live/controls/modes/currentModeId", value: "plan" },
+      { op: "set", path: "/live/controls/usage", value: { used: 40, size: 200, cost: null } },
+      { op: "set", path: "/live/controls/commands", value: [{ name: "review", description: "Review" }] },
+      { op: "set", path: "/live/controls/info/title", value: "Two" },
+    ]));
+    expect(hook.state.modeId).toBe("plan");
+    expect(hook.state.usage).toEqual({ used: 40, size: 200, cost: null });
+    expect(hook.state.availableCommands.map(({ name }) => name)).toEqual(["review"]);
+    expect(hook.state.title).toBe("Two");
+    expect(hook.state.running).toBe(true);
+  });
+
+  it("shows the Agent's own config updates", async () => {
+    await shownSession();
+    expect(hook.state.configOptions).toBeNull();
+    const options = [{ type: "boolean", id: "verbose", name: "Verbose", currentValue: true }];
+    await emit(sessionOps(1, [{ op: "set", path: "/live/controls/configOptions", value: options }]));
+    expect(hook.state.configOptions).toEqual(options);
+  });
+
+  it("removes a URL flow the Agent completed or ended from the page", async () => {
+    const flow = {
+      interactionId: "F", elicitationId: "e", status: "waiting",
+      request: { mode: "url", message: "Sign in", url: "https://example.test/", elicitationId: "e" },
+    };
+    await mount("/sessions/s1");
+    await emit(globalSnapshot(globalLive({ sessions: held })));
+    await emit(catalogSnapshot());
+    await emit(sessionSnapshot([user("hi")], [], sessionLive({ urlFlows: { F: flow } })));
+    expect(hook.state.externalFlows.map(({ elicitationId }) => elicitationId)).toEqual(["F"]);
+    await emit(sessionOps(1, [{ op: "remove", path: "/live/urlFlows/F" }]));
+    expect(hook.state.externalFlows).toEqual([]);
+  });
+
+  it("lists a background session as needing input from the global summary without following it", async () => {
+    const asking = {
+      ...held.s1,
+      pending: { interactions: 1, urlFlows: 0 },
+    };
+    await mount("/");
+    await emit(globalSnapshot(globalLive({ sessions: { s1: asking } })));
+    await emit(catalogSnapshot());
+    expect(current().scopes).toEqual(["global", "catalog"]);
+    expect(hook.state.attentionSessionIds).toEqual(["s1"]);
+    expect(hook.state.openSessionIds).toEqual(["s1"]);
+  });
+
   // -- listing the catalog ------------------------------------------------------------------
 
   const listable = () => globalLive({
