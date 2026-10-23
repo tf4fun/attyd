@@ -8351,7 +8351,6 @@ mod tests {
                     permission_id,
                     PermissionResponder {
                         tool_call_id: "reusable-tool".to_string(),
-                        option_ids: HashSet::new(),
                         sender: permission_sender,
                     },
                 )
@@ -8372,7 +8371,6 @@ mod tests {
                     elicitation_id,
                     ElicitationResponder {
                         url_elicitation_id: None,
-                        request: json!({ "mode": "form" }),
                         sender: elicitation_sender,
                     },
                 )
@@ -8505,7 +8503,6 @@ mod tests {
                     "permission".to_string(),
                     PermissionResponder {
                         tool_call_id: "tool".to_string(),
-                        option_ids: HashSet::new(),
                         sender: permission_sender,
                     },
                 )
@@ -8517,7 +8514,6 @@ mod tests {
                     "elicitation".to_string(),
                     ElicitationResponder {
                         url_elicitation_id: None,
-                        request: json!({ "sessionId": "session", "mode": "form" }),
                         sender: elicitation_sender,
                     },
                 )
@@ -8839,7 +8835,6 @@ mod tests {
                     "permission".to_string(),
                     PermissionResponder {
                         tool_call_id: "tool".to_string(),
-                        option_ids: HashSet::new(),
                         sender: permission_sender,
                     },
                 )
@@ -8851,10 +8846,6 @@ mod tests {
                     "session-elicitation".to_string(),
                     ElicitationResponder {
                         url_elicitation_id: None,
-                        request: json!({
-                            "sessionId": "session", "mode": "form", "message": "test",
-                            "requestedSchema": { "type": "object", "properties": {} }
-                        }),
                         sender: session_sender,
                     },
                 )
@@ -8863,10 +8854,6 @@ mod tests {
                 "request-elicitation".to_string(),
                 ElicitationResponder {
                     url_elicitation_id: None,
-                    request: json!({
-                        "requestId": 1, "mode": "form", "message": "test",
-                        "requestedSchema": { "type": "object", "properties": {} }
-                    }),
                     sender: request_sender,
                 },
             );
