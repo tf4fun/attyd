@@ -107,6 +107,50 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     assert!(!state.sessions.scopes.flow_scopes.contains_key(&interaction));
 }
 
+/// A permission request's `toolCall` is a `ToolCallUpdate` reduced into the session's entries
+/// like one (memory model §3.2), also with no tool notification before it: the tool card exists
+/// while the permission waits, a later notification patches the same entry, and the answer
+/// leaves it.
+#[tokio::test]
+async fn a_permission_requests_tool_call_is_an_entry_before_any_tool_notification() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create(CREATED, json!({})).await;
+    let scope = format!("session/{CREATED}");
+    assert!(peer.entries(&scope).is_empty());
+
+    peer.agent_request("p", "session/request_permission", permission(CREATED))
+        .await;
+    peer.until("the permission waits and its tool call is an entry", |peer| {
+        interaction_ids(&peer.live(&scope)).len() == 1 && peer.entries(&scope).len() == 1
+    })
+    .await;
+    let entry = peer.entries(&scope).remove(0);
+    assert_eq!(entry["call"]["toolCallId"], "tool", "{entry}");
+    assert_eq!(entry["call"]["title"], "Confirm", "{entry}");
+
+    peer.update(
+        CREATED,
+        json!({"sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "in_progress"}),
+    )
+    .await;
+    peer.until("the notification patches the same entry", |peer| {
+        peer.entries(&scope).first().is_some_and(|entry| entry["call"]["status"] == "in_progress")
+    })
+    .await;
+    assert_eq!(peer.entries(&scope).len(), 1);
+
+    let interaction = interaction_ids(&peer.live(&scope)).remove(0);
+    peer.answer(
+        &scope,
+        &interaction,
+        json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
+    )
+    .await;
+    peer.response("p").await;
+    peer.settled().await;
+    assert_eq!(peer.entries(&scope).len(), 1, "the answer leaves the entry");
+}
+
 /// A request-scoped interaction lives until the response of the request it names (memory model
 /// §8.2), whether or not an operation runs: a control action installs none, and the interaction
 /// its `session/set_mode` request raises is not retired for lack of a running operation.
