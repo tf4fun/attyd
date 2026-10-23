@@ -652,7 +652,7 @@ mod tests {
         mirror.commit_load(session_id, "initial").unwrap();
     }
 
-    fn history(mirror: &SessionMirror) -> Option<History> {
+    fn session_history(mirror: &SessionMirror) -> Option<History> {
         mirror.state("session").unwrap().history
     }
 
@@ -748,12 +748,12 @@ mod tests {
     fn going_on_with_given_context_gives_an_epoch_and_a_known_timeline_keeps_its_own() {
         let mut mirror = mirror();
         mirror.register_cold("cold");
-        mirror.use_cached_history("cold", None).unwrap();
+        mirror.use_cached_history("cold").unwrap();
         assert!(epoch(&mirror, "cold").is_some());
 
         mirror.register_new("new");
         let before = epoch(&mirror, "new");
-        mirror.use_cached_history("new", None).unwrap();
+        mirror.use_cached_history("new").unwrap();
         assert_eq!(epoch(&mirror, "new"), before);
     }
 
@@ -816,12 +816,12 @@ mod tests {
     fn going_on_with_the_context_the_agent_gave_is_partial_and_keeps_a_known_status() {
         let mut mirror = mirror();
         mirror.register_cold("cold");
-        mirror.use_cached_history("cold", None).unwrap();
+        mirror.use_cached_history("cold").unwrap();
         assert_eq!(history(&mirror, "cold"), Some(History::Partial));
         assert!(mirror.state("cold").unwrap().timeline.is_some());
 
         mirror.register_new("new");
-        mirror.use_cached_history("new", None).unwrap();
+        mirror.use_cached_history("new").unwrap();
         assert_eq!(history(&mirror, "new"), Some(History::Complete));
     }
 
@@ -910,7 +910,7 @@ mod tests {
     fn a_committed_load_makes_the_history_complete() {
         let mut mirror = mirror();
         load_initial(&mut mirror, "session");
-        assert_eq!(history(&mirror), Some(History::Complete));
+        assert_eq!(session_history(&mirror), Some(History::Complete));
         assert_eq!(timeline_entries(&mirror).as_array().unwrap().len(), 1);
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
         assert_eq!(mirror.history.candidates(), 0);
@@ -1323,7 +1323,7 @@ mod tests {
             .unwrap();
         mirror.commit_attachment_cache("session", "resume").unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Cold);
-        let cached = history(&mirror);
+        let cached = session_history(&mirror);
         assert_eq!(cached, Some(History::Partial));
 
         for attempt in ["automatic-first", "automatic-retry"] {
@@ -1331,7 +1331,7 @@ mod tests {
             mirror
                 .fail_load("session", attempt, "temporary", true)
                 .unwrap();
-            assert_eq!(history(&mirror), cached);
+            assert_eq!(session_history(&mirror), cached);
             assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Loading);
             for admission in [
                 SessionAdmission::Prompt,
@@ -1367,7 +1367,7 @@ mod tests {
             &known,
             mirror.state("session").unwrap().timeline.as_ref().unwrap()
         ));
-        assert_eq!(history(&mirror), Some(History::Complete));
+        assert_eq!(session_history(&mirror), Some(History::Complete));
 
         mirror.register_cold("fork");
         mirror.use_cached_history("fork").unwrap();
@@ -1382,7 +1382,7 @@ mod tests {
         for origin in [MirrorPhase::Ready, MirrorPhase::Blocked] {
             let mut mirror = mirror();
             load_initial(&mut mirror, "session");
-            let old = history(&mirror);
+            let old = session_history(&mirror);
             if origin == MirrorPhase::Blocked {
                 mirror.begin_load("session", "fatal").unwrap();
                 mirror
@@ -1411,7 +1411,7 @@ mod tests {
                 mirror.can_begin("session", SessionAdmission::Attachment),
                 Ok(())
             );
-            assert_eq!(history(&mirror), old, "a failed load leaves the known history");
+            assert_eq!(session_history(&mirror), old, "a failed load leaves the known history");
             assert!(mirror.state("session").unwrap().load_origin.is_none());
             assert_eq!(
                 mirror.state("session").unwrap().sync_error.as_deref(),
@@ -1445,7 +1445,7 @@ mod tests {
         mirror
             .fail_load("session", "first", "temporary", true)
             .unwrap();
-        assert_eq!(history(&mirror), None);
+        assert_eq!(session_history(&mirror), None);
 
         mirror.begin_load("session", "second").unwrap();
         mirror
@@ -1453,7 +1453,7 @@ mod tests {
             .unwrap();
         mirror.commit_load("session", "second").unwrap();
 
-        assert_eq!(history(&mirror), Some(History::Complete));
+        assert_eq!(session_history(&mirror), Some(History::Complete));
         assert_eq!(timeline_entries(&mirror).as_array().unwrap().len(), 1);
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
     }
@@ -1476,12 +1476,12 @@ mod tests {
             mirror.commit_load("session", "invalid"),
             Err(MirrorError::History(HistoryCacheError::InvalidReplay))
         ));
-        assert_eq!(history(&mirror), None);
+        assert_eq!(session_history(&mirror), None);
         mirror
             .fail_load("session", "invalid", "invalid replay", false)
             .unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Blocked);
-        assert_eq!(history(&mirror), None);
+        assert_eq!(session_history(&mirror), None);
     }
 
     #[test]

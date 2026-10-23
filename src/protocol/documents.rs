@@ -5,13 +5,11 @@
 //! endpoint (migration step 6).
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::canon::LogEntry;
-use super::{Op, SessionControls};
+use super::SessionControls;
 
 // ---------------------------------------------------------------------------
 // Scopes (protocol §2)

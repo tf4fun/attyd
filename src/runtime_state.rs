@@ -1590,7 +1590,7 @@ mod session_live {
     use super::{
         InteractionResolution, InteractionUpsert, PendingInteraction, RuntimeStateError,
         SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
-        SessionState, TurnTerminal, remember_resolved_interaction, remember_resolved_permission,
+        SessionState, TurnTerminal, remember_resolved_permission,
     };
 
     pub(super) fn start_operation(

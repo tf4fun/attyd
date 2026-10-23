@@ -5,13 +5,10 @@
 //! shapes that it does not deserialize exist for the generated client types.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::canon::{LogEntry, PromptBlock};
+use super::canon::PromptBlock;
 use super::documents::ProtocolError;
 
 // ---------------------------------------------------------------------------

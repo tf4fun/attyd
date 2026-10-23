@@ -67,11 +67,8 @@ pub(crate) struct SessionState {
     pub(crate) load_attempt: Option<String>,
     #[serde(skip)]
     pub(crate) load_origin: Option<MirrorPhase>,
-    /// The protocol v2 turn log: unknown until a load or creation.
-    #[serde(skip)]
     /// The session timeline of the bridge memory model: unknown (`None`) until a
-    /// load, a creation or a resume gives it. Held beside `log` until the wire
-    /// is derived from it.
+    /// load, a creation or a resume gives it.
     #[serde(skip)]
     pub(crate) timeline: Option<Arc<Timeline>>,
     /// How much of the history the timeline holds; `Some` exactly when the
