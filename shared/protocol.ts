@@ -84,15 +84,7 @@ id: string, kind: OperationKind, status: OperationStatus,
 /**
  * The write's `args` (a prompt as normalized `Block[]`), or the load's cwd.
  */
-input: unknown, cancelRequested: boolean, 
-/**
- * Pending, by interaction ID.
- */
-interactions: { [key in string]: Interaction }, 
-/**
- * A running prompt's updates, folded, with content blocks normalized.
- */
-process?: ProcessUpdate[], result?: unknown, error?: ProtocolError, };
+input: unknown, cancelRequested: boolean, result?: unknown, error?: ProtocolError, };
 
 export type Interaction = { "kind": "permission", interactionId: string, request: RequestPermissionRequest, } | { "kind": "elicitation", interactionId: string, request: CreateElicitationRequest, };
 
