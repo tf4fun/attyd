@@ -216,6 +216,18 @@ async fn a_boolean_option_is_set_and_one_not_offered_is_refused_before_the_agent
     let (status, body) = control(&server, "s", "set_mode", json!({"modeId": "nope"})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "invalid_request", "{body}");
+    // Arguments are refused before the Agent hears of them: a mode that is no string, an option
+    // not offered, a missing value, and a string where the option is a boolean.
+    for (action, body) in [
+        ("set_mode", json!({"modeId": 1})),
+        ("set_config", json!({"configId": "missing", "value": true})),
+        ("set_config", json!({"configId": "verbose"})),
+        ("set_config", json!({"configId": "verbose", "value": "true"})),
+    ] {
+        let (status, refusal) = control(&server, "s", action, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action} {body}: {refusal}");
+        assert_eq!(refusal["error"]["code"], "invalid_request", "{action} {body}");
+    }
     link.quiet(Duration::from_millis(200)).await;
 
     let set = spawn_control(&server, "s", "set_config", json!({"configId": "verbose", "value": true}));

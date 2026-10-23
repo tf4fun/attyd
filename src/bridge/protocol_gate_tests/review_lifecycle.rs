@@ -245,11 +245,11 @@ async fn an_elicitation_that_names_no_outstanding_request_is_refused() {
     );
 }
 
-// An operation's end ends no interaction (memory model §8.2, D11): one the Agent asked of the
-// session while a control operation ran is still the session's when the operation completed,
+// A request's end ends no session-scoped interaction (memory model §8.2, D11): one the Agent asked
+// of the session while a control request ran is still the session's when the control completed,
 // and is answered on its own.
 #[tokio::test]
-async fn a_session_scoped_interaction_outlives_the_control_operation_it_arrived_in() {
+async fn a_session_scoped_interaction_outlives_the_control_request_it_arrived_in() {
     let mut peer = Peer::start(json!({})).await;
     peer.create(
         CREATED,
@@ -261,8 +261,12 @@ async fn a_session_scoped_interaction_outlives_the_control_operation_it_arrived_
     )
     .await;
     let scope = format!("session/{CREATED}");
-    let (op, _) = peer
-        .start_op(&scope, "set_mode", json!({"modeId": "plan"}))
+    let shown = peer.live(&scope)["op"].clone();
+    let answer = peer
+        .control(
+            CREATED,
+            crate::bridge::controls::Control::SetMode { mode_id: "plan".into() },
+        )
         .await;
     let request = peer.request("session/set_mode").await;
     peer.agent_request(
@@ -271,25 +275,21 @@ async fn a_session_scoped_interaction_outlives_the_control_operation_it_arrived_
         form(json!({"sessionId": CREATED})),
     )
     .await;
-    peer.until("the control operation receives the interaction", |peer| {
-        peer.live(&scope)["op"]["id"] == op && interaction_ids(&peer.live(&scope)).len() == 1
+    peer.until("the session receives the interaction", |peer| {
+        interaction_ids(&peer.live(&scope)).len() == 1
     })
     .await;
     peer.reply(&request, json!({})).await;
-    peer.until("the control operation completes", |peer| {
-        peer.live(&scope)["op"]["status"] == "completed"
+    answer.await.unwrap().unwrap();
+    peer.until("the control is folded", |peer| {
+        peer.live(&scope)["controls"]["modes"]["currentModeId"] == "plan"
     })
     .await;
     peer.settled().await;
     let live = peer.live(&scope);
-    assert_eq!(
-        live["op"]["id"], op,
-        "completion must not re-home its interaction in a new operation"
-    );
-    assert_eq!(live["op"]["status"], "completed");
-    assert_eq!(live["controls"]["modes"]["currentModeId"], "plan");
+    assert_eq!(live["op"], shown, "a control installs no operation");
     let interaction = interaction_ids(&live);
-    assert_eq!(interaction.len(), 1, "the interaction outlives the operation: {live}");
+    assert_eq!(interaction.len(), 1, "the interaction outlives the control: {live}");
     peer.answer_resource(&scope, &interaction[0], json!({"response": {"action": "accept", "content": {}}}))
         .await
         .unwrap();
@@ -331,9 +331,7 @@ async fn a_permission_asked_during_a_prompt_is_still_the_sessions_when_the_promp
     let interaction = interaction_ids(&peer.live(&scope));
     assert_eq!(interaction.len(), 1, "the permission outlives the prompt");
     // A new operation of the session does not take it either.
-    let (next, _) = peer
-        .start_op(&scope, "set_mode", json!({"modeId": "plan"}))
-        .await;
+    let (next, next_request) = peer.prompt(CREATED, vec![text("next")]).await;
     peer.until("the next operation runs", |peer| peer.live(&scope)["op"]["id"] == next)
         .await;
     assert_eq!(interaction_ids(&peer.live(&scope)), interaction);
@@ -346,6 +344,7 @@ async fn a_permission_asked_during_a_prompt_is_still_the_sessions_when_the_promp
     .unwrap();
     let response = peer.response("permission").await;
     assert_eq!(response["result"]["outcome"]["optionId"], "allow");
+    peer.reply(&next_request, json!({"stopReason": "end_turn"})).await;
     peer.settled().await;
 }
 

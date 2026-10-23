@@ -72,7 +72,7 @@ data?: unknown, };
 
 export type ErrorCode = "invalid_request" | "not_found" | "stale" | "not_allowed" | "catalog_changed" | "unsupported" | "unavailable" | "agent_error";
 
-export type OperationKind = "prompt" | "set_mode" | "set_config" | "fork" | "create" | "delete" | "authenticate" | "logout" | "terminal_login" | "list" | "load" | "open" | "none";
+export type OperationKind = "prompt" | "fork" | "create" | "delete" | "authenticate" | "logout" | "terminal_login" | "list" | "load" | "open" | "none";
 
 export type OperationStatus = "running" | "completed" | "failed" | "cancelled";
 
@@ -206,19 +206,13 @@ export type OpRequest = {
 /**
  * The `op.id` the write expects the scope to show.
  */
-expect: string, } & ({ "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty });
+expect: string, } & ({ "kind": "prompt", "args": PromptArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty });
 
-export type OpArgs = { "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty };
+export type OpArgs = { "kind": "prompt", "args": PromptArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty };
 
 export type Empty = Record<symbol, never>;
 
 export type PromptArgs = { prompt: Array<PromptBlock>, };
-
-export type SetModeArgs = { modeId: string, };
-
-export type SetConfigArgs = { configId: string, value: ConfigValue, };
-
-export type ConfigValue = string | boolean;
 
 export type ForkArgs = { cwd?: string, };
 

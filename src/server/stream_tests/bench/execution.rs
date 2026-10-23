@@ -293,17 +293,12 @@ async fn review_setup_config_options_are_used_for_admission_and_execution() {
         .await;
     let live = watch.live("session/s");
     assert_eq!(live["controls"]["configOptions"], response);
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &live["op"]["id"],
-            "set_config",
-            json!({"configId": "from-response", "value": true}),
-        )
-        .await;
-    let op = assert_accepted(status, &body, "the option offered by the setup response");
-    // A 202 alone is insufficient: execution must use the same options as
-    // admission and actually send the accepted write to the Agent.
+    let set = bench.spawn_action(
+        "s",
+        "set_config",
+        json!({"configId": "from-response", "value": true}),
+    );
+    // An admitted action must reach the Agent with the same options admission used.
     let request = link.request("session/set_config_option").await;
     assert_eq!(request["params"]["sessionId"], "s");
     assert_eq!(request["params"]["configId"], "from-response");
@@ -313,102 +308,77 @@ async fn review_setup_config_options_are_used_for_admission_and_execution() {
     }]);
     link.reply(&request, json!({"configOptions": confirmed}))
         .await;
-    watch.until_op("session/s", &op, "completed").await;
-    assert_eq!(
-        watch.live("session/s")["controls"]["configOptions"],
-        confirmed
-    );
+    let (status, body) = set.await.unwrap();
+    assert_eq!((status, &body), (StatusCode::OK, &json!({})));
+    watch
+        .until_live("session/s", "the options are confirmed", |live| {
+            live["controls"]["configOptions"] == confirmed
+        })
+        .await;
     watch.converged(&bench).await;
 }
 
-/// A successful `set_mode` or `set_config` folds its acknowledgement into
-/// `controls` in the event that ends it; a failed one changes nothing
-/// (acceptance 18).
+/// A successful `set_mode` or `set_config` action folds its acknowledgement into `controls` in one
+/// event and touches no operation; a failed one changes nothing (acceptance 18).
 #[tokio::test]
-async fn control_acknowledgements_fold_into_the_ending_event_and_failures_change_nothing() {
+async fn control_acknowledgements_fold_into_one_event_and_failures_change_nothing() {
     let (bench, mut link) = Bench::ws(json!({})).await;
     bench.create_with(&mut link, "s", controls()).await;
     let mut watch = bench.watch(&scopes(&["session/s"])).await;
     watch
         .until("the alignment", |watch| watch.has("session/s"))
         .await;
-    let open = bench.expect_of("session/s").await;
+    let op = watch.live("session/s")["op"].clone();
 
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &open,
-            "set_config",
-            json!({"configId": "verbose", "value": true}),
-        )
-        .await;
-    let config = assert_accepted(status, &body, "set_config");
+    let set = bench.spawn_action("s", "set_config", json!({"configId": "verbose", "value": true}));
     let request = link.request("session/set_config_option").await;
     link.reply(&request, json!({"configOptions": verbose(true)}))
         .await;
-    watch.until_op("session/s", &config, "completed").await;
-    assert_eq!(
-        watch.live("session/s")["controls"]["configOptions"],
-        verbose(true)
-    );
-    let end = watch.events.last().unwrap().clone();
-    let paths = patch_paths(&end);
+    assert_eq!(set.await.unwrap(), (StatusCode::OK, json!({})));
+    watch
+        .until_live("session/s", "the acknowledgement folds", |live| {
+            live["controls"]["configOptions"] == verbose(true)
+        })
+        .await;
+    let event = watch.events.last().unwrap().clone();
     assert!(
-        paths.iter().any(|path| path.starts_with("/live/controls"))
-            && paths.iter().any(|path| path.starts_with("/live/op")),
-        "the acknowledgement and the end are one event: {end}"
+        patch_paths(&event).iter().all(|path| path.starts_with("/live/controls")),
+        "the acknowledgement is one change of controls and of nothing else: {event}"
     );
 
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &config,
-            "set_config",
-            json!({"configId": "verbose", "value": false}),
-        )
-        .await;
-    let refused = assert_accepted(status, &body, "a set_config the Agent refuses");
+    let set = bench.spawn_action("s", "set_config", json!({"configId": "verbose", "value": false}));
     let request = link.request("session/set_config_option").await;
     link.refuse(&request).await;
-    watch.until_op("session/s", &refused, "failed").await;
-    let live = watch.live("session/s");
-    assert_eq!(live["op"]["error"]["code"], "agent_error");
+    let (status, body) = set.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], "agent_error", "{body}");
     assert_eq!(
-        live["controls"]["configOptions"],
+        watch.live("session/s")["controls"]["configOptions"],
         verbose(true),
         "a failure folds nothing"
     );
 
-    let (status, body) = bench
-        .op("session/s", &refused, "set_mode", json!({"modeId": "plan"}))
-        .await;
-    let mode = assert_accepted(status, &body, "set_mode");
+    let set = bench.spawn_action("s", "set_mode", json!({"modeId": "plan"}));
     let request = link.request("session/set_mode").await;
     link.reply(&request, json!({})).await;
-    watch.until_op("session/s", &mode, "completed").await;
-    assert_eq!(
-        watch.live("session/s")["controls"]["modes"]["currentModeId"],
-        "plan"
-    );
-    let end = watch.events.last().unwrap().clone();
-    let paths = patch_paths(&end);
-    assert!(
-        paths.iter().any(|path| path.starts_with("/live/controls"))
-            && paths.iter().any(|path| path.starts_with("/live/op")),
-        "the acknowledgement and the end are one event: {end}"
-    );
-
-    let (status, body) = bench
-        .op("session/s", &mode, "set_mode", json!({"modeId": "ask"}))
+    assert_eq!(set.await.unwrap(), (StatusCode::OK, json!({})));
+    watch
+        .until_live("session/s", "the mode folds", |live| {
+            live["controls"]["modes"]["currentModeId"] == "plan"
+        })
         .await;
-    let refused = assert_accepted(status, &body, "a set_mode the Agent refuses");
+
+    let set = bench.spawn_action("s", "set_mode", json!({"modeId": "ask"}));
     let request = link.request("session/set_mode").await;
     link.refuse(&request).await;
-    watch.until_op("session/s", &refused, "failed").await;
+    let (status, body) = set.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], "agent_error", "{body}");
     assert_eq!(
         watch.live("session/s")["controls"]["modes"]["currentModeId"],
         "plan"
     );
+    assert_eq!(watch.live("session/s")["op"], op, "no control touched the operation");
     watch.converged(&bench).await;
 }
 

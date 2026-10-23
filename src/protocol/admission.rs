@@ -78,8 +78,6 @@ fn invalid(message: impl Into<String>) -> ProtocolError {
 fn started_kind(scope: &Scope, kind: &str) -> Option<OperationKind> {
     let kind = match (scope, kind) {
         (Scope::Session(_), "prompt") => OperationKind::Prompt,
-        (Scope::Session(_), "set_mode") => OperationKind::SetMode,
-        (Scope::Session(_), "set_config") => OperationKind::SetConfig,
         (Scope::Session(_), "fork") => OperationKind::Fork,
         (Scope::Global, "create") => OperationKind::Create,
         (Scope::Global, "delete") => OperationKind::Delete,
@@ -324,29 +322,6 @@ fn arguments(
                 .collect::<Result<Vec<_>, _>>()?;
             prompt_capabilities(initialize, &prompt)?;
             Ok(json!({ "prompt": prompt }))
-        }
-        OperationKind::SetMode => {
-            let mode_id = string(args, "modeId")?;
-            let modes = &live["controls"]["modes"];
-            crate::semantic::validate_session_mode_reference(
-                (!modes.is_null()).then_some(modes),
-                mode_id,
-            )
-            .map_err(invalid)?;
-            Ok(json!({ "modeId": mode_id }))
-        }
-        OperationKind::SetConfig => {
-            let config_id = string(args, "configId")?;
-            let value = args
-                .get("value")
-                .ok_or_else(|| invalid("value is required"))?;
-            crate::semantic::validate_session_config_reference(
-                &live["controls"]["configOptions"],
-                config_id,
-                value,
-            )
-            .map_err(invalid)?;
-            Ok(json!({ "configId": config_id, "value": value }))
         }
         OperationKind::Fork => Ok(match optional_string(args, "cwd")? {
             Some(cwd) => json!({ "cwd": session_path(cwd)? }),

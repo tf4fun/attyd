@@ -134,17 +134,15 @@ async fn interactions_of_create_fork_set_config_and_list_are_answered_in_their_s
     assert_eq!(body["result"], json!({"sessionId": "forked"}));
     session.until_op("session/s", &fork, "completed").await;
 
-    // A set_config asks through an elicitation that names its
-    // `session/set_config_option`: it belongs to the session, not `global`.
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &fork,
-            "set_config",
-            json!({"configId": "verbose", "value": true}),
-        )
-        .await;
-    let config = assert_accepted(status, &body, "set_config");
+    // A set_config action asks through an elicitation that names its
+    // `session/set_config_option`: it belongs to the session, not `global`, and it lives with
+    // that request although no operation runs.
+    let shown = session.live("session/s")["op"].clone();
+    let config = bench.spawn_action(
+        "s",
+        "set_config",
+        json!({"configId": "verbose", "value": true}),
+    );
     let request = link.request("session/set_config_option").await;
     link.agent_request(
         "config-question",
@@ -154,35 +152,36 @@ async fn interactions_of_create_fork_set_config_and_list_are_answered_in_their_s
     .await;
     session
         .until_live("session/s", "the set_config's interaction", |live| {
-            live["op"]["id"] == config && !interaction_ids(live).is_empty()
+            !interaction_ids(live).is_empty()
         })
         .await;
+    assert_eq!(session.live("session/s")["op"], shown, "no operation runs for a control");
     let interaction = interaction_for(&session.live("session/s"), "config?");
     assert!(
         interaction_ids(&bench.document("global").await["live"]).is_empty(),
         "the interaction is the session's"
     );
     let (status, body) = bench
-        .answer(
-            "session/s",
-            &config,
-            answers(&[(interaction.as_str(), accept())]),
-        )
+        .act("session/s", &interaction, "answer", accept())
         .await;
-    assert_joined(status, &body, &config, "the set_config's answer");
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert_eq!(
         link.response("config-question").await["result"]["action"],
         "accept"
     );
     session
-        .until_live("session/s", "the answered set_config runs on", |live| {
-            live["op"]["id"] == config && interaction_ids(live).is_empty()
+        .until_live("session/s", "the answered interaction leaves", |live| {
+            interaction_ids(live).is_empty()
         })
         .await;
-    assert_eq!(session.live("session/s")["op"]["status"], "running");
     link.reply(&request, json!({"configOptions": verbose(true)}))
         .await;
-    session.until_op("session/s", &config, "completed").await;
+    assert_eq!(config.await.unwrap(), (StatusCode::OK, json!({})));
+    session
+        .until_live("session/s", "the option is set", |live| {
+            live["controls"]["configOptions"] == verbose(true)
+        })
+        .await;
 
     // A list asks through an elicitation that names its `session/list`.
     let catalog = watch.live("catalog")["op"]["id"].clone();
@@ -501,10 +500,6 @@ async fn a_prompt_cancel_asks_the_agent_once_and_keeps_the_session_occupied() {
     let before = bench.document("session/s").await;
     let (status, body) = bench.cancel("session/s", &prompt).await;
     assert_joined(status, &body, &prompt, "the repeated cancel");
-    let (status, body) = bench
-        .op("session/s", &prompt, "set_mode", json!({"modeId": "plan"}))
-        .await;
-    not_allowed(status, &body, "a set_mode while the cancelled prompt runs");
     link.quiet(QUIET).await;
     watch.quiet(QUIET).await;
     assert_eq!(bench.document("session/s").await, before);
@@ -522,12 +517,17 @@ async fn a_prompt_cancel_asks_the_agent_once_and_keeps_the_session_occupied() {
     not_allowed(status, &body, "a cancel of the ended prompt");
 
     let (status, body) = bench
-        .op("session/s", &prompt, "set_mode", json!({"modeId": "plan"}))
+        .op(
+            "session/s",
+            &prompt,
+            "prompt",
+            json!({"prompt": [text("after")]}),
+        )
         .await;
-    let mode = assert_accepted(status, &body, "a set_mode after the cancelled prompt");
-    let request = link.request("session/set_mode").await;
-    link.reply(&request, json!({})).await;
-    watch.until_op("session/s", &mode, "completed").await;
+    let next = assert_accepted(status, &body, "a prompt after the cancelled prompt");
+    let request = link.request("session/prompt").await;
+    link.reply(&request, json!({"stopReason": "end_turn"})).await;
+    watch.until_op("session/s", &next, "completed").await;
     watch.converged(&bench).await;
 }
 
@@ -560,38 +560,7 @@ async fn other_kinds_refuse_a_cancel() {
 
     let open = watch.live("session/s")["op"]["id"].clone();
     refused(&bench, &mut link, "session/s", &open, "the ended open").await;
-    let (status, body) = bench
-        .op("session/s", &open, "set_mode", json!({"modeId": "plan"}))
-        .await;
-    let mode = assert_accepted(status, &body, "set_mode");
-    let request = link.request("session/set_mode").await;
-    refused(&bench, &mut link, "session/s", &mode, "a running set_mode").await;
-    link.reply(&request, json!({})).await;
-    watch.until_op("session/s", &mode, "completed").await;
-
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &mode,
-            "set_config",
-            json!({"configId": "verbose", "value": true}),
-        )
-        .await;
-    let config = assert_accepted(status, &body, "set_config");
-    let request = link.request("session/set_config_option").await;
-    refused(
-        &bench,
-        &mut link,
-        "session/s",
-        &config,
-        "a running set_config",
-    )
-    .await;
-    link.reply(&request, json!({"configOptions": verbose(true)}))
-        .await;
-    watch.until_op("session/s", &config, "completed").await;
-
-    let (status, body) = bench.op("session/s", &config, "fork", json!({})).await;
+    let (status, body) = bench.op("session/s", &open, "fork", json!({})).await;
     let fork = assert_accepted(status, &body, "fork");
     let request = link.request("session/fork").await;
     refused(&bench, &mut link, "session/s", &fork, "a running fork").await;

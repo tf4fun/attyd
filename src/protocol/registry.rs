@@ -125,15 +125,16 @@ pub(crate) enum InstallError {
     NotFree,
 }
 
-/// The v2 kind of a v1 session operation, where the protocol has one. A close
-/// releases a session and a delete belongs to `global`.
+/// The protocol kind of a session operation of the bridge, where the protocol has one.
 fn session_kind(kind: SessionOperationKind) -> Option<OperationKind> {
     match kind {
         SessionOperationKind::Load | SessionOperationKind::Resume => Some(OperationKind::Load),
         SessionOperationKind::Fork => Some(OperationKind::Fork),
-        SessionOperationKind::SetMode => Some(OperationKind::SetMode),
-        SessionOperationKind::SetConfig => Some(OperationKind::SetConfig),
-        SessionOperationKind::Close | SessionOperationKind::Delete => None,
+        // A control is an action, and a close and a delete are not operations of the session.
+        SessionOperationKind::SetMode
+        | SessionOperationKind::SetConfig
+        | SessionOperationKind::Close
+        | SessionOperationKind::Delete => None,
     }
 }
 
