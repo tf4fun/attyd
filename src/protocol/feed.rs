@@ -223,21 +223,25 @@ impl Feed {
                 .map(|(_, end)| end.clone());
             #[cfg(test)]
             self.tap_released();
-            // A session released with no reason ends nothing for the tap: a client keeps its
-            // copy and subscribes again (S6). A follower it still has is told it closed.
-            #[cfg(test)]
-            if let Some(end) = &recorded {
-                self.tap_event(&StreamEvent::End {
-                    scope: scope.clone(),
-                    end: end.clone(),
-                });
-            }
-            let end = recorded.unwrap_or(End {
-                reason: EndReason::Closed,
-                error: None,
-            });
-            for subscriber in self.subscribers.values_mut() {
-                subscriber.end(&scope, end.clone());
+            // A session that went with a reason ends its scope. One released with none ends
+            // nothing: a client keeps its copy, a follower it still has waits for the
+            // session to be loaded again (S6).
+            match recorded {
+                Some(end) => {
+                    #[cfg(test)]
+                    self.tap_event(&StreamEvent::End {
+                        scope: scope.clone(),
+                        end: end.clone(),
+                    });
+                    for subscriber in self.subscribers.values_mut() {
+                        subscriber.end(&scope, end.clone());
+                    }
+                }
+                None => {
+                    for subscriber in self.subscribers.values_mut() {
+                        subscriber.released(&scope);
+                    }
+                }
             }
         }
         for subscriber in self.subscribers.values_mut() {

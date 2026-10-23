@@ -224,6 +224,15 @@ impl Subscriber {
         self.queue_snapshot(scope, engine);
     }
 
+    /// The bridge no longer holds `scope` and says nothing of why (a release, S6): what was
+    /// queued of it is dropped, the subscriber keeps what it holds and goes on following it,
+    /// and is sent the whole document when it is published again.
+    pub(crate) fn released(&mut self, scope: &str) {
+        if self.scopes.get(scope).is_some_and(|state| !state.ended) {
+            self.clear(scope);
+        }
+    }
+
     /// `scope` is over: what was queued of it is replaced by its end, and
     /// nothing follows.
     pub(crate) fn end(&mut self, scope: &str, end: End) {

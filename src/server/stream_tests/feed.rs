@@ -362,3 +362,55 @@ async fn reading_an_unheld_session_holds_nothing_and_a_bad_scope_is_refused() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "invalid_request");
 }
+
+#[tokio::test]
+async fn closing_a_session_ends_its_scope_with_closed_for_the_streams_that_follow_it() {
+    let (server, mut link) = Server::start(json!({"sessionCapabilities": {"close": {}}})).await;
+    server.create(&mut link, "s1").await;
+    let (_, mut sse) = open(&server, "scope=session%2Fs1").await;
+    event_of(&mut sse, "session/s1").await;
+
+    let address = server.address;
+    let closing = tokio::spawn(async move {
+        send(
+            address,
+            Method::POST,
+            "/api/v2/scopes/session%2Fs1/actions/close",
+            Some(json!({})),
+        )
+        .await
+        .status()
+    });
+    let request = link.request("session/close").await;
+    link.reply(&request, json!({})).await;
+    assert_eq!(closing.await.unwrap(), StatusCode::OK);
+    let end = end_of(&mut sse, "session/s1").await;
+    assert_eq!(end["end"]["reason"], "closed", "{end}");
+}
+
+#[tokio::test]
+async fn a_close_the_agent_refuses_ends_nothing() {
+    let (server, mut link) = Server::start(json!({"sessionCapabilities": {"close": {}}})).await;
+    server.create(&mut link, "s1").await;
+    let (_, mut sse) = open(&server, "scope=session%2Fs1").await;
+    event_of(&mut sse, "session/s1").await;
+
+    let address = server.address;
+    let closing = tokio::spawn(async move {
+        send(
+            address,
+            Method::POST,
+            "/api/v2/scopes/session%2Fs1/actions/close",
+            Some(json!({})),
+        )
+        .await
+        .status()
+    });
+    let request = link.request("session/close").await;
+    link.refuse(&request).await;
+    closing.await.unwrap();
+    // The session is still there for the stream to follow.
+    while let Some(event) = event(&mut sse, Duration::from_millis(500)).await {
+        assert!(event.get("end").is_none(), "{event}");
+    }
+}
