@@ -74,6 +74,14 @@ and a filesystem test asserts that a large valid context is preserved.
   compile (helper visibility, mutability) and generated TypeScript copied from a CI log with
   interleaved log lines. Both were caught by CI before merging and the procedure was changed.
 
+## 4a. The integrated tip
+
+Pushes to a branch like `experiment/protocol-v2` run no CI (only pull requests, `main` and tags do), and
+each pull request was validated against the tip it was based on. So the tip that results from
+merging them one after another was never run as such. The pull request that adds this section is
+based on the tip after the last merge (`ef9d834`) and changes nothing else, so its full run is the
+run of the integrated tip: all suites, coverage, the browser suite and the seven binaries.
+
 ## 5. Where to start reading
 
 `docs/protocol.md` (the wire), `docs/bridge-memory-model.md` (the bridge's memory), then
