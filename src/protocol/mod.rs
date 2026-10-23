@@ -6,7 +6,7 @@
 //! `@agentclientprotocol/sdk` type in TypeScript.
 //!
 //! So far: the control reduction (`controls`), the JSON Pointer ops (`diff`),
-//! `canon` with the hash chain and the turn log (`canon`), the documents and
+//! `canon` (content blocks, attachment references, JCS) (`canon`), the documents and
 //! events (`documents`), operation slots (`op`, `registry`), the projections
 //! (`project`) and the feed (`feed`, `engine`, `subscription`) the bridge actor
 //! commits to (docs/state-sync.md §5).

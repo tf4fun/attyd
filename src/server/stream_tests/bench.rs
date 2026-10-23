@@ -443,10 +443,6 @@ impl Watch {
         self.ended.get(scope).cloned()
     }
 
-    fn events_of(&self, scope: &str) -> Vec<Value> {
-        self.events.iter().filter(|event| event["scope"] == scope).cloned().collect()
-    }
-
     /// Takes events until `condition` holds of this client's replicas.
     async fn until(&mut self, what: &str, condition: impl Fn(&Self) -> bool) {
         let deadline = tokio::time::Instant::now() + WAIT;
