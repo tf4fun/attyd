@@ -477,6 +477,12 @@ async fn elicitation(
         ElicitationScope::Request(_) => None,
         _ => None,
     };
+    // An elicitation names a session or an outstanding request of the bridge: a `requestId`
+    // that is null, or that names none, is refused and never becomes an interaction (Q6).
+    if session_id.is_none() && context.request_scope.is_none() {
+        return Err(Error::invalid_params()
+            .data("an elicitation names a session or an outstanding request of the bridge"));
+    }
     let (sender, receiver) = oneshot::channel();
     let (registered, owner) = {
         let mut state = context.state.lock().await;

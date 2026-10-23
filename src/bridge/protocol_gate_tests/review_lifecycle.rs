@@ -107,48 +107,49 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     assert!(!state.sessions.scopes.flow_scopes.contains_key(&interaction));
 }
 
+/// A request-scoped elicitation names an outstanding request of the bridge (memory model §8.2,
+/// Q6): one that names none, or one that is no longer outstanding, is refused with
+/// `invalid_params` and never becomes an interaction.
 #[tokio::test]
-async fn review_a_null_request_scope_interaction_ends_with_the_global_operation_it_joined() {
+async fn an_elicitation_that_names_no_outstanding_request_is_refused() {
     let mut peer = Peer::start(json!({})).await;
     let (op, created) = peer
         .start_op("global", "create", json!({"cwd": "/workspace"}))
         .await;
     let request = peer.request("session/new").await;
+    let before = peer.live("global");
+    for (id, scope) in [
+        ("null", json!({"requestId": null})),
+        ("unknown", json!({"requestId": "no-such-request"})),
+        ("number", json!({"requestId": 99999})),
+    ] {
+        peer.agent_request(id, "elicitation/create", form(scope)).await;
+        let response = peer.response(id).await;
+        assert_eq!(response["error"]["code"], -32602, "{id}: {response}");
+    }
+    peer.settled().await;
+    assert_eq!(peer.live("global"), before, "a refused request changes nothing");
+    assert!(interaction_ids(&peer.live("global")).is_empty());
+
+    // The one that names the pending request is an interaction.
     peer.agent_request(
-        "question",
+        "named",
         "elicitation/create",
-        form(json!({"requestId": null})),
+        form(json!({"requestId": request["id"]})),
     )
     .await;
-    peer.until("the global operation receives the interaction", |peer| {
+    peer.until("the named elicitation joins the create", |peer| {
         peer.live("global")["op"]["id"] == op && interaction_ids(&peer.live("global")).len() == 1
     })
     .await;
-    let interaction = interaction_ids(&peer.live("global")).remove(0);
     peer.reply(&request, json!({"sessionId": CREATED})).await;
     Peer::ended(created).await.unwrap();
     peer.settled().await;
-    let live = peer.live("global");
+    assert_eq!(peer.live("global")["op"]["status"], "completed");
     assert_eq!(
-        live["op"]["id"], op,
-        "the pending interaction must not become a new operation"
-    );
-    assert_eq!(live["op"]["status"], "completed");
-    {
-        let lock = peer.lock();
-        let state = lock.lock().await;
-        assert!(
-            !state
-                .sessions
-                .request_elicitations
-                .contains_key(&interaction),
-            "ending the operation must clear its pending interaction, not just hide it"
-        );
-        assert!(!state.request_elicitations.contains_key(&interaction));
-    }
-    assert_eq!(
-        peer.response("question").await["result"]["action"],
-        "cancel"
+        peer.response("named").await["result"]["action"],
+        "cancel",
+        "the parent's end answers it"
     );
 }
 
