@@ -248,6 +248,42 @@
       "digest": "GOWKSS3WgGGOnYk7VdSVmA"
     },
     {
+      "name": "an integer beyond two to the fifty three hashes as its double",
+      "kind": "session",
+      "doc": {
+        "epoch": "e1",
+        "rev": 1,
+        "history": "complete",
+        "entries": [],
+        "prompts": [],
+        "live": {
+          "bytes": 9007199254740993,
+          "also": -9007199254740995
+        }
+      },
+      "entryHashes": [],
+      "entriesDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "digest": "2bE5_U_hXm35sywSIl8WqA"
+    },
+    {
+      "name": "the same document written with the doubles",
+      "kind": "session",
+      "doc": {
+        "epoch": "e1",
+        "rev": 1,
+        "history": "complete",
+        "entries": [],
+        "prompts": [],
+        "live": {
+          "bytes": 9007199254740992,
+          "also": -9007199254740996
+        }
+      },
+      "entryHashes": [],
+      "entriesDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "digest": "2bE5_U_hXm35sywSIl8WqA"
+    },
+    {
       "name": "global with its first operation",
       "kind": "scope",
       "doc": {
