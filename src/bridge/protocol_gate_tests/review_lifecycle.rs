@@ -152,11 +152,11 @@ async fn review_a_null_request_scope_interaction_ends_with_the_global_operation_
     );
 }
 
-// Supplementary existing-state-machine case: the same S7 cleanup gap also
-// exists for a directly session-scoped interaction. Not a distinct new 4b
-// implementation finding; it guards against a fix limited to requestId:null.
+// An operation's end ends no interaction (memory model §8.2, D11): one the Agent asked of the
+// session while a control operation ran is still the session's when the operation completed,
+// and is answered on its own.
 #[tokio::test]
-async fn review_a_session_scoped_interaction_ends_with_its_control_operation() {
+async fn a_session_scoped_interaction_outlives_the_control_operation_it_arrived_in() {
     let mut peer = Peer::start(json!({})).await;
     peer.create(
         CREATED,
@@ -191,15 +191,63 @@ async fn review_a_session_scoped_interaction_ends_with_its_control_operation() {
     let live = peer.live(&scope);
     assert_eq!(
         live["op"]["id"], op,
-        "completion must not re-home its old interaction in a new agent_request"
+        "completion must not re-home its interaction in a new agent_request"
     );
     assert_eq!(live["op"]["status"], "completed");
     assert_eq!(live["controls"]["modes"]["currentModeId"], "plan");
-    assert!(interaction_ids(&live).is_empty());
+    let interaction = interaction_ids(&live);
+    assert_eq!(interaction.len(), 1, "the interaction outlives the operation: {live}");
+    peer.answer_resource(&scope, &interaction[0], json!({"response": {"action": "accept", "content": {}}}))
+        .await
+        .unwrap();
     assert_eq!(
         peer.response("question").await["result"]["action"],
-        "cancel"
+        "accept"
     );
+    peer.until("the answered interaction leaves", |peer| {
+        interaction_ids(&peer.live(&scope)).is_empty()
+    })
+    .await;
+    peer.settled().await;
+}
+
+#[tokio::test]
+async fn a_permission_asked_during_a_prompt_is_still_the_sessions_when_the_prompt_ended() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create(CREATED, json!({})).await;
+    let scope = format!("session/{CREATED}");
+    let (op, request) = peer.prompt(CREATED, vec![text("hi")]).await;
+    peer.agent_request("permission", "session/request_permission", permission(CREATED))
+        .await;
+    peer.until("the permission is pending", |peer| {
+        interaction_ids(&peer.live(&scope)).len() == 1
+    })
+    .await;
+    peer.reply(&request, json!({"stopReason": "end_turn"})).await;
+    peer.until("the prompt completes", |peer| {
+        peer.live(&scope)["op"]["id"] == op && peer.live(&scope)["op"]["status"] == "completed"
+    })
+    .await;
+    peer.settled().await;
+    let interaction = interaction_ids(&peer.live(&scope));
+    assert_eq!(interaction.len(), 1, "the permission outlives the prompt");
+    // A new operation of the session does not take it either.
+    let (next, _) = peer
+        .start_op(&scope, "set_mode", json!({"modeId": "plan"}))
+        .await;
+    peer.until("the next operation runs", |peer| peer.live(&scope)["op"]["id"] == next)
+        .await;
+    assert_eq!(interaction_ids(&peer.live(&scope)), interaction);
+    peer.answer_resource(
+        &scope,
+        &interaction[0],
+        json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
+    )
+    .await
+    .unwrap();
+    let response = peer.response("permission").await;
+    assert_eq!(response["result"]["outcome"]["optionId"], "allow");
+    peer.settled().await;
 }
 
 // Uses the existing Peer and real coordinator/ACP transport. No cancellation

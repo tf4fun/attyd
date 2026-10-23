@@ -366,15 +366,6 @@ impl SessionRegistry {
         })
     }
 
-    /// Whether `interaction` belongs to `op`: it joined it, or it predates
-    /// joining and waits in the scope `op` is shown in.
-    pub(crate) fn belongs_to(&self, interaction: &str, op: &str) -> bool {
-        self.scopes
-            .joined
-            .get(interaction)
-            .is_none_or(|joined| joined.op == op)
-    }
-
     /// A transition of `session_id` ended: settle its `agent_request`.
     pub(crate) fn settle_session_ops(&mut self, session_id: &str) {
         if self.scopes.occupied.contains_key(session_id) {
@@ -463,23 +454,6 @@ impl SessionRegistry {
                 .flow_scopes
                 .insert(interaction_id.to_string(), joined.scope);
         }
-    }
-
-    /// Unanswered interactions whose operation ended: an operation's end
-    /// clears its pending interactions (S7).
-    pub(crate) fn orphaned_interactions(&self) -> Vec<(String, Pending)> {
-        self.pending_interactions()
-            .filter(|(pending, _)| {
-                self.scopes
-                    .joined
-                    .get(&pending.interaction_id)
-                    .is_some_and(|joined| {
-                        self.shown_slot(&joined.scope)
-                            .is_none_or(|slot| slot.id != joined.op || !slot.is_running())
-                    })
-            })
-            .map(|(pending, kind)| (pending.interaction_id.clone(), kind))
-            .collect()
     }
 
     /// Forgets joins and flow scopes whose interaction or flow is gone.

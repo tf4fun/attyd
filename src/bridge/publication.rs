@@ -149,7 +149,6 @@ impl BridgeState {
     /// The commit step: settles what the transition left behind and publishes
     /// every change since the last commit.
     pub(super) fn commit(&mut self) {
-        self.retire_orphaned_interactions();
         // The scopes the transitions ended are the feed's to end, with the reasons they gave;
         // they are consumed here. No transition changes what clients see without publishing
         // it, and the events enter every queue in the critical section that produced them (S3).
@@ -170,73 +169,6 @@ impl BridgeState {
             &self.protocol.agent,
             self.catalog_revision,
         )
-    }
-
-    /// An interaction whose operation ended is answered with its cancel
-    /// outcome: an operation's end clears its pending interactions (S7).
-    fn retire_orphaned_interactions(&mut self) {
-        use crate::protocol::registry::Pending;
-        for (interaction_id, pending) in self.sessions.orphaned_interactions() {
-            let epoch = self.sessions.epoch().to_owned();
-            match pending {
-                Pending::Request => {
-                    let responder = self.request_elicitations.remove(&interaction_id);
-                    let _ = self
-                        .sessions
-                        .resolve_elicitation(&epoch, None, &interaction_id, None);
-                    if let Some(responder) = responder {
-                        let _ = responder
-                            .sender
-                            .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
-                    }
-                }
-                Pending::Permission(session_id) => {
-                    let owner = self
-                        .sessions
-                        .permission_owners
-                        .get(&interaction_id)
-                        .cloned();
-                    let responder = owner
-                        .as_ref()
-                        .and_then(|owner| self.sessions.take_permission(&interaction_id, owner));
-                    if owner.is_some() {
-                        let _ =
-                            self.sessions
-                                .resolve_permission(&epoch, &session_id, &interaction_id);
-                    }
-                    if let Some(responder) = responder {
-                        let _ = responder.sender.send(RequestPermissionResponse::new(
-                            RequestPermissionOutcome::Cancelled,
-                        ));
-                    }
-                }
-                Pending::Elicitation(session_id) => {
-                    let owner = self
-                        .sessions
-                        .elicitation_owners
-                        .get(&interaction_id)
-                        .cloned();
-                    let responder = owner
-                        .as_ref()
-                        .and_then(|owner| self.sessions.take_elicitation(&interaction_id, owner));
-                    if owner.is_some() {
-                        let _ = self.sessions.resolve_elicitation(
-                            &epoch,
-                            Some(session_id.as_str()),
-                            &interaction_id,
-                            None,
-                        );
-                    }
-                    if let Some(responder) = responder {
-                        let _ = responder
-                            .sender
-                            .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
-                    }
-                }
-            }
-            self.sessions.scopes.joined.remove(&interaction_id);
-        }
-        self.sessions.prune_joined();
     }
 
     /// The Agent connection ended (protocol §4.4): every running operation
