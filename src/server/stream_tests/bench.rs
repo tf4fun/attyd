@@ -15,6 +15,7 @@ mod execution;
 mod interactions;
 mod login_terminals;
 mod occupation;
+mod reads;
 mod retired_v1;
 #[cfg(unix)]
 mod review_terminal_io;
@@ -100,12 +101,17 @@ impl Bench {
         let mut link = bench.agents.connect().await;
         let initialize = link.request("initialize").await;
         link.reply(&initialize, result).await;
+        bench.until_ready().await;
+        (bench, link)
+    }
+
+    /// Waits until the bridge published `global.agent.phase == ready`.
+    async fn until_ready(&self) {
         let deadline = tokio::time::Instant::now() + WAIT;
-        while bench.document("global").await["live"]["agent"]["phase"] != "ready" {
+        while self.document("global").await["live"]["agent"]["phase"] != "ready" {
             assert!(tokio::time::Instant::now() < deadline, "the Agent never got ready");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        (bench, link)
     }
 
     // -- HTTP -----------------------------------------------------------------

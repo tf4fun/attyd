@@ -183,10 +183,12 @@ Restored in `src/server/stream_tests/bench/occupation.rs`.
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] attachments_are_served_while_their_own_session_references_them
-- [ ] a_compaction_summary_block_is_served_until_its_turn_commits
-- [ ] reads_hold_nothing_and_a_released_session_serves_no_attachment
-- [ ] context_reads_follow_each_sessions_own_workspace
+- [x] attachments_are_served_while_their_own_session_references_them
+- [x] a_compaction_summary_block_is_served_until_its_turn_commits → a_compaction_summary_block_is_served_while_its_entry_references_it
+- [x] reads_hold_nothing_and_a_released_session_serves_no_attachment
+- [x] context_reads_follow_each_sessions_own_workspace
+
+Restored in `src/server/stream_tests/bench/reads.rs`: an attachment is served while an entry of its own session references it (a message, a failed prompt's message, a tool call, a compaction summary), and entries are never removed, so the revision 2 "until its turn commits" lifetimes have no counterpart.
 
 ## Writes over HTTP (`src/server/stream_tests/ops/retired_v1.rs`)
 
