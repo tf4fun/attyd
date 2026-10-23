@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase, OperationKind, Scope};
-use crate::runtime_state::SessionLifecycle;
+use crate::runtime_state::{SessionLifecycle, UrlFlowStatus};
 use crate::session_registry::SessionRegistry;
 
 fn agent() -> AgentInfo {
@@ -410,6 +410,39 @@ fn an_accepted_url_flow_waits_with_its_status() {
                         "status": "waiting" } })
     );
     assert_eq!(live["interactions"], json!({}), "an accepted elicitation is no longer pending");
+}
+
+#[test]
+fn a_url_flow_the_agent_completed_or_the_connection_ended_stays_with_its_status() {
+    let mut registry = registry();
+    let scope = Scope::Session("s".into());
+    let request = json!({ "mode": "url", "elicitationId": "e", "url": "https://example.test" });
+    for (interaction, elicitation) in [("i1", "done"), ("i2", "waiting")] {
+        registry.bind_interaction(interaction, scope.clone());
+        registry
+            .upsert_elicitation("epoch", Some("s"), interaction, request.clone())
+            .unwrap();
+        registry
+            .resolve_elicitation("epoch", Some("s"), interaction, Some(elicitation))
+            .unwrap();
+    }
+    registry
+        .settle_url_registration("epoch", Some("s"), "done", "i1", UrlFlowStatus::Completed)
+        .unwrap();
+    let status = |registry: &SessionRegistry| {
+        let live = scope_live(registry, &scope, &agent(), 0).unwrap();
+        ["i1", "i2"].map(|id| live["urlFlows"][id]["status"].clone())
+    };
+    assert_eq!(status(&registry), [json!("completed"), json!("waiting")]);
+
+    // The connection's end finishes only what still waited.
+    registry.end_connection(crate::protocol::documents::ProtocolError::new(
+        crate::protocol::documents::ErrorCode::Unavailable,
+        "gone",
+    ));
+    assert_eq!(status(&registry), [json!("completed"), json!("ended")]);
+    let summary = project::project_global(&registry, &agent());
+    assert_eq!(summary.sessions["s"].pending.url_flows, 0, "only waiting flows are pending");
 }
 
 #[test]

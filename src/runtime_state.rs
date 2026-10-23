@@ -160,7 +160,11 @@ pub(crate) struct UrlFlow {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UrlFlowStatus {
     Waiting,
+    /// The Agent completed it (`elicitation/complete`); it stays until dismissed.
     Completed,
+    /// The Agent connection ended while it waited; it stays until dismissed.
+    Ended,
+    /// Settles a flow by removing it: a dismissal, or the end of its scope.
     Cancelled,
 }
 
@@ -427,7 +431,7 @@ impl SessionRegistry {
             })
             || !session.permissions.is_empty()
             || !session.elicitations.is_empty()
-            || !session.url_flows.is_empty()
+            || session.url_flows.values().any(|flow| flow.status == UrlFlowStatus::Waiting)
             || !session.terminals.is_empty()
             || !session.attachment_candidate.is_empty()
         {
@@ -1090,6 +1094,8 @@ impl SessionRegistry {
         self.settle_url_flow(expected_epoch, scope, elicitation_id, status)
     }
 
+    /// `Completed` and `Ended` mark a waiting flow in place, and it stays until dismissed;
+    /// `Cancelled` removes it, whatever its status (protocol §4.6, memory model §8.3).
     fn settle_url_flow(
         &mut self,
         expected_epoch: &str,
@@ -1101,43 +1107,31 @@ impl SessionRegistry {
         if status == UrlFlowStatus::Waiting {
             return Err(RuntimeStateError::OperationMismatch);
         }
-        match scope {
+        let (flows, resolved) = match scope {
             Some(session_id) => {
                 let session = self.require_live_mut(session_id)?;
-                if session
-                    .resolved_url_flows
-                    .iter()
-                    .any(|resolved| resolved == elicitation_id)
-                {
-                    return Ok(UrlFlowResolution::AlreadyTerminal);
-                }
-                let flow = session
-                    .url_flows
-                    .remove(elicitation_id)
-                    .ok_or(RuntimeStateError::UnknownInteraction)?;
-                if flow.status != UrlFlowStatus::Waiting {
-                    return Ok(UrlFlowResolution::AlreadyTerminal);
-                }
-                remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
+                (&mut session.url_flows, &mut session.resolved_url_flows)
             }
-            None => {
-                if self
-                    .resolved_request_url_flows
-                    .iter()
-                    .any(|resolved| resolved == elicitation_id)
-                {
-                    return Ok(UrlFlowResolution::AlreadyTerminal);
-                }
-                let flow = self
-                    .request_url_flows
-                    .remove(elicitation_id)
-                    .ok_or(RuntimeStateError::UnknownInteraction)?;
-                if flow.status != UrlFlowStatus::Waiting {
-                    return Ok(UrlFlowResolution::AlreadyTerminal);
-                }
-                remember_resolved_interaction(&mut self.resolved_request_url_flows, elicitation_id);
-            }
+            None => (&mut self.request_url_flows, &mut self.resolved_request_url_flows),
+        };
+        if resolved.iter().any(|resolved| resolved == elicitation_id) {
+            return Ok(UrlFlowResolution::AlreadyTerminal);
         }
+        let flow = flows
+            .get_mut(elicitation_id)
+            .ok_or(RuntimeStateError::UnknownInteraction)?;
+        let waiting = flow.status == UrlFlowStatus::Waiting;
+        if status == UrlFlowStatus::Cancelled {
+            flows.remove(elicitation_id);
+            if waiting {
+                remember_resolved_interaction(resolved, elicitation_id);
+            }
+            return Ok(UrlFlowResolution::Applied);
+        }
+        if !waiting {
+            return Ok(UrlFlowResolution::AlreadyTerminal);
+        }
+        flow.status = status;
         Ok(UrlFlowResolution::Applied)
     }
 
@@ -1575,12 +1569,17 @@ impl SessionRegistry {
     }
 
     pub(crate) fn url_flow_in_use(&self, elicitation_id: &str) -> bool {
-        self.request_url_flows.contains_key(elicitation_id)
+        let waiting = |flows: &BTreeMap<String, UrlFlow>| {
+            flows
+                .get(elicitation_id)
+                .is_some_and(|flow| flow.status == UrlFlowStatus::Waiting)
+        };
+        waiting(&self.request_url_flows)
             || self
                 .sessions
                 .values()
                 .filter_map(|entry| entry.state.live.as_ref())
-                .any(|session| session.url_flows.contains_key(elicitation_id))
+                .any(|session| waiting(&session.url_flows))
     }
 }
 
@@ -4747,14 +4746,25 @@ mod tests {
                 .unwrap(),
             UrlFlowResolution::Applied,
         );
+        // A completed flow stays, completed, until it is dismissed.
+        assert_eq!(
+            state.session("session").unwrap().url_flows["url-id"].status,
+            UrlFlowStatus::Completed,
+        );
         let completed_seq = state.live_snapshot();
         assert_eq!(
             state
-                .settle_url_flow("epoch", Some("session"), "url-id", UrlFlowStatus::Cancelled,)
+                .settle_url_flow("epoch", Some("session"), "url-id", UrlFlowStatus::Completed,)
                 .unwrap(),
             UrlFlowResolution::AlreadyTerminal,
         );
         assert_eq!(state.live_snapshot(), completed_seq);
+        assert_eq!(
+            state
+                .settle_url_flow("epoch", Some("session"), "url-id", UrlFlowStatus::Cancelled,)
+                .unwrap(),
+            UrlFlowResolution::Applied,
+        );
         assert!(
             !state
                 .session("session")
@@ -5188,7 +5198,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_url_flows_are_removed_from_live_state_but_remain_idempotent() {
+    fn a_url_flow_stays_when_completed_and_a_dismissed_one_stays_settled() {
         let mut state = state();
         open(&mut state, "session");
         state
@@ -5204,6 +5214,17 @@ mod tests {
                 .unwrap(),
             UrlFlowResolution::Applied
         );
+        assert_eq!(
+            state.session("session").unwrap().url_flows["url"].status,
+            UrlFlowStatus::Completed
+        );
+        // Dismissing a finished flow removes it.
+        assert_eq!(
+            state
+                .settle_url_flow("epoch", Some("session"), "url", UrlFlowStatus::Cancelled,)
+                .unwrap(),
+            UrlFlowResolution::Applied
+        );
         assert!(
             !state
                 .session("session")
@@ -5211,15 +5232,8 @@ mod tests {
                 .url_flows
                 .contains_key("url")
         );
-        let settled_seq = state.live_snapshot();
-        assert_eq!(
-            state
-                .settle_url_flow("epoch", Some("session"), "url", UrlFlowStatus::Cancelled,)
-                .unwrap(),
-            UrlFlowResolution::AlreadyTerminal
-        );
-        assert_eq!(state.live_snapshot(), settled_seq);
 
+        // A waiting flow dismissed is settled: a late completion changes nothing.
         state
             .upsert_elicitation("epoch", None, "request-form", json!({ "mode": "url" }))
             .unwrap();

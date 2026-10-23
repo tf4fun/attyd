@@ -2111,9 +2111,9 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
             "{scope} keeps no URL flow"
         );
     }
-    // No subscription follows the session: with its operation, interactions
-    // and URL flow gone, nothing needs it, and the connection's end releases
-    // it from the final documents (S6).
+    // No subscription follows the session: with its operation and interactions gone and its
+    // URL flow ended, nothing needs it, and the connection's end releases it from the final
+    // documents (S6).
     let published = peer.publication.lock();
     assert!(published.feed.live(&Scope::parse(&scope).unwrap()).is_none());
     let summary = published.feed.live(&Scope::Global).unwrap();

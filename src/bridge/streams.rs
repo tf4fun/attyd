@@ -205,13 +205,20 @@ pub(super) fn needed(
         || registry.scopes.occupied.contains_key(session_id)
         || registry.session_ref(session_id).is_some_and(|session| {
             session.live.op.is_running()
-                || !session.live.url_flows.is_empty()
+                || session
+                    .live
+                    .url_flows
+                    .values()
+                    .any(|flow| flow.status == UrlFlowStatus::Waiting)
                 || !session.live.terminals.is_empty()
         })
         || registry
             .request_url_flows
             .values()
-            .any(|flow| registry.scopes.flow_scopes.get(&flow.registration_id) == Some(&scope))
+            .any(|flow| {
+                flow.status == UrlFlowStatus::Waiting
+                    && registry.scopes.flow_scopes.get(&flow.registration_id) == Some(&scope)
+            })
 }
 
 impl BridgeState {

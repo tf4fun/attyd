@@ -52,7 +52,10 @@ impl SessionWork {
         if session.live.as_ref().is_some_and(|live| {
             !live.permissions.is_empty()
                 || !live.elicitations.is_empty()
-                || !live.url_flows.is_empty()
+                || live
+                    .url_flows
+                    .values()
+                    .any(|flow| flow.status == crate::runtime_state::UrlFlowStatus::Waiting)
         }) {
             return Self::AwaitingInteraction;
         }

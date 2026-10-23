@@ -99,6 +99,24 @@ impl SessionRegistry {
         owner.epoch == self.epoch && self.sessions.contains_key(&owner.session_id)
     }
 
+    /// The flow accepted from `interaction_id`, in whatever status: the session that holds it
+    /// (none for a request-scoped one) and the Agent's elicitation ID.
+    pub(crate) fn url_flow_named(&self, interaction_id: &str) -> Option<(Option<String>, String)> {
+        let named = |flows: &BTreeMap<String, UrlFlow>| {
+            flows
+                .iter()
+                .find(|(_, flow)| flow.registration_id == interaction_id)
+                .map(|(elicitation_id, _)| elicitation_id.clone())
+        };
+        if let Some(elicitation_id) = named(&self.request_url_flows) {
+            return Some((None, elicitation_id));
+        }
+        self.sessions.iter().find_map(|(session_id, entry)| {
+            let live = entry.state.live.as_ref()?;
+            Some((Some(session_id.clone()), named(&live.url_flows)?))
+        })
+    }
+
     /// Build the lightweight route from the canonical accepted flow's identity.
     pub(crate) fn register_url_route(
         &mut self,

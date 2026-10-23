@@ -17,8 +17,20 @@ use super::documents::{
 };
 use super::op::OpSlot;
 use super::wire::{self, Empty, PromptResult, SessionCreated};
-use crate::runtime_state::{PendingInteraction, SessionLiveState, SessionOperationKind};
+use crate::runtime_state::{
+    PendingInteraction, SessionLiveState, SessionOperationKind, UrlFlow, UrlFlowStatus,
+};
 use crate::session_registry::SessionRegistry;
+
+/// The connection ended: the flows still waiting stay, `ended`, until a client dismisses them
+/// (memory model §8.3).
+fn mark_ended(flows: &mut BTreeMap<String, UrlFlow>) {
+    for flow in flows.values_mut() {
+        if flow.status == UrlFlowStatus::Waiting {
+            flow.status = UrlFlowStatus::Ended;
+        }
+    }
+}
 
 /// A held session the next Agent connection loads again: bridge memory
 /// that outlives the connection (protocol S6, §5.4). It keeps the controls
@@ -592,7 +604,7 @@ impl SessionRegistry {
                 }
                 live.permissions.clear();
                 live.elicitations.clear();
-                live.url_flows.clear();
+                mark_ended(&mut live.url_flows);
                 // Every handle ends with the connection; the output an entry
                 // embeds stays frozen with the session that remains held.
                 for (terminal_id, mut snapshot) in std::mem::take(&mut live.terminals) {
@@ -610,9 +622,8 @@ impl SessionRegistry {
         }
         self.scopes.occupied.clear();
         self.request_elicitations.clear();
-        self.request_url_flows.clear();
+        mark_ended(&mut self.request_url_flows);
         self.scopes.joined.clear();
-        self.scopes.flow_scopes.clear();
         self.scopes.login_terminals.clear();
     }
 
