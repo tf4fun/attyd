@@ -142,11 +142,13 @@ pub(crate) struct Operation {
     #[cfg_attr(test, ts(type = "unknown"))]
     pub input: Value,
     pub cancel_requested: bool,
-    /// Pending, by interaction ID.
+    /// Pending, by interaction ID. They are a member of `live` beside the operation on the wire
+    /// (protocol §4.4), so the generated type leaves them out.
+    #[cfg_attr(test, ts(skip))]
     pub interactions: BTreeMap<String, Interaction>,
-    /// A running prompt's updates, folded, with content blocks normalized.
+    /// Revision 2 showed a running prompt's updates here; entries carry them now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional, type = "ProcessUpdate[]"))]
+    #[cfg_attr(test, ts(skip))]
     pub process: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "unknown"))]
