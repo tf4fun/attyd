@@ -149,6 +149,7 @@ impl BridgeState {
     /// The commit step: settles what the transition left behind and publishes
     /// every change since the last commit.
     pub(super) fn commit(&mut self) {
+        self.retire_orphaned_interactions();
         // The scopes the transitions ended are the feed's to end, with the reasons they gave;
         // they are consumed here. No transition changes what clients see without publishing
         // it, and the events enter every queue in the critical section that produced them (S3).
@@ -169,6 +170,25 @@ impl BridgeState {
             &self.protocol.agent,
             self.catalog_revision,
         )
+    }
+
+    /// A request-scoped interaction whose operation ended is answered with its cancel
+    /// outcome (see `SessionRegistry::orphaned_interactions`).
+    fn retire_orphaned_interactions(&mut self) {
+        for interaction_id in self.sessions.orphaned_interactions() {
+            let epoch = self.sessions.epoch().to_owned();
+            let responder = self.request_elicitations.remove(&interaction_id);
+            let _ = self
+                .sessions
+                .resolve_elicitation(&epoch, None, &interaction_id, None);
+            if let Some(responder) = responder {
+                let _ = responder
+                    .sender
+                    .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
+            }
+            self.sessions.scopes.joined.remove(&interaction_id);
+        }
+        self.sessions.prune_joined();
     }
 
     /// The Agent connection ended (protocol §4.4): every running operation

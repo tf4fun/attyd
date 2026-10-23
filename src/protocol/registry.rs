@@ -456,6 +456,26 @@ impl SessionRegistry {
         }
     }
 
+    /// Request-scoped interactions whose operation ended. Until the parent request's
+    /// response ends them on its own (step 16), the end of the operation they were sent
+    /// for does. A session-scoped interaction is never one of them: an operation's end ends
+    /// no interaction (memory model §8.2).
+    pub(crate) fn orphaned_interactions(&self) -> Vec<String> {
+        self.request_elicitations
+            .values()
+            .filter(|pending| {
+                self.scopes
+                    .joined
+                    .get(&pending.interaction_id)
+                    .is_some_and(|joined| {
+                        self.shown_slot(&joined.scope)
+                            .is_none_or(|slot| slot.id != joined.op || !slot.is_running())
+                    })
+            })
+            .map(|pending| pending.interaction_id.clone())
+            .collect()
+    }
+
     /// Forgets joins and flow scopes whose interaction or flow is gone.
     pub(crate) fn prune_joined(&mut self) {
         let pending: std::collections::BTreeSet<String> = self

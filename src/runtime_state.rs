@@ -883,22 +883,8 @@ impl SessionRegistry {
     ) -> Result<(), RuntimeStateError> {
         self.require_epoch(expected_epoch)?;
         let owner = self.live_owner_mut(session_id)?;
-        let retired = session_live::seal_turn(owner, operation_id, terminal)?;
+        session_live::seal_turn(owner, operation_id, terminal)?;
         self.end_session_turn(session_id, end);
-        self.effects
-            .extend(retired.permissions.into_iter().map(|interaction_id| {
-                RuntimeEffect::CancelPermissionResponder {
-                    session_id: session_id.to_string(),
-                    interaction_id,
-                }
-            }));
-        self.effects
-            .extend(retired.elicitations.into_iter().map(|interaction_id| {
-                RuntimeEffect::CancelElicitationResponder {
-                    session_id: Some(session_id.to_string()),
-                    interaction_id,
-                }
-            }));
         self.settle_session_ops(session_id);
         Ok(())
     }
@@ -1633,11 +1619,6 @@ mod session_live {
         SessionState, TurnTerminal, remember_resolved_interaction, remember_resolved_permission,
     };
 
-    pub(super) struct TurnRetirement {
-        pub(super) permissions: Vec<String>,
-        pub(super) elicitations: Vec<String>,
-    }
-
     pub(super) fn start_operation(
         owner: &mut SessionState,
         operation_id: String,
@@ -1712,7 +1693,7 @@ mod session_live {
         owner: &mut SessionState,
         operation_id: &str,
         terminal: TurnTerminal,
-    ) -> Result<TurnRetirement, RuntimeStateError> {
+    ) -> Result<(), RuntimeStateError> {
         let session = owner
             .live
             .as_mut()
@@ -1733,30 +1714,9 @@ mod session_live {
         if let Some(lifecycle) = lifecycle {
             session.lifecycle = lifecycle;
         }
-        let resolved_permissions = session
-            .permissions
-            .iter()
-            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
-            .map(|(interaction_id, _)| interaction_id.clone())
-            .collect::<Vec<_>>();
-        for interaction_id in &resolved_permissions {
-            session.permissions.remove(interaction_id);
-            remember_resolved_permission(session, interaction_id);
-        }
-        let resolved_elicitations = session
-            .elicitations
-            .iter()
-            .filter(|(_, interaction)| interaction.operation_id.as_deref() == Some(operation_id))
-            .map(|(interaction_id, _)| interaction_id.clone())
-            .collect::<Vec<_>>();
-        for interaction_id in &resolved_elicitations {
-            session.elicitations.remove(interaction_id);
-            remember_resolved_interaction(&mut session.resolved_elicitations, interaction_id);
-        }
-        Ok(TurnRetirement {
-            permissions: resolved_permissions,
-            elicitations: resolved_elicitations,
-        })
+        // The turn's end ends no interaction (memory model §8.2): a session-scoped one is
+        // answered, cancelled by the Agent or the user, or goes with the session.
+        Ok(())
     }
 
     pub(super) fn upsert_permission(
