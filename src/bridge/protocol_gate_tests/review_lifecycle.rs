@@ -107,6 +107,54 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     assert!(!state.sessions.scopes.flow_scopes.contains_key(&interaction));
 }
 
+/// A request-scoped interaction lives until the response of the request it names (memory model
+/// §8.2), whether or not an operation runs: a control action installs none, and the interaction
+/// its `session/set_mode` request raises is not retired for lack of a running operation.
+#[tokio::test]
+async fn an_interaction_of_a_control_request_lives_until_that_requests_response() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create(
+        CREATED,
+        json!({"modes": {"currentModeId": "ask", "availableModes": [
+            {"id": "ask", "name": "Ask"}, {"id": "plan", "name": "Plan"},
+        ]}}),
+    )
+    .await;
+    let scope = format!("session/{CREATED}");
+    let answer = peer
+        .control(
+            CREATED,
+            crate::bridge::controls::Control::SetMode { mode_id: "plan".into() },
+        )
+        .await;
+    let request = peer.request("session/set_mode").await;
+    peer.agent_request(
+        "q",
+        "elicitation/create",
+        form(json!({"requestId": request["id"]})),
+    )
+    .await;
+    peer.until("the control's interaction is pending", |peer| {
+        interaction_ids(&peer.live(&scope)).len() == 1
+    })
+    .await;
+    peer.settled().await;
+    assert_eq!(
+        interaction_ids(&peer.live(&scope)).len(),
+        1,
+        "no running operation ends it: only the control's response does"
+    );
+
+    peer.reply(&request, json!({})).await;
+    answer.await.unwrap().unwrap();
+    peer.until("the response ends the interaction", |peer| {
+        interaction_ids(&peer.live(&scope)).is_empty()
+    })
+    .await;
+    assert_eq!(peer.response("q").await["result"]["action"], "cancel");
+    peer.settled().await;
+}
+
 /// A request-scoped elicitation names an outstanding request of the bridge (memory model §8.2,
 /// Q6): one that names none, or one that is no longer outstanding, is refused with
 /// `invalid_params` and never becomes an interaction.

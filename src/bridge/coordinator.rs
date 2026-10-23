@@ -55,6 +55,16 @@ pub(super) async fn dispatch_ready(
         BridgeIngress::Browser(input) if stopping => input.reject(Error::request_cancelled()),
         BridgeIngress::Browser(input) => return Ok(Some((input, turn))),
         BridgeIngress::RpcCompleted(completion) => {
+            // The interactions that name this request end with its response, before whoever
+            // waited for it goes on.
+            if let Ok(id) = serde_json::to_value(&completion.request_id) {
+                services
+                    .state
+                    .lock()
+                    .await
+                    .sessions
+                    .parent_completed(crate::protocol::registry::request_key(&id));
+            }
             scheduling.handoff_completion(completion, turn)?;
         }
         BridgeIngress::Continuation { reply, .. } => {

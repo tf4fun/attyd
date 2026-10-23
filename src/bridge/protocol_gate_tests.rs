@@ -447,6 +447,28 @@ impl Peer {
             .expect("the bridge dropped the write")
     }
 
+    /// Sends a control action to `session_id` and waits until the bridge admits it; the receiver
+    /// is the Agent's answer.
+    async fn control(
+        &mut self,
+        session_id: &str,
+        control: crate::bridge::controls::Control,
+    ) -> crate::bridge::controls::ControlAnswer {
+        let (reply, admitted) = oneshot::channel();
+        self.commands
+            .send(BridgeInput::Control {
+                session_id: session_id.to_string(),
+                control,
+                reply,
+            })
+            .unwrap();
+        tokio::time::timeout(WAIT, admitted)
+            .await
+            .expect("the control was not admitted")
+            .expect("the bridge dropped the control")
+            .unwrap_or_else(|error| panic!("the control was refused: {error:?}"))
+    }
+
     /// Starts an operation of `kind` in `scope` and waits until it is
     /// published: its ID, and for `create`, `fork` and `list` the end its
     /// response waits for.
