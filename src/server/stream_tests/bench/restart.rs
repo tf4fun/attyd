@@ -60,6 +60,27 @@ async fn restart_while_a_connection_runs_is_not_allowed() {
     assert_eq!(server.document("global").await, before);
 }
 
+/// While the connection initializes, `restart` is `not_allowed` too, and starts nothing (the row of
+/// protocol §12.4 names starting and initializing as well as ready).
+#[tokio::test]
+async fn restart_while_the_connection_initializes_is_not_allowed() {
+    let mut server = Bench::launch().await;
+    let mut link = server.agents.connect().await;
+    let initialize = link.request("initialize").await;
+    let mut stream = server.watch("scope=global").await;
+    stream.event().await;
+    assert_eq!(stream.live("global")["agent"]["phase"], "initializing");
+
+    let (status, body) = server.call(Method::POST, RESTART, Some(json!({}))).await;
+    not_allowed(status, &body, "a restart while the Agent initializes");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(server.agents.accepted(), 1, "nothing was started");
+
+    link.reply(&initialize, initialized(json!({}))).await;
+    until_phase(&mut stream, &["ready"]).await;
+    stream.converged(&server).await;
+}
+
 /// Only `global` has the action, and its body is an object.
 #[tokio::test]
 async fn restart_belongs_to_global_and_takes_an_object() {
