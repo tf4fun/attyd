@@ -48,12 +48,6 @@ pub(crate) enum Admitted {
     Repeat { op: String },
     /// `cancel` of the running operation `op` of `kind`.
     Cancel { op: String, kind: OperationKind },
-    /// `answer` of the running operation `op`: one validated answer for each
-    /// of its pending interactions, by interaction ID.
-    Answer {
-        op: String,
-        answers: Vec<(String, Answer)>,
-    },
 }
 
 /// A validated answer to one pending interaction (protocol §6.2).
@@ -106,7 +100,7 @@ pub(crate) fn admit(
     write: &OpWrite,
 ) -> Result<Admitted, ProtocolError> {
     let started = started_kind(scope, &write.kind);
-    if started.is_none() && !matches!(write.kind.as_str(), "cancel" | "answer") {
+    if started.is_none() && write.kind != "cancel" {
         return Err(invalid(format!(
             "{} is not an operation clients write in {scope}",
             write.kind
@@ -159,8 +153,7 @@ pub(crate) fn admit(
             }
             return Ok(Admitted::Cancel { op: id, kind });
         }
-        let answers = answers(&live["interactions"], &write.args)?;
-        return Ok(Admitted::Answer { op: id, answers });
+        unreachable!("only a cancel is written for a running operation");
     };
     if running {
         return Err(refuse(
@@ -250,33 +243,6 @@ fn optional_string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, 
         None | Some(Value::Null) => Ok(None),
         Some(_) => string(args, field).map(Some),
     }
-}
-
-/// An answer's keys must be exactly the pending interactions (§6.4), then
-/// every answer must be valid for its request; either refuses it whole.
-fn answers(pending: &Value, args: &Value) -> Result<Vec<(String, Answer)>, ProtocolError> {
-    let answers = args["answers"]
-        .as_object()
-        .ok_or_else(|| invalid("answers must be an object keyed by interaction ID"))?;
-    let pending = pending.as_object().cloned().unwrap_or_default();
-    if answers.len() != pending.len() || answers.keys().any(|id| !pending.contains_key(id)) {
-        return Err(refuse(
-            ErrorCode::NotAllowed,
-            "the answers do not name exactly the pending interactions",
-        ));
-    }
-    pending
-        .iter()
-        .map(|(id, interaction)| {
-            let answer = &answers[id];
-            let request = &interaction["request"];
-            let answer = match interaction["kind"].as_str() {
-                Some("permission") => Answer::Permission(permission_answer(request, answer)?),
-                _ => Answer::Elicitation(elicitation_answer(request, answer)?),
-            };
-            Ok((id.clone(), answer))
-        })
-        .collect()
 }
 
 /// The answer to one pending `interaction` from `body`: `{ outcome }` for a

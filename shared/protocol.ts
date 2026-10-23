@@ -176,9 +176,9 @@ export type OpRequest = {
 /**
  * The `op.id` the write expects the scope to show.
  */
-expect: string, } & ({ "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty } | { "kind": "answer", "args": AnswerArgs });
+expect: string, } & ({ "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty });
 
-export type OpArgs = { "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty } | { "kind": "answer", "args": AnswerArgs };
+export type OpArgs = { "kind": "prompt", "args": PromptArgs } | { "kind": "set_mode", "args": SetModeArgs } | { "kind": "set_config", "args": SetConfigArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty };
 
 export type Empty = Record<symbol, never>;
 
@@ -205,8 +205,6 @@ export type ListArgs = { cursor?: string,
  * Refused with `catalog_changed` unless it is `catalog.live.revision`.
  */
 revision?: string, };
-
-export type AnswerArgs = { answers: { [key in string]: Answer }, };
 
 export type Answer = { outcome: RequestPermissionOutcome, } | { response: CreateElicitationResponse, };
 

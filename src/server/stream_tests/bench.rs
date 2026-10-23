@@ -229,9 +229,17 @@ impl Bench {
         })
     }
 
-    /// An `answer` of `op`, in `scope`.
+    /// The answers to interactions of `scope` (protocol §7), one at a time at their resources, in
+    /// the order of their IDs. The first refusal is the result; otherwise `202` naming `op`, which
+    /// the answers leave as it is.
     async fn answer(&self, scope: &str, op: &Value, answers: Value) -> (StatusCode, Value) {
-        self.op(scope, op, "answer", json!({ "answers": answers })).await
+        for (interaction, answer) in answers.as_object().into_iter().flatten() {
+            let (status, body) = self.act(scope, interaction, "answer", answer.clone()).await;
+            if status != StatusCode::NO_CONTENT {
+                return (status, body);
+            }
+        }
+        (StatusCode::ACCEPTED, json!({ "op": op }))
     }
 
     /// A `cancel` of `op`, in `scope`.

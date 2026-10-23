@@ -80,7 +80,6 @@ fn declarations(cfg: &Config) -> Vec<String> {
         MethodArgs,
         TerminalLoginArgs,
         ListArgs,
-        AnswerArgs,
         Answer,
         OpAccepted,
         SessionCreated,

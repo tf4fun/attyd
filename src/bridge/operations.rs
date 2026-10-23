@@ -215,8 +215,8 @@ pub(super) fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(Stri
         .collect()
 }
 
-/// Applies an admitted `cancel` or `answer` of the running operation `op`
-/// under the guard that admitted it. It installs nothing: the operation runs
+/// Applies an admitted `cancel` of the running operation `op` under the guard that admitted
+/// it. It installs nothing: the operation runs
 /// on and ends by its own path.
 pub(super) fn apply(
     state: &mut BridgeState,
@@ -229,11 +229,6 @@ pub(super) fn apply(
     let op = match admitted {
         Admitted::Start { .. } | Admitted::Repeat { .. } => {
             unreachable!("a started operation is installed by admit")
-        }
-        Admitted::Answer { op, answers } => {
-            let deliveries = deliveries(state, answers)?;
-            deliver(state, sink, deliveries);
-            op
         }
         Admitted::Cancel { op, kind } => {
             cancel(state, sink, connection, auth_terminal, scope, &op, kind);
