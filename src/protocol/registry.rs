@@ -462,7 +462,10 @@ impl SessionRegistry {
         let Some(revision) = result["revision"].as_str().and_then(|r| r.parse::<u64>().ok()) else {
             return;
         };
-        let page = json!({ "sessions": result["sessions"], "nextCursor": result["nextCursor"] });
+        let mut page = json!({ "sessions": result["sessions"], "nextCursor": result["nextCursor"] });
+        if let Some(meta) = result.get("_meta").filter(|meta| !meta.is_null()) {
+            page["_meta"] = meta.clone();
+        }
         let pages = &mut self.scopes.catalog_pages;
         if continued && pages.revision == revision {
             pages.pages.push(page);

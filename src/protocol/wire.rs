@@ -176,6 +176,10 @@ pub(crate) struct CatalogPage {
     )]
     pub sessions: Vec<Value>,
     pub next_cursor: Option<String>,
+    /// The Agent's `_meta` of this page.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "unknown"))]
+    pub meta: Option<Value>,
 }
 
 /// The result of `prompt`.
