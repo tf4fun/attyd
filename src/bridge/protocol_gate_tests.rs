@@ -498,10 +498,9 @@ impl Peer {
             .expect("the bridge dropped the answer")
     }
 
-    /// Answers `interaction`, the one pending interaction of the operation
-    /// running in `scope`.
+    /// Answers `interaction`, a pending interaction of `scope`, at its resource.
     async fn answer(&mut self, scope: &str, interaction: &str, answer: Value) {
-        self.write(scope, "answer", json!({"answers": {interaction: answer}}))
+        self.answer_resource(scope, interaction, answer)
             .await
             .unwrap_or_else(|error| panic!("the answer in {scope} was refused: {error:?}"));
     }

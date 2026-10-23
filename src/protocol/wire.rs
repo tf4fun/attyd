@@ -43,7 +43,6 @@ pub(crate) enum OpArgs {
     TerminalLogin(TerminalLoginArgs),
     List(ListArgs),
     Cancel(Empty),
-    Answer(AnswerArgs),
 }
 
 /// An empty body, `args` or result.
@@ -137,14 +136,7 @@ pub(crate) struct ListArgs {
     pub revision: Option<String>,
 }
 
-/// Its keys equal the running operation's `interactions`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub(crate) struct AnswerArgs {
-    pub answers: BTreeMap<String, Answer>,
-}
-
-/// The response to one pending interaction, by its kind.
+/// The response to one pending interaction, by its kind (the body of its `answer` action).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(untagged)]

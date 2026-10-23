@@ -356,33 +356,34 @@ async fn an_agent_request_without_a_running_op_starts_one_that_completes_with_it
     watch.converged(&bench).await;
 }
 
-/// An answer is admitted only with exactly the pending interactions as keys
-/// and only if every answer is valid; otherwise nothing is delivered. A
-/// delivered set cannot be submitted again.
+/// Each interaction is answered on its own, at its resource, and at most once (D10): an answer
+/// that does not fit its request is refused and consumes nothing, the others stay pending, and one
+/// the Agent cancelled is gone.
 #[tokio::test]
-async fn an_answer_is_refused_whole_unless_it_covers_exactly_the_pending_interactions() {
+async fn interactions_are_answered_one_at_a_time_and_one_the_agent_cancelled_is_gone() {
     let (bench, mut link) = Bench::ws(json!({})).await;
     bench.create_with(&mut link, "s", json!({})).await;
     let mut watch = bench.watch(&scopes(&["session/s"])).await;
     watch
         .until("the alignment", |watch| watch.has("session/s"))
         .await;
-    for (id, tool) in [("p1", "one"), ("p2", "two")] {
+    for (id, tool) in [("p1", "one"), ("p2", "two"), ("p3", "three")] {
         link.agent_request(id, "session/request_permission", permission("s", tool))
             .await;
     }
     watch
-        .until_live("session/s", "two interactions", |live| {
-            interaction_ids(live).len() == 2
+        .until_live("session/s", "three interactions", |live| {
+            interaction_ids(live).len() == 3
         })
         .await;
     let live = watch.live("session/s");
-    let op = live["op"]["id"].clone();
-    let (one, two) = (interaction_for(&live, "one"), interaction_for(&live, "two"));
+    let (one, two, three) = (
+        interaction_for(&live, "one"),
+        interaction_for(&live, "two"),
+        interaction_for(&live, "three"),
+    );
 
-    // Refused answers carry `allow`; the delivered one carries `deny`. An
-    // invalid answer is tried in either position, whatever the order of the
-    // random interaction IDs.
+    // An answer that does not fit its request is refused and consumes nothing.
     let before = bench.document("session/s").await;
     for (bad, what) in [
         (accept(), "an elicitation response to a permission"),
@@ -392,101 +393,44 @@ async fn an_answer_is_refused_whole_unless_it_covers_exactly_the_pending_interac
         ),
         (json!({}), "an empty answer"),
     ] {
-        for set in [
-            answers(&[(one.as_str(), allow()), (two.as_str(), bad.clone())]),
-            answers(&[(one.as_str(), bad.clone()), (two.as_str(), allow())]),
-        ] {
-            let (status, body) = bench.answer("session/s", &op, set).await;
-            invalid(status, &body, what);
-        }
+        let (status, body) = bench.act("session/s", &one, "answer", bad).await;
+        invalid(status, &body, what);
     }
-    for (refusal, set, what) in [
-        (
-            "not_allowed",
-            answers(&[(one.as_str(), allow())]),
-            "a missing interaction",
-        ),
-        (
-            "not_allowed",
-            answers(&[
-                (one.as_str(), allow()),
-                (two.as_str(), allow()),
-                ("unknown", allow()),
-            ]),
-            "an extra interaction",
-        ),
-        ("not_allowed", answers(&[]), "no interactions"),
-    ] {
-        let (status, body) = bench.answer("session/s", &op, set).await;
-        match refusal {
-            "not_allowed" => not_allowed(status, &body, what),
-            _ => invalid(status, &body, what),
-        }
-    }
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &op,
-            "answer",
-            json!({"answers": [allow(), allow()]}),
-        )
-        .await;
-    invalid(status, &body, "answers that are not keyed");
     link.quiet(QUIET).await;
     watch.quiet(QUIET).await;
     assert_eq!(bench.document("session/s").await, before);
 
-    // A set computed before a new interaction arrived.
-    let stale_set = answers(&[(one.as_str(), allow()), (two.as_str(), allow())]);
-    link.agent_request("p3", "session/request_permission", permission("s", "three"))
-        .await;
+    // One interaction is answered; the others stay pending, and it cannot be answered again.
+    let (status, _) = bench.act("session/s", &one, "answer", allow()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(link.response("p1").await["result"], allow());
     watch
-        .until_live("session/s", "the third interaction", |live| {
-            interaction_ids(live).len() == 3
-        })
-        .await;
-    let three = interaction_for(&watch.live("session/s"), "three");
-    let (status, body) = bench.answer("session/s", &op, stale_set).await;
-    not_allowed(status, &body, "an answer without the new interaction");
-    link.quiet(QUIET).await;
-
-    // A set that still names an interaction the Agent cancelled.
-    let with_cancelled = answers(&[
-        (one.as_str(), allow()),
-        (two.as_str(), allow()),
-        (three.as_str(), allow()),
-    ]);
-    link.notify("$/cancel_request", json!({"requestId": "p2"}))
-        .await;
-    watch
-        .until_live("session/s", "the cancelled interaction leaves", |live| {
+        .until_live("session/s", "the answered one leaves", |live| {
             interaction_ids(live).len() == 2
         })
         .await;
-    let mut left = interaction_ids(&watch.live("session/s"));
-    left.sort();
-    let mut expected = vec![one.clone(), three.clone()];
-    expected.sort();
-    assert_eq!(left, expected, "the cancelled one left");
-    let (status, body) = bench.answer("session/s", &op, with_cancelled).await;
-    not_allowed(status, &body, "an answer to a cancelled interaction");
+    let (status, body) = bench.act("session/s", &one, "answer", allow()).await;
+    not_found(status, &body, "an interaction answered already");
 
-    let delivered = answers(&[
-        (one.as_str(), selected("deny")),
-        (three.as_str(), selected("deny")),
-    ]);
-    let (status, body) = bench.answer("session/s", &op, delivered.clone()).await;
-    assert_joined(status, &body, &op, "the exact answer");
-    let responses = link.responses(&["p1", "p3"]).await;
-    assert_eq!(
-        responses["p1"]["result"],
-        selected("deny"),
-        "no refused answer was delivered"
-    );
-    assert_eq!(responses["p3"]["result"], selected("deny"));
-    watch.until_op("session/s", &op, "completed").await;
-    let (status, body) = bench.answer("session/s", &op, delivered).await;
-    not_allowed(status, &body, "the delivered answer, submitted again");
+    // One the Agent cancelled is gone, and answering it finds nothing.
+    link.notify("$/cancel_request", json!({"requestId": "p2"})).await;
+    watch
+        .until_live("session/s", "the cancelled interaction leaves", |live| {
+            interaction_ids(live) == [three.clone()]
+        })
+        .await;
+    let (status, body) = bench.act("session/s", &two, "answer", allow()).await;
+    not_found(status, &body, "an interaction the Agent cancelled");
+
+    let (status, _) = bench.act("session/s", &three, "answer", selected("deny")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(link.response("p3").await["result"], selected("deny"));
+    watch
+        .until_live("session/s", "no interaction is left", |live| {
+            interaction_ids(live).is_empty()
+        })
+        .await;
+    link.quiet(QUIET).await;
     watch.converged(&bench).await;
 }
 
