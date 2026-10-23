@@ -121,30 +121,34 @@ Restored in `src/server/stream_tests/bench/admission.rs`, on the revision 3 benc
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] a_prompt_answers_202_with_its_op_and_commits_its_result
-- [ ] create_fork_and_list_answer_with_their_result_or_error_when_they_end
-- [ ] a_fork_uses_its_explicit_cwd_and_otherwise_the_source_cwd
-- [ ] a_fork_response_survives_its_replacement_by_an_agent_request
-- [ ] a_create_response_survives_its_replacement_and_a_late_reader_converges
-- [ ] a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscription
-- [ ] admitted_create_fork_and_list_keep_their_errors_when_the_agent_disconnects
-- [ ] a_dropped_create_response_does_not_withdraw_the_create
-- [ ] prompt_attachment_references_are_resolved_and_an_unknown_one_is_refused
-- [ ] review_setup_config_options_are_used_for_admission_and_execution
-- [ ] control_acknowledgements_fold_into_the_ending_event_and_failures_change_nothing
-- [ ] a_list_returns_its_page_and_a_stale_revision_is_catalog_changed
+- [x] a_prompt_answers_202_with_its_op_and_commits_its_result
+- [x] create_fork_and_list_answer_with_their_result_or_error_when_they_end
+- [x] a_fork_uses_its_explicit_cwd_and_otherwise_the_source_cwd
+- [~] a_fork_response_survives_its_replacement_by_an_agent_request — not applicable: there is no held response: the result is in the document while the operation is the scope's current one, and a client follows the stream (protocol §6.6)
+- [~] a_create_response_survives_its_replacement_and_a_late_reader_converges — not applicable: there is no held response; a late reader converges through the stream's snapshot (covered by the replica and engine tests)
+- [x] a_new_sessions_early_messages_are_its_log_for_reads_and_every_subscription → a_new_sessions_early_messages_are_its_entries_for_reads_and_every_subscription
+- [x] admitted_create_fork_and_list_keep_their_errors_when_the_agent_disconnects
+- [x] a_dropped_create_response_does_not_withdraw_the_create → a_create_runs_to_its_end_without_its_response_being_read
+- [x] prompt_attachment_references_are_resolved_and_an_unknown_one_is_refused
+- [x] review_setup_config_options_are_used_for_admission_and_execution
+- [x] control_acknowledgements_fold_into_the_ending_event_and_failures_change_nothing
+- [x] a_list_returns_its_page_and_a_stale_revision_is_catalog_changed
+
+Restored in `src/server/stream_tests/bench/execution.rs` (`[~]`: not applicable on revision 3, with the reason).
 
 ## Writes over HTTP (`src/server/stream_tests/ops/interactions.rs`)
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] interactions_of_create_fork_set_config_and_list_are_answered_in_their_scope
-- [ ] a_load_interaction_is_answered_in_the_loading_session
-- [ ] an_agent_request_without_a_running_op_starts_one_that_completes_with_its_last_interaction
-- [ ] an_answer_is_refused_whole_unless_it_covers_exactly_the_pending_interactions
-- [ ] a_prompt_cancel_asks_the_agent_once_and_keeps_the_session_occupied
-- [ ] a_cancelled_agent_request_answers_its_interactions_with_their_cancel_outcomes
-- [ ] other_kinds_refuse_a_cancel
+- [x] interactions_of_create_fork_set_config_and_list_are_answered_in_their_scope
+- [x] a_load_interaction_is_answered_in_the_loading_session
+- [x] an_agent_request_without_a_running_op_starts_one_that_completes_with_its_last_interaction
+- [x] an_answer_is_refused_whole_unless_it_covers_exactly_the_pending_interactions
+- [x] a_prompt_cancel_asks_the_agent_once_and_keeps_the_session_occupied
+- [x] a_cancelled_agent_request_answers_its_interactions_with_their_cancel_outcomes
+- [x] other_kinds_refuse_a_cancel
+
+Restored in `src/server/stream_tests/bench/interactions.rs`.
 
 ## Writes over HTTP (`src/server/stream_tests/ops/login_terminals.rs`)
 
