@@ -3,10 +3,16 @@ name: ci
 on:
   # Branch work is validated by its pull request; pushes only build main and
   # release tags, so one commit never runs the same jobs twice.
+  #
+  # A draft pull request runs the fast checks only: release metadata, dependency audits,
+  # TypeScript, the frontend tests and the Rust tests. Marking it ready for review (or any
+  # later push to it) runs the whole validation: the smokes, the instrumented coverage, the
+  # browser suite and the binaries of every target. Merge a pull request once that is green.
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # A newer commit on the same pull request supersedes the running validation.
 concurrency:
@@ -107,17 +113,23 @@ jobs:
       - name: Test Rust backend
         run: npm run test:rust
       - name: Test remote ACP transports
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: npm run test:remote
       - name: Test Rust-hosted REST/SSE bridge
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: node --import tsx scripts/ui-smoke.ts
       - name: Test HTTP trust boundaries and process cleanup
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: node --import tsx scripts/server-boundary-smoke.ts
       - name: Test ACP protocol integration
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: node --import tsx scripts/acp-protocol-smoke.ts
       - name: Check development build without embedded frontend
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: cargo check --locked --features dev
 
   coverage:
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     needs: web-client
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -152,6 +164,7 @@ jobs:
           ATTYD_MIN_RUST_COVERAGE: "85"
 
   browser:
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     needs: web-client
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -184,6 +197,7 @@ jobs:
           if-no-files-found: ignore
 
   binaries:
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     name: binary (${{ matrix.target }})
     needs: [web-client, metadata]
     runs-on: ${{ matrix.runner }}

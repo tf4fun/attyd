@@ -37,6 +37,14 @@ drivers; there is no second backend implementation.
 runs the frontend, Rust backend, and Chromium browser suites as independent parallel jobs. Rust
 unit, remote-transport, protocol v2 host-smoke, release-build, and standalone-binary checks remain
 separate steps so failures identify their layer directly. See the workflow for CI gates.
+
+**Draft pull requests run the fast checks only**: release metadata, the npm and Rust dependency
+audits, TypeScript, the frontend tests, and the Rust tests (`npm run test:rust`). Marking the pull
+request ready for review runs the whole validation, and so does every later push to it: the
+remote-transport and host smokes, the `dev` feature check, the instrumented coverage, the browser
+suite and the binaries of every target. Pushes to `main` and release tags always run everything.
+Work on a pull request as a draft, and mark it ready (`gh pr ready`) once the fast checks pass;
+merge it when the full run is green.
 Linux CI jobs pin `ubuntu-26.04`, with `ubuntu-26.04-arm` for native ARM64 binaries.
 This adopts Ubuntu 26.04 explicitly ahead of the
 [`ubuntu-latest` migration to Ubuntu 26.04](https://github.com/actions/runner-images/issues/14748)
