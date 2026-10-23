@@ -3521,6 +3521,30 @@ test("recovers the session automatically after the ACP connection stops", async 
   expect(browserErrors).toEqual([]);
 });
 
+// With no session followed, nothing starts the Agent again once it exits (state-sync §2.4, S6),
+// so the page's Reconnect sends `restart` (protocol §7, audit Q8). The home page follows only
+// `global` and `catalog`: the Agent is killed from outside, the page says the connection
+// stopped, and Reconnect brings up a new Agent process.
+test("restarts the Agent from the home page when Reconnect is clicked after the process is killed", async ({ page, agentPid }) => {
+  const browserErrors = collectBrowserErrors(page);
+  await page.goto("/");
+  await expect.poll(agentPid).not.toBe("");
+  const first = await agentPid();
+  const connectionError = page.locator(".project-connection-error");
+  await expect(connectionError).toBeHidden();
+
+  process.kill(Number(first), "SIGKILL");
+  await expect(connectionError).toBeVisible({ timeout: 15_000 });
+  // Nothing passive starts it: the page waits for the user.
+  await page.waitForTimeout(1_500);
+  expect(await agentPid()).toBe(first);
+
+  await connectionError.getByRole("button").click();
+  await expect.poll(agentPid, { timeout: 15_000 }).not.toBe(first);
+  await expect(connectionError).toBeHidden({ timeout: 15_000 });
+  expect(browserErrors).toEqual([]);
+});
+
 test("keeps an active stdio prompt alive across browser reconnect", async ({ browser, page }) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), "attyd-disconnect-cancel-"));
   const marker = join(temporaryDirectory, "lifecycle.txt");
