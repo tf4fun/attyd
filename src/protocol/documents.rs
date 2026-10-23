@@ -135,6 +135,10 @@ pub(crate) enum OperationStatus {
 pub(crate) struct Operation {
     /// Random, never reused (protocol §6.5).
     pub id: String,
+    /// The scope it was written to: its issuing scope.
+    pub scope: String,
+    /// The operation it replaced in its issuing scope: the `expect` it was admitted with.
+    pub after: Option<String>,
     pub kind: OperationKind,
     pub status: OperationStatus,
     /// The write's `args` (a prompt as normalized `Block[]`), or the load's cwd.

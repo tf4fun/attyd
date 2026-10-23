@@ -130,9 +130,15 @@ fn interactions(registry: &SessionRegistry, owner: &Scope) -> BTreeMap<String, I
     interactions
 }
 
-fn operation(slot: &OpSlot, interactions: BTreeMap<String, Interaction>) -> Operation {
+fn operation(
+    slot: &OpSlot,
+    shown_in: &Scope,
+    interactions: BTreeMap<String, Interaction>,
+) -> Operation {
     Operation {
         id: slot.id.clone(),
+        scope: slot.scope.clone().unwrap_or_else(|| shown_in.to_string()),
+        after: slot.after.clone(),
         kind: slot.kind,
         status: slot.status,
         input: slot.input.clone(),
@@ -164,7 +170,7 @@ pub(super) fn shown_operation(
     let owner = owner(registry, scope);
     let slot = registry.shown_slot(scope)?;
     Some((
-        operation(slot, interactions(registry, &owner)),
+        operation(slot, scope, interactions(registry, &owner)),
         owner,
     ))
 }
@@ -311,6 +317,7 @@ pub(crate) fn project_global(registry: &SessionRegistry, agent: &AgentInfo) -> G
     GlobalLive {
         op: operation(
             &registry.scopes.global,
+            &Scope::Global,
             interactions(registry, &Scope::Global),
         ),
         url_flows: url_flows(request_flows(registry, &Scope::Global)),
@@ -331,6 +338,7 @@ pub(crate) fn project_catalog(registry: &SessionRegistry, revision: u64) -> Cata
     CatalogLive {
         op: operation(
             &registry.scopes.catalog,
+            &Scope::Catalog,
             interactions(registry, &Scope::Catalog),
         ),
         url_flows: url_flows(request_flows(registry, &Scope::Catalog)),

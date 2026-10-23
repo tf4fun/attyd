@@ -80,7 +80,15 @@ export type Operation = {
 /**
  * Random, never reused (protocol §6.5).
  */
-id: string, kind: OperationKind, status: OperationStatus, 
+id: string, 
+/**
+ * The scope it was written to: its issuing scope.
+ */
+scope: string, 
+/**
+ * The operation it replaced in its issuing scope: the `expect` it was admitted with.
+ */
+after: string | null, kind: OperationKind, status: OperationStatus, 
 /**
  * The write's `args` (a prompt as normalized `Block[]`), or the load's cwd.
  */
