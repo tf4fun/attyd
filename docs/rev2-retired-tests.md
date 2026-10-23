@@ -81,17 +81,19 @@ Retired with the removal of the revision 2 engine. Read them at `9906369`. The r
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] a_permission_is_answered_alone_and_at_most_once
-- [ ] an_interaction_that_does_not_exist_is_not_found
-- [ ] a_mode_is_set_when_the_agent_answers_and_the_answer_is_the_response
-- [ ] an_agent_error_is_the_response_and_changes_nothing
-- [ ] a_boolean_option_is_set_and_one_not_offered_is_refused_before_the_agent_hears
-- [ ] a_control_runs_while_a_prompt_runs
-- [ ] a_control_of_a_session_that_is_not_held_is_not_found
-- [ ] a_session_is_closed_when_the_agent_closes_it_and_leaves_the_bridge
-- [ ] an_agent_error_leaves_the_session_held_and_not_closing
-- [ ] an_agent_that_does_not_advertise_close_is_refused_as_unsupported
-- [ ] closing_during_a_prompt_answers_its_pending_permissions_cancelled
+- [x] a_permission_is_answered_alone_and_at_most_once
+- [x] an_interaction_that_does_not_exist_is_not_found
+- [x] a_mode_is_set_when_the_agent_answers_and_the_answer_is_the_response
+- [x] an_agent_error_is_the_response_and_changes_nothing
+- [x] a_boolean_option_is_set_and_one_not_offered_is_refused_before_the_agent_hears
+- [x] a_control_runs_while_a_prompt_runs
+- [x] a_control_of_a_session_that_is_not_held_is_not_found
+- [x] a_session_is_closed_when_the_agent_closes_it_and_leaves_the_bridge
+- [x] an_agent_error_leaves_the_session_held_and_not_closing
+- [x] an_agent_that_does_not_advertise_close_is_refused_as_unsupported
+- [x] closing_during_a_prompt_answers_its_pending_permissions_cancelled
+
+Restored in `src/server/stream_tests/actions.rs`.
 
 ## Writes over HTTP (`src/server/stream_tests/ops/admission.rs`)
 
