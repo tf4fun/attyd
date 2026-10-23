@@ -76,7 +76,7 @@ async fn interactions_of_create_fork_set_config_and_list_are_answered_in_their_s
             answers(&[(interaction.as_str(), accept())]),
         )
         .await;
-    not_allowed(status, &body, "a delivered answer, submitted again");
+    not_found(status, &body, "a delivered answer, submitted again");
     link.quiet(QUIET).await;
     let mut response = controls();
     response["sessionId"] = json!("s");
@@ -252,15 +252,13 @@ async fn a_load_interaction_is_answered_in_the_loading_session() {
     let op = live["op"]["id"].clone();
     assert_eq!(live["op"]["status"], "running");
     let interaction = interaction_for(&live, "load-tool");
+    // An answer names the interaction, not an operation: it is refused on the form of its body
+    // and consumes nothing.
     let before = bench.document("session/cold").await;
     let (status, body) = bench
-        .answer(
-            "session/cold",
-            &json!("not-the-op"),
-            answers(&[(interaction.as_str(), allow())]),
-        )
+        .act("session/cold", &interaction, "answer", json!({"outcome": {"outcome": "selected"}}))
         .await;
-    stale(status, &body, "an answer on another expect");
+    invalid(status, &body, "an answer that does not fit the request");
     link.quiet(QUIET).await;
     assert_eq!(bench.document("session/cold").await, before);
 
@@ -414,6 +412,8 @@ async fn interactions_are_answered_one_at_a_time_and_one_the_agent_cancelled_is_
 
     // One the Agent cancelled is gone, and answering it finds nothing.
     link.notify("$/cancel_request", json!({"requestId": "p2"})).await;
+    // The bridge answers the cancelled request itself.
+    assert_eq!(link.response("p2").await["error"]["code"], -32800);
     watch
         .until_live("session/s", "the cancelled interaction leaves", |live| {
             interaction_ids(live) == [three.clone()]
@@ -557,8 +557,8 @@ async fn a_cancelled_agent_request_answers_its_interactions_with_their_cancel_ou
 
     let (status, body) = bench.cancel("session/s", &op).await;
     not_allowed(status, &body, "a cancel of the ended agent request");
-    let (status, body) = bench.answer("session/s", &op, answers(&[])).await;
-    not_allowed(status, &body, "an answer to the ended agent request");
+    let (status, body) = bench.act("session/s", "no-such-interaction", "answer", allow()).await;
+    not_found(status, &body, "an answer to an interaction that is gone");
     link.quiet(QUIET).await;
 
     let (status, body) = bench
