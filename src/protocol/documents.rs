@@ -186,6 +186,17 @@ pub(crate) struct UrlFlow {
     pub elicitation_id: String,
     #[cfg_attr(test, ts(type = "CreateElicitationRequest"))]
     pub request: Value,
+    pub status: UrlFlowState,
+}
+
+/// Where an accepted URL flow stands (memory model §8.3); a finished status never changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum UrlFlowState {
+    Waiting,
+    Completed,
+    Ended,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -198,6 +209,8 @@ pub(crate) struct Terminal {
     pub output: String,
     pub truncated: bool,
     pub exit_status: Option<ExitStatus>,
+    /// Its handle is gone and the output frozen.
+    pub released: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
