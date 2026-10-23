@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use super::*;
 
 mod actions;
+mod bench;
 mod feed;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -310,6 +311,11 @@ impl Server {
             .unwrap()
             .normalized()
             .unwrap();
+        Self::serve(options, agents).await
+    }
+
+    /// A server run with `options`, whose Agent connections `agents` accepts.
+    async fn serve(options: Options, agents: Agents) -> Self {
         let options = Arc::new(options);
         let hub = BridgeHub::new(options.clone());
         hub.ensure_runtime().await;
