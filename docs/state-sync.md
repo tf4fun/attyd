@@ -537,10 +537,17 @@ request runs only the fast checks and the full validation starts when it is mark
 a prompt's references (#152) and for the read, whose body is those bytes (#153), which
 the client now verifies before showing anything (#156); the independent acceptance
 rows for concurrent answers (#154) and for integers beyond 2^53 in document digests
-(#155) have their tests. What remains is open for a decision, not unfinished work: zero-session
-recovery (the protocol and its tests say reads and a global-only stream start no
-connection), whether a flow `ended` by the connection's end can be dismissed before the
-next connection, and where a public `close` of a session belongs in the page.
+(#155) have their tests.
+
+The three decisions that were left open were settled by comparison with Zed (audit
+Q8–Q10, memory model §11). **Recovery without a session**: an explicit `restart` action
+on `global` (valid when the Agent is `stopped` or `error`), because nothing passive may
+start a connection; to implement in three pull requests, each tests first: the action in
+the bridge and the server; the write client and the page's restart control; the final
+documents. **Public close**: no separate button, since releasing a session already
+closes it at the Agent when it is unneeded and `close` stays an action; no code. **A flow
+`ended` by the connection's end**: stays in the final documents until the next connection
+starts without it; no code.
 
 Deviations from the plan, on purpose:
 

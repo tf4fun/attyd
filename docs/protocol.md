@@ -56,6 +56,9 @@ memory and send writes to it. The protocol has three goals:
   subscribed. A session that nothing needs is released after
   `--session-unobserved-timeout`, only if the Agent can load or resume it. Subscribing
   to an unheld session starts a `load`. A one-off read holds nothing.
+  The bridge starts an Agent connection only for a session stream that needs one, for
+  the next connection after a terminal login, and for `restart`; a read, a `global` or
+  `catalog` stream, and a write do not (a write without a connection is `unavailable`).
 
 **Client rules**
 
@@ -610,6 +613,7 @@ is a §9 error (`404` when the target does not exist).
 | session controls | `set_mode` | `{ modeId }` | held, `op` not a running `load`, not occupied by a `delete`, not `closing`; the mode was offered | `200 {}` or `200 { error }` when the Agent answers | sets a value: repeating leaves the same state; concurrent ones fold in the order of the Agent's responses |
 | session controls | `set_config` | `{ configId, value }` | as above; the option and value were offered | as above | as above |
 | session | `close` | `{}` | held, `op` ended or a running `prompt`, not `closing`; the Agent advertises close | `200 {}` or `200 { error }` | while one is in flight `not_allowed`; after success `404` |
+| Agent (`global`) | `restart` | `{}` | `agent.phase` is `stopped` or `error`: no connection runs and none is scheduled | `204` when a new connection is started (not when it is ready); `global`'s `agent.phase` follows | while a connection starts or runs `not_allowed`; the repeat after `204` is the same |
 | interaction (any scope) | `answer` | `{ outcome }` (permission) or `{ response }` (elicitation) | pending | `204` | **at most once**: checked, delivered and removed in one step; any other answer, from any client, gets `404` and changes nothing; answers to different interactions are independent |
 | terminal login (`global`) | `input` | `{ data }` | it runs | `204` | **not idempotent**: written each time, in arrival order; input from several clients interleaves |
 | terminal login (`global`) | `resize` | `{ cols, rows }` | it runs | `204` | sets the size |
@@ -741,6 +745,7 @@ client's actual decode, apply, verify and install steps.
 | Large integers | two attachments differing only in an integer beyond ±2^53 get different IDs and read back unchanged; a float in an attachment hashes as its parsed `f64`; document digests agree between bridge and client for such values |
 | Reconnect races | a superseded stream's late events cannot overwrite a newer replica; a `GET` from an older epoch returning after a new epoch's snapshot is not installed, also after the client unsubscribes |
 | Ended scope in a slow queue | a `close` or `delete` `end` queued behind events reaches the slow subscriber; no snapshot is generated for that scope |
+| Restart | after the Agent exits with no session followed: a read, a `global` stream, a `catalog` stream and a write start no connection (the write is `unavailable`); `restart` answers `204`, starts one connection, and `global`'s `agent.phase` follows to `ready`; a `restart` while the phase is `ready`, starting or initializing is `not_allowed` and starts nothing |
 | Bad attachment read | wrong bytes are not shown; a read racing a release yields `404`, not wrong content |
 
 Per-event convergence tests (replica equals bridge document after every event) remain
