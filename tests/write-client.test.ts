@@ -183,6 +183,22 @@ describe("actions (§7)", () => {
     return { calls, client: new ActionsClient(fetch) };
   }
 
+  it("restarts the Agent in global: an empty body, done on 204, refused when a connection runs", async () => {
+    const { calls, client } = actions();
+    const started = client.restart();
+    expect(calls[0]).toMatchObject({ url: "/api/v2/scopes/global/actions/restart", method: "POST", body: {} });
+    calls[0].respond(204);
+    expect(await started).toEqual({ kind: "done" });
+
+    const running = client.restart();
+    calls[1].respond(409, { error: { code: "not_allowed", message: "an Agent connection starts or runs" } });
+    expect(await running).toMatchObject({ kind: "refused", error: { code: "not_allowed" } });
+
+    const lost = client.restart();
+    calls[2].lose();
+    expect(await lost).toEqual({ kind: "uncertain" });
+  });
+
   it("answers one interaction at its resource and is done on 204", async () => {
     const { calls, client } = actions();
     const outcome = client.answer(S, "int 1", { outcome: { outcome: "selected", optionId: "allow" } });
