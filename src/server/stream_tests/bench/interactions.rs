@@ -335,6 +335,47 @@ async fn an_agent_request_without_a_running_op_starts_no_operation() {
     watch.converged(&bench).await;
 }
 
+/// Two clients answer one interaction at once (protocol §12.4, several clients): exactly one
+/// answer is admitted and reaches the Agent, the other finds the interaction gone.
+#[tokio::test]
+async fn two_clients_answering_one_interaction_deliver_exactly_one() {
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create_with(&mut link, "s", json!({})).await;
+    let mut watch = bench.watch(&scopes(&["session/s"])).await;
+    watch
+        .until("the alignment", |watch| watch.has("session/s"))
+        .await;
+    link.agent_request("p", "session/request_permission", permission("s", "tool"))
+        .await;
+    watch
+        .until_live("session/s", "the interaction", |live| {
+            interaction_ids(live).len() == 1
+        })
+        .await;
+    let interaction = interaction_ids(&watch.live("session/s")).remove(0);
+
+    let ((first, first_body), (second, second_body)) = tokio::join!(
+        bench.act("session/s", &interaction, "answer", allow()),
+        bench.act("session/s", &interaction, "answer", selected("deny")),
+    );
+    let mut statuses = [first, second];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND],
+        "{first_body} / {second_body}"
+    );
+    let delivered = if first == StatusCode::NO_CONTENT { allow() } else { selected("deny") };
+    assert_eq!(link.response("p").await["result"], delivered);
+    link.quiet(QUIET).await;
+    watch
+        .until_live("session/s", "the interaction is gone", |live| {
+            interaction_ids(live).is_empty()
+        })
+        .await;
+    watch.converged(&bench).await;
+}
+
 /// Each interaction is answered on its own, at its resource, and at most once (D10): an answer
 /// that does not fit its request is refused and consumes nothing, the others stay pending, and one
 /// the Agent cancelled is gone.
