@@ -531,6 +531,17 @@ revision 3's, served under `/api/v2`.
 | **Cutover** | rev 2 TypeScript removed (#115); admission, answers, controls and reads served from the feed (#118, #119); the bridge gate checks the feed (#121); the publisher, hub, `/api/v2/stream`, the rev 2 scope routes and their tests removed (#122); the revision 3 routes take the `/api/v2` names (#123); the rev 2 events and reads leave the generated types (#124) | done: the revision 2 layer-1 leftovers are removed (the unused session projection #144, the per-session turn log #145, `canon`'s turn log #146); the generated types now match the documents' terminals, URL flows and operations (#143, #147) |
 | **Dependencies** | vite (#57), webpki crates (#57), vitest (#75) advisories | |
 
+Since then (#150–#156): a catalog page keeps the Agent's `_meta` (#150); a draft pull
+request runs only the fast checks and the full validation starts when it is marked ready
+(#151); attachment identity is one definition, the hash of the block's exact form, for
+a prompt's references (#152) and for the read, whose body is those bytes (#153), which
+the client now verifies before showing anything (#156); the independent acceptance
+rows for concurrent answers (#154) and for integers beyond 2^53 in document digests
+(#155) have their tests. What remains is open for a decision, not unfinished work: zero-session
+recovery (the protocol and its tests say reads and a global-only stream start no
+connection), whether a flow `ended` by the connection's end can be dismissed before the
+next connection, and where a public `close` of a session belongs in the page.
+
 Deviations from the plan, on purpose:
 
 - Layer-1 pull requests did not change the published documents. Frozen terminal
