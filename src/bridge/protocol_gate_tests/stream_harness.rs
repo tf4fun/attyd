@@ -198,6 +198,44 @@ impl Peer {
         self.gate.released.contains(scope)
     }
 
+    /// What the next generation takes over once this connection ended.
+    pub(super) fn handover(&mut self) -> Publication {
+        assert!(self.task.is_none(), "the connection ended");
+        self.publication.clone()
+    }
+
+    /// The next generation, publishing into `publication`: started and ready.
+    pub(super) async fn start_on(publication: Publication, capabilities: Value) -> Self {
+        let mut peer = Self::connect_on(publication, |_| {}).await;
+        let initialize = peer.next_request().await;
+        assert_eq!(initialize["method"], "initialize");
+        peer.reply(
+            &initialize,
+            json!({
+                "protocolVersion": 1, "agentCapabilities": capabilities, "authMethods": [],
+            }),
+        )
+        .await;
+        peer.until("the agent is ready", |peer| {
+            peer.live("global")["agent"]["phase"] == "ready"
+        })
+        .await;
+        peer
+    }
+
+    /// Runs one whole turn of `session_id` with `reply`.
+    pub(super) async fn whole_turn(&mut self, session_id: &str, prompt: &str, reply: &str) {
+        let scope = session(session_id);
+        let (op, request) = self.prompt(session_id, vec![text(prompt)]).await;
+        self.update(session_id, chunk(&Uuid::new_v4().to_string(), text(reply)))
+            .await;
+        self.reply(&request, json!({"stopReason": "end_turn"})).await;
+        self.until("the turn completes", |peer| {
+            peer.live(&scope)["op"]["id"] == op && peer.live(&scope)["op"]["status"] == "completed"
+        })
+        .await;
+    }
+
     /// Whether the feed publishes `scope`.
     pub(super) fn published(&self, scope: &str) -> bool {
         self.publication

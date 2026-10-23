@@ -32,15 +32,15 @@ reconnection of a stream; on revision 3 the same rules run behind `FeedSubscript
 - [x] review_a_subscription_after_delete_admission_waits_for_its_end (`protocol_gate_tests/loads.rs`)
 - [x] a_subscription_waits_for_a_cold_delete_and_ends_with_deleted (`protocol_gate_tests/loads.rs`)
 - [x] a_subscription_waiting_for_a_failed_cold_delete_loads_the_session (`protocol_gate_tests/loads.rs`)
-- [ ] the_next_connection_s_equal_replay_ends_the_waiting_load
-- [ ] the_next_connection_s_diverging_replay_rebuilds_from_the_common_prefix
-- [ ] review_an_unfollowed_session_is_released_when_the_agent_connection_ends
-- [ ] a_session_the_agent_cannot_load_again_ends_with_load_failed_at_the_connection_end
+- [x] the_next_connection_s_equal_replay_ends_the_waiting_load → the_next_connections_equal_replay_ends_the_waiting_load (`protocol_gate_tests/reconnection.rs`)
+- [x] the_next_connection_s_diverging_replay_rebuilds_from_the_common_prefix → the_next_connections_diverging_replay_replaces_what_differs (`protocol_gate_tests/reconnection.rs`)
+- [x] review_an_unfollowed_session_is_released_when_the_agent_connection_ends (`protocol_gate_tests/reconnection.rs`)
+- [x] a_session_the_agent_cannot_load_again_ends_with_load_failed_at_the_connection_end (`protocol_gate_tests/reconnection.rs`)
 - [ ] four_consumers_converge_one_by_one_lagging_reconnecting_and_paused
-- [ ] review_resume_only_session_waits_across_eof_and_preserves_its_known_log
-- [ ] review_waiting_session_uses_the_new_connections_resume_capability
-- [ ] review_refused_automatic_close_waits_for_a_new_subscription_cycle
-- [ ] a_new_sessions_early_controls_survive_its_creation_response
+- [x] review_resume_only_session_waits_across_eof_and_preserves_its_known_log → …known_entries (`protocol_gate_tests/reconnection.rs`)
+- [x] review_waiting_session_uses_the_new_connections_resume_capability (`protocol_gate_tests/reconnection.rs`)
+- [x] review_refused_automatic_close_waits_for_a_new_subscription_cycle (`protocol_gate_tests/reconnection.rs`)
+- [x] a_new_sessions_early_controls_survive_its_creation_response (`protocol_gate_tests/reconnection.rs`)
 
 ## Bridge gate: tests rewritten in place
 
