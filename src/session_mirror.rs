@@ -4,9 +4,7 @@ use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
 use crate::history_replay::Replay;
-use crate::protocol::canon::TurnLog;
 use crate::protocol::op::operation_id;
-use crate::protocol::registry::SessionLog;
 use crate::protocol::timeline::History;
 use crate::runtime_state::SessionOperationKind;
 #[cfg(test)]
@@ -141,19 +139,18 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Commits a replay: the session's log is rebuilt from it.
+    /// Commits a replay: the session's timeline is the replay's.
     pub(crate) fn commit_load(
         &mut self,
         session_id: &str,
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
         let replay = self.commit_history(session_id, attempt_id)?;
-        self.replace_session_log(session_id, &replay.updates);
         self.replace_session_timeline(session_id, replay.timeline);
         Ok(())
     }
 
-    /// Ends a load with its replay; a failed or stale load leaves the log.
+    /// Ends a load with its replay; a failed or stale load leaves the timeline.
     fn commit_history(
         &mut self,
         session_id: &str,
@@ -166,32 +163,24 @@ impl SessionRegistry {
     }
 
     // Resume notifications are useful context, but do not promise a full replay:
-    // they never replace a log the bridge already knows.
+    // they never replace a timeline the bridge already knows.
     pub(crate) fn commit_attachment_cache(
         &mut self,
         session_id: &str,
         attempt_id: &str,
     ) -> Result<(), MirrorError> {
         let replay = self.commit_history(session_id, attempt_id)?;
-        self.adopt_session_log(session_id, &replay.updates);
         self.adopt_session_timeline(session_id, replay.timeline);
         self.require_state_mut(session_id)?.phase = MirrorPhase::Cold;
         Ok(())
     }
 
-    /// The session goes on with the log it has, or with `log` if it knows
+    /// The session goes on with the timeline it has, or with an empty partial one if it knows
     /// none: the Agent gave no replay (protocol S1).
-    pub(crate) fn use_cached_history(
-        &mut self,
-        session_id: &str,
-        log: Option<Arc<TurnLog>>,
-    ) -> Result<(), MirrorError> {
+    pub(crate) fn use_cached_history(&mut self, session_id: &str) -> Result<(), MirrorError> {
         let session = self.require_state_mut(session_id)?;
         if session.active_turn.is_some() || session.load_attempt.is_some() {
             return Err(MirrorError::WrongPhase);
-        }
-        if matches!(session.log, SessionLog::Unknown) {
-            session.log = SessionLog::Known(log.unwrap_or_default());
         }
         if session.timeline.is_none() {
             // The context the Agent gave is no replay: what came before is not
@@ -273,8 +262,7 @@ impl SessionRegistry {
     }
 
     /// A conversation update outside a turn. A completed turn being reconciled
-    /// keeps it in its overlay. The timeline reduces it in both cases; the log
-    /// is still only appended by turns and rebuilt by loads.
+    /// keeps it in its overlay. The timeline reduces it in both cases.
     #[cfg(test)]
     pub(crate) fn append_session_update(
         &mut self,
@@ -314,7 +302,7 @@ impl SessionRegistry {
             .complete_turn(operation_id, terminal)
     }
 
-    /// The completed turn is in the session's log: the session is ready.
+    /// The completed turn is in the session's timeline: the session is ready.
     pub(crate) fn commit_completed_turn(
         &mut self,
         session_id: &str,
@@ -420,7 +408,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Releases the session's log, load candidate and turn. Live lifecycle
+    /// Releases the session's load candidate and turn. Live lifecycle
     /// and the operation owner remain available until their own transition
     /// completes. Runtime replacement calls this before installing its entry.
     pub(crate) fn clear_history_for_replacement(&mut self, session_id: &str) {
@@ -541,7 +529,7 @@ mod tests {
         registry.remove("session");
 
         assert_eq!(registry.session("session"), Some(live.clone()));
-        assert_eq!(registry.state("session").unwrap().log, SessionLog::Unknown);
+        assert_eq!(registry.state("session").unwrap().history, None);
         registry.close_session("epoch", "session", "close").unwrap();
         registry.remove("session");
         assert!(registry.session("session").is_none());
@@ -604,7 +592,7 @@ mod tests {
         assert!(state.active_turn.is_none());
         assert!(state.load_attempt.is_none());
         assert!(state.load_origin.is_none());
-        assert_eq!(state.log, SessionLog::Unknown);
+        assert_eq!(state.history, None);
         registry.clear_history_for_replacement("session");
         assert_eq!(registry.live("session"), Some(&live));
     }
@@ -664,8 +652,8 @@ mod tests {
         mirror.commit_load(session_id, "initial").unwrap();
     }
 
-    fn log(mirror: &SessionMirror) -> SessionLog {
-        mirror.state("session").unwrap().log.clone()
+    fn session_history(mirror: &SessionMirror) -> Option<History> {
+        mirror.state("session").unwrap().history
     }
 
     fn text_prompt(text: &str) -> Vec<Value> {
@@ -760,12 +748,12 @@ mod tests {
     fn going_on_with_given_context_gives_an_epoch_and_a_known_timeline_keeps_its_own() {
         let mut mirror = mirror();
         mirror.register_cold("cold");
-        mirror.use_cached_history("cold", None).unwrap();
+        mirror.use_cached_history("cold").unwrap();
         assert!(epoch(&mirror, "cold").is_some());
 
         mirror.register_new("new");
         let before = epoch(&mirror, "new");
-        mirror.use_cached_history("new", None).unwrap();
+        mirror.use_cached_history("new").unwrap();
         assert_eq!(epoch(&mirror, "new"), before);
     }
 
@@ -828,12 +816,12 @@ mod tests {
     fn going_on_with_the_context_the_agent_gave_is_partial_and_keeps_a_known_status() {
         let mut mirror = mirror();
         mirror.register_cold("cold");
-        mirror.use_cached_history("cold", None).unwrap();
+        mirror.use_cached_history("cold").unwrap();
         assert_eq!(history(&mirror, "cold"), Some(History::Partial));
         assert!(mirror.state("cold").unwrap().timeline.is_some());
 
         mirror.register_new("new");
-        mirror.use_cached_history("new", None).unwrap();
+        mirror.use_cached_history("new").unwrap();
         assert_eq!(history(&mirror, "new"), Some(History::Complete));
     }
 
@@ -919,13 +907,11 @@ mod tests {
     }
 
     #[test]
-    fn a_load_rebuilds_the_log_from_its_replay() {
+    fn a_committed_load_makes_the_history_complete() {
         let mut mirror = mirror();
         load_initial(&mut mirror, "session");
-        let SessionLog::Known(known) = log(&mirror) else {
-            panic!("a committed load knows the log");
-        };
-        assert_eq!(known.entries().len(), 1);
+        assert_eq!(session_history(&mirror), Some(History::Complete));
+        assert_eq!(timeline_entries(&mirror).as_array().unwrap().len(), 2);
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
         assert_eq!(mirror.history.candidates(), 0);
     }
@@ -1337,15 +1323,15 @@ mod tests {
             .unwrap();
         mirror.commit_attachment_cache("session", "resume").unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Cold);
-        let cached = log(&mirror);
-        assert!(matches!(cached, SessionLog::Known(_)));
+        let cached = session_history(&mirror);
+        assert_eq!(cached, Some(History::Partial));
 
         for attempt in ["automatic-first", "automatic-retry"] {
             mirror.begin_load("session", attempt).unwrap();
             mirror
                 .fail_load("session", attempt, "temporary", true)
                 .unwrap();
-            assert_eq!(log(&mirror), cached);
+            assert_eq!(session_history(&mirror), cached);
             assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Loading);
             for admission in [
                 SessionAdmission::Prompt,
@@ -1372,25 +1358,23 @@ mod tests {
     }
 
     #[test]
-    fn cached_history_keeps_a_known_log_and_installs_one_only_when_unknown() {
+    fn cached_history_keeps_a_known_timeline_and_installs_one_only_when_unknown() {
         let mut mirror = mirror();
         load_initial(&mut mirror, "session");
-        let known = log(&mirror);
-        mirror
-            .use_cached_history("session", Some(Arc::new(TurnLog::default())))
-            .unwrap();
-        assert_eq!(log(&mirror), known);
+        let known = mirror.state("session").unwrap().timeline.clone().unwrap();
+        mirror.use_cached_history("session").unwrap();
+        assert!(Arc::ptr_eq(
+            &known,
+            mirror.state("session").unwrap().timeline.as_ref().unwrap()
+        ));
+        assert_eq!(session_history(&mirror), Some(History::Complete));
 
         mirror.register_cold("fork");
-        let SessionLog::Known(source) = known else {
-            unreachable!()
-        };
-        mirror
-            .use_cached_history("fork", Some(source.clone()))
-            .unwrap();
+        mirror.use_cached_history("fork").unwrap();
         let fork = mirror.state("fork").unwrap();
         assert_eq!(fork.phase, MirrorPhase::Ready);
-        assert!(matches!(&fork.log, SessionLog::Known(log) if Arc::ptr_eq(log, &source)));
+        assert_eq!(fork.history, Some(History::Partial));
+        assert!(fork.timeline.is_some());
     }
 
     #[test]
@@ -1398,7 +1382,7 @@ mod tests {
         for origin in [MirrorPhase::Ready, MirrorPhase::Blocked] {
             let mut mirror = mirror();
             load_initial(&mut mirror, "session");
-            let old = log(&mirror);
+            let old = session_history(&mirror);
             if origin == MirrorPhase::Blocked {
                 mirror.begin_load("session", "fatal").unwrap();
                 mirror
@@ -1427,7 +1411,7 @@ mod tests {
                 mirror.can_begin("session", SessionAdmission::Attachment),
                 Ok(())
             );
-            assert_eq!(log(&mirror), old, "a failed load leaves the known log");
+            assert_eq!(session_history(&mirror), old, "a failed load leaves the known history");
             assert!(mirror.state("session").unwrap().load_origin.is_none());
             assert_eq!(
                 mirror.state("session").unwrap().sync_error.as_deref(),
@@ -1461,7 +1445,7 @@ mod tests {
         mirror
             .fail_load("session", "first", "temporary", true)
             .unwrap();
-        assert_eq!(log(&mirror), SessionLog::Unknown);
+        assert_eq!(session_history(&mirror), None);
 
         mirror.begin_load("session", "second").unwrap();
         mirror
@@ -1469,16 +1453,8 @@ mod tests {
             .unwrap();
         mirror.commit_load("session", "second").unwrap();
 
-        let SessionLog::Known(known) = log(&mirror) else {
-            panic!("a committed load knows the log");
-        };
-        assert_eq!(known.entries().len(), 1);
-        assert_eq!(
-            known.entries()[0].turn.prompt,
-            TurnLog::from_replay(&[user_update("complete")]).entries()[0]
-                .turn
-                .prompt
-        );
+        assert_eq!(session_history(&mirror), Some(History::Complete));
+        assert_eq!(timeline_entries(&mirror).as_array().unwrap().len(), 1);
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
     }
 
@@ -1500,12 +1476,12 @@ mod tests {
             mirror.commit_load("session", "invalid"),
             Err(MirrorError::History(HistoryCacheError::InvalidReplay))
         ));
-        assert_eq!(log(&mirror), SessionLog::Unknown);
+        assert_eq!(session_history(&mirror), None);
         mirror
             .fail_load("session", "invalid", "invalid replay", false)
             .unwrap();
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Blocked);
-        assert_eq!(log(&mirror), SessionLog::Unknown);
+        assert_eq!(session_history(&mirror), None);
     }
 
     #[test]

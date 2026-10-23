@@ -1,8 +1,8 @@
-//! Operation slots, occupation and the turn log in bridge state
+//! Operation slots and occupation in bridge state
 //! (docs/state-sync.md §2.1).
 //!
 //! A held session keeps its `OpSlot` and reduced controls in its live state and
-//! its `TurnLog` in its history state; `global` and `catalog` keep their slots
+//! its timeline in its history state; `global` and `catalog` keep their slots
 //! here. The registry's transitions maintain them through the functions below;
 //! the commit step publishes them.
 use std::collections::BTreeMap;
@@ -11,7 +11,6 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::SessionControls;
-use super::canon::TurnLog;
 use super::timeline::{History, Timeline};
 use super::documents::{
     End, EndReason, ErrorCode, ExitStatus, LoginTerminal, OperationKind, ProtocolError, Scope,
@@ -21,33 +20,18 @@ use super::wire::{self, Empty, PromptResult, SessionCreated};
 use crate::runtime_state::{PendingInteraction, SessionLiveState, SessionOperationKind};
 use crate::session_registry::SessionRegistry;
 
-/// A session's log: unknown until the bridge holds its history (protocol S1).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) enum SessionLog {
-    #[default]
-    Unknown,
-    Known(Arc<TurnLog>),
-}
-
 /// A held session the next Agent connection loads again: bridge memory
 /// that outlives the connection (protocol S6, §5.4). It keeps the controls
-/// and the log the session had, with its attachments, and the waiting `load`.
+/// and the timeline the session had, with its attachments, and the waiting `load`.
 #[derive(Debug, Clone)]
 pub(crate) struct WaitingSession {
     pub session_id: String,
     pub cwd: std::path::PathBuf,
     pub controls: SessionControls,
-    pub log: SessionLog,
     pub timeline: Option<Arc<Timeline>>,
     pub history: Option<History>,
     pub timeline_epoch: Option<String>,
     pub op: OpSlot,
-}
-
-impl SessionLog {
-    pub(crate) fn empty() -> Self {
-        Self::Known(Arc::new(TurnLog::default()))
-    }
 }
 
 /// The slots of `global` and `catalog`, and the scopes operations occupy
@@ -646,7 +630,6 @@ impl SessionRegistry {
             session_id: session_id.to_string(),
             cwd: live.cwd.clone(),
             controls: live.controls.clone(),
-            log: entry.state.log.clone(),
             timeline: entry.state.timeline.clone(),
             history: entry.state.history,
             timeline_epoch: entry.state.timeline_epoch.clone(),
@@ -778,23 +761,12 @@ impl SessionRegistry {
         }
     }
 
-    /// The running prompt's turn ended. A completed turn is appended to the log
-    /// (S2) whichever client started it; the prompt operation ends.
+    /// The running prompt's turn ended; the prompt operation ends.
     pub(crate) fn end_session_turn(&mut self, session_id: &str, outcome: TurnEnd<'_>) {
         let Some(entry) = self.sessions.get_mut(session_id) else {
             return;
         };
         let state = &mut entry.state;
-        if let TurnEnd::Completed(_) = outcome
-            && let (Some(turn), SessionLog::Known(log)) = (&state.active_turn, &mut state.log)
-        {
-            let updates: Vec<Value> = turn
-                .updates
-                .iter()
-                .map(|update| (**update).clone())
-                .collect();
-            Arc::make_mut(log).commit(&turn.prompt, &updates);
-        }
         let Some(live) = state.live.as_mut() else {
             return;
         };
@@ -857,14 +829,6 @@ impl SessionRegistry {
         }
     }
 
-    /// A load or reload replaced the session's history: its log is rebuilt from
-    /// the replay.
-    pub(crate) fn replace_session_log(&mut self, session_id: &str, replay: &[Value]) {
-        if let Some(entry) = self.sessions.get_mut(session_id) {
-            entry.state.log = SessionLog::Known(Arc::new(TurnLog::from_replay(replay)));
-        }
-    }
-
     /// A load completed: the session's timeline is the replay's, replacing the
     /// retained one in one step (bridge memory model §6.2).
     pub(crate) fn replace_session_timeline(&mut self, session_id: &str, timeline: Timeline) {
@@ -890,17 +854,6 @@ impl SessionRegistry {
             entry.state.timeline = Some(Arc::new(timeline));
             entry.state.history = Some(History::Partial);
             entry.state.timeline_epoch = Some(super::op::operation_id());
-        }
-    }
-
-    /// A resume or the bridge's cache gave the session's context, which is no
-    /// replay: it is the log only of a session whose history is unknown, and a
-    /// known log stays (protocol S1).
-    pub(crate) fn adopt_session_log(&mut self, session_id: &str, updates: &[Value]) {
-        if let Some(entry) = self.sessions.get_mut(session_id)
-            && matches!(entry.state.log, SessionLog::Unknown)
-        {
-            entry.state.log = SessionLog::Known(Arc::new(TurnLog::from_replay(updates)));
         }
     }
 

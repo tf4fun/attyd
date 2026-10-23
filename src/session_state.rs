@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::history_cache::HistoryCacheError;
-use crate::protocol::registry::SessionLog;
 use crate::protocol::op::operation_id;
 use crate::protocol::timeline::{History, PromptEnd, Timeline};
 use crate::runtime_state::{
@@ -68,12 +67,8 @@ pub(crate) struct SessionState {
     pub(crate) load_attempt: Option<String>,
     #[serde(skip)]
     pub(crate) load_origin: Option<MirrorPhase>,
-    /// The protocol v2 turn log: unknown until a load or creation.
-    #[serde(skip)]
-    pub(crate) log: SessionLog,
     /// The session timeline of the bridge memory model: unknown (`None`) until a
-    /// load, a creation or a resume gives it. Held beside `log` until the wire
-    /// is derived from it.
+    /// load, a creation or a resume gives it.
     #[serde(skip)]
     pub(crate) timeline: Option<Arc<Timeline>>,
     /// How much of the history the timeline holds; `Some` exactly when the
@@ -149,7 +144,6 @@ impl SessionState {
             operation: None,
             load_attempt: None,
             load_origin: None,
-            log: SessionLog::Unknown,
             timeline: None,
             history: None,
             timeline_epoch: None,
@@ -159,7 +153,6 @@ impl SessionState {
     pub(crate) fn ready(session_id: impl Into<String>) -> Self {
         let mut session = Self::cold(session_id);
         session.phase = MirrorPhase::Ready;
-        session.log = SessionLog::empty();
         session.timeline = Some(Arc::default());
         session.history = Some(History::Complete);
         session.timeline_epoch = Some(operation_id());

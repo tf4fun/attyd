@@ -295,7 +295,6 @@ impl SessionRegistry {
             .sessions
             .get_mut(&waiting.session_id)
             .expect("the session was opened");
-        entry.state.log = waiting.log;
         entry.state.timeline = waiting.timeline;
         entry.state.history = waiting.history;
         entry.state.timeline_epoch = waiting.timeline_epoch;
@@ -1591,7 +1590,7 @@ mod session_live {
     use super::{
         InteractionResolution, InteractionUpsert, PendingInteraction, RuntimeStateError,
         SessionLifecycle, SessionLiveState, SessionOperationKind, SessionOperationState,
-        SessionState, TurnTerminal, remember_resolved_interaction, remember_resolved_permission,
+        SessionState, TurnTerminal, remember_resolved_permission,
     };
 
     pub(super) fn start_operation(

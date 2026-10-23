@@ -601,8 +601,6 @@ fn serialized_value_len(value: &impl Serialize) -> usize {
     serde_json::to_writer(&mut counter, value).map_or(usize::MAX, |()| counter.0)
 }
 
-/// The conversation updates among a session's early notifications, bare as a
-/// replay gives them to `TurnLog::from_replay`.
 /// The session timeline reduced from notifications as the Agent sent them,
 /// each with its own `_meta` (bridge memory model §3).
 fn timeline_from_notifications(
@@ -622,16 +620,6 @@ fn timeline_from_notifications(
         }
     }
     timeline
-}
-
-fn conversation_updates(updates: &[SessionNotification]) -> Vec<Value> {
-    updates
-        .iter()
-        .filter_map(|notification| {
-            let update = serde_json::to_value(&notification.update).ok()?;
-            is_conversation_update(&update).then_some(update)
-        })
-        .collect()
 }
 
 fn is_conversation_update(update: &Value) -> bool {
@@ -2219,7 +2207,7 @@ fn finish_materialization(
         session.phase == MirrorPhase::Cold
             && session.live.is_none()
             && session.operation.is_none()
-            && session.log == crate::protocol::registry::SessionLog::Unknown
+            && session.history.is_none()
     }) {
         state.sessions.remove(session_id);
     }
@@ -3093,8 +3081,6 @@ async fn handle_command_inner(
                     session_mirror(&mut state).register_new(session_id.clone());
                     // The Agent's messages before the response are the
                     // session's first history (#8).
-                    session_mirror(&mut state)
-                        .replace_session_log(&session_id, &conversation_updates(&early_updates));
                     session_mirror(&mut state).replace_session_timeline(
                         &session_id,
                         timeline_from_notifications(&early_updates),
@@ -3459,7 +3445,7 @@ async fn handle_command_inner(
             let request_id = string_field(&command, "requestId")?.to_string();
             let source_id = string_field(&command, "sessionId")?.to_string();
             require_agent_method("session/fork", &state).await?;
-            let (cwd, source_log) = {
+            let cwd = {
                 let mut state = state.lock().await;
                 let source = state.sessions.active_session(&source_id).ok_or_else(|| {
                     Error::invalid_params()
@@ -3471,12 +3457,6 @@ async fn handle_command_inner(
                     .and_then(Value::as_str)
                     .map(PathBuf::from)
                     .unwrap_or_else(|| source.live.cwd.clone());
-                // Without a replay of its own, the target starts from the
-                // source's completed turns.
-                let source_log = match &source.state.log {
-                    crate::protocol::registry::SessionLog::Known(log) => Some(log.clone()),
-                    crate::protocol::registry::SessionLog::Unknown => None,
-                };
                 reserve_session_operation(
                     &mut state,
                     &source_id,
@@ -3505,7 +3485,7 @@ async fn handle_command_inner(
                 state.sessions.supersede_history_sync(&source_id);
                 refresh_observer_timers(&mut state);
                 state.pending_creations += 1;
-                (cwd, source_log)
+                cwd
             };
             let owner = rpc_owner(&epoch, Some(&source_id), &request_id, None);
             let result = send_ordered(
@@ -3601,15 +3581,6 @@ async fn handle_command_inner(
                     return Err(error);
                 }
             };
-            // Early updates with no message entry, such as a thought or a
-            // plan alone, leave the target with the source's turns.
-            let target_history =
-                crate::protocol::canon::TurnLog::from_replay(&conversation_updates(&early_updates));
-            let target_log = if target_history.entries().is_empty() {
-                source_log
-            } else {
-                Some(Arc::new(target_history))
-            };
             let target_replay = Some(notification_values(&early_updates));
             let epoch = state.sessions.epoch().to_string();
             let runtime_result = state.sessions.open_forked(
@@ -3669,7 +3640,7 @@ async fn handle_command_inner(
             // The response claim is about to release subsequent target messages.
             // Give the target its log before making it routable.
             session_mirror(&mut state)
-                .use_cached_history(&session_id, target_log)
+                .use_cached_history(&session_id)
                 .map_err(mirror_error)?;
             state
                 .sessions
@@ -4790,7 +4761,7 @@ async fn synchronize_attached_history(
         .is_some_and(|session| session.phase == MirrorPhase::Ready);
     if matches!(fallback, AttachmentHistoryFallback::Received) || !ready {
         session_mirror(&mut state)
-            .use_cached_history(session_id, None)
+            .use_cached_history(session_id)
             .map_err(mirror_error)?;
     }
     Ok(())
@@ -7232,14 +7203,9 @@ mod tests {
                 .contains("candidate")
         );
         state.sessions.commit_load("session", "load").unwrap();
-        let crate::protocol::registry::SessionLog::Known(log) =
-            &state.sessions.state("session").unwrap().log
-        else {
-            panic!("the committed load knows the log");
-        };
         assert_eq!(
-            serde_json::to_value(&log.entries()[0].turn).unwrap()["reply"][0]["text"],
-            "candidate"
+            state.sessions.state("session").unwrap().history,
+            Some(crate::protocol::timeline::History::Complete)
         );
         state
             .sessions
