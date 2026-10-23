@@ -215,6 +215,10 @@ impl Feed {
             .map(String::from)
             .collect();
         for scope in gone {
+            let cwd = self
+                .engine
+                .live(&scope)
+                .and_then(|live| live["cwd"].as_str().map(String::from));
             self.engine.remove(&scope);
             self.pacer.settled(&scope);
             let recorded = ended
@@ -239,7 +243,7 @@ impl Feed {
                 }
                 None => {
                     for subscriber in self.subscribers.values_mut() {
-                        subscriber.released(&scope);
+                        subscriber.released(&scope, cwd.as_deref());
                     }
                 }
             }

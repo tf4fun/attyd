@@ -181,6 +181,11 @@ fn a_session_released_with_no_reason_ends_nothing_and_its_followers_wait_for_it(
     // The follower is still waiting for it, so the bridge loads it again.
     let waiting = feed.followed_sessions();
     assert_eq!(waiting["s"].len(), 1, "{waiting:?}");
+    assert_eq!(
+        waiting["s"][0].cwd.as_deref(),
+        Some("/work"),
+        "it is loaded in the directory the bridge knew it in"
+    );
 
     // Published again, the session is sent whole.
     let mut registry = SessionRegistry::new("epoch");
