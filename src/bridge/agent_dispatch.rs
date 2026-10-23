@@ -512,7 +512,15 @@ async fn elicitation(
                 Some(owner) => OpScope::Session(owner.session_id.clone()),
                 None => context.request_scope.clone().unwrap_or(OpScope::Global),
             };
-            state.sessions.bind_interaction(&elicitation_id, scope);
+            match &owner {
+                Some(_) => state.sessions.bind_interaction(&elicitation_id, scope),
+                // A request-scoped one ends with the response of the request it names.
+                None => state.sessions.bind_interaction_to_parent(
+                    &elicitation_id,
+                    scope,
+                    crate::protocol::registry::request_key(&request_value["requestId"]),
+                ),
+            }
             state
                 .sessions
                 .upsert_elicitation(

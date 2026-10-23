@@ -5,7 +5,7 @@
 //! its timeline in its history state; `global` and `catalog` keep their slots
 //! here. The registry's transitions maintain them through the functions below;
 //! the commit step publishes them.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -66,6 +66,18 @@ pub(crate) struct ScopeOps {
     pub login_terminals: BTreeMap<String, LoginTerminal>,
     /// The pages `list` produced since the catalog revision last changed.
     pub catalog_pages: CatalogPages,
+    /// The latest requests of the bridge whose responses arrived (by `request_key`): a
+    /// request-scoped interaction ends with the response of the request it names.
+    pub completed_parents: VecDeque<String>,
+}
+
+/// How many completed requests are remembered for an interaction that arrives after its
+/// parent's response.
+const COMPLETED_PARENTS: usize = 256;
+
+/// The text a request ID is compared by: its JSON form.
+pub(crate) fn request_key(id: &Value) -> String {
+    id.to_string()
 }
 
 /// The pages of a listing and the catalog revision they were listed at; they
@@ -81,6 +93,8 @@ pub(crate) struct CatalogPages {
 pub(crate) struct Joined {
     pub scope: Scope,
     pub op: String,
+    /// The request a request-scoped interaction names (`request_key`); its response ends it.
+    pub parent: Option<String>,
 }
 
 /// The bound of a login terminal's output tail, in bytes.
@@ -97,6 +111,7 @@ impl Default for ScopeOps {
             flow_scopes: BTreeMap::new(),
             login_terminals: BTreeMap::new(),
             catalog_pages: CatalogPages::default(),
+            completed_parents: VecDeque::new(),
         }
     }
 }
@@ -345,6 +360,25 @@ impl SessionRegistry {
         }
     }
 
+    /// A request-scoped interaction naming the request `parent` (its `request_key`) arrived
+    /// for `scope`: it ends with that request's response.
+    pub(crate) fn bind_interaction_to_parent(&mut self, interaction_id: &str, scope: Scope, parent: String) {
+        self.bind_interaction(interaction_id, scope);
+        if let Some(joined) = self.scopes.joined.get_mut(interaction_id) {
+            joined.parent = Some(parent);
+        }
+    }
+
+    /// The response of the bridge's request `key` arrived: the interactions that name it end at
+    /// the next commit, also one that arrives after it.
+    pub(crate) fn parent_completed(&mut self, key: String) {
+        let completed = &mut self.scopes.completed_parents;
+        if completed.len() == COMPLETED_PARENTS {
+            completed.pop_front();
+        }
+        completed.push_back(key);
+    }
+
     /// A request-scoped interaction arrived for `scope`: it joins the operation shown there,
     /// which its parent request was sent for (protocol §6.2).
     /// An unheld session's request falls back to `global`.
@@ -365,7 +399,7 @@ impl SessionRegistry {
         let op = self.slot_mut(&owner).id.clone();
         self.scopes
             .joined
-            .insert(interaction_id.to_string(), Joined { scope, op });
+            .insert(interaction_id.to_string(), Joined { scope, op, parent: None });
     }
 
     /// An accepted request-scoped URL elicitation became a flow: it stays in
@@ -378,10 +412,10 @@ impl SessionRegistry {
         }
     }
 
-    /// Request-scoped interactions whose operation ended. Until the parent request's
-    /// response ends them on its own (step 16), the end of the operation they were sent
-    /// for does. A session-scoped interaction is never one of them: an operation's end ends
-    /// no interaction (memory model §8.2).
+    /// Request-scoped interactions whose parent request has been answered (memory model §8.2).
+    /// One that names no request (none is admitted since Q6) ends with the operation it joined.
+    /// A session-scoped interaction is never one of them: an operation's end ends no
+    /// interaction.
     pub(crate) fn orphaned_interactions(&self) -> Vec<String> {
         self.request_elicitations
             .values()
@@ -389,9 +423,11 @@ impl SessionRegistry {
                 self.scopes
                     .joined
                     .get(&pending.interaction_id)
-                    .is_some_and(|joined| {
-                        self.shown_slot(&joined.scope)
-                            .is_none_or(|slot| slot.id != joined.op || !slot.is_running())
+                    .is_some_and(|joined| match &joined.parent {
+                        Some(parent) => self.scopes.completed_parents.contains(parent),
+                        None => self
+                            .shown_slot(&joined.scope)
+                            .is_none_or(|slot| slot.id != joined.op || !slot.is_running()),
                     })
             })
             .map(|pending| pending.interaction_id.clone())
@@ -624,6 +660,7 @@ impl SessionRegistry {
             }
         }
         self.scopes.occupied.clear();
+        self.scopes.completed_parents.clear();
         self.request_elicitations.clear();
         mark_ended(&mut self.request_url_flows);
         self.scopes.joined.clear();
