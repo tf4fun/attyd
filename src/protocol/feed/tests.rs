@@ -132,7 +132,35 @@ fn a_replaced_timeline_is_a_new_epoch_and_a_snapshot_for_every_subscriber() {
 }
 
 #[test]
-fn a_session_the_bridge_no_longer_holds_ends_its_scope_for_its_subscribers() {
+fn a_session_that_went_with_a_reason_ends_its_scope_for_its_subscribers() {
+    let mut registry = registry();
+    let mut feed = Feed::new("process");
+    feed.commit(&registry, &agent(), 0);
+    let id = feed.subscribe(&follow(&[session()]));
+    drain(&mut feed, id);
+    registry
+        .sessions
+        .get_mut("s")
+        .unwrap()
+        .state
+        .live
+        .as_mut()
+        .unwrap()
+        .lifecycle = SessionLifecycle::Closed;
+    let closed = End {
+        reason: EndReason::Closed,
+        error: None,
+    };
+    feed.commit_ending(&registry, &agent(), 0, Instant::now(), &[("s".to_string(), closed)]);
+    assert_eq!(drain(&mut feed, id), ["end session/s Closed"]);
+    // Nothing is published of it again, and the end is only sent once.
+    feed.commit(&registry, &agent(), 0);
+    assert_eq!(drain(&mut feed, id), Vec::<String>::new());
+    assert_eq!(feed.version("session/s"), None);
+}
+
+#[test]
+fn a_session_released_with_no_reason_ends_nothing_and_its_followers_wait_for_it() {
     let mut registry = registry();
     let mut feed = Feed::new("process");
     feed.commit(&registry, &agent(), 0);
@@ -148,11 +176,24 @@ fn a_session_the_bridge_no_longer_holds_ends_its_scope_for_its_subscribers() {
         .unwrap()
         .lifecycle = SessionLifecycle::Closed;
     feed.commit(&registry, &agent(), 0);
-    assert_eq!(drain(&mut feed, id), ["end session/s Closed"]);
-    // Nothing is published of it again, and the end is only sent once.
-    feed.commit(&registry, &agent(), 0);
-    assert_eq!(drain(&mut feed, id), Vec::<String>::new());
+    assert_eq!(drain(&mut feed, id), Vec::<String>::new(), "a release sends no end");
     assert_eq!(feed.version("session/s"), None);
+    // The follower is still waiting for it, so the bridge loads it again.
+    let waiting = feed.followed_sessions();
+    assert_eq!(waiting["s"].len(), 1, "{waiting:?}");
+    assert_eq!(
+        waiting["s"][0].cwd.as_deref(),
+        Some("/work"),
+        "it is loaded in the directory the bridge knew it in"
+    );
+
+    // Published again, the session is sent whole.
+    let mut registry = SessionRegistry::new("epoch");
+    registry
+        .open_new("epoch", "s", "/work", json!({ "sessionId": "s" }))
+        .unwrap();
+    feed.commit(&registry, &agent(), 0);
+    assert_eq!(drain(&mut feed, id), ["snapshot session/s rev 0"]);
 }
 
 #[test]

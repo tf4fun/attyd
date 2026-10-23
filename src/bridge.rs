@@ -167,6 +167,9 @@ struct BridgeState {
     in_flight_request_ids: HashSet<String>,
     /// Where the end of a control action's command is answered, by its request ID.
     action_replies: HashMap<String, oneshot::Sender<Result<(), crate::protocol::documents::ProtocolError>>>,
+    /// The session a `close` action closes, by its request ID: when the Agent closed it, the
+    /// scope ends with `closed` (protocol §7).
+    action_closes: HashMap<String, String>,
     sessions: SessionRegistry,
     observer_events: Option<mpsc::UnboundedSender<BridgeInput>>,
     observer_timeout: Option<i64>,
@@ -2091,6 +2094,18 @@ where
                     if let Some(request_id) = request_id.as_deref() {
                         let mut state = context.state.lock().await;
                         state.in_flight_request_ids.remove(request_id);
+                        // A closed session's scope ends with `closed`; a release ends nothing.
+                        if let Some(session_id) = state.action_closes.remove(request_id)
+                            && result.is_ok()
+                        {
+                            state.sessions.scopes.ended.push((
+                                session_id,
+                                crate::protocol::documents::End {
+                                    reason: crate::protocol::documents::EndReason::Closed,
+                                    error: None,
+                                },
+                            ));
+                        }
                         // A control action is answered with the end of its command.
                         if let Some(reply) = state.action_replies.remove(request_id) {
                             let _ = reply.send(match &result {

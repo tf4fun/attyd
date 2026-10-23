@@ -116,6 +116,9 @@ pub(super) fn admit(
         operations::deliver(state, sink, deliveries);
     }
     let (reply, answer) = oneshot::channel();
+    if matches!(control, Control::Close) {
+        state.action_closes.insert(request_id.clone(), session_id.to_string());
+    }
     state.action_replies.insert(request_id, reply);
     Ok((command, answer))
 }
