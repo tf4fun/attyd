@@ -150,28 +150,20 @@ pub(super) fn perform(
     }
 }
 
-/// Dismisses the URL flow `scope` shows as `interaction_id`, if any. A flow
-/// is named by the interaction it was accepted from, so an old flow's late
-/// dismissal never reaches a new flow that reuses its `elicitationId`.
+/// Dismisses the URL flow `scope` shows as `interaction_id`, if any, whatever its status. A
+/// flow is named by the interaction it was accepted from, so an old flow's late dismissal never
+/// reaches a new flow that reuses its `elicitationId`.
 fn dismiss_url_flow(state: &mut BridgeState, scope: &OpScope, interaction_id: &str) -> bool {
-    let Some((elicitation_id, registration)) = state
-        .sessions
-        .url_owners
-        .iter()
-        .find(|(_, route)| route.registration_id == interaction_id)
-        .map(|(id, route)| (id.clone(), route.clone()))
-    else {
+    let Some((session_id, elicitation_id)) = state.sessions.url_flow_named(interaction_id) else {
         return false;
     };
     // The scope whose live shows the flow, as the projection places it.
-    let shown_in = match &registration.owner {
-        Some(owner) => {
-            if !state.sessions.owns_resources(owner)
-                || !resolves_canonically(state, &owner.session_id)
-            {
+    let shown_in = match &session_id {
+        Some(session_id) => {
+            if !resolves_canonically(state, session_id) {
                 return false;
             }
-            OpScope::Session(owner.session_id.clone())
+            OpScope::Session(session_id.clone())
         }
         None => state
             .sessions
@@ -187,20 +179,20 @@ fn dismiss_url_flow(state: &mut BridgeState, scope: &OpScope, interaction_id: &s
     let epoch = state.sessions.epoch().to_owned();
     let resolution = state.sessions.settle_url_registration(
         &epoch,
-        registration
-            .owner
-            .as_ref()
-            .map(|owner| owner.session_id.as_str()),
+        session_id.as_deref(),
         &elicitation_id,
-        &registration.registration_id,
+        interaction_id,
         UrlFlowStatus::Cancelled,
     );
     if !matches!(resolution, Ok(UrlFlowResolution::Applied)) {
         return false;
     }
-    state
-        .sessions
-        .take_url_route(&elicitation_id, &registration);
+    // A flow still waiting has a route for the Agent's `elicitation/complete`.
+    if let Some(route) = state.sessions.url_owners.get(&elicitation_id).cloned()
+        && route.registration_id == interaction_id
+    {
+        state.sessions.take_url_route(&elicitation_id, &route);
+    }
     state.sessions.scopes.flow_scopes.remove(interaction_id);
     refresh_observer_timers(state);
     true

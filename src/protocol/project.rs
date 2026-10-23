@@ -175,7 +175,6 @@ pub(super) fn url_flows<'a>(
 ) -> BTreeMap<String, UrlFlow> {
     flows
         .into_iter()
-        .filter(|flow| flow.status == UrlFlowStatus::Waiting)
         .map(|flow| {
             (
                 flow.registration_id.clone(),
@@ -183,7 +182,12 @@ pub(super) fn url_flows<'a>(
                     interaction_id: flow.registration_id.clone(),
                     elicitation_id: flow.elicitation_id.clone(),
                     request: flow.request.clone(),
-                    status: UrlFlowState::Waiting,
+                    status: match flow.status {
+                        UrlFlowStatus::Waiting => UrlFlowState::Waiting,
+                        UrlFlowStatus::Completed => UrlFlowState::Completed,
+                        UrlFlowStatus::Ended => UrlFlowState::Ended,
+                        UrlFlowStatus::Cancelled => unreachable!("a cancelled flow is removed"),
+                    },
                 },
             )
         })

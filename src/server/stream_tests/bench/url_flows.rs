@@ -328,14 +328,14 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
     )
     .await;
     watch
-        .until_live("session/s", "the completed flow is gone", |live| {
-            live["urlFlows"].get(&asked).is_none()
+        .until_live("session/s", "the flow shows completed", |live| {
+            live["urlFlows"][&asked]["status"] == "completed"
         })
         .await;
     assert_eq!(
         flow(&watch.live("session/s"), &prompt_flow),
         prompt_kept,
-        "the completion ends the one flow with its elicitationId"
+        "the completion finishes the one flow with its elicitationId"
     );
     assert_eq!(watch.live("session/s")["op"]["id"], successor);
     watch
@@ -356,6 +356,8 @@ async fn flows_outlive_their_operation_and_end_by_their_own_lifecycle() {
     dismiss(&bench, &mut link, &mut watch, "global", &global_flow).await;
     dismiss(&bench, &mut link, &mut watch, "catalog", &catalog_flow).await;
     dismiss(&bench, &mut link, &mut watch, "session/s", &prompt_flow).await;
+    // A completed flow stays until it is dismissed.
+    dismiss(&bench, &mut link, &mut watch, "session/s", &asked).await;
     watch
         .until_live("global", "the summary has no flow", |live| {
             live["sessions"]["s"]["pending"]["urlFlows"] == 0
@@ -415,8 +417,8 @@ async fn a_reused_elicitation_id_names_a_new_flow() {
     link.notify("elicitation/complete", json!({"elicitationId": "reused"}))
         .await;
     watch
-        .until_live("session/s", "A ends", |live| {
-            live["urlFlows"].get(&a).is_none()
+        .until_live("session/s", "A completes", |live| {
+            live["urlFlows"][&a]["status"] == "completed"
         })
         .await;
 
@@ -524,10 +526,9 @@ async fn a_reused_elicitation_id_names_a_new_flow() {
     watch.converged(&bench).await;
 }
 
-/// The Agent connection's end removes global's flows in the generation's
-/// final documents.
+/// The Agent connection's end leaves global's waiting flows, `ended`, until they are dismissed.
 #[tokio::test]
-async fn the_connection_end_clears_the_global_flow() {
+async fn the_connection_end_leaves_the_global_flow_ended_until_it_is_dismissed() {
     let (bench, mut link) = Bench::ws_initialized(json!({
         "protocolVersion": 1,
         "agentCapabilities": {},
@@ -565,10 +566,17 @@ async fn the_connection_end_clears_the_global_flow() {
     link.close().await;
     watch
         .until_live("global", "the connection ends with its flow", |live| {
-            live["agent"]["phase"] != "ready" && flow_ids(live).is_empty()
+            live["agent"]["phase"] != "ready" && live["urlFlows"][&flow]["status"] == "ended"
         })
         .await;
     let (status, body) = bench.act("global", &flow, "dismiss", json!({})).await;
-    not_found(status, &body, "a flow of an ended connection");
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    watch
+        .until_live("global", "the dismissed flow is gone", |live| {
+            flow_ids(live).is_empty()
+        })
+        .await;
+    let (status, body) = bench.act("global", &flow, "dismiss", json!({})).await;
+    not_found(status, &body, "a repeated dismissal");
     watch.converged(&bench).await;
 }

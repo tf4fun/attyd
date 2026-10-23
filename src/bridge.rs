@@ -5712,6 +5712,22 @@ fn release_url_flows(owner: &SessionResourceOwner, state: &mut BridgeState, sink
             .flow_scopes
             .remove(&registration.registration_id);
     }
+    // A finished flow has no route; it ends with its scope too.
+    let finished: Vec<String> = state
+        .sessions
+        .request_url_flows
+        .iter()
+        .filter(|(_, flow)| {
+            flow.status != UrlFlowStatus::Waiting
+                && state.sessions.scopes.flow_scopes.get(&flow.registration_id) == Some(&scope)
+        })
+        .map(|(elicitation_id, _)| elicitation_id.clone())
+        .collect();
+    for elicitation_id in finished {
+        if let Some(flow) = state.sessions.request_url_flows.remove(&elicitation_id) {
+            state.sessions.scopes.flow_scopes.remove(&flow.registration_id);
+        }
+    }
 }
 
 fn validate_configured_capabilities(

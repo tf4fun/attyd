@@ -431,7 +431,7 @@ async fn assert_prompt_cancel_preserves_accepted_url_flow(request_scoped: bool) 
     }))
     .await;
     peer.until("the Agent completes its flow", |peer| {
-        peer.live(&scope)["urlFlows"].get(&interaction).is_none()
+        peer.live(&scope)["urlFlows"][&interaction]["status"] == "completed"
     })
     .await;
     assert_eq!(
