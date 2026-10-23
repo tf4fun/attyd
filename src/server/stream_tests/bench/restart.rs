@@ -1,5 +1,6 @@
 //! The `restart` action on `global` (protocol §7; audit Q8): with no session followed, nothing
 //! passive starts the next Agent connection after the Agent exits, and `restart` does.
+use super::recovery::initialized;
 use super::*;
 
 const RESTART: &str = "/api/v2/scopes/global/actions/restart";
