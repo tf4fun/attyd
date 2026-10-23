@@ -10,7 +10,6 @@
 //! events (`documents`), operation slots (`op`, `registry`), the projections
 //! (`project`) and the feed (`feed`, `engine`, `subscription`) the bridge actor
 //! commits to (docs/state-sync.md §5).
-#![allow(dead_code)]
 
 pub(crate) mod admission;
 pub(crate) mod canon;
