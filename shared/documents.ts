@@ -3,58 +3,21 @@
 // operation a scope shows names the scope it was written to and the operation it replaced;
 // interactions are a member of `live` beside it, not part of it.
 
-import type { SessionInfo } from "@agentclientprotocol/sdk";
-import type {
-  AgentInfo,
-  Interaction,
-  LoginTerminal,
-  Operation,
-  SessionControls,
-  SessionSummary,
-  Terminal,
-  UrlFlow,
-} from "./protocol";
+import type { CatalogLive, GlobalLive, Operation, SessionLive } from "./protocol";
 import type { Entry, PromptState } from "./entries";
 
-/** The `op` a scope shows (§4.4). */
-export type ShownOp = Omit<Operation, "interactions" | "process"> & {
-  /** The scope the operation was written to. */
-  scope: string;
-  /** The operation it replaced in that scope. */
-  after: string | null;
-};
+// The `live` of each scope is the type generated from the bridge's own (src/protocol), so a client
+// cannot read a document differently from how the bridge writes it.
 
-/** What every scope's `live` has (§4.1). */
-export interface ScopeLive {
-  op: ShownOp;
-  /** Pending, by interaction ID. */
-  interactions: Readonly<Record<string, Interaction>>;
-  /** Accepted URL flows, by interaction ID. */
-  urlFlows: Readonly<Record<string, UrlFlow>>;
-}
+/** The `op` a scope shows (§4.4): the scope it was written to and the operation it replaced
+ * are members of it; the interactions are a sibling in `live`. */
+export type ShownOp = Operation;
 
-export interface SessionLive3 extends ScopeLive {
-  sessionId: string;
-  cwd: string;
-  controls: SessionControls;
-  /** Agent terminals, with their frozen output once released (§4.6). */
-  terminals: Readonly<Record<string, Terminal & { released: boolean }>>;
-  closing: boolean;
-}
+export type SessionLive3 = SessionLive;
 
-export interface GlobalLive3 extends ScopeLive {
-  agent: AgentInfo;
-  /** Sessions the bridge holds; `origin` is the create or fork that installed one. */
-  sessions: Readonly<Record<string, SessionSummary & { origin?: string }>>;
-  terminals: Readonly<Record<string, LoginTerminal>>;
-}
+export type GlobalLive3 = GlobalLive;
 
-export interface CatalogLive3 extends ScopeLive {
-  /** Changes when the Agent's list may have changed. */
-  revision: string;
-  /** The pages listed since `revision` last changed. */
-  pages: readonly { readonly sessions: readonly SessionInfo[]; readonly nextCursor: string | null }[];
-}
+export type CatalogLive3 = CatalogLive;
 
 /** A session's document without `epoch` and `rev`. */
 export interface SessionBody {
