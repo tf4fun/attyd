@@ -53,7 +53,7 @@ async fn cross_recovery_window(hub: &BridgeHub) {
     tokio::time::sleep(backoff + Duration::from_secs(1)).await;
 }
 
-fn initialized(capabilities: Value) -> Value {
+pub(super) fn initialized(capabilities: Value) -> Value {
     json!({"protocolVersion": 1, "agentCapabilities": capabilities, "authMethods": []})
 }
 

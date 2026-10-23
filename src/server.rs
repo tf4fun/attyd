@@ -253,6 +253,32 @@ impl BridgeHub {
         });
     }
 
+    /// The `restart` action (protocol §7): starts the next Agent connection now, when none
+    /// runs. A recovery waiting to start one is replaced by it.
+    async fn restart(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        let runtime = {
+            let mut state = self.state.lock().await;
+            if state.shutting_down {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unavailable,
+                    "the host is shutting down",
+                ));
+            }
+            if state.input.is_some() {
+                return Err(ProtocolError::new(
+                    ErrorCode::NotAllowed,
+                    "an Agent connection starts or runs",
+                ));
+            }
+            if let Some(waiting) = state.recovery.take() {
+                waiting.cancel();
+            }
+            state.begin_generation()
+        };
+        self.spawn_runtime(runtime);
+        Ok(())
+    }
+
     /// Asks the current generation to serve the streams: a subscription of the
     /// revision 3 feed may follow a session the bridge has to load. With no
     /// generation, the next one serves them when it is ready.
@@ -949,6 +975,23 @@ async fn write_scope(
     };
     match segments[1..].iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["ops"] => {}
+        ["actions", "restart"] => {
+            if scope != Scope::Global {
+                return refused(ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!("no such action in {scope}"),
+                ));
+            }
+            match json_body(&headers, &body) {
+                Ok(body) if body.is_object() => {}
+                Ok(_) => return invalid_request("restart: the body must be an object"),
+                Err(response) => return response,
+            }
+            return match state.bridge.restart().await {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(error) => refused(error),
+            };
+        }
         ["actions", action @ ("set_mode" | "set_config" | "close")] => {
             let Scope::Session(session_id) = &scope else {
                 return refused(ProtocolError::new(
