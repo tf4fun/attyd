@@ -5,115 +5,50 @@
 //! shows an operation or an interaction: the session's identity, its reduced
 //! controls, its terminals (those with a handle and the frozen output a tool
 //! embeds) and whether a close is outstanding.
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::documents::{AgentInfo, ExitStatus, Scope, Terminal};
+use super::documents::{AgentInfo, Scope};
 use super::engine;
 use super::project;
-use crate::runtime_state::{SessionLifecycle, SessionLiveState};
 use crate::session_registry::SessionRegistry;
 
-/// A terminal as §4.6 publishes it. `released`: its handle is gone and the
-/// output frozen.
-fn terminal(terminal_id: &str, snapshot: &Value, released: bool) -> Value {
-    let exit_status = snapshot
-        .get("exitStatus")
-        .filter(|status| status.is_object())
-        .map(|status| ExitStatus {
-            exit_code: status.get("exitCode").and_then(Value::as_i64),
-            signal: status.get("signal").and_then(Value::as_str).map(String::from),
-        });
-    serde_json::to_value(Terminal {
-        terminal_id: terminal_id.to_string(),
-        output: snapshot["output"].as_str().unwrap_or_default().to_string(),
-        truncated: snapshot["truncated"].as_bool().unwrap_or(false),
-        exit_status,
-        released,
-    })
-    .expect("a terminal serializes")
-}
-
-fn held(live: &SessionLiveState) -> bool {
-    live.lifecycle != SessionLifecycle::Closed
+/// `live` as a document without the members every scope has (`op`, `interactions`, `urlFlows`).
+fn without_common_members(live: impl serde::Serialize) -> Value {
+    let mut live = serde_json::to_value(live).expect("a live document serializes");
+    if let Some(members) = live.as_object_mut() {
+        for common in ["op", "interactions", "urlFlows"] {
+            members.remove(common);
+        }
+    }
+    live
 }
 
 /// What `live` holds for the session besides its operation, interactions and
 /// URL flows; `None` when the bridge does not hold the session.
 pub(crate) fn session_live(registry: &SessionRegistry, session_id: &str) -> Option<Value> {
-    let live = registry
-        .sessions
-        .get(session_id)?
-        .state
-        .live
-        .as_ref()
-        .filter(|live| held(live))?;
-    let terminals: serde_json::Map<String, Value> = live
-        .terminals
-        .iter()
-        .map(|(id, snapshot)| (id, snapshot, false))
-        .chain(live.frozen_terminals.iter().map(|(id, snapshot)| (id, snapshot, true)))
-        .map(|(id, snapshot, released)| (id.clone(), terminal(id, snapshot, released)))
-        .collect();
-    Some(json!({
-        "sessionId": session_id,
-        "cwd": live.cwd.to_string_lossy(),
-        "controls": live.controls,
-        "terminals": terminals,
-        "closing": matches!(
-            live.lifecycle,
-            SessionLifecycle::Closing | SessionLifecycle::ClosingForDelete
-        ),
-    }))
-}
-
-/// The interactions pending in `scope`, by interaction ID (protocol §4.4).
-/// They are a member of `live` beside the operation, not part of it.
-fn interactions_doc(registry: &SessionRegistry, scope: &Scope) -> Value {
-    let interactions = project::shown_operation(registry, scope)
-        .map(|(operation, _)| operation.interactions)
-        .unwrap_or_default();
-    serde_json::to_value(interactions).expect("interactions serialize")
-}
-
-/// The accepted URL flows of `scope`, by interaction ID (protocol §4.6).
-fn url_flows_doc(registry: &SessionRegistry, scope: &Scope) -> Value {
-    let flows = match scope {
-        Scope::Session(session_id) => registry
-            .sessions
-            .get(session_id)
-            .and_then(|entry| entry.state.live.as_ref())
-            .filter(|live| held(live))
-            .map(|live| {
-                project::url_flows(
-                    live.url_flows
-                        .values()
-                        .chain(project::request_flows(registry, scope)),
-                )
-            })
-            .unwrap_or_default(),
-        _ => project::url_flows(project::request_flows(registry, scope)),
-    };
-    serde_json::to_value(flows).expect("flows serialize")
+    project::project_session_live(registry, session_id).map(without_common_members)
 }
 
 /// The complete `live` of `scope` (protocol §4.1–§4.4): the members every scope
-/// has (`op`, `interactions`, `urlFlows`) and those of its kind. `None` when the
-/// bridge does not hold the session.
+/// has (`op`, `interactions`, `urlFlows`) and those of its kind, serialized from
+/// the types the generated TypeScript comes from. `None` when the bridge does not
+/// hold the session.
 pub(crate) fn scope_live(
     registry: &SessionRegistry,
     scope: &Scope,
     agent: &AgentInfo,
     catalog_revision: u64,
 ) -> Option<Value> {
-    let mut live = match scope {
-        Scope::Session(session_id) => session_live(registry, session_id)?,
-        Scope::Global => global_live(registry, agent),
-        Scope::Catalog => catalog_live(registry, catalog_revision),
+    let live = match scope {
+        Scope::Session(session_id) => {
+            serde_json::to_value(project::project_session_live(registry, session_id)?)
+        }
+        Scope::Global => serde_json::to_value(project::project_global(registry, agent)),
+        Scope::Catalog => {
+            serde_json::to_value(project::project_catalog(registry, catalog_revision))
+        }
     };
-    live["op"] = operation_doc(registry, scope)?;
-    live["interactions"] = interactions_doc(registry, scope);
-    live["urlFlows"] = url_flows_doc(registry, scope);
-    Some(live)
+    Some(live.expect("a live document serializes"))
 }
 
 /// What the publisher is handed for `scope` (protocol §5.2): the epoch the
@@ -153,39 +88,16 @@ pub(crate) fn engine_input(
 
 /// What `live` holds for `global` besides its operation, interactions and URL
 /// flows (protocol §4.3): the Agent, the sessions the bridge holds and the
-/// terminal logins. A login terminal is a terminal like any other, whose handle
-/// lasts until it is dismissed.
+/// terminal logins.
 pub(crate) fn global_live(registry: &SessionRegistry, agent: &AgentInfo) -> Value {
-    let global = serde_json::to_value(project::project_global(registry, agent))
-        .expect("the global live document serializes");
-    let mut terminals = global["terminals"].clone();
-    for terminal in terminals
-        .as_object_mut()
-        .into_iter()
-        .flat_map(|terminals| terminals.values_mut())
-    {
-        terminal["released"] = Value::Bool(false);
-    }
-    json!({
-        "agent": global["agent"],
-        "sessions": global["sessions"],
-        "terminals": terminals,
-    })
+    without_common_members(project::project_global(registry, agent))
 }
 
 /// What `live` holds for `catalog` besides its operation, interactions and URL
 /// flows (protocol §4.3): the revision of the Agent's list and the pages listed
 /// since it last changed.
 pub(crate) fn catalog_live(registry: &SessionRegistry, revision: u64) -> Value {
-    let catalog = serde_json::to_value(project::project_catalog(registry, revision))
-        .expect("the catalog live document serializes");
-    let listed = &registry.scopes.catalog_pages;
-    let pages = if listed.revision == revision {
-        listed.pages.clone()
-    } else {
-        Vec::new()
-    };
-    json!({ "revision": catalog["revision"], "pages": pages })
+    without_common_members(project::project_catalog(registry, revision))
 }
 
 /// The operation `scope` shows (protocol §4.4): that of the scope whose
@@ -193,23 +105,8 @@ pub(crate) fn catalog_live(registry: &SessionRegistry, revision: u64) -> Value {
 /// its `after` the operation it replaced there; a scope's first operation
 /// replaced none. Pending interactions are not part of it.
 pub(crate) fn operation_doc(registry: &SessionRegistry, scope: &Scope) -> Option<Value> {
-    let slot = registry.shown_slot(scope)?;
-    let mut operation = json!({
-        "id": slot.id,
-        "scope": slot.scope.clone().unwrap_or_else(|| scope.to_string()),
-        "after": slot.after,
-        "kind": slot.kind,
-        "status": slot.status,
-        "input": slot.input,
-        "cancelRequested": slot.cancel_requested,
-    });
-    if let Some(result) = &slot.result {
-        operation["result"] = result.clone();
-    }
-    if let Some(error) = &slot.error {
-        operation["error"] = serde_json::to_value(error).expect("an error serializes");
-    }
-    Some(operation)
+    let (operation, _) = project::shown_operation(registry, scope)?;
+    Some(serde_json::to_value(operation).expect("an operation serializes"))
 }
 
 #[cfg(test)]

@@ -143,10 +143,6 @@ pub(crate) struct Operation {
     #[cfg_attr(test, ts(type = "unknown"))]
     pub input: Value,
     pub cancel_requested: bool,
-    /// Pending, by interaction ID. They are a member of `live` beside the operation on the wire
-    /// (protocol §4.4), so the generated type leaves them out.
-    #[cfg_attr(test, ts(skip))]
-    pub interactions: BTreeMap<String, Interaction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "unknown"))]
     pub result: Option<Value>,
@@ -231,6 +227,8 @@ pub(crate) struct LoginTerminal {
     pub exit_status: Option<ExitStatus>,
     /// The authentication method it runs.
     pub method_id: String,
+    /// Always `false`: a login's handle lasts until it is dismissed.
+    pub released: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,13 +239,17 @@ pub(crate) struct LoginTerminal {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionLive {
     pub op: Operation,
+    /// Pending, by interaction ID (protocol §4.4): beside the operation, not part of it.
+    pub interactions: BTreeMap<String, Interaction>,
     /// By interaction ID.
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub session_id: String,
     pub cwd: String,
     pub controls: SessionControls,
-    /// Agent terminals not yet released.
+    /// Agent terminals, those with a handle and those released whose output an entry embeds.
     pub terminals: BTreeMap<String, Terminal>,
+    /// A close request is outstanding.
+    pub closing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -255,6 +257,7 @@ pub(crate) struct SessionLive {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GlobalLive {
     pub op: Operation,
+    pub interactions: BTreeMap<String, Interaction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     pub agent: AgentInfo,
     /// Sessions the bridge holds.
@@ -268,9 +271,16 @@ pub(crate) struct GlobalLive {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CatalogLive {
     pub op: Operation,
+    pub interactions: BTreeMap<String, Interaction>,
     pub url_flows: BTreeMap<String, UrlFlow>,
     /// Changes when the Agent's list may have changed.
     pub revision: String,
+    /// The pages listed since `revision` last changed, in order.
+    #[cfg_attr(
+        test,
+        ts(type = "Array<{ sessions: Array<import(\"@agentclientprotocol/sdk\").SessionInfo>; nextCursor: string | null; _meta?: unknown }>")
+    )]
+    pub pages: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

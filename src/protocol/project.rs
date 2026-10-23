@@ -2,9 +2,11 @@
 //! (docs/state-sync.md §2.2). They are the only definition of what clients see.
 use std::collections::BTreeMap;
 
+use serde_json::Value;
+
 use super::documents::{
-    AgentInfo, CatalogLive, GlobalLive, Interaction, Operation, OperationSummary, PendingCounts,
-    Scope, SessionSummary, UrlFlow, UrlFlowState,
+    AgentInfo, CatalogLive, ExitStatus, GlobalLive, Interaction, Operation, OperationSummary,
+    PendingCounts, Scope, SessionLive, SessionSummary, Terminal, UrlFlow, UrlFlowState,
 };
 use super::op::OpSlot;
 use crate::runtime_state::{PendingInteraction, SessionLifecycle, SessionLiveState, UrlFlowStatus};
@@ -110,11 +112,7 @@ fn interactions(registry: &SessionRegistry, owner: &Scope) -> BTreeMap<String, I
     interactions
 }
 
-fn operation(
-    slot: &OpSlot,
-    shown_in: &Scope,
-    interactions: BTreeMap<String, Interaction>,
-) -> Operation {
+fn operation(slot: &OpSlot, shown_in: &Scope) -> Operation {
     Operation {
         id: slot.id.clone(),
         scope: slot.scope.clone().unwrap_or_else(|| shown_in.to_string()),
@@ -123,7 +121,6 @@ fn operation(
         status: slot.status,
         input: slot.input.clone(),
         cancel_requested: slot.cancel_requested,
-        interactions,
         result: slot.result.clone(),
         error: slot.error.clone(),
     }
@@ -148,10 +145,7 @@ pub(super) fn shown_operation(
 ) -> Option<(Operation, Scope)> {
     let owner = owner(registry, scope);
     let slot = registry.shown_slot(scope)?;
-    Some((
-        operation(slot, scope, interactions(registry, &owner)),
-        owner,
-    ))
+    Some((operation(slot, scope), owner))
 }
 
 /// The accepted request-scoped URL flows of `scope`; a flow of no known scope
@@ -194,13 +188,61 @@ pub(super) fn url_flows<'a>(
         .collect()
 }
 
+/// A terminal as §4.6 publishes it. `released`: its handle is gone and the output frozen.
+fn terminal(terminal_id: &str, snapshot: &Value, released: bool) -> Terminal {
+    let exit_status = snapshot
+        .get("exitStatus")
+        .filter(|status| status.is_object())
+        .map(|status| ExitStatus {
+            exit_code: status.get("exitCode").and_then(Value::as_i64),
+            signal: status.get("signal").and_then(Value::as_str).map(String::from),
+        });
+    Terminal {
+        terminal_id: terminal_id.to_string(),
+        output: snapshot["output"].as_str().unwrap_or_default().to_string(),
+        truncated: snapshot["truncated"].as_bool().unwrap_or(false),
+        exit_status,
+        released,
+    }
+}
+
+/// The complete `live` of a held session (protocol §4.2); `None` when the bridge does not hold it.
+pub(crate) fn project_session_live(
+    registry: &SessionRegistry,
+    session_id: &str,
+) -> Option<SessionLive> {
+    let live = held_live(registry, session_id)?;
+    let scope = Scope::Session(session_id.to_string());
+    let (op, owner) = shown_operation(registry, &scope)?;
+    let terminals = live
+        .terminals
+        .iter()
+        .map(|(id, snapshot)| (id, snapshot, false))
+        .chain(live.frozen_terminals.iter().map(|(id, snapshot)| (id, snapshot, true)))
+        .map(|(id, snapshot, released)| (id.clone(), terminal(id, snapshot, released)))
+        .collect();
+    Some(SessionLive {
+        op,
+        interactions: interactions(registry, &owner),
+        url_flows: url_flows(live.url_flows.values().chain(request_flows(registry, &scope))),
+        session_id: session_id.to_string(),
+        cwd: live.cwd.to_string_lossy().into_owned(),
+        controls: live.controls.clone(),
+        terminals,
+        closing: matches!(
+            live.lifecycle,
+            SessionLifecycle::Closing | SessionLifecycle::ClosingForDelete
+        ),
+    })
+}
+
 fn summary(
     registry: &SessionRegistry,
     session_id: &str,
     live: &SessionLiveState,
 ) -> SessionSummary {
     let scope = Scope::Session(session_id.to_string());
-    let (op, _) = shown_operation(registry, &scope).expect("held session has an op");
+    let (op, owner) = shown_operation(registry, &scope).expect("held session has an op");
     let url_flows = live
         .url_flows
         .values()
@@ -216,7 +258,7 @@ fn summary(
             status: op.status,
         },
         pending: PendingCounts {
-            interactions: op.interactions.len(),
+            interactions: interactions(registry, &owner).len(),
             url_flows,
         },
         origin: live.origin.clone(),
@@ -225,11 +267,8 @@ fn summary(
 
 pub(crate) fn project_global(registry: &SessionRegistry, agent: &AgentInfo) -> GlobalLive {
     GlobalLive {
-        op: operation(
-            &registry.scopes.global,
-            &Scope::Global,
-            interactions(registry, &Scope::Global),
-        ),
+        op: operation(&registry.scopes.global, &Scope::Global),
+        interactions: interactions(registry, &Scope::Global),
         url_flows: url_flows(request_flows(registry, &Scope::Global)),
         agent: agent.clone(),
         sessions: held_sessions(registry)
@@ -245,13 +284,16 @@ pub(crate) fn project_global(registry: &SessionRegistry, agent: &AgentInfo) -> G
 }
 
 pub(crate) fn project_catalog(registry: &SessionRegistry, revision: u64) -> CatalogLive {
+    let listed = &registry.scopes.catalog_pages;
     CatalogLive {
-        op: operation(
-            &registry.scopes.catalog,
-            &Scope::Catalog,
-            interactions(registry, &Scope::Catalog),
-        ),
+        op: operation(&registry.scopes.catalog, &Scope::Catalog),
+        interactions: interactions(registry, &Scope::Catalog),
         url_flows: url_flows(request_flows(registry, &Scope::Catalog)),
         revision: revision.to_string(),
+        pages: if listed.revision == revision {
+            listed.pages.clone()
+        } else {
+            Vec::new()
+        },
     }
 }

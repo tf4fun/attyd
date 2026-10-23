@@ -535,6 +535,7 @@ impl SessionRegistry {
                 truncated: false,
                 exit_status: None,
                 method_id: method_id.to_string(),
+                released: false,
             },
         );
     }
