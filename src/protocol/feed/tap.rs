@@ -21,6 +21,14 @@ pub(super) struct Tap {
 }
 
 impl Feed {
+    /// How many subscriptions still follow `scope`.
+    pub(crate) fn followers(&self, scope: &str) -> usize {
+        self.subscribers
+            .values()
+            .filter(|subscriber| subscriber.followed().any(|(followed, _)| followed == scope))
+            .count()
+    }
+
     /// Taps every later commit and returns the published documents now: a cut.
     pub(crate) fn tap(&mut self, sender: UnboundedSender<TapCommit>) -> BTreeMap<String, Value> {
         self.tap.sender = Some(sender);
@@ -97,6 +105,11 @@ impl FeedSubscription {
 }
 
 impl FeedHandle {
+    /// How many subscriptions still follow `scope`.
+    pub(crate) fn followers(&self, scope: &str) -> usize {
+        self.feed().followers(scope)
+    }
+
     /// Taps every later commit and returns the published documents now.
     pub(crate) fn tap(&self, sender: UnboundedSender<TapCommit>) -> BTreeMap<String, Value> {
         self.feed().tap(sender)

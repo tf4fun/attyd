@@ -2150,6 +2150,7 @@ async fn the_same_history_gives_the_same_entries_after_a_restart() {
     assert_eq!(first, load(&replay).await, "a restart keeps the same entries");
 }
 
+mod holding;
 mod review_lifecycle;
 
 // -- The revision 3 feed (docs/protocol.md §5) ----------------------------------------
