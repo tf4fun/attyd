@@ -550,6 +550,9 @@ closes it at the Agent when it is unneeded and `close` stays an action; no code.
 `ended` by the connection's end**: stays in the final documents until the next connection
 starts without it; no code.
 
+A self-review of the whole implementation, with what it found, fixed and did not cover, is in
+[self-review.md](self-review.md).
+
 Deviations from the plan, on purpose:
 
 - Layer-1 pull requests did not change the published documents. Frozen terminal
