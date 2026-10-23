@@ -99,21 +99,23 @@ Restored in `src/server/stream_tests/actions.rs`.
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] session_writes_need_the_current_ended_op_and_replace_it
-- [ ] global_writes_need_the_current_ended_op_and_replace_it
-- [ ] a_fork_is_refused_while_a_global_operation_runs
-- [ ] a_global_write_is_refused_while_a_fork_runs
-- [ ] a_write_with_a_client_id_is_installed_under_that_id
-- [ ] a_malformed_client_id_is_refused_before_anything_happens
-- [ ] a_repeated_write_is_accepted_again_and_does_nothing_more
-- [ ] a_write_that_is_not_a_repeat_is_judged_by_expect_and_status_as_before
-- [ ] a_list_needs_the_current_ended_catalog_op
-- [ ] of_two_writes_with_one_expect_only_one_is_admitted
-- [ ] a_refused_write_can_be_submitted_again_on_the_same_expect
-- [ ] refusals_follow_the_admission_order
-- [ ] without_a_connection_writes_are_unavailable_after_expect_and_arguments
-- [ ] malformed_and_foreign_writes_are_refused_with_the_protocol_error_body
-- [ ] a_session_id_with_slashes_is_written_through_its_encoded_scope
+- [x] session_writes_need_the_current_ended_op_and_replace_it
+- [x] global_writes_need_the_current_ended_op_and_replace_it
+- [x] a_fork_is_refused_while_a_global_operation_runs
+- [x] a_global_write_is_refused_while_a_fork_runs
+- [x] a_write_with_a_client_id_is_installed_under_that_id
+- [x] a_malformed_client_id_is_refused_before_anything_happens
+- [x] a_repeated_write_is_accepted_again_and_does_nothing_more
+- [x] a_write_that_is_not_a_repeat_is_judged_by_expect_and_status_as_before
+- [x] a_list_needs_the_current_ended_catalog_op
+- [x] of_two_writes_with_one_expect_only_one_is_admitted
+- [x] a_refused_write_can_be_submitted_again_on_the_same_expect
+- [x] refusals_follow_the_admission_order
+- [x] without_a_connection_writes_are_unavailable_after_expect_and_arguments
+- [x] malformed_and_foreign_writes_are_refused_with_the_protocol_error_body
+- [x] a_session_id_with_slashes_is_written_through_its_encoded_scope
+
+Restored in `src/server/stream_tests/bench/admission.rs`, on the revision 3 bench (`bench.rs`).
 
 ## Writes over HTTP (`src/server/stream_tests/ops/execution.rs`)
 
