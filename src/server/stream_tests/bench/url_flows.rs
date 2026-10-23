@@ -526,9 +526,9 @@ async fn a_reused_elicitation_id_names_a_new_flow() {
     watch.converged(&bench).await;
 }
 
-/// The Agent connection's end leaves global's waiting flows, `ended`, until they are dismissed.
+/// The Agent connection's end leaves global's waiting flows in the final documents, `ended`.
 #[tokio::test]
-async fn the_connection_end_leaves_the_global_flow_ended_until_it_is_dismissed() {
+async fn the_connection_end_leaves_the_global_flow_ended_in_the_final_document() {
     let (bench, mut link) = Bench::ws_initialized(json!({
         "protocolVersion": 1,
         "agentCapabilities": {},
@@ -569,14 +569,11 @@ async fn the_connection_end_leaves_the_global_flow_ended_until_it_is_dismissed()
             live["agent"]["phase"] != "ready" && live["urlFlows"][&flow]["status"] == "ended"
         })
         .await;
+    // The ended connection's bridge applies nothing: the flow stays in the final document as
+    // it was published, and the next connection starts without it.
+    let before = bench.document("global").await;
     let (status, body) = bench.act("global", &flow, "dismiss", json!({})).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-    watch
-        .until_live("global", "the dismissed flow is gone", |live| {
-            flow_ids(live).is_empty()
-        })
-        .await;
-    let (status, body) = bench.act("global", &flow, "dismiss", json!({})).await;
-    not_found(status, &body, "a repeated dismissal");
+    not_found(status, &body, "a dismissal after the connection ended");
+    assert_eq!(bench.document("global").await, before);
     watch.converged(&bench).await;
 }
