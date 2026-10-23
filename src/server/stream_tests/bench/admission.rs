@@ -844,9 +844,7 @@ async fn malformed_and_foreign_writes_are_refused_with_the_protocol_error_body()
     for (scope, expect, kind) in [
         ("session/s", &session, "load"),
         ("session/s", &session, "open"),
-        ("session/s", &session, "agent_request"),
         ("global", &global, "none"),
-        ("global", &global, "agent_request"),
         ("catalog", &catalog, "none"),
         ("global", &global, "prompt"),
         ("global", &global, "list"),

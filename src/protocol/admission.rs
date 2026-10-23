@@ -144,7 +144,7 @@ pub(crate) fn admit(
                 .map_err(|error| invalid(format!("unknown operation kind: {error}")))?;
             if !matches!(
                 kind,
-                OperationKind::Prompt | OperationKind::TerminalLogin | OperationKind::AgentRequest
+                OperationKind::Prompt | OperationKind::TerminalLogin
             ) {
                 return Err(refuse(
                     ErrorCode::NotAllowed,
@@ -402,10 +402,7 @@ fn arguments(
             }
             Ok(input)
         }
-        OperationKind::Load
-        | OperationKind::Open
-        | OperationKind::None
-        | OperationKind::AgentRequest => {
+        OperationKind::Load | OperationKind::Open | OperationKind::None => {
             unreachable!("bridge-started kinds are refused first")
         }
     }

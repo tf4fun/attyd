@@ -1,8 +1,7 @@
 //! Interactions, answers and cancels (protocol §4.4, §6.2, §6.4; acceptance
-//! 7, 8): every Agent request joins the running operation of its scope and is
-//! answered through that scope's `answer`, whole or not at all; `cancel`
-//! applies to `prompt`, `terminal_login` and `agent_request` and ends nothing
-//! by itself.
+//! 7, 8): an interaction belongs to its scope, runs beside or without an operation and is
+//! answered one at a time at its resource; `cancel` applies to `prompt` and `terminal_login`
+//! and ends nothing by itself.
 use super::*;
 
 /// An admitted answer or cancel names the running operation.
@@ -282,18 +281,17 @@ async fn a_load_interaction_is_answered_in_the_loading_session() {
     watch.converged(&bench).await;
 }
 
-/// With no operation running, an Agent request starts an `agent_request`,
-/// which later requests join; it completes when its last interaction goes.
+/// With no operation running, an Agent's request is an interaction of its session and starts
+/// no operation (D10): the session stays free for a prompt, which the interactions outlive.
 #[tokio::test]
-async fn an_agent_request_without_a_running_op_starts_one_that_completes_with_its_last_interaction()
-{
+async fn an_agent_request_without_a_running_op_starts_no_operation() {
     let (bench, mut link) = Bench::ws(json!({})).await;
     bench.create_with(&mut link, "s", json!({})).await;
     let mut watch = bench.watch(&scopes(&["session/s"])).await;
     watch
         .until("the alignment", |watch| watch.has("session/s"))
         .await;
-    let open = watch.live("session/s")["op"]["id"].clone();
+    let open = watch.live("session/s")["op"].clone();
     link.agent_request("one", "session/request_permission", permission("s", "one"))
         .await;
     link.agent_request("two", "session/request_permission", permission("s", "two"))
@@ -304,53 +302,36 @@ async fn an_agent_request_without_a_running_op_starts_one_that_completes_with_it
         })
         .await;
     let live = watch.live("session/s");
-    let request = live["op"]["id"].clone();
-    assert_eq!(live["op"]["kind"], "agent_request");
-    assert_eq!(live["op"]["status"], "running");
-    assert_ne!(request, open);
+    assert_eq!(live["op"], open, "no operation started: {live}");
     let (one, two) = (interaction_for(&live, "one"), interaction_for(&live, "two"));
 
-    // It occupies its session like any operation.
-    let (status, body) = bench
-        .op("session/s", &open, "prompt", json!({"prompt": [text("x")]}))
-        .await;
-    stale(status, &body, "a prompt on the replaced open");
+    // The session is free: a prompt is accepted beside them.
     let (status, body) = bench
         .op(
             "session/s",
-            &request,
+            &open["id"],
             "prompt",
             json!({"prompt": [text("x")]}),
         )
         .await;
-    not_allowed(status, &body, "a prompt while the agent request runs");
-
-    let (status, body) = bench
-        .answer(
-            "session/s",
-            &request,
-            answers(&[(one.as_str(), allow()), (two.as_str(), selected("deny"))]),
-        )
-        .await;
-    assert_joined(status, &body, &request, "the answers");
-    let responses = link.responses(&["one", "two"]).await;
-    assert_eq!(responses["one"]["result"], allow());
-    assert_eq!(responses["two"]["result"], selected("deny"));
-    watch.until_op("session/s", &request, "completed").await;
-    assert!(interaction_ids(&watch.live("session/s")).is_empty());
-
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &request,
-            "prompt",
-            json!({"prompt": [text("next")]}),
-        )
-        .await;
-    let prompt = assert_accepted(status, &body, "a prompt on the completed agent request");
+    let prompt = assert_accepted(status, &body, "a prompt beside pending interactions");
     let turn = link.request("session/prompt").await;
     link.reply(&turn, json!({"stopReason": "end_turn"})).await;
     watch.until_op("session/s", &prompt, "completed").await;
+    assert_eq!(interaction_ids(&watch.live("session/s")).len(), 2);
+
+    let (status, _) = bench.act("session/s", &one, "answer", allow()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = bench.act("session/s", &two, "answer", selected("deny")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let responses = link.responses(&["one", "two"]).await;
+    assert_eq!(responses["one"]["result"], allow());
+    assert_eq!(responses["two"]["result"], selected("deny"));
+    watch
+        .until_live("session/s", "no interaction is left", |live| {
+            interaction_ids(live).is_empty()
+        })
+        .await;
     watch.converged(&bench).await;
 }
 
@@ -509,75 +490,7 @@ async fn a_prompt_cancel_asks_the_agent_once_and_keeps_the_session_occupied() {
     watch.converged(&bench).await;
 }
 
-/// An `agent_request`'s cancel answers each pending interaction with its
-/// cancel outcome; it ends `cancelled`, and a new operation is admitted on it.
-#[tokio::test]
-async fn a_cancelled_agent_request_answers_its_interactions_with_their_cancel_outcomes() {
-    let (bench, mut link) = Bench::ws(json!({})).await;
-    bench.create_with(&mut link, "s", json!({})).await;
-    let mut watch = bench.watch(&scopes(&["session/s"])).await;
-    watch
-        .until("the alignment", |watch| watch.has("session/s"))
-        .await;
-    link.agent_request(
-        "permission",
-        "session/request_permission",
-        permission("s", "tool"),
-    )
-    .await;
-    link.agent_request(
-        "elicitation",
-        "elicitation/create",
-        form(json!({"sessionId": "s"}), "form?"),
-    )
-    .await;
-    watch
-        .until_live("session/s", "both interactions", |live| {
-            interaction_ids(live).len() == 2
-        })
-        .await;
-    let op = watch.live("session/s")["op"]["id"].clone();
-    assert_eq!(watch.live("session/s")["op"]["kind"], "agent_request");
-
-    let (status, body) = bench.cancel("session/s", &op).await;
-    assert_joined(status, &body, &op, "the cancel");
-    let responses = link.responses(&["permission", "elicitation"]).await;
-    assert_eq!(
-        responses["permission"]["result"],
-        json!({"outcome": {"outcome": "cancelled"}})
-    );
-    assert_eq!(
-        responses["elicitation"]["result"],
-        json!({"action": "cancel"})
-    );
-    watch.until_op("session/s", &op, "cancelled").await;
-    let live = watch.live("session/s");
-    assert!(interaction_ids(&live).is_empty());
-    assert!(live["op"].get("result").is_none(), "{live}");
-
-    let (status, body) = bench.cancel("session/s", &op).await;
-    not_allowed(status, &body, "a cancel of the ended agent request");
-    let (status, body) = bench.act("session/s", "no-such-interaction", "answer", allow()).await;
-    not_found(status, &body, "an answer to an interaction that is gone");
-    link.quiet(QUIET).await;
-
-    let (status, body) = bench
-        .op(
-            "session/s",
-            &op,
-            "prompt",
-            json!({"prompt": [text("next")]}),
-        )
-        .await;
-    let prompt = assert_accepted(status, &body, "a prompt on the cancelled agent request");
-    let request = link.request("session/prompt").await;
-    link.reply(&request, json!({"stopReason": "end_turn"}))
-        .await;
-    watch.until_op("session/s", &prompt, "completed").await;
-    watch.converged(&bench).await;
-}
-
-/// Kinds other than `prompt`, `terminal_login` and `agent_request` refuse a
+/// Kinds other than `prompt` and `terminal_login` refuse a
 /// cancel while they run; it reaches no Agent and changes nothing.
 #[tokio::test]
 async fn other_kinds_refuse_a_cancel() {

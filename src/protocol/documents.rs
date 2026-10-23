@@ -117,7 +117,6 @@ pub(crate) enum OperationKind {
     Load,
     Open,
     None,
-    AgentRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

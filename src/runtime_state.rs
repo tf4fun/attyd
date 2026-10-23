@@ -386,7 +386,6 @@ impl SessionRegistry {
             uncertainty_reason: None,
         });
 
-        self.settle_session_ops(&session_id);
         Ok(())
     }
 
@@ -443,7 +442,6 @@ impl SessionRegistry {
         });
         self.begin_session_operation(session_id, kind);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -509,7 +507,6 @@ impl SessionRegistry {
         owner.operation = None;
         self.complete_session_operation(session_id, SessionOperationKind::Load, &Value::Null);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -539,7 +536,6 @@ impl SessionRegistry {
         owner.operation = None;
         self.fail_session_operation(session_id, SessionOperationKind::Load, &error);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -572,7 +568,6 @@ impl SessionRegistry {
         owner.operation = None;
         self.complete_session_operation(session_id, kind, &Value::Null);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -671,7 +666,6 @@ impl SessionRegistry {
                 origin: None,
             },
         );
-        self.settle_session_ops(&session_id);
         Ok(())
     }
 
@@ -697,7 +691,6 @@ impl SessionRegistry {
             return Err(RuntimeStateError::OperationCollision.into());
         }
         let operation_id = self.start_turn(session_id, client_intent_id, prompt)?;
-        self.settle_session_ops(session_id);
         Ok(operation_id)
     }
 
@@ -728,7 +721,6 @@ impl SessionRegistry {
         owner
             .admit_turn(operation_id.clone(), &operation_id, prompt)
             .map_err(|_| RuntimeStateError::BusySession)?;
-        self.settle_session_ops(session_id);
         Ok(operation_id)
     }
 
@@ -797,7 +789,6 @@ impl SessionRegistry {
             return Err(RuntimeStateError::BusySession);
         }
         session.controls = controls;
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -818,7 +809,6 @@ impl SessionRegistry {
         }
         execution.cancel_requested = true;
         self.request_session_cancel(session_id);
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -885,7 +875,6 @@ impl SessionRegistry {
         let owner = self.live_owner_mut(session_id)?;
         session_live::seal_turn(owner, operation_id, terminal)?;
         self.end_session_turn(session_id, end);
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -909,7 +898,6 @@ impl SessionRegistry {
             active_operation,
         )?;
         if outcome == InteractionUpsert::Inserted {
-            self.settle_session_ops(session_id);
         }
         Ok(outcome)
     }
@@ -924,7 +912,6 @@ impl SessionRegistry {
         let session = self.require_live_mut(session_id)?;
         let outcome = session_live::resolve_permission(session, interaction_id)?;
         if outcome == InteractionResolution::Applied {
-            self.settle_session_ops(session_id);
         }
         Ok(outcome)
     }
@@ -971,7 +958,6 @@ impl SessionRegistry {
                         operation_id: active_operation,
                     },
                 );
-                self.settle_session_ops(session_id);
             }
             None => {
                 if self
@@ -996,7 +982,6 @@ impl SessionRegistry {
                         operation_id: None,
                     },
                 );
-                self.settle_global_ops();
             }
         }
         Ok(InteractionUpsert::Inserted)
@@ -1046,7 +1031,6 @@ impl SessionRegistry {
                         },
                     );
                 }
-                self.settle_session_ops(session_id);
             }
             None => {
                 if self
@@ -1083,7 +1067,6 @@ impl SessionRegistry {
                         },
                     );
                 }
-                self.settle_global_ops();
             }
         }
         Ok(InteractionResolution::Applied)
@@ -1137,7 +1120,6 @@ impl SessionRegistry {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
                 remember_resolved_interaction(&mut session.resolved_url_flows, elicitation_id);
-                self.settle_session_ops(session_id);
             }
             None => {
                 if self
@@ -1155,7 +1137,6 @@ impl SessionRegistry {
                     return Ok(UrlFlowResolution::AlreadyTerminal);
                 }
                 remember_resolved_interaction(&mut self.resolved_request_url_flows, elicitation_id);
-                self.settle_global_ops();
             }
         }
         Ok(UrlFlowResolution::Applied)
@@ -1221,7 +1202,6 @@ impl SessionRegistry {
         }
         let owner = self.live_owner_mut(session_id)?;
         session_live::start_operation(owner, operation_id, kind, stage.into())?;
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -1292,7 +1272,6 @@ impl SessionRegistry {
         };
 
         self.effects.extend(effects);
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -1362,7 +1341,6 @@ impl SessionRegistry {
 
         self.effects.extend(effects);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -1387,7 +1365,6 @@ impl SessionRegistry {
         owner.operation = None;
         self.complete_session_operation(session_id, kind, &result);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -1423,7 +1400,6 @@ impl SessionRegistry {
             .fold_update(&control_update);
         self.complete_session_operation(session_id, kind, &Value::Null);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
@@ -1454,7 +1430,6 @@ impl SessionRegistry {
         };
         self.fail_session_operation(session_id, kind, &error);
 
-        self.settle_session_ops(session_id);
         Ok(())
     }
 
