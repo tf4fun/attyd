@@ -456,12 +456,13 @@ async fn a_list_returns_its_page_and_a_stale_revision_is_catalog_changed() {
     let sessions = json!([{"sessionId": "saved", "cwd": CWD}]);
     link.reply(
         &request,
-        json!({"sessions": sessions, "nextCursor": "page-3"}),
+        json!({"sessions": sessions, "nextCursor": "page-3", "_meta": {"total": 3}}),
     )
     .await;
     let (status, body) = listed.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["revision"], revision);
+    assert_eq!(body["result"]["_meta"], json!({"total": 3}), "the Agent's page _meta");
     assert_eq!(body["result"]["sessions"], sessions);
     assert_eq!(body["result"]["nextCursor"], "page-3");
     watch.until_op("catalog", &body["op"], "completed").await;

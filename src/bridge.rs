@@ -3168,6 +3168,7 @@ async fn handle_command_inner(
                     .map(serde_json::to_value)
                     .collect::<Result<_, _>>()?,
                 next_cursor: response.next_cursor.clone(),
+                meta: response.meta.clone().map(Value::Object),
             });
             state
                 .sessions

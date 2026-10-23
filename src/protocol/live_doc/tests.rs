@@ -603,6 +603,27 @@ fn a_listing_without_a_cursor_starts_over_and_a_cursor_appends_the_next_page() {
 }
 
 #[test]
+fn the_agents_meta_of_a_listed_page_is_kept_with_that_page() {
+    let mut registry = registry();
+    registry
+        .install_operation(&Scope::Catalog, OperationKind::List, json!({}))
+        .unwrap();
+    registry.complete_scope_operation(
+        &Scope::Catalog,
+        OperationKind::List,
+        json!({ "revision": "1", "sessions": [], "nextCursor": "c1", "_meta": { "total": 9 } }),
+    );
+    list(&mut registry, json!({ "cursor": "c1" }), "1", json!([]), Value::Null);
+    assert_eq!(
+        pages(&registry, 1),
+        json!([
+            { "sessions": [], "nextCursor": "c1", "_meta": { "total": 9 } },
+            { "sessions": [], "nextCursor": null },
+        ])
+    );
+}
+
+#[test]
 fn pages_listed_before_the_revision_changed_are_not_shown() {
     let mut registry = registry();
     list(&mut registry, json!({}), "1", json!([{ "sessionId": "a" }]), Value::Null);
