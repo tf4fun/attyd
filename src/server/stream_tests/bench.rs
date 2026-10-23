@@ -16,6 +16,7 @@ mod interactions;
 mod login_terminals;
 mod occupation;
 mod reads;
+mod recovery;
 mod retired_v1;
 #[cfg(unix)]
 mod review_terminal_io;
@@ -80,6 +81,21 @@ async fn read_scope(address: SocketAddr, scope: &str) -> (StatusCode, Value) {
         (status, Replica::from_snapshot(&body).doc)
     } else {
         (status, body)
+    }
+}
+
+/// `GET /api/v2/stream?…` at `address`, applied to replicas.
+async fn watch_at(address: SocketAddr, query: &str) -> Watch {
+    let response = send(address, Method::GET, &format!("/api/v2/stream?{query}"), None).await;
+    assert_eq!(response.status(), StatusCode::OK, "{query}");
+    Watch {
+        sse: Sse {
+            body: Body::new(response.into_body()).into_data_stream(),
+            buffer: String::new(),
+        },
+        replicas: BTreeMap::new(),
+        ended: BTreeMap::new(),
+        events: Vec::new(),
     }
 }
 
@@ -265,17 +281,7 @@ impl Bench {
 
     /// `GET /api/v2/stream?…`, applied to replicas.
     async fn watch(&self, query: &str) -> Watch {
-        let response = send(self.address, Method::GET, &format!("/api/v2/stream?{query}"), None).await;
-        assert_eq!(response.status(), StatusCode::OK, "{query}");
-        Watch {
-            sse: Sse {
-                body: Body::new(response.into_body()).into_data_stream(),
-                buffer: String::new(),
-            },
-            replicas: BTreeMap::new(),
-            ended: BTreeMap::new(),
-            events: Vec::new(),
-        }
+        watch_at(self.address, query).await
     }
 
     /// Creates `session_id` in `cwd` through a `create`; the Agent's `session/new` response is

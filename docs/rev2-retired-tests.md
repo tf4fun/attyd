@@ -56,26 +56,26 @@ prompts instead of the turn log and the process): `a_streamed_prompt_with_an_ans
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. The revision 2 stream and scope reads over HTTP: alignment, `have`, resumption across Agent EOF, recovery and login restart. `stream_tests/feed.rs` covers the revision 3 stream, loads and the next connection; the recovery cases below are to be restored there.
 
-- [ ] reads_return_one_cut_hold_nothing_and_tell_an_unknown_log_from_an_empty_one
-- [ ] a_stream_aligns_several_scopes_without_ids_and_heartbeats_while_idle
-- [ ] have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_log
-- [ ] each_session_uses_its_own_have_and_cwd_on_a_multi_scope_stream
-- [ ] an_invalid_stream_query_is_refused
-- [ ] after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_restarts_nothing
-- [ ] a_session_stream_waits_through_an_agent_eof_and_converges_on_the_next_connection
-- [ ] a_session_stream_applies_a_diverging_replay_after_an_agent_eof
-- [ ] a_successful_terminal_login_starts_the_next_connection_for_a_global_only_stream
-- [ ] a_new_global_stream_aligns_while_initialize_is_unanswered
-- [ ] a_known_session_aligns_on_a_new_stream_while_the_next_initialize_is_unanswered
-- [ ] an_initialization_failure_keeps_recovering_while_a_session_stream_needs_it
-- [ ] recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_leaves
-- [ ] a_cold_load_cut_by_an_eof_keeps_the_cache_and_converges_on_the_next_connection
-- [ ] a_session_ended_with_load_failed_is_no_recovery_need_behind_a_global_stream
-- [ ] a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing
-- [ ] review_a_subscription_crossing_generations_loads_on_the_current_agent
-- [ ] review_shutdown_during_initialize_publishes_a_final_agent_before_closing_streams
-- [ ] review_an_http_transport_construction_error_is_published_to_v2
-- [ ] review_a_cold_subscription_registered_during_initialize_is_served_after_reloads
+- [x] reads_return_one_cut_hold_nothing_and_tell_an_unknown_log_from_an_empty_one — `stream_tests/feed.rs` `a_scope_is_read_as_one_snapshot_…`, `reading_an_unheld_session_holds_nothing_…`; `bench/reads.rs`
+- [x] a_stream_aligns_several_scopes_without_ids_and_heartbeats_while_idle — `feed.rs` `a_stream_starts_with_the_snapshot_of_every_scope_it_follows` (no SSE ids); the heartbeat is axum's `KeepAlive` at `HEARTBEAT`
+- [x] have_selects_the_suffix_and_a_mismatched_or_longer_head_gets_the_whole_log — `queue_tests` (an update snapshot, another epoch or a rev beyond the document)
+- [x] each_session_uses_its_own_have_and_cwd_on_a_multi_scope_stream — `subscription/tests.rs` (the query parser) and `queue_tests`; `loads.rs`
+- [x] an_invalid_stream_query_is_refused — `feed.rs` `a_stream_with_a_query_that_is_not_one_is_refused`
+- [x] after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_restarts_nothing — `bench/recovery.rs`
+- [x] a_session_stream_waits_through_an_agent_eof_and_converges_on_the_next_connection — `feed.rs` `a_stream_that_follows_a_session_starts_the_next_connection_and_keeps_the_session`; `reconnection.rs`
+- [x] a_session_stream_applies_a_diverging_replay_after_an_agent_eof — `reconnection.rs` `the_next_connections_diverging_replay_replaces_what_differs`
+- [x] a_successful_terminal_login_starts_the_next_connection_for_a_global_only_stream — `bench/recovery.rs`
+- [x] a_new_global_stream_aligns_while_initialize_is_unanswered — `bench/recovery.rs`
+- [x] a_known_session_aligns_on_a_new_stream_while_the_next_initialize_is_unanswered — `bench/recovery.rs`
+- [x] an_initialization_failure_keeps_recovering_while_a_session_stream_needs_it — `bench/recovery.rs`
+- [x] recovery_continues_for_a_remaining_subscriber_and_stops_after_the_last_leaves — `bench/recovery.rs`
+- [x] a_cold_load_cut_by_an_eof_keeps_the_cache_and_converges_on_the_next_connection — `bench/recovery.rs` `a_cold_load_cut_by_an_eof_keeps_the_session_followed_and_converges_on_the_next_connection` (a first load shows no history until it ends; there is no client log to keep)
+- [x] a_session_ended_with_load_failed_is_no_recovery_need_behind_a_global_stream — `bench/recovery.rs`
+- [x] a_login_restart_is_consumed_and_the_next_ordinary_eof_starts_nothing — `bench/recovery.rs`
+- [~] review_a_subscription_crossing_generations_loads_on_the_current_agent — not applicable: a stream subscribes to the feed directly, which the generations share, and asks the current actor to serve it; there is no captured input to go stale
+- [x] review_shutdown_during_initialize_publishes_a_final_agent_before_closing_streams — `bench/recovery.rs`
+- [x] review_an_http_transport_construction_error_is_published_to_v2 — `bench/recovery.rs` `review_an_http_transport_construction_error_is_published`
+- [x] review_a_cold_subscription_registered_during_initialize_is_served_after_reloads — `bench/recovery.rs`
 
 ## Writes over HTTP (`src/server/stream_tests/ops/actions.rs`)
 
