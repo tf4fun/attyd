@@ -542,9 +542,10 @@ rows for concurrent answers (#154) and for integers beyond 2^53 in document dige
 The three decisions that were left open were settled by comparison with Zed (audit
 Q8–Q10, memory model §11). **Recovery without a session**: an explicit `restart` action
 on `global` (valid when the Agent is `stopped` or `error`), because nothing passive may
-start a connection; to implement in three pull requests, each tests first: the action in
-the bridge and the server; the write client and the page's restart control; the final
-documents. **Public close**: no separate button, since releasing a session already
+start a connection. Implemented in three pull requests, each tests first: the action in
+the bridge and the server (#159); the write client and the page's *Reconnect*, which
+already shows when the Agent is stopped or failed and now sends it (#160); these
+documents and the test of a restart while the connection initializes. **Public close**: no separate button, since releasing a session already
 closes it at the Agent when it is unneeded and `close` stays an action; no code. **A flow
 `ended` by the connection's end**: stays in the final documents until the next connection
 starts without it; no code.
