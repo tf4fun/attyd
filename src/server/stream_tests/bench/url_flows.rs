@@ -83,6 +83,7 @@ async fn accept_flow(
             "interactionId": interaction,
             "elicitationId": params["elicitationId"],
             "request": request,
+            "status": "waiting",
         })
     );
     interaction
