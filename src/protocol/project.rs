@@ -1,34 +1,14 @@
 //! Pure projections of bridge state into the published documents
 //! (docs/state-sync.md §2.2). They are the only definition of what clients see.
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use serde_json::Value;
-
-use super::canon::{Attachments, Block, normalize};
 use super::documents::{
-    AgentInfo, CatalogLive, ExitStatus, GlobalLive, Interaction, Operation, OperationKind,
-    OperationSummary, PendingCounts, Scope, SessionLive, SessionSummary, Terminal, UrlFlow,
+    AgentInfo, CatalogLive, GlobalLive, Interaction, Operation, OperationSummary, PendingCounts,
+    Scope, SessionSummary, UrlFlow,
 };
 use super::op::OpSlot;
-use super::registry::SessionLog;
-use crate::runtime_state::{
-    PendingInteraction, SessionLifecycle, SessionLiveState, SharedTurnUpdates, UrlFlowStatus,
-};
+use crate::runtime_state::{PendingInteraction, SessionLifecycle, SessionLiveState, UrlFlowStatus};
 use crate::session_registry::SessionRegistry;
-
-/// A held session's document. `live.op.process` is left out: the commit step
-/// projects the running prompt's updates one by one (`project_update`), so an
-/// update it already published is not projected again.
-#[derive(Debug, Clone)]
-pub(crate) struct SessionDocument {
-    pub log: SessionLog,
-    pub live: SessionLive,
-    /// The running prompt's folded updates, when `op` is that prompt.
-    pub process: Option<SharedTurnUpdates>,
-    /// The blocks `op.input` references.
-    pub input_attachments: Attachments,
-}
 
 fn held(live: &SessionLiveState) -> bool {
     live.lifecycle != SessionLifecycle::Closed
@@ -144,7 +124,6 @@ fn operation(
         input: slot.input.clone(),
         cancel_requested: slot.cancel_requested,
         interactions,
-        process: None,
         result: slot.result.clone(),
         error: slot.error.clone(),
     }
@@ -208,80 +187,6 @@ pub(super) fn url_flows<'a>(
             )
         })
         .collect()
-}
-
-fn terminal(terminal_id: &str, terminal: &Value) -> Terminal {
-    let exit_status = terminal
-        .get("exitStatus")
-        .filter(|status| status.is_object())
-        .map(|status| ExitStatus {
-            exit_code: status.get("exitCode").and_then(Value::as_i64),
-            signal: status
-                .get("signal")
-                .and_then(Value::as_str)
-                .map(String::from),
-        });
-    Terminal {
-        terminal_id: terminal_id.to_string(),
-        output: terminal["output"].as_str().unwrap_or_default().to_string(),
-        truncated: terminal["truncated"].as_bool().unwrap_or(false),
-        exit_status,
-    }
-}
-
-/// `session/<id>`, or `None` when the bridge does not hold the session.
-pub(crate) fn project_session(
-    registry: &SessionRegistry,
-    session_id: &str,
-) -> Option<SessionDocument> {
-    let state = &registry.sessions.get(session_id)?.state;
-    let live = held_live(registry, session_id)?;
-    let scope = Scope::Session(session_id.to_string());
-    let (op, owner) = shown_operation(registry, &scope)?;
-    let slot = registry.shown_slot(&scope)?;
-    let process = (owner == scope && slot.is_running_kind(OperationKind::Prompt)).then(|| {
-        state
-            .active_turn
-            .as_ref()
-            .filter(|turn| turn.execution.is_some())
-            .map_or_else(|| Arc::new(Vec::new()), |turn| Arc::clone(&turn.updates))
-    });
-    Some(SessionDocument {
-        log: state.log.clone(),
-        live: SessionLive {
-            op,
-            url_flows: url_flows(
-                live.url_flows
-                    .values()
-                    .chain(request_flows(registry, &scope)),
-            ),
-            session_id: session_id.to_string(),
-            cwd: live.cwd.to_string_lossy().into_owned(),
-            controls: live.controls.clone(),
-            terminals: live
-                .terminals
-                .iter()
-                .map(|(terminal_id, value)| (terminal_id.clone(), terminal(terminal_id, value)))
-                .collect(),
-        },
-        process,
-        input_attachments: slot.attachments.clone(),
-    })
-}
-
-/// One process update: its image, audio and embedded resource blocks become
-/// attachment references, kept in `attachments`.
-pub(crate) fn project_update(update: &Value, attachments: &mut Attachments) -> Value {
-    let mut update = update.clone();
-    crate::attachments::update_blocks(&mut update, &mut |block: &mut Value| {
-        if matches!(block["type"].as_str(), Some("image" | "audio" | "resource"))
-            && let Some(Block::Attachment(reference)) =
-                normalize(std::slice::from_ref(block), attachments).pop()
-        {
-            *block = serde_json::to_value(reference).expect("references serialize");
-        }
-    });
-    update
 }
 
 fn summary(
