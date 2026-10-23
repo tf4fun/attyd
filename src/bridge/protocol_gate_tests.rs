@@ -2150,7 +2150,9 @@ async fn the_same_history_gives_the_same_entries_after_a_restart() {
 }
 
 mod holding;
+mod loads;
 mod review_lifecycle;
+mod stream_harness;
 
 // -- The revision 3 feed (docs/protocol.md §5) ----------------------------------------
 

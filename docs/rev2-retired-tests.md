@@ -13,12 +13,12 @@ Retired with the port of the gate to the feed. Read them at `e4033d6`. They driv
 reconnection of a stream; on revision 3 the same rules run behind `FeedSubscription`.
 
 - [ ] a_stream_aligns_each_scope_at_once_and_follows_a_prompt_through_its_commit
-- [ ] a_held_session_ignores_the_load_directory
+- [x] a_held_session_ignores_the_load_directory (`protocol_gate_tests/loads.rs`)
 - [ ] a_cold_reopen_keeps_the_client_log_and_confirms_it_when_the_load_ends
 - [ ] a_cold_reopen_with_a_changed_history_replaces_the_client_log
-- [ ] two_subscriptions_share_one_load_and_each_gets_its_log_from_its_own_head
-- [ ] reconnecting_before_during_and_after_a_load_keeps_one_load_and_converges
-- [ ] an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed
+- [x] two_subscriptions_share_one_load_and_each_gets_its_log_from_its_own_head → two_subscriptions_share_one_load_and_both_end_with_the_replayed_entries (`protocol_gate_tests/loads.rs`)
+- [x] reconnecting_before_during_and_after_a_load_keeps_one_load_and_converges (`protocol_gate_tests/loads.rs`)
+- [x] an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed (`protocol_gate_tests/loads.rs`)
 - [ ] a_paused_stream_follows_its_tail_and_is_coalesced_past_its_budget
 - [x] subscribers_hold_a_loadable_session_and_the_last_one_leaving_releases_it (`protocol_gate_tests/holding.rs`)
 - [x] a_loadable_session_without_close_is_released_locally (`protocol_gate_tests/holding.rs`)
@@ -29,9 +29,9 @@ reconnection of a stream; on revision 3 the same rules run behind `FeedSubscript
 - [x] an_exited_terminal_not_yet_released_keeps_the_session_needed (`protocol_gate_tests/holding.rs`)
 - [x] a_new_subscription_or_an_occupation_cancels_the_release_timer (`protocol_gate_tests/holding.rs`)
 - [x] review_a_sessions_own_admitted_operation_keeps_it_held_before_dispatch (`protocol_gate_tests/holding.rs`)
-- [ ] review_a_subscription_after_delete_admission_waits_for_its_end
-- [ ] a_subscription_waits_for_a_cold_delete_and_ends_with_deleted
-- [ ] a_subscription_waiting_for_a_failed_cold_delete_loads_the_session
+- [x] review_a_subscription_after_delete_admission_waits_for_its_end (`protocol_gate_tests/loads.rs`)
+- [x] a_subscription_waits_for_a_cold_delete_and_ends_with_deleted (`protocol_gate_tests/loads.rs`)
+- [x] a_subscription_waiting_for_a_failed_cold_delete_loads_the_session (`protocol_gate_tests/loads.rs`)
 - [ ] the_next_connection_s_equal_replay_ends_the_waiting_load
 - [ ] the_next_connection_s_diverging_replay_rebuilds_from_the_common_prefix
 - [ ] review_an_unfollowed_session_is_released_when_the_agent_connection_ends
