@@ -911,7 +911,7 @@ mod tests {
         let mut mirror = mirror();
         load_initial(&mut mirror, "session");
         assert_eq!(session_history(&mirror), Some(History::Complete));
-        assert_eq!(timeline_entries(&mirror).as_array().unwrap().len(), 1);
+        assert_eq!(timeline_entries(&mirror).as_array().unwrap().len(), 2);
         assert_eq!(mirror.state("session").unwrap().phase, MirrorPhase::Ready);
         assert_eq!(mirror.history.candidates(), 0);
     }
