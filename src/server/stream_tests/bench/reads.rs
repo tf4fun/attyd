@@ -48,6 +48,52 @@ async fn assert_unserved(bench: &Bench, session_id: &str, reference: &Value, wha
     not_found(status, &body, what);
 }
 
+/// An attachment read is exactly the bytes its `id` hashes (protocol §8), so a client verifies
+/// it by hashing the raw body: the block's exact form, an integer beyond 2^53 written exactly
+/// and a float in JCS number form, wherever they sit (here in the Agent's `_meta`).
+#[tokio::test]
+async fn an_attachment_read_is_the_exact_form_bytes_its_id_hashes() {
+    use sha2::{Digest, Sha256};
+
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create_with(&mut link, "s", json!({})).await;
+    let mut watch = bench.watch(&scopes(&["session/s"])).await;
+    watch
+        .until("the alignment", |watch| watch.has("session/s"))
+        .await;
+    let block = json!({
+        "type": "image", "data": "aGk=", "mimeType": "image/png",
+        "_meta": { "big": 9007199254740993u64, "huge": 1e21, "small": 1e-7 },
+    });
+    link.update(
+        "s",
+        json!({"sessionUpdate": "agent_message_chunk", "messageId": "m", "content": block}),
+    )
+    .await;
+    watch
+        .until("the entry", |watch| {
+            !references(&json!(watch.entries("session/s"))).is_empty()
+        })
+        .await;
+    let reference = references(&json!(watch.entries("session/s"))).remove(0);
+
+    let response = send(bench.address, Method::GET, &attachment_path("s", &reference), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let raw = axum::body::to_bytes(axum::body::Body::new(response.into_body()), usize::MAX)
+        .await
+        .unwrap();
+    let hash: String = Sha256::digest(&raw).iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(hash, reference["id"].as_str().unwrap(), "{}", String::from_utf8_lossy(&raw));
+    let body = String::from_utf8(raw.to_vec()).unwrap();
+    assert!(body.contains("9007199254740993") && body.contains("1e+21"), "{body}");
+}
+
 /// A server whose scripted Agent advertises `capabilities`, launched with
 /// `flags` before the Agent's URL.
 async fn ws_with(flags: &[&str], capabilities: Value) -> (Bench, Link) {
