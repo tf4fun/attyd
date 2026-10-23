@@ -507,12 +507,14 @@ mandatory ACP capabilities.
   guarantees have their own cases and are not mislabeled as regressions. A test
   changed to assert a loss is changed back, not counted as fidelity coverage.
 
-### 7.5 Implementation status (2026-10-22)
+### 7.5 Implementation status (2026-10-23)
 
 Each item is one merged pull request into `experiment/protocol-v2`, with its tests
 written first and run by CI only. The bridge is verified through its own memory
 (gate and unit tests that read it); the published rev 2 documents did not change
-while the first layer was built, so the browser suite kept passing.
+while the first layer was built, so the browser suite kept passing. The revision 2
+engine has been removed since (#122): the wire, the clients and the tests are
+revision 3's, served under `/api/v2`.
 
 | Part | Merged | Not yet |
 | --- | --- | --- |
@@ -523,8 +525,10 @@ while the first layer was built, so the browser suite kept passing.
 | **Step 14 — history knowledge** | unknown / partial / complete (#64); a fork target never inherits source entries (#66); one installation at a time (#67); each timeline named by an epoch (#74) | catalog pages and cursors, setup/auth result metadata, zero-session recovery, session generations (with step 18) |
 | **Step 15 — terminals** | a released terminal a tool embeds keeps its frozen output, also across the connection's end (#68) | shown in its tool card: layer 2 |
 | **Step 16 — interactions** | | scope-based lifetimes, parent RPC, URL-flow outcomes, forms, request IDs |
-| **Step 18 — actions** | | controls and close during a prompt (R1, R2), controls metadata (D12) |
-| **Layer 2 — building blocks** | document digest, Rust and TypeScript, against independently computed vectors (#69, #70); the timeline as entries with attachment references (#71); the verifying replica (#72); the publisher with epoch, rev and differential snapshots (#73); the live facts of a session (#76); client-chosen operation IDs and repeats (#77); the global and catalog facts (#78); the operation a scope shows, with its scope and `after` (#80); interactions and URL flows in `live`, the whole `live` of a scope (#81), and the publisher's input (#82); the stream query (#83) and the per-subscriber queue that coalesces to snapshots (#84); the feed that publishes every commit (#85) behind a shared handle streams wait on (#86) and is committed to by the bridge beside the rev 2 publisher (#87); checkpoint pacing, 500 ms after a pause and at least every 2 s (#88, #89); `GET /api/v2/stream` with the heartbeat (#90); loading the session a stream follows with its `cwd`, and ending a scope with the reason the bridge recorded (#91, #92) | operations and actions over HTTP (every operation answers 202; results in the document); the client stream and writes; the projection into the UI; the cutover that moves `/api/v2/stream` to `/api/v2/stream` and replaces the rev 2 engine |
+| **Step 18 — actions** | controls metadata: each control keeps the `_meta` of the update and of the notification that set it (D12, #117) | controls and close during a prompt (R1, R2), session generations guarding late responses |
+| **Layer 2 — building blocks** | document digest, Rust and TypeScript, against independently computed vectors (#69, #70); the timeline as entries with attachment references (#71); the verifying replica (#72); the publisher with epoch, rev and differential snapshots (#73); the live facts of a session (#76); client-chosen operation IDs and repeats (#77); the global and catalog facts (#78); the operation a scope shows, with its scope and `after` (#80); interactions and URL flows in `live`, the whole `live` of a scope (#81), and the publisher's input (#82); the stream query (#83) and the per-subscriber queue that coalesces to snapshots (#84); the feed that publishes every commit (#85) behind a shared handle streams wait on (#86) and is committed to by the bridge beside the rev 2 publisher (#87); checkpoint pacing, 500 ms after a pause and at least every 2 s (#88, #89); `GET /api/v2/stream` with the heartbeat (#90); loading the session a stream follows with its `cwd`, and ending a scope with the reason the bridge recorded (#91, #92) | restoring the acceptance cases of the removed revision 2 tests on revision 3 ([the ledger](rev2-retired-tests.md)); the porting of the browser protocol cases ([list](protocol-browser-cases.md)) |
+| **Layer 2 — wire and clients** | operations, actions and resources over HTTP: every operation answers 202 and the result is in the document, answers per interaction, set_mode/set_config/close and terminal actions (#93–#113); the client stream, the verifying replica set and the write queue in TypeScript; the app on revision 3, with the thread projected from entries (tool calls of old turns shown again), create/fork read from the documents, catalog pages in the document; `GET /api/v2/scopes/{scope}` as one snapshot (#116) | |
+| **Cutover** | rev 2 TypeScript removed (#115); admission, answers, controls and reads served from the feed (#118, #119); the bridge gate checks the feed (#121); the publisher, hub, `/api/v2/stream`, the rev 2 scope routes and their tests removed (#122); the revision 3 routes take the `/api/v2` names (#123); the rev 2 events and reads leave the generated types (#124) | the layer-1 leftovers of rev 2 (`canon`'s turn log, `project`'s process projection), which `registry` and the session mirror still use |
 | **Dependencies** | vite (#57), webpki crates (#57), vitest (#75) advisories | |
 
 Deviations from the plan, on purpose:
