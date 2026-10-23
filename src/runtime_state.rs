@@ -295,7 +295,6 @@ impl SessionRegistry {
             .sessions
             .get_mut(&waiting.session_id)
             .expect("the session was opened");
-        entry.state.log = waiting.log;
         entry.state.timeline = waiting.timeline;
         entry.state.history = waiting.history;
         entry.state.timeline_epoch = waiting.timeline_epoch;

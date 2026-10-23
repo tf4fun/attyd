@@ -18,7 +18,7 @@ struct LoadCandidate {
 }
 
 /// The replay of each load in flight. A completed history lives only in the
-/// session's `TurnLog`; a candidate exists from the load's start to its end.
+/// session's timeline; a candidate exists from the load's start to its end.
 #[derive(Default)]
 pub(crate) struct HistoryCache {
     candidates: HashMap<String, LoadCandidate>,
