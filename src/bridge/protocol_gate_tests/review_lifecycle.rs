@@ -214,7 +214,13 @@ async fn a_session_scoped_interaction_outlives_the_control_operation_it_arrived_
 #[tokio::test]
 async fn a_permission_asked_during_a_prompt_is_still_the_sessions_when_the_prompt_ended() {
     let mut peer = Peer::start(json!({})).await;
-    peer.create(CREATED, json!({})).await;
+    peer.create(
+        CREATED,
+        json!({"modes": {"currentModeId": "ask", "availableModes": [
+            {"id": "ask", "name": "Ask"}, {"id": "plan", "name": "Plan"},
+        ]}}),
+    )
+    .await;
     let scope = format!("session/{CREATED}");
     let (op, request) = peer.prompt(CREATED, vec![text("hi")]).await;
     peer.agent_request("permission", "session/request_permission", permission(CREATED))

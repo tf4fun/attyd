@@ -8476,7 +8476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_terminal_effects_cancel_owned_responders_in_the_adapter() {
+    async fn a_prompts_end_leaves_the_owned_responders_to_their_own_lifetime() {
         let (permission_sender, permission_receiver) = oneshot::channel();
         let (elicitation_sender, elicitation_receiver) = oneshot::channel();
         let state = Arc::new(BridgeLock::new(BridgeState::default()));
@@ -8551,6 +8551,18 @@ mod tests {
         }
         apply_runtime_effects(&state, None).await;
 
+        // Nothing answered them: they are still the session's, and answered by its close.
+        let mut permission_receiver = permission_receiver;
+        let mut elicitation_receiver = elicitation_receiver;
+        assert!(permission_receiver.try_recv().is_err());
+        assert!(elicitation_receiver.try_recv().is_err());
+        {
+            let state = state.lock().await;
+            assert_eq!(state.sessions.permission_owners.len(), 1);
+            assert_eq!(state.sessions.elicitation_owners.len(), 1);
+        }
+        let sink = EventSink { tx: mpsc::unbounded_channel().0 };
+        cancel_interactions("session", &state, &sink).await;
         assert!(matches!(
             permission_receiver.await.unwrap().outcome,
             RequestPermissionOutcome::Cancelled

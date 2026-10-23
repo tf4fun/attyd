@@ -2477,13 +2477,9 @@ mod tests {
         state
             .complete_prompt("epoch", "session", "intent", json!({}))
             .unwrap();
-        assert_eq!(
-            state.take_effects(),
-            vec![RuntimeEffect::CancelPermissionResponder {
-                session_id: "session".to_string(),
-                interaction_id: "permission".to_string()
-            }]
-        );
+        // The turn's end ends no interaction: the permission is still pending, with no effect.
+        assert!(state.take_effects().is_empty());
+        assert!(state.session("session").unwrap().permissions.contains_key("permission"));
         state
             .complete_turn(
                 "session",
@@ -4021,7 +4017,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_turn_drops_cancel_flag_and_cleans_owned_interactions() {
+    fn a_sealed_turn_drops_its_cancel_flag_and_ends_no_interaction() {
         let mut state = state();
         open(&mut state, "session");
         state
@@ -4054,23 +4050,12 @@ mod tests {
             )
             .unwrap();
 
+        // The turn is over; the interactions the Agent asked of the session are still its own
+        // (memory model §8.2), and nothing answers their responders.
         let session = state.session("session").unwrap();
         assert!(session.active_turn.is_none());
-        assert!(session.permissions.is_empty());
-        assert!(session.elicitations.is_empty());
-        assert_eq!(
-            state.take_effects(),
-            vec![
-                RuntimeEffect::CancelPermissionResponder {
-                    session_id: "session".to_string(),
-                    interaction_id: "permission".to_string(),
-                },
-                RuntimeEffect::CancelElicitationResponder {
-                    session_id: Some("session".to_string()),
-                    interaction_id: "elicitation".to_string(),
-                },
-            ]
-        );
+        assert!(session.permissions.contains_key("permission"));
+        assert!(session.elicitations.contains_key("elicitation"));
         assert!(state.take_effects().is_empty());
     }
 
