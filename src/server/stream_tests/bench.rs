@@ -229,13 +229,13 @@ impl Bench {
 
     /// `GET /api/v2/scopes/{scope}`: the document `{ live, prompts, entries?, … }` the replica
     /// of a client would hold, or the refusal.
-    async fn read(&self, scope: &str) -> (StatusCode, Value) {
+    async fn read_document(&self, scope: &str) -> (StatusCode, Value) {
         read_scope(self.address, scope).await
     }
 
     /// A held scope's document, read once.
     async fn document(&self, scope: &str) -> Value {
-        let (status, document) = self.read(scope).await;
+        let (status, document) = self.read_document(scope).await;
         assert_eq!(status, StatusCode::OK, "{scope}: {document}");
         document
     }
