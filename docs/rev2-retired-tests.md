@@ -154,26 +154,30 @@ Restored in `src/server/stream_tests/bench/interactions.rs`.
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] a_login_terminal_takes_input_in_order_and_is_dismissed_after_it_exits
-- [ ] a_signalled_login_completes_and_a_dismissal_removes_only_its_terminal
-- [ ] a_successful_login_completes_and_a_global_only_stream_sees_the_next_connection
+- [x] a_login_terminal_takes_input_in_order_and_is_dismissed_after_it_exits
+- [x] a_signalled_login_completes_and_a_dismissal_removes_only_its_terminal
+- [x] a_successful_login_completes_and_a_global_only_stream_sees_the_next_connection
+
+Restored in `src/server/stream_tests/bench/login_terminals.rs`.
 
 ## Writes over HTTP (`src/server/stream_tests/ops/long_requests.rs`)
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] create_fork_and_list_responses_outlive_the_json_deadline
+- [~] create_fork_and_list_responses_outlive_the_json_deadline — not applicable: revision 3 holds no response, so there is none to outlive the JSON deadline
 
 ## Writes over HTTP (`src/server/stream_tests/ops/occupation.rs`)
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] a_held_sessions_prompt_and_its_delete_are_never_both_admitted
-- [ ] a_close_interaction_is_answered_through_either_scope_that_shows_it
-- [ ] a_failed_held_delete_keeps_its_error_and_the_subscription
-- [ ] a_subscription_during_the_first_load_keeps_its_recovery_directory
-- [ ] a_new_subscription_after_a_partially_failed_delete_still_needs_cwd
-- [ ] a_cold_delete_holds_back_the_load_until_it_ends
+- [x] a_held_sessions_prompt_and_its_delete_are_never_both_admitted
+- [x] a_close_interaction_is_answered_through_either_scope_that_shows_it
+- [x] a_failed_held_delete_keeps_its_error_and_the_subscription
+- [x] a_subscription_during_the_first_load_keeps_its_recovery_directory
+- [x] a_new_subscription_after_a_partially_failed_delete_still_needs_cwd
+- [x] a_cold_delete_holds_back_the_load_until_it_ends
+
+Restored in `src/server/stream_tests/bench/occupation.rs`.
 
 ## Writes over HTTP (`src/server/stream_tests/ops/reads.rs`)
 
@@ -188,21 +192,27 @@ Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] v1_reads_writes_and_event_streams_are_unknown_routes_that_reach_no_agent
+- [x] v1_reads_writes_and_event_streams_are_unknown_routes_that_reach_no_agent
+
+Restored in `src/server/stream_tests/bench/retired_v1.rs`.
 
 ## Writes over HTTP (`src/server/stream_tests/ops/review_terminal_io.rs`)
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] terminal_input_backpressure_does_not_block_its_output_observer
+- [x] terminal_input_backpressure_does_not_block_its_output_observer
+
+Restored in `src/server/stream_tests/bench/review_terminal_io.rs`.
 
 ## Writes over HTTP (`src/server/stream_tests/ops/url_flows.rs`)
 
 Retired with the removal of the revision 2 engine. Read them at `9906369`. Drove `POST /api/v2/scopes/…` and the revision 2 stream through a per-event gate; revision 3 answers every operation `202` and shows the result in the document, so these are restored with that bench.
 
-- [ ] flows_outlive_their_operation_and_end_by_their_own_lifecycle
-- [ ] a_reused_elicitation_id_names_a_new_flow
-- [ ] the_connection_end_clears_the_global_flow
+- [x] flows_outlive_their_operation_and_end_by_their_own_lifecycle
+- [x] a_reused_elicitation_id_names_a_new_flow
+- [x] the_connection_end_clears_the_global_flow
+
+Restored in `src/server/stream_tests/bench/url_flows.rs`.
 
 ## Hub (`src/protocol/hub_tests.rs`)
 
