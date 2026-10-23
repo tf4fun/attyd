@@ -18,8 +18,28 @@ import pathlib
 HERE = pathlib.Path(__file__).parent
 
 
+def jcs(value):
+    """RFC 8785 for the value domain used. JSON numbers are IEEE doubles there (§3.1), so an
+    integer beyond +-2^53 is the integer of its nearest double."""
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value) if abs(value) <= 2**53 else str(int(float(value)))
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(jcs(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(key, ensure_ascii=False) + ":" + jcs(item) for key, item in sorted(value.items())) + "}"
+    raise TypeError(f"outside the value domain: {value!r}")
+
+
 def canon(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return jcs(value).encode("utf-8")
 
 
 def H(*parts):
@@ -214,6 +234,14 @@ def digest_vectors():
     session("integers up to two to the fifty three are exact", {
         "epoch": "e1", "rev": 9007199254740991, "history": "complete", "entries": [], "prompts": [],
         "live": {"usedBytes": 9007199254740991, "negative": -7, "zero": 0}})
+    # The document digest works in the double domain: an integer beyond 2^53 hashes as its
+    # nearest double, in the bridge and in a browser alike (§5.5, §12.4).
+    session("an integer beyond two to the fifty three hashes as its double", {
+        "epoch": "e1", "rev": 1, "history": "complete", "entries": [], "prompts": [],
+        "live": {"bytes": 9007199254740993, "also": -9007199254740995}})
+    session("the same document written with the doubles", {
+        "epoch": "e1", "rev": 1, "history": "complete", "entries": [], "prompts": [],
+        "live": {"bytes": 9007199254740992, "also": -9007199254740996}})
     scope("global with its first operation", {
         "epoch": "g1", "rev": 0, "live": {"op": {"id": "n", "kind": "none", "status": "completed"}, "sessions": {}, "terminals": {}}})
     scope("catalog with a listed page", {
