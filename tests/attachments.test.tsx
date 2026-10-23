@@ -11,12 +11,20 @@ import {
   type AttachedBlock,
 } from "../web/src/lib/attachments";
 import { timelineToMarkdown } from "../web/src/lib/thread-markdown";
+import { canonicalJson, hex, sha256 } from "../shared/digest";
 import type { AttachmentRef } from "../shared/protocol";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
 
 const png = (data: string): AttachedBlock => ({ type: "image", mimeType: "image/png", data });
+
+/** What the bridge serves for `block` (its exact form) and the reference whose ID hashes it. */
+function served(block: AttachedBlock, kind: AttachmentRef["block"] = "image"): { body: string; reference: AttachmentRef } {
+  const body = canonicalJson(block);
+  const id = hex(sha256(new TextEncoder().encode(body)));
+  return { body, reference: { type: "attachment", id, block: kind, mimeType: "image/png" } };
+}
 
 describe("local attachment URLs", () => {
   let container: HTMLDivElement;
@@ -95,7 +103,7 @@ describe("attachment types a local URL may show", () => {
 });
 
 describe("attachment reader", () => {
-  const reference: AttachmentRef = { type: "attachment", id: "a".repeat(64), block: "image", mimeType: "image/png" };
+  const { body, reference } = served(png("AQID"));
   let fetches: number;
   let pending: Array<() => void>;
 
@@ -104,7 +112,7 @@ describe("attachment reader", () => {
     pending = [];
     vi.stubGlobal("fetch", vi.fn(async () => {
       fetches += 1;
-      return new Response(JSON.stringify(png("AQID")), { status: 200 });
+      return new Response(body, { status: 200 });
     }));
   });
 
@@ -128,6 +136,21 @@ describe("attachment reader", () => {
     expect(fetches).toBe(1);
   });
 
+  it("shows no bytes that do not hash to the reference's ID, and reads again later", async () => {
+    vi.mocked(fetch).mockImplementationOnce(async () => {
+      fetches += 1;
+      return new Response(canonicalJson(png("AQIE")), { status: 200 });
+    });
+    const attachments = reader();
+    const wrong = attachments.acquire(reference);
+    await expect(wrong.read).rejects.toThrow(/did not verify/);
+    wrong.release();
+    flush();
+    // A failed read is not kept: the next view reads the right bytes.
+    expect(await attachments.acquire(reference).read).toEqual(png("AQID"));
+    expect(fetches).toBe(2);
+  });
+
   it("drops a block once no view holds it, but not across a remount in one commit", async () => {
     const attachments = reader();
     const view = attachments.acquire(reference);
@@ -149,14 +172,15 @@ describe("full-content export", () => {
 
   it("exports the text of the attachments the thread names, and keeps an unreadable one as a reference", async () => {
     const text: AttachedBlock = { type: "resource", resource: { uri: "file:///notes.md", mimeType: "text/markdown", text: "# Notes\n" } };
+    const notes = served(text, "resource");
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) =>
-      String(input).endsWith("/attachments/a1")
-        ? new Response(JSON.stringify(text), { status: 200 })
+      String(input).endsWith(`/attachments/${notes.reference.id}`)
+        ? new Response(notes.body, { status: 200 })
         : new Response("", { status: 404 }));
     const reader = createAttachmentReader("s");
     const ref = (id: string): AttachmentRef => ({ type: "attachment", id, block: "resource", mimeType: "text/markdown", uri: "file:///notes.md" });
     const timeline = await withAttachedBlocks(reader, [
-      { id: "m", type: "message", role: "user", blocks: [{ type: "text", text: "see" }, ref("a1")], raw: [] },
+      { id: "m", type: "message", role: "user", blocks: [{ type: "text", text: "see" }, ref(notes.reference.id)], raw: [] },
       { id: "a", type: "assistant", chunks: [{ id: "c", role: "agent", blocks: [ref("gone")], raw: [] }] },
     ]);
     const markdown = timelineToMarkdown(timeline, { title: "T" });
