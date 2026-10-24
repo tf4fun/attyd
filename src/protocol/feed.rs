@@ -514,6 +514,15 @@ impl FeedHandle {
         read(self.feed().tree())
     }
 
+    /// A short subscription for a read: its views are kept for a while.
+    pub(crate) fn subscribe_tree_reading(&self, query: &StreamQuery) -> TreeSubscription {
+        let id = self.feed().subscribe_tree_at(query, true);
+        TreeSubscription(FeedSubscription(Arc::new(SubscriptionGuard {
+            id,
+            handle: self.clone(),
+        })))
+    }
+
     /// A stream of revision 4 over the paths of `query`, its first event queued.
     pub(crate) fn subscribe_tree(&self, query: &StreamQuery) -> TreeSubscription {
         let id = self.feed().subscribe_tree(query);

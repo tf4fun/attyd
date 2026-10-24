@@ -1197,10 +1197,7 @@ async fn read_node(
         protocol_error(StatusCode::BAD_REQUEST, ProtocolError::new(ErrorCode::InvalidRequest, message))
     };
     let Some((path, index)) = node.rsplit_once("/segments/") else {
-        return protocol_error(
-            StatusCode::NOT_FOUND,
-            ProtocolError::new(ErrorCode::NotFound, format!("no read of {node}")),
-        );
+        return read_path(&format!("/{node}"), query.as_deref().unwrap_or(""), state).await;
     };
     let Ok(index) = index.parse::<usize>() else {
         return invalid(format!("not a segment index: {index:?}"));
@@ -1233,6 +1230,72 @@ async fn read_node(
             ProtocolError::new(ErrorCode::Stale, format!("segment {index} of /{path} changed after {at}")),
         ),
     }
+}
+
+/// `GET /api/v2/nodes/{path}?instance&have&window&cwd` (protocol revision 4 §7.1): what a stream's
+/// first event would carry for the path, or `unchanged` when the client holds the instance and the
+/// path has not changed since `have`. Like a short subscription it observes the session of a
+/// session or view path: it may start its load (with `cwd`), holds it while it is served, and
+/// restarts its unobserved timer. A poll during a load returns what exists.
+async fn read_path(path: &str, query: &str, state: AppState) -> Response {
+    use crate::protocol::tree_stream::params::{Follow, StreamQuery, is_path, session_of};
+    let invalid = |message: String| {
+        protocol_error(StatusCode::BAD_REQUEST, ProtocolError::new(ErrorCode::InvalidRequest, message))
+    };
+    if !is_path(path) {
+        return invalid(format!("not a path: {path:?}"));
+    }
+    let (mut instance, mut have, mut window, mut cwd) = (None, None, None, None);
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let fresh = match key.as_ref() {
+            "instance" => !value.is_empty() && instance.replace(value.to_string()).is_none(),
+            "have" => value.parse::<u64>().ok().is_some_and(|version| have.replace(version).is_none()),
+            "window" => value
+                .parse::<usize>()
+                .ok()
+                .filter(|bytes| *bytes >= crate::protocol::hash::L)
+                .is_some_and(|bytes| window.replace(bytes).is_none()),
+            "cwd" => !value.is_empty() && cwd.replace(value.to_string()).is_none(),
+            _ => false,
+        };
+        if !fresh {
+            return invalid(format!("not a read parameter: {key}={value}"));
+        }
+    }
+    if have.is_some() && instance.is_none() {
+        return invalid("have needs the instance it belongs to".into());
+    }
+    let stream = StreamQuery {
+        instance,
+        follow: vec![Follow { path: path.to_string(), have, window }],
+        cwd: session_of(path).zip(cwd).into_iter().collect(),
+    };
+    if state.bridge.state.lock().await.shutting_down {
+        return protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
+        );
+    }
+    // A short subscription: it holds the session while the read is served, and dropping it
+    // restarts the session's unobserved timer. Its first event is the answer.
+    let subscription = state.bridge.publication.lock().feed.subscribe_tree_reading(&stream);
+    state.bridge.serve_streams().await;
+    let Some(first) = subscription.next_json().await else {
+        return protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
+        );
+    };
+    let first: Value = serde_json::from_str(&first).expect("an event is JSON");
+    let change = first["changes"][0].clone();
+    let unchanged = change["snapshot"]["node"] == json!({ "same": true });
+    let mut body = json!({ "instance": first["instance"], "rev": first["rev"] });
+    if unchanged {
+        body["unchanged"] = json!(true);
+    } else {
+        body["change"] = change;
+    }
+    axum::Json(body).into_response()
 }
 
 /// `GET /api/v2/stream?follow=…` (design: protocol revision 4 §6): the events of the paths it
