@@ -2,11 +2,15 @@
 //! one event per commit that changed a followed path.
 use std::collections::{BTreeMap, VecDeque};
 
+use tokio::time::Instant;
+
 use super::super::Op;
+use super::super::digest;
+use super::super::pacing::Pacer;
 use super::super::tree::{Committed, Tree};
 use super::params::StreamQuery;
 use super::snapshot::snapshot;
-use super::wire::{Change, End, EndReason, Event};
+use super::wire::{Change, Check, End, EndReason, Event};
 
 /// What the stream holds on behalf of the subscriber for one followed path.
 struct PathState {
@@ -20,6 +24,8 @@ pub(crate) struct Subscriber {
     paths: BTreeMap<String, PathState>,
     cwd: BTreeMap<String, String>,
     queue: VecDeque<Event>,
+    /// When a path that changed is due its checkpoint (design §6.5).
+    pacer: Pacer,
 }
 
 /// Whether `path` is below `ancestor`.
@@ -78,6 +84,7 @@ impl Subscriber {
             paths,
             cwd: query.cwd.clone(),
             queue: VecDeque::from([first]),
+            pacer: Pacer::default(),
         }
     }
 
@@ -92,6 +99,11 @@ impl Subscriber {
 
     /// A commit: queues one event with the change of every followed path it touched.
     pub(crate) fn publish(&mut self, tree: &Tree, committed: &Committed) {
+        self.publish_at(tree, committed, Instant::now());
+    }
+
+    /// `publish` at `now`, which paces the checkpoints of what changed.
+    pub(crate) fn publish_at(&mut self, tree: &Tree, committed: &Committed, now: Instant) {
         let mut changes = Vec::new();
         for (path, state) in &mut self.paths {
             let direct: Vec<&Op> = committed
@@ -114,11 +126,14 @@ impl Subscriber {
                     Some(snapshot) => {
                         state.queued = Some(snapshot.at);
                         state.present = true;
+                        // A snapshot carries the hash of its subtree.
+                        self.pacer.settled(path);
                         changes.push(Change::Snapshot { path: path.clone(), snapshot });
                     }
                     None if state.present => {
                         state.present = false;
                         state.queued = None;
+                        self.pacer.settled(path);
                         changes.push(Change::End {
                             path: path.clone(),
                             end: End { reason: EndReason::Absent, error: None },
@@ -130,6 +145,7 @@ impl Subscriber {
             }
             let from = state.queued.expect("a present path has a version");
             state.queued = Some(committed.rev);
+            self.pacer.changed(path, now);
             changes.push(Change::Ops {
                 path: path.clone(),
                 from,
@@ -144,6 +160,35 @@ impl Subscriber {
                 check: None,
             });
         }
+    }
+
+    /// Queues the checkpoints due at `now`, one event for all the paths: each states the path
+    /// version and hash of the tree, which every event queued before it has been applied to.
+    /// Whether one was queued.
+    pub(crate) fn checkpoints(&mut self, tree: &Tree, now: Instant) -> bool {
+        let check: Vec<Check> = self
+            .pacer
+            .due(now)
+            .into_iter()
+            .filter_map(|path| {
+                let node = tree.get(&path)?;
+                Some(Check {
+                    at: node.srev(),
+                    hash: digest::wire(&node.hash()),
+                    path,
+                })
+            })
+            .collect();
+        if check.is_empty() {
+            return false;
+        }
+        self.queue.push_back(Event { instance: None, rev: tree.rev(), changes: None, check: Some(check) });
+        true
+    }
+
+    /// When the next checkpoint is due, if a path waits for one.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.pacer.deadline()
     }
 
     /// The next event to write.

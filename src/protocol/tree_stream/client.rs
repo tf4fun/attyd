@@ -46,6 +46,8 @@ pub(crate) struct Client {
     pub paths: BTreeMap<String, Held>,
     /// The `rev` of the last event.
     pub rev: u64,
+    /// The checkpoints that matched the version held: path, `at`, hash.
+    pub checks: Vec<(String, u64, String)>,
 }
 
 impl Client {
@@ -74,6 +76,18 @@ impl Client {
                 *held = Held::default();
             }
             self.instance = Some(instance.clone());
+        }
+        for check in event.check.iter().flatten() {
+            let held = self
+                .paths
+                .get(&check.path)
+                .ok_or_else(|| format!("a check of a path not followed: {}", check.path))?;
+            if check.at > held.version {
+                return Err(format!("{}: checked at {}, held {}: a change was missed", check.path, check.at, held.version));
+            }
+            if check.at == held.version {
+                self.checks.push((check.path.clone(), check.at, check.hash.clone()));
+            }
         }
         // All changes of one event are applied together: on an error nothing is.
         let mut next = self.paths.clone();

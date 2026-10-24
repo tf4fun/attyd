@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::*;
+use crate::protocol::tree::Committed;
 use crate::protocol::tree::Spec;
 use crate::protocol::tree_stream::client::Client;
 use crate::protocol::tree_stream::params::{Follow, StreamQuery};
@@ -165,16 +166,16 @@ fn a_session_installed_later_is_snapshotted_and_one_removed_ends_absent() {
 fn a_followed_path_replaced_whole_by_an_ancestor_op_is_sent_as_a_snapshot() {
     let mut tree = Tree::new("I");
     tree.commit(root(0, &[("s", session("t", &["a", "b"]))]));
-    let mut subscriber = Subscriber::new(&query(&["/sessions/s/entries"]), &tree);
-    let mut client = Client::following(&["/sessions/s/entries"]);
+    let mut subscriber = Subscriber::new(&query(&["/sessions/s/entries/0"]), &tree);
+    let mut client = Client::following(&["/sessions/s/entries/0"]);
     pump(&mut subscriber, &mut client);
-    // A shrinking list is a whole `set` of the list: the followed path itself.
+    // A shrinking list is a whole `set` of the list, above the followed item.
     let committed = tree.commit_with_ops(root(0, &[("s", session("t", &["z"]))])).unwrap();
     subscriber.publish(&tree, &committed);
     let event = subscriber.next().unwrap();
     assert!(matches!(event.changes.as_ref().unwrap()[0], Change::Snapshot { .. }));
     client.apply(&event).unwrap();
-    holds(&client, &tree, &["/sessions/s/entries"]);
+    holds(&client, &tree, &["/sessions/s/entries/0"]);
 }
 
 #[test]
@@ -252,4 +253,123 @@ fn a_value_set_at_the_followed_path_is_a_set_of_the_whole_relative_path() {
     assert_eq!(ops, &[Op::Set { path: "/n".into(), value: json!(5) }]);
     client.apply(&event).unwrap();
     holds(&client, &tree, &["/global"]);
+}
+
+// --- checkpoints (design §6.5) -------------------------------------------------------
+
+use std::time::Duration;
+
+use tokio::time::Instant;
+
+use crate::protocol::digest;
+
+fn committed(tree: &mut Tree, step: BTreeMap<String, Spec>) -> Committed {
+    tree.commit_with_ops(step).unwrap()
+}
+
+#[test]
+fn a_path_that_changed_is_checked_after_a_pause_and_the_check_states_its_version_and_hash() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s/entries"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    pump(&mut subscriber, &mut client);
+    let t0 = Instant::now();
+    let change = committed(&mut tree, root(0, &[("s", session("t", &["a", "b"]))]));
+    subscriber.publish_at(&tree, &change, t0);
+    pump(&mut subscriber, &mut client);
+
+    assert!(!subscriber.checkpoints(&tree, t0 + Duration::from_millis(499)));
+    assert_eq!(subscriber.deadline(), Some(t0 + Duration::from_millis(500)));
+    assert!(subscriber.checkpoints(&tree, t0 + Duration::from_millis(500)));
+    pump(&mut subscriber, &mut client);
+    let node = tree.get(paths[0]).unwrap();
+    assert_eq!(client.checks, vec![(paths[0].to_string(), node.srev(), digest::wire(&node.hash()))]);
+    assert!(!subscriber.checkpoints(&tree, t0 + Duration::from_secs(60)), "nothing changed since");
+    assert_eq!(subscriber.deadline(), None);
+}
+
+#[test]
+fn a_path_that_keeps_changing_is_checked_at_least_every_two_seconds() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &[]))]));
+    let mut subscriber = Subscriber::new(&query(&["/sessions/s/entries"]), &tree);
+    subscriber.next();
+    let t0 = Instant::now();
+    let mut entries = Vec::new();
+    for n in 0..5 {
+        entries.push("x");
+        let at = t0 + Duration::from_millis(400 * n);
+        let change = committed(&mut tree, root(0, &[("s", session("t", &entries))]));
+        subscriber.publish_at(&tree, &change, at);
+        assert!(!subscriber.checkpoints(&tree, at), "n={n}");
+    }
+    assert_eq!(subscriber.deadline(), Some(t0 + Duration::from_secs(2)));
+    assert!(subscriber.checkpoints(&tree, t0 + Duration::from_secs(2)));
+}
+
+#[test]
+fn a_snapshot_carries_its_hash_and_settles_the_path() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a", "b"]))]));
+    let mut subscriber = Subscriber::new(&query(&["/sessions/s/entries/0"]), &tree);
+    subscriber.next();
+    let t0 = Instant::now();
+    let change = committed(&mut tree, root(0, &[("s", session("t", &["A", "b"]))]));
+    subscriber.publish_at(&tree, &change, t0);
+    assert!(subscriber.deadline().is_some());
+    let shrink = committed(&mut tree, root(0, &[("s", session("t", &["z"]))]));
+    subscriber.publish_at(&tree, &shrink, t0 + Duration::from_millis(10));
+    assert_eq!(subscriber.deadline(), None, "the whole path was sent, with its hash");
+}
+
+#[test]
+fn a_path_that_is_gone_is_not_checked() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let mut subscriber = Subscriber::new(&query(&["/sessions/s"]), &tree);
+    subscriber.next();
+    let t0 = Instant::now();
+    let change = committed(&mut tree, root(0, &[("s", session("u", &["a"]))]));
+    subscriber.publish_at(&tree, &change, t0);
+    let gone = committed(&mut tree, root(0, &[]));
+    subscriber.publish_at(&tree, &gone, t0);
+    assert!(!subscriber.checkpoints(&tree, t0 + Duration::from_secs(1)));
+}
+
+#[test]
+fn a_check_of_a_later_version_than_the_client_holds_reveals_a_missed_change() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s/entries"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    pump(&mut subscriber, &mut client);
+    let t0 = Instant::now();
+    let change = committed(&mut tree, root(0, &[("s", session("t", &["a", "b"]))]));
+    subscriber.publish_at(&tree, &change, t0);
+    subscriber.next().expect("the only change of the path is lost on the way");
+    assert!(subscriber.checkpoints(&tree, t0 + Duration::from_millis(500)));
+    let check = subscriber.next().unwrap();
+    let gap = client.apply(&check).expect_err("the path went quiet, the check at > v_p says why");
+    assert!(gap.contains("missed"), "{gap}");
+}
+
+#[test]
+fn a_check_older_than_what_the_client_holds_is_ignored() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s/entries"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    pump(&mut subscriber, &mut client);
+    let t0 = Instant::now();
+    let change = committed(&mut tree, root(0, &[("s", session("t", &["a", "b"]))]));
+    subscriber.publish_at(&tree, &change, t0);
+    assert!(subscriber.checkpoints(&tree, t0 + Duration::from_millis(500)));
+    // The client has applied the change; the check is of the version before it.
+    let ops = subscriber.next().unwrap();
+    client.apply(&ops).unwrap();
+    let mut old = subscriber.next().unwrap();
+    old.check.as_mut().unwrap()[0].at = 1;
+    client.apply(&old).unwrap();
+    assert!(client.checks.is_empty());
 }
