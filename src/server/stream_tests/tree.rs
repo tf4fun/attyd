@@ -536,3 +536,20 @@ async fn a_close_the_agent_refuses_ends_nothing() {
         assert_eq!(ends.count(), 0, "{event}");
     }
 }
+
+// --- what revision 3 served is gone --------------------------------------------------------
+
+#[tokio::test]
+async fn the_scope_documents_and_the_scope_streams_of_revision_3_are_not_served() {
+    let (server, _link) = Server::start(json!({})).await;
+    for path in ["/api/v2/scopes/global", "/api/v2/scopes/session%2Fs"] {
+        let response = server.send(path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let (status, _) = post(&server, "/api/v2/scopes/global/ops", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    for query in ["scope=global", "scope=global&have=global:e:1", ""] {
+        let (status, _) = open(&server, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query:?}");
+    }
+}

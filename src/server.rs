@@ -671,26 +671,6 @@ fn protocol_error(status: StatusCode, error: ProtocolError) -> Response {
     (status, axum::Json(wire::ErrorBody { error })).into_response()
 }
 
-/// `GET /api/v2/scopes/{scope}` (protocol §8): the document as one snapshot, the one a stream
-/// aligns with. It starts, loads and holds nothing; a session the bridge does not hold is
-/// `not_found`.
-async fn read_scope(Path(scope): Path<String>, State(state): State<AppState>) -> Response {
-    if Scope::parse(&scope).is_none() {
-        return protocol_error(
-            StatusCode::BAD_REQUEST,
-            ProtocolError::new(ErrorCode::InvalidRequest, format!("no scope {scope}")),
-        );
-    }
-    let snapshot = state.bridge.publication.lock().feed.snapshot(&scope);
-    match snapshot {
-        Some(snapshot) => axum::Json(snapshot).into_response(),
-        None => protocol_error(
-            StatusCode::NOT_FOUND,
-            ProtocolError::new(ErrorCode::NotFound, format!("{scope} is not held")),
-        ),
-    }
-}
-
 /// The reads of a held session (protocol §8): an attachment its published
 /// `log` or `live` references, and its workspace context. A read holds,
 /// loads and renews nothing; an unheld session is `not_found`. The raw path
@@ -950,36 +930,9 @@ fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
     })
 }
 
-/// `POST /api/v2/scopes/{scope}/ops` (protocol §6.3): every operation is
-/// answered `202` when it is admitted, none holds its response open; the result
-/// arrives in the document.
-async fn write_scope(
-    State(state): State<AppState>,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    let segments: Option<Vec<String>> = uri
-        .path()
-        .strip_prefix("/api/v2/scopes/")
-        .unwrap_or_default()
-        .split('/')
-        .map(path_segment)
-        .collect();
-    let Some(segments) = segments else {
-        return invalid_request("the path is not valid percent-encoded UTF-8");
-    };
-    let Some(scope) = segments.first().and_then(|scope| Scope::parse(scope)) else {
-        return invalid_request(format!(
-            "no scope {}",
-            segments.first().map_or("", |scope| scope)
-        ));
-    };
-    write_in(state, scope, &segments[1..], headers, body).await
-}
-
-/// `POST /api/v2/targets/{target}/…` (protocol revision 4 §8): the writes of `/api/v2/scopes`,
-/// to a target named `global`, `catalog` or `sessions/<id>`.
+/// `POST /api/v2/targets/{target}/…` (protocol revision 4 §8): the writes of a target named
+/// `global`, `catalog` or `sessions/<id>`: operations (every one answered `202` when admitted, none
+/// holding its response open; the result arrives in the tree), actions and resource actions.
 async fn write_target(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -1152,36 +1105,11 @@ async fn write_in(
     (StatusCode::ACCEPTED, axum::Json(wire::OpAccepted { op })).into_response()
 }
 
-/// `GET /api/v2/stream` (protocol §5): the events of the scopes it follows from
-/// the revision 3 feed, without SSE ids, with a heartbeat while idle. Dropping
-/// the body closes the subscription.
+/// `GET /api/v2/stream?follow=…` (protocol revision 4 §6): the events of the paths of the state
+/// tree it follows, without SSE ids, with a heartbeat while idle. Dropping the body closes the
+/// subscription.
 async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -> Response {
-    // A query that names `follow` is a stream of revision 4, over paths of the state tree.
-    if url::form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes()).any(|(key, _)| key == "follow") {
-        return tree_stream(query.as_deref().unwrap_or(""), state).await;
-    }
-    let follow = match crate::protocol::subscription::parse_stream_query(query.as_deref().unwrap_or("")) {
-        Ok(follow) => follow,
-        Err(error) => return protocol_error(StatusCode::BAD_REQUEST, error),
-    };
-    if state.bridge.state.lock().await.shutting_down {
-        return protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
-        );
-    }
-    let subscription = state.bridge.publication.lock().feed.subscribe(&follow);
-    state.bridge.serve_streams().await;
-    let stream = futures::stream::unfold(subscription, |subscription| async move {
-        let data = subscription.next_encoded().await?.json();
-        Some((
-            Ok::<_, Infallible>(SseEvent::default().data(data)),
-            subscription,
-        ))
-    });
-    Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(HEARTBEAT))
-        .into_response()
+    tree_stream(query.as_deref().unwrap_or(""), state).await
 }
 
 /// `GET /api/v2/nodes/{path}/segments/{i}?at=<version>` (protocol revision 4 §7.1): one segment
@@ -1292,8 +1220,7 @@ async fn read_path(path: &str, query: &str, state: AppState) -> Response {
     axum::Json(body).into_response()
 }
 
-/// `GET /api/v2/stream?follow=…` (design: protocol revision 4 §6): the events of the paths it
-/// follows, one JSON event per SSE message. Dropping the body closes the subscription.
+/// The stream of the paths `query` follows, one JSON event per SSE message.
 async fn tree_stream(query: &str, state: AppState) -> Response {
     let query = match crate::protocol::tree_stream::params::parse_stream_query(query) {
         Ok(query) => query,
