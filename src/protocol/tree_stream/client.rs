@@ -10,9 +10,16 @@ use super::wire::{Change, Event, SNode};
 /// What a client holding `held` has after installing `node` (design §6.3): it keeps every child
 /// the structure names and the snapshot omits, drops the rest, and replaces the listed.
 pub(crate) fn install(held: Option<&Value>, node: &SNode) -> Value {
+    // A list is addressed by index, an object or a map by key.
+    let member = |held: Option<&Value>, key: &str| -> Option<Value> {
+        match held? {
+            Value::Array(items) => items.get(key.parse::<usize>().ok()?).cloned(),
+            other => other.get(key).cloned(),
+        }
+    };
     let child = |held: Option<&Value>, key: &str, c: &BTreeMap<String, SNode>| match c.get(key) {
-        Some(node) => install(held.and_then(|held| held.get(key)), node),
-        None => held.and_then(|held| held.get(key)).cloned().expect("a kept child is held"),
+        Some(node) => install(member(held, key).as_ref(), node),
+        None => member(held, key).expect("a kept child is held"),
     };
     match node {
         SNode::Same { .. } => held.cloned().expect("the client holds what it says it holds"),
