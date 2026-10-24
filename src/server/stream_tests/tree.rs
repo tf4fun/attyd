@@ -321,3 +321,39 @@ async fn a_write_against_an_operation_that_is_not_the_current_one_is_stale_throu
     let (status, _) = post(&server, "/api/v2/targets/nowhere/ops", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn a_delayed_prompt_is_open_then_a_repeat_runs_it_once_and_the_delayed_copy_is_a_no_op() {
+    let (server, mut link) = Server::start(json!({})).await;
+    server.create(&mut link, "s1").await;
+    let path = "/sessions/s1/op";
+    let (_, mut sse) = open(&server, &format!("follow={path}")).await;
+    let first = next(&mut sse).await;
+    let instance = first["instance"].as_str().unwrap().to_string();
+    let snapshot = &change(&first, path)["snapshot"];
+    let (at, e) = (snapshot["at"].as_u64().unwrap(), snapshot["node"]["v"]["id"].as_str().unwrap().to_string());
+    let ask = |id: &str| format!("/api/v2/targets/sessions/s1/ops/{id}?expect={e}&instance={instance}&at={at}");
+
+    // The write is delayed: nothing admitted it yet, so the outcome is open and only a repeat of
+    // the same request is allowed.
+    let (_, body) = read(&server, &ask(CREATE)).await;
+    assert_eq!(body, json!({ "outcome": "open" }));
+
+    let write = json!({"id": CREATE, "expect": e, "kind": "prompt", "args": {"prompt": [text("work")]}});
+    let uri = "/api/v2/targets/sessions/s1/ops";
+    let (status, _) = post(&server, uri, write.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let prompt = link.request("session/prompt").await;
+    // The delayed copy arrives while the prompt runs: it is the same operation, and no second
+    // prompt reaches the Agent.
+    let (status, body) = post(&server, uri, write).await;
+    assert_eq!((status, &body), (StatusCode::ACCEPTED, &json!({"op": CREATE})));
+    link.quiet(Duration::from_millis(300)).await;
+
+    let (_, body) = read(&server, &ask(CREATE)).await;
+    assert_eq!(body["outcome"], "admitted", "{body}");
+    assert_eq!(body["record"]["kind"], "prompt");
+    let (_, body) = read(&server, &ask(OTHER)).await;
+    assert_eq!(body, json!({ "outcome": "superseded" }), "a new identity for the same input is never open now");
+    link.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+}
