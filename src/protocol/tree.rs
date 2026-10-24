@@ -298,6 +298,48 @@ impl Node {
         node
     }
 
+    /// Replaces the subtree at `tokens` below this node by `spec`, as a commit at `rev` does; the
+    /// ancestors recompute their `srev` and forget their hash. A new child of an object or a map
+    /// is added when its parent exists. `false` when the parent does not exist or holds no
+    /// children by key.
+    fn replace_at(
+        &mut self,
+        tokens: &[String],
+        spec: Spec,
+        rev: u64,
+        path: &str,
+        ops: &mut Vec<Op>,
+    ) -> bool {
+        let Some((key, rest)) = tokens.split_first() else {
+            *self = Node::reconcile(Some(self), spec, rev, path, ops);
+            return true;
+        };
+        let child_path = diff::child(path, key);
+        let children = match &mut self.body {
+            Body::Object { children, .. } | Body::Map(children) => children,
+            _ => return false,
+        };
+        let mut own = self.rev;
+        match children.get_mut(key) {
+            Some(child) => {
+                if !child.replace_at(rest, spec, rev, &child_path, ops) {
+                    return false;
+                }
+            }
+            None if rest.is_empty() => {
+                let node = Node::reconcile(None, spec, rev, &child_path, &mut Vec::new());
+                ops.push(Op::Set { path: child_path, value: node.to_value() });
+                children.insert(key.clone(), node);
+                own = rev;
+            }
+            None => return false,
+        }
+        self.rev = own;
+        self.srev = own.max(children.values().map(|node| node.srev).max().unwrap_or(0));
+        self.hash = OnceLock::new();
+        true
+    }
+
     /// The node's content hash (design §5): of the value and its text chains, or of the object,
     /// map or list over its children's hashes.
     pub(crate) fn hash(&self) -> Hash {
@@ -415,6 +457,24 @@ impl Tree {
             return None;
         }
         self.root = new;
+        self.rev = next;
+        Some(Committed { rev: next, ops })
+    }
+}
+
+impl Tree {
+    /// Publishes `spec` as the subtree at `path`, leaving the rest of the tree as it is: a commit
+    /// of one subtree, for state that changes outside the projection of the registry. `None`
+    /// when it changes nothing, or when the path's parent does not exist.
+    pub(crate) fn commit_at(&mut self, path: &str, spec: Spec) -> Option<Committed> {
+        let tokens: Vec<String> = path.strip_prefix('/')?.split('/').map(unescape).collect();
+        let next = self.rev + 1;
+        let mut ops = Vec::new();
+        let mut root = self.root.clone();
+        if !root.replace_at(&tokens, spec, next, "", &mut ops) || root.srev < next {
+            return None;
+        }
+        self.root = root;
         self.rev = next;
         Some(Committed { rev: next, ops })
     }

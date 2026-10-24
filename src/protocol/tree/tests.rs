@@ -370,3 +370,63 @@ fn a_commit_without_a_change_has_no_ops() {
     tree.commit_with_ops(root(&[("s", session("t", &["a"]))])).unwrap();
     assert!(tree.commit_with_ops(root(&[("s", session("t", &["a"]))])).is_none());
 }
+
+// --- a commit of one subtree ---------------------------------------------------------
+
+fn failures(entries: &[(&str, &str)]) -> Spec {
+    Spec::map(entries.iter().map(|(id, message)| (*id, Spec::value(json!({ "message": message })))))
+}
+
+fn with_failures(entries: &[(&str, &str)]) -> BTreeMap<String, Spec> {
+    BTreeMap::from([(
+        "global".to_string(),
+        Spec::object(fields(json!({ "agent": "a" })), [("loadFailures", failures(entries))]),
+    )])
+}
+
+#[test]
+fn a_subtree_is_committed_alone_with_its_ops_and_its_ancestors_revised() {
+    let mut tree = Tree::new("i");
+    tree.commit(root(&[("s", session("t", &["a"]))]));
+    tree.commit(with_failures(&[]));
+    let before = tree.root().to_value();
+    let hash = tree.root().hash();
+    let committed = tree
+        .commit_at("/global/loadFailures", failures(&[("s", "boom")]))
+        .expect("a change");
+    assert_eq!(committed.rev, tree.rev());
+    assert_eq!(
+        committed.ops,
+        vec![Op::Set { path: "/global/loadFailures/s".into(), value: json!({ "message": "boom" }) }]
+    );
+    let mut document = before;
+    for op in &committed.ops {
+        crate::protocol::diff::apply(&mut document, op).unwrap();
+    }
+    assert_eq!(document, tree.root().to_value());
+    for path in ["/global/loadFailures/s", "/global/loadFailures", "/global", ""] {
+        assert_eq!(tree.get(path).unwrap().srev(), committed.rev, "{path}");
+    }
+    assert_ne!(tree.root().hash(), hash, "the ancestors' hashes follow");
+    assert_eq!(tree.get("/global").unwrap().rev(), 2, "the object's own fields did not change");
+}
+
+#[test]
+fn a_subtree_that_does_not_change_or_has_no_parent_is_not_committed() {
+    let mut tree = Tree::new("i");
+    tree.commit(with_failures(&[("s", "boom")]));
+    assert!(tree.commit_at("/global/loadFailures", failures(&[("s", "boom")])).is_none());
+    assert_eq!(tree.rev(), 1);
+    assert!(tree.commit_at("/nowhere/loadFailures", failures(&[])).is_none());
+    assert!(tree.commit_at("/global/agent/x", failures(&[])).is_none());
+    assert_eq!(tree.rev(), 1);
+}
+
+#[test]
+fn a_subtree_removing_a_key_removes_it() {
+    let mut tree = Tree::new("i");
+    tree.commit(with_failures(&[("s", "boom"), ("u", "bang")]));
+    let committed = tree.commit_at("/global/loadFailures", failures(&[("u", "bang")])).unwrap();
+    assert_eq!(committed.ops, vec![Op::Remove { path: "/global/loadFailures/s".into() }]);
+    assert!(tree.get("/global/loadFailures/s").is_none());
+}
