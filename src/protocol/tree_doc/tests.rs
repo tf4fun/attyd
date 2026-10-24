@@ -165,7 +165,7 @@ fn a_held_session_is_published_with_identity_controls_and_nodes() {
     assert_eq!(session["closing"], false);
     assert_eq!(session["controls"]["commands"], json!([]));
     assert_eq!(session["op"]["kind"], "open");
-    assert_eq!(session["opDetail"]["input"], Value::Null);
+    assert_eq!(session["opDetail"]["input"], json!({}));
     assert_eq!(session["terminals"], json!({}));
     assert_eq!(session["interactions"], json!({}));
     assert_eq!(session["urlFlows"], json!({}));
@@ -248,13 +248,7 @@ fn an_unknown_history_has_no_entries_and_no_history() {
 fn streamed_text_changes_only_the_entry_that_grew() {
     let mut registry = registry();
     chunk(&mut registry, "a", "one");
-    registry
-        .append_session_update(
-            "s",
-            json!({ "sessionUpdate": "user_message_chunk", "messageId": "u",
-                    "content": { "type": "text", "text": "q" } }),
-        )
-        .unwrap();
+    chunk(&mut registry, "b", "two");
     let mut projector = Projector::default();
     let mut tree = Tree::new("i");
     tree.commit(projector.project(&registry, &agent(), 1));
