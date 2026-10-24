@@ -131,6 +131,23 @@ pub(crate) fn catalog(registry: &SessionRegistry, revision: u64) -> Spec {
     Spec::object(fields(json!({ "revision": live.revision })), children)
 }
 
+/// `/sessions/<id>` without its history: identity, controls, operation, interactions and
+/// terminals. `None` when the bridge does not hold the session.
+pub(crate) fn session(registry: &SessionRegistry, session_id: &str) -> Option<Spec> {
+    let live = project::project_session_live(registry, session_id)?;
+    let mut children = common(&live.op, &live.interactions, &live.url_flows);
+    children.push(("controls", value(&live.controls)));
+    children.push(("terminals", values(&live.terminals)));
+    Some(Spec::object(
+        fields(json!({
+            "sessionId": live.session_id,
+            "cwd": live.cwd,
+            "closing": live.closing,
+        })),
+        children,
+    ))
+}
+
 /// The complete tree the bridge now publishes, to commit.
 pub(crate) fn project_tree(
     registry: &SessionRegistry,
@@ -140,6 +157,14 @@ pub(crate) fn project_tree(
     BTreeMap::from([
         ("global".to_string(), global(registry, agent)),
         ("catalog".to_string(), catalog(registry, catalog_revision)),
+        (
+            "sessions".to_string(),
+            Spec::map(
+                project::held_sessions(registry)
+                    .into_iter()
+                    .filter_map(|id| session(registry, &id).map(|spec| (id, spec))),
+            ),
+        ),
     ])
 }
 

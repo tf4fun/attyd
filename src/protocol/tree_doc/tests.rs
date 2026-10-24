@@ -151,3 +151,58 @@ fn the_detail_changes_with_the_operation_and_the_head_with_its_status() {
     tree.commit(project_tree(&registry, &agent(), 1));
     assert!(tree.get("/global/op").unwrap().rev() > running);
 }
+
+// --- /sessions/<id> -----------------------------------------------------------------
+
+#[test]
+fn a_held_session_is_published_with_identity_controls_and_nodes() {
+    let tree = tree_of(&registry());
+    let session = at(&tree, "/sessions/s");
+    assert_eq!(session["sessionId"], "s");
+    assert_eq!(session["cwd"], "/work");
+    assert_eq!(session["closing"], false);
+    assert_eq!(session["controls"]["commands"], json!([]));
+    assert_eq!(session["op"]["kind"], "open");
+    assert_eq!(session["opDetail"]["input"], Value::Null);
+    assert_eq!(session["terminals"], json!({}));
+    assert_eq!(session["interactions"], json!({}));
+    assert_eq!(session["urlFlows"], json!({}));
+}
+
+#[test]
+fn a_controls_change_moves_only_the_controls_node() {
+    let mut registry = registry();
+    let mut tree = tree_of(&registry);
+    registry
+        .update_control_state(
+            "epoch",
+            "s",
+            json!({ "sessionUpdate": "session_info_update", "title": "Titled" }),
+        )
+        .unwrap();
+    let rev = tree.commit(project_tree(&registry, &agent(), 1)).unwrap();
+    assert_eq!(tree.get("/sessions/s/controls").unwrap().rev(), rev);
+    assert_eq!(tree.get("/sessions/s").unwrap().rev(), 1);
+    assert_eq!(tree.get("/sessions/s/op").unwrap().rev(), 1);
+    // The title is also in the summary global shows.
+    assert_eq!(tree.get("/global/sessions/s").unwrap().rev(), rev);
+}
+
+#[test]
+fn a_session_the_bridge_does_not_hold_is_not_published() {
+    let registry = registry();
+    assert!(session(&registry, "t").is_none());
+    assert!(tree_of(&registry).get("/sessions/t").is_none());
+}
+
+#[test]
+fn a_session_an_operation_occupies_shows_that_operation() {
+    let mut registry = registry();
+    registry
+        .install_operation(&Scope::Global, OperationKind::Delete, json!({ "sessionId": "s" }))
+        .unwrap();
+    let tree = tree_of(&registry);
+    let op = at(&tree, "/sessions/s/op");
+    assert_eq!(op["scope"], "global");
+    assert_eq!(op["kind"], "delete");
+}
