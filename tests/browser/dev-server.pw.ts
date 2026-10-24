@@ -60,7 +60,7 @@ export default function DevProbe() {
     page.on("websocket", (socket) => sockets.push(socket.url()));
     const stream = page.waitForResponse((response) =>
       new URL(response.url()).pathname === "/api/v2/stream" &&
-      new URL(response.url()).searchParams.getAll("scope").includes("session/saved-session") &&
+      new URL(response.url()).searchParams.getAll("follow").includes("/sessions/saved-session") &&
       response.status() === 200
     );
     const response = await page.goto(`${origin}/sessions/saved-session`);

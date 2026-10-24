@@ -1,6 +1,7 @@
 import { expect, test as baseTest } from "@playwright/test";
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
+import { nodeValue, snapshotChange } from "./api-requests";
 
 const test = baseTest.extend<{ fixtureUrl: string }>({
   fixtureUrl: async ({}, use) => {
@@ -65,13 +66,23 @@ test("replaces loading with the load failure and subscribes again on manual retr
     subscriptions += 1;
     if (fail) {
       // The load ends the scope with `load_failed` (protocol §5.2).
+      // global keeps the whole error; the session's path ends with its summary (design §6.2).
+      const failure = { code: "agent_error", message: "Synthetic load failure", data: { code: -32603, message: "Synthetic load failure" } };
+      const global = await nodeValue(page.request, "/global");
+      const catalog = await nodeValue(page.request, "/catalog");
+      const event = {
+        instance: "synthetic",
+        rev: 3,
+        changes: [
+          snapshotChange("/global", { ...global, loadFailures: { "lazy-process-session": failure } }, 2),
+          snapshotChange("/catalog", catalog, 2),
+          { path: "/sessions/lazy-process-session", end: { reason: "load_failed", error: { code: "agent_error", agentCode: -32603 } } },
+        ],
+      };
       await route.fulfill({
         status: 200,
         headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
-        body: `data: ${JSON.stringify({
-          scope: SCOPE,
-          end: { reason: "load_failed", error: { code: "agent_error", message: "Synthetic load failure" } },
-        })}\n\n`,
+        body: `data: ${JSON.stringify(event)}\n\n`,
       });
     } else await route.continue();
   });
@@ -93,5 +104,5 @@ test("replaces loading with the load failure and subscribes again on manual retr
 const SCOPE = "session/lazy-process-session";
 
 function isSessionStream(url: URL): boolean {
-  return url.pathname === "/api/v2/stream" && url.searchParams.getAll("scope").includes(SCOPE);
+  return url.pathname === "/api/v2/stream" && url.searchParams.getAll("follow").includes("/sessions/lazy-process-session");
 }

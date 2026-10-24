@@ -1,11 +1,13 @@
-import type { Page, Request } from "@playwright/test";
+import type { APIRequestContext, Page, Request } from "@playwright/test";
+import { wire } from "../../shared/digest";
+import { hashAt } from "../../shared/tree-replica";
 
 export interface ApiRequests {
   /** Every `/api/v1` request the page sent. */
   v1: string[];
   /** Every stream subscription the page opened. */
   streams: URL[];
-  /** One-off `GET …/scopes/…` reads. */
+  /** One-off `GET /api/v2/nodes/…` reads. */
   reads: URL[];
   /** Operation writes: the scope and the request body. */
   ops: Array<{ scope: string; kind: string; body: Record<string, unknown> }>;
@@ -30,28 +32,57 @@ export function trackApi(page: Page): ApiRequests {
     if (path.startsWith("/api/v1")) requests.v1.push(`${request.method()} ${path}`);
     if (path.includes("/process")) requests.process.push(path);
     if (path === "/api/v2/stream") requests.streams.push(url);
-    if (!path.startsWith("/api/v2/scopes/")) return;
-    const ops = /^\/api\/v2\/scopes\/(.+)\/ops$/u.exec(path);
-    const action = /^\/api\/v2\/scopes\/(.+)\/resources\/([^/]+)\/([^/]+)$/u.exec(path);
-    const control = /^\/api\/v2\/scopes\/(.+)\/actions\/([^/]+)$/u.exec(path);
+    if (path.startsWith("/api/v2/nodes/") && request.method() === "GET") requests.reads.push(url);
+    if (!path.startsWith("/api/v2/targets/")) return;
+    const ops = /^\/api\/v2\/targets\/(.+)\/ops$/u.exec(path);
+    const action = /^\/api\/v2\/targets\/(.+)\/resources\/([^/]+)\/([^/]+)$/u.exec(path);
+    const control = /^\/api\/v2\/targets\/(.+)\/actions\/([^/]+)$/u.exec(path);
     if (request.method() === "GET") requests.reads.push(url);
     else if (ops != null) {
       const body = request.postDataJSON() as Record<string, unknown>;
-      requests.ops.push({ scope: decodeURIComponent(ops[1]!), kind: String(body.kind), body });
+      requests.ops.push({ scope: scopeOfTarget(ops[1]!), kind: String(body.kind), body });
     } else if (action != null) {
-      requests.actions.push(`${decodeURIComponent(action[1]!)} ${decodeURIComponent(action[2]!)} ${action[3]}`);
+      requests.actions.push(`${scopeOfTarget(action[1]!)} ${decodeURIComponent(action[2]!)} ${action[3]}`);
     } else if (control != null) {
       requests.controls.push({
-        scope: decodeURIComponent(control[1]!), action: control[2]!, body: request.postDataJSON() as Record<string, unknown>,
+        scope: scopeOfTarget(control[1]!), action: control[2]!, body: request.postDataJSON() as Record<string, unknown>,
       });
     }
   });
   return requests;
 }
 
-/** The scopes a stream subscription follows. */
+/** A snapshot of `path` as a stream would send it, for a page whose stream a case replaces. */
+export function snapshotChange(path: string, value: unknown, at: number) {
+  const tokens = path.slice(1).split("/").map((token) => token.replace(/~1/gu, "/").replace(/~0/gu, "~"));
+  return { path, snapshot: { base: null, at, hash: wire(hashAt(tokens, value)), node: { v: value } } };
+}
+
+/** `global`, `catalog` or `session/<id>` for the target `global`, `catalog` or `sessions/<id>`. */
+function scopeOfTarget(target: string): string {
+  const [kind, id] = target.split("/");
+  return kind === "sessions" ? `session/${decodeURIComponent(id!)}` : target;
+}
+
+/** The scopes a stream subscription follows: the sessions and the two others, by the paths it follows. */
 export function scopesOf(url: URL): string[] {
-  return url.searchParams.getAll("scope");
+  return url.searchParams.getAll("follow").map((path) => {
+    const match = /^\/sessions\/([^/]+)/u.exec(path);
+    return match === null ? path.slice(1) : `session/${decodeURIComponent(match[1]!.replace(/~1/gu, "/").replace(/~0/gu, "~"))}`;
+  });
+}
+
+/** The value at `path` of the tree, as a read of the node answers (design §7.1). */
+export async function nodeValue(request: APIRequestContext, path: string, origin = ""): Promise<any> {
+  const body = (await (await request.get(`${origin}/api/v2/nodes${path}`)).json()) as {
+    change?: { snapshot?: { node?: { v?: unknown } } };
+  };
+  return body.change?.snapshot?.node?.v;
+}
+
+/** The `id` of the operation a target (`global`, `catalog`, `sessions/<id>`) shows: what a write expects. */
+export async function opIdOf(request: APIRequestContext, target: string, origin = ""): Promise<string> {
+  return (await nodeValue(request, `/${target}/op`, origin)).id as string;
 }
 
 /** Controls of one kind (`set_mode`, `set_config`, `close`), optionally on one scope. */
