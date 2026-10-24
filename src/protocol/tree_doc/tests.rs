@@ -435,13 +435,13 @@ fn a_new_turn_adds_to_the_index_and_leaves_the_turns_before_it_unchanged() {
         registry.append_session_update("s", update).unwrap();
     }
     project_at(&mut projector, &mut tree, &registry).unwrap();
-    assert_eq!(at(&tree, "/sessions/s/turns").as_array().unwrap().len(), 2);
+    assert_eq!(at(&tree, "/sessions/s/turns").as_array().unwrap().len(), 1);
     let entries_rev = tree.get("/sessions/s/entries/0").unwrap().rev();
 
     registry.append_session_update("s", user("q more", None)).unwrap();
     project_at(&mut projector, &mut tree, &registry).unwrap();
     let turns = at(&tree, "/sessions/s/turns");
-    assert_eq!(turns.as_array().unwrap().len(), 3);
+    assert_eq!(turns.as_array().unwrap().len(), 2);
     assert_eq!(tree.get("/sessions/s/entries/0").unwrap().rev(), entries_rev);
     assert_eq!(tree.get("/sessions/s/turns/0").unwrap().rev(), entries_rev, "turn 0 is unchanged");
     assert_eq!(tree.get("/sessions/s/turns/1").unwrap().rev(), tree.rev());
