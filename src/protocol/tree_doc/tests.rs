@@ -466,3 +466,113 @@ fn an_unknown_history_has_no_turns() {
     registry.register_cold("s");
     assert!(at(&tree_of(&registry), "/sessions/s").get("turns").is_none());
 }
+
+// --- the operation log of a target (design §9.3) ---------------------------------------
+
+fn ops_of(tree: &Tree, target: &str) -> Vec<Value> {
+    at(tree, &format!("/{target}/ops")).as_array().unwrap().clone()
+}
+
+fn op_id(tree: &Tree, target: &str) -> String {
+    at(tree, &format!("/{target}/op"))["id"].as_str().unwrap().to_string()
+}
+
+fn run(registry: &mut SessionRegistry, scope: &Scope, kind: OperationKind) -> String {
+    registry.install_operation(scope, kind, json!({})).unwrap()
+}
+
+#[test]
+fn the_first_operation_seen_of_a_target_is_the_baseline_and_has_no_record() {
+    let registry = registry();
+    let tree = tree_of(&registry);
+    for target in ["global", "catalog", "sessions/s"] {
+        assert_eq!(ops_of(&tree, target), Vec::<Value>::new(), "{target}");
+    }
+}
+
+#[test]
+fn an_admitted_operation_is_recorded_with_the_one_it_replaced_and_follows_its_status() {
+    let mut registry = registry();
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry);
+    let initial = op_id(&tree, "global");
+    let id = run(&mut registry, &Scope::Global, OperationKind::Logout);
+    let admitted = project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert_eq!(
+        ops_of(&tree, "global"),
+        vec![json!({ "id": id, "after": initial, "kind": "logout", "rev": admitted, "status": "running" })]
+    );
+    registry.complete_scope_operation(&Scope::Global, OperationKind::Logout, json!({}));
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert_eq!(ops_of(&tree, "global")[0]["status"], "completed");
+    assert_eq!(ops_of(&tree, "global")[0]["rev"], admitted, "the commit that admitted it");
+
+    let second = run(&mut registry, &Scope::Global, OperationKind::Logout);
+    registry.fail_scope_operation(
+        &Scope::Global,
+        OperationKind::Logout,
+        ProtocolError::agent(&json!({ "code": -32000, "message": "m".repeat(1 << 20) })),
+    );
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    let records = ops_of(&tree, "global");
+    assert_eq!(records.len(), 2);
+    assert_eq!((records[1]["id"].as_str().unwrap(), records[1]["after"].as_str().unwrap()), (second.as_str(), id.as_str()));
+    assert_eq!(records[1]["error"], json!({ "code": "agent_error", "agentCode": -32000 }));
+    assert!(serde_json::to_string(&records).unwrap().len() < 1024, "bounded however large the Agent's error");
+}
+
+#[test]
+fn an_operation_that_occupies_another_target_is_recorded_in_both_with_their_own_after() {
+    let mut registry = registry();
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry);
+    let (global_before, session_before) = (op_id(&tree, "global"), op_id(&tree, "sessions/s"));
+    registry
+        .install_operation(&Scope::Global, OperationKind::Delete, json!({ "sessionId": "s" }))
+        .unwrap();
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    let delete = op_id(&tree, "global");
+    let global = &ops_of(&tree, "global")[0];
+    let session = &ops_of(&tree, "sessions/s")[0];
+    assert_eq!((global["id"].as_str(), global["after"].as_str()), (Some(delete.as_str()), Some(global_before.as_str())));
+    assert_eq!((session["id"].as_str(), session["after"].as_str()), (Some(delete.as_str()), Some(session_before.as_str())));
+    assert_eq!(session["kind"], "delete");
+}
+
+#[test]
+fn a_log_keeps_the_last_sixty_four_as_an_unbroken_chain() {
+    let mut registry = registry();
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry);
+    let mut ids = vec![op_id(&tree, "global")];
+    for _ in 0..70 {
+        ids.push(run(&mut registry, &Scope::Global, OperationKind::Logout));
+        project_at(&mut projector, &mut tree, &registry);
+        registry.complete_scope_operation(&Scope::Global, OperationKind::Logout, json!({}));
+        project_at(&mut projector, &mut tree, &registry);
+    }
+    let records = ops_of(&tree, "global");
+    assert_eq!(records.len(), 64);
+    assert_eq!(records[63]["id"], *ids.last().unwrap());
+    for pair in records.windows(2) {
+        assert_eq!(pair[1]["after"], pair[0]["id"], "each record replaced the one before it");
+    }
+    assert_eq!(records[0]["after"], ids[ids.len() - 65]);
+}
+
+#[test]
+fn a_session_released_and_held_again_starts_an_empty_log() {
+    let mut registry = registry();
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry);
+    run(&mut registry, &Scope::Session("s".into()), OperationKind::Prompt);
+    project_at(&mut projector, &mut tree, &registry);
+    assert_eq!(ops_of(&tree, "sessions/s").len(), 1);
+    registry.sessions.get_mut("s").unwrap().state.live.as_mut().unwrap().lifecycle =
+        crate::runtime_state::SessionLifecycle::Closed;
+    project_at(&mut projector, &mut tree, &registry);
+    registry.sessions.get_mut("s").unwrap().state.live.as_mut().unwrap().lifecycle =
+        crate::runtime_state::SessionLifecycle::Active;
+    project_at(&mut projector, &mut tree, &registry);
+    assert_eq!(ops_of(&tree, "sessions/s"), Vec::<Value>::new());
+}
