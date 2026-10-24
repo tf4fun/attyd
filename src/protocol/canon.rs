@@ -83,11 +83,13 @@ impl Attachments {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnknownAttachment(pub String);
 
-/// Normalizes content, keeping each attachment's block in `attachments`.
+/// Normalizes content, keeping each attachment's block in `attachments`. Text and
+/// resource links lose `_meta`; an attachment keeps its exact form, so its ID is the one
+/// the published timeline gives the same block (protocol §3.1).
 pub(crate) fn normalize(blocks: &[Value], attachments: &mut Attachments) -> Vec<Block> {
     let mut normalized: Vec<Block> = Vec::new();
-    for block in blocks {
-        let block = without_meta(block);
+    for original in blocks {
+        let block = without_meta(original);
         let block_type = block["type"].as_str().unwrap_or_default().to_owned();
         let kind = match block_type.as_str() {
             "text" => {
@@ -120,11 +122,11 @@ pub(crate) fn normalize(blocks: &[Value], attachments: &mut Attachments) -> Vec<
             AttachmentKind::Resource => source["uri"].as_str().map(String::from),
             AttachmentKind::Image | AttachmentKind::Audio => None,
         };
-        let id = super::timeline_doc::attachment_id(&block);
+        let id = super::timeline_doc::attachment_id(original);
         attachments
             .0
             .entry(id.clone())
-            .or_insert_with(|| Arc::new(block));
+            .or_insert_with(|| Arc::new(original.clone()));
         normalized.push(Block::Attachment(AttachmentRef {
             r#type: AttachmentTag::Attachment,
             id,
@@ -414,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_merges_text_references_attachments_and_drops_meta() {
+    fn normalization_merges_text_references_attachments_and_drops_meta_outside_them() {
         let resource = json!({
             "type": "resource",
             "resource": {
@@ -433,17 +435,19 @@ mod tests {
             text("c"),
             text("d"),
         ];
+        let image_id = crate::protocol::timeline_doc::attachment_id(&blocks[2]);
+        let resource_id = crate::protocol::timeline_doc::attachment_id(&blocks[4]);
         let mut attachments = Attachments::default();
         let normalized = normalize(&blocks, &mut attachments);
         assert_eq!(
             serde_json::to_value(&normalized).unwrap(),
             json!([
                 { "type": "text", "text": "ab", "annotations": { "priority": 1 } },
-                { "type": "attachment", "id": IMAGE_ID, "block": "image", "mimeType": "image/png" },
+                { "type": "attachment", "id": image_id, "block": "image", "mimeType": "image/png" },
                 { "type": "resource_link", "uri": "file:///y", "name": "y" },
                 {
                     "type": "attachment",
-                    "id": RESOURCE_ID,
+                    "id": resource_id,
                     "block": "resource",
                     "mimeType": "text/plain",
                     "uri": "file:///x.txt",
@@ -451,14 +455,29 @@ mod tests {
                 { "type": "text", "text": "cd" },
             ])
         );
-        assert_eq!(attachments.get(IMAGE_ID), Some(&image()));
-        assert_eq!(
-            attachments.get(RESOURCE_ID),
-            Some(&json!({
-                "type": "resource",
-                "resource": { "uri": "file:///x.txt", "mimeType": "text/plain", "text": "t" },
-            }))
-        );
+        // An attachment is kept exactly as it came, `_meta` included.
+        assert_ne!(image_id, IMAGE_ID);
+        assert_ne!(resource_id, RESOURCE_ID);
+        assert_eq!(attachments.get(&image_id), Some(&blocks[2]));
+        assert_eq!(attachments.get(&resource_id), Some(&blocks[4]));
+    }
+
+    // #182: a prompt's references and the published timeline name the same block
+    // by the same ID, also when the block carries `_meta`, so a reference taken from
+    // the operation's input reads and resolves.
+    #[test]
+    fn a_prompt_attachment_with_meta_has_the_published_timelines_id() {
+        let block = with_meta(image());
+        let mut attachments = Attachments::default();
+        let Block::Attachment(reference) = normalize(&[block.clone()], &mut attachments).remove(0)
+        else {
+            panic!("the image is referenced");
+        };
+        let mut index = crate::protocol::timeline_doc::AttachmentIndex::default();
+        let published = crate::protocol::timeline_doc::publish_block(&block, &mut index);
+        assert_eq!(published["id"], json!(reference.id));
+        assert_eq!(index.get(&reference.id), Some(&block));
+        assert_eq!(attachments.get(&reference.id), Some(&block));
     }
 
     #[test]
