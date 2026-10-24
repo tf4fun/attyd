@@ -272,8 +272,9 @@ impl Feed {
                 subscriber.coalesce(&self.engine);
             }
         }
+        let next = self.tree.rev() + 1;
         self.tree
-            .commit(self.projector.project(registry, agent, catalog_revision));
+            .commit(self.projector.project(registry, agent, catalog_revision, next));
         #[cfg(test)]
         self.tap_flush();
     }

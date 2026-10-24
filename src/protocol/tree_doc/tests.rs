@@ -251,10 +251,10 @@ fn streamed_text_changes_only_the_entry_that_grew() {
     chunk(&mut registry, "b", "two");
     let mut projector = Projector::default();
     let mut tree = Tree::new("i");
-    tree.commit(projector.project(&registry, &agent(), 1));
+    tree.commit(projector.project(&registry, &agent(), 1, tree.rev() + 1));
     assert_eq!(registry.sessions["s"].state.timeline.as_ref().unwrap().entries().len(), 2);
     chunk(&mut registry, "b", " more");
-    let rev = tree.commit(projector.project(&registry, &agent(), 1)).unwrap();
+    let rev = tree.commit(projector.project(&registry, &agent(), 1, tree.rev() + 1)).unwrap();
     assert_eq!(tree.get("/sessions/s/entries/1").unwrap().rev(), rev);
     assert_eq!(tree.get("/sessions/s/entries/0").unwrap().rev(), 1);
     assert_eq!(tree.get("/sessions/s/entries").unwrap().rev(), 1, "no entry was added");
@@ -265,8 +265,8 @@ fn an_unchanged_entry_is_published_with_the_same_value_object() {
     let mut registry = registry();
     chunk(&mut registry, "a", "one");
     let mut projector = Projector::default();
-    let first = projector.project(&registry, &agent(), 1);
-    let second = projector.project(&registry, &agent(), 1);
+    let first = projector.project(&registry, &agent(), 1, 1);
+    let second = projector.project(&registry, &agent(), 1, 1);
     let entry = |tree: &BTreeMap<String, Spec>| match &tree["sessions"] {
         Spec::Map(sessions) => match &sessions["s"] {
             Spec::Object { children, .. } => match &children["entries"] {
@@ -289,13 +289,71 @@ fn a_replaced_history_replaces_the_entries_and_a_released_session_forgets_them()
     chunk(&mut registry, "a", "one");
     chunk(&mut registry, "b", "two");
     let mut projector = Projector::default();
-    projector.project(&registry, &agent(), 1);
-    assert_eq!(projector.entries["s"].len(), 2);
+    projector.project(&registry, &agent(), 1, 1);
+    assert_eq!(projector.sessions["s"].entries.len(), 2);
     registry.register_cold("s");
-    projector.project(&registry, &agent(), 1);
-    assert!(projector.entries["s"].is_empty());
+    projector.project(&registry, &agent(), 1, 1);
+    assert!(projector.sessions["s"].entries.is_empty());
     registry.sessions.get_mut("s").unwrap().state.live.as_mut().unwrap().lifecycle =
         crate::runtime_state::SessionLifecycle::Closed;
-    projector.project(&registry, &agent(), 1);
-    assert!(!projector.entries.contains_key("s"));
+    projector.project(&registry, &agent(), 1, 1);
+    assert!(!projector.sessions.contains_key("s"));
+}
+
+// --- historyRev and heldSince (§4.2) -------------------------------------------------
+
+fn project_at(projector: &mut Projector, tree: &mut Tree, registry: &SessionRegistry) -> Option<u64> {
+    tree.commit(projector.project(registry, &agent(), 1, tree.rev() + 1))
+}
+
+#[test]
+fn a_session_is_held_since_the_revision_that_installed_it_and_keeps_it() {
+    let mut registry = SessionRegistry::new("epoch");
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry);
+    registry
+        .open_new("epoch", "s", "/work", json!({ "sessionId": "s" }))
+        .unwrap();
+    let installed = project_at(&mut projector, &mut tree, &registry).unwrap();
+    chunk(&mut registry, "m", "hi");
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    let session = at(&tree, "/sessions/s");
+    assert_eq!(session["heldSince"], installed);
+    assert_eq!(session["historyRev"], installed, "a new session's history is installed with it");
+}
+
+#[test]
+fn growing_the_history_keeps_its_revision_and_replacing_it_takes_the_new_one() {
+    let mut registry = registry();
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    let first = project_at(&mut projector, &mut tree, &registry).unwrap();
+    chunk(&mut registry, "m", "hi");
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert_eq!(at(&tree, "/sessions/s")["historyRev"], first);
+
+    registry.register_cold("s");
+    let unknown = project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert!(at(&tree, "/sessions/s").get("historyRev").is_none());
+
+    registry.register_new("s");
+    let replaced = project_at(&mut projector, &mut tree, &registry).unwrap();
+    let session = at(&tree, "/sessions/s");
+    assert!(replaced > unknown);
+    assert_eq!(session["historyRev"], replaced);
+    assert_eq!(session["heldSince"], first, "the session stayed held");
+}
+
+#[test]
+fn a_session_released_and_held_again_is_held_since_the_later_revision() {
+    let mut registry = registry();
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    let first = project_at(&mut projector, &mut tree, &registry).unwrap();
+    registry.sessions.get_mut("s").unwrap().state.live.as_mut().unwrap().lifecycle =
+        crate::runtime_state::SessionLifecycle::Closed;
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    registry.sessions.get_mut("s").unwrap().state.live.as_mut().unwrap().lifecycle =
+        crate::runtime_state::SessionLifecycle::Active;
+    let again = project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert!(again > first);
+    assert_eq!(at(&tree, "/sessions/s")["heldSince"], again);
 }

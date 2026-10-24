@@ -155,23 +155,37 @@ pub(crate) fn session(registry: &SessionRegistry, session_id: &str) -> Option<Sp
 /// entry the memory did not touch keeps its value (and the tree compares it by pointer).
 #[derive(Default)]
 pub(crate) struct Projector {
-    entries: BTreeMap<String, Vec<(Arc<Entry>, Arc<Value>)>>,
+    sessions: BTreeMap<String, Memo>,
+}
+
+/// What is remembered of one held session.
+#[derive(Default)]
+struct Memo {
+    entries: Vec<(Arc<Entry>, Arc<Value>)>,
+    /// The revision at which the bridge started holding the session this time (§4.2).
+    held_since: u64,
+    /// The timeline the history was last installed as, and the revision it was.
+    timeline: Option<String>,
+    history_rev: u64,
 }
 
 impl Projector {
-    /// The complete tree the bridge now publishes, to commit.
+    /// The complete tree the bridge now publishes, to commit as revision `next_rev`: a session
+    /// held for the first time, or whose history was replaced, takes it for `heldSince` or
+    /// `historyRev`. Each of those changes the tree, so `next_rev` is then the revision committed.
     pub(crate) fn project(
         &mut self,
         registry: &SessionRegistry,
         agent: &AgentInfo,
         catalog_revision: u64,
+        next_rev: u64,
     ) -> BTreeMap<String, Spec> {
         let held = project::held_sessions(registry);
-        self.entries.retain(|id, _| held.contains(id));
+        self.sessions.retain(|id, _| held.contains(id));
         let sessions: Vec<(String, Spec)> = held
             .into_iter()
             .filter_map(|id| {
-                let spec = self.session_with_history(registry, &id)?;
+                let spec = self.session_with_history(registry, &id, next_rev)?;
                 Some((id, spec))
             })
             .collect();
@@ -184,14 +198,29 @@ impl Projector {
 
     /// `/sessions/<id>` with `history`, `entries` and `prompts` (§4.2). While the history is
     /// unknown there is no `history` field and no `entries` node.
-    fn session_with_history(&mut self, registry: &SessionRegistry, session_id: &str) -> Option<Spec> {
+    fn session_with_history(
+        &mut self,
+        registry: &SessionRegistry,
+        session_id: &str,
+        next_rev: u64,
+    ) -> Option<Spec> {
         let Spec::Object { mut fields, mut children } = session(registry, session_id)? else {
             unreachable!("a session is an object");
         };
         let state = &registry.sessions.get(session_id)?.state;
-        let cache = self.entries.entry(session_id.to_string()).or_default();
+        let memo = self.sessions.entry(session_id.to_string()).or_insert_with(|| Memo {
+            held_since: next_rev,
+            ..Memo::default()
+        });
+        fields.insert("heldSince".into(), json!(memo.held_since));
+        if memo.timeline != state.timeline_epoch {
+            memo.history_rev = next_rev;
+            memo.timeline = state.timeline_epoch.clone();
+        }
+        let cache = &mut memo.entries;
         match state.timeline.as_ref() {
             Some(timeline) => {
+                fields.insert("historyRev".into(), json!(memo.history_rev));
                 if let Some(history) = state.history {
                     fields.insert("history".into(), json!(history));
                 }
@@ -237,7 +266,7 @@ pub(crate) fn project_tree(
     agent: &AgentInfo,
     catalog_revision: u64,
 ) -> BTreeMap<String, Spec> {
-    Projector::default().project(registry, agent, catalog_revision)
+    Projector::default().project(registry, agent, catalog_revision, 1)
 }
 
 #[cfg(test)]
