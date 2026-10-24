@@ -198,6 +198,12 @@ export interface Follow {
 export type Received = "applied" | "ended" | "ignored" | "resubscribe";
 
 /**
+ * How many replicas of scopes no longer followed are kept, so following one again
+ * asks only for what changed since; older ones are dropped.
+ */
+export const KEPT_UNFOLLOWED = 4;
+
+/**
  * The replicas of the scopes one client follows, and the stream that feeds them.
  * A new stream replaces the previous one; events of a replaced stream change nothing.
  */
@@ -209,6 +215,8 @@ export class DocumentReplicaSet {
   #current: number | undefined;
   /** The scopes the current stream follows and has not ended. */
   #following = new Set<string>();
+  /** Held replicas of scopes no longer followed, the least recently followed first. */
+  #unfollowed: string[] = [];
   #lastResubscribe: { readonly reason: string; readonly full: boolean } | undefined;
   readonly #path: string;
 
@@ -230,7 +238,15 @@ export class DocumentReplicaSet {
     }
     this.#stream += 1;
     this.#current = this.#stream;
-    this.#following = new Set(follow.map(({ scope }) => scope));
+    const following = new Set(follow.map(({ scope }) => scope));
+    const left = [...this.#replicas.keys()].filter((scope) => !following.has(scope) && !this.#unfollowed.includes(scope));
+    this.#unfollowed = [...this.#unfollowed.filter((scope) => !following.has(scope)), ...left];
+    while (this.#unfollowed.length > KEPT_UNFOLLOWED) {
+      const dropped = this.#unfollowed.shift()!;
+      this.#replicas.delete(dropped);
+      this.#failures.delete(dropped);
+    }
+    this.#following = following;
     return { stream: this.#stream, url: `${this.#path}?${params}` };
   }
 
