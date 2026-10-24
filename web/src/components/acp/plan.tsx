@@ -1,9 +1,8 @@
 import type { PlanEntry, SessionUpdate } from "@agentclientprotocol/sdk";
 import { Check, ChevronRight, Circle, CircleDot, FileText, ListChecks, X } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { useTranslation } from "../../i18n";
+import { MarkdownText } from "./content-block";
 import { RawJson } from "./raw-json";
 
 export function PlanCard({ update, entryId }: { update: SessionUpdate; entryId: string }) {
@@ -68,7 +67,7 @@ function PlanDisclosure({
       <div id={bodyId} className="plan-body" data-thread-searchable hidden={!open}>
         {entries ? <PlanEntries entries={entries} /> : null}
         {file ? <code>{file.uri}</code> : null}
-        {markdown ? <div className="markdown"><Markdown remarkPlugins={[remarkGfm]}>{markdown.content}</Markdown></div> : null}
+        {markdown ? <div className="markdown"><MarkdownText text={markdown.content} /></div> : null}
         <RawJson label={t("plan.event")} value={update} />
       </div>
     </section>
