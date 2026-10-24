@@ -422,7 +422,10 @@ An interaction is an Agent request waiting for the user: `session/request_permis
 
 ### 8.4 Needed sessions
 
-A session is needed while it is observed, occupied by an operation, has an outstanding
+A session is **observed** while a client follows it, or a client's read of it is being served and
+for the delay after (protocol revision 4 [§7.2](protocol-r4-design.md#72-holding): a `GET` of a
+session or view path observes the session like a short subscription; revision 3's reads observe
+nothing). A session is needed while it is observed, occupied by an operation, has an outstanding
 control or close request, or has a resource that can still act: a pending interaction,
 a terminal with a handle, a `waiting` URL flow. Frozen output and finished flows do not
 keep it needed.

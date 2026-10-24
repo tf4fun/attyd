@@ -59,7 +59,9 @@ memory and send writes to it. The protocol has three goals:
 - **B6 Holding.** The bridge holds a session while it is needed (memory model §8.4) or
   subscribed. A session that nothing needs is released after
   `--session-unobserved-timeout`, only if the Agent can load or resume it. Subscribing
-  to an unheld session starts a `load`. A one-off read holds nothing.
+  to an unheld session starts a `load`. A one-off read holds nothing (revision 3; in
+  [revision 4](protocol-r4-design.md#72-holding) a read of a session or view path observes
+  the session like a short subscription).
   The bridge starts an Agent connection only for a session stream that needs one, for
   the next connection after a terminal login, and for `restart`; a read, a `global` or
   `catalog` stream, and a write do not (a write without a connection is `unavailable`).
