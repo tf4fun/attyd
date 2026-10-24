@@ -71,7 +71,7 @@ try {
   const globalOp = async () => (await live.ended("global")).id;
   /** A global write with `headers`: admitted, then shown completed. */
   const writeGlobal = async (write: OpArgs, headers: Record<string, string>) => {
-    const response = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+    const response = await fetch(`${origin}/api/v2/targets/global/ops`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify({ expect: await globalOp(), ...write }),
@@ -103,20 +103,20 @@ try {
 
   for (const attackOrigin of ["http://127.0.0.1:1", "https://evil.example", "null"]) {
     // A real write and real reads, refused for their origin alone.
-    const attack = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+    const attack = await fetch(`${origin}/api/v2/targets/global/ops`, {
       method: "POST",
       headers: { Origin: attackOrigin, "Content-Type": "application/x-www-form-urlencoded" },
       body: "unused=1",
     });
     assert.equal(attack.status, 403, `unexpected acceptance of ${attackOrigin}`);
-    const forged = await fetch(`${origin}/api/v2/scopes/global/ops`, {
+    const forged = await fetch(`${origin}/api/v2/targets/global/ops`, {
       method: "POST",
       headers: { Origin: attackOrigin, "Content-Type": "application/json" },
       body: JSON.stringify({ expect: await globalOp(), kind: "logout", args: {} }),
     });
     assert.equal(forged.status, 403, `unexpected acceptance of a JSON write from ${attackOrigin}`);
     assert.equal((await fetch(`${origin}/api/health`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin reads must also be denied");
-    assert.equal((await fetch(`${origin}/api/v2/stream?scope=global`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin streams must also be denied");
+    assert.equal((await fetch(`${origin}/api/v2/stream?follow=%2Fglobal`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin streams must also be denied");
     assert.equal(await listed(), true, "a rejected logout must not change Agent authentication");
   }
 
@@ -139,7 +139,7 @@ try {
   await verifyLargeRequestBody(origin, live);
 
   live.close();
-  const events = await fetch(`${origin}/api/v2/stream?scope=global`, { signal: observer.signal });
+  const events = await fetch(`${origin}/api/v2/stream?follow=%2Fglobal`, { signal: observer.signal });
   assert.equal(events.status, 200);
   const reader = events.body!.getReader();
   assert.equal((await reader.read()).done, false);
@@ -242,7 +242,7 @@ async function verifyLargeRequestBody(origin: string, client: SmokeClient): Prom
     { type: "audio", mimeType: "audio/wav", data: wav.toString("base64") },
   ] } });
   assert.ok(Buffer.byteLength(body) > 5 * 1024 * 1024);
-  const accepted = await postJson(`${origin}/api/v2/scopes/${encodeURIComponent(scope)}/ops`, { "Content-Type": "application/json" }, body);
+  const accepted = await postJson(`${origin}/api/v2/targets/sessions/${encodeURIComponent(sessionId)}/ops`, { "Content-Type": "application/json" }, body);
   assert.equal(accepted.status, 202, "a supported attachment must reach the prompt");
   const op = (JSON.parse(accepted.body) as { op: string }).op;
   const completed = await client.ended(scope, op);
