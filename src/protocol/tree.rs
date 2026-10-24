@@ -120,6 +120,22 @@ impl Node {
         self.srev
     }
 
+    /// An own field of an object node.
+    pub(crate) fn field(&self, name: &str) -> Option<&Value> {
+        match &self.body {
+            Body::Object { fields, .. } => fields.get(name),
+            _ => None,
+        }
+    }
+
+    /// The items of a list node.
+    pub(crate) fn items(&self) -> &[Node] {
+        match &self.body {
+            Body::List(items) => items,
+            _ => &[],
+        }
+    }
+
     /// The length of a list node.
     pub(crate) fn list_len(&self) -> Option<usize> {
         match &self.body {

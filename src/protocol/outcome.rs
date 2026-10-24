@@ -84,5 +84,30 @@ pub(crate) fn outcome(target: &TargetState, request: &Request) -> Outcome {
     Outcome::Unknown { reason: Reason::Expired }
 }
 
+/// What the tree publishes of `target`: `global`, `catalog` or `sessions/<id>` (the ID as in a
+/// path, escaped). `None` when the target is not in the tree.
+pub(crate) fn state_of(tree: &super::tree::Tree, target: &str) -> Option<TargetState> {
+    let node = tree.get(&format!("/{target}"))?;
+    let op = tree.get(&format!("/{target}/op"))?.as_value()?.0["id"].as_str()?.to_string();
+    let ops = tree
+        .get(&format!("/{target}/ops"))?
+        .items()
+        .iter()
+        .filter_map(|record| {
+            let (record, _) = record.as_value()?;
+            Some(Logged {
+                id: record["id"].as_str()?.to_string(),
+                after: record["after"].as_str().map(String::from),
+            })
+        })
+        .collect();
+    Some(TargetState {
+        instance: tree.instance().to_string(),
+        op,
+        held_since: node.field("heldSince").and_then(serde_json::Value::as_u64),
+        ops,
+    })
+}
+
 #[cfg(test)]
 mod tests;
