@@ -616,7 +616,6 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/v2/stream", get(feed_stream))
-        .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
         .route("/api/v2/sessions/{*read}", get(read_session))
         .route("/api/v2/nodes/{*node}", get(read_node))
         .route("/api/v2/targets/{*target}", get(read_target).post(write_target))
