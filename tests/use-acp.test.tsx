@@ -203,6 +203,18 @@ describe("revision 3 workspace, read side", () => {
     expect(posts[0].body).toEqual({});
   });
 
+  // #178: a restart the bridge refuses is shown, not dropped.
+  it("shows why a restart was refused", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({ agent: agent({ phase: "stopped" }) })));
+    await emit(catalogSnapshot());
+    respond = () => ({ status: 409, body: { error: { code: "not_allowed", message: "The Agent is starting" } } });
+    await act(async () => hook.reconnect());
+    await settle();
+    const error = hook.state.timeline.find((item) => item.type === "error");
+    expect((error as { message: string } | undefined)?.message).toContain("The Agent is starting");
+  });
+
   it("only follows again when the Agent is ready: no restart is sent", async () => {
     await mount("/");
     await emit(globalSnapshot());
