@@ -76,11 +76,12 @@ and a filesystem test asserts that a large valid context is preserved.
 
 ## 4a. The integrated tip
 
-Pushes to a branch like `experiment/protocol-v2` run no CI (only pull requests, `main` and tags do), and
-each pull request was validated against the tip it was based on. So the tip that results from
-merging them one after another was never run as such. The pull request that adds this section is
-based on the tip after the last merge (`ef9d834`) and changes nothing else, so its full run is the
-run of the integrated tip: all suites, coverage, the browser suite and the seven binaries.
+Each pull request is validated against the tip it was based on, so the tip that results from
+merging several one after another was never run as such. Pushes to `experiment/**` now run the
+whole validation (`.github/workflows/ci.yml`, #180), so every merge into
+`experiment/protocol-v2` is run as the tip it produces: all suites, coverage, the browser suite
+and the binaries of every target. (Before that, #174 validated one tip, `ef9d834`, once; a draft
+pull request runs only the fast checks, so such a run counts only once the pull request is ready.)
 
 ## 5. Where to start reading
 
