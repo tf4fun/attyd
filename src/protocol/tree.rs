@@ -32,6 +32,9 @@ pub(crate) enum Spec {
     },
     /// The set of keys, and one node per key.
     Map(BTreeMap<String, Spec>),
+    /// The child as it is now (an empty map if there is none): for a part of the tree another
+    /// step of the same commit derives, such as the views.
+    Keep,
     /// The length, and one node per index.
     List(Vec<Spec>),
 }
@@ -43,6 +46,7 @@ impl Spec {
             Spec::Object { .. } => 1,
             Spec::Map(_) => 2,
             Spec::List(_) => 3,
+            Spec::Keep => u8::MAX,
         }
     }
 
@@ -140,6 +144,14 @@ impl Node {
     pub(crate) fn list_len(&self) -> Option<usize> {
         match &self.body {
             Body::List(items) => Some(items.len()),
+            _ => None,
+        }
+    }
+
+    /// The shared value of a value node.
+    pub(crate) fn value_arc(&self) -> Option<Arc<Value>> {
+        match &self.body {
+            Body::Value(value, _) => Some(Arc::clone(value)),
             _ => None,
         }
     }
@@ -311,6 +323,7 @@ impl Node {
                 };
                 Body::Map(Node::reconcile_children(old_children, children, rev, path, ops))
             }
+            Spec::Keep => unreachable!("a kept part is a child of a commit"),
             Spec::List(items) => {
                 let old_items = match old_body {
                     Some(Body::List(items)) => Some(items.as_slice()),
@@ -413,6 +426,18 @@ impl Node {
         ops: &mut Vec<Op>,
         existing: bool,
     ) -> Node {
+        if matches!(spec, Spec::Keep) {
+            return match old {
+                Some(old) => old.clone(),
+                None => {
+                    let node = Node::reconcile(None, Spec::Map(BTreeMap::new()), rev, path, &mut Vec::new());
+                    if existing {
+                        ops.push(Op::Set { path: path.to_string(), value: node.to_value() });
+                    }
+                    node
+                }
+            };
+        }
         let comparable = old.filter(|old| old.kind() == spec.kind());
         if comparable.is_some() {
             return Node::reconcile(comparable, spec, rev, path, ops);
@@ -593,6 +618,45 @@ impl Tree {
 }
 
 impl Tree {
+    /// `commit_with_ops`, then the views: `derive` reads the tree as this commit makes it and
+    /// returns the `views` subtree, which is committed in the same revision (design §4.5). The
+    /// views already published keep their revisions where nothing changed.
+    pub(crate) fn commit_with_views(
+        &mut self,
+        mut root: BTreeMap<String, Spec>,
+        derive: impl FnOnce(&Tree) -> Spec,
+    ) -> Option<Committed> {
+        root.insert(VIEWS.to_string(), Spec::Keep);
+        self.commit_derived(Spec::Map(root), derive)
+    }
+
+    /// Only the views: the rest of the tree is as it is.
+    pub(crate) fn commit_views(&mut self, derive: impl FnOnce(&Tree) -> Spec) -> Option<Committed> {
+        let mut root: BTreeMap<String, Spec> = match &self.root.body {
+            Body::Map(children) => children.keys().map(|key| (key.clone(), Spec::Keep)).collect(),
+            _ => BTreeMap::new(),
+        };
+        root.insert(VIEWS.to_string(), Spec::Keep);
+        self.commit_derived(Spec::Map(root), derive)
+    }
+
+    fn commit_derived(&mut self, root: Spec, derive: impl FnOnce(&Tree) -> Spec) -> Option<Committed> {
+        let next = self.rev + 1;
+        let mut ops = Vec::new();
+        let made = Node::reconcile(Some(&self.root), root, next, "", &mut ops);
+        let mut candidate = Tree { instance: self.instance.clone(), rev: next, root: made };
+        let views = derive(&candidate);
+        candidate
+            .root
+            .replace_at(&[VIEWS.to_string()], views, next, "", &mut ops);
+        if candidate.root.srev < next {
+            return None;
+        }
+        self.root = candidate.root;
+        self.rev = next;
+        Some(Committed { rev: next, ops })
+    }
+
     /// Publishes `spec` as the subtree at `path`, leaving the rest of the tree as it is: a commit
     /// of one subtree, for state that changes outside the projection of the registry. `None`
     /// when it changes nothing, or when the path's parent does not exist.
@@ -609,6 +673,9 @@ impl Tree {
         Some(Committed { rev: next, ops })
     }
 }
+
+/// The top-level key of the derived views (design §4.5).
+pub(crate) const VIEWS: &str = "views";
 
 /// What a commit changed.
 #[derive(Debug, Clone, PartialEq)]

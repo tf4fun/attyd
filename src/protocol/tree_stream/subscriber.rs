@@ -8,6 +8,7 @@ use super::super::Op;
 use super::super::digest;
 use super::super::pacing::Pacer;
 use super::super::tree::{Committed, Tree};
+use super::super::views::{self, Gone, View};
 use super::params::{StreamQuery, session_of};
 use super::snapshot::snapshot_windowed;
 use super::windowed_ops::windowed;
@@ -31,6 +32,17 @@ struct PathState {
     queued: Option<u64>,
     /// Whether the path existed at the last event queued for it.
     present: bool,
+    /// A fixed view that ended: nothing follows its end.
+    over: bool,
+}
+
+/// Why `path`, if it is a fixed view, is over: the end it is finished by (design §4.5).
+fn fixed_end(tree: &Tree, path: &str) -> Option<End> {
+    let reason = match views::gone(tree, &View::of(path)?)? {
+        Gone::Absent => EndReason::Absent,
+        Gone::Replaced => EndReason::Replaced,
+    };
+    Some(End { reason, error: None })
 }
 
 pub(crate) struct Subscriber {
@@ -78,17 +90,21 @@ impl Subscriber {
         let mut changes = Vec::new();
         for follow in &query.follow {
             let have = follow.have.filter(|_| same_instance);
-            let mut state = PathState { window: follow.window, written: have, queued: None, present: false };
+            let mut state = PathState { window: follow.window, written: have, queued: None, present: false, over: false };
             match snapshot_windowed(tree, &follow.path, have, follow.window) {
                 Some(snapshot) => {
                     state.queued = Some(snapshot.at);
                     state.present = true;
                     changes.push(Change::Snapshot { path: follow.path.clone(), snapshot });
                 }
-                None => changes.push(Change::End {
-                    path: follow.path.clone(),
-                    end: End { reason: EndReason::Absent, error: None },
-                }),
+                None => {
+                    let fixed = fixed_end(tree, &follow.path);
+                    state.over = fixed.is_some();
+                    changes.push(Change::End {
+                        path: follow.path.clone(),
+                        end: fixed.unwrap_or(End { reason: EndReason::Absent, error: None }),
+                    });
+                }
             }
             paths.insert(follow.path.clone(), state);
         }
@@ -128,7 +144,7 @@ impl Subscriber {
 
     /// The paths followed and the directory given for the load of the session each is under.
     pub(crate) fn followed(&self) -> impl Iterator<Item = &str> {
-        self.paths.keys().map(String::as_str)
+        self.paths.iter().filter(|(_, state)| !state.over).map(|(path, _)| path.as_str())
     }
 
     pub(crate) fn cwd(&self) -> &BTreeMap<String, String> {
@@ -156,6 +172,17 @@ impl Subscriber {
     ) {
         let mut changes = Vec::new();
         for (path, state) in &mut self.paths {
+            if state.over {
+                continue;
+            }
+            // A fixed view that was not there yet may now be over for good.
+            if !state.present
+                && let Some(end) = fixed_end(tree, path)
+            {
+                state.over = true;
+                changes.push(Change::End { path: path.clone(), end });
+                continue;
+            }
             let direct: Vec<&Op> = committed
                 .ops
                 .iter()
@@ -184,8 +211,10 @@ impl Subscriber {
                         state.present = false;
                         state.queued = None;
                         self.pacer.settled(path);
-                        let end = session_of(path)
-                            .and_then(|session_id| ended.get(&session_id).cloned())
+                        let fixed = fixed_end(tree, path);
+                        state.over = fixed.is_some();
+                        let end = fixed
+                            .or_else(|| session_of(path).and_then(|session_id| ended.get(&session_id).cloned()))
                             .unwrap_or(End { reason: EndReason::Absent, error: None });
                         changes.push(Change::End { path: path.clone(), end });
                     }
@@ -255,7 +284,7 @@ impl Subscriber {
             .paths
             .iter_mut()
             .filter(|(path, state)| {
-                session_of(path).as_deref() == Some(session_id) && !state.present && tree.get(path).is_none()
+                session_of(path).as_deref() == Some(session_id) && !state.present && !state.over && tree.get(path).is_none()
             })
             .map(|(path, _)| Change::End { path: path.clone(), end: end.clone() })
             .collect();
@@ -310,6 +339,9 @@ impl Subscriber {
         self.queued_bytes = 0;
         let mut changes = Vec::new();
         for (path, state) in &mut self.paths {
+            if state.over {
+                continue;
+            }
             match snapshot_windowed(tree, path, state.written, state.window) {
                 Some(snapshot) => {
                     state.queued = Some(snapshot.at);
@@ -321,7 +353,9 @@ impl Subscriber {
                     state.queued = None;
                     state.present = false;
                     self.pacer.settled(path);
-                    let end = queued_ends.remove(path.as_str());
+                    let fixed = fixed_end(tree, path);
+                    state.over = fixed.is_some();
+                    let end = fixed.or_else(|| queued_ends.remove(path.as_str()));
                     if end.is_some() || state.written.is_some() {
                         changes.push(Change::End {
                             path: path.clone(),

@@ -75,6 +75,8 @@ pub(super) fn serve(state: &mut BridgeState) -> Option<Value> {
             || session_materialization(state, &session_id).is_some()
             || published(&state.protocol.publication, &session_id)
         {
+            // Nothing to load for a read of it: it is dealt with.
+            clear_pending(state, &session_id);
             continue;
         }
         if command.is_some() {
@@ -89,11 +91,18 @@ pub(super) fn serve(state: &mut BridgeState) -> Option<Value> {
                 format!("the session {session_id} is not held: its subscription needs a cwd"),
             );
             end_waiting(state, &session_id, EndReason::LoadFailed, Some(error));
+            clear_pending(state, &session_id);
             continue;
         };
+        clear_pending(state, &session_id);
         command = prepare_session_load(state, session_id, Some(cwd));
     }
     command
+}
+
+/// A read of `session_id` was dealt with: its load is started, or there is none to start.
+fn clear_pending(state: &BridgeState, session_id: &str) {
+    state.protocol.publication.lock().feed.clear_pending(session_id);
 }
 
 /// The sessions some subscription, of either stream, waits to have published,

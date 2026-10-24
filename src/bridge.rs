@@ -851,7 +851,10 @@ fn refresh_observer_timers(state: &mut BridgeState) {
     // Only a session the Agent can bring back is released, and only once it
     // is not needed (S6); a needed one counts as running work.
     let releasable = streams::releasable(state);
-    let followed = streams::followed(state);
+    let mut followed = streams::followed(state);
+    // A session a read touched counts as followed once, so that its release timer starts over
+    // when the read ends (protocol revision 4 §7.2).
+    followed.extend(state.protocol.publication.lock().feed.take_touched());
     let owners = state
         .sessions
         .iter_entries()

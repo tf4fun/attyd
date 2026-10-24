@@ -220,7 +220,6 @@ async fn a_segment_read_needs_a_version_and_a_text_position() {
         ("/api/v2/nodes/sessions/s1/entries/0/chunks/0/content/text/segments/0?at=999999", StatusCode::BAD_REQUEST),
         ("/api/v2/nodes/sessions/s1/entries/0/chunks/0/content/text/segments/0?at=1&at=2", StatusCode::BAD_REQUEST),
         ("/api/v2/nodes/sessions/s1/controls/segments/0?at=1", StatusCode::NOT_FOUND),
-        ("/api/v2/nodes/global", StatusCode::NOT_FOUND),
     ] {
         let (got, body) = read(&server, path).await;
         assert_eq!(got, status, "{path}: {body}");
@@ -356,4 +355,86 @@ async fn a_delayed_prompt_is_open_then_a_repeat_runs_it_once_and_the_delayed_cop
     let (_, body) = read(&server, &ask(OTHER)).await;
     assert_eq!(body, json!({ "outcome": "superseded" }), "a new identity for the same input is never open now");
     link.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+}
+
+// --- reads of a node (design §7.1) -------------------------------------------------------
+
+#[tokio::test]
+async fn a_read_is_what_a_streams_first_event_carries_or_unchanged_for_the_version_held() {
+    let (server, _link) = Server::start(json!({})).await;
+    let (status, body) = read(&server, "/api/v2/nodes/global").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let instance = body["instance"].as_str().unwrap().to_string();
+    let snapshot = &body["change"]["snapshot"];
+    assert_eq!(body["change"]["path"], "/global");
+    assert_eq!(snapshot["base"], Value::Null);
+    assert_eq!(snapshot["node"]["v"]["agent"]["phase"], "ready");
+    let at = snapshot["at"].as_u64().unwrap();
+
+    let (_, body) = read(&server, &format!("/api/v2/nodes/global?instance={instance}&have={at}")).await;
+    assert_eq!(body["unchanged"], true, "{body}");
+    assert!(body.get("change").is_none() && body["rev"].as_u64().is_some());
+    // Another instance: whatever the version, the whole path.
+    let (_, body) = read(&server, &format!("/api/v2/nodes/global?instance=AnotherInstance0000000&have={at}")).await;
+    assert!(body.get("unchanged").is_none() && body["change"]["snapshot"]["base"] == Value::Null, "{body}");
+    // The nodes under it are paths too.
+    let (_, body) = read(&server, "/api/v2/nodes/global/agent").await;
+    assert_eq!(body["change"]["end"]["reason"], "absent", "agent is a field of global, not a node");
+}
+
+#[tokio::test]
+async fn a_read_with_a_bad_parameter_is_refused() {
+    let (server, _link) = Server::start(json!({})).await;
+    for query in ["have=1", "instance=I&have=x", "window=10", "bogus=1", "instance=I&instance=J"] {
+        let (status, body) = read(&server, &format!("/api/v2/nodes/global?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_read_opens_a_session_the_bridge_does_not_hold_with_the_cwd_it_gave() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let (status, body) = read(&server, &format!("/api/v2/nodes/sessions/saved/entries?cwd={}", query_scope(CWD))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["change"]["end"]["reason"], "absent", "nothing yet: the load is only started");
+    let load = link.serve_load("saved", &turns(&[("hello", "hi there")])).await;
+    assert_eq!(load["params"]["cwd"], CWD);
+
+    // Polling goes on until the session is there.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (_, body) = read(&server, &format!("/api/v2/nodes/sessions/saved/entries?cwd={}", query_scope(CWD))).await;
+        if let Some(entries) = body["change"]["snapshot"]["node"]["v"].as_array()
+            && entries.len() == 2
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never loaded: {body}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_read_of_a_view_materializes_it_and_a_second_read_finds_it_unchanged() {
+    let (server, mut link) = Server::start(json!({})).await;
+    server.create(&mut link, "s1").await;
+    link.update(
+        "s1",
+        json!({"sessionUpdate": "agent_message_chunk", "messageId": "m", "content": text("hello")}),
+    )
+    .await;
+    let path = "/api/v2/nodes/views/s1/output/latest";
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (instance, at) = loop {
+        let (status, body) = read(&server, path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let view = &body["change"]["snapshot"]["node"]["v"];
+        if view["text"] == "hello" {
+            break (body["instance"].as_str().unwrap().to_string(), body["change"]["snapshot"]["at"].as_u64().unwrap());
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never arrived: {body}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let (_, body) = read(&server, &format!("{path}?instance={instance}&have={at}")).await;
+    assert_eq!(body["unchanged"], true, "the view was kept for the poll: {body}");
 }

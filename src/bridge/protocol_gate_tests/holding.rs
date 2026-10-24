@@ -371,3 +371,42 @@ async fn review_a_sessions_own_admitted_operation_keeps_it_held_before_dispatch(
     assert!(!peer.released(&scope), "the session's own operation holds it");
     assert_eq!(peer.live(&scope)["op"]["id"], op);
 }
+
+#[tokio::test]
+async fn a_client_that_only_polls_opens_a_session_holds_it_while_it_polls_and_lets_it_go_after() {
+    let replay = turns(&[("one", "1")]);
+    let mut peer = Peer::start_with(loadable(), json!([]), |options| {
+        options.session_unobserved_timeout = 1;
+    })
+    .await;
+    let scope = session(SAVED);
+    let path = format!("/sessions/{SAVED}/entries");
+
+    // The first poll finds nothing yet and starts the load with the directory it gave.
+    let first = peer.poll(&path, Some(CWD)).await;
+    assert_eq!(first["changes"][0]["end"]["reason"], "absent");
+    peer.serve_load(SAVED, &replay).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let polled = peer.poll(&path, Some(CWD)).await;
+        if polled["changes"][0]["snapshot"]["node"]["v"].as_array().is_some_and(|entries| entries.len() == 2) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never loaded: {polled}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Polling every half second, within the timer of one second, keeps the session for longer
+    // than the timer.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        peer.poll(&path, None).await;
+        assert!(!peer.released(&scope), "a poll restarts the unobserved timer");
+    }
+
+    // Once the client stops, the existing rule releases the session after the timeout.
+    let close = peer.request("session/close").await;
+    assert_eq!(close["params"]["sessionId"], SAVED);
+    peer.reply(&close, json!({})).await;
+    peer.until("the session is released", |peer| peer.released(&scope)).await;
+}
