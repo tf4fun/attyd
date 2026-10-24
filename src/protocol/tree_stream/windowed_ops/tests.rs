@@ -35,12 +35,22 @@ fn root(texts: &[String]) -> BTreeMap<String, Spec> {
     )])
 }
 
-/// The bytes of window text an op carries.
+/// The most bytes of one window's text an op carries.
 fn carried(op: &Op) -> usize {
+    fn windows(value: &Value) -> usize {
+        match value {
+            Value::Object(members) if members.contains_key("offset") && members.contains_key("before") => {
+                members["text"].as_str().map_or(0, str::len)
+            }
+            Value::Object(members) => members.values().map(windows).max().unwrap_or(0),
+            Value::Array(items) => items.iter().map(windows).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
     match op {
-        Op::Set { value, .. } => serde_json::to_string(value).unwrap().len(),
+        Op::Set { value, .. } => windows(value),
         Op::Append { tail: AppendTail::Text { text }, .. } => text.len(),
-        Op::Append { tail: AppendTail::Values { values }, .. } => serde_json::to_string(values).unwrap().len(),
+        Op::Append { tail: AppendTail::Values { values }, .. } => values.iter().map(windows).max().unwrap_or(0),
         _ => 0,
     }
 }
@@ -60,7 +70,7 @@ fn follow(steps: Vec<Vec<String>>) -> Vec<Vec<Op>> {
         let ops: Vec<Op> = committed.ops.iter().flat_map(|op| windowed(&tree, op, N, &mut replaced)).collect();
         for op in &ops {
             diff::apply(&mut held, op).unwrap_or_else(|error| panic!("step {index}: {op:?}: {error:?}"));
-            assert!(carried(op) < N + L + 512, "step {index}: an op carries {} bytes", carried(op));
+            assert!(carried(op) < N + L, "step {index}: an op carries {} bytes of one window", carried(op));
         }
         assert_eq!(held, tree.root().to_value_windowed(N), "step {index}");
         all.push(ops);
@@ -93,7 +103,7 @@ fn small_appends_are_appends_with_a_new_length_and_trim_when_the_window_passes_a
             if let Op::Trim { path, .. } = op {
                 assert!(matches!(&step[n + 1], Op::Set { path, .. } if path.ends_with("/offset")));
                 assert!(matches!(&step[n + 2], Op::Set { path, .. } if path.ends_with("/before")));
-                assert!(path.ends_with("/text/text"));
+                assert!(path.ends_with("/text"));
             }
         }
     }
