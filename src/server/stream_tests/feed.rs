@@ -3,7 +3,7 @@
 use super::*;
 
 /// `GET /api/v2/stream?…`: the status and the SSE body.
-async fn open(server: &Server, query: &str) -> (StatusCode, Sse) {
+pub(super) async fn open(server: &Server, query: &str) -> (StatusCode, Sse) {
     let response = server.send(&format!("/api/v2/stream?{query}")).await;
     let status = response.status();
     if status == StatusCode::OK {
@@ -17,7 +17,7 @@ async fn open(server: &Server, query: &str) -> (StatusCode, Sse) {
 }
 
 /// The next event of the stream, skipping comments (the heartbeat).
-async fn event(sse: &mut Sse, period: Duration) -> Option<Value> {
+pub(super) async fn event(sse: &mut Sse, period: Duration) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + period;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
