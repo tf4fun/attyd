@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, json};
 
 use super::*;
+use crate::protocol::hash;
 
 fn fields(value: Value) -> Map<String, Value> {
     value.as_object().expect("an object").clone()
@@ -133,7 +134,7 @@ fn an_unchanged_value_keeps_its_identity() {
     let mut tree = Tree::new("i");
     let shared = Arc::new(json!({ "text": "a" }));
     let spec = |value: &Arc<Value>| {
-        BTreeMap::from([("x".to_string(), Spec::List(vec![Spec::Value(value.clone())]))])
+        BTreeMap::from([("x".to_string(), Spec::List(vec![Spec::Value(value.clone(), TextRule::None)]))])
     };
     tree.commit(spec(&shared));
     tree.commit(spec(&Arc::new(json!({ "text": "a" }))));
@@ -187,4 +188,81 @@ fn check(tree: &Tree, path: &str, then: &Value, now: &Value, rev: u64) {
             check(tree, &format!("{path}/{index}"), then, now, rev);
         }
     }
+}
+
+// --- hashes (design §5) --------------------------------------------------------------
+
+#[test]
+fn a_node_hashes_like_the_hash_functions_over_its_content() {
+    let mut tree = Tree::new("i");
+    let entry = json!({ "kind": "message", "role": "agent",
+        "chunks": [{ "content": { "type": "text", "text": "hi" } }] });
+    tree.commit(BTreeMap::from([(
+        "s".to_string(),
+        Spec::object(
+            fields(json!({ "title": "t" })),
+            [
+                ("controls", Spec::value(json!({ "modes": null }))),
+                ("entries", Spec::List(vec![Spec::text_value(Arc::new(entry.clone()), TextRule::Entry)])),
+            ],
+        ),
+    )]));
+    let entry_hash = hash::value_hash(TextRule::Entry, &entry);
+    let controls = hash::value_hash(TextRule::None, &json!({ "modes": null }));
+    let object = hash::object_hash(
+        &fields(json!({ "title": "t" })),
+        [("controls", controls), ("entries", hash::list_hash([&entry_hash]))],
+    );
+    assert_eq!(tree.get("/s/entries/0").unwrap().hash(), entry_hash);
+    assert_eq!(tree.get("/s").unwrap().hash(), object);
+    assert_eq!(tree.root().hash(), hash::map_hash([("s", object)]));
+}
+
+#[test]
+fn a_hash_depends_on_content_and_not_on_revisions() {
+    let (mut a, mut b) = (Tree::new("a"), Tree::new("b"));
+    a.commit(root(&[("s", session("t", &["x"]))]));
+    a.commit(root(&[("s", session("t", &["x", "y"]))]));
+    b.commit(root(&[("s", session("t", &["x", "y"]))]));
+    assert_ne!(a.rev(), b.rev());
+    assert_eq!(a.root().hash(), b.root().hash());
+    assert_eq!(a.get("/sessions/s").unwrap().hash(), b.get("/sessions/s").unwrap().hash());
+}
+
+#[test]
+fn a_change_changes_the_hashes_of_its_path_and_no_other() {
+    let mut tree = Tree::new("i");
+    tree.commit(root(&[("s", session("t", &["a", "b"]))]));
+    let before = |tree: &Tree, path: &str| tree.get(path).unwrap().hash();
+    let (e0, e1, list, global) = (
+        before(&tree, "/sessions/s/entries/0"),
+        before(&tree, "/sessions/s/entries/1"),
+        before(&tree, "/sessions/s/entries"),
+        before(&tree, "/global"),
+    );
+    let root_before = tree.root().hash();
+    tree.commit(root(&[("s", session("t", &["a", "c"]))]));
+    assert_eq!(before(&tree, "/sessions/s/entries/0"), e0);
+    assert_ne!(before(&tree, "/sessions/s/entries/1"), e1);
+    assert_ne!(before(&tree, "/sessions/s/entries"), list);
+    assert_eq!(before(&tree, "/global"), global);
+    assert_ne!(tree.root().hash(), root_before);
+}
+
+#[test]
+fn an_unchanged_value_keeps_the_hash_it_computed() {
+    let mut tree = Tree::new("i");
+    let value = Arc::new(json!({ "text": "a" }));
+    let spec = |value: &Arc<Value>| BTreeMap::from([("x".to_string(), Spec::Value(value.clone(), TextRule::None))]);
+    tree.commit(spec(&value));
+    let first = tree.get("/x").unwrap();
+    first.hash();
+    assert!(first.hash.get().is_some());
+    tree.commit(spec(&Arc::new(json!({ "text": "a" }))));
+    tree.commit(BTreeMap::from([
+        ("x".to_string(), Spec::Value(value.clone(), TextRule::None)),
+        ("y".to_string(), Spec::value(json!(1))),
+    ]));
+    assert!(tree.get("/x").unwrap().hash.get().is_some(), "computed once for the content");
+    assert!(tree.get("/y").unwrap().hash.get().is_none(), "computed when asked for");
 }
