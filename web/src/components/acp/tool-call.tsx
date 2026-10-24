@@ -125,55 +125,60 @@ export function ToolCallCard({
         </span>
       </header>
       <div id={bodyId} className="tool-body" data-thread-searchable hidden={!open}>
-        {call.rawInput !== undefined ? (
-          <section className="tool-data-section tool-input">
-            <header>{t("tool.input")}</header>
-            <StructuredData value={call.rawInput} />
-          </section>
-        ) : null}
-        <section className="tool-data-section tool-output">
-          <header>{t("tool.output")}</header>
-          {visibleContent.length > 0 ? (
-            <>
-              <div className="tool-output-content">
-                {visibleContent.map(({ item, index }) => (
-                  <ToolContentView key={index} content={item} terminalSnapshots={terminalSnapshots} />
-                ))}
+        {/* A closed body is not rendered: long outputs cost nothing until opened. */}
+        {open ? (
+          <>
+            {call.rawInput !== undefined ? (
+              <section className="tool-data-section tool-input">
+                <header>{t("tool.input")}</header>
+                <StructuredData value={call.rawInput} />
+              </section>
+            ) : null}
+            <section className="tool-data-section tool-output">
+              <header>{t("tool.output")}</header>
+              {visibleContent.length > 0 ? (
+                <>
+                  <div className="tool-output-content">
+                    {visibleContent.map(({ item, index }) => (
+                      <ToolContentView key={index} content={item} terminalSnapshots={terminalSnapshots} />
+                    ))}
+                  </div>
+                  {call.rawOutput !== undefined ? (
+                    <details className="tool-additional-output">
+                      <summary><ChevronRight size={12} />{t("tool.additionalOutput")}</summary>
+                      <StructuredData value={call.rawOutput} />
+                    </details>
+                  ) : null}
+                </>
+              ) : call.rawOutput !== undefined ? (
+                <StructuredData value={call.rawOutput} />
+              ) : (
+                <p className="tool-output-empty">{emptyOutputMessage(status, t)}</p>
+              )}
+            </section>
+            <footer className={debugOpen ? "message-meta message-meta-open component-debug-meta" : "message-meta component-debug-meta"}>
+              <div className="message-meta-actions">
+                <DebugInfoButton
+                  expanded={debugOpen}
+                  label={t("tool.info")}
+                  onClick={() => setDebugOpen((value) => !value)}
+                />
               </div>
-              {call.rawOutput !== undefined ? (
-                <details className="tool-additional-output">
-                  <summary><ChevronRight size={12} />{t("tool.additionalOutput")}</summary>
-                  <StructuredData value={call.rawOutput} />
-                </details>
-              ) : null}
-            </>
-          ) : call.rawOutput !== undefined ? (
-            <StructuredData value={call.rawOutput} />
-          ) : (
-            <p className="tool-output-empty">{emptyOutputMessage(status, t)}</p>
-          )}
-        </section>
-        <footer className={debugOpen ? "message-meta message-meta-open component-debug-meta" : "message-meta component-debug-meta"}>
-          <div className="message-meta-actions">
-            <DebugInfoButton
-              expanded={debugOpen}
-              label={t("tool.info")}
-              onClick={() => setDebugOpen((value) => !value)}
-            />
-          </div>
-          <DebugInfoPanel
-            label={t("tool.debugInfo")}
-            hidden={!debugOpen}
-            entries={[
-              { label: t("tool.callId"), value: call.toolCallId, format: "text" },
-              ...(call.name ? [{ label: t("tool.name"), value: call.name, format: "text" as const }] : []),
-              ...(call.locations?.length ? [{ label: t("tool.locations"), value: call.locations }] : []),
-              ...(annotations.length ? [{ label: t("tool.annotations"), value: annotations }] : []),
-              ...(terminals.length ? [{ label: t("tool.terminals"), value: terminals }] : []),
-              { label: t("tool.events"), value: item.raw },
-            ]}
-          />
-        </footer>
+              <DebugInfoPanel
+                label={t("tool.debugInfo")}
+                hidden={!debugOpen}
+                entries={[
+                  { label: t("tool.callId"), value: call.toolCallId, format: "text" },
+                  ...(call.name ? [{ label: t("tool.name"), value: call.name, format: "text" as const }] : []),
+                  ...(call.locations?.length ? [{ label: t("tool.locations"), value: call.locations }] : []),
+                  ...(annotations.length ? [{ label: t("tool.annotations"), value: annotations }] : []),
+                  ...(terminals.length ? [{ label: t("tool.terminals"), value: terminals }] : []),
+                  { label: t("tool.events"), value: item.raw },
+                ]}
+              />
+            </footer>
+          </>
+        ) : null}
       </div>
     </section>
   );

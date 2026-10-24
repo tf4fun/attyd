@@ -56,7 +56,7 @@ describe("Markdown rendering", () => {
     expect(container.textContent).toContain("changed");
   });
 
-  it("does not parse a tool's output again when the tool updates", async () => {
+  it("parses a tool's output only while it is open, once across updates", async () => {
     const render = (call: Partial<ToolCall>) => act(async () => root.render(<ToolCallCard item={{
       id: "tool:fixture",
       type: "tool",
@@ -70,6 +70,15 @@ describe("Markdown rendering", () => {
     }} />));
     await render({ status: "in_progress" });
     await render({ status: "completed" });
+    const card = container.querySelector<HTMLElement>(".tool-card")!;
+    const body = card.querySelector<HTMLElement>(".tool-body")!;
+    expect(body.hidden).toBe(true);
+    expect(body.childElementCount).toBe(0);
+    expect(parsed).toEqual([]);
+
+    await act(async () => card.querySelector<HTMLButtonElement>(".tool-disclosure")!.click());
+    expect(body.hidden).toBe(false);
+    expect(body.querySelector(".tool-output table")).not.toBeNull();
     await render({ status: "completed", rawOutput: { done: true } });
     expect(parsed).toEqual(["| a |\n| - |\n| 1 |"]);
   });

@@ -381,6 +381,99 @@ describe("ACP interactive UI contract", () => {
       .toEqual(locations);
   });
 
+  it("renders zero-based tool locations, diffs, and terminal references faithfully", async () => {
+    await render(root, (
+      <Conversation
+        timeline={[{
+          id: "tool:fixture",
+          type: "tool",
+          call: {
+            sessionUpdate: "tool_call",
+            toolCallId: "fixture",
+            title: "shell · cat /workspace/fixture.ts",
+            kind: "execute",
+            status: "completed",
+            rawInput: { command: "cat /workspace/fixture.ts", timeoutMs: 10_000 },
+            locations: [{ path: "/workspace/fixture.ts", line: 0 }],
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: "**literal tool output**\n\n- first result",
+                },
+              },
+              {
+                type: "diff",
+                path: "/workspace/fixture.ts",
+                oldText: "before",
+                newText: "after",
+              },
+              { type: "terminal", terminalId: "terminal-1" },
+            ],
+          },
+          raw: [],
+        }, {
+          id: "tool:structured",
+          type: "tool",
+          call: {
+            toolCallId: "structured",
+            title: "fetch · Load project metadata",
+            kind: "fetch",
+            status: "completed",
+            rawInput: { uri: "https://example.test/project" },
+            rawOutput: { status: 200, project: "attyd" },
+          },
+          raw: [{ update: { sessionUpdate: "tool_call" } }],
+        }]}
+        terminalSnapshots={[{
+          sessionId: "session",
+          terminalId: "terminal-1",
+          output: "command output",
+          truncated: true,
+          exitStatus: { exitCode: 0 },
+          released: true,
+        }]}
+      />
+    ));
+    for (const disclosure of container.querySelectorAll<HTMLElement>(".tool-disclosure")) await click(disclosure);
+    const html = container.innerHTML;
+
+    expect(html).toContain("Locations");
+    expect(html).toContain('"line": 0');
+    expect(html).toContain('class="change-review-line line-removed"');
+    expect(html).toContain('class="change-review-line line-added"');
+    expect(html).toContain("before");
+    expect(html).toContain("after");
+    expect(html).toContain("terminal-1");
+    expect(html).toContain("command output");
+    expect(html).toContain("Completed");
+    expect(html).toContain("Earlier output was truncated.");
+    expect(html).toContain('<div class="structured-scalar structured-markdown">');
+    expect(html).toContain("<strong>literal tool output</strong>");
+    expect(html).toContain("<li>first result</li>");
+    expect(html).toContain('data-tool-status="completed"');
+    expect(html).toContain('data-live="false"');
+    expect(html).toContain('aria-label="Tool status: Completed"');
+    expect(html).toContain('<strong title="shell · cat /workspace/fixture.ts">shell · cat /workspace/fixture.ts</strong>');
+    expect(html).toContain('<strong title="fetch · Load project metadata">fetch · Load project metadata</strong>');
+    expect(html).not.toContain("Description");
+    expect(html).not.toContain('class="locations"');
+    expect(html).toContain("Input");
+    expect(html).toContain("command");
+    expect(html).toContain("timeoutMs");
+    expect(html).toContain("Output");
+    expect(html).toContain("status");
+    expect(html).toContain("project");
+    expect(html).toContain("attyd");
+    expect(html.match(/class="structured-data"/g)?.length).toBeGreaterThanOrEqual(3);
+    expect(html).toContain('aria-label="Tool info"');
+    expect(html).toContain('aria-label="Tool debug information"');
+    expect(html).toContain("Tool call ID");
+    expect(html).toContain("Latest source event");
+    expect(html).not.toContain("open=\"\"");
+  });
+
   it("keeps ACP tools collapsed by default and preserves manual disclosure", async () => {
     const pendingTool = {
       id: "tool:inspect",
