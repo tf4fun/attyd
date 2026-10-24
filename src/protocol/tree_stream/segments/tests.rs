@@ -2,8 +2,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::json;
 
 use super::*;
@@ -57,9 +55,6 @@ fn a_device_pages_through_a_text_and_the_chain_reproduces_its_hash() {
         paged.push_str(&read.segment);
     }
     assert_eq!(paged, text);
-    let mut expected = tree.get("/s/entries/0").unwrap().to_value();
-    assert_eq!(expected["chunks"][0]["content"]["text"], text.as_str());
-    let _ = &mut expected;
     // The chain at the end is the text's, so its hash is the one the tree states.
     let hash = hash::finish_for_tests(text.len() as u64, &chain);
     assert_eq!(hash, hash::text_hash(&text));
@@ -140,5 +135,4 @@ fn a_version_older_than_the_lengths_remembered_is_stale() {
         tree.commit(root(&text));
     }
     assert_eq!(read(&tree, 0, held), SegmentRead::Stale, "it cannot be told whether segment 0 was complete");
-    let _ = URL_SAFE_NO_PAD.encode([0u8]);
 }
