@@ -535,7 +535,8 @@ Since then (#150–#156): a catalog page keeps the Agent's `_meta` (#150); a dra
 request runs only the fast checks and the full validation starts when it is marked ready
 (#151); attachment identity is one definition, the hash of the block's exact form, for
 a prompt's references (#152) and for the read, whose body is those bytes (#153), which
-the client now verifies before showing anything (#156); the independent acceptance
+the client now verifies before showing anything (#156), and the running operation's input
+names an attachment by that same ID, `_meta` included (#184); the independent acceptance
 rows for concurrent answers (#154) and for integers beyond 2^53 in document digests
 (#155) have their tests.
 
@@ -565,12 +566,13 @@ Deviations from the plan, on purpose:
 
 ### 7.4 Second milestone: bridge-to-client replication
 
-Status (2026-10-21): the design is proposed as [protocol revision 3](protocol.md):
+Status: implemented ([§7.5](#75-implementation-status-2026-10-23)); the design, proposed
+2026-10-21, is [protocol revision 3](protocol.md):
 replication of the memory model's documents with `epoch`/`rev`, differential
 snapshots, client-computed digests at snapshots and checkpoints, client-chosen
 operation IDs and results in the document. Its acceptance cases are
-[protocol §12.4](protocol.md#124-independent-acceptance). Implementation follows the
-first-layer gate.
+[protocol §12.4](protocol.md#124-independent-acceptance). It was implemented after
+the first-layer gate.
 
 This stage designs **简易 Agent 交互协议**, the project's private protocol between
 FE/other presentation clients and the bridge. ACP continues to govern the bridge's
