@@ -111,9 +111,11 @@ wire design is reviewed:
   Ordinary increments are computed at enqueue time from the queued tail; each
   follows the preceding queued increment. A resync is computed from the baseline.
   A queued event never advances the delivery baseline.
-- **Coalescing.** At the existing 1 MiB queue budget, replace a queued suffix for
-  each extant scope with one alignment from the baseline. Its target becomes the
-  queued tail. Preserve a queued `end`, with nothing following for that scope.
+- **Coalescing.** When the events queued besides snapshots pass the 1 MiB budget,
+  replace a queued suffix for each extant scope with one alignment from the baseline.
+  Its target becomes the queued tail. Preserve a queued `end`, with nothing following
+  for that scope. A scope has at most one queued snapshot, so snapshots do not count
+  against the budget: a snapshot larger than it is not rebuilt on every commit.
 - **Heartbeats.** The baseline sends an SSE comment after 15 seconds of idleness.
 - **Holding.** A session subscription is a lease while its stream is open. Loading
   an unheld session follows admission; occupation delays it. Global/catalog

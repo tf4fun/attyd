@@ -141,6 +141,10 @@ impl Encoded {
         Arc::unwrap_or_clone(self.event)
     }
 
+    fn is_snapshot(&self) -> bool {
+        matches!(*self.event, StreamEvent::Snapshot { .. })
+    }
+
     /// The event's JSON, as the stream writes it.
     pub(crate) fn json(&self) -> Arc<str> {
         Arc::clone(&self.json)
@@ -167,6 +171,11 @@ pub(crate) struct Subscriber {
     scopes: BTreeMap<String, ScopeState>,
     queue: VecDeque<Encoded>,
     queued_bytes: usize,
+    /// The bytes of the snapshots among them. A scope has at most one queued (each is
+    /// queued in place of what was queued of its scope), so they are bounded by the
+    /// documents and do not count against the budget: coalescing them again would only
+    /// build the same snapshots anew.
+    snapshot_bytes: usize,
 }
 
 impl Subscriber {
@@ -187,6 +196,7 @@ impl Subscriber {
                 .collect(),
             queue: VecDeque::new(),
             queued_bytes: 0,
+            snapshot_bytes: 0,
         }
     }
 
@@ -201,20 +211,27 @@ impl Subscriber {
 
     fn push(&mut self, encoded: Encoded) {
         self.queued_bytes += encoded.json.len();
+        if encoded.is_snapshot() {
+            self.snapshot_bytes += encoded.json.len();
+        }
         self.queue.push_back(encoded);
     }
 
     /// Drops what is queued of `scope`.
     fn clear(&mut self, scope: &str) {
-        let mut removed = 0;
+        let (mut removed, mut snapshots) = (0, 0);
         self.queue.retain(|queued| {
             let keep = queued.event.scope() != scope;
             if !keep {
                 removed += queued.json.len();
+                if queued.is_snapshot() {
+                    snapshots += queued.json.len();
+                }
             }
             keep
         });
         self.queued_bytes -= removed;
+        self.snapshot_bytes -= snapshots;
     }
 
     /// Queues the snapshot `engine` has for `scope`, from the version held.
@@ -303,6 +320,9 @@ impl Subscriber {
     pub(crate) fn next_encoded(&mut self) -> Option<Encoded> {
         let queued = self.queue.pop_front()?;
         self.queued_bytes -= queued.json.len();
+        if queued.is_snapshot() {
+            self.snapshot_bytes -= queued.json.len();
+        }
         if let Some(state) = self.scopes.get_mut(queued.event.scope()) {
             match &*queued.event {
                 StreamEvent::Snapshot { snapshot, .. } => {
@@ -349,8 +369,9 @@ impl Subscriber {
         self.queued_bytes
     }
 
+    /// Whether the events queued besides the snapshots exceed the budget.
     pub(crate) fn over_budget(&self) -> bool {
-        self.queued_bytes > QUEUE_BUDGET
+        self.queued_bytes - self.snapshot_bytes > QUEUE_BUDGET
     }
 }
 

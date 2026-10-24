@@ -250,3 +250,30 @@ fn an_event_is_encoded_once_for_every_subscriber() {
     assert!(Arc::ptr_eq(&a.json(), &b.json()));
     assert_eq!(&*a.json(), serde_json::to_string(&event).unwrap());
 }
+
+// #181: a coalesced snapshot larger than the budget is not built again on the next
+// commit; only events queued after it count against the budget.
+#[test]
+fn a_snapshot_larger_than_the_budget_is_not_coalesced_again() {
+    let mut engine = Engine::default();
+    let big = "x".repeat(QUEUE_BUDGET);
+    published(&mut engine, "E1", &["a", &big]);
+    let mut subscriber = Subscriber::new(&subscribed(None));
+    subscriber.align(&engine);
+    assert!(subscriber.queued_bytes() > QUEUE_BUDGET);
+    assert!(!subscriber.over_budget());
+    let Commit::Ops(event) = published(&mut engine, "E1", &["a", &big, "b"]) else {
+        panic!("ops expected");
+    };
+    subscriber.publish(&event);
+    assert!(!subscriber.over_budget(), "a small event behind a big snapshot");
+    assert_eq!(subscriber.queued(), 2);
+    let Commit::Ops(event) = published(&mut engine, "E1", &["a", &big, "b", &big]) else {
+        panic!("ops expected");
+    };
+    subscriber.publish(&event);
+    assert!(subscriber.over_budget(), "events past the budget behind it");
+    subscriber.coalesce(&engine);
+    assert_eq!(subscriber.queued(), 1);
+    assert!(!subscriber.over_budget());
+}
