@@ -3,7 +3,7 @@
 use super::recovery::initialized;
 use super::*;
 
-const RESTART: &str = "/api/v2/scopes/global/actions/restart";
+const RESTART: &str = "/api/v2/targets/global/actions/restart";
 
 /// Events until the Agent is in one of `phases`.
 async fn until_phase(stream: &mut Watch, phases: &[&str]) {
@@ -85,8 +85,8 @@ async fn restart_while_the_connection_initializes_is_not_allowed() {
 #[tokio::test]
 async fn restart_belongs_to_global_and_takes_an_object() {
     let (server, _link) = Bench::start(json!({})).await;
-    for scope in ["catalog", "session%2Fs"] {
-        let path = format!("/api/v2/scopes/{scope}/actions/restart");
+    for scope in ["catalog", "sessions/s"] {
+        let path = format!("/api/v2/targets/{scope}/actions/restart");
         let (status, body) = server.call(Method::POST, &path, Some(json!({}))).await;
         not_found(status, &body, &format!("restart in {scope}"));
     }

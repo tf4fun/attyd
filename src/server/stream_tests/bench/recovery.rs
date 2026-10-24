@@ -114,7 +114,7 @@ async fn sign_in(address: SocketAddr) {
     let started = send(
         address,
         Method::POST,
-        "/api/v2/scopes/global/ops",
+        "/api/v2/targets/global/ops",
         Some(json!({
             "expect": expect,
             "kind": "terminal_login",
@@ -137,7 +137,7 @@ async fn sign_in(address: SocketAddr) {
     let input = send(
         address,
         Method::POST,
-        &format!("/api/v2/scopes/global/resources/{login}/input"),
+        &format!("/api/v2/targets/global/resources/{login}/input"),
         Some(json!({"data": "open-sesame\r"})),
     )
     .await;
@@ -512,8 +512,10 @@ async fn review_shutdown_during_initialize_publishes_a_final_agent_before_closin
     link.close().await;
     for message in String::from_utf8(delivered).unwrap().split("\n\n") {
         if let Some(event) = Watch::parse(message) {
-            assert_eq!(event["scope"], "global", "{event}");
-            assert!(event.get("end").is_none(), "{event}");
+            for change in event["changes"].as_array().into_iter().flatten() {
+                assert_eq!(change["path"], "/global", "{event}");
+                assert!(change.get("end").is_none(), "{event}");
+            }
             stream.take(&event);
         }
     }

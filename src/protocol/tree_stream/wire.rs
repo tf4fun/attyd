@@ -2,6 +2,8 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+#[cfg(test)]
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::super::Op;
@@ -9,6 +11,7 @@ use super::super::tree_doc::ErrorSummary;
 
 /// One event: the first of a stream names its `instance`; a commit or a catch-up carries
 /// `changes`; a checkpoint carries `check`.
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20,6 +23,7 @@ pub(crate) struct Event {
     pub check: Option<Vec<Check>>,
 }
 
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(crate) enum Change {
@@ -37,6 +41,7 @@ impl Change {
     }
 }
 
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Check {
     pub path: String,
@@ -44,6 +49,7 @@ pub(crate) struct Check {
     pub hash: String,
 }
 
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct End {
     pub reason: EndReason,
@@ -51,6 +57,7 @@ pub(crate) struct End {
     pub error: Option<ErrorSummary>,
 }
 
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EndReason {
@@ -61,6 +68,7 @@ pub(crate) enum EndReason {
     Replaced,
 }
 
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Snapshot {
     /// The `have` it builds on; `null` replaces everything.
@@ -72,6 +80,7 @@ pub(crate) struct Snapshot {
 }
 
 /// A node of a snapshot (§6.3).
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(crate) enum SNode {

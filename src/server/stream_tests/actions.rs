@@ -1,9 +1,9 @@
-//! Interaction answers and controls as actions over HTTP, `POST /api/v2/scopes/{scope}/resources/
+//! Interaction answers and controls as actions over HTTP, `POST /api/v2/targets/{target}/resources/
 //! {interactionId}/answer` and `…/actions/{set_mode|set_config|close}` (protocol §7): one
 //! interaction at a time, at most once; a control answered when the Agent answers.
 use super::*;
 
-/// The `live` of a scope read (`GET /api/v2/scopes/{scope}`).
+/// The `live` of a scope read (a read of its node, put back as the document).
 fn live_of(read: &Value) -> &Value {
     &read["snapshot"]["doc"]["live"]
 }
@@ -37,7 +37,7 @@ async fn pending(server: &Server, session: &str) -> BTreeMap<String, String> {
 
 async fn answer(server: &Server, session: &str, interaction: &str, body: Value) -> (StatusCode, Value) {
     let path = format!(
-        "/api/v2/scopes/session%2F{session}/resources/{interaction}/answer"
+        "/api/v2/targets/sessions/{session}/resources/{interaction}/answer"
     );
     let response = send(server.address, Method::POST, &path, Some(body)).await;
     let status = response.status();
@@ -135,7 +135,7 @@ async fn create_with_controls(server: &Server, link: &mut Link, session_id: &str
     });
     let address = server.address;
     let created = tokio::spawn(async move {
-        send(address, Method::POST, "/api/v2/scopes/global/ops", Some(body)).await
+        send(address, Method::POST, "/api/v2/targets/global/ops", Some(body)).await
     });
     let new = link.request("session/new").await;
     let mut response = controls();
@@ -150,7 +150,7 @@ async fn create_with_controls(server: &Server, link: &mut Link, session_id: &str
 }
 
 async fn control(server: &Server, session: &str, action: &str, body: Value) -> (StatusCode, Value) {
-    let path = format!("/api/v2/scopes/session%2F{session}/actions/{action}");
+    let path = format!("/api/v2/targets/sessions/{session}/actions/{action}");
     let response = send(server.address, Method::POST, &path, Some(body)).await;
     let status = response.status();
     let bytes = axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
@@ -167,7 +167,7 @@ fn spawn_control(
     body: Value,
 ) -> tokio::task::JoinHandle<(StatusCode, Value)> {
     let address = server.address;
-    let path = format!("/api/v2/scopes/session%2F{session}/actions/{action}");
+    let path = format!("/api/v2/targets/sessions/{session}/actions/{action}");
     tokio::spawn(async move {
         let response = send(address, Method::POST, &path, Some(body)).await;
         let status = response.status();
@@ -248,7 +248,7 @@ async fn a_control_runs_while_a_prompt_runs() {
         "id": "Pr0mptWhileControl-001", "expect": live_of(&document)["op"]["id"],
         "kind": "prompt", "args": {"prompt": [text("work")]},
     });
-    let response = send(server.address, Method::POST, "/api/v2/scopes/session%2Fs/ops", Some(body)).await;
+    let response = send(server.address, Method::POST, "/api/v2/targets/sessions/s/ops", Some(body)).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let prompt = link.request("session/prompt").await;
 
@@ -345,7 +345,7 @@ async fn closing_during_a_prompt_answers_its_pending_permissions_cancelled() {
         "id": "Pr0mptThenClose-000001", "expect": live_of(&document)["op"]["id"],
         "kind": "prompt", "args": {"prompt": [text("work")]},
     });
-    let response = send(server.address, Method::POST, "/api/v2/scopes/session%2Fs/ops", Some(body)).await;
+    let response = send(server.address, Method::POST, "/api/v2/targets/sessions/s/ops", Some(body)).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let prompt = link.request("session/prompt").await;
     link.agent_request("one", "session/request_permission", permission("s", "one"))
