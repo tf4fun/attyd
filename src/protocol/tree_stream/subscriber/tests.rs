@@ -520,3 +520,23 @@ fn an_end_followed_by_the_path_coming_back_is_not_kept() {
     pump(&mut subscriber, &mut client);
     holds(&client, &tree, &["/sessions/s"]);
 }
+
+#[test]
+fn several_clients_at_one_version_get_equal_hashes() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s"];
+    let mut subscribers = [Subscriber::new(&query(&paths), &tree), Subscriber::new(&query(&paths), &tree)];
+    let mut clients = [Client::following(&paths), Client::following(&paths)];
+    let t0 = Instant::now();
+    let change = committed(&mut tree, root(0, &[("s", session("t", &["a", "b"]))]));
+    for (subscriber, client) in subscribers.iter_mut().zip(&mut clients) {
+        pump(subscriber, client);
+        subscriber.publish_at(&tree, &change, t0);
+        pump(subscriber, client);
+        assert!(subscriber.checkpoints(&tree, t0 + Duration::from_secs(1)));
+        pump(subscriber, client);
+    }
+    assert_eq!(clients[0].checks, clients[1].checks);
+    assert_eq!(clients[0].checks.len(), 1);
+}
