@@ -465,6 +465,11 @@ impl FeedHandle {
         }))
     }
 
+    /// `read` over the tree as committed now.
+    pub(crate) fn with_tree<R>(&self, read: impl FnOnce(&Tree) -> R) -> R {
+        read(self.feed().tree())
+    }
+
     /// A stream of revision 4 over the paths of `query`, its first event queued.
     pub(crate) fn subscribe_tree(&self, query: &StreamQuery) -> TreeSubscription {
         let id = self.feed().subscribe_tree(query);

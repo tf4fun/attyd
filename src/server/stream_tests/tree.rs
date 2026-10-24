@@ -164,3 +164,65 @@ async fn shutting_the_server_down_ends_the_path_streams_after_what_is_queued() {
     while event(&mut sse, WAIT).await.is_some() {}
     assert!(sse.message(WAIT).await.is_none(), "the stream ended");
 }
+
+// --- segments (design §7.1) -----------------------------------------------------------
+
+/// `GET path`: the status and the JSON body.
+async fn read(server: &Server, path: &str) -> (StatusCode, Value) {
+    let response = send(server.address, Method::GET, path, None).await;
+    (response.status(), json_of(response).await)
+}
+
+#[tokio::test]
+async fn a_device_pages_through_a_long_message_at_the_version_it_holds() {
+    let (server, mut link) = Server::start(json!({})).await;
+    server.create(&mut link, "s1").await;
+    let long = format!("{}{}", "a".repeat(5000), "é".repeat(2000));
+    link.update(
+        "s1",
+        json!({"sessionUpdate": "agent_message_chunk", "messageId": "m", "content": text(&long)}),
+    )
+    .await;
+    let path = "/sessions/s1/entries";
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (rev, at) = loop {
+        let (_, mut sse) = open(&server, &format!("follow={path}")).await;
+        let first = next(&mut sse).await;
+        let snapshot = &change(&first, path)["snapshot"];
+        if snapshot["node"]["v"].as_array().is_some_and(|entries| !entries.is_empty()) {
+            break (first["rev"].clone(), snapshot["at"].clone());
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the message never arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _ = rev;
+    let base = "/api/v2/nodes/sessions/s1/entries/0/chunks/0/content/text/segments";
+    let mut paged = String::new();
+    for index in 0..3 {
+        let (status, body) = read(&server, &format!("{base}/{index}?at={at}")).await;
+        assert_eq!(status, StatusCode::OK, "{index}: {body}");
+        assert_eq!(body["before"].as_str().unwrap().len(), 43);
+        paged.push_str(body["segment"].as_str().unwrap());
+    }
+    assert_eq!(paged, long);
+    let (status, body) = read(&server, &format!("{base}/3?at={at}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn a_segment_read_needs_a_version_and_a_text_position() {
+    let (server, mut link) = Server::start(json!({})).await;
+    server.create(&mut link, "s1").await;
+    for (path, status) in [
+        ("/api/v2/nodes/sessions/s1/entries/0/chunks/0/content/text/segments/0", StatusCode::BAD_REQUEST),
+        ("/api/v2/nodes/sessions/s1/entries/0/chunks/0/content/text/segments/x?at=1", StatusCode::BAD_REQUEST),
+        ("/api/v2/nodes/sessions/s1/entries/0/chunks/0/content/text/segments/0?at=999999", StatusCode::BAD_REQUEST),
+        ("/api/v2/nodes/sessions/s1/entries/0/chunks/0/content/text/segments/0?at=1&at=2", StatusCode::BAD_REQUEST),
+        ("/api/v2/nodes/sessions/s1/controls/segments/0?at=1", StatusCode::NOT_FOUND),
+        ("/api/v2/nodes/global", StatusCode::NOT_FOUND),
+    ] {
+        let (got, body) = read(&server, path).await;
+        assert_eq!(got, status, "{path}: {body}");
+    }
+}
