@@ -22,6 +22,7 @@ pub(crate) mod feed;
 pub(crate) mod hash;
 pub(crate) mod live_doc;
 pub(crate) mod op;
+pub(crate) mod outcome;
 pub(crate) mod pacing;
 pub(crate) mod project;
 pub(crate) mod publication;
