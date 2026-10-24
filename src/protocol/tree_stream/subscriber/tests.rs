@@ -540,3 +540,74 @@ fn several_clients_at_one_version_get_equal_hashes() {
     assert_eq!(clients[0].checks, clients[1].checks);
     assert_eq!(clients[0].checks.len(), 1);
 }
+
+// --- windows (design §6.4) ------------------------------------------------------------
+
+use crate::protocol::hash::TextRule;
+use crate::protocol::window::windowed_value_hash;
+
+fn entry(text: &str) -> Spec {
+    Spec::text_value(
+        std::sync::Arc::new(json!({ "kind": "message", "role": "agent", "chunks": [
+            { "content": { "type": "text", "text": text } }] })),
+        TextRule::Entry,
+    )
+}
+
+fn with_entries(texts: &[String]) -> BTreeMap<String, Spec> {
+    BTreeMap::from([(
+        "sessions".to_string(),
+        Spec::map([("s", Spec::object(Default::default(), [("entries", Spec::List(texts.iter().map(|t| entry(t)).collect()))]))]),
+    )])
+}
+
+fn windowed_query(path: &str, bytes: usize) -> StreamQuery {
+    let mut q = query(&[path]);
+    q.follow[0].window = Some(bytes);
+    q
+}
+
+#[test]
+fn a_windowed_stream_keeps_a_client_in_step_with_windows_of_the_tree() {
+    let path = "/sessions/s/entries";
+    let mut tree = Tree::new("I");
+    tree.commit(with_entries(&["start".to_string()]));
+    let mut subscriber = Subscriber::new(&windowed_query(path, 8192), &tree);
+    let mut client = Client::following(&[path]);
+    pump(&mut subscriber, &mut client);
+    let mut text = "start".to_string();
+    for size in [10, 5000, 7000, 1 << 20, 3, 4096] {
+        text.push_str(&"w".repeat(size));
+        let change = committed(&mut tree, with_entries(&[text.clone()]));
+        subscriber.publish(&tree, &change);
+        let queued = subscriber.next().unwrap();
+        // However much was appended, no event carries N + L bytes of the window's text.
+        assert!(serde_json::to_string(&queued).unwrap().len() < 8192 + 4096 + 1024, "{size}");
+        client.apply(&queued).unwrap();
+        assert_eq!(client.value(path), Some(&tree.get(path).unwrap().to_value_windowed(8192)), "{size}");
+        let held = &client.value(path).unwrap()[0];
+        assert_eq!(windowed_value_hash(TextRule::Entry, held), Some(tree.get("/sessions/s/entries/0").unwrap().hash()));
+    }
+}
+
+#[test]
+fn a_catch_up_and_a_reconnect_carry_windows_too() {
+    let path = "/sessions/s/entries";
+    let mut tree = Tree::new("I");
+    tree.commit(with_entries(&["a".repeat(100_000)]));
+    let subscriber = Subscriber::new(&windowed_query(path, 8192), &tree);
+    assert!(serde_json::to_string(&subscriber.peek_first()).unwrap().len() < 8192 + 4096 + 1024);
+
+    let mut subscriber = subscriber;
+    let mut client = Client::following(&[path]);
+    pump(&mut subscriber, &mut client);
+    for n in 0..5 {
+        let change = committed(&mut tree, with_entries(&["a".repeat(100_000 + 500 * (n + 1))]));
+        subscriber.publish(&tree, &change);
+    }
+    subscriber.coalesce(&tree);
+    let catch_up = subscriber.next().unwrap();
+    assert!(serde_json::to_string(&catch_up).unwrap().len() < 8192 + 4096 + 1024);
+    client.apply(&catch_up).unwrap();
+    assert_eq!(client.value(path), Some(&tree.get(path).unwrap().to_value_windowed(8192)));
+}

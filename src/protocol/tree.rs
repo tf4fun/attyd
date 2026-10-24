@@ -11,7 +11,7 @@
 //! pointer comparison, not a walk of its JSON.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{Map, Value};
@@ -81,6 +81,22 @@ enum Body {
     List(Vec<Node>),
 }
 
+/// How the text positions of a value node have changed, to tell a segment read whether the
+/// segment it names is the one a client holds (design §7.1): earlier segments of a text never
+/// change while it only grows, and the lengths tell which segments were complete.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TextHistory {
+    /// The revision at which a text position was last replaced or edited other than by an
+    /// append.
+    pub replaced: u64,
+    /// The length in bytes of each text position, by pointer, as of the last revisions at which
+    /// the value changed.
+    pub lengths: VecDeque<(u64, Vec<(String, u64)>)>,
+}
+
+/// How many revisions of lengths a value node remembers.
+const LENGTH_HISTORY: usize = 8;
+
 /// A node with its revisions.
 #[derive(Debug, Clone)]
 pub(crate) struct Node {
@@ -89,6 +105,8 @@ pub(crate) struct Node {
     body: Body,
     /// Computed when first asked for and kept while the node is.
     hash: OnceLock<Hash>,
+    /// For a value node with text positions.
+    text: TextHistory,
 }
 
 impl Node {
@@ -102,6 +120,22 @@ impl Node {
         self.srev
     }
 
+    /// The length of a list node.
+    pub(crate) fn list_len(&self) -> Option<usize> {
+        match &self.body {
+            Body::List(items) => Some(items.len()),
+            _ => None,
+        }
+    }
+
+    /// The value of a value node and the rule of its text positions.
+    pub(crate) fn as_value(&self) -> Option<(&Value, TextRule)> {
+        match &self.body {
+            Body::Value(value, rule) => Some((value, *rule)),
+            _ => None,
+        }
+    }
+
     /// The child `key` of an object or a map, or the index `key` of a list.
     pub(crate) fn child(&self, key: &str) -> Option<&Node> {
         match &self.body {
@@ -111,11 +145,15 @@ impl Node {
         }
     }
 
-    /// The node's own level and its children, for the snapshot of a stream.
-    pub(crate) fn shape(&self) -> super::tree_stream::snapshot::Shape<'_> {
+    /// The node's own level and its children, for the snapshot of a stream; with `window`, the
+    /// text positions of a value are held as windows of that many bytes.
+    pub(crate) fn shape(&self, window: Option<usize>) -> super::tree_stream::snapshot::Shape<'_> {
         use super::tree_stream::snapshot::Shape;
         match &self.body {
-            Body::Value(value, _) => Shape::Value((**value).clone()),
+            Body::Value(value, rule) => Shape::Value(match window {
+                Some(bytes) => super::window::window_value(*rule, value, bytes),
+                None => (**value).clone(),
+            }),
             Body::Object { fields, children } => Shape::Object(
                 Value::Object(fields.clone()),
                 children.iter().map(|(key, node)| (key.clone(), node)).collect(),
@@ -128,6 +166,27 @@ impl Node {
                 items.len(),
                 items.iter().enumerate().map(|(index, node)| (index.to_string(), node)).collect(),
             ),
+        }
+    }
+
+    /// `to_value`, with the text positions held as windows of `window` bytes.
+    pub(crate) fn to_value_windowed(&self, window: usize) -> Value {
+        match &self.body {
+            Body::Value(value, rule) => super::window::window_value(*rule, value, window),
+            Body::Object { fields, children } => {
+                let mut object = fields.clone();
+                for (key, child) in children {
+                    object.insert(key.clone(), child.to_value_windowed(window));
+                }
+                Value::Object(object)
+            }
+            Body::Map(children) => Value::Object(
+                children
+                    .iter()
+                    .map(|(key, child)| (key.clone(), child.to_value_windowed(window)))
+                    .collect(),
+            ),
+            Body::List(items) => Value::Array(items.iter().map(|item| item.to_value_windowed(window)).collect()),
         }
     }
 
@@ -191,14 +250,24 @@ impl Node {
             _ => rev,
         };
         let old_body = old.map(|old| &old.body);
+        let old_text = old.map(|old| &old.text);
+        let mut text = TextHistory::default();
         let body = match spec {
             Spec::Value(value, rule) => match old_body {
-                Some(Body::Value(old, _)) if same => Body::Value(old.clone(), rule),
+                Some(Body::Value(old, _)) if same => {
+                    text = old_text.cloned().unwrap_or_default();
+                    Body::Value(old.clone(), rule)
+                }
                 Some(Body::Value(old, _)) => {
+                    let before = ops.len();
                     diff::diff(path, old, &value, &text_mode, ops);
+                    text = Node::text_after(old_text, rule, &value, path, &ops[before..], rev);
                     Body::Value(value, rule)
                 }
-                _ => Body::Value(value, rule),
+                _ => {
+                    text = Node::text_after(None, rule, &value, path, &[], rev);
+                    Body::Value(value, rule)
+                }
             },
             Spec::Object { fields, children } => {
                 let (old_fields, old_children) = match old_body {
@@ -271,7 +340,51 @@ impl Node {
             (Some(old), Body::Value(..)) if same => old.hash.clone(),
             _ => OnceLock::new(),
         };
-        Node { rev: own, srev, body, hash }
+        Node { rev: own, srev, body, hash, text }
+    }
+
+    /// The text history of a value node that has just taken `value`: whether the ops that made
+    /// it were only appends to its text positions, and the lengths now.
+    fn text_after(
+        old: Option<&TextHistory>,
+        rule: TextRule,
+        value: &Value,
+        path: &str,
+        ops: &[Op],
+        rev: u64,
+    ) -> TextHistory {
+        let positions = hash::text_pointers(rule, value);
+        if positions.is_empty() {
+            return TextHistory::default();
+        }
+        let only_appends = !ops.is_empty()
+            && ops.iter().all(|op| match op {
+                Op::Append { path: at, tail: AppendTail::Text { .. } } => at
+                    .strip_prefix(path)
+                    .is_some_and(|pointer| positions.iter().any(|position| position == pointer)),
+                _ => false,
+            });
+        let mut history = old.cloned().unwrap_or_default();
+        if !only_appends || old.is_none() {
+            history.replaced = rev;
+        }
+        let lengths = positions
+            .iter()
+            .map(|position| {
+                let length = value.pointer(position).and_then(Value::as_str).map_or(0, str::len);
+                (position.clone(), length as u64)
+            })
+            .collect();
+        history.lengths.push_back((rev, lengths));
+        while history.lengths.len() > LENGTH_HISTORY {
+            history.lengths.pop_front();
+        }
+        history
+    }
+
+    /// The text history of a value node.
+    pub(crate) fn text_history(&self) -> &TextHistory {
+        &self.text
     }
 
     /// A child at `path`: reconciled with its old node when that is of the same kind, else
@@ -413,6 +526,7 @@ impl Tree {
                 srev: 0,
                 body: Body::Map(BTreeMap::new()),
                 hash: OnceLock::new(),
+                text: TextHistory::default(),
             },
         }
     }

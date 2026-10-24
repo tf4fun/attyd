@@ -141,3 +141,58 @@ fn installing_differential_snapshots_always_reproduces_the_tree() {
         held = Some((value, snapshot.at));
     }
 }
+
+// --- text windows (design §6.4) ------------------------------------------------------
+
+use crate::protocol::hash::TextRule;
+use crate::protocol::window;
+
+fn entry_spec(text: &str) -> Spec {
+    Spec::text_value(
+        std::sync::Arc::new(json!({ "kind": "message", "role": "agent", "chunks": [
+            { "content": { "type": "text", "text": text } }] })),
+        TextRule::Entry,
+    )
+}
+
+fn entries_root(texts: &[&str]) -> BTreeMap<String, Spec> {
+    BTreeMap::from([(
+        "sessions".to_string(),
+        Spec::map([("s", Spec::object(Default::default(), [("entries", Spec::List(texts.iter().map(|t| entry_spec(t)).collect()))]))]),
+    )])
+}
+
+#[test]
+fn a_windowed_snapshot_holds_text_as_windows_and_states_the_hash_of_the_whole() {
+    let long = "x".repeat(50_000);
+    let mut tree = Tree::new("i");
+    tree.commit(entries_root(&["short", &long]));
+    let snapshot = snapshot_windowed(&tree, "/sessions/s/entries", None, Some(8192)).unwrap();
+    let SNode::Value { v } = &snapshot.node else { panic!() };
+    assert_eq!(v[0]["chunks"][0]["content"]["text"]["text"], "short");
+    let held = &v[1]["chunks"][0]["content"]["text"];
+    assert_eq!(held["length"], 50_000);
+    assert!(held["text"].as_str().unwrap().len() < 8192 + 4096);
+    // The window verifies as the whole text: the entry hashes as the tree says.
+    let entry = tree.get("/sessions/s/entries/1").unwrap();
+    assert_eq!(window::windowed_value_hash(TextRule::Entry, &v[1]), Some(entry.hash()));
+    // Without a window the same snapshot is the whole text.
+    let whole = snapshot_windowed(&tree, "/sessions/s/entries", None, None).unwrap();
+    assert_eq!(whole.hash, snapshot.hash);
+    let SNode::Value { v } = &whole.node else { panic!() };
+    assert_eq!(v[1]["chunks"][0]["content"]["text"].as_str().unwrap().len(), 50_000);
+}
+
+#[test]
+fn a_differential_snapshot_windows_the_values_it_sends() {
+    let long = "x".repeat(50_000);
+    let mut tree = Tree::new("i");
+    tree.commit(entries_root(&["short"]));
+    let have = tree.get("/sessions/s/entries").unwrap().srev();
+    tree.commit(entries_root(&["short", &long]));
+    let snapshot = snapshot_windowed(&tree, "/sessions/s/entries", Some(have), Some(8192)).unwrap();
+    let SNode::List { l, c } = &snapshot.node else { panic!() };
+    assert_eq!(*l, 2);
+    let SNode::Value { v } = &c["1"] else { panic!() };
+    assert_eq!(v["chunks"][0]["content"]["text"]["length"], 50_000);
+}

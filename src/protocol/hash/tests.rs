@@ -191,3 +191,28 @@ fn locating_text_positions_does_not_change_what_is_hashed() {
     assert_eq!(value_hash(TextRule::Terminal, &terminal), value_hash(TextRule::None, &terminal));
     assert_eq!(value_hash(TextRule::OutputView, &terminal), value_hash(TextRule::None, &terminal));
 }
+
+#[test]
+fn text_positions_are_found_in_document_order_by_the_kind_of_value() {
+    use serde_json::json;
+    let message = json!({ "kind": "message", "chunks": [
+        { "content": { "type": "text", "text": "a" } },
+        { "content": { "type": "image", "data": "x" } },
+        { "content": { "type": "text", "text": "b" } },
+    ]});
+    assert_eq!(text_pointers(TextRule::Entry, &message), ["/chunks/0/content/text", "/chunks/2/content/text"]);
+    let tool = json!({ "kind": "tool", "call": { "content": [
+        { "type": "diff", "path": "p" },
+        { "type": "content", "content": { "type": "text", "text": "o" } },
+    ]}});
+    assert_eq!(text_pointers(TextRule::Entry, &tool), ["/call/content/1/content/text"]);
+    let compaction = json!({ "kind": "compaction", "summary": [{ "content": { "type": "text", "text": "s" } }] });
+    assert_eq!(text_pointers(TextRule::Entry, &compaction), ["/summary/0/content/text"]);
+    assert_eq!(text_pointers(TextRule::Terminal, &json!({ "output": "o" })), ["/output"]);
+    assert_eq!(text_pointers(TextRule::OutputView, &json!({ "text": "t" })), ["/text"]);
+    assert!(text_pointers(TextRule::None, &message).is_empty());
+    assert!(text_pointers(TextRule::Entry, &json!({ "kind": "plan", "text": "x" })).is_empty());
+    for pointer in text_pointers(TextRule::Entry, &message) {
+        assert!(message.pointer(&pointer).unwrap().is_string());
+    }
+}

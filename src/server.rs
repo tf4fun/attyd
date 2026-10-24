@@ -618,6 +618,7 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route("/api/v2/stream", get(feed_stream))
         .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
         .route("/api/v2/sessions/{*read}", get(read_session))
+        .route("/api/v2/nodes/{*node}", get(read_node))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
         .layer(CompressionLayer::new())
@@ -1072,6 +1073,57 @@ async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(HEARTBEAT))
         .into_response()
+}
+
+/// `GET /api/v2/nodes/{path}/segments/{i}?at=<version>` (protocol revision 4 §7.1): one segment
+/// of the text position at `path`, as it was at the version the client holds it at. It starts,
+/// loads and holds nothing.
+async fn read_node(
+    Path(node): Path<String>,
+    RawQuery(query): RawQuery,
+    State(state): State<AppState>,
+) -> Response {
+    use crate::protocol::tree_stream::segments::{SegmentRead, read_segment};
+    let invalid = |message: String| {
+        protocol_error(StatusCode::BAD_REQUEST, ProtocolError::new(ErrorCode::InvalidRequest, message))
+    };
+    let Some((path, index)) = node.rsplit_once("/segments/") else {
+        return protocol_error(
+            StatusCode::NOT_FOUND,
+            ProtocolError::new(ErrorCode::NotFound, format!("no read of {node}")),
+        );
+    };
+    let Ok(index) = index.parse::<usize>() else {
+        return invalid(format!("not a segment index: {index:?}"));
+    };
+    let mut at = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes()) {
+        match (key.as_ref(), value.parse::<u64>()) {
+            ("at", Ok(version)) if at.replace(version).is_none() => {}
+            _ => return invalid(format!("not a read parameter: {key}={value}")),
+        }
+    }
+    let Some(at) = at else {
+        return invalid("a segment is read at a version: at=<version>".into());
+    };
+    let read = state
+        .bridge
+        .publication
+        .lock()
+        .feed
+        .with_tree(|tree| read_segment(tree, &format!("/{path}"), index, at));
+    match read {
+        SegmentRead::Segment(segment) => axum::Json(segment).into_response(),
+        SegmentRead::NotFound => protocol_error(
+            StatusCode::NOT_FOUND,
+            ProtocolError::new(ErrorCode::NotFound, format!("no segment {index} of /{path}")),
+        ),
+        SegmentRead::Future => invalid(format!("the tree has not reached version {at}")),
+        SegmentRead::Stale => protocol_error(
+            StatusCode::CONFLICT,
+            ProtocolError::new(ErrorCode::Stale, format!("segment {index} of /{path} changed after {at}")),
+        ),
+    }
 }
 
 /// `GET /api/v2/stream?follow=…` (design: protocol revision 4 §6): the events of the paths it

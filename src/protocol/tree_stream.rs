@@ -3,8 +3,10 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod params;
+pub(crate) mod segments;
 pub(crate) mod snapshot;
 pub(crate) mod subscriber;
+pub(crate) mod windowed_ops;
 pub(crate) mod wire;
 #[cfg(test)]
 pub(crate) mod client;
