@@ -4,7 +4,7 @@
 // interactions are a member of `live` beside it, not part of it.
 
 import type { CatalogLive, GlobalLive, Operation, SessionLive } from "./protocol";
-import type { Entry, PromptState } from "./entries";
+import type { Entry, PromptState, TurnHead } from "./entries";
 
 // The `live` of each scope is the type generated from the bridge's own (src/protocol), so a client
 // cannot read a document differently from how the bridge writes it.
@@ -25,5 +25,7 @@ export interface SessionBody {
   history?: "complete" | "partial";
   entries?: readonly Entry[];
   prompts: readonly PromptState[];
+  /** The partition of the entries into turns, which the bridge publishes; absent while the history is unknown. */
+  turns?: readonly TurnHead[];
   live: SessionLive3;
 }

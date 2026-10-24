@@ -10,6 +10,7 @@ import { PromptComposer } from "../components/acp/prompt-composer";
 import { SessionControls } from "../components/acp/session-controls";
 import { InterfaceSettings } from "../components/interface-settings";
 import { projectEntries } from "../lib/entry-projection";
+import { turnHeads } from "./turn-heads";
 import type { AppState, TimelineItem } from "../lib/state";
 import { initializeTheme } from "../lib/theme";
 import "../styles.css";
@@ -88,7 +89,7 @@ function showcaseProjection(session: MockSession): ShowcaseProjection {
   const prompts: PromptState[] = entries.flatMap((entry, index) =>
     entry.kind === "message" && entry.role === "user" && !(entries[index - 1]?.kind === "message" && (entries[index - 1] as { role: string }).role === "user")
       ? [{ entry: index, end: { response: { stopReason: "end_turn" } } } as PromptState] : []);
-  return { timeline: projectEntries(session.sessionId, entries, prompts).timeline, availableCommands, usage };
+  return { timeline: projectEntries(session.sessionId, entries, prompts, turnHeads(entries, prompts)).timeline, availableCommands, usage };
 }
 
 /**
@@ -181,7 +182,7 @@ function InteractionExample({ example, session, projection }: { example: string;
       { kind: "message", role: "user", chunks: [{ content: { type: "text", text: "检查运行中工具，点击停止后再模拟迟到结果。" } }] },
       ...entriesFromUpdates(updates),
     ];
-    return projectEntries(session.sessionId, entries, [{ entry: 0 }]).timeline;
+    return projectEntries(session.sessionId, entries, [{ entry: 0 }], turnHeads(entries, [{ entry: 0 }])).timeline;
   }, [session, stage]);
   const permission = example.startsWith("permission-") ? session.examples.permissions[Number(example.slice(11))] : undefined;
   const elicitation = example.startsWith("form-") ? session.examples.elicitations[Number(example.slice(5))] : undefined;

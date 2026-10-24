@@ -5,7 +5,9 @@
 // the cases keep writing documents.
 import { wire } from "../../shared/digest";
 import { applyOps } from "../../shared/patch";
+import type { Entry, PromptState } from "../../shared/entries";
 import type { Op } from "../../shared/protocol";
+import { turnHeads } from "../../web/src/dev/turn-heads";
 import { hashAt, tokensOf, type TreeEnd, type TreeEvent } from "../../shared/tree-replica";
 
 type Doc = Record<string, unknown>;
@@ -41,7 +43,10 @@ export function treeValue(scope: string, doc: Doc): Doc {
       ...(doc.history === undefined ? {} : { history: doc.history }),
       ...(doc.entries === undefined ? {} : { entries: doc.entries }),
       prompts: doc.prompts ?? [],
-      ...(doc.turns === undefined ? {} : { turns: doc.turns }),
+      // The partition the bridge publishes with the entries.
+      ...(doc.entries === undefined
+        ? {}
+        : { turns: turnHeads(doc.entries as Entry[], (doc.prompts ?? []) as PromptState[]) }),
     };
   }
   return { ...rest, ...common, ...(scope === "global" ? { loadFailures: doc.loadFailures ?? {} } : {}) };

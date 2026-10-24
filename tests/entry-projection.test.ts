@@ -4,7 +4,8 @@
 // ended. Every value follows from the document; an item is reused only for the entries it came from.
 import { describe, expect, it } from "vitest";
 import { projectEntries } from "../web/src/lib/entry-projection";
-import type { Entry, PromptState } from "../shared/entries";
+import type { Entry, PromptState, TurnHead } from "../shared/entries";
+import { turnHeads } from "../web/src/dev/turn-heads";
 
 const text = (value: string) => ({ type: "text", text: value });
 const user = (value: string, messageId?: string): Entry => ({
@@ -22,7 +23,8 @@ const legacyPlan = (...statuses: string[]): Entry => ({
 });
 const ended = (entry: number, end: PromptState["end"]): PromptState => ({ entry, ...(end ? { end } : {}) });
 
-const project = (entries: Entry[], prompts: PromptState[] = []) => projectEntries("S", entries, prompts);
+const project = (entries: Entry[], prompts: PromptState[] = [], turns: TurnHead[] = turnHeads(entries, prompts)) =>
+  projectEntries("S", entries, prompts, turns);
 
 describe("entries in a thread", () => {
   it("shows each message in order, an agent reply as one assistant item", () => {
@@ -88,6 +90,22 @@ describe("turns", () => {
   it("marks every item of a turn with the turn its prompt opened", () => {
     const { timeline } = project([user("one"), agent("a"), user("two"), agent("b")]);
     expect(timeline.map((item) => item.historyTurnId)).toEqual(["turn:0", "turn:0", "turn:2", "turn:2"]);
+  });
+
+  it("follows the partition the bridge published and derives none of its own", () => {
+    const entries = [user("a"), agent("1"), user("b"), agent("2")];
+    const head = (start: number, length: number): TurnHead => ({
+      historyRev: 1, start, length, state: "ended", output: null,
+    });
+    // The bridge says it is one turn: the thread has one, whatever the user messages suggest.
+    expect(project(entries, [], [head(0, 4)]).timeline.map((item) => item.historyTurnId))
+      .toEqual(["turn:0", "turn:0", "turn:0", "turn:0"]);
+    // And a different partition gives a different thread.
+    expect(project(entries, [], [head(0, 1), head(1, 3)]).timeline.map((item) => item.historyTurnId))
+      .toEqual(["turn:0", "turn:1", "turn:1", "turn:1"]);
+    // Entries with no index are one turn.
+    expect(projectEntries("S", entries, [], []).timeline.map((item) => item.historyTurnId))
+      .toEqual(["turn:0", "turn:0", "turn:0", "turn:0"]);
   });
 
   it("does not split a turn at a user message with the same messageId", () => {

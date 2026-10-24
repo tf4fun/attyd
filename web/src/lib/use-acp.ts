@@ -1122,7 +1122,7 @@ export class Workspace {
     let activePlan: AppState["activePlan"];
     let agentActivity: AppState["agentActivity"];
     if (visible && live != null && shown != null) {
-      const projected = projectEntries(live.sessionId, entries ?? [], shown.body.prompts);
+      const projected = projectEntries(live.sessionId, entries ?? [], shown.body.prompts, shown.body.turns ?? []);
       timeline = projected.timeline;
       activePlan = projected.activePlan;
       agentActivity = projected.activity;
