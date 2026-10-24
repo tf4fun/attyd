@@ -1,6 +1,6 @@
 //! The revision 4 hashes against the vectors an independent implementation computed
 //! (tests/fixtures/protocol_r4_vectors.py); the TypeScript hashes reproduce the same file.
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::*;
 
@@ -90,4 +90,87 @@ fn the_length_is_part_of_the_hash() {
     let state = chain_states("abc");
     assert_ne!(finish(3, &state[0]), finish(4, &state[0]));
     assert_ne!(text_hash(""), finish(0, &[1; 32]));
+}
+
+// --- values and nodes ----------------------------------------------------------------
+
+fn rule(name: &str) -> TextRule {
+    match name {
+        "none" => TextRule::None,
+        "entry" => TextRule::Entry,
+        "terminal" => TextRule::Terminal,
+        "outputView" => TextRule::OutputView,
+        other => panic!("unknown rule {other}"),
+    }
+}
+
+#[test]
+fn values_hash_like_the_vectors_with_their_text_positions_through_the_chain() {
+    for case in vectors()["values"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let hash = value_hash(rule(case["rule"].as_str().unwrap()), &case["value"]);
+        assert_eq!(hex(&hash), case["hash"].as_str().unwrap(), "{name}");
+    }
+}
+
+/// The hash of a node tree as the vectors write it.
+fn node(tree: &Value) -> Hash {
+    let children = |tree: &Value| -> Vec<(String, Hash)> {
+        tree["children"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, child)| (name.clone(), node(child)))
+            .collect()
+    };
+    match tree["kind"].as_str().unwrap() {
+        "value" => value_hash(rule(tree["rule"].as_str().unwrap()), &tree["value"]),
+        "object" => {
+            let children = children(tree);
+            object_hash(
+                tree["fields"].as_object().unwrap(),
+                children.iter().map(|(name, hash)| (name.as_str(), *hash)),
+            )
+        }
+        "map" => {
+            let children = children(tree);
+            map_hash(children.iter().map(|(name, hash)| (name.as_str(), *hash)))
+        }
+        "list" => {
+            let items: Vec<Hash> = tree["items"].as_array().unwrap().iter().map(node).collect();
+            list_hash(&items)
+        }
+        other => panic!("unknown kind {other}"),
+    }
+}
+
+#[test]
+fn nodes_hash_like_the_vectors() {
+    for case in vectors()["nodes"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        assert_eq!(hex(&node(&case["node"])), case["hash"].as_str().unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn text_outside_a_text_position_is_hashed_as_plain_json() {
+    let plan = serde_json::json!({ "kind": "plan", "planId": "p", "text": "x" });
+    let other = serde_json::json!({ "kind": "plan", "planId": "p", "text": "y" });
+    assert_ne!(value_hash(TextRule::Entry, &plan), value_hash(TextRule::Entry, &other));
+}
+
+#[test]
+fn a_text_position_is_hashed_by_its_chain_and_not_by_its_characters() {
+    // The same message hashed as a plain value differs: the text became its chain hash.
+    let message = serde_json::json!({ "kind": "message", "role": "agent",
+        "chunks": [{ "content": { "type": "text", "text": "hi" } }] });
+    assert_ne!(value_hash(TextRule::Entry, &message), value_hash(TextRule::None, &message));
+}
+
+#[test]
+fn the_kinds_have_their_own_domain() {
+    let empty_object = object_hash(&Map::new(), []);
+    assert_ne!(empty_object, map_hash([]));
+    assert_ne!(map_hash([]), list_hash([]));
+    assert_ne!(empty_object, list_hash([]));
 }
