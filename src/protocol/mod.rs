@@ -36,6 +36,7 @@ pub(crate) mod tree_stream;
 pub(crate) mod tree_doc;
 #[cfg(test)]
 mod typescript;
+pub(crate) mod window;
 pub(crate) mod wire;
 
 use serde::{Deserialize, Serialize};
