@@ -202,3 +202,71 @@ fn a_path_inside_a_view_is_the_view_and_a_path_is_built_and_parsed_back() {
         assert_eq!(View::of(not), None, "{not}");
     }
 }
+
+// --- the shape of the tree (design §4.2) ---------------------------------------------------
+
+/// Whether `path` is an instance of `pattern`, `*` standing for one token.
+fn matches(pattern: &str, path: &str) -> bool {
+    let (pattern, path): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), path.split('/').collect());
+    pattern.len() == path.len() && pattern.iter().zip(&path).all(|(p, t)| *p == "*" || p == t)
+}
+
+fn rule_name(rule: TextRule) -> &'static str {
+    match rule {
+        TextRule::None => "none",
+        TextRule::Entry => "entry",
+        TextRule::Terminal => "terminal",
+        TextRule::OutputView => "outputView",
+    }
+}
+
+#[test]
+fn every_node_of_the_tree_is_of_the_kind_the_shape_names() {
+    let shape: Value = serde_json::from_str(include_str!("../../../tests/fixtures/protocol-r4-shape.json")).unwrap();
+    let nodes = shape["nodes"].as_array().unwrap();
+    let mut world = World::new();
+    world.update(text("user_message_chunk", "u1", "q1")).update(text("agent_message_chunk", "a1", "one"));
+    world.update(text("user_message_chunk", "u2", "q2")).update(text("agent_message_chunk", "a2", "two"));
+    world.registry.start_login_terminal("login", "method");
+    world.registry.login_output("login", "output");
+    world.registry
+        .install_operation(&crate::protocol::documents::Scope::Global, crate::protocol::documents::OperationKind::Logout, json!({}))
+        .unwrap();
+    world.commit().unwrap();
+    let h = world.history_rev();
+    world.wanted.insert(latest());
+    world.wanted.insert(View::Output { session: "s".into(), instance: "I".into(), history_rev: h, start: 2 });
+    world.wanted.insert(View::Turn { session: "s".into(), instance: "I".into(), history_rev: h, start: 2 });
+    world.commit().unwrap();
+
+    let mut seen = BTreeSet::new();
+    let mut checked = 0;
+    world.tree.root().walk("", &mut |path, node| {
+        if path.is_empty() {
+            return;
+        }
+        let spec = nodes
+            .iter()
+            .find(|spec| matches(spec["path"].as_str().unwrap(), path))
+            .unwrap_or_else(|| panic!("{path} is a node the shape does not name"));
+        assert_eq!(node.kind_name(), spec["kind"], "{path}");
+        if let Some((_, rule)) = node.as_value() {
+            assert_eq!(rule_name(rule), spec["rule"].as_str().unwrap_or("none"), "{path}");
+        }
+        if spec["kind"] == "object" {
+            let expected: BTreeSet<&str> = spec["children"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+            assert!(node.child_names().iter().all(|name| expected.contains(name)), "{path}: {:?}", node.child_names());
+        }
+        seen.insert(spec["path"].as_str().unwrap().to_string());
+        checked += 1;
+    });
+    assert!(checked > 40, "{checked}");
+    // The kinds the scenario produces are all in the shape: these were reached.
+    for pattern in [
+        "/global", "/global/op", "/global/ops/*", "/global/terminals/*", "/catalog", "/sessions/*", "/sessions/*/entries/*",
+        "/sessions/*/turns/*", "/sessions/*/controls", "/views/*/output/latest",
+        "/views/*/history/*/*/output/*", "/views/*/history/*/*/turn/*/entries/*",
+    ] {
+        assert!(seen.contains(pattern), "{pattern} was not produced: {seen:?}");
+    }
+}

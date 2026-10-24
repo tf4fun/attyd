@@ -148,6 +148,42 @@ impl Node {
         }
     }
 
+    /// The kind of this node, as the shape of the tree names it.
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match &self.body {
+            Body::Value(..) => "value",
+            Body::Object { .. } => "object",
+            Body::Map(_) => "map",
+            Body::List(_) => "list",
+        }
+    }
+
+    /// The names of the children of an object node.
+    pub(crate) fn child_names(&self) -> Vec<&str> {
+        match &self.body {
+            Body::Object { children, .. } | Body::Map(children) => children.keys().map(String::as_str).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Visits this node and everything below it with its path.
+    pub(crate) fn walk<'a>(&'a self, path: &str, visit: &mut impl FnMut(&str, &'a Node)) {
+        visit(path, self);
+        match &self.body {
+            Body::Value(..) => {}
+            Body::Object { children, .. } | Body::Map(children) => {
+                for (key, child) in children {
+                    child.walk(&diff::child(path, key), visit);
+                }
+            }
+            Body::List(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    item.walk(&diff::child(path, &index.to_string()), visit);
+                }
+            }
+        }
+    }
+
     /// The shared value of a value node.
     pub(crate) fn value_arc(&self) -> Option<Arc<Value>> {
         match &self.body {
