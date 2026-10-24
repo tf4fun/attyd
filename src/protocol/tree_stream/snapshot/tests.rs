@@ -3,10 +3,11 @@
 //! listed; the result must be what the tree holds and hash as the snapshot says.
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::*;
 use crate::protocol::tree::Spec;
+use crate::protocol::tree_stream::client::install;
 
 fn session(title: &str, entries: &[&str]) -> Spec {
     Spec::object(
@@ -23,27 +24,6 @@ fn root(sessions: &[(&str, Spec)]) -> BTreeMap<String, Spec> {
         ("global".to_string(), Spec::value(json!({ "agent": "a" }))),
         ("sessions".to_string(), Spec::map(sessions.iter().map(|(id, spec)| (*id, spec.clone())))),
     ])
-}
-
-/// What a client holding `held` has after installing `node`.
-fn install(held: Option<&Value>, node: &SNode) -> Value {
-    let child = |held: Option<&Value>, key: &str, c: &BTreeMap<String, SNode>| match c.get(key) {
-        Some(node) => install(held.and_then(|held| held.get(key)), node),
-        None => held.and_then(|held| held.get(key)).cloned().expect("a kept child is held"),
-    };
-    match node {
-        SNode::Same { .. } => held.cloned().expect("the client holds what it says it holds"),
-        SNode::Value { v } => v.clone(),
-        SNode::Object { o, k, c } => {
-            let mut object: Map<String, Value> = o.as_object().unwrap().clone();
-            for key in k {
-                object.insert(key.clone(), child(held, key, c));
-            }
-            Value::Object(object)
-        }
-        SNode::Map { m, c } => Value::Object(m.iter().map(|key| (key.clone(), child(held, key, c))).collect()),
-        SNode::List { l, c } => Value::Array((0..*l).map(|i| child(held, &i.to_string(), c)).collect()),
-    }
 }
 
 fn hash_of(value: &Value, tree: &Tree, path: &str) -> String {

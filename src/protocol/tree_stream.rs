@@ -4,4 +4,7 @@
 
 pub(crate) mod params;
 pub(crate) mod snapshot;
+pub(crate) mod subscriber;
 pub(crate) mod wire;
+#[cfg(test)]
+pub(crate) mod client;
