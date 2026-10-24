@@ -229,6 +229,7 @@ fn every_node_of_the_tree_is_of_the_kind_the_shape_names() {
     world.update(text("user_message_chunk", "u2", "q2")).update(text("agent_message_chunk", "a2", "two"));
     world.registry.start_login_terminal("login", "method");
     world.registry.login_output("login", "output");
+    world.commit().unwrap();
     world.registry
         .install_operation(&crate::protocol::documents::Scope::Global, crate::protocol::documents::OperationKind::Logout, json!({}))
         .unwrap();
