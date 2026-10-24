@@ -253,10 +253,10 @@ fn streamed_text_changes_only_the_entry_that_grew() {
     let mut tree = Tree::new("i");
     tree.commit(projector.project(&registry, &agent(), 1));
     assert_eq!(registry.sessions["s"].state.timeline.as_ref().unwrap().entries().len(), 2);
-    chunk(&mut registry, "a", " more");
+    chunk(&mut registry, "b", " more");
     let rev = tree.commit(projector.project(&registry, &agent(), 1)).unwrap();
-    assert_eq!(tree.get("/sessions/s/entries/0").unwrap().rev(), rev);
-    assert_eq!(tree.get("/sessions/s/entries/1").unwrap().rev(), 1);
+    assert_eq!(tree.get("/sessions/s/entries/1").unwrap().rev(), rev);
+    assert_eq!(tree.get("/sessions/s/entries/0").unwrap().rev(), 1);
     assert_eq!(tree.get("/sessions/s/entries").unwrap().rev(), 1, "no entry was added");
 }
 
