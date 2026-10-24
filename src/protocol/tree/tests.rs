@@ -490,7 +490,7 @@ fn only_so_many_revisions_of_lengths_are_remembered_and_plain_values_keep_none()
 // --- derived views in the same revision (design §4.5) ---------------------------------
 
 /// The `views` a derivation of `wanted` entries yields: each is `{ n: <the global value> }`.
-fn views_of(wanted: &[&str]) -> impl Fn(&Tree) -> Spec + '_ {
+fn views_of<'a>(wanted: &'a [&'a str]) -> impl Fn(&Tree) -> Spec + 'a {
     move |tree| {
         let n = tree.get("/global").map(|node| node.to_value()["n"].clone()).unwrap_or(Value::Null);
         Spec::map(wanted.iter().map(|name| (*name, Spec::value(json!({ "name": name, "n": n })))))
