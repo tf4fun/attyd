@@ -281,6 +281,21 @@ impl Subscriber {
     /// snapshot from the version last written, or its end. It never changes what a path
     /// version contains (design §6.5).
     pub(crate) fn coalesce(&mut self, tree: &Tree) {
+        // The ends queued are kept, with their reasons: a snapshot says nothing of why a path
+        // is gone.
+        let mut queued_ends: BTreeMap<String, End> = BTreeMap::new();
+        for queued in &self.queue {
+            for change in queued.event.changes.iter().flatten() {
+                match change {
+                    Change::End { path, end } => {
+                        queued_ends.insert(path.clone(), end.clone());
+                    }
+                    other => {
+                        queued_ends.remove(other.path());
+                    }
+                }
+            }
+        }
         self.queue.clear();
         self.queued_bytes = 0;
         let mut changes = Vec::new();
@@ -296,10 +311,11 @@ impl Subscriber {
                     state.queued = None;
                     state.present = false;
                     self.pacer.settled(path);
-                    if state.written.is_some() {
+                    let end = queued_ends.remove(path.as_str());
+                    if end.is_some() || state.written.is_some() {
                         changes.push(Change::End {
                             path: path.clone(),
-                            end: End { reason: EndReason::Absent, error: None },
+                            end: end.unwrap_or(End { reason: EndReason::Absent, error: None }),
                         });
                     }
                 }

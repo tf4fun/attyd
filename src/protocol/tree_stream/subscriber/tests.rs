@@ -477,3 +477,46 @@ fn snapshots_do_not_count_against_the_budget() {
     let subscriber = Subscriber::new(&query(&["/sessions/s"]), &tree);
     assert!(!subscriber.over_budget(), "the first event is a 2 MB snapshot");
 }
+
+#[test]
+fn an_end_queued_behind_events_reaches_a_slow_subscriber_with_its_reason() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s", "/sessions/u"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    pump(&mut subscriber, &mut client);
+    let ends = BTreeMap::from([(
+        "s".to_string(),
+        End { reason: EndReason::Deleted, error: None },
+    )]);
+    let change = committed(&mut tree, root(1, &[("s", session("u", &["a"]))]));
+    subscriber.publish(&tree, &change);
+    let gone = committed(&mut tree, root(1, &[]));
+    subscriber.publish_ended(&tree, &gone, Instant::now(), &ends);
+    subscriber.end_session(&tree, "u", &End { reason: EndReason::LoadFailed, error: None });
+    subscriber.coalesce(&tree);
+    let catch_up = subscriber.next().unwrap();
+    let changes = catch_up.changes.as_ref().unwrap();
+    let reason = |path: &str| match changes.iter().find(|c| c.path() == path) {
+        Some(Change::End { end, .. }) => Some(end.reason),
+        other => panic!("{path}: {other:?}"),
+    };
+    assert_eq!(reason("/sessions/s"), Some(EndReason::Deleted));
+    assert_eq!(reason("/sessions/u"), Some(EndReason::LoadFailed), "never held, but its end is owed");
+    assert!(changes.iter().all(|change| !matches!(change, Change::Snapshot { .. })), "no snapshot for an ended path");
+}
+
+#[test]
+fn an_end_followed_by_the_path_coming_back_is_not_kept() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let (mut client, mut subscriber) = (Client::following(&["/sessions/s"]), Subscriber::new(&query(&["/sessions/s"]), &tree));
+    pump(&mut subscriber, &mut client);
+    let gone = committed(&mut tree, root(0, &[]));
+    subscriber.publish(&tree, &gone);
+    let back = committed(&mut tree, root(0, &[("s", session("t", &["b"]))]));
+    subscriber.publish(&tree, &back);
+    subscriber.coalesce(&tree);
+    pump(&mut subscriber, &mut client);
+    holds(&client, &tree, &["/sessions/s"]);
+}
