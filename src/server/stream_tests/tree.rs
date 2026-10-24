@@ -226,3 +226,98 @@ async fn a_segment_read_needs_a_version_and_a_text_position() {
         assert_eq!(got, status, "{path}: {body}");
     }
 }
+
+// --- writes to targets and the outcome of a lost answer (design §8, §9.3) ---------------
+
+/// A client-chosen operation id: 22 characters of base64url.
+const CREATE: &str = "Cr3ateOperation_Id-001";
+const OTHER: &str = "Other0peration_Id-002";
+
+/// What a client holds of `global` when it writes: the instance, the version and the `op.id`.
+async fn global_held(server: &Server) -> (String, u64, String) {
+    let (_, mut sse) = open(server, "follow=/global").await;
+    let first = next(&mut sse).await;
+    let snapshot = &change(&first, "/global")["snapshot"];
+    (
+        first["instance"].as_str().unwrap().to_string(),
+        snapshot["at"].as_u64().unwrap(),
+        snapshot["node"]["v"]["op"]["id"].as_str().unwrap().to_string(),
+    )
+}
+
+async fn post(server: &Server, path: &str, body: Value) -> (StatusCode, Value) {
+    let response = send(server.address, Method::POST, path, Some(body)).await;
+    (response.status(), json_of(response).await)
+}
+
+fn resolution(id: &str, expect: &str, instance: &str, at: u64) -> String {
+    format!("/api/v2/targets/global/ops/{id}?expect={expect}&instance={instance}&at={at}")
+}
+
+#[tokio::test]
+async fn a_write_to_a_target_is_admitted_and_its_outcome_can_be_asked_for() {
+    let (server, mut link) = Server::start(json!({})).await;
+    let (instance, at, e) = global_held(&server).await;
+
+    // Not admitted yet: the request is open.
+    let (status, body) = read(&server, &resolution(CREATE, &e, &instance, at)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "outcome": "open" })));
+
+    let write = json!({"id": CREATE, "expect": e, "kind": "create", "args": {"cwd": CWD}});
+    let (status, body) = post(&server, "/api/v2/targets/global/ops", write.clone()).await;
+    assert_eq!((status, &body), (StatusCode::ACCEPTED, &json!({"op": CREATE})));
+    // A repeat of the same request is the same operation.
+    let (status, body) = post(&server, "/api/v2/targets/global/ops", write).await;
+    assert_eq!((status, &body), (StatusCode::ACCEPTED, &json!({"op": CREATE})));
+
+    let new = link.request("session/new").await;
+    link.reply(&new, json!({"sessionId": "s1"})).await;
+
+    let (_, admitted) = read(&server, &resolution(CREATE, &e, &instance, at)).await;
+    assert_eq!(admitted["outcome"], "admitted", "{admitted}");
+    assert_eq!(admitted["record"]["id"], CREATE);
+    assert_eq!(admitted["record"]["after"], e);
+    assert_eq!(admitted["record"]["kind"], "create");
+    // Another request for the same `e` can never be admitted now.
+    let (_, superseded) = read(&server, &resolution(OTHER, &e, &instance, at)).await;
+    assert_eq!(superseded, json!({ "outcome": "superseded" }));
+    link.quiet(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn a_request_of_another_instance_is_unknown_restarted_and_bad_reads_are_refused() {
+    let (server, _link) = Server::start(json!({})).await;
+    let (instance, at, e) = global_held(&server).await;
+    let (status, body) = read(&server, &resolution(CREATE, &e, "AnotherInstance0000000", at)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "outcome": "unknown", "reason": "restarted" })));
+    let (status, body) = read(&server, "/api/v2/targets/sessions/ghost/ops/x?expect=e&instance=I&at=1").await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "outcome": "unknown", "reason": "restarted" })));
+    let (status, body) = read(&server, &resolution("x", &e, &instance, at).replace("sessions", "sessions")).await;
+    assert_eq!((status, body["outcome"].as_str()), (StatusCode::OK, Some("open")));
+    for (path, expected) in [
+        (format!("/api/v2/targets/global/ops/x?instance={instance}&at={at}"), StatusCode::BAD_REQUEST),
+        (format!("/api/v2/targets/global/ops/x?expect={e}&at={at}"), StatusCode::BAD_REQUEST),
+        (format!("/api/v2/targets/global/ops/x?expect={e}&instance={instance}&at=zero"), StatusCode::BAD_REQUEST),
+        (format!("/api/v2/targets/global/ops/x?expect={e}&instance={instance}&at=1&bogus=1"), StatusCode::BAD_REQUEST),
+        ("/api/v2/targets/nowhere/ops/x?expect=e&instance=I&at=1".to_string(), StatusCode::BAD_REQUEST),
+        ("/api/v2/targets/global/state/x?expect=e&instance=I&at=1".to_string(), StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = read(&server, &path).await;
+        assert_eq!(status, expected, "{path}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_write_against_an_operation_that_is_not_the_current_one_is_stale_through_a_target() {
+    let (server, _link) = Server::start(json!({})).await;
+    let (status, body) = post(
+        &server,
+        "/api/v2/targets/global/ops",
+        json!({"id": CREATE, "expect": "NotTheCurrentOp0000000", "kind": "create", "args": {"cwd": CWD}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "stale");
+    let (status, _) = post(&server, "/api/v2/targets/nowhere/ops", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

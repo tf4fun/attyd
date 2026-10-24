@@ -109,5 +109,29 @@ pub(crate) fn state_of(tree: &super::tree::Tree, target: &str) -> Option<TargetS
     })
 }
 
+/// The body of `GET /api/v2/targets/{target}/ops/{id}`: the outcome of `request` against the tree,
+/// an admitted one with its record. A session the bridge does not hold is one released since the
+/// client held it; `None` for a target that does not exist.
+pub(crate) fn resolve(
+    tree: &super::tree::Tree,
+    target: &str,
+    request: &Request,
+) -> Option<serde_json::Value> {
+    let result = match state_of(tree, target) {
+        Some(state) => outcome(&state, request),
+        None if target.starts_with("sessions/") => Outcome::Unknown {
+            reason: if tree.instance() == request.instance { Reason::Released } else { Reason::Restarted },
+        },
+        None => return None,
+    };
+    let mut body = serde_json::to_value(&result).expect("an outcome serializes");
+    if let Outcome::Admitted { record } = &result {
+        let log = tree.get(&format!("/{target}/ops"))?;
+        let held = log.items().iter().filter_map(|item| item.as_value()).find(|(value, _)| value["id"] == record.as_str());
+        body["record"] = held?.0.clone();
+    }
+    Some(body)
+}
+
 #[cfg(test)]
 mod tests;

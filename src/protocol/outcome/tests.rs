@@ -178,3 +178,34 @@ fn a_target_that_is_not_in_the_tree_has_no_state() {
     assert!(state_of(&bridge.tree, "sessions/nope").is_none());
     assert!(state_of(&bridge.tree, "nowhere").is_none());
 }
+
+#[test]
+fn the_answer_to_a_read_names_the_record_of_an_admitted_request() {
+    let mut bridge = Bridge::new();
+    let e = bridge.state("global").op;
+    let admitted = bridge.write(&Scope::Global, OperationKind::Logout);
+    let at = bridge.tree.get("/global").unwrap().srev();
+    let request = Request { id: admitted.clone(), expect: e.clone(), instance: "I".into(), at };
+    let body = resolve(&bridge.tree, "global", &request).unwrap();
+    assert_eq!(body["outcome"], "admitted");
+    assert_eq!(body["record"]["id"], admitted.as_str());
+    assert_eq!(body["record"]["after"], e.as_str());
+    assert_eq!(body["record"]["kind"], "logout");
+    let open = Request { id: "other".into(), expect: admitted, instance: "I".into(), at };
+    assert_eq!(resolve(&bridge.tree, "global", &open).unwrap(), json!({ "outcome": "open" }));
+}
+
+#[test]
+fn a_session_the_bridge_does_not_hold_is_released_or_restarted_and_a_missing_target_is_none() {
+    let bridge = Bridge::new();
+    let request = |instance: &str| Request { id: "x".into(), expect: "e".into(), instance: instance.into(), at: 1 };
+    assert_eq!(
+        resolve(&bridge.tree, "sessions/gone", &request("I")).unwrap(),
+        json!({ "outcome": "unknown", "reason": "released" })
+    );
+    assert_eq!(
+        resolve(&bridge.tree, "sessions/gone", &request("OTHER")).unwrap(),
+        json!({ "outcome": "unknown", "reason": "restarted" })
+    );
+    assert!(resolve(&bridge.tree, "nowhere", &request("I")).is_none());
+}
