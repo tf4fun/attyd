@@ -423,7 +423,8 @@ pub(crate) fn escape(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
-fn unescape(token: &str) -> String {
+/// The key a JSON Pointer token stands for.
+pub(crate) fn unescape(token: &str) -> String {
     token.replace("~1", "/").replace("~0", "~")
 }
 
