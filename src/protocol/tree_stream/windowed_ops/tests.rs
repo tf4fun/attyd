@@ -192,3 +192,25 @@ fn what_is_not_a_text_position_is_left_alone() {
     let ops: Vec<Op> = committed.ops.iter().flat_map(|op| windowed(&tree, op, N, &mut replaced)).collect();
     assert_eq!(ops, committed.ops);
 }
+
+#[test]
+fn with_the_smallest_window_one_byte_is_an_append_and_twelve_thousand_bytes_are_a_set() {
+    let step = |texts: &[&str]| root(&texts.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+    let mut tree = Tree::new("i");
+    tree.commit(step(&["start"]));
+    let mut ops_of = |tree: &mut Tree, texts: &[&str]| {
+        let committed = tree.commit_with_ops(step(texts)).unwrap();
+        let mut replaced = BTreeSet::new();
+        committed
+            .ops
+            .iter()
+            .flat_map(|op| windowed(tree, op, 4096, &mut replaced))
+            .collect::<Vec<Op>>()
+    };
+    let one = "start!";
+    let twelve = format!("{one}{}", "k".repeat(12_000));
+    let first = ops_of(&mut tree, &[one]);
+    assert!(matches!(first[0], Op::Append { .. }), "{first:?}");
+    let second = ops_of(&mut tree, &[&twelve]);
+    assert!(matches!(second[0], Op::Set { .. }), "{second:?}");
+}
