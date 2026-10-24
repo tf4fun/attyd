@@ -163,6 +163,14 @@ impl Subscriber {
         &self.cwd
     }
 
+    /// The bridge released `session_id`, which it knew in `cwd`: a path of it this subscriber
+    /// follows asks for the load in that directory, whatever it supplied.
+    pub(crate) fn remember_cwd(&mut self, session_id: &str, cwd: &str) {
+        if self.paths.keys().any(|path| session_of(path).as_deref() == Some(session_id)) {
+            self.cwd.insert(session_id.to_string(), cwd.to_string());
+        }
+    }
+
     /// A commit: queues one event with the change of every followed path it touched.
     pub(crate) fn publish(&mut self, tree: &Tree, committed: &Committed) {
         self.publish_at(tree, committed, Instant::now());

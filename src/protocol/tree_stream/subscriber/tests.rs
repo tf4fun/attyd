@@ -625,6 +625,7 @@ fn a_path_that_ended_for_a_reason_asks_for_nothing_but_is_still_tracked_and_asks
     subscriber.end_session(&tree, "s", &End { reason: EndReason::LoadFailed, error: None });
     assert_eq!(subscriber.followed().count(), 0, "a failed load is not asked for again");
     assert_eq!(subscriber.tracked().collect::<Vec<_>>(), ["/sessions/s/op"]);
+    assert!(matches!(&subscriber.next().unwrap().changes.unwrap()[0], Change::End { .. }));
 
     // The session is there later: the subscription delivers it and asks for it again if it goes.
     let change = committed(&mut tree, root(0, &[("s", Spec::object(Default::default(), [("op", Spec::value(json!({ "id": "o" })))]))]));

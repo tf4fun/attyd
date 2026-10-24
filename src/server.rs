@@ -1270,12 +1270,6 @@ async fn read_path(path: &str, query: &str, state: AppState) -> Response {
         follow: vec![Follow { path: path.to_string(), have, window }],
         cwd: session_of(path).zip(cwd).into_iter().collect(),
     };
-    if state.bridge.state.lock().await.shutting_down {
-        return protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
-        );
-    }
     // A short subscription: it holds the session while the read is served, and dropping it
     // restarts the session's unobserved timer. Its first event is the answer.
     let subscription = state.bridge.publication.lock().feed.subscribe_tree_reading(&stream);

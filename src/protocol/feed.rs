@@ -420,6 +420,22 @@ impl Feed {
                 _ => {}
             }
         }
+        // The directories of the sessions the tree holds now: one released in this commit is
+        // loaded again where the bridge knew it.
+        let known: Vec<(String, String)> = self
+            .tree
+            .get("/sessions")
+            .map(|sessions| {
+                sessions
+                    .child_names()
+                    .into_iter()
+                    .filter_map(|id| {
+                        let cwd = sessions.child(id)?.field("cwd")?.as_str()?.to_string();
+                        Some((id.to_string(), cwd))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let next = self.tree.rev() + 1;
         let root = self.projector.project(registry, agent, catalog_revision, next);
         let wanted = self.wanted_views(None, now);
@@ -429,6 +445,13 @@ impl Feed {
                 .map(|(session_id, end)| (session_id.clone(), tree_end(end)))
                 .collect();
             self.publish_tree(&committed, now, &ends);
+            for (session_id, cwd) in known {
+                if self.tree.get(&format!("/sessions/{}", super::tree::escape(&session_id))).is_none() {
+                    for subscriber in self.tree_subscribers.values_mut() {
+                        subscriber.remember_cwd(&session_id, &cwd);
+                    }
+                }
+            }
         }
         #[cfg(test)]
         self.tap_flush();

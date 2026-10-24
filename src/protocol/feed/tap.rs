@@ -25,10 +25,23 @@ pub(super) struct Tap {
 impl Feed {
     /// How many subscriptions still follow `scope`.
     pub(crate) fn followers(&self, scope: &str) -> usize {
-        self.subscribers
+        let scopes = self
+            .subscribers
             .values()
             .filter(|subscriber| subscriber.followed().any(|(followed, _)| followed == scope))
-            .count()
+            .count();
+        // A stream of the tree follows a session through any path of it.
+        let session_id = scope.strip_prefix("session/");
+        let paths = self
+            .tree_subscribers
+            .values()
+            .filter(|subscriber| {
+                subscriber
+                    .followed()
+                    .any(|path| session_id.is_some() && session_of(path).as_deref() == session_id)
+            })
+            .count();
+        scopes + paths
     }
 
     /// Taps every later commit and returns the published documents now: a cut.
