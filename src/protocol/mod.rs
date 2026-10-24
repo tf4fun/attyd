@@ -31,6 +31,7 @@ pub(crate) mod subscription;
 pub(crate) mod timeline;
 pub(crate) mod timeline_doc;
 pub(crate) mod tree;
+pub(crate) mod tree_doc;
 #[cfg(test)]
 mod typescript;
 pub(crate) mod wire;
