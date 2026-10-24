@@ -1,5 +1,7 @@
 //! The revision 4 tree projection (docs/protocol-r4-design.md §4.2, §4.4). Expected values
 //! are written from the design's shapes, not computed by the projection.
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 
 use super::*;
@@ -205,4 +207,101 @@ fn a_session_an_operation_occupies_shows_that_operation() {
     let op = at(&tree, "/sessions/s/op");
     assert_eq!(op["scope"], "global");
     assert_eq!(op["kind"], "delete");
+}
+
+// --- entries and prompts ------------------------------------------------------------
+
+fn chunk(registry: &mut SessionRegistry, id: &str, text: &str) {
+    registry
+        .append_session_update(
+            "s",
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": id,
+                    "content": { "type": "text", "text": text } }),
+        )
+        .unwrap();
+}
+
+#[test]
+fn entries_are_a_flat_list_of_the_published_entries_with_the_history() {
+    let mut registry = registry();
+    chunk(&mut registry, "m", "hi");
+    let tree = tree_of(&registry);
+    let session = at(&tree, "/sessions/s");
+    assert_eq!(session["history"], "complete");
+    assert_eq!(session["entries"][0]["kind"], "message");
+    assert_eq!(session["entries"][0]["chunks"][0]["content"]["text"], "hi");
+    assert_eq!(session["prompts"], json!([]));
+    assert_eq!(tree.get("/sessions/s/entries/0").unwrap().to_value(), session["entries"][0]);
+}
+
+#[test]
+fn an_unknown_history_has_no_entries_and_no_history() {
+    let mut registry = registry();
+    registry.register_cold("s");
+    let session = at(&tree_of(&registry), "/sessions/s");
+    assert!(session.get("history").is_none());
+    assert!(session.get("entries").is_none());
+    assert_eq!(session["prompts"], json!([]));
+}
+
+#[test]
+fn streamed_text_changes_only_the_entry_that_grew() {
+    let mut registry = registry();
+    chunk(&mut registry, "a", "one");
+    registry
+        .append_session_update(
+            "s",
+            json!({ "sessionUpdate": "user_message_chunk", "messageId": "u",
+                    "content": { "type": "text", "text": "q" } }),
+        )
+        .unwrap();
+    let mut projector = Projector::default();
+    let mut tree = Tree::new("i");
+    tree.commit(projector.project(&registry, &agent(), 1));
+    assert_eq!(registry.sessions["s"].state.timeline.as_ref().unwrap().entries().len(), 2);
+    chunk(&mut registry, "a", " more");
+    let rev = tree.commit(projector.project(&registry, &agent(), 1)).unwrap();
+    assert_eq!(tree.get("/sessions/s/entries/0").unwrap().rev(), rev);
+    assert_eq!(tree.get("/sessions/s/entries/1").unwrap().rev(), 1);
+    assert_eq!(tree.get("/sessions/s/entries").unwrap().rev(), 1, "no entry was added");
+}
+
+#[test]
+fn an_unchanged_entry_is_published_with_the_same_value_object() {
+    let mut registry = registry();
+    chunk(&mut registry, "a", "one");
+    let mut projector = Projector::default();
+    let first = projector.project(&registry, &agent(), 1);
+    let second = projector.project(&registry, &agent(), 1);
+    let entry = |tree: &BTreeMap<String, Spec>| match &tree["sessions"] {
+        Spec::Map(sessions) => match &sessions["s"] {
+            Spec::Object { children, .. } => match &children["entries"] {
+                Spec::List(entries) => match &entries[0] {
+                    Spec::Value(value) => value.clone(),
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
+    };
+    assert!(Arc::ptr_eq(&entry(&first), &entry(&second)));
+}
+
+#[test]
+fn a_replaced_history_replaces_the_entries_and_a_released_session_forgets_them() {
+    let mut registry = registry();
+    chunk(&mut registry, "a", "one");
+    chunk(&mut registry, "b", "two");
+    let mut projector = Projector::default();
+    projector.project(&registry, &agent(), 1);
+    assert_eq!(projector.entries["s"].len(), 2);
+    registry.register_cold("s");
+    projector.project(&registry, &agent(), 1);
+    assert!(projector.entries["s"].is_empty());
+    registry.sessions.get_mut("s").unwrap().state.live.as_mut().unwrap().lifecycle =
+        crate::runtime_state::SessionLifecycle::Closed;
+    projector.project(&registry, &agent(), 1);
+    assert!(!projector.entries.contains_key("s"));
 }

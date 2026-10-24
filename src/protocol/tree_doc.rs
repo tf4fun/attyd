@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -14,6 +15,8 @@ use super::documents::{
     AgentInfo, ErrorCode, Operation, OperationKind, OperationStatus, ProtocolError,
 };
 use super::project;
+use super::timeline::Entry;
+use super::timeline_doc::{AttachmentIndex, publish_entry};
 use super::tree::Spec;
 use crate::session_registry::SessionRegistry;
 
@@ -148,24 +151,93 @@ pub(crate) fn session(registry: &SessionRegistry, session_id: &str) -> Option<Sp
     ))
 }
 
-/// The complete tree the bridge now publishes, to commit.
+/// What the projection remembers between commits: a session's published entries, so that an
+/// entry the memory did not touch keeps its value (and the tree compares it by pointer).
+#[derive(Default)]
+pub(crate) struct Projector {
+    entries: BTreeMap<String, Vec<(Arc<Entry>, Arc<Value>)>>,
+}
+
+impl Projector {
+    /// The complete tree the bridge now publishes, to commit.
+    pub(crate) fn project(
+        &mut self,
+        registry: &SessionRegistry,
+        agent: &AgentInfo,
+        catalog_revision: u64,
+    ) -> BTreeMap<String, Spec> {
+        let held = project::held_sessions(registry);
+        self.entries.retain(|id, _| held.contains(id));
+        let sessions: Vec<(String, Spec)> = held
+            .into_iter()
+            .filter_map(|id| {
+                let spec = self.session_with_history(registry, &id)?;
+                Some((id, spec))
+            })
+            .collect();
+        BTreeMap::from([
+            ("global".to_string(), global(registry, agent)),
+            ("catalog".to_string(), catalog(registry, catalog_revision)),
+            ("sessions".to_string(), Spec::map(sessions)),
+        ])
+    }
+
+    /// `/sessions/<id>` with `history`, `entries` and `prompts` (§4.2). While the history is
+    /// unknown there is no `history` field and no `entries` node.
+    fn session_with_history(&mut self, registry: &SessionRegistry, session_id: &str) -> Option<Spec> {
+        let Spec::Object { mut fields, mut children } = session(registry, session_id)? else {
+            unreachable!("a session is an object");
+        };
+        let state = &registry.sessions.get(session_id)?.state;
+        let cache = self.entries.entry(session_id.to_string()).or_default();
+        match state.timeline.as_ref() {
+            Some(timeline) => {
+                if let Some(history) = state.history {
+                    fields.insert("history".into(), json!(history));
+                }
+                let source = timeline.entries();
+                // Entries only change in place or grow; a shorter list is another history.
+                cache.truncate(source.len());
+                let mut index = AttachmentIndex::default();
+                for (position, entry) in source.iter().enumerate() {
+                    match cache.get(position) {
+                        Some((cached, _)) if Arc::ptr_eq(cached, entry) => {}
+                        _ => {
+                            let published = Arc::new(publish_entry(entry, &mut index));
+                            if position < cache.len() {
+                                cache[position] = (Arc::clone(entry), published);
+                            } else {
+                                cache.push((Arc::clone(entry), published));
+                            }
+                        }
+                    }
+                }
+                children.insert(
+                    "entries".into(),
+                    Spec::List(cache.iter().map(|(_, value)| Spec::Value(Arc::clone(value))).collect()),
+                );
+                children.insert(
+                    "prompts".into(),
+                    Spec::List(timeline.prompts().iter().map(value).collect()),
+                );
+            }
+            None => {
+                cache.clear();
+                children.insert("prompts".into(), Spec::List(Vec::new()));
+            }
+        }
+        Some(Spec::Object { fields, children })
+    }
+}
+
+/// `Projector::project` with nothing remembered.
+#[cfg(test)]
 pub(crate) fn project_tree(
     registry: &SessionRegistry,
     agent: &AgentInfo,
     catalog_revision: u64,
 ) -> BTreeMap<String, Spec> {
-    BTreeMap::from([
-        ("global".to_string(), global(registry, agent)),
-        ("catalog".to_string(), catalog(registry, catalog_revision)),
-        (
-            "sessions".to_string(),
-            Spec::map(
-                project::held_sessions(registry)
-                    .into_iter()
-                    .filter_map(|id| session(registry, &id).map(|spec| (id, spec))),
-            ),
-        ),
-    ])
+    Projector::default().project(registry, agent, catalog_revision)
 }
 
 #[cfg(test)]
