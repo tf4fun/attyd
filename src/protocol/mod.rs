@@ -19,6 +19,7 @@ pub(crate) mod digest;
 pub(crate) mod documents;
 pub(crate) mod engine;
 pub(crate) mod feed;
+pub(crate) mod hash;
 pub(crate) mod live_doc;
 pub(crate) mod op;
 pub(crate) mod pacing;
