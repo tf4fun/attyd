@@ -27,6 +27,14 @@ function shownOp(replicas: QueueSource, scope: string): Operation | undefined {
   return live.op as unknown as Operation;
 }
 
+/**
+ * The target a scope's writes go to (design §8): `global`, `catalog` or `sessions/<id>`, the ID
+ * percent-encoded as a path segment.
+ */
+export function targetOf(scope: string): string {
+  return scope.startsWith("session/") ? `sessions/${encodeURIComponent(scope.slice("session/".length))}` : scope;
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -223,7 +231,7 @@ export class ResourceClient {
   /** The last input sent to each terminal; the next waits for its answer. */
   readonly #inputs = new Map<string, Promise<ActionOutcome>>();
 
-  /** `base` is the API prefix; the revision 3 routes are served beside the revision 2 ones until the cutover. */
+  /** `base` is the API prefix. */
   constructor(fetch: HttpFetch, base = "/api/v2") {
     this.#fetch = fetch;
     this.#base = base;
@@ -253,7 +261,7 @@ export class ResourceClient {
     let response: Awaited<ReturnType<HttpFetch>>;
     try {
       response = await this.#fetch(
-        `${this.#base}/scopes/${encodeURIComponent(scope)}/resources/${encodeURIComponent(resourceId)}/${action}`,
+        `${this.#base}/targets/${targetOf(scope)}/resources/${encodeURIComponent(resourceId)}/${action}`,
         { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
       );
     } catch {

@@ -24,6 +24,10 @@ export interface ScopeReplica {
   readonly doc: Readonly<Record<string, unknown>>;
   /** The path version whose hash the replica last matched. */
   readonly verifiedRev: number;
+  /** The log of the operations that occupied the scope (design §9.3). */
+  readonly ops: ReadonlyArray<{ readonly id: string; readonly after: string | null }>;
+  /** The revision at which the bridge started holding the session; null for `global` and `catalog`. */
+  readonly heldSince: number | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -131,7 +135,20 @@ export class ScopeFeed {
     if (replica === undefined) return undefined;
     const doc = documentOf(scope, replica.value);
     if (doc === undefined) return undefined;
-    return { scope, epoch: this.#feed.instance ?? "", rev: replica.version, doc, verifiedRev: replica.verified };
+    const value = replica.value as Record<string, unknown>;
+    const log = Array.isArray(value.ops) ? value.ops : [];
+    return {
+      scope,
+      epoch: this.#feed.instance ?? "",
+      rev: replica.version,
+      doc,
+      verifiedRev: replica.verified,
+      ops: log.filter(isRecord).map((record) => ({
+        id: String(record.id),
+        after: typeof record.after === "string" ? record.after : null,
+      })),
+      heldSince: typeof value.heldSince === "number" ? value.heldSince : null,
+    };
   }
 
   /** Why `scope` ended, if it did since it was followed. The whole error of a failed load is the bridge's `loadFailures`. */
