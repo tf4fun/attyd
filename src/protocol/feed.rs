@@ -426,9 +426,7 @@ impl FeedSubscription {
     /// the feed is closed and the queue is drained.
     #[cfg(test)]
     pub(crate) async fn next(&self) -> Option<StreamEvent> {
-        self.next_encoded()
-            .await
-            .map(|encoded| encoded.event().clone())
+        self.next_encoded().await.map(Encoded::into_event)
     }
 
     /// `next`, with the JSON it was encoded to once for every subscriber.

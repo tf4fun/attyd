@@ -136,6 +136,11 @@ impl Encoded {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn into_event(self) -> StreamEvent {
+        Arc::unwrap_or_clone(self.event)
+    }
+
     /// The event's JSON, as the stream writes it.
     pub(crate) fn json(&self) -> Arc<str> {
         Arc::clone(&self.json)
@@ -290,8 +295,7 @@ impl Subscriber {
     /// The next event to write, as an event.
     #[cfg(test)]
     pub(crate) fn next(&mut self) -> Option<StreamEvent> {
-        self.next_encoded()
-            .map(|encoded| Arc::unwrap_or_clone(encoded.event))
+        self.next_encoded().map(Encoded::into_event)
     }
 
     /// The next event to write; a snapshot or a version advances what the
