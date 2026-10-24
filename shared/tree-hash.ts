@@ -166,3 +166,24 @@ export function mapHash(children: ReadonlyMap<string, Hash> | Record<string, Has
 export function listHash(children: readonly Hash[]): Hash {
   return sha256(concat([encoder.encode("l"), u64be(children.length), ...children]));
 }
+
+const cached = new WeakMap<object, Map<TextRule, Hash>>();
+
+/**
+ * `valueHash` remembered by the identity of the value, which a replica freezes: a value that did
+ * not change is not hashed again. Primitives are hashed each time.
+ */
+export function cachedValueHash(rule: TextRule, value: unknown): Hash {
+  if (typeof value !== "object" || value === null) return valueHash(rule, value);
+  let byRule = cached.get(value);
+  if (byRule === undefined) {
+    byRule = new Map();
+    cached.set(value, byRule);
+  }
+  let hash = byRule.get(rule);
+  if (hash === undefined) {
+    hash = valueHash(rule, value);
+    byRule.set(rule, hash);
+  }
+  return hash;
+}

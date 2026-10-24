@@ -8,6 +8,7 @@ import {
   SEGMENT_LENGTH,
   type Hash,
   type TextRule,
+  cachedValueHash,
   chainStates,
   listHash,
   mapHash,
@@ -84,5 +85,14 @@ describe("revision 4 hashes", () => {
   it("keeps the kinds in their own domains", () => {
     expect(hex(objectHash({}, new Map()))).not.toBe(hex(mapHash(new Map())));
     expect(hex(mapHash(new Map()))).not.toBe(hex(listHash([])));
+  });
+
+  it("remembers the hash of a value by its identity", () => {
+    const entry = Object.freeze({ kind: "message", role: "agent", chunks: [] });
+    const first = cachedValueHash("entry", entry);
+    expect(cachedValueHash("entry", entry)).toBe(first);
+    expect(hex(first)).toBe(hex(valueHash("entry", entry)));
+    expect(cachedValueHash("none", entry)).not.toBe(first);
+    expect(hex(cachedValueHash("none", { ...entry }))).toBe(hex(valueHash("none", entry)));
   });
 });
