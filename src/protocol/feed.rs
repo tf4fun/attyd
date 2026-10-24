@@ -210,7 +210,27 @@ impl Feed {
                 }
             }
         }
+        for (session_id, cwd) in &self.pending_loads {
+            let published = self
+                .tree
+                .get(&format!("/sessions/{}", super::tree::escape(session_id)))
+                .is_some();
+            let waiting = sessions.entry(session_id.clone()).or_default();
+            if !published {
+                waiting.push(Waiting { id: 0, cwd: cwd.clone() });
+            }
+        }
         sessions
+    }
+
+    /// The bridge dealt with the read of `session_id`: its load is started or will never be.
+    pub(crate) fn clear_pending(&mut self, session_id: &str) {
+        self.pending_loads.remove(session_id);
+    }
+
+    /// The sessions reads touched since the last call.
+    pub(crate) fn take_touched(&mut self) -> std::collections::BTreeSet<String> {
+        std::mem::take(&mut self.touched)
     }
 
     /// Queues a tree commit for the revision 4 streams that follow what it changed.
