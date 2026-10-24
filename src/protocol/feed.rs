@@ -55,6 +55,12 @@ pub(crate) struct Feed {
     /// Views a read keeps materialized for a while, so that a client that polls finds the same
     /// path version and is told nothing changed.
     view_pins: BTreeMap<View, Instant>,
+    /// Sessions a read asked for, by the directory it gave: the bridge starts their load once,
+    /// after the read's subscription is gone.
+    pending_loads: BTreeMap<String, Option<String>>,
+    /// Sessions a read touched since the bridge last refreshed its unobserved timers: each
+    /// counts as followed once, so that its release timer starts over when the read ends.
+    touched: std::collections::BTreeSet<String>,
     #[cfg(test)]
     tap: tap::Tap,
 }
@@ -75,6 +81,8 @@ impl Feed {
             projector: Projector::default(),
             tree_subscribers: BTreeMap::new(),
             view_pins: BTreeMap::new(),
+            pending_loads: BTreeMap::new(),
+            touched: std::collections::BTreeSet::new(),
             #[cfg(test)]
             tap: tap::Tap::default(),
         }
@@ -116,6 +124,10 @@ impl Feed {
             for follow in &extra.follow {
                 if let Some(view) = View::of(&follow.path) {
                     self.view_pins.insert(view, now + VIEW_LINGER);
+                }
+                if let Some(session_id) = session_of(&follow.path) {
+                    self.pending_loads.insert(session_id.clone(), extra.cwd.get(&session_id).cloned());
+                    self.touched.insert(session_id);
                 }
             }
         }
@@ -507,6 +519,14 @@ impl FeedHandle {
             id,
             handle: self.clone(),
         }))
+    }
+
+    pub(crate) fn clear_pending(&self, session_id: &str) {
+        self.feed().clear_pending(session_id);
+    }
+
+    pub(crate) fn take_touched(&self) -> std::collections::BTreeSet<String> {
+        self.feed().take_touched()
     }
 
     /// `read` over the tree as committed now.
