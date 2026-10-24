@@ -1,8 +1,7 @@
 # Protocol revision 4: partial synchronization and serialized writes
 
-Status: **proposed design, second draft 2026-10-24, for review** (issue #201; first
-draft reviewed in [#201](https://github.com/tf4fun/attyd/issues/201), §15 lists what the
-review changed). Nothing here is implemented. Revision 3 ([protocol.md](protocol.md))
+Status: **proposed design, third draft 2026-10-24, for review** (issue #201; reviews are
+tracked on PR #202, §15 lists what each review changed). Nothing here is implemented. Revision 3 ([protocol.md](protocol.md))
 stays the served protocol until this design is accepted and its plan (§14) lands.
 Layer 1, the [bridge memory model](bridge-memory-model.md), is unchanged: this revision
 changes how that memory is published (layer 2), how clients write to it, and one
@@ -87,7 +86,7 @@ client-computed verification, coalescing a slow subscriber into a snapshot.
 | `have=<scope>:<epoch>:<rev>` | `have=<path>:<path version>` with one `instance` per stream |
 | document digest at snapshots and checkpoints | node hash of each followed path, at a stated path version |
 | client-derived turns | `/sessions/<id>/turns`, an index derived by the bridge |
-| — | `/views/<id>/output/latest`, `/views/<id>/output/<start>`, `/views/<id>/turn/<start>` |
+| — | `/views/<id>/output/latest`; fixed `/views/<id>/history/<historyRev>/output/<start>` and `…/turn/<start>` |
 | `op` with input and result | `op` head, `opDetail` with input and result |
 | — | text windows with bounded events, segment reads |
 | `after` on the operation | per-target operation log (last `K`), resolution read |
@@ -129,6 +128,7 @@ Shape (`·` marks a node, indentation children):
     · opDetail                  value: { input, result? }
     · ops                       list of value OpRecord (§9.3)
     · sessions                  map sessionId → value SessionSummary
+    · loadFailures              map sessionId → value ProtocolError (§6.2)
     · terminals                 map → value LoginTerminal
     · interactions              map → value Interaction
     · urlFlows                  map → value UrlFlow
@@ -143,8 +143,8 @@ Shape (`·` marks a node, indentation children):
     · prompts                   list of value Prompt
     · turns                     list of value TurnHead (absent while history is unknown, §4.3)
 · /views/<id>/output/latest     value: OutputView (§4.5)
-· /views/<id>/output/<start>    value: OutputView
-· /views/<id>/turn/<start>      object: TurnHead fields; child · entries (list of value Entry)
+· /views/<id>/history/<h>/output/<start>   value: OutputView
+· /views/<id>/history/<h>/turn/<start>     object: TurnHead fields; child · entries (list of value Entry)
 ```
 
 `historyRev` is the revision at which the session's history was last installed or
@@ -160,6 +160,7 @@ turn partition does. The bridge publishes the partition memory model §5 defines
 
 ```ts
 interface TurnHead {
+  historyRev: number;        // the session's historyRev: which history `start` indexes
   start: number;             // index of the turn's first entry
   length: number;            // its number of entries
   messageId?: string;        // the opening user message's messageId, if any
@@ -184,15 +185,28 @@ Revision 3's client-side derivation is removed: the browser reads `turns`.
 ### 4.4 The operation head
 
 ```ts
-interface OpHead {           // revision 3 Operation without `input` and `result`
+interface OpHead {           // revision 3 Operation without `input`, `result` and the error's body
   id: string; scope: string; after: string | null; kind: OperationKind;
-  status: OperationStatus; cancelRequested: boolean; error?: ProtocolError;
+  status: OperationStatus; cancelRequested: boolean;
+  error?: ErrorSummary;      // of `opDetail.error`, when it failed
+}
+
+interface ErrorSummary {
+  code: ErrorCode;           // revision 3 §9
+  agentCode?: number;        // for `agent_error`: the ACP error's integer `code`
 }
 ```
 
-`opDetail` holds `{ input, result? }` of the same operation and changes with it. A writer
-needs only `op` (its `id` for `expect`, its `status`), which is bounded however large the
-last prompt was.
+`opDetail` holds `{ input, result?, error? }` of the same operation, `error` being the
+whole `ProtocolError` (its `message` and `data` are the Agent's, of any size), and changes
+with it. A writer needs only `op` (its `id` for `expect`, its `status`, and whether and how
+it failed), which is bounded however large the last prompt or the Agent's error was.
+
+**Bounded heads.** Everything this design offers a small client as a fixed-size unit
+(`OpHead`, `OpRecord`, `TurnHead`, `OutputView` apart from its windowed `text`, `End`)
+holds only enums, numbers, booleans, IDs and revisions. IDs the client did not choose
+(`messageId`, interaction and terminal IDs) are the Agent's strings; the bridge passes
+them through unchanged, so their size is the Agent's.
 
 ### 4.5 Views
 
@@ -203,7 +217,7 @@ entries.
 
 ```ts
 interface OutputView {
-  turn: { start: number; messageId?: string; state: "running" | "ended" } | null;
+  turn: { historyRev: number; start: number; messageId?: string; state: "running" | "ended" } | null;
   entry: number | null;      // the output message's entry index, null when none yet
   text: string;              // its text blocks' `text`, concatenated in order, nothing inserted (a text position)
   other: number;             // how many of its blocks are not text (not included)
@@ -213,17 +227,23 @@ interface OutputView {
 - `/views/<id>/output/latest` **moves**: to the next turn when one starts, and to the next
   agent message when the Agent writes one after a tool call. It means "the output of the
   current turn".
-- `/views/<id>/output/<start>` and `/views/<id>/turn/<start>` are **fixed** to the turn
-  starting at entry `<start>` of the history installed at `historyRev`:
-  - when no turn starts at `<start>` (it was merged into another, or never existed), the
-    path ends with `absent`;
-  - when the history is replaced, it ends with `replaced`. It never silently shows another
-    turn. A client that wants the turn of the new history at that index subscribes again
-    without `have`, which re-confirms the selection against the new history.
+- `/views/<id>/history/<h>/output/<start>` and `/views/<id>/history/<h>/turn/<start>` are
+  **fixed** to the turn starting at entry `<start>` of the history installed at
+  `historyRev = h`. The selection is the path itself, separate from any cached baseline:
+  - when no turn starts at `<start>` in that history (it was merged into another, or never
+    existed), the path ends with `absent`;
+  - when the session's `historyRev` is not `h` (the history was replaced), the path ends
+    with `replaced`, whenever it is followed or read, with or without `have`.
+
+  So recovering a broken replica (resubscribing without `have`, §6.5) re-reads the same
+  selection and can never turn into another one. A client that wants the turn of the new
+  history chooses it explicitly: it reads the new `historyRev` (from `TurnHead`s or
+  `OutputView.turn`) and follows a new path. A client picks a fixed turn from the turn
+  index or from `output/latest`, both of which state `historyRev`.
 - `text` is the message's text as the Agent wrote it, Markdown included; the bridge
   converts, summarizes and separates nothing. A client wanting the whole entry (blocks,
   annotations, attachments) follows `/sessions/<id>/entries/<n>` or the turn view.
-- `/views/<id>/turn/<start>` holds the turn's entries as a copy (shared in memory with the
+- `/views/<id>/history/<h>/turn/<start>` holds the turn's entries as a copy (shared in memory with the
   canonical list), so the turn verifies without the other entries.
 
 A view is materialized while it is followed or read. Its path revision is the revision at
@@ -330,7 +350,7 @@ type Change =
   | { path: string; end: End };
 
 interface Check { path: string; at: number; hash: string }
-interface End { reason: "deleted" | "closed" | "load_failed" | "absent" | "replaced"; error?: ProtocolError }
+interface End { reason: "deleted" | "closed" | "load_failed" | "absent" | "replaced"; error?: ErrorSummary }
 ```
 
 The client holds, per followed path `p`, a path version `v_p`.
@@ -349,10 +369,17 @@ The client holds, per followed path `p`, a path version `v_p`.
 - `Op` is revision 3's (§5.3), with pointers relative to `p`.
 - **`end`**: the path does not exist now. For a session path (`/sessions/<id>/…`,
   `output/latest`) the subscription stays: a later install or load starts it with a
-  snapshot (`absent` and `closed` are not final there). A fixed view (`output/<start>`,
-  `turn/<start>`) is finished by `absent` and `replaced`; the client drops it.
-- **Checkpoint**: `at` is the path version the hash is of. The client compares only when
-  `v_p == at` (it is, unless a gap is pending).
+  snapshot (`absent` and `closed` are not final there). A fixed view is finished by
+  `absent` and `replaced`; the client drops it.
+- An `end` carries an `ErrorSummary`, enough to act on (for example `agentCode` −32000:
+  authentication is required). A failed load leaves no session whose `opDetail` could keep
+  the whole error, so the bridge keeps it in `/global/loadFailures/<sessionId>` until that
+  session is held again or deleted, bounded to the last `K` failures. A client that shows
+  the message (the browser) follows `/global` anyway; a device need not.
+- **Checkpoint**: `at` is the path version the hash is of. With `at == v_p` the client
+  compares; with `at > v_p` it has missed a change (for example the last one before the
+  path went quiet) and resubscribes with its `have`; with `at < v_p` the checkpoint is
+  older than what it holds and is ignored.
 
 ### 6.3 Snapshots
 
@@ -400,20 +427,29 @@ interface TextWindow {
 - It hashes to the same `h` as the whole string, starting the chain at `before`.
 - `text` holds the shortest run of whole trailing segments of at least `N` bytes (all of
   them when the text is shorter), so `|text| < N + L`.
-- **Bounded events.** No event carries more than `N + L` bytes of one window's text.
-  - An append of `a` bytes with `|text| + a < N + 2L` is sent as `append` on `…/text`,
-    `set` on `…/length`, and when the window then exceeds the rule above, `trim` of whole
-    leading segments with `set` of `offset` and `before`.
-  - Any larger append, and any replacement of the text, is sent as one `set` of the
-    whole window: the new tail, at most `N + L` bytes.
+- **Bounded events.** No event carries `N + L` bytes or more of one window's text. Let
+  `a` be the bytes a commit appends to the text (all its appends together).
+  - If `a < N + L`, the change is `append` on `…/text` and `set` on `…/length`, followed,
+    when the window then exceeds the rule above, by `trim` of whole leading segments and
+    `set` of `offset` and `before`.
+  - Otherwise, and for any replacement of the text, the change is one `set` of the whole
+    window: the new tail, under `N + L` bytes.
 
-  A client therefore needs, per window, the held window plus one event's window: under
-  `2(N + L)` bytes of text, applying on a copy included. The bridge never sends it the
-  appended bytes that fall outside its window.
+  The decision depends on `a` alone, never on how short the held window is. A client
+  therefore needs, per window, the held window plus one event's text: under `2(N + L)`
+  bytes, applying on a copy included.
 - Snapshots carry windows by the same rule.
 
-### 6.5 Coalescing and keepalive
+### 6.5 Checkpoints, recovery, coalescing and keepalive
 
+- **When checkpoints are sent**: for each followed path, after its changes pause for
+  500 ms, and at least every 2 s while it keeps changing; also in every snapshot (`hash`).
+- **Mismatch**: on a hash mismatch the client drops its replica of that path and
+  resubscribes **without** that path's `have`; the bridge sends the whole subtree. If a
+  full snapshot fails verification again, the client reports that synchronization failed
+  and retries with backoff. A path is shown as confirmed only up to its last verified
+  version. Dropping a replica never changes which path is followed: a fixed view keeps its
+  `history/<h>` binding (§4.5).
 - **Slow subscriber**: when a stream's queue exceeds its budget, the bridge drops the
   queued events and queues one catch-up event at the current `rev` carrying, per followed
   path, a differential snapshot from the last `v_p` it actually wrote. Ends are kept.
@@ -524,7 +560,7 @@ interface OpRecord {
   kind: OperationKind;
   rev: number;               // the commit that admitted it
   status: OperationStatus;   // updated until it ends
-  error?: ProtocolError;
+  error?: ErrorSummary;      // as in OpHead
 }
 ```
 
@@ -618,7 +654,7 @@ values of the Agent's size, so a device that cannot hold them does not offer ans
 | Client | Holds | Per event | Verification |
 | --- | --- | --- | --- |
 | full replica (`/sessions/S`) | the session | the change | hashes along the changed path; the entries list hashes its children's hashes (`O(entries)` per checkpoint) |
-| one turn (`/views/S/turn/<start>`) | that turn | changes in it | that subtree |
+| one turn (`/views/S/history/<h>/turn/<start>`) | that turn | changes in it | that subtree |
 | one output with window `N` | `< N + L` bytes of text, a few fields | `< N + L` bytes of text | one value, one chain |
 | paging a long text | one segment | — | the chain, one segment at a time |
 
@@ -654,7 +690,7 @@ The bridge keeps per node `rev`, `srev` and a cached hash, per materialized view
 
 ## 13. Decisions and remaining questions
 
-Decided in review (#201):
+Decided in review (#201, PR #202):
 
 1. `K = 64` and `L = 4096`. `K` bounds only how long an outcome can be found, never
    execution. `L` is a protocol constant; a device controls what it holds with `N`. The
@@ -666,12 +702,12 @@ Decided in review (#201):
 4. Following a view holds and loads the session.
 5. Plain `GET` polling with `have`; a `GET` observes the session (§7.2).
 
-Remaining:
+6. A running turn without an agent message has `entry: null`; a thought never stands in
+   for the output.
+7. No lightweight view of pending permissions for now; it is added when a device needs it
+   (S5 notes the cost).
 
-1. Should `OutputView` for a running turn without an agent message yet show the latest
-   thought? (Proposed: no; `entry: null` until an agent message exists.)
-2. Should the bridge bound a single interaction request for small clients (for example a
-   view of pending permissions with options only)? Left out until a device needs it.
+No question is open.
 
 ## 14. Plan
 
@@ -712,11 +748,28 @@ Acceptance cases to add to [protocol-acceptance](protocol-acceptance.md):
   installed;
 - a polling-only client opens an unheld session, keeps it held while polling, and it is
   released after the timeout once polling stops;
+- the only change to a path is lost and the path goes quiet: the next checkpoint has
+  `at > v_p` and the client recovers;
+- a fixed view whose replica fails verification after a load is resubscribed without
+  `have` and ends with `replaced`; it never shows the new history's turn;
+- an append of 12,000 bytes to a 1-byte text in a window of `N = 4096` arrives as one
+  `set` of the window, not as an `append`;
+- an Agent error of 1 MiB leaves `OpHead`, `OpRecord` and `End` bounded; the whole error
+  is in `opDetail`, or in `/global/loadFailures` for a failed load;
 - revision 3's §12.4 cases restated per path.
 
-## 15. Changes from the first draft
+## 15. Changes from earlier drafts
 
-From the review on #201:
+Second to third draft, from the review of af54130 on PR #202:
+
+| Second draft | Third draft | Review point |
+| --- | --- | --- |
+| a checkpoint was compared only when `at == v_p` | `at > v_p` means a missed change and starts recovery; `at < v_p` is ignored; the 500 ms / 2 s schedule is restated in §6.5 | P1: losing the last change before a quiet period went unnoticed |
+| a fixed view was bound to its history only while a `have` was given; resubscribing without `have` re-confirmed the selection | the binding is part of the path (`history/<h>/…`); a replaced history always ends it with `replaced`; dropping a replica never changes the selection | P2: recovery could silently switch the turn |
+| an append was sent as `append` when the resulting window stayed small | the choice depends on the appended bytes alone: `a < N + L` is an `append`, anything larger a new window | P2: 1 byte + 12,000 appended exceeded the event budget |
+| `OpHead.error` and `OpRecord.error` were the whole `ProtocolError` | an `ErrorSummary` (code, Agent integer code); the whole error in `opDetail`; `End.error` too, with failed loads kept in `/global/loadFailures` | P2: an Agent's 1 MiB error reached the device |
+
+First to second draft, from the review of c543213 (moved from #201 to PR #202):
 
 | First draft | Second draft | Review point |
 | --- | --- | --- |
