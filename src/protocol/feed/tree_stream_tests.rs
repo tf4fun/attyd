@@ -347,3 +347,83 @@ fn a_stream_of_a_view_holds_the_session_like_the_session_does() {
     let id = feed.subscribe_tree(&query("follow=/views/s/output/latest&cwd=s:/work"));
     assert_eq!(feed.followed_sessions()["s"], vec![Waiting { id, cwd: Some("/work".into()) }]);
 }
+
+fn end_of(event: &TreeEvent, path: &str) -> Option<TreeEndReason> {
+    event.changes.iter().flatten().find_map(|change| match change {
+        Change::End { path: at, end } if at == path => Some(end.reason),
+        _ => None,
+    })
+}
+
+fn history_rev(feed: &Feed) -> u64 {
+    feed.tree().get("/sessions/s").unwrap().field("historyRev").and_then(Value::as_u64).unwrap()
+}
+
+#[test]
+fn a_fixed_view_ends_when_its_turn_is_gone_or_its_history_replaced_and_stays_ended() {
+    let mut feed = Feed::new("process");
+    let mut registry = registry();
+    conversation(&mut registry, "q", "one");
+    feed.commit(&registry, &agent(), 1);
+    let (instance, h) = (feed.tree().instance().to_string(), history_rev(&feed));
+    let output = format!("/views/s/history/{instance}/{h}/output/0");
+    let missing = format!("/views/s/history/{instance}/{h}/output/1");
+    let id = feed.subscribe_tree(&query(&format!("follow={output}&follow={missing}")));
+    let mut client = Client::following(&[output.as_str(), missing.as_str()]);
+    let first = feed.next_tree(id).unwrap();
+    assert_eq!(end_of(&first, &missing), Some(TreeEndReason::Absent), "no turn starts at 1");
+    assert_eq!(end_of(&first, &output), None);
+    client.apply(&first).unwrap();
+    assert_eq!(client.value(&output).unwrap()["text"], "one");
+    assert_eq!(feed.followed_sessions()["s"], vec![], "the finished view holds nothing, the other does");
+
+    // The history is replaced: the view is replaced, and nothing follows its end.
+    registry.register_cold("s");
+    registry.register_new("s");
+    feed.commit(&registry, &agent(), 1);
+    let replaced = feed.next_tree(id).unwrap();
+    assert_eq!(end_of(&replaced, &output), Some(TreeEndReason::Replaced));
+    assert!(feed.next_tree(id).is_none());
+    conversation(&mut registry, "q", "again");
+    feed.commit(&registry, &agent(), 1);
+    assert!(feed.next_tree(id).is_none(), "a finished view does not come back");
+}
+
+#[test]
+fn a_fixed_view_of_another_instance_or_history_is_replaced_whatever_the_client_holds() {
+    let mut feed = Feed::new("process");
+    let mut registry = registry();
+    conversation(&mut registry, "q", "one");
+    feed.commit(&registry, &agent(), 1);
+    let h = history_rev(&feed);
+    let old_instance = format!("/views/s/history/OLDINSTANCE0000000000/{h}/output/0");
+    let id = feed.subscribe_tree(&query(&format!("follow={old_instance}")));
+    let first = feed.next_tree(id).unwrap();
+    assert_eq!(end_of(&first, &old_instance), Some(TreeEndReason::Replaced));
+    // Resubscribing as a client does after a failed verification (no `have`) says the same.
+    let again = feed.subscribe_tree(&query(&format!("follow={old_instance}")));
+    assert_eq!(end_of(&feed.next_tree(again).unwrap(), &old_instance), Some(TreeEndReason::Replaced));
+    let other_history = format!("/views/s/history/{}/{}/output/0", feed.tree().instance(), h + 5);
+    let third = feed.subscribe_tree(&query(&format!("follow={other_history}")));
+    assert_eq!(end_of(&feed.next_tree(third).unwrap(), &other_history), Some(TreeEndReason::Replaced));
+}
+
+#[test]
+fn a_fixed_view_of_a_session_not_loaded_yet_waits_and_is_replaced_once_it_is_loaded_otherwise() {
+    let mut feed = Feed::new("process");
+    feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
+    let path = format!("/views/s/history/{}/1/output/0", feed.tree().instance());
+    let id = feed.subscribe_tree(&query(&format!("follow={path}&cwd=s:/work")));
+    let first = feed.next_tree(id).unwrap();
+    assert_eq!(end_of(&first, &path), Some(TreeEndReason::Absent), "not final: the session is not there");
+    assert_eq!(feed.followed_sessions()["s"].len(), 1, "still waiting for the load");
+    let mut registry = registry();
+    conversation(&mut registry, "q", "one");
+    feed.commit(&registry, &agent(), 1);
+    // The load installed another history than the one the path names.
+    let h = history_rev(&feed);
+    if h != 1 {
+        let event = feed.next_tree(id).unwrap();
+        assert_eq!(end_of(&event, &path), Some(TreeEndReason::Replaced));
+    }
+}
