@@ -148,6 +148,14 @@ impl Node {
         }
     }
 
+    /// The shared value of a value node.
+    pub(crate) fn value_arc(&self) -> Option<Arc<Value>> {
+        match &self.body {
+            Body::Value(value, _) => Some(Arc::clone(value)),
+            _ => None,
+        }
+    }
+
     /// The value of a value node and the rule of its text positions.
     pub(crate) fn as_value(&self) -> Option<(&Value, TextRule)> {
         match &self.body {
