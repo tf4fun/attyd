@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DocumentReplicaSet,
+  KEPT_UNFOLLOWED,
   applyEvent,
   type Applied,
   type DocumentReplica,
@@ -226,6 +227,26 @@ describe("DocumentReplicaSet", () => {
     set.receive(stream, copy(session[0].event));
     set.receive(stream, copy(session[1].event));
     expect(new URL(`http://x${set.open([{ scope: "session/S" }]).url}`).searchParams.get("have")).toBe("session/S:E1:11");
+  });
+
+  // #181: replicas of scopes no longer followed are kept for a few, then dropped.
+  it("keeps a few replicas of scopes no longer followed, dropping the least recently followed", () => {
+    const set = new DocumentReplicaSet();
+    const scopes = Array.from({ length: KEPT_UNFOLLOWED + 2 }, (_, index) => `session/${index}`);
+    for (const scope of scopes) {
+      const { stream } = set.open([{ scope: "global" }, { scope }]);
+      expect(set.receive(stream, { ...copy(session[0].event), scope } as StreamEvent)).toBe("applied");
+    }
+    const last = scopes.at(-1)!;
+    // Followed now: the last one; kept: the KEPT_UNFOLLOWED before it.
+    expect(scopes.filter((scope) => set.get(scope) !== undefined)).toEqual(scopes.slice(1));
+    // Following a kept one again asks for what it holds, and keeps it from being dropped.
+    const again = set.open([{ scope: scopes[1]! }]);
+    expect(new URL(`http://x${again.url}`).searchParams.get("have")).toBe(`${scopes[1]}:${session[0].doc.epoch}:${session[0].doc.rev}`);
+    set.open([{ scope: "session/other" }]);
+    expect(set.get(scopes[1]!)).toBeDefined();
+    expect(set.get(scopes[2]!)).toBeUndefined();
+    expect(set.get(last)).toBeDefined();
   });
 
   it("ignores the events of a replaced stream", () => {
