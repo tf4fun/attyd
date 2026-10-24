@@ -14,7 +14,7 @@ import {
   UserRound,
 } from "lucide-react";
 import type { PromptBlock } from "../../../../shared/protocol";
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import i18n, { useTranslation } from "../../i18n";
 import type {
@@ -62,6 +62,11 @@ export function Conversation({
   onProcessToggle?: () => void;
 }) {
   const { t } = useTranslation("conversation");
+  // Entries keep the same handlers across updates, so an unchanged entry is not rendered again.
+  const reusePrompt = useLatest(onReusePrompt);
+  const retryPrompt = useLatest(onRetryPrompt);
+  const navigate = useLatest(onNavigateThread);
+  const openMarkdown = useLatest(onOpenThreadMarkdown);
   const turns = useMemo(() => collectTurnReviewChanges(timeline), [timeline]);
   const previousTurnKeys = useRef(new Map<string, string>());
   const keyedTurns = useMemo(() => {
@@ -117,8 +122,8 @@ export function Conversation({
           canAutoCollapse={canAutoCollapse}
           onProcessToggle={onProcessToggle}
           entryProps={{
-            terminalSnapshots, canReusePrompt, onReusePrompt, onRetryPrompt,
-            agentActivity, onNavigateThread, onOpenThreadMarkdown,
+            terminalSnapshots, canReusePrompt, onReusePrompt: reusePrompt, onRetryPrompt: retryPrompt,
+            agentActivity, onNavigateThread: navigate, onOpenThreadMarkdown: openMarkdown,
           }}
         />;
       })}
@@ -224,7 +229,38 @@ function TurnChangeReview({ turnId, summary }: { turnId: string; summary: Review
   );
 }
 
-function TimelineEntry({
+/** A handler that keeps its identity and calls the latest `callback`; absent while it is. */
+function useLatest<A extends unknown[]>(callback: ((...args: A) => void) | undefined) {
+  const latest = useRef(callback);
+  useLayoutEffect(() => { latest.current = callback; });
+  const stable = useCallback((...args: A) => latest.current?.(...args), []);
+  return callback ? stable : undefined;
+}
+
+type TimelineEntryProps = ComponentProps<typeof TimelineEntryView>;
+
+/** The thinking chunk `activity` shows as live, the only part of it an entry reads. */
+function thinking(activity: AgentActivity | undefined): string | undefined {
+  return activity?.kind === "thinking" ? activity.timelineId : undefined;
+}
+
+/** Whether an entry would render the same: it reads terminals only for a terminal tool, activity only as an assistant. */
+function sameEntry(previous: TimelineEntryProps, next: TimelineEntryProps): boolean {
+  const { item } = next;
+  return previous.item === item &&
+    previous.canReusePrompt === next.canReusePrompt &&
+    previous.onReusePrompt === next.onReusePrompt &&
+    previous.onRetryPrompt === next.onRetryPrompt &&
+    previous.onNavigateThread === next.onNavigateThread &&
+    previous.onOpenThreadMarkdown === next.onOpenThreadMarkdown &&
+    (item.type !== "tool" || !(item.call.content ?? []).some(({ type }) => type === "terminal") ||
+      previous.terminalSnapshots === next.terminalSnapshots) &&
+    (item.type !== "assistant" || thinking(previous.agentActivity) === thinking(next.agentActivity));
+}
+
+const TimelineEntry = memo(TimelineEntryView, sameEntry);
+
+function TimelineEntryView({
   item,
   terminalSnapshots,
   canReusePrompt,
