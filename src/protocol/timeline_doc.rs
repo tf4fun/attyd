@@ -18,17 +18,45 @@ use super::timeline::{Entry, History, Prompt, Timeline};
 
 /// The blocks the published entries reference, by attachment ID, as the bridge
 /// retains them (protocol §8). Built while entries are published; a block is
-/// served while a published entry still references it.
+/// served while a published entry still references it, counted per reference.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct AttachmentIndex(HashMap<String, Arc<Value>>);
+pub(crate) struct AttachmentIndex(HashMap<String, Held>);
+
+#[derive(Debug, Clone, PartialEq)]
+struct Held {
+    block: Arc<Value>,
+    references: usize,
+}
 
 impl AttachmentIndex {
     pub(crate) fn get(&self, id: &str) -> Option<&Value> {
-        self.0.get(id).map(|block| &**block)
+        self.0.get(id).map(|held| &*held.block)
     }
 
     pub(crate) fn len(&self) -> usize {
         self.0.len()
+    }
+
+    fn reference(&mut self, id: &str, block: Value) {
+        self.0
+            .entry(id.to_string())
+            .or_insert_with(|| Held {
+                block: Arc::new(block),
+                references: 0,
+            })
+            .references += 1;
+    }
+
+    /// Drops one reference to each of `ids`; a block nothing references is no longer served.
+    pub(crate) fn release(&mut self, ids: &[String]) {
+        for id in ids {
+            if let Some(held) = self.0.get_mut(id) {
+                held.references -= 1;
+                if held.references == 0 {
+                    self.0.remove(id);
+                }
+            }
+        }
     }
 }
 
@@ -116,14 +144,17 @@ fn byte_block(block: &Value) -> Option<(AttachmentKind, Option<String>, Option<S
 /// their annotations and `_meta`; a byte-carrying block becomes a reference and
 /// is kept in `index`.
 pub(crate) fn publish_block(block: &Value, index: &mut AttachmentIndex) -> Value {
-    let Some((kind, mime_type, uri)) = byte_block(block) else {
-        return block.clone();
+    publish_owned(block.clone(), index, &mut Vec::new())
+}
+
+/// `publish_block` of a block it may keep, adding the ID it references to `ids`.
+fn publish_owned(block: Value, index: &mut AttachmentIndex, ids: &mut Vec<String>) -> Value {
+    let Some((kind, mime_type, uri)) = byte_block(&block) else {
+        return block;
     };
-    let id = attachment_id(block);
-    index
-        .0
-        .entry(id.clone())
-        .or_insert_with(|| Arc::new(block.clone()));
+    let id = attachment_id(&block);
+    index.reference(&id, block);
+    ids.push(id.clone());
     serde_json::to_value(AttachmentRef {
         r#type: AttachmentTag::Attachment,
         id,
@@ -134,24 +165,31 @@ pub(crate) fn publish_block(block: &Value, index: &mut AttachmentIndex) -> Value
     .expect("a reference serializes")
 }
 
-fn publish_member(parent: &mut Value, key: &str, index: &mut AttachmentIndex) {
-    if let Some(block) = parent.get(key).cloned() {
-        parent[key] = publish_block(&block, index);
+fn publish_member(parent: &mut Value, key: &str, index: &mut AttachmentIndex, ids: &mut Vec<String>) {
+    if let Some(block) = parent.get_mut(key).map(Value::take) {
+        parent[key] = publish_owned(block, index, ids);
     }
 }
 
 /// An entry as it is published: its content blocks as `publish_block` writes them.
 pub(crate) fn publish_entry(entry: &Entry, index: &mut AttachmentIndex) -> Value {
+    publish_entry_referencing(entry, index).0
+}
+
+/// `publish_entry`, with the attachment IDs the published entry references, once per
+/// reference: what `AttachmentIndex::release` is given when the entry is replaced.
+pub(crate) fn publish_entry_referencing(entry: &Entry, index: &mut AttachmentIndex) -> (Value, Vec<String>) {
+    let mut ids = Vec::new();
     let mut value = serde_json::to_value(entry).expect("entries serialize");
     match entry {
         Entry::Message(_) => {
             for chunk in value["chunks"].as_array_mut().into_iter().flatten() {
-                publish_member(chunk, "content", index);
+                publish_member(chunk, "content", index, &mut ids);
             }
         }
         Entry::Compaction(_) => {
             for chunk in value["summary"].as_array_mut().into_iter().flatten() {
-                publish_member(chunk, "content", index);
+                publish_member(chunk, "content", index, &mut ids);
             }
         }
         Entry::Tool(_) => {
@@ -161,13 +199,13 @@ pub(crate) fn publish_entry(entry: &Entry, index: &mut AttachmentIndex) -> Value
                 .and_then(Value::as_array_mut);
             for item in content.into_iter().flatten() {
                 if item["type"] == "content" {
-                    publish_member(item, "content", index);
+                    publish_member(item, "content", index, &mut ids);
                 }
             }
         }
         Entry::Plan(_) => {}
     }
-    value
+    (value, ids)
 }
 
 /// A session document's history, entries and prompts (protocol §3). While the
