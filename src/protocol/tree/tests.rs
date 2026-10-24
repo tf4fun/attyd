@@ -486,3 +486,77 @@ fn only_so_many_revisions_of_lengths_are_remembered_and_plain_values_keep_none()
     tree.commit(BTreeMap::from([("p".to_string(), Spec::value(json!({ "text": "x" })))]));
     assert!(tree.get("/p").unwrap().text_history().lengths.is_empty());
 }
+
+// --- derived views in the same revision (design §4.5) ---------------------------------
+
+/// The `views` a derivation of `wanted` entries yields: each is `{ n: <the global value> }`.
+fn views_of(wanted: &[&str]) -> impl Fn(&Tree) -> Spec + '_ {
+    move |tree| {
+        let n = tree.get("/global").map(|node| node.to_value()["n"].clone()).unwrap_or(Value::Null);
+        Spec::map(wanted.iter().map(|name| (*name, Spec::value(json!({ "name": name, "n": n })))))
+    }
+}
+
+fn global(n: i64) -> BTreeMap<String, Spec> {
+    BTreeMap::from([("global".to_string(), Spec::value(json!({ "n": n })))])
+}
+
+#[test]
+fn views_are_derived_from_the_tree_a_commit_makes_and_committed_with_it() {
+    let mut tree = Tree::new("i");
+    let committed = tree.commit_with_views(global(1), views_of(&["a"])).unwrap();
+    assert_eq!(tree.get("/views/a").unwrap().to_value(), json!({ "name": "a", "n": 1 }));
+    assert_eq!(tree.get("/views/a").unwrap().rev(), committed.rev);
+    assert_eq!(tree.get("/global").unwrap().rev(), committed.rev, "one revision for both");
+    let committed = tree.commit_with_views(global(2), views_of(&["a"])).unwrap();
+    assert_eq!(tree.get("/views/a").unwrap().to_value()["n"], 2);
+    assert_eq!(tree.get("/views/a").unwrap().rev(), committed.rev);
+    assert!(committed.ops.iter().any(|op| matches!(op, Op::Set { path, .. } | Op::Append { path, .. } if path.starts_with("/views/a"))), "{:?}", committed.ops);
+}
+
+#[test]
+fn a_view_that_did_not_change_keeps_its_revision_and_a_commit_without_a_change_is_none() {
+    let mut tree = Tree::new("i");
+    tree.commit_with_views(global(1), views_of(&["a"])).unwrap();
+    tree.commit_with_views(global(1), views_of(&["a", "b"])).unwrap();
+    assert_eq!(tree.get("/views/a").unwrap().rev(), 1);
+    assert_eq!(tree.get("/views/b").unwrap().rev(), 2);
+    assert!(tree.commit_with_views(global(1), views_of(&["a", "b"])).is_none());
+    assert_eq!(tree.rev(), 2);
+}
+
+#[test]
+fn a_view_no_longer_wanted_is_removed_and_one_wanted_again_takes_the_later_revision() {
+    let mut tree = Tree::new("i");
+    tree.commit_with_views(global(1), views_of(&["a"])).unwrap();
+    let removed = tree.commit_with_views(global(1), views_of(&[])).unwrap();
+    assert!(tree.get("/views/a").is_none());
+    assert_eq!(removed.ops, vec![Op::Remove { path: "/views/a".into() }]);
+    let again = tree.commit_with_views(global(1), views_of(&["a"])).unwrap();
+    assert_eq!(tree.get("/views/a").unwrap().rev(), again.rev, "materialized later than its last change");
+}
+
+#[test]
+fn only_the_views_can_be_committed_and_the_rest_stays() {
+    let mut tree = Tree::new("i");
+    tree.commit_with_views(global(1), views_of(&[])).unwrap();
+    let before = tree.get("/global").unwrap().rev();
+    let committed = tree.commit_views(views_of(&["a"])).unwrap();
+    assert_eq!(tree.get("/global").unwrap().rev(), before);
+    assert_eq!(tree.get("/views/a").unwrap().rev(), committed.rev);
+    assert_eq!(committed.ops, vec![Op::Set { path: "/views/a".into(), value: json!({ "name": "a", "n": 1 }) }]);
+    assert!(tree.commit_views(views_of(&["a"])).is_none());
+}
+
+#[test]
+fn the_ops_of_a_commit_with_views_turn_the_tree_before_into_the_tree_after() {
+    let mut tree = Tree::new("i");
+    let mut document = tree.root().to_value();
+    for (n, wanted) in [(1, vec!["a"]), (2, vec!["a", "b"]), (3, vec!["b"]), (3, vec![]), (4, vec!["a"])] {
+        let committed = tree.commit_with_views(global(n), views_of(&wanted)).unwrap();
+        for op in &committed.ops {
+            crate::protocol::diff::apply(&mut document, op).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+        }
+        assert_eq!(document, tree.root().to_value(), "n={n} {wanted:?}");
+    }
+}
