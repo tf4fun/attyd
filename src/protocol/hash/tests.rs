@@ -174,3 +174,20 @@ fn the_kinds_have_their_own_domain() {
     assert_ne!(map_hash([]), list_hash([]));
     assert_ne!(empty_object, list_hash([]));
 }
+
+#[test]
+fn locating_text_positions_does_not_change_what_is_hashed() {
+    // Entries without the members a rule looks at hash as plain values.
+    for entry in [
+        serde_json::json!({ "kind": "message", "role": "user" }),
+        serde_json::json!({ "kind": "tool" }),
+        serde_json::json!({ "kind": "tool", "call": {} }),
+        serde_json::json!({ "kind": "compaction" }),
+        serde_json::json!({ "kind": "plan" }),
+    ] {
+        assert_eq!(value_hash(TextRule::Entry, &entry), value_hash(TextRule::None, &entry), "{entry}");
+    }
+    let terminal = serde_json::json!({ "terminalId": "t" });
+    assert_eq!(value_hash(TextRule::Terminal, &terminal), value_hash(TextRule::None, &terminal));
+    assert_eq!(value_hash(TextRule::OutputView, &terminal), value_hash(TextRule::None, &terminal));
+}

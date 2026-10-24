@@ -94,6 +94,8 @@ pub(crate) enum TextRule {
     OutputView,
 }
 
+/// The `text` of a text block (never creates a member: indexing a `&mut Value` by a missing
+/// key would insert `null`, changing what is hashed).
 fn text_block(block: Option<&mut Value>) -> Option<&mut Value> {
     let block = block?;
     (block["type"] == "text" && block["text"].is_string()).then(|| &mut block["text"])
@@ -116,22 +118,26 @@ fn texts<'a>(rule: TextRule, value: &'a mut Value) -> Vec<&'a mut Value> {
         }
         TextRule::Entry => match value["kind"].as_str() {
             Some("message") => found.extend(
-                value["chunks"]
-                    .as_array_mut()
+                value
+                    .get_mut("chunks")
+                    .and_then(Value::as_array_mut)
                     .into_iter()
                     .flatten()
                     .filter_map(|chunk| text_block(chunk.get_mut("content"))),
             ),
             Some("compaction") => found.extend(
-                value["summary"]
-                    .as_array_mut()
+                value
+                    .get_mut("summary")
+                    .and_then(Value::as_array_mut)
                     .into_iter()
                     .flatten()
                     .filter_map(|chunk| text_block(chunk.get_mut("content"))),
             ),
             Some("tool") => found.extend(
-                value["call"]["content"]
-                    .as_array_mut()
+                value
+                    .get_mut("call")
+                    .and_then(|call| call.get_mut("content"))
+                    .and_then(Value::as_array_mut)
                     .into_iter()
                     .flatten()
                     .filter(|item| item["type"] == "content")
