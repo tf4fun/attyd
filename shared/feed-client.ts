@@ -131,7 +131,7 @@ export class FeedClient {
       return;
     }
     if (received === "resubscribe") {
-      this.#broken(this.#set.lastResubscribe?.reason ?? "the replica could not be applied");
+      this.#broken(this.#set.lastResubscribe?.reason ?? "the replica could not be applied", scope);
     } else if (received !== "ignored") {
       if (received === "ended") this.#ends.set(scope, (JSON.parse(data) as { end: End }).end);
       this.#failures = 0;
@@ -140,13 +140,18 @@ export class FeedClient {
     }
   }
 
-  /** The stream failed: close it, and subscribe again later (§5.4). */
-  #broken(reason: string): void {
+  /**
+   * The stream failed: close it, and subscribe again later (§5.4). A scope whose content
+   * keeps failing verification backs off by its own count, which another scope's
+   * delivery does not reset.
+   */
+  #broken(reason: string, scope?: string): void {
     this.#disconnect();
     const generation = this.#generation;
     this.#failures += 1;
-    const delayMs = Math.min(FIRST_DELAY_MS * 2 ** (this.#failures - 1), LAST_DELAY_MS);
-    this.#report({ state: "retrying", attempt: this.#failures, delayMs, reason });
+    const attempt = Math.max(this.#failures, scope === undefined ? 0 : this.#set.consecutiveFailures(scope));
+    const delayMs = Math.min(FIRST_DELAY_MS * 2 ** (attempt - 1), LAST_DELAY_MS);
+    this.#report({ state: "retrying", attempt, delayMs, reason });
     this.#schedule(() => {
       if (!this.#closed && generation === this.#generation) this.#connect();
     }, delayMs);

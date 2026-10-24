@@ -298,3 +298,40 @@ fn an_attachment_is_served_while_a_published_entry_references_it() {
     assert_eq!(engine.attachment(scope, "unknown"), None);
     assert_eq!(engine.attachment("session/other", id), None);
 }
+
+// #181: replacing an entry's content releases the blocks only it referenced; a
+// block the new content still references stays.
+#[test]
+fn a_block_no_published_entry_references_any_more_is_not_served() {
+    let mut engine = Engine::default();
+    let scope = "session/S";
+    let image = |data: &str| json!({ "type": "image", "data": data, "mimeType": "image/png" });
+    let content = |images: &[Value]| -> Vec<Value> {
+        images.iter().map(|image| json!({ "type": "content", "content": image })).collect()
+    };
+    let id = |block: &Value| crate::protocol::timeline_doc::attachment_id(block);
+    let (a, b) = (image("AAAA"), image("BBBB"));
+    let mut timeline = Timeline::default();
+    timeline.reduce(
+        &json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "shot", "content": content(&[a.clone()]) }),
+        None,
+    );
+    engine.commit(scope, &input(&timeline, &json!({})));
+    assert_eq!(engine.attachment(scope, &id(&a)), Some(&a));
+
+    timeline.reduce(
+        &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "content": content(&[a.clone(), b.clone()]) }),
+        None,
+    );
+    engine.commit(scope, &input(&timeline, &json!({})));
+    assert_eq!(engine.attachment(scope, &id(&a)), Some(&a), "still referenced");
+    assert_eq!(engine.attachment(scope, &id(&b)), Some(&b));
+
+    timeline.reduce(
+        &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "content": content(&[b.clone()]) }),
+        None,
+    );
+    engine.commit(scope, &input(&timeline, &json!({})));
+    assert_eq!(engine.attachment(scope, &id(&a)), None, "no entry references it");
+    assert_eq!(engine.attachment(scope, &id(&b)), Some(&b));
+}

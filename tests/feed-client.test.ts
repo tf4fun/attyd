@@ -194,6 +194,23 @@ describe("a stream that fails", () => {
     expect(h.scheduled[h.scheduled.length - 1].delay).toBe(1000);
   });
 
+  // #177: a scope whose snapshot never verifies is not retried every second because
+  // another scope on the same stream delivers.
+  it("backs off a scope whose content keeps failing, while another scope delivers", () => {
+    const h = harness();
+    const T = "session/T";
+    h.client.follow([{ scope: S }, { scope: T }]);
+    const first = event(0) as StreamEvent & { snapshot: object };
+    const disagreeing = { ...first, scope: T, snapshot: { ...first.snapshot, digest: "x".repeat(22) } } as StreamEvent;
+    for (const delay of [1000, 2000, 4000, 8000]) {
+      h.last().emit(event(0));
+      h.last().emit(JSON.parse(JSON.stringify(disagreeing)) as StreamEvent);
+      expect(h.sources[h.sources.length - 1].closed).toBe(true);
+      expect(h.scheduled[h.scheduled.length - 1].delay).toBe(delay);
+      h.runScheduled();
+    }
+  });
+
   it("never waits longer than thirty seconds", () => {
     const h = harness();
     h.client.follow([{ scope: S }]);

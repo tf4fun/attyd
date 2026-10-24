@@ -3527,21 +3527,31 @@ test("recovers the session automatically after the ACP connection stops", async 
 // stopped, and Reconnect brings up a new Agent process.
 test("restarts the Agent from the home page when Reconnect is clicked after the process is killed", async ({ page, agentPid }) => {
   const browserErrors = collectBrowserErrors(page);
+  const api = trackApi(page);
   await page.goto("/");
   await expect.poll(agentPid).not.toBe("");
   const first = await agentPid();
   const connectionError = page.locator(".project-connection-error");
   await expect(connectionError).toBeHidden();
+  expect(api.streams.length).toBeGreaterThan(0);
 
   process.kill(Number(first), "SIGKILL");
   await expect(connectionError).toBeVisible({ timeout: 15_000 });
-  // Nothing passive starts it: the page waits for the user.
+  // Nothing passive starts it: a connection the bridge started by itself would publish
+  // `starting` at once, which hides the card, long before a new process writes its pid.
   await page.waitForTimeout(1_500);
-  expect(await agentPid()).toBe(first);
+  await expect(connectionError).toBeVisible();
+  expect(controlsOf(api, "restart")).toEqual([]);
 
-  await connectionError.getByRole("button").click();
+  await connectionError.getByRole("button", { name: "Reconnect" }).click();
+  // Reconnect is what starts it: one `restart` on `global` (protocol §7).
+  await expect.poll(() => controlsOf(api, "restart", "global")).toEqual([{}]);
   await expect.poll(agentPid, { timeout: 15_000 }).not.toBe(first);
+  // The marker is rewritten in place: an empty read is not a new process.
+  await expect.poll(agentPid).not.toBe("");
   await expect(connectionError).toBeHidden({ timeout: 15_000 });
+  expect(controlsOf(api, "restart")).toHaveLength(1);
+  expect(api.v1).toEqual([]);
   expect(browserErrors).toEqual([]);
 });
 

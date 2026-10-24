@@ -136,6 +136,8 @@ interface Post {
 
 const LOST = Symbol("lost");
 let posts: Post[];
+/** What a `GET` of `url` answers; unset, every read is `404`. */
+let read: ((url: string) => { status: number; body: unknown } | undefined) | undefined;
 let respond: (post: Post) => { status: number; body?: unknown } | typeof LOST | Promise<{ status: number; body?: unknown } | typeof LOST>;
 
 let hook: ReturnType<typeof useAcp>;
@@ -151,10 +153,16 @@ describe("revision 3 workspace, read side", () => {
   beforeEach(() => {
     FakeEventSource.sources = [];
     posts = [];
+    read = undefined;
     respond = (post) => ({ status: 202, body: { op: post.body.id } });
     vi.stubGlobal("EventSource", FakeEventSource);
     vi.stubGlobal("fetch", vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
-      if (init?.method !== "POST") return new Response("{}", { status: 404 });
+      if (init?.method !== "POST") {
+        const answer = read?.(url);
+        return answer === undefined
+          ? new Response("{}", { status: 404 })
+          : new Response(JSON.stringify(answer.body), { status: answer.status });
+      }
       const post = { url, body: JSON.parse(init.body ?? "{}") as Post["body"] };
       posts.push(post);
       const answer = await respond(post);
@@ -201,6 +209,18 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.reconnect());
     expect(posts.map(({ url }) => url)).toEqual(["/api/v2/scopes/global/actions/restart"]);
     expect(posts[0].body).toEqual({});
+  });
+
+  // #178: a restart the bridge refuses is shown, not dropped.
+  it("shows why a restart was refused", async () => {
+    await mount("/");
+    await emit(globalSnapshot(globalLive({ agent: agent({ phase: "stopped" }) })));
+    await emit(catalogSnapshot());
+    respond = () => ({ status: 409, body: { error: { code: "not_allowed", message: "The Agent is starting" } } });
+    await act(async () => hook.reconnect());
+    await settle();
+    const error = hook.state.timeline.find((item) => item.type === "error");
+    expect((error as { message: string } | undefined)?.message).toContain("The Agent is starting");
   });
 
   it("only follows again when the Agent is ready: no restart is sent", async () => {
@@ -610,6 +630,27 @@ describe("revision 3 workspace, read side", () => {
     await settle();
     expect(hook.state.sessionTransition).toBeUndefined();
     expect(hook.state.timeline.some((item) => item.type === "error")).toBe(true);
+  });
+
+  // #176: the replica may not have the commit that admitted the create yet; the bridge's
+  // document, read after the answer was lost, has it.
+  it("settles a create whose answer was lost from the bridge's document, not from a replica that lags", async () => {
+    respond = () => LOST;
+    read = (url) => url === "/api/v2/scopes/global"
+      ? {
+        status: 200,
+        body: globalSnapshot(globalLive({ op: op("global", { id: posts[0].body.id, after: "g0", kind: "create", status: "running" }) })),
+      }
+      : undefined;
+    await mount("/");
+    await emit(globalSnapshot());
+    await emit(catalogSnapshot());
+    await act(async () => { hook.newSession("/proj"); });
+    await settle();
+    expect(hook.state.timeline.some((item) => item.type === "error")).toBe(false);
+    const id = posts[0].body.id!;
+    await emit(globalOpChanged(1, { id, kind: "create", status: "completed", result: { sessionId: "new1" } }));
+    expect(window.location.pathname).toMatch(/\/sessions\/new1$/u);
   });
 
   it("forks the shown session and goes to the fork in the source's project", async () => {

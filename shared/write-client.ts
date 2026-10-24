@@ -66,6 +66,11 @@ export class OpsClient {
     return resolveWrite(write, shownOperation(this.#replicas, write.scope));
   }
 
+  /** Whether `write` was admitted, from the `live` of its scope read some other way (§6.6). */
+  resolveFrom(write: Write, live: unknown): Resolution {
+    return resolveWrite(write, operationOf(live, write.scope));
+  }
+
   /** Asks the running operation to end; a cancel has no id of its own. */
   cancel(scope: string): Promise<WriteOutcome> {
     const op = shownOperation(this.#replicas, scope);
@@ -97,7 +102,11 @@ export class OpsClient {
 
 /** The `op` the aligned document of `scope` shows. */
 function shownOperation(replicas: ReplicaSource, scope: string): ShownOperation | undefined {
-  const live = replicas.get(scope)?.doc.live;
+  return operationOf(replicas.get(scope)?.doc.live, scope);
+}
+
+/** The `op` a scope's `live` shows. */
+function operationOf(live: unknown, scope: string): ShownOperation | undefined {
   if (!isRecord(live) || !isRecord(live.op) || typeof live.op.id !== "string") return undefined;
   const { id, scope: written, after, status } = live.op;
   return {

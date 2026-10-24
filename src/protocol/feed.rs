@@ -7,7 +7,7 @@
 //! or has a new epoch is a snapshot for its subscribers, and any other change is
 //! the next rev as ops. A session the bridge no longer holds ends its scope. A
 //! subscriber whose queue went past its budget is sent snapshots instead.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -213,11 +213,11 @@ impl Feed {
             self.end_waiting(session_id, end);
         }
         // A session the bridge no longer holds is over.
+        let held: HashSet<String> = scopes.iter().map(Scope::to_string).collect();
         let gone: Vec<String> = self
             .engine
             .scopes()
-            .filter(|published| published.starts_with("session/"))
-            .filter(|published| !scopes.iter().any(|scope| scope.to_string() == *published))
+            .filter(|published| published.starts_with("session/") && !held.contains(*published))
             .map(String::from)
             .collect();
         for scope in gone {

@@ -24,11 +24,12 @@ import { WriteQueue, type HttpFetch } from "../../../shared/protocol-client";
 import {
   ActionsClient,
   OpsClient,
+  type ActionOutcome,
   type StartingWrite,
   type Write,
   type WriteOutcome,
 } from "../../../shared/write-client";
-import { originOf } from "../../../shared/write-resolution";
+import { originOf, type Resolution } from "../../../shared/write-resolution";
 import { createAttachmentReader, type AttachmentReader } from "./attachments";
 import { projectEntries } from "./entry-projection";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
@@ -77,6 +78,8 @@ interface Intent {
   id: string;
   /** Present when the answer was lost: the write to resolve from the document. */
   lost?: Write;
+  /** What the bridge's document of the scope, read after the answer was lost, says of it. */
+  read?: Resolution;
   navigation: number;
   cwd: string;
 }
@@ -509,7 +512,12 @@ export class Workspace {
     if (global == null) return;
     for (const intent of [...this.#intents]) {
       if (intent.lost != null) {
-        const resolution = this.#ops.resolve(intent.lost);
+        // The replica may not have the commit that admitted it yet: only what it shows
+        // admitted is settled from it; anything else waits for the bridge's document.
+        const resolution = this.#ops.resolve(intent.lost) === "admitted" || originOf(global.sessions ?? {}, intent.id) != null
+          ? "admitted"
+          : intent.read;
+        if (resolution === undefined) continue;
         if (resolution !== "admitted") {
           // Not admitted, or not knowable: the user decides (C3).
           this.#finishIntent(intent);
@@ -660,7 +668,13 @@ export class Workspace {
    */
   reconnect = (): void => {
     const phase = this.#global()?.agent.phase;
-    if (phase === "stopped" || phase === "error") void this.#actions.restart().then(() => this.#changed());
+    if (phase === "stopped" || phase === "error") {
+      void this.#actions.restart().then((outcome) => {
+        // A refused or unanswered restart leaves the card; the user is told why.
+        this.#report("restart", outcome);
+        this.#changed();
+      });
+    }
     this.#applyFollow(true);
   };
 
@@ -674,7 +688,7 @@ export class Workspace {
   }
 
   /** Shows what a write's answer says when the page cannot leave it to the document. */
-  #report(operation: string, outcome: WriteOutcome): void {
+  #report(operation: string, outcome: WriteOutcome | ActionOutcome): void {
     let message: string | undefined;
     let data: unknown;
     if (outcome.kind === "refused") {
@@ -709,7 +723,9 @@ export class Workspace {
         this.#intents.push({ kind, scope, id: outcome.op, navigation, cwd });
         if (scope === GLOBAL) this.#mine.add(outcome.op);
       } else if (outcome.kind === "uncertain" && outcome.write != null) {
-        this.#intents.push({ kind, scope, id: outcome.write.id, lost: outcome.write, navigation, cwd });
+        const intent: Intent = { kind, scope, id: outcome.write.id, lost: outcome.write, navigation, cwd };
+        this.#intents.push(intent);
+        this.#readLost(intent, outcome.write);
       } else {
         this.#transition = undefined;
         if (this.#navigation === navigation) this.#report(label, outcome);
@@ -717,6 +733,24 @@ export class Workspace {
       this.#changed();
     });
     this.#changed();
+  }
+
+  /**
+   * Reads the document of the scope a lost write went to. The bridge commits an admission
+   * before it answers, so this read, made after the answer was lost, shows the write if it
+   * was admitted (§6.6); one that fails leaves it unknown.
+   */
+  #readLost(intent: Intent, write: Write): void {
+    const ops = this.#ops;
+    void readJson(`/api/v2/scopes/${encodeURIComponent(write.scope)}`)
+      .then(
+        (body) => ops.resolveFrom(write, isRecord(body) && isRecord(body.snapshot) && isRecord(body.snapshot.doc) ? body.snapshot.doc.live : undefined),
+        (): Resolution => "unknown",
+      )
+      .then((resolution) => {
+        intent.read = resolution;
+        this.#changed();
+      });
   }
 
   newSession = (cwd: string): boolean => {
