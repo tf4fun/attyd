@@ -23,7 +23,8 @@
 | ACP 有哪些能力、字段和版本差异？ | [ACP 功能矩阵](acp-bridge-matrix.md) → 五个领域分册 | 方法、数据、来源、排除面与直接反例；机器索引负责源码集合闭合 |
 | bridge 应执行什么、保留什么？ | [ACP 内存契约](acp-fidelity-audit.md#9-acp-to-bridge-memory-contract) | 第一层基本规则、内存语义、未决项和直接验收；前文保留缺陷证据 |
 | 相比稳定 v1 缺了什么？ | [Release parity](release-parity.md) | 固定基线的回退、共有缺口与后续展示工作 |
-| 前端如何与 bridge 交互？ | [简易 Agent 交互协议](protocol.md) | 唯一通信契约；§12 记录第二阶段设计要求与待决问题 |
+| 前端如何与 bridge 交互？ | [简易 Agent 交互协议](protocol.md) | 唯一通信契约（修订 4）；§12 记录设计要求与独立验收 |
+| 为什么修订 4 这样设计？ | [修订 4 设计](protocol-r4-design.md) | 需求、场景、备选方案与决定；规则以协议为准 |
 | 为什么选择这些规则？ | [设计取舍](client-api-redesign.md) | 理由和代价，引用协议，不重复 DTO、端点和状态规则 |
 | 如何分步实现？ | [实现与迁移计划](state-sync.md) | 所有权、更新与释放路径、复用模块、步骤及依赖 |
 | 哪些行为必须通过？ | [编号验收用例](protocol-acceptance.md) | 保留 1–37 的追踪关系；第二阶段故障验收由协议 §12.4 定义 |

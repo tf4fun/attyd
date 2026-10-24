@@ -15,10 +15,10 @@ settle points or held `create`/`fork`/`list` responses are read as the revision 
 mechanism: `epoch`/`rev`, differential snapshots, digests, and `202` with results in the
 document. The section references in case titles retain the original proposal's
 numbering: old §4.1 maps to [session history](protocol.md#3-session-history), §4.2/§4.3 to
-[live documents and resources](protocol.md#4-live-documents), §5.2 to
-[synchronization](protocol.md#54-synchronization), §6.1/§6.2 to
+[live documents and resources](protocol.md#4-live-nodes), §5.2 to
+[synchronization](protocol.md#55-checkpoints-recovery-coalescing-and-keepalive), §6.1/§6.2 to
 [operations](protocol.md#6-operations) and [actions](protocol.md#7-actions),
-§7 to holding (S6), and §8 to [reads](protocol.md#8-reads).
+§7 to holding (S6), and §8 to [reads](protocol.md#8-reads-and-holding).
 They are historical cross-references, not a second contract.
 
 The design must also satisfy the independent verification and repair cases in
