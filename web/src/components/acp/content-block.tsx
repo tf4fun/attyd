@@ -10,7 +10,7 @@ import {
   Paperclip,
   UserRound,
 } from "lucide-react";
-import { useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "../../i18n";
@@ -19,6 +19,16 @@ import { useAttachedBlock, useBlockUrl } from "../../lib/attachments";
 import type { AttachmentRef, PromptBlock } from "../../../../shared/protocol";
 import { validateContentBlockSemantics } from "../../../../shared/content-validation";
 import { assertNever } from "../../../../shared/exhaustive";
+
+const remarkPlugins = [remarkGfm];
+
+/**
+ * Markdown parsed once per text: a re-render with the same text, as every
+ * timeline update causes, reuses the rendered tree instead of parsing again.
+ */
+export const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
+  return <Markdown remarkPlugins={remarkPlugins}>{text}</Markdown>;
+});
 
 export function ContentBlocks({ blocks, presentation = "message" }: {
   blocks: PromptBlock[];
@@ -55,12 +65,12 @@ export function ContentBlockView({
           ) : presentation === "tool" ? (
             <div className="structured-scalar structured-markdown">
               <div className="markdown">
-                <Markdown remarkPlugins={[remarkGfm]}>{block.text}</Markdown>
+                <MarkdownText text={block.text} />
               </div>
             </div>
           ) : (
             <div className="markdown">
-              <Markdown remarkPlugins={[remarkGfm]}>{block.text}</Markdown>
+              <MarkdownText text={block.text} />
             </div>
           )}
         </ContentBlockFrame>
@@ -85,7 +95,6 @@ function PromptText({ text }: { text: string }) {
   const contentRef = useRef<HTMLDivElement>(null);
   const [collapsible, setCollapsible] = useState(false);
   const [expanded, setExpanded] = useState(false);
-  const markdown = useMemo(() => <Markdown remarkPlugins={[remarkGfm]}>{text}</Markdown>, [text]);
   useLayoutEffect(() => {
     const body = bodyRef.current;
     const content = contentRef.current;
@@ -125,7 +134,7 @@ function PromptText({ text }: { text: string }) {
           }
         }}
       >
-        <div className="prompt-text-content markdown" ref={contentRef}>{markdown}</div>
+        <div className="prompt-text-content markdown" ref={contentRef}><MarkdownText text={text} /></div>
       </div>
       {collapsible ? (
         <button
