@@ -5,7 +5,7 @@ clients) and the bridge. The bridge remains an ordinary ACP client toward the Ag
 The `/api/v2` endpoint namespace and the revision numbers belong to this application
 protocol, separately from ACP's versions.
 
-Status: **revision 3 proposal, 2026-10-21; not implemented.** Layer 1, what the bridge
+Status: **revision 3, proposed 2026-10-21; implemented and served under `/api/v2`** (progress in [state-sync §7.5](state-sync.md#75-implementation-status-2026-10-23)). Layer 1, what the bridge
 keeps in memory and how ACP input changes it, is defined only by the
 [bridge memory model](bridge-memory-model.md). This document defines layer 2: how that
 memory reaches clients and how clients write to it. Where the two disagree, the memory
