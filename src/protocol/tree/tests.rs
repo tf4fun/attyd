@@ -4,6 +4,7 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::protocol::hash;
+use crate::protocol::{AppendTail, Op};
 
 fn fields(value: Value) -> Map<String, Value> {
     value.as_object().expect("an object").clone()
@@ -265,4 +266,107 @@ fn an_unchanged_value_keeps_the_hash_it_computed() {
     ]));
     assert!(tree.get("/x").unwrap().hash.get().is_some(), "computed once for the content");
     assert!(tree.get("/y").unwrap().hash.get().is_none(), "computed when asked for");
+}
+
+// --- ops (design §6.2) ---------------------------------------------------------------
+
+/// Commits `steps` and checks, after each, that its ops turn the value before into the value
+/// after; returns the ops of each.
+fn replay(steps: Vec<BTreeMap<String, Spec>>) -> Vec<Vec<Op>> {
+    let mut tree = Tree::new("i");
+    let mut all = Vec::new();
+    for (index, step) in steps.into_iter().enumerate() {
+        let mut document = tree.root().to_value();
+        let Some(committed) = tree.commit_with_ops(step) else {
+            all.push(Vec::new());
+            continue;
+        };
+        for op in &committed.ops {
+            crate::protocol::diff::apply(&mut document, op)
+                .unwrap_or_else(|error| panic!("step {index}: {op:?} does not apply: {error:?}"));
+        }
+        assert_eq!(document, tree.root().to_value(), "step {index}: {:?}", committed.ops);
+        all.push(committed.ops);
+    }
+    all
+}
+
+#[test]
+fn the_ops_of_a_commit_turn_the_tree_before_into_the_tree_after() {
+    let terminal = |output: &str| {
+        Spec::map([("t", Spec::text_value(Arc::new(json!({ "terminalId": "t", "output": output })), TextRule::Terminal))])
+    };
+    let with = |sessions: &[(&str, Spec)], terminals: Spec| {
+        let mut tree = root(sessions);
+        tree.insert("terminals".into(), terminals);
+        tree
+    };
+    replay(vec![
+        root(&[]),
+        root(&[("s", session("t", &["a"]))]),
+        root(&[("s", session("t", &["a", "b", "c"]))]),
+        root(&[("s", session("t", &["a", "bb", "c"]))]),
+        root(&[("s", session("u", &["a", "bb", "c"]))]),
+        root(&[("s", session("u", &["a"]))]),
+        root(&[("s", session("u", &["z"])), ("n", session("n", &[]))]),
+        root(&[("n", session("n", &[]))]),
+        root(&[]),
+        with(&[], terminal("abc")),
+        with(&[], terminal("abcdef")),
+        with(&[], terminal("def")),
+        with(&[], Spec::Map(BTreeMap::new())),
+    ]);
+}
+
+#[test]
+fn a_node_that_changes_kind_is_set_whole() {
+    let ops = replay(vec![
+        BTreeMap::from([("x".to_string(), Spec::value(json!([1, 2])))]),
+        BTreeMap::from([("x".to_string(), Spec::List(vec![Spec::value(json!(1))]))]),
+    ]);
+    assert_eq!(ops[1], vec![Op::Set { path: "/x".into(), value: json!([1]) }]);
+}
+
+#[test]
+fn text_growing_in_a_value_is_an_append_and_a_terminal_tail_trims() {
+    let value = |text: &str| BTreeMap::from([("x".to_string(), Spec::value(json!({ "text": text })))]);
+    let ops = replay(vec![value("ab"), value("abcd")]);
+    assert_eq!(
+        ops[1],
+        vec![Op::Append { path: "/x/text".into(), tail: AppendTail::Text { text: "cd".into() } }]
+    );
+}
+
+#[test]
+fn a_list_that_grows_appends_and_one_that_shrinks_is_set_whole() {
+    let ops = replay(vec![
+        root(&[("s", session("t", &["a"]))]),
+        root(&[("s", session("t", &["a", "b"]))]),
+        root(&[("s", session("t", &[]))]),
+    ]);
+    assert_eq!(
+        ops[1],
+        vec![Op::Append {
+            path: "/sessions/s/entries".into(),
+            tail: AppendTail::Values { values: vec![json!({ "text": "b" })] },
+        }]
+    );
+    assert_eq!(
+        ops[2],
+        vec![Op::Set { path: "/sessions/s/entries".into(), value: json!([]) }]
+    );
+}
+
+#[test]
+fn an_added_or_removed_key_is_a_set_or_a_remove_and_paths_are_escaped() {
+    let ops = replay(vec![root(&[]), root(&[("a/b", session("t", &[]))]), root(&[])]);
+    assert_eq!(ops[1][0], Op::Set { path: "/sessions/a~1b".into(), value: json!({ "title": "t", "entries": [] }) });
+    assert_eq!(ops[2], vec![Op::Remove { path: "/sessions/a~1b".into() }]);
+}
+
+#[test]
+fn a_commit_without_a_change_has_no_ops() {
+    let mut tree = Tree::new("i");
+    tree.commit_with_ops(root(&[("s", session("t", &["a"]))])).unwrap();
+    assert!(tree.commit_with_ops(root(&[("s", session("t", &["a"]))])).is_none());
 }
