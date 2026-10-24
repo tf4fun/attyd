@@ -1,6 +1,7 @@
 //! Subscriptions to a stream (docs/protocol.md §5.1): which scopes a stream
 //! follows and what version of each a client already holds.
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use super::documents::{End, ErrorCode, ProtocolError, Scope};
 pub(crate) use super::engine::Have;
@@ -118,9 +119,44 @@ struct ScopeState {
     cwd: Option<String>,
 }
 
-struct Queued {
-    event: StreamEvent,
-    bytes: usize,
+/// An event with its JSON, encoded once: every subscriber it is queued for shares
+/// both, and the stream writes the JSON as it is.
+#[derive(Clone)]
+pub(crate) struct Encoded {
+    event: Arc<StreamEvent>,
+    json: Arc<str>,
+}
+
+impl Encoded {
+    pub(crate) fn new(event: StreamEvent) -> Self {
+        let json = serde_json::to_string(&event).expect("a protocol event serializes");
+        Self {
+            event: Arc::new(event),
+            json: json.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_event(self) -> StreamEvent {
+        Arc::unwrap_or_clone(self.event)
+    }
+
+    /// The event's JSON, as the stream writes it.
+    pub(crate) fn json(&self) -> Arc<str> {
+        Arc::clone(&self.json)
+    }
+}
+
+impl From<&Encoded> for Encoded {
+    fn from(encoded: &Encoded) -> Self {
+        encoded.clone()
+    }
+}
+
+impl From<&StreamEvent> for Encoded {
+    fn from(event: &StreamEvent) -> Self {
+        Self::new(event.clone())
+    }
 }
 
 /// The events one stream has yet to write, per subscriber (protocol §5.1, §5.4).
@@ -129,7 +165,7 @@ struct Queued {
 /// missed but a snapshot of each scope from the version it last was written.
 pub(crate) struct Subscriber {
     scopes: BTreeMap<String, ScopeState>,
-    queue: VecDeque<Queued>,
+    queue: VecDeque<Encoded>,
     queued_bytes: usize,
 }
 
@@ -163,10 +199,9 @@ impl Subscriber {
             .map(|(scope, state)| (scope.as_str(), state.cwd.as_deref()))
     }
 
-    fn push(&mut self, event: StreamEvent) {
-        let bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len());
-        self.queued_bytes += bytes;
-        self.queue.push_back(Queued { event, bytes });
+    fn push(&mut self, encoded: Encoded) {
+        self.queued_bytes += encoded.json.len();
+        self.queue.push_back(encoded);
     }
 
     /// Drops what is queued of `scope`.
@@ -175,7 +210,7 @@ impl Subscriber {
         self.queue.retain(|queued| {
             let keep = queued.event.scope() != scope;
             if !keep {
-                removed += queued.bytes;
+                removed += queued.json.len();
             }
             keep
         });
@@ -186,7 +221,7 @@ impl Subscriber {
     fn queue_snapshot(&mut self, scope: &str, engine: &Engine) {
         let held = self.scopes.get(scope).and_then(|state| state.written.clone());
         if let Some(snapshot) = engine.snapshot(scope, held.as_ref()) {
-            self.push(snapshot);
+            self.push(Encoded::new(snapshot));
         }
     }
 
@@ -200,13 +235,14 @@ impl Subscriber {
     }
 
     /// A commit's event: queued for a subscriber that follows its scope.
-    pub(crate) fn publish(&mut self, event: &StreamEvent) {
+    pub(crate) fn publish(&mut self, event: impl Into<Encoded>) {
+        let encoded = event.into();
         if self
             .scopes
-            .get(event.scope())
+            .get(encoded.event.scope())
             .is_some_and(|state| !state.ended)
         {
-            self.push(event.clone());
+            self.push(encoded);
         }
     }
 
@@ -250,20 +286,25 @@ impl Subscriber {
         }
         state.ended = true;
         self.clear(scope);
-        self.push(StreamEvent::End {
+        self.push(Encoded::new(StreamEvent::End {
             scope: scope.to_string(),
             end,
-        });
+        }));
+    }
+
+    /// The next event to write, as an event.
+    #[cfg(test)]
+    pub(crate) fn next(&mut self) -> Option<StreamEvent> {
+        self.next_encoded().map(Encoded::into_event)
     }
 
     /// The next event to write; a snapshot or a version advances what the
     /// subscriber is known to hold.
-    pub(crate) fn next(&mut self) -> Option<StreamEvent> {
+    pub(crate) fn next_encoded(&mut self) -> Option<Encoded> {
         let queued = self.queue.pop_front()?;
-        self.queued_bytes -= queued.bytes;
-        let event = queued.event;
-        if let Some(state) = self.scopes.get_mut(event.scope()) {
-            match &event {
+        self.queued_bytes -= queued.json.len();
+        if let Some(state) = self.scopes.get_mut(queued.event.scope()) {
+            match &*queued.event {
                 StreamEvent::Snapshot { snapshot, .. } => {
                     state.written = Some(Have {
                         epoch: snapshot.epoch.clone(),
@@ -278,7 +319,7 @@ impl Subscriber {
                 StreamEvent::Checkpoint { .. } | StreamEvent::End { .. } => {}
             }
         }
-        Some(event)
+        Some(queued)
     }
 
     /// The subscriber could not keep up: for each scope still followed, what is

@@ -1059,8 +1059,7 @@ async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -
     let subscription = state.bridge.publication.lock().feed.subscribe(&follow);
     state.bridge.serve_streams().await;
     let stream = futures::stream::unfold(subscription, |subscription| async move {
-        let event = subscription.next().await?;
-        let data = serde_json::to_string(&event).expect("a protocol event serializes");
+        let data = subscription.next_encoded().await?.json();
         Some((
             Ok::<_, Infallible>(SseEvent::default().data(data)),
             subscription,
