@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use super::documents::{
     AgentInfo, ErrorCode, Operation, OperationKind, OperationStatus, ProtocolError,
 };
+use super::hash::TextRule;
 use super::project;
 use super::timeline::{Entry, Role, Timeline};
 use super::timeline_doc::{AttachmentIndex, publish_entry};
@@ -92,6 +93,14 @@ fn values<T: Serialize>(entries: &BTreeMap<String, T>) -> Spec {
     Spec::map(entries.iter().map(|(key, entry)| (key.clone(), value(entry))))
 }
 
+/// A map of terminals: their `output` is a text position (§4.6).
+fn terminals<T: Serialize>(entries: &BTreeMap<String, T>) -> Spec {
+    Spec::map(entries.iter().map(|(key, entry)| {
+        let terminal = serde_json::to_value(entry).expect("a terminal serializes");
+        (key.clone(), Spec::text_value(Arc::new(terminal), TextRule::Terminal))
+    }))
+}
+
 fn fields(members: Value) -> Map<String, Value> {
     match members {
         Value::Object(members) => members,
@@ -119,7 +128,7 @@ pub(crate) fn global(registry: &SessionRegistry, agent: &AgentInfo) -> Spec {
     let live = project::project_global(registry, agent);
     let mut children = common(&live.op, &live.interactions, &live.url_flows);
     children.push(("sessions", values(&live.sessions)));
-    children.push(("terminals", values(&live.terminals)));
+    children.push(("terminals", terminals(&live.terminals)));
     Spec::object(fields(json!({ "agent": live.agent })), children)
 }
 
@@ -140,7 +149,7 @@ pub(crate) fn session(registry: &SessionRegistry, session_id: &str) -> Option<Sp
     let live = project::project_session_live(registry, session_id)?;
     let mut children = common(&live.op, &live.interactions, &live.url_flows);
     children.push(("controls", value(&live.controls)));
-    children.push(("terminals", values(&live.terminals)));
+    children.push(("terminals", terminals(&live.terminals)));
     Some(Spec::object(
         fields(json!({
             "sessionId": live.session_id,
@@ -296,7 +305,7 @@ impl Projector {
                 }
                 children.insert(
                     "entries".into(),
-                    Spec::List(cache.iter().map(|(_, value)| Spec::Value(Arc::clone(value))).collect()),
+                    Spec::List(cache.iter().map(|(_, value)| Spec::text_value(Arc::clone(value), TextRule::Entry)).collect()),
                 );
                 children.insert(
                     "turns".into(),

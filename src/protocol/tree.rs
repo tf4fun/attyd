@@ -12,15 +12,17 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::{Map, Value};
+
+use super::hash::{self, Hash, TextRule};
 
 /// What a node holds (§4.2).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Spec {
-    /// Any JSON; it has no child nodes.
-    Value(Arc<Value>),
+    /// Any JSON, with the text positions it hashes through chains; it has no child nodes.
+    Value(Arc<Value>, TextRule),
     /// Its own fields, and named child nodes.
     Object {
         fields: Map<String, Value>,
@@ -34,7 +36,12 @@ pub(crate) enum Spec {
 
 impl Spec {
     pub(crate) fn value(value: Value) -> Self {
-        Self::Value(Arc::new(value))
+        Self::Value(Arc::new(value), TextRule::None)
+    }
+
+    /// A value whose text positions `rule` names (design §4.6).
+    pub(crate) fn text_value(value: Arc<Value>, rule: TextRule) -> Self {
+        Self::Value(value, rule)
     }
 
     pub(crate) fn object(
@@ -54,7 +61,7 @@ impl Spec {
 
 #[derive(Debug, Clone)]
 enum Body {
-    Value(Arc<Value>),
+    Value(Arc<Value>, TextRule),
     Object {
         fields: Map<String, Value>,
         children: BTreeMap<String, Node>,
@@ -69,6 +76,8 @@ pub(crate) struct Node {
     rev: u64,
     srev: u64,
     body: Body,
+    /// Computed when first asked for and kept while the node is.
+    hash: OnceLock<Hash>,
 }
 
 impl Node {
@@ -85,7 +94,7 @@ impl Node {
     /// The child `key` of an object or a map, or the index `key` of a list.
     pub(crate) fn child(&self, key: &str) -> Option<&Node> {
         match &self.body {
-            Body::Value(_) => None,
+            Body::Value(..) => None,
             Body::Object { children, .. } | Body::Map(children) => children.get(key),
             Body::List(items) => items.get(key.parse::<usize>().ok().filter(|i| i.to_string() == key)?),
         }
@@ -95,7 +104,7 @@ impl Node {
     /// keys, a list its items.
     pub(crate) fn to_value(&self) -> Value {
         match &self.body {
-            Body::Value(value) => (**value).clone(),
+            Body::Value(value, _) => (**value).clone(),
             Body::Object { fields, children } => {
                 let mut object = fields.clone();
                 for (key, child) in children {
@@ -117,7 +126,9 @@ impl Node {
     /// the length. Children are compared when they are reconciled.
     fn same_level(&self, spec: &Spec) -> bool {
         match (&self.body, spec) {
-            (Body::Value(old), Spec::Value(new)) => Arc::ptr_eq(old, new) || old == new,
+            (Body::Value(old, old_rule), Spec::Value(new, new_rule)) => {
+                old_rule == new_rule && (Arc::ptr_eq(old, new) || old == new)
+            }
             (
                 Body::Object { fields: old, children: old_children },
                 Spec::Object { fields: new, children: new_children },
@@ -138,9 +149,9 @@ impl Node {
         };
         let old_body = old.map(|old| &old.body);
         let body = match spec {
-            Spec::Value(value) => match old_body {
-                Some(Body::Value(old)) if same => Body::Value(old.clone()),
-                _ => Body::Value(value),
+            Spec::Value(value, rule) => match old_body {
+                Some(Body::Value(old, _)) if same => Body::Value(old.clone(), rule),
+                _ => Body::Value(value, rule),
             },
             Spec::Object { fields, children } => {
                 let old_children = match old_body {
@@ -174,13 +185,37 @@ impl Node {
             }
         };
         let srev = own.max(match &body {
-            Body::Value(_) => 0,
+            Body::Value(..) => 0,
             Body::Object { children, .. } | Body::Map(children) => {
                 children.values().map(|node| node.srev).max().unwrap_or(0)
             }
             Body::List(items) => items.iter().map(|node| node.srev).max().unwrap_or(0),
         });
-        Node { rev: own, srev, body }
+        // A value node that did not change keeps the hash it had.
+        let hash = match (old, &body) {
+            (Some(old), Body::Value(..)) if same => old.hash.clone(),
+            _ => OnceLock::new(),
+        };
+        Node { rev: own, srev, body, hash }
+    }
+
+    /// The node's content hash (design §5): of the value and its text chains, or of the object,
+    /// map or list over its children's hashes.
+    pub(crate) fn hash(&self) -> Hash {
+        *self.hash.get_or_init(|| match &self.body {
+            Body::Value(value, rule) => hash::value_hash(*rule, value),
+            Body::Object { fields, children } => hash::object_hash(
+                fields,
+                children.iter().map(|(name, node)| (name.as_str(), node.hash())),
+            ),
+            Body::Map(children) => {
+                hash::map_hash(children.iter().map(|(key, node)| (key.as_str(), node.hash())))
+            }
+            Body::List(items) => {
+                let hashes: Vec<Hash> = items.iter().map(Node::hash).collect();
+                hash::list_hash(&hashes)
+            }
+        })
     }
 
     fn reconcile_children(
@@ -217,6 +252,7 @@ impl Tree {
                 rev: 0,
                 srev: 0,
                 body: Body::Map(BTreeMap::new()),
+                hash: OnceLock::new(),
             },
         }
     }

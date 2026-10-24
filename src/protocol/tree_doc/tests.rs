@@ -271,7 +271,7 @@ fn an_unchanged_entry_is_published_with_the_same_value_object() {
         Spec::Map(sessions) => match &sessions["s"] {
             Spec::Object { children, .. } => match &children["entries"] {
                 Spec::List(entries) => match &entries[0] {
-                    Spec::Value(value) => value.clone(),
+                    Spec::Value(value, _) => value.clone(),
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
