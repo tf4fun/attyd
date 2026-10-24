@@ -1,0 +1,376 @@
+{
+ "comment": "Outcomes of lost write answers (docs/protocol-r4-design.md \u00a79.3), computed by an independent statement of the table. Both the bridge and shared/ must reproduce them.",
+ "cases": [
+  {
+   "name": "admitted: its record is in the log",
+   "target": {
+    "instance": "I",
+    "op": "x",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "x",
+      "after": "e"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "admitted",
+    "record": "x"
+   }
+  },
+  {
+   "name": "admitted even when later operations followed",
+   "target": {
+    "instance": "I",
+    "op": "z",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "x",
+      "after": "e"
+     },
+     {
+      "id": "y",
+      "after": "x"
+     },
+     {
+      "id": "z",
+      "after": "y"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "admitted",
+    "record": "x"
+   }
+  },
+  {
+   "name": "admitted wins over a record that also replaced e",
+   "target": {
+    "instance": "I",
+    "op": "x",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "y",
+      "after": "e"
+     },
+     {
+      "id": "x",
+      "after": "y"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "admitted",
+    "record": "x"
+   }
+  },
+  {
+   "name": "superseded: another operation replaced e",
+   "target": {
+    "instance": "I",
+    "op": "y",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "y",
+      "after": "e"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "superseded"
+   }
+  },
+  {
+   "name": "superseded, though the replacer is no longer the current op",
+   "target": {
+    "instance": "I",
+    "op": "z",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "y",
+      "after": "e"
+     },
+     {
+      "id": "z",
+      "after": "y"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "superseded"
+   }
+  },
+  {
+   "name": "open: e is still the current op, not admitted yet",
+   "target": {
+    "instance": "I",
+    "op": "e",
+    "heldSince": null,
+    "ops": []
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "open"
+   }
+  },
+  {
+   "name": "open: e is the current op and the log holds older records",
+   "target": {
+    "instance": "I",
+    "op": "e",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "e",
+      "after": "d"
+     },
+     {
+      "id": "d",
+      "after": "c"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "open"
+   }
+  },
+  {
+   "name": "expired: e is older than the window and nothing replaced it in it",
+   "target": {
+    "instance": "I",
+    "op": "z",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "z",
+      "after": "y"
+     },
+     {
+      "id": "y",
+      "after": "w"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "unknown",
+    "reason": "expired"
+   }
+  },
+  {
+   "name": "expired: an empty log whose op is not e",
+   "target": {
+    "instance": "I",
+    "op": "z",
+    "heldSince": null,
+    "ops": []
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "unknown",
+    "reason": "expired"
+   }
+  },
+  {
+   "name": "restarted: another instance, whatever the log says",
+   "target": {
+    "instance": "J",
+    "op": "x",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "x",
+      "after": "e"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "unknown",
+    "reason": "restarted"
+   }
+  },
+  {
+   "name": "restarted wins over released",
+   "target": {
+    "instance": "J",
+    "op": "e",
+    "heldSince": 50,
+    "ops": []
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "unknown",
+    "reason": "restarted"
+   }
+  },
+  {
+   "name": "released: the target was installed after the version held",
+   "target": {
+    "instance": "I",
+    "op": "e",
+    "heldSince": 11,
+    "ops": []
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "unknown",
+    "reason": "released"
+   }
+  },
+  {
+   "name": "released wins over an admitted-looking record of the new installation",
+   "target": {
+    "instance": "I",
+    "op": "x",
+    "heldSince": 11,
+    "ops": [
+     {
+      "id": "x",
+      "after": "e"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "unknown",
+    "reason": "released"
+   }
+  },
+  {
+   "name": "not released: installed at or before the version held",
+   "target": {
+    "instance": "I",
+    "op": "e",
+    "heldSince": 10,
+    "ops": []
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "open"
+   }
+  },
+  {
+   "name": "global has no heldSince",
+   "target": {
+    "instance": "I",
+    "op": "e",
+    "heldSince": null,
+    "ops": []
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 0
+   },
+   "expected": {
+    "outcome": "open"
+   }
+  },
+  {
+   "name": "the lost fork answer: global's op was replaced while the request was lost",
+   "target": {
+    "instance": "I",
+    "op": "authenticate-2",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "authenticate-2",
+      "after": "e"
+     }
+    ]
+   },
+   "request": {
+    "id": "fork-1",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "superseded"
+   }
+  }
+ ]
+}

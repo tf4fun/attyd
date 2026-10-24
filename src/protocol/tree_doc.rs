@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::documents::{
-    AgentInfo, ErrorCode, Operation, OperationKind, OperationStatus, ProtocolError,
+    AgentInfo, ErrorCode, Operation, OperationKind, OperationStatus, ProtocolError, Scope,
 };
 use super::hash::TextRule;
 use super::project;
@@ -215,6 +215,32 @@ pub(crate) fn turn_heads(timeline: &Timeline, history_rev: u64) -> Vec<TurnHead>
 
 /// What the projection remembers between commits: a session's published entries, so that an
 /// entry the memory did not touch keeps its value (and the tree compares it by pointer).
+/// The record of an operation that occupied a target (design §9.3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct OpRecord {
+    pub id: String,
+    /// This target's `op.id` it replaced; none for the first operation seen of the target.
+    pub after: Option<String>,
+    pub kind: OperationKind,
+    /// The commit that admitted it.
+    pub rev: u64,
+    /// Updated until it ends.
+    pub status: OperationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorSummary>,
+}
+
+/// How many operations a target remembers (design §9.3).
+pub(crate) const OP_LOG: usize = 64;
+
+/// What is remembered of the operations of one target.
+#[derive(Default)]
+struct TargetLog {
+    /// The `op.id` the target showed at the last commit; none before the first.
+    last: Option<String>,
+    records: std::collections::VecDeque<OpRecord>,
+}
+
 /// How many failed loads `/global/loadFailures` keeps (design §6.2).
 pub(crate) const LOAD_FAILURES: usize = 64;
 
@@ -224,6 +250,8 @@ pub(crate) struct Projector {
     /// The last failed loads, oldest first, with the whole error. A stream's `end` carries only
     /// its summary; a client that shows the message reads it here.
     failures: std::collections::VecDeque<(String, ProtocolError)>,
+    /// The operations each target showed, by target (`global`, `catalog`, `sessions/<id>`).
+    logs: BTreeMap<String, TargetLog>,
 }
 
 /// What is remembered of one held session.
@@ -253,6 +281,45 @@ impl Projector {
         self.failures.retain(|(id, _)| id != session_id);
     }
 
+    /// A commit at `next_rev` shows `operation` as the `op` of `target`. The first operation seen
+    /// of a target is the baseline; every change of `op.id` after it is an admission and is
+    /// recorded with the id it replaced. The record of the operation shown follows its status.
+    fn observe(&mut self, target: &str, operation: &Operation, next_rev: u64) {
+        let log = self.logs.entry(target.to_string()).or_default();
+        if let Some(last) = &log.last
+            && *last != operation.id
+        {
+            log.records.push_back(OpRecord {
+                id: operation.id.clone(),
+                after: Some(last.clone()),
+                kind: operation.kind,
+                rev: next_rev,
+                status: operation.status,
+                error: None,
+            });
+            while log.records.len() > OP_LOG {
+                log.records.pop_front();
+            }
+        }
+        log.last = Some(operation.id.clone());
+        if let Some(record) = log.records.iter_mut().rev().find(|record| record.id == operation.id) {
+            record.status = operation.status;
+            record.error = operation.error.as_ref().map(ErrorSummary::of);
+        }
+    }
+
+    /// `ops` of `target`.
+    fn ops(&self, target: &str) -> Spec {
+        Spec::List(
+            self.logs
+                .get(target)
+                .into_iter()
+                .flat_map(|log| log.records.iter())
+                .map(value)
+                .collect(),
+        )
+    }
+
     /// `/global/loadFailures`.
     pub(crate) fn load_failures(&self) -> Spec {
         Spec::map(self.failures.iter().map(|(id, error)| (id.clone(), value(error))))
@@ -270,6 +337,20 @@ impl Projector {
     ) -> BTreeMap<String, Spec> {
         let held = project::held_sessions(registry);
         self.sessions.retain(|id, _| held.contains(id));
+        self.logs.retain(|target, _| match target.strip_prefix("sessions/") {
+            Some(id) => held.iter().any(|held| held == id),
+            None => true,
+        });
+        for (target, scope) in [("global", Scope::Global), ("catalog", Scope::Catalog)] {
+            if let Some((operation, _)) = project::shown_operation(registry, &scope) {
+                self.observe(target, &operation, next_rev);
+            }
+        }
+        for id in &held {
+            if let Some((operation, _)) = project::shown_operation(registry, &Scope::Session(id.clone())) {
+                self.observe(&format!("sessions/{id}"), &operation, next_rev);
+            }
+        }
         // A session held again has no failure to explain.
         self.failures.retain(|(id, _)| !held.contains(id));
         let sessions: Vec<(String, Spec)> = held
@@ -282,10 +363,15 @@ impl Projector {
         let mut global = global(registry, agent);
         if let Spec::Object { children, .. } = &mut global {
             children.insert("loadFailures".into(), self.load_failures());
+            children.insert("ops".into(), self.ops("global"));
+        }
+        let mut catalog = catalog(registry, catalog_revision);
+        if let Spec::Object { children, .. } = &mut catalog {
+            children.insert("ops".into(), self.ops("catalog"));
         }
         BTreeMap::from([
             ("global".to_string(), global),
-            ("catalog".to_string(), catalog(registry, catalog_revision)),
+            ("catalog".to_string(), catalog),
             ("sessions".to_string(), Spec::map(sessions)),
         ])
     }
@@ -301,6 +387,7 @@ impl Projector {
         let Spec::Object { mut fields, mut children } = session(registry, session_id)? else {
             unreachable!("a session is an object");
         };
+        children.insert("ops".into(), self.ops(&format!("sessions/{session_id}")));
         let state = &registry.sessions.get(session_id)?.state;
         let memo = self.sessions.entry(session_id.to_string()).or_insert_with(|| Memo {
             held_since: next_rev,

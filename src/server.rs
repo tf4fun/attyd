@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 #[cfg(not(feature = "dev"))]
 use rust_embed::RustEmbed;
 use serde_json::{Value, json};
@@ -619,6 +619,7 @@ fn app_router(options: &Options, bridge: Arc<BridgeHub>) -> Router {
         .route("/api/v2/scopes/{*scope}", get(read_scope).post(write_scope))
         .route("/api/v2/sessions/{*read}", get(read_session))
         .route("/api/v2/nodes/{*node}", get(read_node))
+        .route("/api/v2/targets/{*target}", get(read_target).post(write_target))
         .fallback(move |request: Request| frontend(dev_proxy.clone(), request))
         .layer(DefaultBodyLimit::disable())
         .layer(CompressionLayer::new())
@@ -974,7 +975,115 @@ async fn write_scope(
             segments.first().map_or("", |scope| scope)
         ));
     };
-    match segments[1..].iter().map(String::as_str).collect::<Vec<_>>()[..] {
+    write_in(state, scope, &segments[1..], headers, body).await
+}
+
+/// `POST /api/v2/targets/{target}/…` (protocol revision 4 §8): the writes of `/api/v2/scopes`,
+/// to a target named `global`, `catalog` or `sessions/<id>`.
+async fn write_target(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let segments: Option<Vec<String>> = uri
+        .path()
+        .strip_prefix("/api/v2/targets/")
+        .unwrap_or_default()
+        .split('/')
+        .map(path_segment)
+        .collect();
+    let Some(segments) = segments else {
+        return invalid_request("the path is not valid percent-encoded UTF-8");
+    };
+    let Some((scope, rest)) = split_target(&segments) else {
+        return invalid_request(format!("no target {}", segments.first().map_or("", |target| target)));
+    };
+    write_in(state, scope, rest, headers, body).await
+}
+
+/// `GET /api/v2/targets/{target}/ops/{id}?expect=<e>&instance=<i>&at=<version>` (protocol revision
+/// 4 §9.3): what became of the request `(id, e)` written to the target, made while the client held
+/// instance `i` and the target at path version `at`. It starts, loads and holds nothing.
+async fn read_target(
+    uri: axum::http::Uri,
+    RawQuery(query): RawQuery,
+    State(state): State<AppState>,
+) -> Response {
+    use crate::protocol::outcome::{Request, resolve};
+    let segments: Option<Vec<String>> = uri
+        .path()
+        .strip_prefix("/api/v2/targets/")
+        .unwrap_or_default()
+        .split('/')
+        .map(path_segment)
+        .collect();
+    let Some(segments) = segments else {
+        return invalid_request("the path is not valid percent-encoded UTF-8");
+    };
+    let Some((scope, rest)) = split_target(&segments) else {
+        return invalid_request(format!("no target {}", segments.first().map_or("", |target| target)));
+    };
+    let [kind, id] = rest else {
+        return refused(ProtocolError::new(ErrorCode::NotFound, format!("no such read in {scope}")));
+    };
+    if kind != "ops" || id.is_empty() {
+        return refused(ProtocolError::new(ErrorCode::NotFound, format!("no such read in {scope}")));
+    }
+    let (mut expect, mut instance, mut at) = (None, None, None);
+    for (key, value) in url::form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes()) {
+        let fresh = match key.as_ref() {
+            "expect" => expect.replace(value.to_string()).is_none(),
+            "instance" => instance.replace(value.to_string()).is_none(),
+            "at" => value.parse::<u64>().ok().is_some_and(|version| at.replace(version).is_none()),
+            _ => false,
+        };
+        if !fresh {
+            return invalid_request(format!("not a read parameter: {key}={value}"));
+        }
+    }
+    let (Some(expect), Some(instance), Some(at)) = (expect, instance, at) else {
+        return invalid_request("a request is resolved with expect, instance and at");
+    };
+    let target = match &scope {
+        Scope::Global => "global".to_string(),
+        Scope::Catalog => "catalog".to_string(),
+        Scope::Session(session_id) => format!("sessions/{}", crate::protocol::tree::escape(session_id)),
+    };
+    let request = Request { id: id.clone(), expect, instance, at };
+    let body = state
+        .bridge
+        .publication
+        .lock()
+        .feed
+        .with_tree(|tree| resolve(tree, &target, &request));
+    match body {
+        Some(body) => axum::Json(body).into_response(),
+        None => refused(ProtocolError::new(ErrorCode::NotFound, format!("{scope} is not published"))),
+    }
+}
+
+/// The target a path starts with and the rest of it.
+fn split_target(segments: &[String]) -> Option<(Scope, &[String])> {
+    match segments {
+        [target, rest @ ..] if target == "global" => Some((Scope::Global, rest)),
+        [target, rest @ ..] if target == "catalog" => Some((Scope::Catalog, rest)),
+        [target, id, rest @ ..] if target == "sessions" && !id.is_empty() => {
+            Some((Scope::Session(id.clone()), rest))
+        }
+        _ => None,
+    }
+}
+
+/// The write `rest` names, to `scope`.
+async fn write_in(
+    state: AppState,
+    scope: Scope,
+    rest: &[String],
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["ops"] => {}
         ["actions", "restart"] => {
             if scope != Scope::Global {
