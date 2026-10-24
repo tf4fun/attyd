@@ -24,7 +24,6 @@ async fn restart_starts_the_connection_nothing_passive_would() {
     let (mut server, link) = Bench::start(json!({})).await;
     let mut stream = server.watch("scope=global&scope=catalog").await;
     stream.event().await;
-    stream.event().await;
     link.close().await;
     until_phase(&mut stream, &["stopped", "error"]).await;
     server.document("global").await;

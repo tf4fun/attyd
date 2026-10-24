@@ -110,7 +110,7 @@ impl Feed {
         let followed = self
             .tree_subscribers
             .values()
-            .flat_map(|subscriber| subscriber.followed())
+            .flat_map(|subscriber| subscriber.tracked())
             .chain(extra.into_iter().flat_map(|query| query.follow.iter().map(|follow| follow.path.as_str())));
         let mut wanted: std::collections::BTreeSet<View> = followed.filter_map(View::of).collect();
         wanted.extend(self.view_pins.keys().cloned());

@@ -468,7 +468,17 @@ impl Sse {
 /// A read of the node of `scope`, as the document of the scope it holds (design §7.1).
 async fn read_scope_snapshot(address: SocketAddr, scope: &str) -> (StatusCode, Value) {
     use crate::protocol::tree_stream::documents::{path_of, snapshot_body};
-    let path = format!("/api/v2/nodes{}", path_of(scope));
+    let encoded: String = path_of(scope)
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    let path = format!("/api/v2/nodes{encoded}");
     let response = send(address, Method::GET, &path, None).await;
     let status = response.status();
     let body = json_of(response).await;

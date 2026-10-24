@@ -611,3 +611,36 @@ fn a_catch_up_and_a_reconnect_carry_windows_too() {
     client.apply(&catch_up).unwrap();
     assert_eq!(client.value(path), Some(&tree.get(path).unwrap().to_value_windowed(8192)));
 }
+
+// --- what an end for a reason asks of the bridge --------------------------------------------
+
+#[test]
+fn a_path_that_ended_for_a_reason_asks_for_nothing_but_is_still_tracked_and_asks_again_when_it_is_there() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[]));
+    let mut subscriber = Subscriber::new(&query(&["/sessions/s/op"]), &tree);
+    subscriber.next();
+    assert_eq!(subscriber.followed().collect::<Vec<_>>(), ["/sessions/s/op"], "a session still to be loaded is asked for");
+
+    subscriber.end_session(&tree, "s", &End { reason: EndReason::LoadFailed, error: None });
+    assert_eq!(subscriber.followed().count(), 0, "a failed load is not asked for again");
+    assert_eq!(subscriber.tracked().collect::<Vec<_>>(), ["/sessions/s/op"]);
+
+    // The session is there later: the subscription delivers it and asks for it again if it goes.
+    let change = committed(&mut tree, root(0, &[("s", Spec::object(Default::default(), [("op", Spec::value(json!({ "id": "o" })))]))]));
+    subscriber.publish(&tree, &change);
+    assert!(matches!(&subscriber.next().unwrap().changes.unwrap()[0], Change::Snapshot { .. }));
+    assert_eq!(subscriber.followed().count(), 1);
+}
+
+#[test]
+fn a_session_that_went_without_a_reason_is_asked_for_again_and_one_that_went_with_one_is_not() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &[])), ("u", session("t", &[]))]));
+    let mut subscriber = Subscriber::new(&query(&["/sessions/s/entries", "/sessions/u/entries"]), &tree);
+    subscriber.next();
+    let ends = BTreeMap::from([("u".to_string(), End { reason: EndReason::Deleted, error: None })]);
+    let gone = committed(&mut tree, root(0, &[]));
+    subscriber.publish_ended(&tree, &gone, Instant::now(), &ends);
+    assert_eq!(subscriber.followed().collect::<Vec<_>>(), ["/sessions/s/entries"], "released: loaded again; deleted: not");
+}

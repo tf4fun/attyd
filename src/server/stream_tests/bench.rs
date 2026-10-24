@@ -489,13 +489,19 @@ impl Watch {
         self.events.push(event.clone());
     }
 
-    /// The next event, skipping comments (the heartbeat), applied.
+    /// The next event, skipping comments (the heartbeat) and events that only say a path is not
+    /// there yet, applied.
     async fn event(&mut self) -> Value {
         loop {
             let message = self.sse.message(WAIT).await.expect("the stream sent no event");
             if let Some(event) = Self::parse(&message) {
                 self.take(&event);
-                return event;
+                let nothing_yet = event["changes"].as_array().is_some_and(|changes| {
+                    changes.iter().all(|change| change["end"]["reason"] == "absent")
+                });
+                if !nothing_yet {
+                    return event;
+                }
             }
         }
     }

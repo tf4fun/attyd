@@ -440,11 +440,14 @@ async fn a_read_of_a_view_materializes_it_and_a_second_read_finds_it_unchanged()
 
 // --- the connection a followed session needs (S6, Q2) and closing ------------------------
 
-/// The next change of `path` that ends it.
+/// The next change of `path` that ends it for a reason: that it is not there is not one.
 async fn end_of(sse: &mut Sse, path: &str) -> Value {
     loop {
         let event = next(sse).await;
-        if let Some(change) = event["changes"].as_array().and_then(|changes| changes.iter().find(|c| c["path"] == path && c.get("end").is_some())) {
+        let found = event["changes"].as_array().and_then(|changes| {
+            changes.iter().find(|c| c["path"] == path && c["end"]["reason"].is_string() && c["end"]["reason"] != "absent")
+        });
+        if let Some(change) = found {
             return change.clone();
         }
     }

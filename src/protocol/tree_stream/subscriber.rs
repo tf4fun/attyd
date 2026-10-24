@@ -34,6 +34,10 @@ struct PathState {
     present: bool,
     /// A fixed view that ended: nothing follows its end.
     over: bool,
+    /// Whether the path asks for its session to be held and loaded. An end for a reason (deleted,
+    /// closed, failed to load) says there is no point in asking again: the subscription stays, to
+    /// deliver the path if it is ever there again, and asks for nothing.
+    demand: bool,
 }
 
 /// Why `path`, if it is a fixed view, is over: the end it is finished by (design §4.5).
@@ -90,7 +94,7 @@ impl Subscriber {
         let mut changes = Vec::new();
         for follow in &query.follow {
             let have = follow.have.filter(|_| same_instance);
-            let mut state = PathState { window: follow.window, written: have, queued: None, present: false, over: false };
+            let mut state = PathState { window: follow.window, written: have, queued: None, present: false, over: false, demand: true };
             match snapshot_windowed(tree, &follow.path, have, follow.window) {
                 Some(snapshot) => {
                     state.queued = Some(snapshot.at);
@@ -144,6 +148,14 @@ impl Subscriber {
 
     /// The paths followed and the directory given for the load of the session each is under.
     pub(crate) fn followed(&self) -> impl Iterator<Item = &str> {
+        self.paths
+            .iter()
+            .filter(|(_, state)| !state.over && state.demand)
+            .map(|(path, _)| path.as_str())
+    }
+
+    /// The paths still tracked, whether or not they ask for their session.
+    pub(crate) fn tracked(&self) -> impl Iterator<Item = &str> {
         self.paths.iter().filter(|(_, state)| !state.over).map(|(path, _)| path.as_str())
     }
 
@@ -203,6 +215,7 @@ impl Subscriber {
                     Some(snapshot) => {
                         state.queued = Some(snapshot.at);
                         state.present = true;
+                        state.demand = true;
                         // A snapshot carries the hash of its subtree.
                         self.pacer.settled(path);
                         changes.push(Change::Snapshot { path: path.clone(), snapshot });
@@ -216,6 +229,8 @@ impl Subscriber {
                         let end = fixed
                             .or_else(|| session_of(path).and_then(|session_id| ended.get(&session_id).cloned()))
                             .unwrap_or(End { reason: EndReason::Absent, error: None });
+                        // An end for a reason is no reason to ask for the session again.
+                        state.demand = end.reason == EndReason::Absent;
                         changes.push(Change::End { path: path.clone(), end });
                     }
                     None => {}
@@ -286,7 +301,10 @@ impl Subscriber {
             .filter(|(path, state)| {
                 session_of(path).as_deref() == Some(session_id) && !state.present && !state.over && tree.get(path).is_none()
             })
-            .map(|(path, _)| Change::End { path: path.clone(), end: end.clone() })
+            .map(|(path, state)| {
+                state.demand = end.reason == EndReason::Absent;
+                Change::End { path: path.clone(), end: end.clone() }
+            })
             .collect();
         if !changes.is_empty() {
             self.push(Event { instance: None, rev: tree.rev(), changes: Some(changes), check: None });
@@ -346,6 +364,7 @@ impl Subscriber {
                 Some(snapshot) => {
                     state.queued = Some(snapshot.at);
                     state.present = true;
+                    state.demand = true;
                     self.pacer.settled(path);
                     changes.push(Change::Snapshot { path: path.clone(), snapshot });
                 }
@@ -356,6 +375,9 @@ impl Subscriber {
                     let fixed = fixed_end(tree, path);
                     state.over = fixed.is_some();
                     let end = fixed.or_else(|| queued_ends.remove(path.as_str()));
+                    if let Some(end) = &end {
+                        state.demand = end.reason == EndReason::Absent;
+                    }
                     if end.is_some() || state.written.is_some() {
                         changes.push(Change::End {
                             path: path.clone(),
