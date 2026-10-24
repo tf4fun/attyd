@@ -1046,6 +1046,10 @@ async fn write_scope(
 /// the revision 3 feed, without SSE ids, with a heartbeat while idle. Dropping
 /// the body closes the subscription.
 async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -> Response {
+    // A query that names `follow` is a stream of revision 4, over paths of the state tree.
+    if url::form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes()).any(|(key, _)| key == "follow") {
+        return tree_stream(query.as_deref().unwrap_or(""), state).await;
+    }
     let follow = match crate::protocol::subscription::parse_stream_query(query.as_deref().unwrap_or("")) {
         Ok(follow) => follow,
         Err(error) => return protocol_error(StatusCode::BAD_REQUEST, error),
@@ -1060,6 +1064,33 @@ async fn feed_stream(RawQuery(query): RawQuery, State(state): State<AppState>) -
     state.bridge.serve_streams().await;
     let stream = futures::stream::unfold(subscription, |subscription| async move {
         let data = subscription.next_encoded().await?.json();
+        Some((
+            Ok::<_, Infallible>(SseEvent::default().data(data)),
+            subscription,
+        ))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(HEARTBEAT))
+        .into_response()
+}
+
+/// `GET /api/v2/stream?follow=…` (design: protocol revision 4 §6): the events of the paths it
+/// follows, one JSON event per SSE message. Dropping the body closes the subscription.
+async fn tree_stream(query: &str, state: AppState) -> Response {
+    let query = match crate::protocol::tree_stream::params::parse_stream_query(query) {
+        Ok(query) => query,
+        Err(error) => return protocol_error(StatusCode::BAD_REQUEST, error),
+    };
+    if state.bridge.state.lock().await.shutting_down {
+        return protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ProtocolError::new(ErrorCode::Unavailable, "the server is shutting down"),
+        );
+    }
+    let subscription = state.bridge.publication.lock().feed.subscribe_tree(&query);
+    state.bridge.serve_streams().await;
+    let stream = futures::stream::unfold(subscription, |subscription| async move {
+        let data = subscription.next_json().await?;
         Some((
             Ok::<_, Infallible>(SseEvent::default().data(data)),
             subscription,

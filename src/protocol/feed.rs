@@ -21,8 +21,11 @@ use super::live_doc::engine_input;
 use super::pacing::Pacer;
 use super::project::held_sessions;
 use super::subscription::{Encoded, Subscribed, Subscriber};
-use super::tree::Tree;
-use super::tree_doc::Projector;
+use super::tree::{Committed, Tree};
+use super::tree_doc::{ErrorSummary, Projector};
+use super::tree_stream::params::{StreamQuery, session_of};
+use super::tree_stream::subscriber::Subscriber as TreeSubscriber;
+use super::tree_stream::wire::{End as TreeEnd, EndReason as TreeEndReason, Event as TreeEvent};
 use crate::session_registry::SessionRegistry;
 
 pub(crate) type SubscriptionId = u64;
@@ -46,6 +49,8 @@ pub(crate) struct Feed {
     /// The revision 4 state tree (docs/protocol-r4-design.md §4), committed beside the scopes.
     tree: Tree,
     projector: Projector,
+    /// The streams of revision 4, which follow paths of the tree.
+    tree_subscribers: BTreeMap<SubscriptionId, TreeSubscriber>,
     #[cfg(test)]
     tap: tap::Tap,
 }
@@ -61,6 +66,7 @@ impl Feed {
             // A random instance per process, apart from the scopes' epoch (§4.1).
             tree: Tree::new(super::op::operation_id()),
             projector: Projector::default(),
+            tree_subscribers: BTreeMap::new(),
             #[cfg(test)]
             tap: tap::Tap::default(),
         }
@@ -82,8 +88,21 @@ impl Feed {
         id
     }
 
+    /// Registers a stream of revision 4 and queues its first event.
+    pub(crate) fn subscribe_tree(&mut self, query: &StreamQuery) -> SubscriptionId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tree_subscribers.insert(id, TreeSubscriber::new(query, &self.tree));
+        id
+    }
+
+    pub(crate) fn next_tree(&mut self, id: SubscriptionId) -> Option<TreeEvent> {
+        self.tree_subscribers.get_mut(&id)?.next()
+    }
+
     pub(crate) fn unsubscribe(&mut self, id: SubscriptionId) {
         self.subscribers.remove(&id);
+        self.tree_subscribers.remove(&id);
     }
 
     /// The next event to write to subscription `id`.
@@ -97,7 +116,7 @@ impl Feed {
     }
 
     pub(crate) fn subscribers(&self) -> usize {
-        self.subscribers.len()
+        self.subscribers.len() + self.tree_subscribers.len()
     }
 
     /// The sessions some subscription follows, with the subscriptions that
@@ -118,12 +137,57 @@ impl Feed {
                 }
             }
         }
+        for (&id, subscriber) in &self.tree_subscribers {
+            for path in subscriber.followed() {
+                let Some(session_id) = session_of(path) else {
+                    continue;
+                };
+                let published = self
+                    .tree
+                    .get(&format!("/sessions/{}", super::tree::escape(&session_id)))
+                    .is_some();
+                let waiting = sessions.entry(session_id.clone()).or_default();
+                if !published && !waiting.iter().any(|waiting| waiting.id == id) {
+                    waiting.push(Waiting {
+                        id,
+                        cwd: subscriber.cwd().get(&session_id).cloned(),
+                    });
+                }
+            }
+        }
         sessions
+    }
+
+    /// Queues a tree commit for the revision 4 streams that follow what it changed.
+    fn publish_tree(&mut self, committed: &Committed, now: Instant, ends: &BTreeMap<String, TreeEnd>) {
+        for subscriber in self.tree_subscribers.values_mut() {
+            subscriber.publish_ended(&self.tree, committed, now, ends);
+            if subscriber.over_budget() {
+                subscriber.coalesce(&self.tree);
+            }
+        }
     }
 
     /// Ends `session/<session_id>` for the subscriptions still waiting for it:
     /// a subscription that has the session published is not ended by this.
     pub(crate) fn end_waiting(&mut self, session_id: &str, end: &End) {
+        let tree_end = tree_end(end);
+        let published = self
+            .tree
+            .get(&format!("/sessions/{}", super::tree::escape(session_id)))
+            .is_some();
+        if !published
+            && let (EndReason::LoadFailed, Some(error)) = (end.reason, &end.error)
+        {
+            self.projector.record_failure(session_id, error.clone());
+            let failures = self.projector.load_failures();
+            if let Some(committed) = self.tree.commit_at("/global/loadFailures", failures) {
+                self.publish_tree(&committed, Instant::now(), &BTreeMap::new());
+            }
+        }
+        for subscriber in self.tree_subscribers.values_mut() {
+            subscriber.end_session(&self.tree, session_id, &tree_end);
+        }
         let scope = Scope::Session(session_id.to_string()).to_string();
         if self.engine.version(&scope).is_some() {
             return;
@@ -272,9 +336,24 @@ impl Feed {
                 subscriber.coalesce(&self.engine);
             }
         }
+        for (session_id, end) in ended {
+            match (end.reason, &end.error) {
+                (EndReason::LoadFailed, Some(error)) => {
+                    self.projector.record_failure(session_id, error.clone());
+                }
+                (EndReason::Deleted, _) => self.projector.forget_failure(session_id),
+                _ => {}
+            }
+        }
         let next = self.tree.rev() + 1;
-        self.tree
-            .commit(self.projector.project(registry, agent, catalog_revision, next));
+        let root = self.projector.project(registry, agent, catalog_revision, next);
+        if let Some(committed) = self.tree.commit_with_ops(root) {
+            let ends: BTreeMap<String, TreeEnd> = ended
+                .iter()
+                .map(|(session_id, end)| (session_id.clone(), tree_end(end)))
+                .collect();
+            self.publish_tree(&committed, now, &ends);
+        }
         #[cfg(test)]
         self.tap_flush();
     }
@@ -293,12 +372,31 @@ impl Feed {
                 subscriber.publish(&checkpoint);
             }
         }
+        for subscriber in self.tree_subscribers.values_mut() {
+            queued |= subscriber.checkpoints(&self.tree, now);
+        }
         queued
     }
 
-    /// When the next checkpoint is due, if a scope waits for one.
+    /// When the next checkpoint is due, if a scope or a path waits for one.
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.pacer.deadline()
+        self.tree_subscribers
+            .values()
+            .filter_map(TreeSubscriber::deadline)
+            .chain(self.pacer.deadline())
+            .min()
+    }
+}
+
+/// The end of a revision 3 scope as a path of the tree ends.
+fn tree_end(end: &End) -> TreeEnd {
+    TreeEnd {
+        reason: match end.reason {
+            EndReason::Deleted => TreeEndReason::Deleted,
+            EndReason::Closed => TreeEndReason::Closed,
+            EndReason::LoadFailed => TreeEndReason::LoadFailed,
+        },
+        error: end.error.as_ref().map(ErrorSummary::of),
     }
 }
 
@@ -365,6 +463,15 @@ impl FeedHandle {
             id,
             handle: self.clone(),
         }))
+    }
+
+    /// A stream of revision 4 over the paths of `query`, its first event queued.
+    pub(crate) fn subscribe_tree(&self, query: &StreamQuery) -> TreeSubscription {
+        let id = self.feed().subscribe_tree(query);
+        TreeSubscription(FeedSubscription(Arc::new(SubscriptionGuard {
+            id,
+            handle: self.clone(),
+        })))
     }
 
     pub(crate) fn subscribers(&self) -> usize {
@@ -483,8 +590,50 @@ impl FeedSubscription {
     }
 }
 
+/// One revision 4 stream's side of a subscription.
+#[derive(Clone)]
+pub(crate) struct TreeSubscription(FeedSubscription);
+
+impl TreeSubscription {
+    /// The next event to write, as JSON; waits when none is queued, and is `None` once the feed
+    /// is closed and the queue is drained.
+    pub(crate) async fn next_json(&self) -> Option<String> {
+        let subscription = &self.0;
+        let handle = &subscription.0.handle;
+        loop {
+            let ready = handle.0.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            let deadline = {
+                let mut feed = handle.feed();
+                if feed.checkpoints(Instant::now()) {
+                    handle.0.ready.notify_waiters();
+                }
+                if let Some(event) = feed.next_tree(subscription.0.id) {
+                    return Some(serde_json::to_string(&event).expect("an event serializes"));
+                }
+                feed.deadline()
+            };
+            if handle.0.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        () = ready => {}
+                        () = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
+                None => ready.await,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod handle_tests;
+#[cfg(test)]
+mod tree_stream_tests;
 #[cfg(test)]
 mod tree_tests;
 #[cfg(test)]

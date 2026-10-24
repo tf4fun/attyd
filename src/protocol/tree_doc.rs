@@ -215,9 +215,15 @@ pub(crate) fn turn_heads(timeline: &Timeline, history_rev: u64) -> Vec<TurnHead>
 
 /// What the projection remembers between commits: a session's published entries, so that an
 /// entry the memory did not touch keeps its value (and the tree compares it by pointer).
+/// How many failed loads `/global/loadFailures` keeps (design §6.2).
+pub(crate) const LOAD_FAILURES: usize = 64;
+
 #[derive(Default)]
 pub(crate) struct Projector {
     sessions: BTreeMap<String, Memo>,
+    /// The last failed loads, oldest first, with the whole error. A stream's `end` carries only
+    /// its summary; a client that shows the message reads it here.
+    failures: std::collections::VecDeque<(String, ProtocolError)>,
 }
 
 /// What is remembered of one held session.
@@ -232,6 +238,26 @@ struct Memo {
 }
 
 impl Projector {
+    /// A load of `session_id` failed with `error`: kept until the session is held again or
+    /// deleted, among the last `LOAD_FAILURES`.
+    pub(crate) fn record_failure(&mut self, session_id: &str, error: ProtocolError) {
+        self.forget_failure(session_id);
+        self.failures.push_back((session_id.to_string(), error));
+        while self.failures.len() > LOAD_FAILURES {
+            self.failures.pop_front();
+        }
+    }
+
+    /// The session is deleted: its failure is no longer kept.
+    pub(crate) fn forget_failure(&mut self, session_id: &str) {
+        self.failures.retain(|(id, _)| id != session_id);
+    }
+
+    /// `/global/loadFailures`.
+    pub(crate) fn load_failures(&self) -> Spec {
+        Spec::map(self.failures.iter().map(|(id, error)| (id.clone(), value(error))))
+    }
+
     /// The complete tree the bridge now publishes, to commit as revision `next_rev`: a session
     /// held for the first time, or whose history was replaced, takes it for `heldSince` or
     /// `historyRev`. Each of those changes the tree, so `next_rev` is then the revision committed.
@@ -244,6 +270,8 @@ impl Projector {
     ) -> BTreeMap<String, Spec> {
         let held = project::held_sessions(registry);
         self.sessions.retain(|id, _| held.contains(id));
+        // A session held again has no failure to explain.
+        self.failures.retain(|(id, _)| !held.contains(id));
         let sessions: Vec<(String, Spec)> = held
             .into_iter()
             .filter_map(|id| {
@@ -251,8 +279,12 @@ impl Projector {
                 Some((id, spec))
             })
             .collect();
+        let mut global = global(registry, agent);
+        if let Spec::Object { children, .. } = &mut global {
+            children.insert("loadFailures".into(), self.load_failures());
+        }
         BTreeMap::from([
-            ("global".to_string(), global(registry, agent)),
+            ("global".to_string(), global),
             ("catalog".to_string(), catalog(registry, catalog_revision)),
             ("sessions".to_string(), Spec::map(sessions)),
         ])

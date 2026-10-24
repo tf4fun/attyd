@@ -20,6 +20,7 @@ use super::*;
 mod actions;
 mod bench;
 mod feed;
+mod tree;
 
 const WAIT: Duration = Duration::from_secs(10);
 const CWD: &str = "/workspace";
