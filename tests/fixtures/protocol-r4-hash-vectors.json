@@ -1,0 +1,599 @@
+{
+ "comment": "Revision 4 hash vectors (docs/protocol-r4-design.md §4.6, §5), computed by an independent implementation (Python hashlib and its own canonical JSON). Both the Rust and the TypeScript hashes must reproduce them.",
+ "L": 4096,
+ "text": [
+  {
+   "name": "empty",
+   "text": "",
+   "length": 0,
+   "segments": [],
+   "chain": [],
+   "hash": "83d0ad8dec252193c3f87a5f13b10d552d83c1346a3d991c9fbce402fd025cb1"
+  },
+  {
+   "name": "one byte",
+   "text": "a",
+   "length": 1,
+   "segments": [
+    1
+   ],
+   "chain": [
+    "41a0370c3d9f42773a59e8e01651911cf43b1e3f66944cbb690029debc4eb647"
+   ],
+   "hash": "c4aec2c284d2484b0f5755b9be2f4ed83e5ec6bbae7485c2ace37ab64a1724d5"
+  },
+  {
+   "name": "exactly one segment",
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "length": 4096,
+   "segments": [
+    4096
+   ],
+   "chain": [
+    "6f1885712cf8484fefb53ea41e85e04da5179a4c91a650777cb20310b1fb04a7"
+   ],
+   "hash": "82b8bdb1f0a442cb80bc761c84a8fa96a92ce04a4cff40594fa507c9dba1b5f9"
+  },
+  {
+   "name": "one byte over a segment",
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "length": 4097,
+   "segments": [
+    4096,
+    1
+   ],
+   "chain": [
+    "6f1885712cf8484fefb53ea41e85e04da5179a4c91a650777cb20310b1fb04a7",
+    "db831f8aa3d01539d6868857d62871ba44926270bb9477d172f1edd5df10b2f0"
+   ],
+   "hash": "b2391e4cc05b1f7df9359f82b254ed0484d86bb8a6346acade43cc2eb12d46c7"
+  },
+  {
+   "name": "two full segments",
+   "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+   "length": 8192,
+   "segments": [
+    4096,
+    4096
+   ],
+   "chain": [
+    "21679ee95213a482ef33d5bfb1d32160992d809e73868705c63723bf1cc8bba5",
+    "2e2524a87322f03721fa96053bb769d7597e4a075ae99f65a4b71fe5ebbbc373"
+   ],
+   "hash": "c2e3028ac3fb94548a70306d1466f1506ed99d1b79b4212d84024e808197c21c"
+  },
+  {
+   "name": "a three-byte character does not straddle the boundary",
+   "text": "aa日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日",
+   "length": 4502,
+   "segments": [
+    4094,
+    408
+   ],
+   "chain": [
+    "7cbd08da0c56f1a2cfb7f13bee929a97225e048538b90a9778dbe40a345035a7",
+    "c5aa1b379fc081b125769c65907f8055613fbd2bf5a457e676e77329014d6371"
+   ],
+   "hash": "9aab58ac4ab1a4e1c2ac23668f698379fd270d9f79fdaf88e9bea8049aba0f80"
+  },
+  {
+   "name": "four-byte characters",
+   "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+   "length": 10000,
+   "segments": [
+    4096,
+    4096,
+    1808
+   ],
+   "chain": [
+    "9c672a84a0b14e4138ec1eb610733d55eeb94bc88fa70c06d49a4acede540eab",
+    "c12ae907b9c7979f93d52a0ea249ff3796100749ee3375d45923783f5f9f6ca3",
+    "72dba01c9e5924bbb2c6f2e9df71379a0e7f3c366942113b618e368b343c4ec0"
+   ],
+   "hash": "1c2adac5c60f0f9960062b246c6362cda1b0d91bf2072971bd2d0e8168162d67"
+  },
+  {
+   "name": "two-byte characters on a boundary",
+   "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+   "length": 6000,
+   "segments": [
+    4096,
+    1904
+   ],
+   "chain": [
+    "4fbf46ea8f05e5fe8fcfb94dcb0e815042253eb39fb412f91f8326a1f72b6d18",
+    "3f701067767655212237b457cf984ad0b5cc9522319430dd4f442c48b23a7f74"
+   ],
+   "hash": "cc4608553a63bf82d4c83e1dba01c919a016f1d068eb7b4b491074fae74d3c4c"
+  },
+  {
+   "name": "mixed",
+   "text": "héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 ",
+   "length": 14000,
+   "segments": [
+    4095,
+    4096,
+    4096,
+    1713
+   ],
+   "chain": [
+    "4fae252d94795a9e3518360cd385338def40c3b1885d99bab3d2873f900f73cb",
+    "eeb65968d966707b962bc5f20b7a38ee20ed49f2a9040d8a57513b6484b217ab",
+    "cda57c2ceb3e440de5852fc3b49907ca19673446c53f7dee6526d176a7a372f8",
+    "48361481438369450b46aec1e40988dfd9a2bca9a6c929cc219d9e2040fa953b"
+   ],
+   "hash": "e91c3b0524de9919c8848e09159d41022739aa0b09caff8984648caf176621a6"
+  }
+ ],
+ "windows": [
+  {
+   "name": "empty, from segment 0",
+   "length": 0,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "",
+   "hash": "83d0ad8dec252193c3f87a5f13b10d552d83c1346a3d991c9fbce402fd025cb1"
+  },
+  {
+   "name": "one byte, from segment 0",
+   "length": 1,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "a",
+   "hash": "c4aec2c284d2484b0f5755b9be2f4ed83e5ec6bbae7485c2ace37ab64a1724d5"
+  },
+  {
+   "name": "one byte, from segment 1",
+   "length": 1,
+   "offset": 1,
+   "before": "41a0370c3d9f42773a59e8e01651911cf43b1e3f66944cbb690029debc4eb647",
+   "text": "",
+   "hash": "c4aec2c284d2484b0f5755b9be2f4ed83e5ec6bbae7485c2ace37ab64a1724d5"
+  },
+  {
+   "name": "exactly one segment, from segment 0",
+   "length": 4096,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "hash": "82b8bdb1f0a442cb80bc761c84a8fa96a92ce04a4cff40594fa507c9dba1b5f9"
+  },
+  {
+   "name": "exactly one segment, from segment 1",
+   "length": 4096,
+   "offset": 4096,
+   "before": "6f1885712cf8484fefb53ea41e85e04da5179a4c91a650777cb20310b1fb04a7",
+   "text": "",
+   "hash": "82b8bdb1f0a442cb80bc761c84a8fa96a92ce04a4cff40594fa507c9dba1b5f9"
+  },
+  {
+   "name": "one byte over a segment, from segment 0",
+   "length": 4097,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "hash": "b2391e4cc05b1f7df9359f82b254ed0484d86bb8a6346acade43cc2eb12d46c7"
+  },
+  {
+   "name": "one byte over a segment, from segment 1",
+   "length": 4097,
+   "offset": 4096,
+   "before": "6f1885712cf8484fefb53ea41e85e04da5179a4c91a650777cb20310b1fb04a7",
+   "text": "x",
+   "hash": "b2391e4cc05b1f7df9359f82b254ed0484d86bb8a6346acade43cc2eb12d46c7"
+  },
+  {
+   "name": "one byte over a segment, from segment 2",
+   "length": 4097,
+   "offset": 4097,
+   "before": "db831f8aa3d01539d6868857d62871ba44926270bb9477d172f1edd5df10b2f0",
+   "text": "",
+   "hash": "b2391e4cc05b1f7df9359f82b254ed0484d86bb8a6346acade43cc2eb12d46c7"
+  },
+  {
+   "name": "two full segments, from segment 0",
+   "length": 8192,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+   "hash": "c2e3028ac3fb94548a70306d1466f1506ed99d1b79b4212d84024e808197c21c"
+  },
+  {
+   "name": "two full segments, from segment 1",
+   "length": 8192,
+   "offset": 4096,
+   "before": "21679ee95213a482ef33d5bfb1d32160992d809e73868705c63723bf1cc8bba5",
+   "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+   "hash": "c2e3028ac3fb94548a70306d1466f1506ed99d1b79b4212d84024e808197c21c"
+  },
+  {
+   "name": "two full segments, from segment 2",
+   "length": 8192,
+   "offset": 8192,
+   "before": "2e2524a87322f03721fa96053bb769d7597e4a075ae99f65a4b71fe5ebbbc373",
+   "text": "",
+   "hash": "c2e3028ac3fb94548a70306d1466f1506ed99d1b79b4212d84024e808197c21c"
+  },
+  {
+   "name": "a three-byte character does not straddle the boundary, from segment 0",
+   "length": 4502,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "aa日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日",
+   "hash": "9aab58ac4ab1a4e1c2ac23668f698379fd270d9f79fdaf88e9bea8049aba0f80"
+  },
+  {
+   "name": "a three-byte character does not straddle the boundary, from segment 1",
+   "length": 4502,
+   "offset": 4094,
+   "before": "7cbd08da0c56f1a2cfb7f13bee929a97225e048538b90a9778dbe40a345035a7",
+   "text": "日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日",
+   "hash": "9aab58ac4ab1a4e1c2ac23668f698379fd270d9f79fdaf88e9bea8049aba0f80"
+  },
+  {
+   "name": "a three-byte character does not straddle the boundary, from segment 2",
+   "length": 4502,
+   "offset": 4502,
+   "before": "c5aa1b379fc081b125769c65907f8055613fbd2bf5a457e676e77329014d6371",
+   "text": "",
+   "hash": "9aab58ac4ab1a4e1c2ac23668f698379fd270d9f79fdaf88e9bea8049aba0f80"
+  },
+  {
+   "name": "four-byte characters, from segment 0",
+   "length": 10000,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+   "hash": "1c2adac5c60f0f9960062b246c6362cda1b0d91bf2072971bd2d0e8168162d67"
+  },
+  {
+   "name": "four-byte characters, from segment 1",
+   "length": 10000,
+   "offset": 4096,
+   "before": "9c672a84a0b14e4138ec1eb610733d55eeb94bc88fa70c06d49a4acede540eab",
+   "text": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+   "hash": "1c2adac5c60f0f9960062b246c6362cda1b0d91bf2072971bd2d0e8168162d67"
+  },
+  {
+   "name": "four-byte characters, from segment 3",
+   "length": 10000,
+   "offset": 10000,
+   "before": "72dba01c9e5924bbb2c6f2e9df71379a0e7f3c366942113b618e368b343c4ec0",
+   "text": "",
+   "hash": "1c2adac5c60f0f9960062b246c6362cda1b0d91bf2072971bd2d0e8168162d67"
+  },
+  {
+   "name": "two-byte characters on a boundary, from segment 0",
+   "length": 6000,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+   "hash": "cc4608553a63bf82d4c83e1dba01c919a016f1d068eb7b4b491074fae74d3c4c"
+  },
+  {
+   "name": "two-byte characters on a boundary, from segment 1",
+   "length": 6000,
+   "offset": 4096,
+   "before": "4fbf46ea8f05e5fe8fcfb94dcb0e815042253eb39fb412f91f8326a1f72b6d18",
+   "text": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+   "hash": "cc4608553a63bf82d4c83e1dba01c919a016f1d068eb7b4b491074fae74d3c4c"
+  },
+  {
+   "name": "two-byte characters on a boundary, from segment 2",
+   "length": 6000,
+   "offset": 6000,
+   "before": "3f701067767655212237b457cf984ad0b5cc9522319430dd4f442c48b23a7f74",
+   "text": "",
+   "hash": "cc4608553a63bf82d4c83e1dba01c919a016f1d068eb7b4b491074fae74d3c4c"
+  },
+  {
+   "name": "mixed, from segment 0",
+   "length": 14000,
+   "offset": 0,
+   "before": "0000000000000000000000000000000000000000000000000000000000000000",
+   "text": "héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 ",
+   "hash": "e91c3b0524de9919c8848e09159d41022739aa0b09caff8984648caf176621a6"
+  },
+  {
+   "name": "mixed, from segment 1",
+   "length": 14000,
+   "offset": 4095,
+   "before": "4fae252d94795a9e3518360cd385338def40c3b1885d99bab3d2873f900f73cb",
+   "text": "😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 héllo, 世界 😀 ",
+   "hash": "e91c3b0524de9919c8848e09159d41022739aa0b09caff8984648caf176621a6"
+  },
+  {
+   "name": "mixed, from segment 4",
+   "length": 14000,
+   "offset": 14000,
+   "before": "48361481438369450b46aec1e40988dfd9a2bca9a6c929cc219d9e2040fa953b",
+   "text": "",
+   "hash": "e91c3b0524de9919c8848e09159d41022739aa0b09caff8984648caf176621a6"
+  }
+ ],
+ "values": [
+  {
+   "name": "plain value",
+   "rule": "none",
+   "value": {
+    "a": 1,
+    "b": [
+     true,
+     null,
+     "x"
+    ],
+    "é": "ü"
+   },
+   "hash": "d4c958d58a572cf58e687095ba01fd653d48783aed5e0b72572bc35fa496e65b"
+  },
+  {
+   "name": "a message entry hashes its text through the chain",
+   "rule": "entry",
+   "value": {
+    "kind": "message",
+    "role": "agent",
+    "messageId": "m",
+    "chunks": [
+     {
+      "content": {
+       "type": "text",
+       "text": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word "
+      }
+     },
+     {
+      "content": {
+       "type": "image",
+       "data": "AAAA"
+      }
+     },
+     {
+      "content": {
+       "type": "text",
+       "text": "tail"
+      }
+     }
+    ]
+   },
+   "hash": "c46e7e6bcef5a70a8b55b9516bb6fe15c26912e0c6636cef97b56a9b6776da9b"
+  },
+  {
+   "name": "a tool entry's content text",
+   "rule": "entry",
+   "value": {
+    "kind": "tool",
+    "call": {
+     "toolCallId": "t",
+     "content": [
+      {
+       "type": "content",
+       "content": {
+        "type": "text",
+        "text": "out"
+       }
+      },
+      {
+       "type": "diff",
+       "path": "/p",
+       "newText": "not a text position"
+      }
+     ]
+    }
+   },
+   "hash": "e81bd1cb9b6cb7bf90368b88e4407316e42f370e5fe53397d28bf0bed34733ba"
+  },
+  {
+   "name": "a compaction summary",
+   "rule": "entry",
+   "value": {
+    "kind": "compaction",
+    "compactionId": "c",
+    "status": {},
+    "summary": [
+     {
+      "content": {
+       "type": "text",
+       "text": "s"
+      }
+     }
+    ]
+   },
+   "hash": "c614ca72c431126b04e8289edc7d8f634def113f6f97b64f6ed73e0f9cc7f692"
+  },
+  {
+   "name": "text outside a text position is plain JSON",
+   "rule": "entry",
+   "value": {
+    "kind": "plan",
+    "planId": "p",
+    "text": "not a position"
+   },
+   "hash": "505837d09c3b06b9b2d635a3fb594f96ab0f0d5c2fd775edab81c25fb1574796"
+  },
+  {
+   "name": "a terminal's output",
+   "rule": "terminal",
+   "value": {
+    "terminalId": "t",
+    "output": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+    "truncated": false
+   },
+   "hash": "a698bca7446f80cee052ade81b500c7cf6263a7fbdca5fecc26e97141e42c995"
+  },
+  {
+   "name": "an output view's text",
+   "rule": "outputView",
+   "value": {
+    "turn": null,
+    "entry": null,
+    "text": "",
+    "other": 0
+   },
+   "hash": "0c2f4ef8f1b2cf0ec7cd97e4c0263432437ba508a6fe23a3ad24a40dc42f5843"
+  },
+  {
+   "name": "an output view with text",
+   "rule": "outputView",
+   "value": {
+    "turn": {
+     "historyRev": 1
+    },
+    "entry": 3,
+    "text": "héllo",
+    "other": 1
+   },
+   "hash": "3090f49145840af47e52f5095a91afce3f3f0eb2f8a4808a6fe5458d02d5ffb6"
+  }
+ ],
+ "nodes": [
+  {
+   "name": "an empty map",
+   "node": {
+    "kind": "map",
+    "children": {}
+   },
+   "hash": "62c66a7a5dd70c3146618063c344e531e6d4b59e379808443ce962b3abd63c5a"
+  },
+  {
+   "name": "an empty list",
+   "node": {
+    "kind": "list",
+    "items": []
+   },
+   "hash": "9a87cc3076dc0da4df27eb28fb2a51793333aff1d678ed34602edebbedf61d0e"
+  },
+  {
+   "name": "a list is ordered and counted",
+   "node": {
+    "kind": "list",
+    "items": [
+     {
+      "kind": "value",
+      "rule": "none",
+      "value": {
+       "x": 1
+      }
+     },
+     {
+      "kind": "value",
+      "rule": "none",
+      "value": 2
+     },
+     {
+      "kind": "value",
+      "rule": "none",
+      "value": null
+     }
+    ]
+   },
+   "hash": "617bba879c1d05935becdc258113d9ecdc036d570833f4f5d1052f6be66b2bfa"
+  },
+  {
+   "name": "a map is keyed",
+   "node": {
+    "kind": "map",
+    "children": {
+     "b": {
+      "kind": "value",
+      "rule": "none",
+      "value": {
+       "x": 1
+      }
+     },
+     "a": {
+      "kind": "value",
+      "rule": "none",
+      "value": "s"
+     }
+    }
+   },
+   "hash": "78c9754c7fa99581ba358b4307887a15339375861e89d9db444c7ee459f936c6"
+  },
+  {
+   "name": "keys sort by UTF-16 code units, not code points",
+   "node": {
+    "kind": "map",
+    "children": {
+     "😀": {
+      "kind": "value",
+      "rule": "none",
+      "value": 1
+     },
+     "￿": {
+      "kind": "value",
+      "rule": "none",
+      "value": 2
+     },
+     "a": {
+      "kind": "value",
+      "rule": "none",
+      "value": 3
+     }
+    }
+   },
+   "hash": "6cf08628f99df046eea2e4728a3903805abc94723f4521b62f378c39d13467b7"
+  },
+  {
+   "name": "an object has its own fields and named children",
+   "node": {
+    "kind": "object",
+    "fields": {
+     "title": "t",
+     "n": 1
+    },
+    "children": {
+     "controls": {
+      "kind": "value",
+      "rule": "none",
+      "value": {
+       "x": 1
+      }
+     },
+     "entries": {
+      "kind": "list",
+      "items": [
+       {
+        "kind": "value",
+        "rule": "entry",
+        "value": {
+         "kind": "message",
+         "role": "user",
+         "chunks": [
+          {
+           "content": {
+            "type": "text",
+            "text": "hi"
+           }
+          }
+         ]
+        }
+       }
+      ]
+     },
+     "terminals": {
+      "kind": "map",
+      "children": {
+       "t": {
+        "kind": "value",
+        "rule": "terminal",
+        "value": {
+         "terminalId": "t",
+         "output": "ok"
+        }
+       }
+      }
+     }
+    }
+   },
+   "hash": "50393e13f15a9e37dd97fd8a2e63a91f2df8efecce7c6000d1813141a8189023"
+  },
+  {
+   "name": "an empty object",
+   "node": {
+    "kind": "object",
+    "fields": {},
+    "children": {}
+   },
+   "hash": "4a510c930baa5effe460243839a11df59d9043759240f2c36404c4fee37ab895"
+  }
+ ]
+}
