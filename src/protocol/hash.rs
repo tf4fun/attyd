@@ -94,57 +94,55 @@ pub(crate) enum TextRule {
     OutputView,
 }
 
-/// The `text` of a text block (never creates a member: indexing a `&mut Value` by a missing
-/// key would insert `null`, changing what is hashed).
-fn text_block(block: Option<&mut Value>) -> Option<&mut Value> {
-    let block = block?;
-    (block["type"] == "text" && block["text"].is_string()).then(|| &mut block["text"])
+/// Whether `block` is a text block: `{ "type": "text", "text": <string> }`.
+fn is_text_block(block: Option<&Value>) -> bool {
+    block.is_some_and(|block| block["type"] == "text" && block["text"].is_string())
 }
 
-/// The text positions of `value` under `rule`.
-fn texts<'a>(rule: TextRule, value: &'a mut Value) -> Vec<&'a mut Value> {
+/// The JSON Pointers, relative to `value`, of its text positions under `rule` (§4.6), in
+/// document order.
+pub(crate) fn text_pointers(rule: TextRule, value: &Value) -> Vec<String> {
     let mut found = Vec::new();
     match rule {
         TextRule::None => {}
         TextRule::Terminal => {
             if value["output"].is_string() {
-                found.push(&mut value["output"]);
+                found.push("/output".to_string());
             }
         }
         TextRule::OutputView => {
             if value["text"].is_string() {
-                found.push(&mut value["text"]);
+                found.push("/text".to_string());
             }
         }
-        TextRule::Entry => match value["kind"].as_str() {
-            Some("message") => found.extend(
-                value
-                    .get_mut("chunks")
-                    .and_then(Value::as_array_mut)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|chunk| text_block(chunk.get_mut("content"))),
-            ),
-            Some("compaction") => found.extend(
-                value
-                    .get_mut("summary")
-                    .and_then(Value::as_array_mut)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|chunk| text_block(chunk.get_mut("content"))),
-            ),
-            Some("tool") => found.extend(
-                value
-                    .get_mut("call")
-                    .and_then(|call| call.get_mut("content"))
-                    .and_then(Value::as_array_mut)
-                    .into_iter()
-                    .flatten()
-                    .filter(|item| item["type"] == "content")
-                    .filter_map(|item| text_block(item.get_mut("content"))),
-            ),
-            _ => {}
-        },
+        TextRule::Entry => {
+            let items = |key: &str| value.get(key).and_then(Value::as_array).into_iter().flatten().enumerate();
+            match value["kind"].as_str() {
+                Some("message") => {
+                    for (index, chunk) in items("chunks") {
+                        if is_text_block(chunk.get("content")) {
+                            found.push(format!("/chunks/{index}/content/text"));
+                        }
+                    }
+                }
+                Some("compaction") => {
+                    for (index, chunk) in items("summary") {
+                        if is_text_block(chunk.get("content")) {
+                            found.push(format!("/summary/{index}/content/text"));
+                        }
+                    }
+                }
+                Some("tool") => {
+                    let content = value.get("call").and_then(|call| call.get("content")).and_then(Value::as_array);
+                    for (index, item) in content.into_iter().flatten().enumerate() {
+                        if item["type"] == "content" && is_text_block(item.get("content")) {
+                            found.push(format!("/call/content/{index}/content/text"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     found
 }
@@ -152,8 +150,10 @@ fn texts<'a>(rule: TextRule, value: &'a mut Value) -> Vec<&'a mut Value> {
 /// `h = H("v" ‖ canon(value'))`: `value'` is the value with each text position replaced by
 /// `"#"` and the unpadded base64url of that text's hash.
 pub(crate) fn value_hash(rule: TextRule, value: &Value) -> Hash {
+    let pointers = text_pointers(rule, value);
     let mut replaced = value.clone();
-    for text in texts(rule, &mut replaced) {
+    for pointer in pointers {
+        let text = replaced.pointer_mut(&pointer).expect("a text position exists");
         let hash = text_hash(text.as_str().expect("a text position is a string"));
         *text = Value::String(format!("#{}", URL_SAFE_NO_PAD.encode(hash)));
     }
