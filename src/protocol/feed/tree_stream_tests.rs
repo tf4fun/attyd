@@ -196,3 +196,77 @@ async fn a_changed_path_is_checked_after_the_pause_by_a_waiting_stream() {
     handle.close();
     assert!(subscription.next_json().await.is_none());
 }
+
+// --- /global/loadFailures (design §6.2) -----------------------------------------------
+
+fn failure(message: &str) -> End {
+    End {
+        reason: EndReason::LoadFailed,
+        error: Some(ProtocolError::agent(&json!({ "code": -32000, "message": message, "data": { "big": "x".repeat(10_000) } }))),
+    }
+}
+
+#[test]
+fn a_failed_load_leaves_its_whole_error_in_global_and_a_stream_of_global_sees_it() {
+    let mut feed = Feed::new("process");
+    feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
+    let id = feed.subscribe_tree(&query("follow=/global/loadFailures"));
+    let mut client = Client::following(&["/global/loadFailures"]);
+    pump(&mut feed, id, &mut client);
+    assert_eq!(client.value("/global/loadFailures"), Some(&json!({})));
+
+    feed.end_waiting("s", &failure("login required"));
+    assert_eq!(pump(&mut feed, id, &mut client), 1);
+    let kept = &client.value("/global/loadFailures").unwrap()["s"];
+    assert_eq!(kept["code"], "agent_error");
+    assert_eq!(kept["message"], "login required");
+    assert_eq!(kept["data"]["code"], -32000);
+    assert_eq!(kept["data"]["data"]["big"].as_str().unwrap().len(), 10_000);
+}
+
+#[test]
+fn a_failure_is_forgotten_when_the_session_is_held_or_deleted() {
+    let mut feed = Feed::new("process");
+    feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
+    feed.end_waiting("s", &failure("a"));
+    feed.end_waiting("t", &failure("b"));
+    assert!(feed.tree().get("/global/loadFailures/s").is_some());
+    feed.commit(&registry(), &agent(), 1);
+    assert!(feed.tree().get("/global/loadFailures/s").is_none(), "s is held again");
+    assert!(feed.tree().get("/global/loadFailures/t").is_some());
+    feed.commit_ending(
+        &SessionRegistry::new("epoch"),
+        &agent(),
+        1,
+        Instant::now(),
+        &[("t".to_string(), End { reason: EndReason::Deleted, error: None })],
+    );
+    assert!(feed.tree().get("/global/loadFailures/t").is_none(), "t is deleted");
+}
+
+#[test]
+fn only_the_last_failures_are_kept() {
+    let mut feed = Feed::new("process");
+    feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
+    for n in 0..70 {
+        feed.end_waiting(&format!("s{n}"), &failure("x"));
+    }
+    let node = feed.tree().get("/global/loadFailures").unwrap().to_value();
+    let kept = node.as_object().unwrap();
+    assert_eq!(kept.len(), 64);
+    assert!(kept.contains_key("s69") && !kept.contains_key("s5") && kept.contains_key("s6"));
+}
+
+#[test]
+fn a_session_that_ends_with_a_failed_load_after_it_was_held_is_recorded_too() {
+    let mut feed = Feed::new("process");
+    feed.commit(&registry(), &agent(), 1);
+    feed.commit_ending(
+        &SessionRegistry::new("epoch"),
+        &agent(),
+        1,
+        Instant::now(),
+        &[("s".to_string(), failure("cannot reattach"))],
+    );
+    assert_eq!(feed.tree().get("/global/loadFailures/s").unwrap().to_value()["message"], "cannot reattach");
+}

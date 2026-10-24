@@ -21,7 +21,7 @@ use super::live_doc::engine_input;
 use super::pacing::Pacer;
 use super::project::held_sessions;
 use super::subscription::{Encoded, Subscribed, Subscriber};
-use super::tree::Tree;
+use super::tree::{Committed, Tree};
 use super::tree_doc::{ErrorSummary, Projector};
 use super::tree_stream::params::{StreamQuery, session_of};
 use super::tree_stream::subscriber::Subscriber as TreeSubscriber;
@@ -158,10 +158,33 @@ impl Feed {
         sessions
     }
 
+    /// Queues a tree commit for the revision 4 streams that follow what it changed.
+    fn publish_tree(&mut self, committed: &Committed, now: Instant, ends: &BTreeMap<String, TreeEnd>) {
+        for subscriber in self.tree_subscribers.values_mut() {
+            subscriber.publish_ended(&self.tree, committed, now, ends);
+            if subscriber.over_budget() {
+                subscriber.coalesce(&self.tree);
+            }
+        }
+    }
+
     /// Ends `session/<session_id>` for the subscriptions still waiting for it:
     /// a subscription that has the session published is not ended by this.
     pub(crate) fn end_waiting(&mut self, session_id: &str, end: &End) {
         let tree_end = tree_end(end);
+        let published = self
+            .tree
+            .get(&format!("/sessions/{}", super::tree::escape(session_id)))
+            .is_some();
+        if !published
+            && let (EndReason::LoadFailed, Some(error)) = (end.reason, &end.error)
+        {
+            self.projector.record_failure(session_id, error.clone());
+            let failures = self.projector.load_failures();
+            if let Some(committed) = self.tree.commit_at("/global/loadFailures", failures) {
+                self.publish_tree(&committed, Instant::now(), &BTreeMap::new());
+            }
+        }
         for subscriber in self.tree_subscribers.values_mut() {
             subscriber.end_session(&self.tree, session_id, &tree_end);
         }
@@ -313,6 +336,15 @@ impl Feed {
                 subscriber.coalesce(&self.engine);
             }
         }
+        for (session_id, end) in ended {
+            match (end.reason, &end.error) {
+                (EndReason::LoadFailed, Some(error)) => {
+                    self.projector.record_failure(session_id, error.clone());
+                }
+                (EndReason::Deleted, _) => self.projector.forget_failure(session_id),
+                _ => {}
+            }
+        }
         let next = self.tree.rev() + 1;
         let root = self.projector.project(registry, agent, catalog_revision, next);
         if let Some(committed) = self.tree.commit_with_ops(root) {
@@ -320,12 +352,7 @@ impl Feed {
                 .iter()
                 .map(|(session_id, end)| (session_id.clone(), tree_end(end)))
                 .collect();
-            for subscriber in self.tree_subscribers.values_mut() {
-                subscriber.publish_ended(&self.tree, &committed, now, &ends);
-                if subscriber.over_budget() {
-                    subscriber.coalesce(&self.tree);
-                }
-            }
+            self.publish_tree(&committed, now, &ends);
         }
         #[cfg(test)]
         self.tap_flush();
