@@ -15,7 +15,7 @@ use super::documents::{
     AgentInfo, ErrorCode, Operation, OperationKind, OperationStatus, ProtocolError,
 };
 use super::project;
-use super::timeline::Entry;
+use super::timeline::{Entry, Role, Timeline};
 use super::timeline_doc::{AttachmentIndex, publish_entry};
 use super::tree::Spec;
 use crate::session_registry::SessionRegistry;
@@ -151,6 +151,59 @@ pub(crate) fn session(registry: &SessionRegistry, session_id: &str) -> Option<Sp
     ))
 }
 
+/// A turn of the flat entries (§4.3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TurnHead {
+    /// The session's `historyRev`: which history `start` indexes.
+    pub history_rev: u64,
+    pub start: usize,
+    pub length: usize,
+    /// The opening user message's `messageId`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    pub state: TurnState,
+    /// Index of the turn's last agent message entry, `null` when it has none.
+    pub output: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TurnState {
+    Running,
+    Ended,
+}
+
+/// The turns of `timeline` (memory model §5) as the index publishes them. A turn is
+/// `running` exactly while the prompt that started it has no `end`; anything else is `ended`.
+pub(crate) fn turn_heads(timeline: &Timeline, history_rev: u64) -> Vec<TurnHead> {
+    let entries = timeline.entries();
+    timeline
+        .turns()
+        .into_iter()
+        .map(|turn| {
+            let message_id = match &*entries[turn.start] {
+                Entry::Message(message) if message.role == Role::User => message.message_id.clone(),
+                _ => None,
+            };
+            let running = turn
+                .prompt
+                .is_some_and(|prompt| timeline.prompts()[prompt].end.is_none());
+            let output = (turn.start..turn.end).rev().find(|&index| {
+                matches!(&*entries[index], Entry::Message(message) if message.role == Role::Agent)
+            });
+            TurnHead {
+                history_rev,
+                start: turn.start,
+                length: turn.end - turn.start,
+                message_id,
+                state: if running { TurnState::Running } else { TurnState::Ended },
+                output,
+            }
+        })
+        .collect()
+}
+
 /// What the projection remembers between commits: a session's published entries, so that an
 /// entry the memory did not touch keeps its value (and the tree compares it by pointer).
 #[derive(Default)]
@@ -244,6 +297,10 @@ impl Projector {
                 children.insert(
                     "entries".into(),
                     Spec::List(cache.iter().map(|(_, value)| Spec::Value(Arc::clone(value))).collect()),
+                );
+                children.insert(
+                    "turns".into(),
+                    Spec::List(turn_heads(timeline, memo.history_rev).iter().map(value).collect()),
                 );
                 children.insert(
                     "prompts".into(),

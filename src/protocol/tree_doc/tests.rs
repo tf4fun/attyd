@@ -357,3 +357,112 @@ fn a_session_released_and_held_again_is_held_since_the_later_revision() {
     assert!(again > first);
     assert_eq!(at(&tree, "/sessions/s")["heldSince"], again);
 }
+
+// --- the turn index (§4.3) ----------------------------------------------------------
+
+use crate::protocol::timeline::{PromptEnd, Timeline};
+
+fn text_block(text: &str) -> Value {
+    json!({ "type": "text", "text": text })
+}
+
+fn user(text: &str, id: Option<&str>) -> Value {
+    let mut update = json!({ "sessionUpdate": "user_message_chunk", "content": text_block(text) });
+    if let Some(id) = id {
+        update["messageId"] = json!(id);
+    }
+    update
+}
+
+fn agent_message(text: &str, id: &str) -> Value {
+    json!({ "sessionUpdate": "agent_message_chunk", "messageId": id, "content": text_block(text) })
+}
+
+fn head(start: usize, length: usize, id: Option<&str>, state: TurnState, output: Option<usize>) -> TurnHead {
+    TurnHead {
+        history_rev: 9,
+        start,
+        length,
+        message_id: id.map(String::from),
+        state,
+        output,
+    }
+}
+
+#[test]
+fn turns_are_the_partition_of_the_entries_with_their_output() {
+    let mut timeline = Timeline::default();
+    for update in [
+        agent_message("preface", "p"),
+        user("q1", Some("u1")),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "x" }),
+        agent_message("a1", "a1"),
+        agent_message("a1b", "a2"),
+        user("q2", Some("u2")),
+        json!({ "sessionUpdate": "tool_call", "toolCallId": "t2", "title": "y" }),
+    ] {
+        timeline.reduce(&update, None);
+    }
+    assert_eq!(
+        turn_heads(&timeline, 9),
+        vec![
+            head(0, 1, None, TurnState::Ended, Some(0)),
+            head(1, 4, Some("u1"), TurnState::Ended, Some(4)),
+            head(5, 2, Some("u2"), TurnState::Ended, None),
+        ]
+    );
+}
+
+#[test]
+fn a_turn_runs_exactly_while_its_prompt_has_no_end() {
+    let mut timeline = Timeline::default();
+    timeline.begin_prompt(&[text_block("a")]);
+    timeline.reduce(&agent_message("x", "m"), None);
+    assert_eq!(turn_heads(&timeline, 9)[0].state, TurnState::Running);
+    timeline.end_prompt(PromptEnd::Response(json!({ "stopReason": "end_turn" })));
+    assert_eq!(turn_heads(&timeline, 9)[0].state, TurnState::Ended);
+    timeline.begin_prompt(&[text_block("b")]);
+    let turns = turn_heads(&timeline, 9);
+    assert_eq!((turns[0].state, turns[1].state), (TurnState::Ended, TurnState::Running));
+    assert_eq!(turns[1].output, None);
+}
+
+#[test]
+fn a_new_turn_adds_to_the_index_and_leaves_the_turns_before_it_unchanged() {
+    let mut registry = registry();
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    for update in [user("q", None), agent_message("a", "a")] {
+        registry.append_session_update("s", update).unwrap();
+    }
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert_eq!(at(&tree, "/sessions/s/turns").as_array().unwrap().len(), 2);
+    let entries_rev = tree.get("/sessions/s/entries/0").unwrap().rev();
+
+    registry.append_session_update("s", user("q more", None)).unwrap();
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    let turns = at(&tree, "/sessions/s/turns");
+    assert_eq!(turns.as_array().unwrap().len(), 3);
+    assert_eq!(tree.get("/sessions/s/entries/0").unwrap().rev(), entries_rev);
+    assert_eq!(tree.get("/sessions/s/turns/0").unwrap().rev(), entries_rev, "turn 0 is unchanged");
+    assert_eq!(tree.get("/sessions/s/turns/1").unwrap().rev(), tree.rev());
+}
+
+#[test]
+fn turns_are_published_with_the_session_and_say_which_history_they_index() {
+    let mut registry = registry();
+    chunk(&mut registry, "m", "hi");
+    let tree = tree_of(&registry);
+    let session = at(&tree, "/sessions/s");
+    assert_eq!(
+        session["turns"],
+        json!([{ "historyRev": session["historyRev"], "start": 0, "length": 1,
+                 "state": "ended", "output": 0 }])
+    );
+}
+
+#[test]
+fn an_unknown_history_has_no_turns() {
+    let mut registry = registry();
+    registry.register_cold("s");
+    assert!(at(&tree_of(&registry), "/sessions/s").get("turns").is_none());
+}
