@@ -22,7 +22,7 @@ use super::diff::{self, Text};
 use super::documents::End;
 use super::digest::{self, Hash};
 use super::timeline::{Entry, History, Timeline};
-use super::timeline_doc::{AttachmentIndex, publish_entry};
+use super::timeline_doc::{AttachmentIndex, publish_entry_referencing};
 use super::{AppendTail, Op};
 
 /// The version of a document a replica holds (`have`, protocol §5.1).
@@ -122,6 +122,8 @@ pub(crate) enum EntriesBase {
 struct PublishedEntry {
     source: Arc<Entry>,
     value: Value,
+    /// The attachments `value` references, once per reference.
+    attachments: Vec<String>,
     changed_rev: u64,
     hash: OnceLock<Hash>,
 }
@@ -213,10 +215,12 @@ impl ScopeDoc {
     }
 }
 
-fn publish(entry: &Arc<Entry>, rev: u64, attachments: &mut AttachmentIndex) -> PublishedEntry {
+fn publish(entry: &Arc<Entry>, rev: u64, index: &mut AttachmentIndex) -> PublishedEntry {
+    let (value, attachments) = publish_entry_referencing(entry, index);
     PublishedEntry {
         source: Arc::clone(entry),
-        value: publish_entry(entry, attachments),
+        value,
+        attachments,
         changed_rev: rev,
         hash: OnceLock::new(),
     }
@@ -309,7 +313,11 @@ impl Engine {
                             continue;
                         }
                         let before = ops.len();
-                        let value = publish_entry(entry, &mut doc.attachments);
+                        let (value, attachments) =
+                            publish_entry_referencing(entry, &mut doc.attachments);
+                        // Counted for the new content before the old is released, so a
+                        // block both reference stays.
+                        doc.attachments.release(&published.attachments);
                         diff::diff(
                             &diff::child("/entries", &index.to_string()),
                             &published.value,
@@ -325,6 +333,7 @@ impl Engine {
                         entries[index] = Arc::new(PublishedEntry {
                             source: Arc::clone(entry),
                             value,
+                            attachments,
                             changed_rev,
                             hash: OnceLock::new(),
                         });
