@@ -270,3 +270,80 @@ fn a_session_that_ends_with_a_failed_load_after_it_was_held_is_recorded_too() {
     );
     assert_eq!(feed.tree().get("/global/loadFailures/s").unwrap().to_value()["message"], "cannot reattach");
 }
+
+// --- views (design §4.5) ----------------------------------------------------------------
+
+fn conversation(registry: &mut SessionRegistry, user: &str, agent_text: &str) {
+    for (kind, id, text) in [("user_message_chunk", "u", user), ("agent_message_chunk", "a", agent_text)] {
+        registry
+            .append_session_update(
+                "s",
+                json!({ "sessionUpdate": kind, "messageId": format!("{id}{user}"),
+                        "content": { "type": "text", "text": text } }),
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_followed_view_is_materialized_at_once_and_follows_the_session_in_the_same_revision() {
+    let mut feed = Feed::new("process");
+    let mut registry = registry();
+    conversation(&mut registry, "q", "one");
+    feed.commit(&registry, &agent(), 1);
+    assert!(feed.tree().get("/views").map(|views| views.to_value()) == Some(json!({})), "no one follows a view yet");
+
+    let path = "/views/s/output/latest";
+    let id = feed.subscribe_tree(&query(&format!("follow={path}")));
+    let mut client = Client::following(&[path]);
+    pump(&mut feed, id, &mut client);
+    assert_eq!(client.value(path).unwrap()["text"], "one");
+
+    conversation(&mut registry, "r", "two");
+    feed.commit(&registry, &agent(), 1);
+    pump(&mut feed, id, &mut client);
+    assert_eq!(client.value(path).unwrap()["text"], "two");
+    // The view changed in the revision that changed the session's entries.
+    let rev = feed.tree().rev();
+    assert_eq!(feed.tree().get(path).unwrap().rev(), rev);
+    assert_eq!(feed.tree().get("/sessions/s/entries").unwrap().srev(), rev);
+}
+
+#[test]
+fn a_view_no_one_follows_is_removed_at_the_next_commit() {
+    let mut feed = Feed::new("process");
+    let mut registry = registry();
+    conversation(&mut registry, "q", "one");
+    feed.commit(&registry, &agent(), 1);
+    let path = "/views/s/output/latest";
+    let id = feed.subscribe_tree(&query(&format!("follow={path}")));
+    assert!(feed.tree().get(path).is_some());
+    feed.unsubscribe(id);
+    conversation(&mut registry, "r", "two");
+    feed.commit(&registry, &agent(), 1);
+    assert!(feed.tree().get(path).is_none());
+}
+
+#[test]
+fn a_read_keeps_its_view_for_a_while_so_a_poll_finds_the_same_version() {
+    let mut feed = Feed::new("process");
+    let mut registry = registry();
+    conversation(&mut registry, "q", "one");
+    feed.commit(&registry, &agent(), 1);
+    let path = "/views/s/output/latest";
+    let id = feed.subscribe_tree_at(&query(&format!("follow={path}")), true);
+    let held = feed.tree().get(path).unwrap().srev();
+    feed.unsubscribe(id);
+    // An unrelated commit: the pinned view stays, at the same path version.
+    registry.start_login_terminal("login", "m");
+    feed.commit(&registry, &agent(), 1);
+    assert_eq!(feed.tree().get(path).unwrap().srev(), held);
+}
+
+#[test]
+fn a_stream_of_a_view_holds_the_session_like_the_session_does() {
+    let mut feed = Feed::new("process");
+    feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
+    let id = feed.subscribe_tree(&query("follow=/views/s/output/latest&cwd=s:/work"));
+    assert_eq!(feed.followed_sessions()["s"], vec![Waiting { id, cwd: Some("/work".into()) }]);
+}

@@ -24,6 +24,7 @@ use super::subscription::{Encoded, Subscribed, Subscriber};
 use super::tree::{Committed, Tree};
 use super::tree_doc::{ErrorSummary, Projector};
 use super::tree_stream::params::{StreamQuery, session_of};
+use super::views::{self, View};
 use super::tree_stream::subscriber::Subscriber as TreeSubscriber;
 use super::tree_stream::wire::{End as TreeEnd, EndReason as TreeEndReason, Event as TreeEvent};
 use crate::session_registry::SessionRegistry;
@@ -51,9 +52,15 @@ pub(crate) struct Feed {
     projector: Projector,
     /// The streams of revision 4, which follow paths of the tree.
     tree_subscribers: BTreeMap<SubscriptionId, TreeSubscriber>,
+    /// Views a read keeps materialized for a while, so that a client that polls finds the same
+    /// path version and is told nothing changed.
+    view_pins: BTreeMap<View, Instant>,
     #[cfg(test)]
     tap: tap::Tap,
 }
+
+/// How long a read keeps a view materialized.
+pub(crate) const VIEW_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Feed {
     pub(crate) fn new(process_epoch: impl Into<String>) -> Self {
@@ -67,6 +74,7 @@ impl Feed {
             tree: Tree::new(super::op::operation_id()),
             projector: Projector::default(),
             tree_subscribers: BTreeMap::new(),
+            view_pins: BTreeMap::new(),
             #[cfg(test)]
             tap: tap::Tap::default(),
         }
@@ -88,8 +96,43 @@ impl Feed {
         id
     }
 
+    /// The views something follows or has read lately, and those `extra` follows.
+    fn wanted_views(&mut self, extra: Option<&StreamQuery>, now: Instant) -> std::collections::BTreeSet<View> {
+        self.view_pins.retain(|_, until| *until > now);
+        let followed = self
+            .tree_subscribers
+            .values()
+            .flat_map(|subscriber| subscriber.followed())
+            .chain(extra.into_iter().flat_map(|query| query.follow.iter().map(|follow| follow.path.as_str())));
+        let mut wanted: std::collections::BTreeSet<View> = followed.filter_map(View::of).collect();
+        wanted.extend(self.view_pins.keys().cloned());
+        wanted
+    }
+
+    /// Materializes the views `extra` follows, so that its first event carries them; they are
+    /// kept for `VIEW_LINGER` when `linger` (a read).
+    fn materialize_views(&mut self, extra: &StreamQuery, linger: bool, now: Instant) {
+        if linger {
+            for follow in &extra.follow {
+                if let Some(view) = View::of(&follow.path) {
+                    self.view_pins.insert(view, now + VIEW_LINGER);
+                }
+            }
+        }
+        let wanted = self.wanted_views(Some(extra), now);
+        if let Some(committed) = self.tree.commit_views(|tree| views::derive(tree, &wanted)) {
+            self.publish_tree(&committed, now, &BTreeMap::new());
+        }
+    }
+
     /// Registers a stream of revision 4 and queues its first event.
     pub(crate) fn subscribe_tree(&mut self, query: &StreamQuery) -> SubscriptionId {
+        self.subscribe_tree_at(query, false)
+    }
+
+    /// `subscribe_tree`; a read (`linger`) keeps the views it asks for.
+    pub(crate) fn subscribe_tree_at(&mut self, query: &StreamQuery, linger: bool) -> SubscriptionId {
+        self.materialize_views(query, linger, Instant::now());
         let id = self.next_id;
         self.next_id += 1;
         self.tree_subscribers.insert(id, TreeSubscriber::new(query, &self.tree));
@@ -347,7 +390,8 @@ impl Feed {
         }
         let next = self.tree.rev() + 1;
         let root = self.projector.project(registry, agent, catalog_revision, next);
-        if let Some(committed) = self.tree.commit_with_ops(root) {
+        let wanted = self.wanted_views(None, now);
+        if let Some(committed) = self.tree.commit_with_views(root, |tree| views::derive(tree, &wanted)) {
             let ends: BTreeMap<String, TreeEnd> = ended
                 .iter()
                 .map(|(session_id, end)| (session_id.clone(), tree_end(end)))
