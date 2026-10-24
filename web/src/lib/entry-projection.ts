@@ -1,8 +1,9 @@
 // The thread of a session projected from the entries of its document (docs/protocol.md
 // §3, bridge memory model §3–§5). The entries are in the order they were received:
 // messages, tool calls, plans and compactions. Turns are derived from them, and each
-// prompt's end closes its turn. Every value is computed afresh; nothing is carried over
-// from an earlier projection (C1).
+// prompt's end closes its turn. The projection is a pure function of the entries (C1):
+// an item is reused only for the very entry objects it was computed from, which a
+// replica freezes, so a view can skip the items an update left unchanged.
 
 import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { PromptBlock } from "../../../shared/protocol";
@@ -21,6 +22,33 @@ interface Turn {
   start: number;
   end: number;
   prompt: PromptState | undefined;
+}
+
+/** Values derived from one entry object, with the key (id and turn) they were made for. */
+const derived = new WeakMap<object, { key: string; value: unknown }>();
+/** The assistant item a run of messages formed, by its first entry. */
+const runs = new WeakMap<object, Extract<TimelineItem, { type: "assistant" }>>();
+
+/** What `make` derives from `entry` for `key`, reused while both are the same. */
+function derive<T>(entry: Entry, key: string, make: () => T): T {
+  const held = derived.get(entry);
+  if (held?.key === key) return held.value as T;
+  const value = make();
+  derived.set(entry, { key, value });
+  return value;
+}
+
+/** `item`, or the identical one made earlier from the same chunks. */
+function reuseRun(item: TimelineItem): TimelineItem {
+  if (item.type !== "assistant") return item;
+  const first = item.chunks[0].raw[0] as object;
+  const held = runs.get(first);
+  if (held?.id === item.id && held.historyTurnId === item.historyTurnId &&
+    held.chunks.length === item.chunks.length && held.chunks.every((chunk, n) => chunk === item.chunks[n])) {
+    return held;
+  }
+  runs.set(first, item);
+  return item;
 }
 
 function isUser(entry: Entry): entry is MessageEntry {
@@ -160,15 +188,16 @@ export function projectEntries(
       switch (entry.kind) {
         case "message": {
           if (entry.role === "user") {
-            timeline.push({
+            timeline.push(derive(entry, `${id} ${historyTurnId}`, (): TimelineItem => ({
               id, type: "message", role: "user", blocks: blocksOf(entry.chunks),
               messageId: entry.messageId, raw: [entry], historyTurnId,
-            });
+            })));
             break;
           }
-          const chunk: AssistantMessageChunk = {
-            id, role: entry.role, blocks: blocksOf(entry.chunks), messageId: entry.messageId, raw: [entry],
-          };
+          const { role } = entry;
+          const chunk = derive(entry, id, (): AssistantMessageChunk => ({
+            id, role, blocks: blocksOf(entry.chunks), messageId: entry.messageId, raw: [entry],
+          }));
           // Consecutive assistant messages are one item, a chunk each.
           const previous = timeline.at(-1);
           if (previous?.type === "assistant" && previous.historyTurnId === historyTurnId && index > turn.start &&
@@ -180,25 +209,29 @@ export function projectEntries(
           break;
         }
         case "tool":
-          timeline.push({ id, type: "tool", call: toolCall(entry), raw: [entry], historyTurnId });
+          timeline.push(derive(entry, `${id} ${historyTurnId}`, (): TimelineItem => ({
+            id, type: "tool", call: toolCall(entry), raw: [entry], historyTurnId,
+          })));
           break;
         case "plan": {
-          const item = { id, type: "plan" as const, update: planUpdate(entry), raw: [entry], historyTurnId };
+          const item = derive(entry, `${id} ${historyTurnId}`, () => ({
+            id, type: "plan" as const, update: planUpdate(entry), raw: [entry], historyTurnId,
+          }));
           if (index === activeIndex) activePlan = item;
           else timeline.push(item);
           break;
         }
         case "compaction":
-          timeline.push({
+          timeline.push(derive(entry, `${id} ${historyTurnId}`, (): TimelineItem => ({
             id, type: "compaction", compactionId: entry.compactionId, status: entry.status as never,
             blocks: blocksOf(entry.summary), ...(entry.error !== undefined ? { error: entry.error } : {}),
             raw: [entry], historyTurnId,
-          });
+          })));
           break;
       }
     }
     const closing = outcome(turn, entries);
     if (closing !== undefined) timeline.push(closing);
   }
-  return { timeline, activePlan, activity: running ? activityOf(entries) : undefined };
+  return { timeline: timeline.map(reuseRun), activePlan, activity: running ? activityOf(entries) : undefined };
 }

@@ -1,7 +1,7 @@
 // The thread of a session projected from the entries of its document
 // (docs/protocol.md §3, bridge memory model §3–§5): messages, tool calls, plans and
 // compactions in the order they were received, the turns they form, and how each prompt
-// ended. Every value is computed afresh from the document.
+// ended. Every value follows from the document; an item is reused only for the entries it came from.
 import { describe, expect, it } from "vitest";
 import { projectEntries } from "../web/src/lib/entry-projection";
 import type { Entry, PromptState } from "../shared/entries";
@@ -165,5 +165,37 @@ describe("the plan above the composer", () => {
     expect(project(entries, [ended(0, { response: { stopReason: "end_turn" } })]).activePlan).toBeUndefined();
     expect(project(entries, [ended(0, { response: { stopReason: "end_turn" } })]).timeline.some((item) => item.type === "plan")).toBe(true);
     expect(project([user("hi"), legacyPlan("completed")], [ended(0)]).activePlan).toBeUndefined();
+  });
+});
+
+describe("items an update leaves unchanged", () => {
+  it("are the same objects while their entries are", () => {
+    const entries = [user("hi"), agent("one"), thought("hmm"), tool("t1", { status: "in_progress" })];
+    const before = project(entries).timeline;
+    // A stream event replaces the entries it changes and appends new ones (§5.3).
+    const after = project([...entries.slice(0, 3), tool("t1", { status: "completed" }), agent("two")]).timeline;
+    expect(after[0]).toBe(before[0]);
+    expect(after[1]).toBe(before[1]);
+    expect(after[2]).not.toBe(before[2]);
+    expect(after[2]).toMatchObject({ type: "tool", call: { status: "completed" } });
+    expect(after[3]).toMatchObject({ type: "assistant", chunks: [{ blocks: [text("two")] }] });
+  });
+
+  it("renews an assistant run when it gains a message, keeping its earlier chunks", () => {
+    const entries = [user("hi"), agent("one")];
+    const [, before] = project(entries).timeline;
+    const [, after] = project([...entries, thought("hmm")]).timeline;
+    expect(after).not.toBe(before);
+    if (before.type !== "assistant" || after.type !== "assistant") throw new Error("expected assistant runs");
+    expect(after.chunks[0]).toBe(before.chunks[0]);
+    expect(after.chunks).toHaveLength(2);
+  });
+
+  it("are made again when the same entry starts another turn", () => {
+    const reply = agent("one");
+    const [first] = project([reply]).timeline;
+    const [, second] = project([user("hi"), reply]).timeline;
+    expect(second).not.toBe(first);
+    expect(second).toMatchObject({ id: "entry:1", historyTurnId: "turn:0" });
   });
 });
