@@ -343,13 +343,6 @@ def with_digests(steps, digest_of):
 
 if __name__ == "__main__":
     write("protocol-digest-vectors.json", digest_vectors())
-    write("protocol-replica-scenario.json", {
-        "comment": "Events, the document after each and its digest, computed independently (docs/protocol.md §5.2–§5.5). Replayed by the TypeScript replica.",
-        "scenarios": {
-            "session": with_digests(session_scenario(), lambda doc: session_digest(doc)[0]),
-            "global": with_digests(global_scenario(), scope_digest),
-        },
-    })
     write("protocol-engine-scenario.json", {
         "comment": "What the bridge's publisher emits for a session and for global, step by step, computed independently (docs/protocol.md §5.2–§5.5). Replayed by the Rust engine.",
         "session": engine_scenario(),
