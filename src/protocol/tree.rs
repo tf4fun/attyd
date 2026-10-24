@@ -111,6 +111,26 @@ impl Node {
         }
     }
 
+    /// The node's own level and its children, for the snapshot of a stream.
+    pub(crate) fn shape(&self) -> super::tree_stream::snapshot::Shape<'_> {
+        use super::tree_stream::snapshot::Shape;
+        match &self.body {
+            Body::Value(value, _) => Shape::Value((**value).clone()),
+            Body::Object { fields, children } => Shape::Object(
+                Value::Object(fields.clone()),
+                children.iter().map(|(key, node)| (key.clone(), node)).collect(),
+            ),
+            Body::Map(children) => Shape::Map(
+                children.keys().cloned().collect(),
+                children.iter().map(|(key, node)| (key.clone(), node)).collect(),
+            ),
+            Body::List(items) => Shape::List(
+                items.len(),
+                items.iter().enumerate().map(|(index, node)| (index.to_string(), node)).collect(),
+            ),
+        }
+    }
+
     /// The node's subtree as one JSON value: an object is its fields and children, a map its
     /// keys, a list its items.
     pub(crate) fn to_value(&self) -> Value {

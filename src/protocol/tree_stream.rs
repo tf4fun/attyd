@@ -3,3 +3,5 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod params;
+pub(crate) mod snapshot;
+pub(crate) mod wire;
