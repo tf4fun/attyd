@@ -111,11 +111,15 @@ impl Node {
         }
     }
 
-    /// The node's own level and its children, for the snapshot of a stream.
-    pub(crate) fn shape(&self) -> super::tree_stream::snapshot::Shape<'_> {
+    /// The node's own level and its children, for the snapshot of a stream; with `window`, the
+    /// text positions of a value are held as windows of that many bytes.
+    pub(crate) fn shape(&self, window: Option<usize>) -> super::tree_stream::snapshot::Shape<'_> {
         use super::tree_stream::snapshot::Shape;
         match &self.body {
-            Body::Value(value, _) => Shape::Value((**value).clone()),
+            Body::Value(value, rule) => Shape::Value(match window {
+                Some(bytes) => super::window::window_value(*rule, value, bytes),
+                None => (**value).clone(),
+            }),
             Body::Object { fields, children } => Shape::Object(
                 Value::Object(fields.clone()),
                 children.iter().map(|(key, node)| (key.clone(), node)).collect(),
@@ -128,6 +132,27 @@ impl Node {
                 items.len(),
                 items.iter().enumerate().map(|(index, node)| (index.to_string(), node)).collect(),
             ),
+        }
+    }
+
+    /// `to_value`, with the text positions held as windows of `window` bytes.
+    pub(crate) fn to_value_windowed(&self, window: usize) -> Value {
+        match &self.body {
+            Body::Value(value, rule) => super::window::window_value(*rule, value, window),
+            Body::Object { fields, children } => {
+                let mut object = fields.clone();
+                for (key, child) in children {
+                    object.insert(key.clone(), child.to_value_windowed(window));
+                }
+                Value::Object(object)
+            }
+            Body::Map(children) => Value::Object(
+                children
+                    .iter()
+                    .map(|(key, child)| (key.clone(), child.to_value_windowed(window)))
+                    .collect(),
+            ),
+            Body::List(items) => Value::Array(items.iter().map(|item| item.to_value_windowed(window)).collect()),
         }
     }
 

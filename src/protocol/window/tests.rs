@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::Value;
 
 fn texts() -> Vec<String> {
     vec![
@@ -83,4 +84,51 @@ fn the_window_moves_forward_only_by_whole_segments_as_text_grows() {
         last = offset;
     }
     assert!(last > 0);
+}
+
+use serde_json::json;
+
+use crate::protocol::hash::TextRule;
+
+fn entry(text: &str) -> Value {
+    json!({ "kind": "message", "role": "agent", "messageId": "m", "chunks": [
+        { "content": { "type": "text", "text": text } },
+        { "content": { "type": "image", "data": "AAAA" } },
+        { "content": { "type": "text", "text": "short" } },
+    ]})
+}
+
+#[test]
+fn a_value_holds_its_text_positions_as_windows_and_nothing_else_changes() {
+    let long = "x".repeat(30_000);
+    let held = window_value(TextRule::Entry, &entry(&long), 8192);
+    assert_eq!(held["role"], "agent");
+    assert_eq!(held["chunks"][1], json!({ "content": { "type": "image", "data": "AAAA" } }));
+    let first = &held["chunks"][0]["content"]["text"];
+    assert_eq!(first["length"], 30_000);
+    assert_eq!(first["offset"], 20_480);
+    assert_eq!(first["text"].as_str().unwrap().len(), 30_000 - 20_480);
+    let second = &held["chunks"][2]["content"]["text"];
+    assert_eq!(second, &json!({ "length": 5, "offset": 0, "before": state_wire(&ZERO), "text": "short" }));
+}
+
+#[test]
+fn a_value_with_windows_hashes_like_the_whole_value() {
+    for long in ["".to_string(), "x".repeat(100), "日".repeat(9000), "y".repeat(100_000)] {
+        let whole = entry(&long);
+        for bytes in [4096, 8192] {
+            let held = window_value(TextRule::Entry, &whole, bytes);
+            assert_eq!(
+                windowed_value_hash(TextRule::Entry, &held),
+                Some(hash::value_hash(TextRule::Entry, &whole)),
+                "{} {bytes}",
+                long.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_text_position_that_is_not_a_window_does_not_verify() {
+    assert_eq!(windowed_value_hash(TextRule::Terminal, &json!({ "output": "plain" })), None);
 }

@@ -7,7 +7,9 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 
-use super::hash::{self, Hash, L, ZERO};
+use serde_json::Value;
+
+use super::hash::{self, Hash, L, TextRule, ZERO};
 
 /// A text position held as a window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,6 +58,36 @@ pub(crate) fn window(text: &str, bytes: usize) -> TextWindow {
         before: state_wire(&state_before(text, offset)),
         text: text[offset..].to_string(),
     }
+}
+
+/// `value` with each text position of `rule` replaced by its window.
+pub(crate) fn window_value(rule: TextRule, value: &Value, bytes: usize) -> Value {
+    let mut out = value.clone();
+    for pointer in hash::text_pointers(rule, value) {
+        let text = out.pointer_mut(&pointer).expect("a text position exists");
+        let held = window(text.as_str().expect("a text position is a string"), bytes);
+        *text = serde_json::to_value(held).expect("a window serializes");
+    }
+    out
+}
+
+/// The hash of a value that holds its text positions as windows, as a client computes it
+/// (design §5, §6.4): each window hashes as the whole text it stands for. `None` when a text
+/// position is not a window.
+pub(crate) fn windowed_value_hash(rule: TextRule, windowed: &Value) -> Option<Hash> {
+    use sha2::{Digest, Sha256};
+    let mut replaced = windowed.clone();
+    for pointer in hash::text_pointers(rule, windowed) {
+        let held = replaced.pointer_mut(&pointer)?;
+        let before = URL_SAFE_NO_PAD.decode(held["before"].as_str()?).ok()?;
+        let before: Hash = before.try_into().ok()?;
+        let hash = hash::window_hash(&before, held["length"].as_u64()?, held["text"].as_str()?);
+        *held = Value::String(format!("#{}", URL_SAFE_NO_PAD.encode(hash)));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"v");
+    hasher.update(super::canon::canonical_json(&replaced));
+    Some(hasher.finalize().into())
 }
 
 /// Whether appending `appended` bytes to a window is sent as an `append` (design §6.4): the

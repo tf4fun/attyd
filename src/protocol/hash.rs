@@ -94,9 +94,14 @@ pub(crate) enum TextRule {
     OutputView,
 }
 
-/// Whether `block` is a text block: `{ "type": "text", "text": <string> }`.
+/// Whether `value` is a text position's content: a string, or its window (design §6.4).
+fn is_text(value: &Value) -> bool {
+    value.is_string() || value.as_object().is_some_and(|window| window.get("length").is_some_and(Value::is_u64))
+}
+
+/// Whether `block` is a text block: `{ "type": "text", "text": <text> }`.
 fn is_text_block(block: Option<&Value>) -> bool {
-    block.is_some_and(|block| block["type"] == "text" && block["text"].is_string())
+    block.is_some_and(|block| block["type"] == "text" && is_text(&block["text"]))
 }
 
 /// The JSON Pointers, relative to `value`, of its text positions under `rule` (§4.6), in
@@ -106,12 +111,12 @@ pub(crate) fn text_pointers(rule: TextRule, value: &Value) -> Vec<String> {
     match rule {
         TextRule::None => {}
         TextRule::Terminal => {
-            if value["output"].is_string() {
+            if is_text(&value["output"]) {
                 found.push("/output".to_string());
             }
         }
         TextRule::OutputView => {
-            if value["text"].is_string() {
+            if is_text(&value["text"]) {
                 found.push("/text".to_string());
             }
         }

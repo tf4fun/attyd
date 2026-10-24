@@ -10,12 +10,27 @@ use super::wire::{SNode, Snapshot};
 /// is sent whole; a container that changed is sent as its structure and the children that
 /// changed. `None` when `path` is not in the tree.
 pub(crate) fn snapshot(tree: &Tree, path: &str, have: Option<u64>) -> Option<Snapshot> {
+    snapshot_windowed(tree, path, have, None)
+}
+
+/// `snapshot`, with the text positions held as windows of `window` bytes (design §6.4).
+pub(crate) fn snapshot_windowed(
+    tree: &Tree,
+    path: &str,
+    have: Option<u64>,
+    window: Option<usize>,
+) -> Option<Snapshot> {
     let node = tree.get(path)?;
     let at = node.srev();
     let node_of = match have {
         Some(have) if at <= have => SNode::Same { same: true },
-        Some(have) => changed(node, have),
-        None => SNode::Value { v: node.to_value() },
+        Some(have) => changed(node, have, window),
+        None => SNode::Value {
+            v: match window {
+                Some(bytes) => node.to_value_windowed(bytes),
+                None => node.to_value(),
+            },
+        },
     };
     Some(Snapshot {
         base: have,
@@ -25,14 +40,14 @@ pub(crate) fn snapshot(tree: &Tree, path: &str, have: Option<u64>) -> Option<Sna
     })
 }
 
-fn changed(node: &Node, have: u64) -> SNode {
+fn changed(node: &Node, have: u64, window: Option<usize>) -> SNode {
     let children = |all: Vec<(String, &Node)>| -> BTreeMap<String, SNode> {
         all.into_iter()
             .filter(|(_, child)| child.srev() > have)
-            .map(|(key, child)| (key, changed(child, have)))
+            .map(|(key, child)| (key, changed(child, have, window)))
             .collect()
     };
-    match node.shape() {
+    match node.shape(window) {
         Shape::Value(value) => SNode::Value { v: value },
         Shape::Object(fields, all) => SNode::Object {
             o: fields,
