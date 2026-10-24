@@ -156,6 +156,22 @@ impl Stream {
 }
 
 impl Peer {
+    /// A read of `path` the way `GET /api/v2/nodes/{path}` serves it (protocol revision 4 §7.1): a
+    /// short subscription that asks the bridge to serve the streams, answers with its first event
+    /// and is dropped.
+    pub(super) async fn poll(&self, path: &str, cwd: Option<&str>) -> Value {
+        use crate::protocol::tree_stream::params::{Follow, StreamQuery, session_of};
+        let query = StreamQuery {
+            instance: None,
+            follow: vec![Follow { path: path.to_string(), have: None, window: None }],
+            cwd: session_of(path).zip(cwd.map(String::from)).into_iter().collect(),
+        };
+        let subscription = self.publication.lock().feed.subscribe_tree_reading(&query);
+        self.commands.send(BridgeInput::ServeStreams).unwrap();
+        let first = subscription.next_json().await.expect("the feed is open");
+        serde_json::from_str(&first).expect("an event is JSON")
+    }
+
     /// Nothing reaches the Agent for `period`.
     pub(super) async fn quiet(&mut self, period: Duration) {
         assert!(
