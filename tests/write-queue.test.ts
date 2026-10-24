@@ -325,7 +325,7 @@ describe("terminal input and resource actions (§7; acceptance 16)", () => {
     const net = http();
     const resources = new ResourceClient(net.fetch);
     const sent = resources.input("global", "T1", "ls\r");
-    expect(net.calls[0]).toMatchObject({ url: "/api/v2/scopes/global/resources/T1/input", method: "POST", body: { data: "ls\r" } });
+    expect(net.calls[0]).toMatchObject({ url: "/api/v2/targets/global/resources/T1/input", method: "POST", body: { data: "ls\r" } });
     net.calls[0].respond(204);
     expect(await sent).toEqual({ kind: "done" });
   });
@@ -352,8 +352,8 @@ describe("terminal input and resource actions (§7; acceptance 16)", () => {
     void resources.input("global", "T2", "b");
     await flush();
     expect(net.calls.map((call) => call.url)).toEqual([
-      "/api/v2/scopes/global/resources/T1/input",
-      "/api/v2/scopes/global/resources/T2/input",
+      "/api/v2/targets/global/resources/T1/input",
+      "/api/v2/targets/global/resources/T2/input",
     ]);
   });
 
@@ -384,13 +384,13 @@ describe("terminal input and resource actions (§7; acceptance 16)", () => {
     const resources = new ResourceClient(net.fetch);
     const resized = resources.resize("global", "T1", 120, 40);
     await flush();
-    expect(net.calls[0]).toMatchObject({ url: "/api/v2/scopes/global/resources/T1/resize", body: { cols: 120, rows: 40 } });
+    expect(net.calls[0]).toMatchObject({ url: "/api/v2/targets/global/resources/T1/resize", body: { cols: 120, rows: 40 } });
     net.calls[0].respond(204);
     expect(await resized).toEqual({ kind: "done" });
 
     const dismissed = resources.dismiss(S, "flow-1");
     await flush();
-    expect(net.calls[1]).toMatchObject({ url: "/api/v2/scopes/session%2FS/resources/flow-1/dismiss", body: {} });
+    expect(net.calls[1]).toMatchObject({ url: "/api/v2/targets/sessions/S/resources/flow-1/dismiss", body: {} });
     net.calls[1].respond(404, { error: { code: "not_found", message: "no resource flow-1" } });
     expect(await dismissed).toMatchObject({ kind: "refused", error: { code: "not_found" } });
   });

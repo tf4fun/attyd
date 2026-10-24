@@ -342,7 +342,7 @@ async fn control_acknowledgements_fold_into_one_event_and_failures_change_nothin
         .await;
     let event = watch.events.last().unwrap().clone();
     assert!(
-        patch_paths(&event).iter().all(|path| path.starts_with("/live/controls")),
+        patch_paths(&event).iter().all(|path| path.starts_with("/controls")),
         "the acknowledgement is one change of controls and of nothing else: {event}"
     );
 

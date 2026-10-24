@@ -56,3 +56,18 @@ export interface PromptState {
     | { readonly error: { readonly code?: number; readonly message?: string; readonly data?: unknown } }
     | { readonly interrupted: true };
 }
+
+/**
+ * A turn of the session's flat entries, as the bridge publishes the partition (docs/protocol-r4-design.md
+ * §4.3): `start..start + length` are its entries, `output` the index of its last agent message.
+ */
+export interface TurnHead {
+  /** The session's `historyRev`: which history `start` indexes. */
+  readonly historyRev: number;
+  readonly start: number;
+  readonly length: number;
+  /** The opening user message's `messageId`, if any. */
+  readonly messageId?: string;
+  readonly state: "running" | "ended";
+  readonly output: number | null;
+}

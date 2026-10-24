@@ -1,26 +1,27 @@
-// The revision 3 client the smokes drive a real server with: the shared `FeedClient` and
-// `OpsClient`, fed by a fetch-based SSE reader, since Node has no `EventSource`. It adds
-// a wait on a replica, and a write that is read to its end, and nothing else.
+// The revision 4 client the smokes drive a real server with: the shared `TreeFeedClient` (read as the
+// documents of the scopes by `ScopeFeed`) and `OpsClient`, fed by a fetch-based SSE reader, since
+// Node has no `EventSource`. It adds a wait on a replica, and a write that is read to its end, and
+// nothing else.
 
-import type { DocumentReplica, Follow } from "../shared/document-replica.js";
 import type { CatalogLive3, GlobalLive3, SessionLive3, ShownOp } from "../shared/documents.js";
 import type { Entry, PromptState } from "../shared/entries.js";
-import { FeedClient, type StreamSource } from "../shared/feed-client.js";
+import { ScopeFeed, type Follow, type ScopeReplica as DocumentReplica } from "../shared/scope-feed.js";
+import { TreeFeedClient, type StreamSource } from "../shared/tree-feed.js";
 import type { HttpFetch } from "../shared/protocol-client.js";
 import { ActionsClient, OpsClient, type StartingWrite } from "../shared/write-client.js";
 
 export class SmokeClient {
-  readonly replicas: FeedClient;
+  readonly replicas: ScopeFeed;
   readonly ops: OpsClient;
   readonly actions: ActionsClient;
   /** Each stream that failed, with why; a smoke that keeps its stream expects none. */
   readonly streamErrors: string[] = [];
 
   constructor(readonly origin: string) {
-    this.replicas = new FeedClient(
+    this.replicas = new ScopeFeed(new TreeFeedClient(
       (url) => openStream(new URL(url, origin), (error) => this.streamErrors.push(error)),
       (reconnect) => void setTimeout(reconnect, 100),
-    );
+    ));
     const http: HttpFetch = (url, init) => fetch(new URL(url, origin), init);
     this.ops = new OpsClient(http, this.replicas);
     this.actions = new ActionsClient(http);

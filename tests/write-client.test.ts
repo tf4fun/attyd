@@ -1,5 +1,5 @@
-// The write side of the client of revision 3 (docs/protocol.md §6, §7): operations with
-// client-chosen ids, every one answered 202, and actions. The transport is faked so each
+// The write side of the client of revision 4 (docs/protocol-r4-design.md §8, §9): operations with
+// client-chosen ids written to targets, every one answered 202, and actions. The transport is faked so each
 // case fixes the order of HTTP answers itself.
 import { describe, expect, it } from "vitest";
 import {
@@ -12,7 +12,7 @@ import {
 import { WriteQueue, type HttpFetch } from "../shared/protocol-client";
 
 const S = "session/S";
-const OPS = "/api/v2/scopes/session%2FS/ops";
+const OPS = "/api/v2/targets/sessions/S/ops";
 const ID = "AAAAAAAAAAAAAAAAAAAAAA";
 
 interface Call {
@@ -46,12 +46,17 @@ function http() {
 
 /** The documents the writer reads `expect` from, set directly by each case. */
 function shown() {
-  const docs = new Map<string, { doc: { live: unknown } }>();
+  const docs = new Map<string, Parameters<ReplicaSource["get"]> extends never ? never : NonNullable<ReturnType<ReplicaSource["get"]>>>();
   const source: ReplicaSource = { get: (scope) => docs.get(scope) };
   return {
     source,
-    show(op: Record<string, unknown>, scope = S) {
+    show(op: Record<string, unknown>, scope = S, held: { rev?: number; heldSince?: number | null; ops?: { id: string; after: string | null }[] } = {}) {
       docs.set(scope, {
+        epoch: "I",
+        rev: 7,
+        heldSince: null,
+        ops: [],
+        ...held,
         doc: {
           live: {
             op: { id: "op-A", scope, after: null, kind: "none", status: "completed", input: null, cancelRequested: false, ...op },
@@ -138,7 +143,7 @@ describe("operation writes (§6)", () => {
     const first = ops.write(S, prompt);
     calls[0].lose();
     const lost = (await first) as Extract<WriteOutcome, { kind: "uncertain" }>;
-    expect(lost.write).toEqual({ id: ID, expect: "op-A", scope: S });
+    expect(lost.write).toEqual({ id: ID, expect: "op-A", scope: S, instance: "I", at: 7 });
 
     // The document moved on meanwhile; the repeat is still the same write.
     show({ id: "op-B" });
@@ -148,7 +153,7 @@ describe("operation writes (§6)", () => {
     expect(await repeat).toEqual({ kind: "accepted", op: ID });
   });
 
-  it("resolves a lost write from the document of the scope it was written to", async () => {
+  it("finds out what became of a lost write from the target's log as the client holds it", async () => {
     const { calls, fetch } = http();
     const { source, show } = shown();
     show({ id: "op-A" });
@@ -157,12 +162,34 @@ describe("operation writes (§6)", () => {
     calls[0].lose();
     const lost = (await first) as Extract<WriteOutcome, { kind: "uncertain" }>;
 
-    show({ id: ID, after: "op-A", scope: S });
+    // The write is in the log: it took effect.
+    show({ id: ID }, S, { ops: [{ id: ID, after: "op-A" }] });
     expect(ops.resolve(lost.write)).toBe("admitted");
-    show({ id: "op-A", status: "completed" });
+    // Another operation replaced `op-A`: this one can never be admitted.
+    show({ id: "op-X" }, S, { ops: [{ id: "op-X", after: "op-A" }] });
     expect(ops.resolve(lost.write)).toBe("not_admitted");
-    show({ id: "op-X", scope: "global", after: "op-A" });
+    // Not admitted yet: left to the user.
+    show({ id: "op-A" });
     expect(ops.resolve(lost.write)).toBe("unknown");
+    // The session was released and held again since.
+    show({ id: "op-A" }, S, { heldSince: 9 });
+    expect(ops.resolve(lost.write)).toBe("unknown");
+  });
+
+  it("asks the bridge where the log is out of reach, and reads its answer", async () => {
+    const { calls, fetch } = http();
+    const { source, show } = shown();
+    show({ id: "op-A" });
+    const ops = new OpsClient(fetch, source, () => ID);
+    const first = ops.write(S, prompt);
+    calls[0].lose();
+    const lost = (await first) as Extract<WriteOutcome, { kind: "uncertain" }>;
+    expect(ops.resolutionUrl(lost.write)).toBe(`/api/v2/targets/sessions/S/ops/${ID}?expect=op-A&instance=I&at=7`);
+    expect(ops.resolveFrom(lost.write, { outcome: "admitted", record: {} })).toBe("admitted");
+    expect(ops.resolveFrom(lost.write, { outcome: "superseded" })).toBe("not_admitted");
+    for (const answer of [{ outcome: "open" }, { outcome: "unknown", reason: "restarted" }, "nonsense", undefined]) {
+      expect(ops.resolveFrom(lost.write, answer)).toBe("unknown");
+    }
   });
 
   it("cancels the op the document shows, with no id of its own", async () => {
@@ -186,7 +213,7 @@ describe("actions (§7)", () => {
   it("restarts the Agent in global: an empty body, done on 204, refused when a connection runs", async () => {
     const { calls, client } = actions();
     const started = client.restart();
-    expect(calls[0]).toMatchObject({ url: "/api/v2/scopes/global/actions/restart", method: "POST", body: {} });
+    expect(calls[0]).toMatchObject({ url: "/api/v2/targets/global/actions/restart", method: "POST", body: {} });
     calls[0].respond(204);
     expect(await started).toEqual({ kind: "done" });
 
@@ -203,7 +230,7 @@ describe("actions (§7)", () => {
     const { calls, client } = actions();
     const outcome = client.answer(S, "int 1", { outcome: { outcome: "selected", optionId: "allow" } });
     expect(calls[0]).toMatchObject({
-      url: "/api/v2/scopes/session%2FS/resources/int%201/answer",
+      url: "/api/v2/targets/sessions/S/resources/int%201/answer",
       body: { outcome: { outcome: "selected", optionId: "allow" } },
     });
     calls[0].respond(204);
@@ -228,13 +255,13 @@ describe("actions (§7)", () => {
   it("sets a mode and an option, held until the Agent answers", async () => {
     const { calls, client } = actions();
     const mode = client.setMode(S, "plan");
-    expect(calls[0]).toMatchObject({ url: "/api/v2/scopes/session%2FS/actions/set_mode", body: { modeId: "plan" } });
+    expect(calls[0]).toMatchObject({ url: "/api/v2/targets/sessions/S/actions/set_mode", body: { modeId: "plan" } });
     calls[0].respond(200, {});
     expect(await mode).toEqual({ kind: "done" });
 
     const option = client.setConfig(S, "verbose", true);
     expect(calls[1]).toMatchObject({
-      url: "/api/v2/scopes/session%2FS/actions/set_config",
+      url: "/api/v2/targets/sessions/S/actions/set_config",
       body: { configId: "verbose", value: true },
     });
     calls[1].respond(200, {});
@@ -252,7 +279,7 @@ describe("actions (§7)", () => {
   it("closes a session, and a refusal before anything was sent is refused", async () => {
     const { calls, client } = actions();
     const closed = client.close(S);
-    expect(calls[0]).toMatchObject({ url: "/api/v2/scopes/session%2FS/actions/close", body: {} });
+    expect(calls[0]).toMatchObject({ url: "/api/v2/targets/sessions/S/actions/close", body: {} });
     calls[0].respond(409, { error: { code: "not_allowed", message: "closing" } });
     expect(await closed).toEqual({ kind: "refused", error: { code: "not_allowed", message: "closing" } });
   });
@@ -262,7 +289,7 @@ describe("actions (§7)", () => {
     const first = client.input("global", "t1", "a");
     const second = client.input("global", "t1", "b");
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe("/api/v2/scopes/global/resources/t1/input");
+    expect(calls[0].url).toBe("/api/v2/targets/global/resources/t1/input");
     calls[0].respond(204);
     await first;
     await Promise.resolve();
@@ -272,14 +299,14 @@ describe("actions (§7)", () => {
     expect(await second).toEqual({ kind: "done" });
 
     const dismissed = client.dismiss("global", "t1");
-    expect(calls[2].url).toBe("/api/v2/scopes/global/resources/t1/dismiss");
+    expect(calls[2].url).toBe("/api/v2/targets/global/resources/t1/dismiss");
     calls[2].respond(204);
     expect(await dismissed).toEqual({ kind: "done" });
   });
 });
 
-describe("queued writes on revision 3 (C2, C3)", () => {
-  // The queue sends through the revision 3 client and reads the `live` of the documents.
+describe("queued writes (C2, C3)", () => {
+  // The queue sends through the client and reads the `live` of the documents.
   function queued() {
     const { calls, fetch } = http();
     const { source, show } = shown();

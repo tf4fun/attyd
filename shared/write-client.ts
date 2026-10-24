@@ -1,9 +1,10 @@
-// The write side of the client of revision 3 (docs/protocol.md §6, §7). Operations
-// carry an id the client chose and the `op` its document shows as `expect`; every one
-// is answered `202` when admitted and its result arrives in the document. Actions take
-// no `expect`. Writes and actions never change a replica: the stream alone does (C1).
-// A write without a definite answer is never resent by itself (C3): the client returns
-// what it needs to repeat it or to resolve it from the document (§6.6).
+// The write side of the client of revision 4 (docs/protocol-r4-design.md §8, §9). Operations are
+// written to a target (`global`, `catalog`, `sessions/<id>`) and carry an id the client chose and
+// the `op` its document shows as `expect`; every one is answered `202` when admitted and its
+// result arrives in the document. Actions take no `expect`. Writes and actions never change a
+// replica: the stream alone does (C1). A write without a definite answer is never resent by
+// itself (C3): the client returns what it needs to repeat it or to find out what became of it
+// from the target's log (§9.3).
 
 import type { OpArgs, ProtocolError } from "./protocol";
 import {
@@ -11,17 +12,35 @@ import {
   isRecord,
   refusal,
   ResourceClient,
+  targetOf,
   type ActionOutcome,
   type HttpFetch,
 } from "./protocol-client";
-import { newOperationId, resolveWrite, type Resolution, type ShownOperation, type Write } from "./write-resolution";
+import type { Logged, TargetState } from "./outcome";
+import { newOperationId, resolveWrite, type Resolution, type Write } from "./write-resolution";
 
 export type { ActionOutcome } from "./protocol-client";
 export type { Write } from "./write-resolution";
 
-/** The documents a writer reads `expect` from. */
+/** The documents a writer reads `expect` from, and what it held when it wrote. */
 export interface ReplicaSource {
-  get(scope: string): { readonly doc: { readonly live?: unknown } } | undefined;
+  get(scope: string):
+    | {
+        /** The instance of the bridge. */
+        readonly epoch?: string;
+        /** The path version held. */
+        readonly rev?: number;
+        readonly heldSince?: number | null;
+        readonly ops?: readonly Logged[];
+        readonly doc: { readonly live?: unknown };
+      }
+    | undefined;
+}
+
+/** The `op` a target shows: only what a write reads. */
+interface ShownOperation {
+  readonly id: string;
+  readonly status: string;
 }
 
 export type WriteOutcome =
@@ -52,7 +71,14 @@ export class OpsClient {
   write(scope: string, args: StartingWrite): Promise<WriteOutcome> {
     const op = shownOperation(this.#replicas, scope);
     if (op === undefined) return Promise.resolve(blocked(`no aligned document of ${scope}`));
-    const write: Write = { id: this.#newId(), expect: op.id, scope };
+    const held = this.#replicas.get(scope);
+    const write: Write = {
+      id: this.#newId(),
+      expect: op.id,
+      scope,
+      ...(held?.epoch === undefined ? {} : { instance: held.epoch }),
+      ...(held?.rev === undefined ? {} : { at: held.rev }),
+    };
     return this.#send(write.scope, { id: write.id, expect: write.expect, kind: args.kind, args: args.args }, write);
   }
 
@@ -61,14 +87,33 @@ export class OpsClient {
     return this.#send(write.scope, { id: write.id, expect: write.expect, kind: args.kind, args: args.args }, write);
   }
 
-  /** Whether `write` was admitted, from the document of the scope it was written to (§6.6). */
+  /** What became of `write`, from the log of the target it was written to as the client holds it (§9.3). */
   resolve(write: Write): Resolution {
-    return resolveWrite(write, shownOperation(this.#replicas, write.scope));
+    const held = this.#replicas.get(write.scope);
+    const op = shownOperation(this.#replicas, write.scope);
+    if (held === undefined || op === undefined) return "unknown";
+    const target: TargetState = {
+      instance: held.epoch ?? write.instance ?? "",
+      op: op.id,
+      heldSince: held.heldSince ?? null,
+      ops: held.ops ?? [],
+    };
+    return resolveWrite(write, target);
   }
 
-  /** Whether `write` was admitted, from the `live` of its scope read some other way (§6.6). */
-  resolveFrom(write: Write, live: unknown): Resolution {
-    return resolveWrite(write, operationOf(live, write.scope));
+  /** Where the bridge says what became of `write` (§9.3): `GET` this and give the answer to `resolveFrom`. */
+  resolutionUrl(write: Write): string {
+    const query = new URLSearchParams({ expect: write.expect });
+    if (write.instance !== undefined) query.set("instance", write.instance);
+    if (write.at !== undefined) query.set("at", String(write.at));
+    return `/api/v2/targets/${targetOf(write.scope)}/ops/${encodeURIComponent(write.id)}?${query}`;
+  }
+
+  /** What became of `write`, from the bridge's answer to `resolutionUrl` (§9.3). */
+  resolveFrom(_write: Write, answer: unknown): Resolution {
+    if (!isRecord(answer)) return "unknown";
+    if (answer.outcome === "admitted") return "admitted";
+    return answer.outcome === "superseded" ? "not_admitted" : "unknown";
   }
 
   /** Asks the running operation to end; a cancel has no id of its own. */
@@ -81,7 +126,7 @@ export class OpsClient {
   async #send(scope: string, body: unknown, write: Write | undefined): Promise<WriteOutcome> {
     let response: Awaited<ReturnType<HttpFetch>>;
     try {
-      response = await this.#fetch(`/api/v2/scopes/${encodeURIComponent(scope)}/ops`, {
+      response = await this.#fetch(`/api/v2/targets/${targetOf(scope)}/ops`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
@@ -102,19 +147,9 @@ export class OpsClient {
 
 /** The `op` the aligned document of `scope` shows. */
 function shownOperation(replicas: ReplicaSource, scope: string): ShownOperation | undefined {
-  return operationOf(replicas.get(scope)?.doc.live, scope);
-}
-
-/** The `op` a scope's `live` shows. */
-function operationOf(live: unknown, scope: string): ShownOperation | undefined {
+  const live = replicas.get(scope)?.doc.live;
   if (!isRecord(live) || !isRecord(live.op) || typeof live.op.id !== "string") return undefined;
-  const { id, scope: written, after, status } = live.op;
-  return {
-    id,
-    scope: typeof written === "string" ? written : scope,
-    after: typeof after === "string" ? after : null,
-    status: typeof status === "string" ? status : "running",
-  };
+  return { id: live.op.id, status: typeof live.op.status === "string" ? live.op.status : "running" };
 }
 
 function blocked(reason: string): WriteOutcome {
@@ -126,7 +161,7 @@ export type InteractionAnswer =
   | { readonly response: unknown };
 
 /**
- * Sends actions (§7). Controls and close are held until the Agent answers: an error it
+ * Sends actions (§8). Controls and close are held until the Agent answers: an error it
  * answered with is a refusal here, and a lost answer is uncertain, never resent.
  */
 export class ActionsClient {
@@ -197,5 +232,5 @@ export class ActionsClient {
 }
 
 function base(scope: string): string {
-  return `/api/v2/scopes/${encodeURIComponent(scope)}`;
+  return `/api/v2/targets/${targetOf(scope)}`;
 }

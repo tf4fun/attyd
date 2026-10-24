@@ -1,23 +1,19 @@
-// Operation IDs and the resolution of a write whose answer was lost (docs/protocol.md
-// §6.5, §6.6). A client chooses the ID of each operation it starts; with the `id` and the
-// `after` the bridge records on the operation, it learns from its replica whether a write
-// was admitted, without keeping a table of past requests.
+// Operation IDs and the resolution of a write whose answer was lost (docs/protocol-r4-design.md
+// §9.2, §9.3). A client chooses the ID of each operation it starts; with the instance and the
+// path version of the target it held, the target's `op` and its log of operations (`outcome.ts`),
+// it learns whether a write was admitted without keeping a table of past requests.
 
-/** A write to the operations of `scope`: the ID it chose and the operation it expected. */
+import { outcome, type TargetState } from "./outcome";
+
+/** A write to the operations of `scope`: the ID it chose, the operation it expected and what the client held. */
 export interface Write {
   readonly id: string;
   readonly expect: string;
   readonly scope: string;
-}
-
-/** The `op` a scope shows: only what the resolution reads. */
-export interface ShownOperation {
-  readonly id: string;
-  /** The scope the operation was written to. */
-  readonly scope: string;
-  /** The operation it replaced in that scope. */
-  readonly after: string | null;
-  readonly status: string;
+  /** The instance of the bridge the client held when it wrote. */
+  readonly instance?: string;
+  /** The path version of the target the client held. */
+  readonly at?: number;
 }
 
 export type Resolution = "admitted" | "not_admitted" | "unknown";
@@ -41,19 +37,26 @@ export function newOperationId(random: (length: number) => Uint8Array = randomBy
 }
 
 /**
- * Whether `write` was admitted, from the `op` its scope shows now (§6.6). An operation
- * written to another scope says nothing about this one, whatever its `after`: that is
- * unknown, left to the user.
+ * What became of `write`, from the target's state (design §9.3). Only `admitted` is a definite yes;
+ * `superseded` is a definite no (it can never be admitted); `open` and `unknown` are left to the
+ * user, whom the page asks before repeating or resubmitting.
  */
-export function resolveWrite(write: Write, shown: ShownOperation | undefined): Resolution {
-  if (shown === undefined) return "unknown";
-  if (shown.id === write.id) return "admitted";
-  if (shown.scope === write.scope) {
-    if (shown.after === write.id) return "admitted";
-    if (shown.after === write.expect) return "not_admitted";
+export function resolveWrite(write: Write, target: TargetState | undefined): Resolution {
+  if (target === undefined) return "unknown";
+  const result = outcome(target, {
+    id: write.id,
+    expect: write.expect,
+    instance: write.instance ?? target.instance,
+    at: write.at ?? 0,
+  });
+  switch (result.outcome) {
+    case "admitted":
+      return "admitted";
+    case "superseded":
+      return "not_admitted";
+    default:
+      return "unknown";
   }
-  if (shown.id === write.expect && shown.status !== "running") return "not_admitted";
-  return "unknown";
 }
 
 /** The session a `create` or `fork` with ID `id` installed, while the bridge holds it (§6.6). */

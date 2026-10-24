@@ -124,7 +124,7 @@ async fn unread_input(bench: &Bench, terminal: &str, data: &str) -> TcpStream {
     let address = bench.address;
     let body = json!({"data": data}).to_string();
     let request = format!(
-        "POST /api/v2/scopes/global/resources/{}/input HTTP/1.1\r\n\
+        "POST /api/v2/targets/global/resources/{}/input HTTP/1.1\r\n\
          Host: {address}\r\nOrigin: http://{address}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         encoded(terminal),

@@ -1,13 +1,14 @@
-// The thread of a session projected from the entries of its document (docs/protocol.md
-// §3, bridge memory model §3–§5). The entries are in the order they were received:
-// messages, tool calls, plans and compactions. Turns are derived from them, and each
-// prompt's end closes its turn. The projection is a pure function of the entries (C1):
+// The thread of a session projected from the entries of its document (docs/protocol-r4-design.md
+// §4.3, bridge memory model §3–§5). The entries are in the order they were received:
+// messages, tool calls, plans and compactions. The turns are the partition the bridge publishes
+// (the client derives none), and each prompt's end closes its turn. The projection is a pure
+// function of the entries and the turns (C1):
 // an item is reused only for the very entry objects it was computed from, which a
 // replica freezes, so a view can skip the items an update left unchanged.
 
 import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { PromptBlock } from "../../../shared/protocol";
-import type { Chunk, Entry, MessageEntry, PlanEntry, PromptState } from "../../../shared/entries";
+import type { Chunk, Entry, MessageEntry, PlanEntry, PromptState, TurnHead } from "../../../shared/entries";
 import type { AgentActivity, AssistantMessageChunk, TimelineItem, ViewToolCall } from "./state";
 
 export interface ProjectedEntries {
@@ -56,23 +57,17 @@ function isUser(entry: Entry): entry is MessageEntry {
 }
 
 /**
- * The turns of `entries`: one starts at each user message, except one whose
- * `messageId` is that of the message that started the current turn; entries before
- * the first user message form a first turn.
+ * The turns the bridge published, each with the prompt its first entry sent. Entries the index
+ * does not cover (it is published with them, so none) would be left out of the thread; an index
+ * missing for entries that exist is one turn of all of them.
  */
-function turnsOf(entries: readonly Entry[], prompts: readonly PromptState[]): Turn[] {
-  const starts: number[] = [];
-  let opener: MessageEntry | undefined;
-  entries.forEach((entry, index) => {
-    if (!isUser(entry)) return;
-    if (opener?.messageId !== undefined && opener.messageId === entry.messageId) return;
-    opener = entry;
-    starts.push(index);
-  });
-  if (starts[0] !== 0 && entries.length > 0) starts.unshift(0);
-  return starts.map((start, n) => ({
+function turnsFrom(heads: readonly TurnHead[], entries: readonly Entry[], prompts: readonly PromptState[]): Turn[] {
+  if (heads.length === 0) {
+    return entries.length === 0 ? [] : [{ start: 0, end: entries.length, prompt: prompts.find((prompt) => prompt.entry === 0) }];
+  }
+  return heads.map(({ start, length }) => ({
     start,
-    end: starts[n + 1] ?? entries.length,
+    end: Math.min(start + length, entries.length),
     prompt: prompts.find((prompt) => prompt.entry === start),
   }));
 }
@@ -166,9 +161,10 @@ export function projectEntries(
   sessionId: string,
   entries: readonly Entry[],
   prompts: readonly PromptState[],
+  heads: readonly TurnHead[],
 ): ProjectedEntries {
   void sessionId;
-  const turns = turnsOf(entries, prompts);
+  const turns = turnsFrom(heads, entries, prompts);
   const running = prompts.some((prompt) => prompt.end === undefined);
   // The last plan of a running prompt, while it has unfinished steps, is shown above the composer.
   let activeIndex = -1;

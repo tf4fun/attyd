@@ -18,8 +18,8 @@ import type {
   PromptBlock,
 } from "../../../shared/protocol";
 import type { CatalogLive3, GlobalLive3, SessionBody, SessionLive3, ShownOp } from "../../../shared/documents";
-import type { Follow } from "../../../shared/document-replica";
-import { FeedClient, type StreamSource } from "../../../shared/feed-client";
+import { ScopeFeed, type Follow } from "../../../shared/scope-feed";
+import { TreeFeedClient, type StreamSource } from "../../../shared/tree-feed";
 import { WriteQueue, type HttpFetch } from "../../../shared/protocol-client";
 import {
   ActionsClient,
@@ -187,7 +187,7 @@ export class Workspace {
   readonly #listeners = new Set<() => void>();
   // The client of one connection: `start()` makes it, its cleanup closes it, so a
   // StrictMode remount gets a working stream again.
-  #feed!: FeedClient;
+  #feed!: ScopeFeed;
   #ops!: NotifyingOps;
   #actions!: ActionsClient;
   #queue!: WriteQueue;
@@ -230,7 +230,7 @@ export class Workspace {
 
   #connect(): void {
     const fetchJson: HttpFetch = (url, init) => fetch(url, init);
-    const feed = new FeedClient(openEventSource);
+    const feed = new ScopeFeed(new TreeFeedClient(openEventSource));
     this.#feed = feed;
     this.#ops = new NotifyingOps(fetchJson, feed, () => {
       if (this.#feed === feed) this.#changed();
@@ -736,15 +736,15 @@ export class Workspace {
   }
 
   /**
-   * Reads the document of the scope a lost write went to. The bridge commits an admission
-   * before it answers, so this read, made after the answer was lost, shows the write if it
-   * was admitted (§6.6); one that fails leaves it unknown.
+   * Asks the bridge what became of a lost write (design §9.3). The bridge commits an admission
+   * before it answers, so this read, made after the answer was lost, finds the write in the
+   * target's log if it was admitted; one that fails leaves it unknown.
    */
   #readLost(intent: Intent, write: Write): void {
     const ops = this.#ops;
-    void readJson(`/api/v2/scopes/${encodeURIComponent(write.scope)}`)
+    void readJson(ops.resolutionUrl(write))
       .then(
-        (body) => ops.resolveFrom(write, isRecord(body) && isRecord(body.snapshot) && isRecord(body.snapshot.doc) ? body.snapshot.doc.live : undefined),
+        (body) => ops.resolveFrom(write, body),
         (): Resolution => "unknown",
       )
       .then((resolution) => {
@@ -1122,7 +1122,7 @@ export class Workspace {
     let activePlan: AppState["activePlan"];
     let agentActivity: AppState["agentActivity"];
     if (visible && live != null && shown != null) {
-      const projected = projectEntries(live.sessionId, entries ?? [], shown.body.prompts);
+      const projected = projectEntries(live.sessionId, entries ?? [], shown.body.prompts, shown.body.turns ?? []);
       timeline = projected.timeline;
       activePlan = projected.activePlan;
       agentActivity = projected.activity;
