@@ -304,6 +304,11 @@ computation from them.
   `c_i` is the **chain state** after segment `i`.
 - **Value:** `h = H("v" ‖ canon(value'))`, where `value'` is the value with each text
   position replaced by the string `"#" + b64(h(text))` (32 bytes).
+  Here `b64` is the unpadded base64url of the 32 bytes. Which strings are text positions is
+  fixed by §4.6 and found by the node's kind, not by its content: for an entry, the `text` of
+  each text block in a message's `chunks[*].content`, a compaction's `summary[*].content` and
+  a tool call's `call.content[*].content` (items of type `content`); for a terminal, `output`;
+  for an output view, `text`. Any other string, `text` members included, is plain JSON.
 - **Object:** `h = H("o" ‖ canon(own') ‖ ∥_{name ascending} (canon(name) ‖ h(child)))`.
 - **Map:** `h = H("m" ‖ ∥_{key ascending} (canon(key) ‖ h(child)))`.
 - **List:** `h = H("l" ‖ u64be(n) ‖ h(child_0) ‖ … ‖ h(child_{n-1}))`.
