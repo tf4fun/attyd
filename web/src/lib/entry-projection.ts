@@ -194,8 +194,9 @@ export function projectEntries(
             })));
             break;
           }
+          const { role } = entry;
           const chunk = derive(entry, id, (): AssistantMessageChunk => ({
-            id, role: entry.role, blocks: blocksOf(entry.chunks), messageId: entry.messageId, raw: [entry],
+            id, role, blocks: blocksOf(entry.chunks), messageId: entry.messageId, raw: [entry],
           }));
           // Consecutive assistant messages are one item, a chunk each.
           const previous = timeline.at(-1);
