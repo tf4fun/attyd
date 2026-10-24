@@ -1,6 +1,6 @@
 # Protocol revision 4: partial synchronization and serialized writes
 
-Status: **proposed design, third draft 2026-10-24, for review** (issue #201; reviews are
+Status: **proposed design, fourth draft 2026-10-24, for review** (issue #201; reviews are
 tracked on PR #202, §15 lists what each review changed). Nothing here is implemented. Revision 3 ([protocol.md](protocol.md))
 stays the served protocol until this design is accepted and its plan (§14) lands.
 Layer 1, the [bridge memory model](bridge-memory-model.md), is unchanged: this revision
@@ -86,7 +86,7 @@ client-computed verification, coalescing a slow subscriber into a snapshot.
 | `have=<scope>:<epoch>:<rev>` | `have=<path>:<path version>` with one `instance` per stream |
 | document digest at snapshots and checkpoints | node hash of each followed path, at a stated path version |
 | client-derived turns | `/sessions/<id>/turns`, an index derived by the bridge |
-| — | `/views/<id>/output/latest`; fixed `/views/<id>/history/<historyRev>/output/<start>` and `…/turn/<start>` |
+| — | `/views/<id>/output/latest`; fixed `/views/<id>/history/<instance>/<historyRev>/output/<start>` and `…/turn/<start>` |
 | `op` with input and result | `op` head, `opDetail` with input and result |
 | — | text windows with bounded events, segment reads |
 | `after` on the operation | per-target operation log (last `K`), resolution read |
@@ -125,7 +125,7 @@ Shape (`·` marks a node, indentation children):
 ```text
 · /global                       object: { agent }                   (revision 3 §4.3)
     · op                        value: OpHead (§4.4)
-    · opDetail                  value: { input, result? }
+    · opDetail                  value: { input, result?, error? }
     · ops                       list of value OpRecord (§9.3)
     · sessions                  map sessionId → value SessionSummary
     · loadFailures              map sessionId → value ProtocolError (§6.2)
@@ -143,8 +143,8 @@ Shape (`·` marks a node, indentation children):
     · prompts                   list of value Prompt
     · turns                     list of value TurnHead (absent while history is unknown, §4.3)
 · /views/<id>/output/latest     value: OutputView (§4.5)
-· /views/<id>/history/<h>/output/<start>   value: OutputView
-· /views/<id>/history/<h>/turn/<start>     object: TurnHead fields; child · entries (list of value Entry)
+· /views/<id>/history/<i>/<h>/output/<start>   value: OutputView
+· /views/<id>/history/<i>/<h>/turn/<start>     object: TurnHead fields; child · entries (list of value Entry)
 ```
 
 `historyRev` is the revision at which the session's history was last installed or
@@ -227,23 +227,27 @@ interface OutputView {
 - `/views/<id>/output/latest` **moves**: to the next turn when one starts, and to the next
   agent message when the Agent writes one after a tool call. It means "the output of the
   current turn".
-- `/views/<id>/history/<h>/output/<start>` and `/views/<id>/history/<h>/turn/<start>` are
-  **fixed** to the turn starting at entry `<start>` of the history installed at
-  `historyRev = h`. The selection is the path itself, separate from any cached baseline:
+- `/views/<id>/history/<i>/<h>/output/<start>` and `/views/<id>/history/<i>/<h>/turn/<start>`
+  are **fixed** to the turn starting at entry `<start>` of the history installed at
+  `historyRev = h` **in instance `i`**. A revision alone does not name a history: a new
+  instance counts revisions from 1 again and can install a different history at the same
+  `h`. The selection `(i, h, start)` is the path itself, separate from any cached baseline:
   - when no turn starts at `<start>` in that history (it was merged into another, or never
     existed), the path ends with `absent`;
-  - when the session's `historyRev` is not `h` (the history was replaced), the path ends
-    with `replaced`, whenever it is followed or read, with or without `have`.
+  - when `i` is not the bridge's instance, or the session's `historyRev` is not `h` (the
+    history was replaced), the path ends with `replaced`. This holds on a stream and for a
+    `GET`, whenever it is followed or read, with or without `have` or `instance`.
 
   So recovering a broken replica (resubscribing without `have`, §6.5) re-reads the same
-  selection and can never turn into another one. A client that wants the turn of the new
-  history chooses it explicitly: it reads the new `historyRev` (from `TurnHead`s or
-  `OutputView.turn`) and follows a new path. A client picks a fixed turn from the turn
-  index or from `output/latest`, both of which state `historyRev`.
+  selection, and reconnecting to a new instance (§6.6) ends it; neither can turn it into
+  another one. A client that wants a turn of the new history chooses it explicitly: it
+  reads the instance and `historyRev` (from the stream, `TurnHead`s or `OutputView.turn`)
+  and follows a new path. A client picks a fixed turn from the turn index or from
+  `output/latest`, both of which state `historyRev`.
 - `text` is the message's text as the Agent wrote it, Markdown included; the bridge
   converts, summarizes and separates nothing. A client wanting the whole entry (blocks,
   annotations, attachments) follows `/sessions/<id>/entries/<n>` or the turn view.
-- `/views/<id>/history/<h>/turn/<start>` holds the turn's entries as a copy (shared in memory with the
+- `/views/<id>/history/<i>/<h>/turn/<start>` holds the turn's entries as a copy (shared in memory with the
   canonical list), so the turn verifies without the other entries.
 
 A view is materialized while it is followed or read. Its path revision is the revision at
@@ -372,10 +376,13 @@ The client holds, per followed path `p`, a path version `v_p`.
   snapshot (`absent` and `closed` are not final there). A fixed view is finished by
   `absent` and `replaced`; the client drops it.
 - An `end` carries an `ErrorSummary`, enough to act on (for example `agentCode` −32000:
-  authentication is required). A failed load leaves no session whose `opDetail` could keep
-  the whole error, so the bridge keeps it in `/global/loadFailures/<sessionId>` until that
-  session is held again or deleted, bounded to the last `K` failures. A client that shows
-  the message (the browser) follows `/global` anyway; a device need not.
+  authentication is required). A session path that ends with `load_failed` (a failed cold
+  load, or a session that cannot be reattached and ends) leaves no `opDetail` that could
+  keep the whole error, so the bridge keeps it in `/global/loadFailures/<sessionId>` until
+  that session is held again or deleted, bounded to the last `K` failures. A failed
+  reattachment that keeps the session held has no `end`: its error is in the session's
+  `opDetail`. A client that shows the message (the browser) follows `/global` anyway; a
+  device need not.
 - **Checkpoint**: `at` is the path version the hash is of. With `at == v_p` the client
   compares; with `at > v_p` it has missed a change (for example the last one before the
   path went quiet) and resubscribes with its `have`; with `at < v_p` the checkpoint is
@@ -449,7 +456,7 @@ interface TextWindow {
   full snapshot fails verification again, the client reports that synchronization failed
   and retries with backoff. A path is shown as confirmed only up to its last verified
   version. Dropping a replica never changes which path is followed: a fixed view keeps its
-  `history/<h>` binding (§4.5).
+  `history/<i>/<h>` binding (§4.5).
 - **Slow subscriber**: when a stream's queue exceeds its budget, the bridge drops the
   queued events and queues one catch-up event at the current `rev` carrying, per followed
   path, a differential snapshot from the last `v_p` it actually wrote. Ends are kept.
@@ -654,7 +661,7 @@ values of the Agent's size, so a device that cannot hold them does not offer ans
 | Client | Holds | Per event | Verification |
 | --- | --- | --- | --- |
 | full replica (`/sessions/S`) | the session | the change | hashes along the changed path; the entries list hashes its children's hashes (`O(entries)` per checkpoint) |
-| one turn (`/views/S/history/<h>/turn/<start>`) | that turn | changes in it | that subtree |
+| one turn (`/views/S/history/<i>/<h>/turn/<start>`) | that turn | changes in it | that subtree |
 | one output with window `N` | `< N + L` bytes of text, a few fields | `< N + L` bytes of text | one value, one chain |
 | paging a long text | one segment | — | the chain, one segment at a time |
 
@@ -752,6 +759,9 @@ Acceptance cases to add to [protocol-acceptance](protocol-acceptance.md):
   `at > v_p` and the client recovers;
 - a fixed view whose replica fails verification after a load is resubscribed without
   `have` and ends with `replaced`; it never shows the new history's turn;
+- after a bridge restart, the new instance happens to have the same `historyRev` and a turn
+  at the same `start`: following or reading the old fixed path, on a stream or by `GET`,
+  ends with `replaced` and installs nothing from the new instance;
 - an append of 12,000 bytes to a 1-byte text in a window of `N = 4096` arrives as one
   `set` of the window, not as an `append`;
 - an Agent error of 1 MiB leaves `OpHead`, `OpRecord` and `End` bounded; the whole error
@@ -759,6 +769,14 @@ Acceptance cases to add to [protocol-acceptance](protocol-acceptance.md):
 - revision 3's §12.4 cases restated per path.
 
 ## 15. Changes from earlier drafts
+
+Third to fourth draft, from the review of 804f3fa on PR #202:
+
+| Third draft | Fourth draft | Review point |
+| --- | --- | --- |
+| fixed views bound to `historyRev` | bound to `(instance, historyRev, start)`, the instance part of the path; another instance ends them with `replaced` on a stream and for a `GET` | P2: a new instance counts revisions again and can reuse the same `historyRev` |
+| `opDetail` shown as `{ input, result? }` in the tree | `{ input, result?, error? }`, as §4.4 says | wording |
+| "a failed load leaves no session" | only a path that ends with `load_failed`; a failed reattachment that keeps the session keeps its error in `opDetail` | wording |
 
 Second to third draft, from the review of af54130 on PR #202:
 
