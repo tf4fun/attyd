@@ -8,7 +8,7 @@ use super::super::Op;
 use super::super::digest;
 use super::super::pacing::Pacer;
 use super::super::tree::{Committed, Tree};
-use super::params::StreamQuery;
+use super::params::{StreamQuery, session_of};
 use super::snapshot::snapshot;
 use super::super::subscription::QUEUE_BUDGET;
 use super::wire::{Change, Check, End, EndReason, Event};
@@ -139,6 +139,18 @@ impl Subscriber {
 
     /// `publish` at `now`, which paces the checkpoints of what changed.
     pub(crate) fn publish_at(&mut self, tree: &Tree, committed: &Committed, now: Instant) {
+        self.publish_ended(tree, committed, now, &BTreeMap::new());
+    }
+
+    /// `publish_at`, with the sessions that ended in this commit and why: a followed path of
+    /// such a session that is gone ends with that reason instead of `absent`.
+    pub(crate) fn publish_ended(
+        &mut self,
+        tree: &Tree,
+        committed: &Committed,
+        now: Instant,
+        ended: &BTreeMap<String, End>,
+    ) {
         let mut changes = Vec::new();
         for (path, state) in &mut self.paths {
             let direct: Vec<&Op> = committed
@@ -169,10 +181,10 @@ impl Subscriber {
                         state.present = false;
                         state.queued = None;
                         self.pacer.settled(path);
-                        changes.push(Change::End {
-                            path: path.clone(),
-                            end: End { reason: EndReason::Absent, error: None },
-                        });
+                        let end = session_of(path)
+                            .and_then(|session_id| ended.get(&session_id).cloned())
+                            .unwrap_or(End { reason: EndReason::Absent, error: None });
+                        changes.push(Change::End { path: path.clone(), end });
                     }
                     None => {}
                 }
@@ -224,6 +236,22 @@ impl Subscriber {
     /// When the next checkpoint is due, if a path waits for one.
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.pacer.deadline()
+    }
+
+    /// A load of `session_id` failed, or the session is over, before it was published: its
+    /// followed paths end with `end`. The subscription stays (a later load starts it again).
+    pub(crate) fn end_session(&mut self, tree: &Tree, session_id: &str, end: &End) {
+        let changes: Vec<Change> = self
+            .paths
+            .iter_mut()
+            .filter(|(path, state)| {
+                session_of(path).as_deref() == Some(session_id) && !state.present && tree.get(path).is_none()
+            })
+            .map(|(path, _)| Change::End { path: path.clone(), end: end.clone() })
+            .collect();
+        if !changes.is_empty() {
+            self.push(Event { instance: None, rev: tree.rev(), changes: Some(changes), check: None });
+        }
     }
 
     /// The next event to write; it advances what the client is known to hold.
