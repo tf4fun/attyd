@@ -12,6 +12,10 @@ memory reaches clients and how clients write to it. Where the two disagree, the 
 model wins. Revision 2 (turn log with a hash chain) is at the fixed baseline linked in
 the [history index](history.md); §11 lists what changed.
 
+A revision 4 for partial synchronization by light clients and serialized writes from
+several clients is proposed in [protocol-r4-design.md](protocol-r4-design.md) (#201); it
+defines nothing until accepted.
+
 Related documents: [design rationale](client-api-redesign.md),
 [numbered acceptance cases](protocol-acceptance.md),
 [implementation plan](state-sync.md), [test evidence](acp-coverage.md).
