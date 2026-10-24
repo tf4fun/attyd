@@ -24,6 +24,7 @@ import { WriteQueue, type HttpFetch } from "../../../shared/protocol-client";
 import {
   ActionsClient,
   OpsClient,
+  type ActionOutcome,
   type StartingWrite,
   type Write,
   type WriteOutcome,
@@ -667,7 +668,13 @@ export class Workspace {
    */
   reconnect = (): void => {
     const phase = this.#global()?.agent.phase;
-    if (phase === "stopped" || phase === "error") void this.#actions.restart().then(() => this.#changed());
+    if (phase === "stopped" || phase === "error") {
+      void this.#actions.restart().then((outcome) => {
+        // A refused or unanswered restart leaves the card; the user is told why.
+        this.#report("restart", outcome);
+        this.#changed();
+      });
+    }
     this.#applyFollow(true);
   };
 
@@ -681,7 +688,7 @@ export class Workspace {
   }
 
   /** Shows what a write's answer says when the page cannot leave it to the document. */
-  #report(operation: string, outcome: WriteOutcome): void {
+  #report(operation: string, outcome: WriteOutcome | ActionOutcome): void {
     let message: string | undefined;
     let data: unknown;
     if (outcome.kind === "refused") {
