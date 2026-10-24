@@ -52,7 +52,7 @@ fn global_is_the_agent_with_its_nodes() {
     assert_eq!(global["terminals"], json!({}));
     assert_eq!(global["interactions"], json!({}));
     assert_eq!(global["urlFlows"], json!({}));
-    assert!(global.get("loadFailures").is_none(), "loadFailures is added with the stream");
+    assert_eq!(global["loadFailures"], json!({}));
 }
 
 #[test]
