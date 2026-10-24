@@ -102,6 +102,22 @@ impl Node {
         self.srev
     }
 
+    /// The length of a list node.
+    pub(crate) fn list_len(&self) -> Option<usize> {
+        match &self.body {
+            Body::List(items) => Some(items.len()),
+            _ => None,
+        }
+    }
+
+    /// The value of a value node and the rule of its text positions.
+    pub(crate) fn as_value(&self) -> Option<(&Value, TextRule)> {
+        match &self.body {
+            Body::Value(value, rule) => Some((value, *rule)),
+            _ => None,
+        }
+    }
+
     /// The child `key` of an object or a map, or the index `key` of a list.
     pub(crate) fn child(&self, key: &str) -> Option<&Node> {
         match &self.body {
