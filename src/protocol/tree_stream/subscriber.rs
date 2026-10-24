@@ -9,7 +9,8 @@ use super::super::digest;
 use super::super::pacing::Pacer;
 use super::super::tree::{Committed, Tree};
 use super::params::{StreamQuery, session_of};
-use super::snapshot::snapshot;
+use super::snapshot::snapshot_windowed;
+use super::windowed_ops::windowed;
 use super::super::subscription::QUEUE_BUDGET;
 use super::wire::{Change, Check, End, EndReason, Event};
 
@@ -21,6 +22,8 @@ struct Queued {
 
 /// What the stream holds on behalf of the subscriber for one followed path.
 struct PathState {
+    /// Hold the text positions under the path as windows of this many bytes (design §6.4).
+    window: Option<usize>,
     /// The path version the client is known to hold: what the client said it held, then what
     /// was last written to its stream. An event still in the queue is not delivered.
     written: Option<u64>,
@@ -75,8 +78,8 @@ impl Subscriber {
         let mut changes = Vec::new();
         for follow in &query.follow {
             let have = follow.have.filter(|_| same_instance);
-            let mut state = PathState { written: have, queued: None, present: false };
-            match snapshot(tree, &follow.path, have) {
+            let mut state = PathState { window: follow.window, written: have, queued: None, present: false };
+            match snapshot_windowed(tree, &follow.path, have, follow.window) {
                 Some(snapshot) => {
                     state.queued = Some(snapshot.at);
                     state.present = true;
@@ -169,7 +172,7 @@ impl Subscriber {
                 continue;
             }
             if replaced || appeared || !state.present {
-                match snapshot(tree, path, state.queued) {
+                match snapshot_windowed(tree, path, state.queued, state.window) {
                     Some(snapshot) => {
                         state.queued = Some(snapshot.at);
                         state.present = true;
@@ -193,11 +196,18 @@ impl Subscriber {
             let from = state.queued.expect("a present path has a version");
             state.queued = Some(committed.rev);
             self.pacer.changed(path, now);
-            changes.push(Change::Ops {
-                path: path.clone(),
-                from,
-                ops: direct.iter().map(|op| rebased(op, path.len())).collect(),
-            });
+            let ops: Vec<Op> = match state.window {
+                Some(bytes) => {
+                    let mut replaced = std::collections::BTreeSet::new();
+                    direct
+                        .iter()
+                        .flat_map(|op| windowed(tree, op, bytes, &mut replaced))
+                        .map(|op| rebased(&op, path.len()))
+                        .collect()
+                }
+                None => direct.iter().map(|op| rebased(op, path.len())).collect(),
+            };
+            changes.push(Change::Ops { path: path.clone(), from, ops });
         }
         if !changes.is_empty() {
             self.push(Event {
@@ -300,7 +310,7 @@ impl Subscriber {
         self.queued_bytes = 0;
         let mut changes = Vec::new();
         for (path, state) in &mut self.paths {
-            match snapshot(tree, path, state.written) {
+            match snapshot_windowed(tree, path, state.written, state.window) {
                 Some(snapshot) => {
                     state.queued = Some(snapshot.at);
                     state.present = true;
@@ -324,6 +334,12 @@ impl Subscriber {
         // A catch-up that replaces the first event names the instance too.
         let instance = (!self.instance_written).then(|| tree.instance().to_string());
         self.push(Event { instance, rev: tree.rev(), changes: Some(changes), check: None });
+    }
+
+    /// The event at the head of the queue.
+    #[cfg(test)]
+    pub(crate) fn peek_first(&self) -> &Event {
+        &self.queue.front().expect("an event is queued").event
     }
 
     pub(crate) fn queued(&self) -> usize {
