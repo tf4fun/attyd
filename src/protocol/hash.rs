@@ -68,6 +68,12 @@ fn finish(length: u64, last: &Hash) -> Hash {
     hasher.finalize().into()
 }
 
+/// The hash from the chain state after the last segment (tests of a paged text).
+#[cfg(test)]
+pub(crate) fn finish_for_tests(length: u64, last: &Hash) -> Hash {
+    finish(length, last)
+}
+
 /// The hash of a whole text.
 pub(crate) fn text_hash(text: &str) -> Hash {
     finish(text.len() as u64, &chain_states(text).last().copied().unwrap_or(ZERO))

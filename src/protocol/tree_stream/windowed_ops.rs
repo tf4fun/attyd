@@ -17,7 +17,7 @@ fn op_path(op: &Op) -> &str {
 }
 
 /// The deepest node on `path` and the tokens below it, which address into a value node.
-fn locate<'a>(tree: &'a Tree, path: &str) -> (&'a Node, Vec<String>) {
+pub(super) fn locate<'a>(tree: &'a Tree, path: &str) -> (&'a Node, Vec<String>) {
     let tokens: Vec<String> = path.strip_prefix('/').map(|rest| rest.split('/').map(unescape).collect()).unwrap_or_default();
     let mut node = tree.root();
     for (index, token) in tokens.iter().enumerate() {
@@ -29,7 +29,7 @@ fn locate<'a>(tree: &'a Tree, path: &str) -> (&'a Node, Vec<String>) {
     (node, Vec::new())
 }
 
-fn pointer(tokens: &[String]) -> String {
+pub(super) fn pointer(tokens: &[String]) -> String {
     tokens.iter().map(|token| format!("/{}", escape(token))).collect()
 }
 
