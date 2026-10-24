@@ -21,6 +21,8 @@ use super::live_doc::engine_input;
 use super::pacing::Pacer;
 use super::project::held_sessions;
 use super::subscription::{Encoded, Subscribed, Subscriber};
+use super::tree::Tree;
+use super::tree_doc::Projector;
 use crate::session_registry::SessionRegistry;
 
 pub(crate) type SubscriptionId = u64;
@@ -41,6 +43,9 @@ pub(crate) struct Feed {
     next_id: SubscriptionId,
     /// When a scope that changed is due its checkpoint.
     pacer: Pacer,
+    /// The revision 4 state tree (docs/protocol-r4-design.md §4), committed beside the scopes.
+    tree: Tree,
+    projector: Projector,
     #[cfg(test)]
     tap: tap::Tap,
 }
@@ -53,9 +58,17 @@ impl Feed {
             subscribers: BTreeMap::new(),
             next_id: 1,
             pacer: Pacer::default(),
+            // A random instance per process, apart from the scopes' epoch (§4.1).
+            tree: Tree::new(super::op::operation_id()),
+            projector: Projector::default(),
             #[cfg(test)]
             tap: tap::Tap::default(),
         }
+    }
+
+    /// The revision 4 tree as last committed.
+    pub(crate) fn tree(&self) -> &Tree {
+        &self.tree
     }
 
     /// Registers a subscriber and queues the alignment of every scope that is
@@ -259,6 +272,8 @@ impl Feed {
                 subscriber.coalesce(&self.engine);
             }
         }
+        self.tree
+            .commit(self.projector.project(registry, agent, catalog_revision));
         #[cfg(test)]
         self.tap_flush();
     }
@@ -469,6 +484,8 @@ impl FeedSubscription {
 
 #[cfg(test)]
 mod handle_tests;
+#[cfg(test)]
+mod tree_tests;
 #[cfg(test)]
 pub(crate) mod tap;
 #[cfg(test)]
