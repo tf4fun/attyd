@@ -20,7 +20,7 @@ use super::engine::{Commit, Engine, StreamEvent};
 use super::live_doc::engine_input;
 use super::pacing::Pacer;
 use super::project::held_sessions;
-use super::subscription::{Subscribed, Subscriber};
+use super::subscription::{Encoded, Subscribed, Subscriber};
 use crate::session_registry::SessionRegistry;
 
 pub(crate) type SubscriptionId = u64;
@@ -74,8 +74,13 @@ impl Feed {
     }
 
     /// The next event to write to subscription `id`.
+    #[cfg(test)]
     pub(crate) fn next(&mut self, id: SubscriptionId) -> Option<StreamEvent> {
         self.subscribers.get_mut(&id)?.next()
+    }
+
+    pub(crate) fn next_encoded(&mut self, id: SubscriptionId) -> Option<Encoded> {
+        self.subscribers.get_mut(&id)?.next_encoded()
     }
 
     pub(crate) fn subscribers(&self) -> usize {
@@ -188,6 +193,7 @@ impl Feed {
                     #[cfg(test)]
                     self.tap_event(&event);
                     self.pacer.changed(&name, now);
+                    let event = Encoded::new(event);
                     for subscriber in self.subscribers.values_mut() {
                         subscriber.publish(&event);
                     }
@@ -266,6 +272,7 @@ impl Feed {
                 continue;
             };
             queued = true;
+            let checkpoint = Encoded::new(checkpoint);
             for subscriber in self.subscribers.values_mut() {
                 subscriber.publish(&checkpoint);
             }
@@ -417,7 +424,15 @@ pub(crate) struct FeedSubscription(Arc<SubscriptionGuard>);
 impl FeedSubscription {
     /// The next event to write; waits when none is queued, and is `None` once
     /// the feed is closed and the queue is drained.
+    #[cfg(test)]
     pub(crate) async fn next(&self) -> Option<StreamEvent> {
+        self.next_encoded()
+            .await
+            .map(|encoded| encoded.event().clone())
+    }
+
+    /// `next`, with the JSON it was encoded to once for every subscriber.
+    pub(crate) async fn next_encoded(&self) -> Option<Encoded> {
         let handle = &self.0.handle;
         loop {
             // Enabled before the queue is read, so a commit between the two wakes
@@ -433,7 +448,7 @@ impl FeedSubscription {
                 if feed.checkpoints(Instant::now()) {
                     handle.0.ready.notify_waiters();
                 }
-                if let Some(event) = feed.next(self.0.id) {
+                if let Some(event) = feed.next_encoded(self.0.id) {
                     return Some(event);
                 }
                 feed.deadline()

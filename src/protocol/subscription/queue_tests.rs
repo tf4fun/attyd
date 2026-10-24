@@ -236,3 +236,17 @@ fn entries_base_of_a_snapshot_is_replace_without_a_version_held() {
     };
     assert_eq!(snapshot.entries.unwrap().base, EntriesBase::Replace);
 }
+
+// #181: an event is encoded once, however many subscribers it is queued for, and
+// what is written is its JSON.
+#[test]
+fn an_event_is_encoded_once_for_every_subscriber() {
+    let event = StreamEvent::Checkpoint { scope: SCOPE.into(), rev: 1, digest: "x".into() };
+    let encoded = Encoded::new(event.clone());
+    let (mut a, mut b) = (Subscriber::new(&subscribed(None)), Subscriber::new(&subscribed(None)));
+    a.publish(&encoded);
+    b.publish(&encoded);
+    let (a, b) = (a.next_encoded().unwrap(), b.next_encoded().unwrap());
+    assert!(Arc::ptr_eq(&a.json(), &b.json()));
+    assert_eq!(&*a.json(), serde_json::to_string(&event).unwrap());
+}
