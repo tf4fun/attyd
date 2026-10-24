@@ -405,9 +405,10 @@ interface Snapshot {
 
 type SNode =
   | { v: unknown }                                         // the whole subtree as JSON
-  | { o: unknown; c: Record<string, SNode> }               // object: own fields, changed children
+  | { o: unknown; k: string[]; c: Record<string, SNode> } // object: own fields, all child names, changed children
   | { m: string[]; c: Record<string, SNode> }              // map: all keys, changed children
-  | { l: number; c: Record<string, SNode> };               // list: length, changed children
+  | { l: number; c: Record<string, SNode> }                // list: length, changed children
+  | { same: true };                                        // the root: nothing changed since `base`
 ```
 
 For `have = h`, the bridge walks the subtree: a node with `srev ≤ h` is omitted (the
@@ -420,8 +421,9 @@ copy is adopted only if its hash matches; then `v_p = at`.
 
 A full snapshot is `{ base: null, at, node: { v } }`. A differential snapshot needs no
 knowledge of what the client held beyond `h`, since structure is always sent where
-anything below changed. When `srev(p) ≤ h`, the snapshot is `{ base: h, at: h, node }`
-with the root's structure only, or nothing changed at all (§7.1).
+anything below changed. When `srev(p) ≤ h`, nothing changed since the client's version: the
+snapshot is `{ base: h, at: srev(p), hash, node: { same: true } }`, and the client keeps what
+it holds (a `GET` says `unchanged`, §7.1). A list's changed children are keyed by index.
 
 ### 6.4 Text windows
 
