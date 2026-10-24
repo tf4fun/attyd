@@ -362,7 +362,7 @@ describe("ACP UI component contract", () => {
     expect(html).not.toContain("not-base64");
   });
 
-  it("renders zero-based tool locations, diffs, and terminal references faithfully", () => {
+  it("renders closed tool cards as their headers alone", () => {
     const html = renderToStaticMarkup(
       <Conversation
         timeline={[{
@@ -418,39 +418,14 @@ describe("ACP UI component contract", () => {
       />,
     );
 
-    expect(html).toContain("Locations");
-    expect(html).toContain("&quot;line&quot;: 0");
-    expect(html).toContain('class="change-review-line line-removed"');
-    expect(html).toContain('class="change-review-line line-added"');
-    expect(html).toContain("before");
-    expect(html).toContain("after");
-    expect(html).toContain("terminal-1");
-    expect(html).toContain("command output");
-    expect(html).toContain("Completed");
-    expect(html).toContain("Earlier output was truncated.");
-    expect(html).toContain('<div class="structured-scalar structured-markdown">');
-    expect(html).toContain("<strong>literal tool output</strong>");
-    expect(html).toContain("<li>first result</li>");
     expect(html).toContain('data-tool-status="completed"');
     expect(html).toContain('data-live="false"');
     expect(html).toContain('aria-label="Tool status: Completed"');
     expect(html).toContain('<strong title="shell · cat /workspace/fixture.ts">shell · cat /workspace/fixture.ts</strong>');
     expect(html).toContain('<strong title="fetch · Load project metadata">fetch · Load project metadata</strong>');
-    expect(html).not.toContain("Description");
-    expect(html).not.toContain('class="locations"');
-    expect(html).toContain("Input");
-    expect(html).toContain("command");
-    expect(html).toContain("timeoutMs");
-    expect(html).toContain("Output");
-    expect(html).toContain("status");
-    expect(html).toContain("project");
-    expect(html).toContain("attyd");
-    expect(html.match(/class="structured-data"/g)?.length).toBeGreaterThanOrEqual(3);
-    expect(html).toContain('aria-label="Tool info"');
-    expect(html).toContain('aria-label="Tool debug information"');
-    expect(html).toContain("Tool call ID");
-    expect(html).toContain("Latest source event");
-    expect(html).not.toContain("open=\"\"");
+    // A closed body is rendered empty until the tool is opened.
+    expect(html.match(/<div id="[^"]+" class="tool-body" data-thread-searchable="true" hidden=""><\/div>/g)).toHaveLength(2);
+    expect(html).not.toContain("literal tool output");
   });
 
 });
