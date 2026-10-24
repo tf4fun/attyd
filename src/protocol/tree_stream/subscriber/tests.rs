@@ -373,3 +373,107 @@ fn a_check_older_than_what_the_client_holds_is_ignored() {
     client.apply(&old).unwrap();
     assert!(client.checks.is_empty());
 }
+
+// --- a subscriber that cannot keep up (design §6.5) -----------------------------------
+
+fn big(n: usize) -> String {
+    "x".repeat(n)
+}
+
+#[test]
+fn a_queue_past_the_budget_is_replaced_by_one_catch_up_from_the_version_written() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s/entries", "/global"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    pump(&mut subscriber, &mut client);
+    let mut entries = vec!["a".to_string()];
+    let mut n = 0;
+    while !subscriber.over_budget() {
+        n += 1;
+        entries.push(big(100_000));
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let change = committed(&mut tree, root(n, &[("s", session("t", &refs))]));
+        subscriber.publish(&tree, &change);
+        assert!(n < 100);
+    }
+    assert!(subscriber.queued() > 1);
+    subscriber.coalesce(&tree);
+    assert_eq!(subscriber.queued(), 1);
+    assert!(!subscriber.over_budget());
+    let catch_up = subscriber.next().unwrap();
+    assert_eq!(catch_up.rev, tree.rev());
+    assert_eq!(catch_up.instance, None, "the first event was written");
+    client.apply(&catch_up).unwrap();
+    holds(&client, &tree, &paths);
+    // The catch-up carries only what changed since the version written: entry 0 is not in it.
+    let json = serde_json::to_string(&catch_up).unwrap();
+    assert!(json.contains("\"1\"") && !json.contains("\"text\":\"a\""), "{}", &json[..200.min(json.len())]);
+}
+
+#[test]
+fn a_catch_up_goes_on_from_what_was_written_not_from_what_was_queued() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s/entries"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    pump(&mut subscriber, &mut client);
+    for entries in [&["a", "b"][..], &["a", "b", "c"], &["a", "b", "c", "d"]] {
+        let change = committed(&mut tree, root(0, &[("s", session("t", entries))]));
+        subscriber.publish(&tree, &change);
+    }
+    // The client got the first of them only.
+    let first = subscriber.next().unwrap();
+    client.apply(&first).unwrap();
+    subscriber.coalesce(&tree);
+    pump(&mut subscriber, &mut client);
+    holds(&client, &tree, &paths);
+    // And the stream goes on with ops from the version the catch-up installed.
+    let change = committed(&mut tree, root(0, &[("s", session("t", &["a", "b", "c", "d", "e"]))]));
+    subscriber.publish(&tree, &change);
+    pump(&mut subscriber, &mut client);
+    holds(&client, &tree, &paths);
+}
+
+#[test]
+fn a_catch_up_ends_a_path_that_is_gone_and_keeps_a_path_never_held_quiet() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s", "/sessions/u"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    pump(&mut subscriber, &mut client);
+    let change = committed(&mut tree, root(0, &[]));
+    subscriber.publish(&tree, &change);
+    subscriber.coalesce(&tree);
+    let catch_up = subscriber.next().unwrap();
+    let changes = catch_up.changes.as_ref().unwrap();
+    assert_eq!(changes.len(), 1, "/sessions/u was never held");
+    assert!(matches!(&changes[0], Change::End { path, .. } if path == "/sessions/s"));
+    client.apply(&catch_up).unwrap();
+    assert_eq!(client.value("/sessions/s"), None);
+}
+
+#[test]
+fn a_catch_up_that_replaces_the_first_event_names_the_instance() {
+    let mut tree = Tree::new("I");
+    tree.commit(root(0, &[("s", session("t", &["a"]))]));
+    let paths = ["/sessions/s/entries"];
+    let (mut client, mut subscriber) = (Client::following(&paths), Subscriber::new(&query(&paths), &tree));
+    let change = committed(&mut tree, root(0, &[("s", session("t", &["a", "b"]))]));
+    subscriber.publish(&tree, &change);
+    subscriber.coalesce(&tree);
+    assert_eq!(subscriber.queued(), 1);
+    let catch_up = subscriber.next().unwrap();
+    assert_eq!(catch_up.instance.as_deref(), Some("I"));
+    client.apply(&catch_up).unwrap();
+    holds(&client, &tree, &paths);
+}
+
+#[test]
+fn snapshots_do_not_count_against_the_budget() {
+    let mut tree = Tree::new("I");
+    let text = big(2_000_000);
+    tree.commit(root(0, &[("s", session("t", &[text.as_str()]))]));
+    let subscriber = Subscriber::new(&query(&["/sessions/s"]), &tree);
+    assert!(!subscriber.over_budget(), "the first event is a 2 MB snapshot");
+}

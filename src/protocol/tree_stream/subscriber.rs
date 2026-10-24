@@ -10,10 +10,20 @@ use super::super::pacing::Pacer;
 use super::super::tree::{Committed, Tree};
 use super::params::StreamQuery;
 use super::snapshot::snapshot;
+use super::super::subscription::QUEUE_BUDGET;
 use super::wire::{Change, Check, End, EndReason, Event};
+
+/// A queued event and the bytes it counts against the budget.
+struct Queued {
+    event: Event,
+    counted: usize,
+}
 
 /// What the stream holds on behalf of the subscriber for one followed path.
 struct PathState {
+    /// The path version the client is known to hold: what the client said it held, then what
+    /// was last written to its stream. An event still in the queue is not delivered.
+    written: Option<u64>,
     /// The path version after everything queued for the path: what the next ops `from`.
     queued: Option<u64>,
     /// Whether the path existed at the last event queued for it.
@@ -23,7 +33,12 @@ struct PathState {
 pub(crate) struct Subscriber {
     paths: BTreeMap<String, PathState>,
     cwd: BTreeMap<String, String>,
-    queue: VecDeque<Event>,
+    queue: VecDeque<Queued>,
+    /// The bytes of the queued events that carry ops. Snapshots are bounded by the tree and
+    /// do not count: coalescing them again would only build the same snapshots anew.
+    queued_bytes: usize,
+    /// Whether the event that names the instance was written.
+    instance_written: bool,
     /// When a path that changed is due its checkpoint (design §6.5).
     pacer: Pacer,
 }
@@ -60,7 +75,7 @@ impl Subscriber {
         let mut changes = Vec::new();
         for follow in &query.follow {
             let have = follow.have.filter(|_| same_instance);
-            let mut state = PathState { queued: None, present: false };
+            let mut state = PathState { written: have, queued: None, present: false };
             match snapshot(tree, &follow.path, have) {
                 Some(snapshot) => {
                     state.queued = Some(snapshot.at);
@@ -80,12 +95,32 @@ impl Subscriber {
             changes: Some(changes),
             check: None,
         };
-        Self {
+        let mut subscriber = Self {
             paths,
             cwd: query.cwd.clone(),
-            queue: VecDeque::from([first]),
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            instance_written: false,
             pacer: Pacer::default(),
-        }
+        };
+        subscriber.push(first);
+        subscriber
+    }
+
+    fn push(&mut self, event: Event) {
+        // Only an event with ops counts: the rest is snapshots, ends and checks.
+        let has_ops = event
+            .changes
+            .iter()
+            .flatten()
+            .any(|change| matches!(change, Change::Ops { .. }));
+        let counted = if has_ops {
+            serde_json::to_string(&event).expect("an event serializes").len()
+        } else {
+            0
+        };
+        self.queued_bytes += counted;
+        self.queue.push_back(Queued { event, counted });
     }
 
     /// The paths followed and the directory given for the load of the session each is under.
@@ -153,7 +188,7 @@ impl Subscriber {
             });
         }
         if !changes.is_empty() {
-            self.queue.push_back(Event {
+            self.push(Event {
                 instance: None,
                 rev: committed.rev,
                 changes: Some(changes),
@@ -182,7 +217,7 @@ impl Subscriber {
         if check.is_empty() {
             return false;
         }
-        self.queue.push_back(Event { instance: None, rev: tree.rev(), changes: None, check: Some(check) });
+        self.push(Event { instance: None, rev: tree.rev(), changes: None, check: Some(check) });
         true
     }
 
@@ -191,9 +226,60 @@ impl Subscriber {
         self.pacer.deadline()
     }
 
-    /// The next event to write.
+    /// The next event to write; it advances what the client is known to hold.
     pub(crate) fn next(&mut self) -> Option<Event> {
-        self.queue.pop_front()
+        let Queued { event, counted } = self.queue.pop_front()?;
+        self.queued_bytes -= counted;
+        self.instance_written |= event.instance.is_some();
+        for change in event.changes.iter().flatten() {
+            if let Some(state) = self.paths.get_mut(change.path()) {
+                state.written = match change {
+                    Change::Snapshot { snapshot, .. } => Some(snapshot.at),
+                    Change::Ops { .. } => Some(event.rev),
+                    Change::End { .. } => None,
+                };
+            }
+        }
+        Some(event)
+    }
+
+    /// Whether the events queued exceed the budget.
+    pub(crate) fn over_budget(&self) -> bool {
+        self.queued_bytes > QUEUE_BUDGET
+    }
+
+    /// The subscriber could not keep up: what is queued is dropped and replaced by one
+    /// catch-up event at the current revision, carrying for each followed path a differential
+    /// snapshot from the version last written, or its end. It never changes what a path
+    /// version contains (design §6.5).
+    pub(crate) fn coalesce(&mut self, tree: &Tree) {
+        self.queue.clear();
+        self.queued_bytes = 0;
+        let mut changes = Vec::new();
+        for (path, state) in &mut self.paths {
+            match snapshot(tree, path, state.written) {
+                Some(snapshot) => {
+                    state.queued = Some(snapshot.at);
+                    state.present = true;
+                    self.pacer.settled(path);
+                    changes.push(Change::Snapshot { path: path.clone(), snapshot });
+                }
+                None => {
+                    state.queued = None;
+                    state.present = false;
+                    self.pacer.settled(path);
+                    if state.written.is_some() {
+                        changes.push(Change::End {
+                            path: path.clone(),
+                            end: End { reason: EndReason::Absent, error: None },
+                        });
+                    }
+                }
+            }
+        }
+        // A catch-up that replaces the first event names the instance too.
+        let instance = (!self.instance_written).then(|| tree.instance().to_string());
+        self.push(Event { instance, rev: tree.rev(), changes: Some(changes), check: None });
     }
 
     pub(crate) fn queued(&self) -> usize {
