@@ -207,7 +207,7 @@ describe("a tree replica", () => {
 
   it("lets nothing of a replaced stream or of a path not followed through", () => {
     const first = open([PATH]);
-    const second = first.set.open([PATH]);
+    const second = first.set.open([{ path: PATH }]);
     expect(first.set.receive(first.stream, event([snapshot(PATH, [entry("a")], 5)], 100, "I"))).toEqual({ kind: "ignored", changed: [] });
     expect(first.set.receive(second.stream, event([snapshot("/global", { n: 1 }, 5)], 100, "I"))).toEqual({ kind: "ignored", changed: [] });
     expect(first.set.get(PATH)).toBeUndefined();
