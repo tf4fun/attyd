@@ -1,15 +1,16 @@
 name: ci
 
 on:
-  # Branch work is validated by its pull request; pushes only build main and
-  # release tags, so one commit never runs the same jobs twice.
+  # Branch work is validated by its pull request; pushes build main, an integration
+  # branch (`experiment/**`, whose merged tip no pull request ran as such) and release
+  # tags.
   #
   # A draft pull request runs the fast checks only: release metadata, dependency audits,
   # TypeScript, the frontend tests and the Rust tests. Marking it ready for review (or any
   # later push to it) runs the whole validation: the smokes, the instrumented coverage, the
   # browser suite and the binaries of every target. Merge a pull request once that is green.
   push:
-    branches: [main]
+    branches: [main, "experiment/**"]
     tags: ["v*"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
