@@ -539,6 +539,7 @@ mod tests {
         resources.materialization = Some(MaterializationResources {
             attempt_id: "materialization".to_string(),
             cancellation: materialization.clone(),
+            failure_recorded: false,
         });
         resources.validation = Some(SessionUpdateSemanticState::default());
         resources.replay_validation_backup = Some(ReplayValidationBackup {

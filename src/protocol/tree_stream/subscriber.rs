@@ -85,6 +85,17 @@ fn op_path(op: &Op) -> &str {
 }
 
 impl Subscriber {
+    /// One final read after shutdown: deliver the existing cut without holding a session,
+    /// requesting a load, or tracking subsequent publication.
+    pub(crate) fn final_snapshot(query: &StreamQuery, tree: &Tree) -> Self {
+        let mut subscriber = Self::new(query, tree);
+        for state in subscriber.paths.values_mut() {
+            state.demand = false;
+            state.over = true;
+        }
+        subscriber
+    }
+
     /// A subscriber for `query`, aligned with `tree`: its first event names the instance and
     /// carries, per followed path, a snapshot from the version the client holds when it holds
     /// the tree's instance, else a whole one.

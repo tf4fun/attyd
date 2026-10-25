@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 
 use super::*;
-use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase, ErrorCode, ProtocolError};
+use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase, ProtocolError};
 use crate::protocol::tree_stream::client::Client;
 use crate::protocol::tree_stream::params::parse_stream_query;
 use crate::protocol::tree_stream::wire::Change;
@@ -204,7 +204,7 @@ fn a_failed_load_leaves_its_whole_error_in_global_and_a_stream_of_global_sees_it
 }
 
 #[test]
-fn a_repeated_load_cleanup_keeps_the_first_failure_until_a_new_request() {
+fn a_later_load_failure_replaces_the_previous_cause_even_without_subscribers() {
     let mut feed = Feed::new();
     let registry = SessionRegistry::new("epoch");
     feed.commit(&registry, &agent(), 1);
@@ -214,20 +214,11 @@ fn a_repeated_load_cleanup_keeps_the_first_failure_until_a_new_request() {
     feed.end_waiting("s", &failure("the Agent refused"));
     pump(&mut feed, id, &mut client);
     let original = feed.tree().get("/global/loadFailures/s").unwrap().to_value();
-    let rev = feed.tree().rev();
-    let cleanup = End {
-        reason: EndReason::LoadFailed,
-        error: Some(ProtocolError::new(ErrorCode::Unavailable, "cleanup of the same load")),
-    };
-    feed.end_waiting("s", &cleanup);
-    assert_eq!(feed.tree().rev(), rev);
-    assert_eq!(feed.tree().get("/global/loadFailures/s").unwrap().to_value(), original);
-    assert!(feed.next_tree(id).is_none(), "the same failure cannot end this path twice");
-
     // Another request can fail before it ever installs a session, and replaces the cause.
     let retry = feed.subscribe_tree(&query("follow=/sessions/s&cwd=s:/elsewhere"));
     feed.next_tree(retry).unwrap();
     feed.end_waiting("s", &failure("the next request failed"));
+    assert_ne!(feed.tree().get("/global/loadFailures/s").unwrap().to_value(), original);
     assert_eq!(feed.tree().get("/global/loadFailures/s").unwrap().to_value()["message"], "the next request failed");
 
     // A real completed load attempt is recorded even if its last subscriber has gone away.

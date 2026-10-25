@@ -107,6 +107,14 @@ async fn closing_the_feed_ends_every_subscription() {
     handle.with_tree(|tree| assert_eq!(client.value("/global"), tree.get("/global").map(|node| node.to_value()).as_ref()));
     assert!(read.next().await.is_none());
     assert!(handle.take_touched().is_empty());
+    let missing = handle.subscribe_tree_reading(&parse_stream_query(
+        "follow=/views/missing/output/latest&cwd=missing:/work",
+    ).unwrap());
+    assert!(missing.next().await.is_some(), "the final cut reports absence");
+    assert!(missing.next().await.is_none());
+    assert!(handle.followed_sessions().is_empty(), "a final read requests no load");
+    assert!(handle.take_touched().is_empty());
+    handle.with_tree(|tree| assert!(tree.get("/views/missing").is_none()));
 }
 
 #[tokio::test]

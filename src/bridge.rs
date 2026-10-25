@@ -728,7 +728,9 @@ fn settle_runtime_attachment_request_error(
                 kind,
                 agent_error_value(error),
             )
-            .map_err(runtime_state_error)
+            .map_err(runtime_state_error)?;
+        record_materialization_failure(state, session_id);
+        Ok(())
     }
 }
 
@@ -761,7 +763,19 @@ fn fail_runtime_attachment(
                 kind,
                 json!({ "message": error.message.clone(), "data": error.data.clone() }),
             )
-            .map_err(runtime_state_error)
+            .map_err(runtime_state_error)?;
+        record_materialization_failure(state, session_id);
+        Ok(())
+    }
+}
+
+/// `fail_attachment` checked the RPC owner and queued the authoritative load failure.
+/// Keep that fact with its materialization across the commit and the result's cleanup.
+fn record_materialization_failure(state: &mut BridgeState, session_id: &str) {
+    if let Ok(resources) = state.sessions.resources_mut(session_id)
+        && let Some(materialization) = &mut resources.materialization
+    {
+        materialization.failure_recorded = true;
     }
 }
 
@@ -988,6 +1002,7 @@ fn prepare_session_load(
         .materialization = Some(crate::session_resources::MaterializationResources {
         attempt_id: materialization_id.clone(),
         cancellation: CancellationToken::new(),
+        failure_recorded: false,
     });
     let method = if state
         .agent_capabilities
@@ -2212,7 +2227,9 @@ fn finish_materialization(
         Ok(()) => Ok(()),
         Err(error) => Err(SessionViewError::from(error.clone())),
     };
-    streams::finish_load(state, session_id, result);
+    if !materialization.failure_recorded {
+        streams::finish_load(state, session_id, result);
+    }
     if state.sessions.state(session_id).is_some_and(|session| {
         session.phase == MirrorPhase::Cold
             && session.live.is_none()
@@ -2222,6 +2239,9 @@ fn finish_materialization(
         state.sessions.remove(session_id);
     }
     refresh_observer_timers(state);
+    // A subscription may have arrived after the failure commit while this owner still
+    // blocked its load. Revisit that demand after releasing the materialization.
+    streams::wake(state);
 }
 
 fn drain_runtime_effects(state: &mut BridgeState) -> Vec<(String, String)> {
@@ -5275,7 +5295,9 @@ fn reserve_attachment_locked(
             );
             match attached {
                 Ok(()) => {
-                    if let Some(materialization) = materialization {
+                    if let Some(mut materialization) = materialization {
+                        // A retry is another attachment attempt owned by the same workflow.
+                        materialization.failure_recorded = false;
                         state
                             .sessions
                             .resources_mut(session_id)
@@ -7074,6 +7096,7 @@ mod tests {
             .materialization = Some(crate::session_resources::MaterializationResources {
             attempt_id: "cold-load".to_string(),
             cancellation: cancellation.clone(),
+            failure_recorded: false,
         });
         let state = Arc::new(BridgeLock::new(bridge));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -7792,6 +7815,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_subscriber_between_failure_and_cleanup_keeps_the_cause_and_can_load_again() {
+        use crate::protocol::tree_stream::params::parse_stream_query;
+        use crate::protocol::tree_stream::wire::{Change, EndReason};
+
+        for rpc_error in [true, false] {
+            let (events, mut wakes) = mpsc::unbounded_channel();
+            let mut bridge = BridgeState {
+                agent_capabilities: Some(serde_json::from_value(json!({ "loadSession": true })).unwrap()),
+                observer_events: Some(events),
+                ..BridgeState::default()
+            };
+            let command = prepare_session_load(&mut bridge, "saved".into(), Some("/workspace".into())).unwrap();
+            let owner = command["bridgeMaterializationId"].as_str().unwrap().to_string();
+            let token = session_materialization(&bridge, "saved").unwrap().cancellation.clone();
+            let publication = bridge.protocol.publication.clone();
+            let state = Arc::new(BridgeLock::new(bridge));
+            reserve_attachment_with_cwd(
+                "saved", RuntimeSessionOperationKind::Load, Some("/workspace"),
+                "first-attempt", Some(&owner), &state,
+            ).await.unwrap();
+            let query = parse_stream_query("follow=/sessions/saved&cwd=saved:/workspace").unwrap();
+            let first = publication.lock().feed.subscribe_tree(&query);
+            while first.try_next().is_some() {}
+            let error = Error::invalid_params().data("the first load failed");
+            {
+                let mut state = state.lock().await;
+                if rpc_error {
+                    settle_runtime_attachment_request_error(
+                        &mut state, "saved", "first-attempt", RuntimeSessionOperationKind::Load, false, &error,
+                    ).unwrap();
+                } else {
+                    fail_runtime_attachment(
+                        &mut state, "saved", "first-attempt", RuntimeSessionOperationKind::Load, false, &error,
+                    ).unwrap();
+                }
+                assert!(session_materialization(&state, "saved").unwrap().failure_recorded);
+            } // The first guard publishes the registry's original load_failed.
+            let end = first.try_next().expect("the authoritative failure");
+            assert!(end.changes.as_ref().unwrap().iter().any(|change| {
+                matches!(change, Change::End { end, .. } if end.reason == EndReason::LoadFailed)
+            }));
+            let original = publication.lock().feed.with_tree(|tree| {
+                tree.get("/global/loadFailures/saved").unwrap().to_value()
+            });
+            assert_eq!(original["code"], "agent_error");
+            assert!(!token.is_cancelled(), "only the result owner releases its token");
+
+            // HTTP registers directly with the feed after the failure commit. Its first
+            // ServeStreams can run while the old materialization still occupies the session.
+            let next = publication.lock().feed.subscribe_tree(&query);
+            while next.try_next().is_some() {}
+            {
+                let mut state = state.lock().await;
+                assert!(streams::serve(&mut state).is_none());
+            }
+            while wakes.try_recv().is_ok() {}
+            {
+                let mut state = state.lock().await;
+                finish_materialization(&mut state, "saved", &owner, &Err(error));
+            } // A separate guard finishes the old result after the new subscription exists.
+            assert!(token.is_cancelled());
+            assert!(first.try_next().is_none(), "the original subscription is not ended twice");
+            assert!(next.try_next().is_none(), "old cleanup must not end the new subscriber");
+            publication.lock().feed.with_tree(|tree| {
+                assert_eq!(tree.get("/global/loadFailures/saved").unwrap().to_value(), original);
+            });
+            assert_eq!(publication.lock().feed.followed_sessions()["saved"].len(), 1);
+            assert!(matches!(wakes.try_recv(), Ok(BridgeInput::ServeStreams)), "cleanup renews the consumed wakeup");
+            let mut state = state.lock().await;
+            let retry = streams::serve(&mut state).expect("the new subscriber starts its own load");
+            assert_eq!(retry["type"], "session/load");
+            assert_ne!(retry["bridgeMaterializationId"], owner);
+            let next_owner = session_materialization(&state, "saved").unwrap();
+            let next_token = next_owner.cancellation.clone();
+            assert!(!next_owner.failure_recorded);
+            finish_materialization(&mut state, "saved", &owner, &Err(Error::internal_error()));
+            assert!(!next_token.is_cancelled(), "an old result cannot cancel the next owner");
+        }
+    }
+
+    #[tokio::test]
     async fn only_the_owner_can_settle_a_materialization() {
         let state = Arc::new(BridgeLock::new(BridgeState::default()));
         {
@@ -7804,6 +7908,7 @@ mod tests {
                 .materialization = Some(crate::session_resources::MaterializationResources {
                 attempt_id: "owner".into(),
                 cancellation: CancellationToken::new(),
+                failure_recorded: false,
             });
         }
 

@@ -120,14 +120,13 @@ impl Feed {
     /// `subscribe_tree`; a read (`linger`) keeps the views it asks for.
     pub(crate) fn subscribe_tree_at(&mut self, query: &StreamQuery, linger: bool) -> SubscriptionId {
         self.materialize_views(query, linger, Instant::now());
-        self.align_tree(query)
+        self.add_subscriber(TreeSubscriber::new(query, &self.tree))
     }
 
-    /// Aligns with the existing cut, without materializing views or requesting a load.
-    fn align_tree(&mut self, query: &StreamQuery) -> SubscriptionId {
+    fn add_subscriber(&mut self, subscriber: TreeSubscriber) -> SubscriptionId {
         let id = self.next_id;
         self.next_id += 1;
-        self.tree_subscribers.insert(id, TreeSubscriber::new(query, &self.tree));
+        self.tree_subscribers.insert(id, subscriber);
         id
     }
 
@@ -210,16 +209,7 @@ impl Feed {
             .is_some();
         if !published
             && let (EndReason::LoadFailed, Some(error)) = (end.reason, &end.error)
-            && (!self.projector.has_failure(session_id)
-                || self.pending_loads.contains_key(session_id)
-                || self.tree_subscribers.values().any(|subscriber| {
-                    subscriber.followed().any(|path| session_of(path).as_deref() == Some(session_id))
-                }))
         {
-            // The load's cleanup can report its failure again after its registry transition
-            // was committed. Keep that transition's original error once no one waits for it.
-            // A new request renews demand; registry-ended loads are recorded unconditionally
-            // by commit_ending, including when a short read has already gone away.
             self.projector.record_failure(session_id, error.clone());
             let failures = self.projector.load_failures();
             if let Some(committed) = self.tree.commit_at("/global/loadFailures", failures) {
@@ -432,7 +422,12 @@ impl FeedHandle {
         let id = if self.0.closed.load(Ordering::SeqCst) {
             // A read can still inspect the final cut after shutdown. A new stream has no
             // further events to follow; neither case materializes views or requests a load.
-            if linger { feed.align_tree(query) } else { 0 }
+            if linger {
+                let subscriber = TreeSubscriber::final_snapshot(query, &feed.tree);
+                feed.add_subscriber(subscriber)
+            } else {
+                0
+            }
         } else {
             feed.subscribe_tree_at(query, linger)
         };
