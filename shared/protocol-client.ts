@@ -205,6 +205,7 @@ export class WriteQueue {
     if (queue === undefined || queue.sending?.id === id) return;
     queue.items = queue.items.filter((item) => item.id !== id);
     queue.refused.delete(id);
+    queue.repeated.delete(id);
   }
 
   #queue(scope: string): ScopeQueue {
