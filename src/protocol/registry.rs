@@ -291,10 +291,9 @@ impl SessionRegistry {
         if !self.slot_mut(&scope).is_running() {
             return;
         }
-        self.scopes
-            .occupied
-            .retain(|_, occupier| *occupier != scope);
+        let freed = self.take_occupied_by(&scope);
         self.slot_mut(&scope).fail(error);
+        self.leave_op_in(&freed, &scope);
     }
 
     /// The slot a held scope shows: the occupying operation's, if any.
@@ -494,19 +493,13 @@ impl SessionRegistry {
         if !self.held_scope(scope) || !self.slot_mut(scope).is_running_kind(kind) {
             return;
         }
-        if kind == OperationKind::Delete {
-            let occupied: Vec<String> = self
-                .scopes
-                .occupied
-                .iter()
-                .filter(|(_, occupier)| *occupier == scope)
-                .map(|(session_id, _)| session_id.clone())
-                .collect();
-            for session_id in occupied {
-                self.scopes.occupied.remove(&session_id);
-            }
-        }
+        let freed = if kind == OperationKind::Delete {
+            self.take_occupied_by(scope)
+        } else {
+            Vec::new()
+        };
         self.slot_mut(scope).fail(error);
+        self.leave_op_in(&freed, scope);
     }
 
     /// A delete of a session the bridge does not hold completed.
@@ -623,7 +616,9 @@ impl SessionRegistry {
                 }
             }
         }
-        self.scopes.occupied.clear();
+        for (session_id, occupier) in std::mem::take(&mut self.scopes.occupied) {
+            self.leave_op_in(&[session_id], &occupier);
+        }
         self.scopes.completed_parents.clear();
         self.request_elicitations.clear();
         mark_ended(&mut self.request_url_flows);
@@ -724,6 +719,7 @@ impl SessionRegistry {
         if kind == SessionOperationKind::Delete {
             if let Some(occupier) = self.free_occupation(session_id) {
                 self.slot_mut(&occupier).fail(agent_error(error));
+                self.leave_op_in(&[session_id.to_string()], &occupier);
             }
             return;
         }
@@ -761,6 +757,41 @@ impl SessionRegistry {
                 error: Some(agent_error(error)),
             },
         ));
+    }
+
+    /// Ends the occupation `scope` holds and returns the sessions it freed.
+    fn take_occupied_by(&mut self, scope: &Scope) -> Vec<String> {
+        let freed: Vec<String> = self
+            .scopes
+            .occupied
+            .iter()
+            .filter(|(_, occupier)| *occupier == scope)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in &freed {
+            self.scopes.occupied.remove(session_id);
+        }
+        freed
+    }
+
+    /// The occupying operation of `occupier` ended without removing the sessions it occupied: they
+    /// keep showing it. A session's `op.id` never returns to an ID it showed before, so a client
+    /// that expected the operation it replaced can never be admitted (design §9.2, §9.3).
+    fn leave_op_in(&mut self, sessions: &[String], occupier: &Scope) {
+        let mut shown = match occupier {
+            Scope::Global => self.scopes.global.clone(),
+            Scope::Catalog => self.scopes.catalog.clone(),
+            Scope::Session(id) => match self.held_live(id) {
+                Some(live) => live.op.clone(),
+                None => return,
+            },
+        };
+        shown.completion = super::op::Completion::default();
+        for session_id in sessions {
+            if let Some(live) = self.held_live_mut(session_id) {
+                live.op = shown.clone();
+            }
+        }
     }
 
     fn free_occupation(&mut self, session_id: &str) -> Option<Scope> {

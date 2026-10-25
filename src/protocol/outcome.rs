@@ -71,15 +71,18 @@ pub(crate) fn outcome(target: &TargetState, request: &Request) -> Outcome {
     if let Some(record) = target.ops.iter().find(|record| record.id == request.id) {
         return Outcome::Admitted { record: record.id.clone() };
     }
+    // `e` still being the target's `op` means no operation replaced it, whatever the log says: it
+    // is checked before `superseded`, which must never be answered for a request that may yet be
+    // admitted.
+    if target.op == request.expect {
+        return Outcome::Open;
+    }
     if target
         .ops
         .iter()
         .any(|record| record.after.as_deref() == Some(request.expect.as_str()))
     {
         return Outcome::Superseded;
-    }
-    if target.op == request.expect {
-        return Outcome::Open;
     }
     Outcome::Unknown { reason: Reason::Expired }
 }
