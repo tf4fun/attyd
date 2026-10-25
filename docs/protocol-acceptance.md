@@ -133,6 +133,17 @@ The existing `runtime_state` cases
 successful reload invalidates old control request identities, while a failed reload
 preserves them with the original installation.
 
+Prompt admission during close (#224, P2-4) is covered by
+[closing.rs](../src/server/stream_tests/bench/closing.rs), through real HTTP and a
+scripted ACP Agent. Each case waits until the Agent has received `session/close` and
+the session publishes `closing: true`, then withholds the close response while writing
+the prompt. Native node reads include both the current operation and its `ops` records.
+
+| Boundary | Gate |
+| --- | --- |
+| A new prompt with the current `expect` is refused with HTTP 409 `not_allowed`; `op`, `ops`, `opDetail`, entries and prompt outcomes stay unchanged, and no ACP prompt is sent. After close fails, the same identity, expect and input execute once and complete | `a_prompt_during_close_is_refused_without_admission_and_can_start_after_close_fails` |
+| Repeating an already accepted prompt ID while closing still returns HTTP 202 before checking its original, now stale `expect`; it changes no state and sends no second ACP prompt, whether the original is running or completed | `an_accepted_prompt_identity_stays_idempotent_during_close` |
+
 The reference client's memory figures count UTF-8 window text, not the actual heap used
 by parsed JSON and replica copies. View polling below the 30-second `VIEW_LINGER` can
 receive `unchanged`; after eviction it receives a full snapshot again. These are the
