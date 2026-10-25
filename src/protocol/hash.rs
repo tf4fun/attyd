@@ -3,7 +3,6 @@
 //! Text is hashed as a chain over fixed segments, so that a client can verify and continue a
 //! window of a text it does not hold whole. Everything is `SHA-256`; node hashes are 32 bytes
 //! and go on the wire as the unpadded base64url of their first 16 bytes (`digest::wire`).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -48,6 +47,7 @@ pub(crate) fn chain_step(before: &Hash, segment: &str) -> Hash {
 }
 
 /// The chain states after each segment of `text`.
+#[cfg(test)]
 pub(crate) fn chain_states(text: &str) -> Vec<Hash> {
     let mut state = ZERO;
     segments(text)
@@ -75,6 +75,7 @@ pub(crate) fn finish_for_tests(length: u64, last: &Hash) -> Hash {
 }
 
 /// The hash of a whole text.
+#[cfg(test)]
 pub(crate) fn text_hash(text: &str) -> Hash {
     finish(text.len() as u64, &chain_states(text).last().copied().unwrap_or(ZERO))
 }
@@ -127,6 +128,7 @@ impl TextChain {
 
 /// The hash of a text of `length` bytes of which a client holds the tail `text`, starting at a
 /// segment boundary whose chain state is `before`. It equals `text_hash` of the whole text.
+#[cfg(test)]
 pub(crate) fn window_hash(before: &Hash, length: u64, text: &str) -> Hash {
     let last = segments(text).fold(*before, |state, segment| chain_step(&state, segment));
     finish(length, &last)
@@ -206,6 +208,7 @@ pub(crate) fn text_pointers(rule: TextRule, value: &Value) -> Vec<String> {
 
 /// `h = H("v" ‖ canon(value'))`: `value'` is the value with each text position replaced by
 /// `"#"` and the unpadded base64url of that text's hash.
+#[cfg(test)]
 pub(crate) fn value_hash(rule: TextRule, value: &Value) -> Hash {
     value_hash_with(rule, value, |_, text| text_hash(text))
 }

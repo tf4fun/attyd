@@ -23,6 +23,7 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
+    #[cfg(test)]
     pub(crate) fn parse(scope: &str) -> Option<Self> {
         match scope {
             "global" => Some(Self::Global),

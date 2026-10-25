@@ -7,14 +7,11 @@
 use super::*;
 use crate::protocol::admission::{self, Admitted, Answer, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError};
-use crate::protocol::op::OpEnd;
 use crate::protocol::registry::InstallError;
 
-/// An admitted write: its operation, and for `create`, `fork` and `list` the
-/// end its held response waits for (protocol §6.3).
+/// The identity of an admitted write; its result is published in the tree.
 pub(crate) struct OperationAdmission {
     pub op: String,
-    pub end: Option<oneshot::Receiver<OpEnd>>,
 }
 
 /// The internal command that tags the operation it runs for.
@@ -49,7 +46,7 @@ pub(super) fn admit(
         })?
     };
     if let Admitted::Repeat { op } = admitted {
-        return Ok(Write::Repeat(OperationAdmission { op, end: None }));
+        return Ok(Write::Repeat(OperationAdmission { op }));
     }
     let Admitted::Start {
         kind,
@@ -79,13 +76,8 @@ pub(super) fn admit(
             ProtocolError::new(ErrorCode::NotAllowed, format!("{scope} is not free"))
         }
     })?;
-    let end = matches!(kind, OpKind::Create | OpKind::Fork | OpKind::List).then(|| {
-        let (sender, end) = oneshot::channel();
-        state.sessions.hold_response(scope, &op, sender);
-        end
-    });
     let command = command(state, scope, kind, &op, input);
-    Ok(Write::Start(OperationAdmission { op, end }, command))
+    Ok(Write::Start(OperationAdmission { op }, command))
 }
 
 fn not_allowed(message: impl Into<String>) -> ProtocolError {
@@ -244,7 +236,7 @@ pub(super) fn apply(
             op
         }
     };
-    Ok(OperationAdmission { op, end: None })
+    Ok(OperationAdmission { op })
 }
 
 /// A cancel sets `cancelRequested` once and asks for the operation's end; a

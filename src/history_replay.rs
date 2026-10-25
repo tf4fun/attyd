@@ -86,11 +86,11 @@ impl HistoryBuilder {
     }
 }
 
-/// A completed replay: the folded updates the turn log is built from, and the
-/// session timeline reduced from the same updates as received (bridge memory
-/// model §6.2).
+/// The session timeline reduced from received replay updates (memory model §6.2).
 #[derive(Debug)]
 pub(crate) struct Replay {
+    /// Test provenance for comparing the timeline with the original folded updates.
+    #[cfg(test)]
     pub(crate) updates: Vec<Value>,
     pub(crate) timeline: Timeline,
 }
@@ -220,10 +220,13 @@ impl ReplayCandidate {
         let mut data = self.lock();
         data.updates()?;
         data.sealed = true;
-        Ok(Replay {
+        let replay = Replay {
+            #[cfg(test)]
             updates: std::mem::take(&mut data.history).updates,
             timeline: std::mem::take(&mut data.timeline),
-        })
+        };
+        data.history = HistoryBuilder::default();
+        Ok(replay)
     }
 
     pub(crate) fn discard(&self) {

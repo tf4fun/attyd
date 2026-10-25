@@ -9,7 +9,6 @@
 //!
 //! Values are compared by `Arc` first, so an entry the bridge did not touch costs a
 //! pointer comparison, not a walk of its JSON.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -157,6 +156,7 @@ impl Node {
     }
 
     /// The kind of this node, as the shape of the tree names it.
+    #[cfg(test)]
     pub(crate) fn kind_name(&self) -> &'static str {
         match &self.body {
             Body::Value(..) => "value",
@@ -175,6 +175,7 @@ impl Node {
     }
 
     /// Visits this node and everything below it with its path.
+    #[cfg(test)]
     pub(crate) fn walk<'a>(&'a self, path: &str, visit: &mut impl FnMut(&str, &'a Node)) {
         visit(path, self);
         match &self.body {
@@ -688,11 +689,13 @@ impl Tree {
     /// Publishes `root`, the complete tree. When it differs from the published one the
     /// revision rises by exactly one, however many paths changed, and the new revision is
     /// returned; otherwise nothing changes.
+    #[cfg(test)]
     pub(crate) fn commit(&mut self, root: BTreeMap<String, Spec>) -> Option<u64> {
         self.commit_with_ops(root).map(|committed| committed.rev)
     }
 
     /// `commit`, with the ops that turn the tree before into the tree after.
+    #[cfg(test)]
     pub(crate) fn commit_with_ops(&mut self, root: BTreeMap<String, Spec>) -> Option<Committed> {
         let next = self.rev + 1;
         let mut ops = Vec::new();

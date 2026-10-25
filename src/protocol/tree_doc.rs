@@ -3,7 +3,6 @@
 //! A projection of the registry into the `Spec` the tree is committed from, keeping unchanged
 //! entry values and the attachment blocks their references name. The operation is split into
 //! its head and its detail (§4.4).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

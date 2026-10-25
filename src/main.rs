@@ -1,3 +1,6 @@
+// Keep this crate warning-free in test, development and release builds.
+#![deny(warnings)]
+
 mod agent_process;
 mod auth_terminal;
 mod auto_close;

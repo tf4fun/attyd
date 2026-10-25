@@ -182,6 +182,7 @@ impl SessionRegistry {
     /// Installs a running operation in `scope` and occupies the other scopes it
     /// acts on (a delete occupies its session). Admission (protocol §6.4) is
     /// checked by the caller; this only refuses a scope that is not free.
+    #[cfg(test)]
     pub(crate) fn install_operation(
         &mut self,
         scope: &Scope,
@@ -254,22 +255,6 @@ impl SessionRegistry {
             self.scopes.occupied.insert(session_id, scope.clone());
         }
         Ok(id)
-    }
-
-    /// The held response of the running operation `op` in `scope` takes its
-    /// end (protocol §6.3).
-    pub(crate) fn hold_response(
-        &mut self,
-        scope: &Scope,
-        op: &str,
-        sender: tokio::sync::oneshot::Sender<super::op::OpEnd>,
-    ) {
-        if self.held_scope(scope) {
-            let slot = self.slot_mut(scope);
-            if slot.id == op && slot.is_running() {
-                slot.completion = super::op::Completion::new(sender);
-            }
-        }
     }
 
     /// The running operation `op`, wherever it is, failed: it frees the
@@ -484,6 +469,7 @@ impl SessionRegistry {
 
     /// The running operation of `kind` in `scope` failed. A failed delete
     /// frees the session it occupied.
+    #[cfg(test)]
     pub(crate) fn fail_scope_operation(
         &mut self,
         scope: &Scope,
@@ -779,7 +765,7 @@ impl SessionRegistry {
     /// keep showing it. A session's `op.id` never returns to an ID it showed before, so a client
     /// that expected the operation it replaced can never be admitted (design §9.2, §9.3).
     fn leave_op_in(&mut self, sessions: &[String], occupier: &Scope) {
-        let mut shown = match occupier {
+        let shown = match occupier {
             Scope::Global => self.scopes.global.clone(),
             Scope::Catalog => self.scopes.catalog.clone(),
             Scope::Session(id) => match self.held_live(id) {
@@ -787,7 +773,6 @@ impl SessionRegistry {
                 None => return,
             },
         };
-        shown.completion = super::op::Completion::default();
         for session_id in sessions {
             if let Some(live) = self.held_live_mut(session_id) {
                 live.op = shown.clone();

@@ -9,6 +9,7 @@ use super::wire::{SNode, Snapshot};
 /// A node with `srev ≤ have` is omitted (the client keeps its own); a value node that changed
 /// is sent whole; a container that changed is sent as its structure and the children that
 /// changed. `None` when `path` is not in the tree.
+#[cfg(test)]
 pub(crate) fn snapshot(tree: &Tree, path: &str, have: Option<u64>) -> Option<Snapshot> {
     snapshot_windowed(tree, path, have, None)
 }

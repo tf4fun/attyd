@@ -100,15 +100,6 @@ impl EventSink {
     }
 }
 
-fn ensure_interaction_delivered(delivered: bool, interaction: &str) -> Result<(), Error> {
-    if !delivered {
-        return Err(Error::request_cancelled().data(format!(
-            "Agent cancelled the {interaction} request before delivery"
-        )));
-    }
-    Ok(())
-}
-
 fn relay_bytes(value: &impl Serialize) -> Result<usize, Error> {
     let bytes = serde_json::to_vec(value)?.len();
     Ok(bytes)
@@ -4848,13 +4839,6 @@ fn nonempty_string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, E
         .ok_or_else(|| Error::invalid_params().data(format!("{field} must contain non-empty")))
 }
 
-fn string_field_allow_empty<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::invalid_params().data(format!("{field} must be a string")))
-}
-
 fn u16_field(value: &Value, field: &str) -> Result<u16, Error> {
     value
         .get(field)
@@ -6235,20 +6219,32 @@ mod tests {
             admitted.await.unwrap().unwrap()
         }
 
-        /// Lists the catalog: the page its held response ends with.
+        /// Observes this operation's final result through the R4 stream.
+        pub(super) async fn ended(
+            &mut self,
+            scope: &str,
+            id: &str,
+        ) -> Result<Value, crate::protocol::documents::ProtocolError> {
+            self.until(|stream| {
+                let op = &stream.live(scope)["op"];
+                op["id"] == id && matches!(op["status"].as_str(), Some("completed" | "failed"))
+            })
+            .await;
+            let op = &self.live(scope)["op"];
+            if op["status"] == "completed" {
+                Ok(op["result"].clone())
+            } else {
+                Err(serde_json::from_value(op["error"].clone()).unwrap())
+            }
+        }
+
+        /// Lists the catalog and reads its published page.
         pub(super) async fn list(
             &mut self,
             commands: &mpsc::UnboundedSender<BridgeInput>,
         ) -> Value {
             let admission = self.write(commands, "catalog", "list", json!({})).await;
-            let page = tokio::time::timeout(Duration::from_secs(10), admission.end.unwrap())
-                .await
-                .expect("the list did not end")
-                .unwrap()
-                .unwrap();
-            self.until(|stream| stream.live("catalog")["op"]["id"] == admission.op)
-                .await;
-            page
+            self.ended("catalog", &admission.op).await.unwrap()
         }
     }
 
@@ -6378,11 +6374,7 @@ mod tests {
         let created = global
             .write(&commands, "global", "create", json!({"cwd": cwd}))
             .await;
-        let created = tokio::time::timeout(Duration::from_secs(10), created.end.unwrap())
-            .await
-            .expect("the create did not end")
-            .unwrap()
-            .unwrap();
+        let created = global.ended("global", &created.op).await.unwrap();
         assert_eq!(created["sessionId"], "test-session");
         let scope = "session/test-session";
         let mut session = V2Stream::open(&commands, &[(scope, None)]).await;
@@ -6468,13 +6460,6 @@ mod tests {
         assert!(!remote.fs.read_text_file);
         assert!(!remote.terminal);
         assert!(!remote.auth.terminal);
-    }
-
-    #[test]
-    fn failed_interaction_delivery_is_never_reported_as_resolved() {
-        let error = ensure_interaction_delivered(false, "elicitation").unwrap_err();
-        assert_eq!(error.code, ErrorCode::RequestCancelled);
-        ensure_interaction_delivered(true, "elicitation").unwrap();
     }
 
     #[tokio::test]
@@ -7260,7 +7245,6 @@ mod tests {
         assert!(string_field(&command, "wideIdentifier").is_ok());
         assert!(string_field(&command, "tooWideIdentifier").is_ok());
         assert!(nonempty_string_field(&command, "path").is_ok());
-        assert_eq!(string_field_allow_empty(&command, "empty").unwrap(), "");
         assert_eq!(u16_field(&command, "cols").unwrap(), 80);
         assert!(u16_field(&command, "zero").is_err());
         assert!(u16_field(&json!({ "cols": 65_536 }), "cols").is_err());
@@ -9061,17 +9045,10 @@ mod catalog_command_tests {
         let new = wire.next_request().await;
         assert_eq!(new["method"], "session/new");
         wire.reply(&new, json!({"sessionId": "created"})).await;
-        tokio::time::timeout(Duration::from_secs(3), creating.end.unwrap())
-            .await
-            .expect("the create did not end")
-            .unwrap()
-            .unwrap();
+        stream.ended("global", &creating.op).await.unwrap();
         wire.reply(&list, json!({"sessions": [], "nextCursor": null}))
             .await;
-        let stale = tokio::time::timeout(Duration::from_secs(3), listing.end.unwrap())
-            .await
-            .expect("the list did not end")
-            .unwrap();
+        let stale = stream.ended("catalog", &listing.op).await;
         assert!(stale.is_err(), "a stale page was returned: {stale:?}");
         stream
             .until(|stream| {

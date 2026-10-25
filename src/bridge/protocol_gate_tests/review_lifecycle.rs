@@ -88,7 +88,7 @@ async fn review_request_scoped_session_flow_is_removed_when_its_scope_is_deleted
     );
     peer.reply(&new_request, json!({"sessionId": "other"}))
         .await;
-    Peer::ended(creating).await.unwrap();
+    peer.ended(creating).await.unwrap();
     peer.until("the replacement flow belongs to global", |peer| {
         peer.live("global")["urlFlows"].get(&replacement).is_some()
             && peer.live("global")["op"]["status"] == "completed"
@@ -235,7 +235,7 @@ async fn an_elicitation_that_names_no_outstanding_request_is_refused() {
     })
     .await;
     peer.reply(&request, json!({"sessionId": CREATED})).await;
-    Peer::ended(created).await.unwrap();
+    peer.ended(created).await.unwrap();
     peer.settled().await;
     assert_eq!(peer.live("global")["op"]["status"], "completed");
     assert_eq!(

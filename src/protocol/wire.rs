@@ -3,7 +3,6 @@
 //! and applies a write is internal. The server reads an operation write
 //! field by field, so admission keeps its refusal order (§6.4); the request
 //! shapes that it does not deserialize exist for the generated client types.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,6 +17,10 @@ use super::documents::ProtocolError;
 /// New operations carry a client-chosen identity; cancellation acts on `expect`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum OpRequest {
     Prompt {
@@ -70,6 +73,10 @@ pub(crate) enum OpRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "kind", content = "args", rename_all = "snake_case")]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) enum OpArgs {
     Prompt(PromptArgs),
     Fork(ForkArgs),
@@ -94,6 +101,10 @@ pub(crate) fn value<T: Serialize>(dto: &T) -> Value {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) struct PromptArgs {
     pub prompt: Vec<PromptBlock>,
 }
@@ -101,6 +112,10 @@ pub(crate) struct PromptArgs {
 /// Default `cwd`: the source session's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) struct ForkArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -109,6 +124,10 @@ pub(crate) struct ForkArgs {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) struct CreateArgs {
     pub cwd: String,
 }
@@ -116,6 +135,10 @@ pub(crate) struct CreateArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) struct DeleteArgs {
     pub session_id: String,
 }
@@ -124,6 +147,10 @@ pub(crate) struct DeleteArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) struct MethodArgs {
     pub method_id: String,
 }
@@ -131,6 +158,10 @@ pub(crate) struct MethodArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) struct TerminalLoginArgs {
     pub method_id: String,
     pub cols: u16,
@@ -139,6 +170,10 @@ pub(crate) struct TerminalLoginArgs {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) struct ListArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -153,6 +188,10 @@ pub(crate) struct ListArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(untagged)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Public request DTO for TypeScript generation; admission parses JSON directly")
+)]
 pub(crate) enum Answer {
     Permission {
         #[cfg_attr(test, ts(type = "RequestPermissionOutcome"))]
