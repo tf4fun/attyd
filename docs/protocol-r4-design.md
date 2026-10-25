@@ -362,14 +362,17 @@ interface End { reason: "deleted" | "closed" | "load_failed" | "absent" | "repla
 
 The client holds, per followed path `p`, a path version `v_p`.
 
-- A **snapshot** sets the content of `p` and `v_p = snapshot.at` (§6.3), not the event's
+- An installed **snapshot** sets the content of `p` and `v_p = snapshot.at` (§6.3), not the event's
   `rev`: a path last changed at 5 and snapshotted at global revision 100 is held at 5.
 - An **ops change** in a commit event at `rev` carries `from`, the path version before the
   commit. The client applies it only if `from == v_p`, then sets `v_p = rev` (the commit
   changed `p`, so its new path version is `rev`).
-- A change whose resulting version is `≤ v_p` (a snapshot with `at ≤ v_p` and the same
-  instance, or an ops change with `rev ≤ v_p`) is a duplicate and is ignored (**receive
-  idempotence**). Any other mismatch, or an op that does not apply, is a gap: the client
+- In the same instance, a snapshot with `at < v_p` and an ops change with `rev ≤ v_p`
+  are ignored (**receive idempotence**). A snapshot with `at == v_p` verifies the content
+  already held against its `hash`: a match confirms it through `v_p`; a mismatch drops
+  the replica and resubscribes without that path's `have`. It never reinstalls the
+  snapshot's payload, whether full, `same`, or a differential snapshot from an older
+  `base`. Any other version mismatch, or an op that does not apply, is a gap: the client
   resubscribes with its `have`s.
 - All changes of one commit arrive in one event and are applied together: everything a
   client follows is consistent at that commit.
@@ -412,8 +415,9 @@ type SNode =
 For `have = h`, the bridge walks the subtree: a node with `srev ≤ h` is omitted (the
 client keeps its own); a value node with `srev > h` is sent whole; a container with
 `srev > h` is sent as its structure (own fields, all keys, or the length) plus its
-children with `srev > h`. The client installs into a copy: it keeps every child the
-structure names and the snapshot omits, drops every child the structure no longer names,
+children with `srev > h`. When installing a new path or a newer snapshot, the client
+installs into a copy: it keeps every child the structure names and the snapshot omits,
+drops every child the structure no longer names,
 and replaces the rest. By §4.7 a kept child is exactly the bridge's current value. The
 copy is adopted only if its hash matches; then `v_p = at`.
 
@@ -650,9 +654,10 @@ version)` every client holds the same content of a path, which their hashes conf
 They need not receive updates at the same moment; coalescing never changes what a
 version contains.
 
-**S3. Duplicates and retries.** A change that does not advance `v_p` is ignored, and a
-gap is never applied (receive). A request repeated with its own identity executes at most
-once (§9.2), and a new identity is only made after `superseded` (§9.3) (submit).
+**S3. Duplicates and retries.** A repeated change is never applied twice; a same-version
+snapshot verifies the content already held, and a gap is never applied (receive). A
+request repeated with its own identity executes at most once (§9.2), and a new identity
+is only made after `superseded` (§9.3) (submit).
 
 **S4. Conflicting writes.** Two clients write prompts to `sessions/S` with the same
 `expect`. One is admitted; the other gets `stale`, keeps its input, and its outcome is
@@ -771,6 +776,10 @@ Acceptance cases to add to [protocol-acceptance](protocol-acceptance.md):
   released after the timeout once polling stops;
 - the only change to a path is lost and the path goes quiet: the next checkpoint has
   `at > v_p` and the client recovers;
+- a corrupted append advances the held version, then the stream breaks before its
+  checkpoint: the reconnect's same-version snapshot verifies the held content and
+  requests a full snapshot on mismatch, even if no further change or checkpoint arrives
+  (#224, P2-1; concrete gates in [protocol-acceptance](protocol-acceptance.md));
 - a fixed view whose replica fails verification after a load is resubscribed without
   `have` and ends with `replaced`; it never shows the new history's turn;
 - after a bridge restart, the new instance happens to have the same `historyRev` and a turn

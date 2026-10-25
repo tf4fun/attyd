@@ -578,14 +578,17 @@ interface End { reason: "deleted" | "closed" | "load_failed" | "absent" | "repla
 
 The client holds, per followed path `p`, a path version `v_p`.
 
-- A **snapshot** sets the content of `p` and `v_p = snapshot.at` (§5.3), not the event's
+- An installed **snapshot** sets the content of `p` and `v_p = snapshot.at` (§5.3), not the event's
   `rev`: a path last changed at 5 and snapshotted at global revision 100 is held at 5.
 - An **ops change** in a commit event at `rev` carries `from`, the path version before the
   commit. The client applies it only if `from == v_p`, then sets `v_p = rev` (the commit
   changed `p`, so its new path version is `rev`).
-- A change whose resulting version is `≤ v_p` (a snapshot with `at ≤ v_p` and the same
-  instance, or an ops change with `rev ≤ v_p`) is a duplicate and is ignored (**receive
-  idempotence**). Any other mismatch, or an op that does not apply, is a gap: the client
+- In the same instance, a snapshot with `at < v_p` and an ops change with `rev ≤ v_p`
+  are ignored (**receive idempotence**). A snapshot with `at == v_p` verifies the content
+  already held against its `hash`: a match confirms it through `v_p`; a mismatch drops
+  the replica and resubscribes without that path's `have`. It never reinstalls the
+  snapshot's payload, whether full, `same`, or a differential snapshot from an older
+  `base`. Any other version mismatch, or an op that does not apply, is a gap: the client
   resubscribes with its `have`s.
 - All changes of one commit arrive in one event and are applied together: everything a
   client follows is consistent at that commit.
@@ -628,8 +631,9 @@ type SNode =
 For `have = h`, the bridge walks the subtree: a node with `srev ≤ h` is omitted (the
 client keeps its own); a value node with `srev > h` is sent whole; a container with
 `srev > h` is sent as its structure (own fields, all keys, or the length) plus its
-children with `srev > h`. The client installs into a copy: it keeps every child the
-structure names and the snapshot omits, drops every child the structure no longer names,
+children with `srev > h`. When installing a new path or a newer snapshot, the client
+installs into a copy: it keeps every child the structure names and the snapshot omits,
+drops every child the structure no longer names,
 and replaces the rest. By §2.7 a kept child is exactly the bridge's current value. The
 copy is adopted only if its hash matches; then `v_p = at`.
 
@@ -1095,6 +1099,7 @@ decode, apply, verify and install steps.
 | Inapplicable op | an op whose target is missing leaves the replica unchanged and triggers resubscription |
 | Wrong content with valid framing | alter a value in an event while keeping versions continuous; the next checkpoint detects it; a whole snapshot repairs it |
 | Corrupted local replica | replace a value in the replica without an event; the next checkpoint or reconnect snapshot detects and repairs it; a differential snapshot never confirms it |
+| Reconnect at the held version (#224, P2-1) | corrupt an append without changing its version, then disconnect before the checkpoint; a same-version `same` snapshot detects the wrong held content and triggers a resubscription without that path's `have`, whose full snapshot repairs it without any later change or checkpoint. Equal-version full and older-base differential snapshots also verify without reinstalling; older snapshots never roll the replica back |
 | A path last changed long ago | a snapshot gives `v_p = at`, and the next ops change chains from it |
 | The only change is lost | the path goes quiet; the next checkpoint has `at > v_p` and the client recovers |
 | Late update to an early entry | a reconnecting client receives only that entry's path and verifies |
