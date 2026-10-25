@@ -52,8 +52,8 @@ function shown() {
   const source: ReplicaSource = { get: (scope) => docs.get(scope) };
   return {
     source,
-    show(op: Record<string, unknown>, scope = S) {
-      docs.set(scope, { doc: { live: sessionLive(op) } });
+    show(op: Record<string, unknown>, scope = S, held: Record<string, unknown> = {}) {
+      docs.set(scope, { ...held, doc: { live: sessionLive(op) } });
     },
   };
 }
@@ -70,7 +70,7 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     const view = shown();
     view.show({ id: "op-A", kind: "prompt", status: "running" });
     const ops = new OpsClient(net.fetch, view.source);
-    const live = { get: (scope: string) => { const doc = view.source.get(scope); return doc === undefined ? undefined : { live: doc.doc.live }; } };
+    const live = { get: (scope: string) => { const doc = view.source.get(scope); return doc === undefined ? undefined : { live: doc.doc.live, rev: doc.rev }; } };
     return { net, view, queue: new WriteQueue(ops, live) };
   }
 
@@ -240,7 +240,7 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     const uncertain = q.enqueue(S, oldInput);
     net.calls[0].lose();
     await flush();
-    expect(q.items(S)).toEqual([{ id: uncertain, write: oldInput, state: "uncertain" }]);
+    expect(q.items(S)).toMatchObject([{ id: uncertain, write: oldInput, state: "uncertain" }]);
 
     q.update(S);
     await flush();
@@ -260,7 +260,7 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     q.update(S);
     await flush();
     expect(texts(net.calls)).toEqual(["old uncertain input", "different new input"]);
-    expect(q.items(S)).toEqual([{ id: uncertain, write: oldInput, state: "uncertain" }]);
+    expect(q.items(S)).toMatchObject([{ id: uncertain, write: oldInput, state: "uncertain" }]);
   });
 
   it("never sends a write without a definite answer again, whatever is refused later", async () => {
@@ -302,6 +302,79 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     q.update(S);
     expect(net.calls).toHaveLength(2);
     expect(net.calls[1].body).toMatchObject({ expect: "op-B", args: { prompt: [{ text: "maybe" }] } });
+  });
+
+  describe("an uncertain write is settled from the target's log (design §9.3)", () => {
+    const held = (rev: number, ops: unknown[], extra: Record<string, unknown> = {}) => ({ epoch: "I", rev, ops, heldSince: null, ...extra });
+
+    async function lostWrite() {
+      const made = queue();
+      made.queue.enqueue(S, prompt("maybe"));
+      made.view.show({ id: "op-A", status: "completed" }, S, held(10, []));
+      made.queue.update(S);
+      made.net.calls[0].lose();
+      await flush();
+      expect(made.queue.items(S)[0].state).toBe("uncertain");
+      return { ...made, sent: made.net.calls[0].body as { id: string; expect: string } };
+    }
+
+    it("leaves the queue when the log shows it admitted, and is not sent again", async () => {
+      const { net, view, queue: q, sent } = await lostWrite();
+      view.show({ id: "op-B", status: "completed" }, S, held(11, [{ id: sent.id, after: "op-A" }]));
+      q.update(S);
+      expect(q.items(S)).toHaveLength(0);
+      expect(net.calls).toHaveLength(1);
+    });
+
+    it("is sent again with a new id once another operation replaced the one it expected: only then", async () => {
+      const { net, view, queue: q, sent } = await lostWrite();
+      view.show({ id: "other", status: "completed" }, S, held(11, [{ id: "other", after: "op-A" }]));
+      q.update(S);
+      expect(net.calls).toHaveLength(2);
+      const again = net.calls[1].body as { id: string; expect: string };
+      expect(again.id).not.toBe(sent.id);
+      expect(again.expect).toBe("other");
+    });
+
+    it("is repeated unchanged, once, while the operation it expected is still the target's", async () => {
+      const { net, view, queue: q, sent } = await lostWrite();
+      view.show({ id: "op-A", status: "completed" }, S, held(11, []));
+      q.update(S);
+      expect(net.calls).toHaveLength(2);
+      expect(net.calls[1].body).toMatchObject({ id: sent.id, expect: sent.expect });
+      net.calls[1].lose();
+      await flush();
+      q.update(S);
+      expect(net.calls).toHaveLength(2);
+      expect(q.items(S)[0].state).toBe("uncertain");
+    });
+
+    it("leaves the queue when the repeat is admitted", async () => {
+      const { net, view, queue: q, sent } = await lostWrite();
+      view.show({ id: "op-A", status: "completed" }, S, held(11, []));
+      q.update(S);
+      net.calls[1].respond(202, { op: sent.id });
+      await flush();
+      expect(q.items(S)).toHaveLength(0);
+    });
+
+    it("is never sent as a new write because its repeat was refused", async () => {
+      const { net, view, queue: q } = await lostWrite();
+      view.show({ id: "op-A", status: "completed" }, S, held(11, []));
+      q.update(S);
+      net.calls[1].respond(409, { error: { code: "stale", message: "expected another operation" } });
+      await flush();
+      expect(net.calls).toHaveLength(2);
+      expect(q.items(S)[0].state).toBe("uncertain");
+    });
+
+    it("is left to the user when the bridge restarted, and nothing is sent", async () => {
+      const { net, view, queue: q } = await lostWrite();
+      view.show({ id: "op-X", status: "completed" }, S, held(3, [], { epoch: "J" }));
+      q.update(S);
+      expect(net.calls).toHaveLength(1);
+      expect(q.items(S)[0].state).toBe("uncertain");
+    });
   });
 
   it("never sends a write the user took back", () => {

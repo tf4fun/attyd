@@ -239,7 +239,7 @@ export class Workspace {
     this.#queue = new WriteQueue(this.#ops, {
       get: (scope) => {
         const replica = feed.get(scope);
-        return replica === undefined ? undefined : { live: replica.doc.live };
+        return replica === undefined ? undefined : { live: replica.doc.live, rev: replica.rev };
       },
     });
     feed.subscribe((scope) => {

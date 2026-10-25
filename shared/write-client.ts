@@ -17,7 +17,8 @@ import {
   type HttpFetch,
 } from "./protocol-client";
 import type { Logged, TargetState } from "./outcome";
-import { newOperationId, resolveWrite, type Resolution, type Write } from "./write-resolution";
+import { newOperationId, nextStep, resolveWrite, type Resolution, type Write } from "./write-resolution";
+import type { Next } from "./outcome";
 
 export type { ActionOutcome } from "./protocol-client";
 export type { Write } from "./write-resolution";
@@ -89,16 +90,24 @@ export class OpsClient {
 
   /** What became of `write`, from the log of the target it was written to as the client holds it (§9.3). */
   resolve(write: Write): Resolution {
+    return resolveWrite(write, this.#targetOf(write));
+  }
+
+  /** What the client may do next with `write` (§9.3), from the same log. */
+  nextStep(write: Write): Next {
+    return nextStep(write, this.#targetOf(write));
+  }
+
+  #targetOf(write: Write): TargetState | undefined {
     const held = this.#replicas.get(write.scope);
     const op = shownOperation(this.#replicas, write.scope);
-    if (held === undefined || op === undefined) return "unknown";
-    const target: TargetState = {
+    if (held === undefined || op === undefined) return undefined;
+    return {
       instance: held.epoch ?? write.instance ?? "",
       op: op.id,
       heldSince: held.heldSince ?? null,
       ops: held.ops ?? [],
     };
-    return resolveWrite(write, target);
   }
 
   /** Where the bridge says what became of `write` (§9.3): `GET` this and give the answer to `resolveFrom`. */
