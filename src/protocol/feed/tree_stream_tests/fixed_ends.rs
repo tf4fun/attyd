@@ -163,8 +163,10 @@ fn a_fixed_view_replaced_after_alignment_keeps_its_end_while_session_paths_can_r
 
         // The terminal state belongs only to the fixed selection. An ordinary session
         // path on the same stream can end, then start again with its new contents.
+        // Keep the same registry: replacing it would also rewind global operation IDs.
+        registry.retire_entry("s");
         feed.commit_ending(
-            &SessionRegistry::new("epoch"),
+            &registry,
             &agent(),
             1,
             Instant::now(),
@@ -183,6 +185,9 @@ fn a_fixed_view_replaced_after_alignment_keeps_its_end_while_session_paths_can_r
         client.apply(&closed).unwrap();
         assert!(client.value(ENTRIES).is_none());
 
+        registry
+            .open_new("epoch", "s", "/work", json!({ "sessionId": "s" }))
+            .unwrap();
         conversation(&mut registry, "again", "new output");
         feed.commit(&registry, &agent(), 1);
         coalesce_again(&mut feed, id);
