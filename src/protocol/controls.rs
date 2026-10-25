@@ -121,6 +121,8 @@ impl SessionControls {
         }
         if let Some(options) = response.get("configOptions").and_then(Value::as_array) {
             self.config_options = Some(options.clone());
+            // The response's array has no source metadata; each option keeps its own `_meta`.
+            self.meta.config_options = None;
         }
     }
 
@@ -385,6 +387,60 @@ mod tests {
         })]);
         kept.apply_response(&json!({ "configOptions": [] }));
         assert_eq!(kept.meta.modes, Some(source(json!({ "e": 1 }), Value::Null)));
+    }
+
+    #[test]
+    fn setup_config_options_replace_the_early_source_but_keep_each_options_metadata() {
+        let early = json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{"type": "boolean", "id": "verbose", "name": "Verbose",
+                "currentValue": false, "_meta": {"option": "early"}}],
+            "_meta": {"source": "early"}, "notificationMeta": {"envelope": "early"},
+        });
+        for options in [
+            json!([]),
+            json!([{"type": "boolean", "id": "verbose", "name": "Verbose",
+                "currentValue": true, "_meta": {"option": "response"}}]),
+        ] {
+            let controls = SessionControls::settle(
+                [&early],
+                &json!({"sessionId": "s", "configOptions": options}),
+            );
+            assert_eq!(
+                controls.config_options.as_ref().unwrap(),
+                options.as_array().unwrap()
+            );
+            assert_eq!(
+                controls.meta.config_options,
+                None,
+                "the old update no longer set this value"
+            );
+            assert!(serde_json::to_value(&controls).unwrap()["meta"].get("configOptions").is_none());
+        }
+    }
+
+    #[test]
+    fn a_setup_response_without_config_options_keeps_the_early_value_and_source() {
+        let early = json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{"type": "boolean", "id": "verbose", "name": "Verbose",
+                "currentValue": false, "_meta": {"option": "early"}}],
+            "_meta": {"source": "early"}, "notificationMeta": {"envelope": "early"},
+        });
+        for response in [
+            json!({"sessionId": "s"}),
+            json!({"sessionId": "s", "configOptions": null}),
+        ] {
+            let controls = SessionControls::settle([&early], &response);
+            assert_eq!(
+                controls.config_options.as_ref().unwrap(),
+                early["configOptions"].as_array().unwrap()
+            );
+            assert_eq!(
+                controls.meta.config_options,
+                Some(source(json!({"source": "early"}), json!({"envelope": "early"})))
+            );
+        }
     }
 
     #[test]
