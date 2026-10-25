@@ -45,6 +45,20 @@ scripts and Agent fixtures, Playwright browser tests, and ordinary unit tests ma
 the application's strict checks. Passing Vitest execution does not replace this
 static type check.
 
+The `attyd` Rust crate uses `#![deny(warnings)]`: a compiler warning fails the build,
+including the native test build, the `dev` feature check and all seven release targets
+in CI. This gate applies to this crate; dependency advisories are checked separately
+by the audit job. Draft CI checks the test build, while ready PRs also exercise the
+production configurations. CI does not currently run Clippy or a Rustfmt check;
+those tools have no enforced repository baseline.
+
+Helpers used only by Rust test fixtures are compiled with `#[cfg(test)]`. Production
+protocol modules have no blanket `dead_code` allowance. Public request DTOs retained
+for TypeScript generation have individual allowances explaining why the server does
+not construct them; the other local exceptions retain request-lifetime RAII ownership
+or completion/error provenance asserted by tests. New warnings must be removed or
+given a narrow, documented exception instead of disabling a module's checks.
+
 **Draft pull requests run the fast checks only**: release metadata, the npm and Rust dependency
 audits, TypeScript, the frontend tests, and the Rust tests (`npm run test:rust`). Marking the pull
 request ready for review runs the whole validation, and so does every later push to it: the
