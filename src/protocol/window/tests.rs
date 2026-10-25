@@ -132,3 +132,13 @@ fn a_value_with_windows_hashes_like_the_whole_value() {
 fn a_text_position_that_is_not_a_window_does_not_verify() {
     assert_eq!(windowed_value_hash(TextRule::Terminal, &json!({ "output": "plain" })), None);
 }
+
+#[test]
+fn a_window_of_any_size_a_client_names_never_overflows() {
+    // `N + L` of a client's `N` near the largest size must not overflow: a window that large holds
+    // the whole text, so every append is an append.
+    assert!(appends(1, usize::MAX));
+    assert!(appends(1 << 20, usize::MAX - L));
+    assert_eq!(window_offset("abc", usize::MAX), 0);
+    assert_eq!(window("abc", usize::MAX).text, "abc");
+}
