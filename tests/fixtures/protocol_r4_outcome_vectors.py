@@ -70,8 +70,8 @@ CASES = [
      target("e", [], held_since=10), request("x", "e", at=10)),
     ("global has no heldSince",
      target("e", []), request("x", "e", at=0)),
-    ("the lost fork answer: global's op was replaced while the request was lost",
-     target("authenticate-2", [("authenticate-2", "e")]), request("fork-1", "e")),
+    ("a lost answer: global's op was replaced while the request was lost",
+     target("authenticate-2", [("authenticate-2", "e")]), request("create-1", "e")),
 ]
 
 if __name__ == "__main__":

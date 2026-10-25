@@ -671,7 +671,15 @@ values of the Agent's size, so a device that cannot hold them does not offer ans
 | paging a long text | one segment | — | the chain, one segment at a time |
 
 Peak memory claims are to be measured, not assumed: plan step 8 runs a minimal reference
-client through receive, parse, verify and install, and records its peak.
+client through receive, parse, verify and install, and records its peak. What the reference
+client counts is the UTF-8 bytes of window text held and carried by an event, a stand-in for
+the peak: it does not count the parsed JSON of an event or the copy applying it makes, which
+the `2 (N + L)` bound includes only as text. A device's real peak is measured on the device.
+
+Implementation note (#216): a `fork` is installed in its source session's `op`, not in
+`global`'s; the exclusion with `global` is enforced at admission, and only a `delete` is
+recorded in two targets (§9.3 as written above says both). The specification, [protocol.md](protocol.md),
+states what is implemented.
 
 The bridge keeps per node `rev`, `srev` and a cached hash, per materialized view its value
 (text shared with the entry where it is one block), and per target `K` small records.

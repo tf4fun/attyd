@@ -731,7 +731,7 @@ the last request asks what became of a write (§6.6).
 | Target | Kind | `args` | Occupies | Allowed while | Result |
 | --- | --- | --- | --- | --- | --- |
 | `sessions/<id>` | `prompt` | `{ prompt: PromptBlock[] }` | the session | `op` ended, not `closing` | `{ stopReason, usage? }` |
-| `sessions/<id>` | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source and `global` (memory model §9) | `op` ended, `global` free | `{ sessionId }` |
+| `sessions/<id>` | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source; excludes writes to `global` while it runs (admission, below) | `op` ended, `global`'s `op` ended | `{ sessionId }` |
 | `global` | `create` | `{ cwd }` | `global` | `op` ended | `{ sessionId }` |
 | `global` | `delete` | `{ sessionId }` | `global`, `sessions/<sessionId>` | `op` ended, the session free | `{}` |
 | `global` | `authenticate` | `{ methodId }` | `global` | `op` ended | `{}` |
@@ -820,8 +820,9 @@ interface OpRecord {
 ```
 
 Every target keeps `ops`: the records of the last `K = 64` operations that occupied it,
-**including those written to another target** (a `fork` written to a session is recorded
-in the session and in `global`, each with its own `after`). Within the window, each
+**including those written to another target** (a `delete` written to `global` is recorded
+in `global` and in the session it occupies, each with its own `after`; a `fork` is shown
+and recorded only in its source session, and excludes writes to `global` while it runs). Within the window, each
 target's log is the complete chain of its `op`s. A target's log lives as long as the
 target: releasing a session and holding it again starts an empty log.
 
@@ -913,7 +914,10 @@ is a §10 error (`404` when the target does not exist).
 
 **Polling.** A client that cannot keep a stream polls `GET /nodes/{path}?have=` with its
 path version; it gets a differential snapshot or `unchanged`. Updates between polls are
-coalesced, which R2 allows; latency is the polling interval.
+coalesced, which R2 allows; latency is the polling interval. A view a read materialized
+lingers for 30 s, so a client polling a view more often than that finds the same path
+version and is told `unchanged`; a slower one finds the view materialized anew at a later
+version and receives a whole snapshot each time (correct, but not cheap).
 
 **Paging a long text.** A device reads segments `0, 1, …` with `at` set to the version it
 holds, chaining `c_i`, and checks the chain against its window's `before`, or the whole
@@ -1091,7 +1095,7 @@ decode, apply, verify and install steps.
 | Turn index | a partition change rewrites only the index; a fixed view ends `absent`; a load ends fixed views `replaced`, also after a resubscription without `have` |
 | Text windows | a 1 MiB append arrives as one window of at most `N + L` bytes that verifies from its 32-byte `before`; 1 byte then 12,000 bytes at `N = 4096` is a `set`; a stale segment read is refused |
 | Several clients | two followers at one version have equal hashes; their writes race as §6.6 states; two answers to one interaction deliver exactly one |
-| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, a `fork` lost while another operation replaced `global`'s `op`, and a session released and held again (`released`); only `superseded` allows a new request |
+| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, a write lost while another operation replaced `global`'s `op`, and a session released and held again (`released`); only `superseded` allows a new request |
 | A delayed request | the query answers `open` while `op.id == e`; the repeat of `(x, e)` is admitted or a no-op; exactly one prompt runs |
 | Bounded heads | with a 1 MiB Agent error, `OpHead`, `OpRecord` and `End` stay bounded |
 | Reconnect races | a superseded stream's late events cannot overwrite a newer replica; a late `GET` of an old instance is not installed (§8.3) |

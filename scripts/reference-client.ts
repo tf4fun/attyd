@@ -9,6 +9,7 @@
 // `2 (window + L)` bytes of text, whatever the output's length.
 
 import { newOperationId } from "../shared/write-resolution.js";
+import { RequestOrder } from "../shared/request-order.js";
 import { isTextWindow } from "../shared/tree-hash.js";
 import { TreeFeedClient, type StreamSource } from "../shared/tree-feed.js";
 import { TreeReplicaSet, type Change, type Follow, type PathReplica, type TreeEvent } from "../shared/tree-replica.js";
@@ -62,13 +63,17 @@ export class ReferenceClient {
   readonly #follow: readonly Follow[];
   readonly #feed: TreeFeedClient;
   readonly #set = new TreeReplicaSet("/api/v2/stream");
+  /** Which answers of a poll may be installed (design §7.3). */
+  readonly #order = new RequestOrder();
+  readonly #fetch: typeof fetch;
   #held = 0;
 
   constructor(
     readonly origin: string,
     readonly session: string,
-    options: { window?: number; cwd?: string } = {},
+    options: { window?: number; cwd?: string; fetch?: typeof fetch } = {},
   ) {
+    this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#follow = [
       { path: this.outputPath, window: options.window ?? 4096, ...(options.cwd === undefined ? {} : { cwd: options.cwd }) },
       { path: this.opPath },
@@ -101,6 +106,7 @@ export class ReferenceClient {
   async poll(): Promise<"changed" | "unchanged"> {
     let changed = false;
     for (const follow of this.#follow) {
+      const ticket = this.#order.issue();
       const { stream, url } = this.#set.open([follow]);
       const asked = new URL(url, this.origin).searchParams;
       const node = new URL(`/api/v2/nodes${follow.path}`, this.origin);
@@ -110,10 +116,16 @@ export class ReferenceClient {
       }
       const have = asked.getAll("have").find((entry) => entry.startsWith(`${follow.path}:`));
       if (have !== undefined) node.searchParams.set("have", have.slice(follow.path.length + 1));
-      const response = await fetch(node);
+      const response = await this.#fetch(node);
       if (response.status !== 200) throw new Error(`${node.pathname} returned ${response.status}: ${await response.text()}`);
       const answer = await response.json() as { instance: string; rev: number; unchanged?: true; change?: Change };
       if (answer.unchanged === true || answer.change === undefined) continue;
+      // A path the client reads but does not follow on a stream: installed only if the instance it
+      // was issued under is still the one adopted, and its version is newer than the one held.
+      const version = "snapshot" in answer.change ? answer.change.snapshot.at : answer.rev;
+      const decision = this.#order.decide(ticket, { instance: answer.instance, version }, this.#replica(follow.path)?.version ?? null, false);
+      if (decision === "discard") continue;
+      if (decision === "adopt-and-install") this.#order.adopt(answer.instance);
       const event: TreeEvent = { instance: answer.instance, rev: answer.rev, changes: [answer.change] };
       this.#measure(JSON.stringify(event), event);
       const result = this.#set.receive(stream, event);

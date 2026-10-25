@@ -131,10 +131,10 @@ fn a_request_whose_expect_is_still_current_is_open_until_it_is_admitted() {
 }
 
 #[test]
-fn a_fork_replacing_globals_op_supersedes_an_authenticate_whose_answer_was_lost() {
+fn an_operation_replacing_globals_op_supersedes_a_write_whose_answer_was_lost() {
     let mut bridge = Bridge::new();
     let e = bridge.state("global").op;
-    // The authenticate `x` was lost on the way and never admitted; another operation replaced `e`.
+    // The write `x` to `global` was lost on the way and never admitted; another operation replaced `e`.
     let replacer = bridge.write(&Scope::Global, OperationKind::Logout);
     assert_eq!(asked("authenticate-x", &e, &bridge, "global"), Outcome::Superseded);
     let _ = replacer;

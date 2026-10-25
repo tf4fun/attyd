@@ -55,7 +55,7 @@ fn paths_may_not_overlap() {
         assert!(error(query).contains("overlap"), "{query}");
     }
     // Siblings and a name that is only a string prefix of another do not overlap.
-    parse("follow=/sessions/s/turns&follow=/sessions/s/turns2&follow=/sessions/s/op").unwrap();
+    parse("follow=/sessions/s/op&follow=/sessions/s/opDetail&follow=/sessions/s/turns").unwrap();
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn a_path_is_a_json_pointer_below_the_root() {
     for bad in ["follow=", "follow=/", "follow=global", "follow=/a~", "follow=/a~2b"] {
         assert!(error(bad).contains("not a path"), "{bad}");
     }
-    parse("follow=/a~0b/c~1d").unwrap();
+    parse("follow=/views/a~1b/output/latest&follow=/sessions/a~0b/op").unwrap();
 }
 
 #[test]
@@ -118,4 +118,27 @@ fn the_session_of_a_path() {
     assert_eq!(session_of("/sessions").as_deref(), None);
     assert_eq!(session_of("/global/sessions/s"), None);
     assert_eq!(session_of("/catalog"), None);
+}
+
+#[test]
+fn only_positions_the_tree_has_a_node_at_can_be_followed() {
+    for node in [
+        "/global", "/catalog", "/sessions", "/views", "/sessions/s", "/sessions/s/op", "/sessions/s/opDetail",
+        "/sessions/s/controls", "/sessions/s/entries", "/sessions/s/entries/12", "/sessions/s/turns/0",
+        "/sessions/s/prompts", "/sessions/s/terminals/t", "/sessions/s/ops", "/sessions/s/interactions/i",
+        "/global/loadFailures/s", "/global/sessions/s", "/global/terminals", "/catalog/pages/3",
+        "/views/s/output/latest", "/views/s/history/I/4/output/10", "/views/s/history/I/4/turn/10",
+        "/views/s/history/I/4/turn/10/entries", "/views/s/history/I/4/turn/10/entries/2",
+    ] {
+        assert!(is_node(node), "{node}");
+    }
+    for inside in [
+        "/sessions/s/controls/modes", "/sessions/s/op/id", "/sessions/s/turns/0/start", "/sessions/s/turns2",
+        "/sessions/s/entries/0/chunks", "/global/op/status", "/global/sessions/s/op", "/catalog/pages/0/title",
+        "/views/s/output/latest/text", "/views/s/output/other", "/views/s/history/I/4/turn/10/entries/2/chunks",
+        "/views/s/history/I/4/turn/10/other", "/nowhere", "/global2",
+    ] {
+        assert!(!is_node(inside), "{inside}");
+        assert!(error(&format!("follow={inside}")).contains("not a node"), "{inside}");
+    }
 }

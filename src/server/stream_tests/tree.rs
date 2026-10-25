@@ -376,9 +376,10 @@ async fn a_read_is_what_a_streams_first_event_carries_or_unchanged_for_the_versi
     // Another instance: whatever the version, the whole path.
     let (_, body) = read(&server, &format!("/api/v2/nodes/global?instance=AnotherInstance0000000&have={at}")).await;
     assert!(body.get("unchanged").is_none() && body["change"]["snapshot"]["base"] == Value::Null, "{body}");
-    // The nodes under it are paths too.
-    let (_, body) = read(&server, "/api/v2/nodes/global/agent").await;
-    assert_eq!(body["change"]["end"]["reason"], "absent", "agent is a field of global, not a node");
+    // A field of `global` is no node: it could never exist, so it is refused, not reported absent.
+    let (status, body) = read(&server, "/api/v2/nodes/global/agent").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().contains("not a node"), "{body}");
 }
 
 #[tokio::test]

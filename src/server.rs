@@ -1172,6 +1172,9 @@ async fn read_path(path: &str, query: &str, state: AppState) -> Response {
     if !is_path(path) {
         return invalid(format!("not a path: {path:?}"));
     }
+    if !crate::protocol::tree_stream::params::is_node(path) {
+        return invalid(format!("not a node of the tree: {path:?}"));
+    }
     let (mut instance, mut have, mut window, mut cwd) = (None, None, None, None);
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         let fresh = match key.as_ref() {

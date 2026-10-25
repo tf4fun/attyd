@@ -36,6 +36,46 @@ pub(crate) fn is_path(path: &str) -> bool {
         && path.match_indices('~').all(|(at, _)| matches!(path.as_bytes().get(at + 1), Some(b'0' | b'1')))
 }
 
+/// Whether the tree has a node at `path` (design §4.2): the shape `shared/tree-shape.ts` writes
+/// down. A position inside a value, such as `/sessions/s/controls/modes`, is no node and cannot be
+/// followed: it could never exist, and following it would hold and load its session for nothing.
+pub(crate) fn is_node(path: &str) -> bool {
+    let tokens: Vec<String> = path.strip_prefix('/').map(|rest| rest.split('/').map(unescape).collect()).unwrap_or_default();
+    let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    // A collection is itself, or one item of it.
+    let collection = |rest: &[&str]| rest.len() <= 1;
+    let session_child = |rest: &[&str]| match rest {
+        ["controls" | "op" | "opDetail", tail @ ..] => tail.is_empty(),
+        ["ops" | "prompts" | "turns" | "entries" | "interactions" | "urlFlows" | "terminals", tail @ ..] => collection(tail),
+        _ => false,
+    };
+    match tokens.as_slice() {
+        ["global"] | ["catalog"] | ["sessions"] | ["views"] => true,
+        ["global", rest @ ..] => match rest {
+            ["op" | "opDetail", tail @ ..] => tail.is_empty(),
+            ["ops" | "sessions" | "loadFailures" | "interactions" | "urlFlows" | "terminals", tail @ ..] => collection(tail),
+            _ => false,
+        },
+        ["catalog", rest @ ..] => match rest {
+            ["op" | "opDetail", tail @ ..] => tail.is_empty(),
+            ["ops" | "pages" | "interactions" | "urlFlows", tail @ ..] => collection(tail),
+            _ => false,
+        },
+        ["sessions", _id] => true,
+        ["sessions", _id, rest @ ..] => session_child(rest),
+        ["views", _id, rest @ ..] => match rest {
+            [] | ["output"] | ["output", "latest"] | ["history"] => true,
+            ["history", _instance] | ["history", _instance, _rev] => true,
+            ["history", _instance, _rev, "output" | "turn"] => true,
+            ["history", _instance, _rev, "output", _start] => true,
+            ["history", _instance, _rev, "turn", _start] => true,
+            ["history", _instance, _rev, "turn", _start, "entries", tail @ ..] => collection(tail),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether one of the paths contains the other (or they are the same).
 fn overlap(a: &str, b: &str) -> bool {
     let contains = |outer: &str, inner: &str| {
@@ -76,6 +116,9 @@ pub(crate) fn parse_stream_query(query: &str) -> Result<StreamQuery, ProtocolErr
             "follow" => {
                 if !is_path(&value) {
                     return Err(invalid(format!("not a path: {value:?}")));
+                }
+                if !is_node(&value) {
+                    return Err(invalid(format!("not a node of the tree: {value:?}")));
                 }
                 if let Some(other) = parsed.follow.iter().find(|follow| overlap(&follow.path, &value)) {
                     return Err(invalid(format!("paths overlap: {:?} and {value:?}", other.path)));

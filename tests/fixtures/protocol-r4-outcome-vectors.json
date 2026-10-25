@@ -350,7 +350,7 @@
    }
   },
   {
-   "name": "the lost fork answer: global's op was replaced while the request was lost",
+   "name": "a lost answer: global's op was replaced while the request was lost",
    "target": {
     "instance": "I",
     "op": "authenticate-2",
@@ -363,7 +363,7 @@
     ]
    },
    "request": {
-    "id": "fork-1",
+    "id": "create-1",
     "expect": "e",
     "instance": "I",
     "at": 10
