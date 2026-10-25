@@ -7,7 +7,6 @@
 //! /views/<id>/history/<instance>/<historyRev>/output/<start>    the output of the turn at <start>
 //! /views/<id>/history/<instance>/<historyRev>/turn/<start>      that turn's entries
 //! ```
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -71,6 +70,7 @@ impl View {
     }
 
     /// The path of the view.
+    #[cfg(test)]
     pub(crate) fn path(&self) -> String {
         self.tokens().iter().fold("/views".to_string(), |path, token| format!("{path}/{}", escape(token)))
     }
@@ -294,6 +294,7 @@ fn nested(trie: Trie) -> Spec {
 }
 
 /// The `views` subtree for the views wanted, read from `tree` as a commit makes it.
+#[cfg(test)]
 pub(crate) fn derive(tree: &Tree, wanted: &BTreeSet<View>) -> Spec {
     derive_cached(tree, wanted, &mut ViewCache::default())
 }

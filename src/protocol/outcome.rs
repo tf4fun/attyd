@@ -4,7 +4,6 @@
 //! client held instance `i` and `W` at path version `t`. The rule reads only what the tree
 //! publishes of `W`: its `op`, its `ops` and, for a session, `heldSince`. The same rule is in
 //! `shared/outcome.ts`; both replay `tests/fixtures/protocol-r4-outcome-vectors.json`.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use serde::Serialize;
 

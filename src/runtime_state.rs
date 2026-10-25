@@ -548,7 +548,6 @@ impl SessionRegistry {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_attachment(
         &mut self,
         expected_epoch: &str,
@@ -580,7 +579,6 @@ impl SessionRegistry {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fail_attachment(
         &mut self,
         expected_epoch: &str,
@@ -679,7 +677,6 @@ impl SessionRegistry {
     }
 
     /// Atomically admit a canonical turn and publish its live projection before Agent dispatch.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_session_turn(
         &mut self,
         expected_epoch: &str,
@@ -1368,7 +1365,6 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_control_operation(
         &mut self,
         expected_epoch: &str,

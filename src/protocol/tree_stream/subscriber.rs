@@ -183,11 +183,13 @@ impl Subscriber {
     }
 
     /// A commit: queues one event with the change of every followed path it touched.
+    #[cfg(test)]
     pub(crate) fn publish(&mut self, tree: &Tree, committed: &Committed) {
         self.publish_at(tree, committed, Instant::now());
     }
 
     /// `publish` at `now`, which paces the checkpoints of what changed.
+    #[cfg(test)]
     pub(crate) fn publish_at(&mut self, tree: &Tree, committed: &Committed, now: Instant) {
         self.publish_ended(tree, committed, now, &BTreeMap::new());
     }
@@ -426,6 +428,7 @@ impl Subscriber {
         &self.queue.front().expect("an event is queued").event
     }
 
+    #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
         self.queue.len()
     }
