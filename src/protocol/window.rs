@@ -60,6 +60,17 @@ pub(crate) fn window(text: &str, bytes: usize) -> TextWindow {
     }
 }
 
+/// A window whose prefix chain was already computed by the published node.
+pub(crate) fn window_cached(text: &str, bytes: usize, chain: &hash::TextChain) -> TextWindow {
+    let offset = chain.window_offset(text.len(), bytes);
+    TextWindow {
+        length: text.len() as u64,
+        offset: offset as u64,
+        before: state_wire(&chain.before(offset)),
+        text: text[offset..].to_string(),
+    }
+}
+
 /// `value` with each text position of `rule` replaced by its window.
 pub(crate) fn window_value(rule: TextRule, value: &Value, bytes: usize) -> Value {
     let mut out = value.clone();

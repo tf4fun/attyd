@@ -132,6 +132,34 @@ jobs:
         if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: cargo check --locked --features dev
 
+  protocol-benchmark:
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft && contains(github.event.pull_request.labels.*.name, 'protocol-benchmark') }}
+    needs: web-client
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: protocol-benchmark
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-client
+          path: dist/client
+      - name: Compare publication costs with the original protocol implementation
+        run: python3 scripts/protocol-benchmark.py
+      - name: Upload protocol benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: protocol-benchmark
+          path: artifacts/protocol-benchmark/
+          if-no-files-found: warn
+
   coverage:
     if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     needs: web-client

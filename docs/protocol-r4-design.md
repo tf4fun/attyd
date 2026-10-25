@@ -678,8 +678,12 @@ client counts is the UTF-8 bytes of window text held and carried by an event, a 
 the peak: it does not count the parsed JSON of an event or the copy applying it makes, which
 the `2 (N + L)` bound includes only as text. A device's real peak is measured on the device.
 
-The bridge keeps per node `rev`, `srev` and a cached hash, per materialized view its value
-(text shared with the entry where it is one block), and per target `K` small records.
+The bridge keeps per node `rev`, `srev` and a cached hash, per materialized view its owned
+JSON value, and per target `K` small records. Computed text chains retain segment boundaries
+and chain states across appends, not copies of prior bodies; windows and segment reads reuse
+them. An output view's immutable string still copies the existing output when it grows,
+even for a single-block entry. The projection still scans entries and the turn index;
+these caches do not make a complete bridge commit constant-time.
 
 ## 12. Alternatives considered
 

@@ -245,6 +245,64 @@ fn an_unknown_history_has_no_entries_and_no_history() {
 }
 
 #[test]
+fn turn_heads_and_prompts_that_did_not_change_keep_the_value_they_were_published_as() {
+    let mut registry = registry();
+    for n in 0..3 {
+        let timeline = Arc::make_mut(registry.sessions.get_mut("s").unwrap().state.timeline.as_mut().unwrap());
+        timeline.begin_prompt(&[json!({ "type": "text", "text": format!("q{n}") })]);
+        chunk(&mut registry, &format!("a{n}"), "answer");
+        let timeline = Arc::make_mut(registry.sessions.get_mut("s").unwrap().state.timeline.as_mut().unwrap());
+        timeline.end_prompt(PromptEnd::Response(json!({ "stopReason": "end_turn" })));
+    }
+    let mut projector = Projector::default();
+    let mut tree = Tree::new("i");
+    tree.commit(projector.project(&registry, &agent(), 1, tree.rev() + 1));
+    let shared = |tree: &Tree, path: &str| tree.get(path).unwrap().value_arc().unwrap();
+    let before: Vec<_> = ["/sessions/s/turns/0", "/sessions/s/turns/1", "/sessions/s/prompts/0", "/sessions/s/prompts/1"]
+        .iter()
+        .map(|path| shared(&tree, path))
+        .collect();
+    // The last turn grows; the others are untouched, and nothing is serialized again for them.
+    chunk(&mut registry, "a2", " more");
+    tree.commit(projector.project(&registry, &agent(), 1, tree.rev() + 1)).unwrap();
+    for (path, held) in ["/sessions/s/turns/0", "/sessions/s/turns/1", "/sessions/s/prompts/0", "/sessions/s/prompts/1"]
+        .iter()
+        .zip(&before)
+    {
+        assert!(Arc::ptr_eq(&shared(&tree, path), held), "{path} keeps its value");
+    }
+}
+
+#[test]
+fn operation_records_keep_published_values_until_their_status_changes_even_when_the_log_shifts() {
+    let mut projector = Projector::default();
+    let registry = registry();
+    let (mut operation, _) = project::shown_operation(&registry, &Scope::Global).unwrap();
+    projector.observe("global", &operation, 1);
+    for index in 0..OP_LOG {
+        operation.id = format!("op-{index}");
+        operation.status = OperationStatus::Running;
+        projector.observe("global", &operation, index as u64 + 2);
+    }
+    let published = |projector: &Projector| {
+        let Spec::List(items) = projector.ops("global") else { unreachable!() };
+        items.into_iter().map(|item| match item { Spec::Value(value, _) => value, _ => unreachable!() }).collect::<Vec<_>>()
+    };
+    let before = published(&projector);
+    projector.observe("global", &operation, 100);
+    assert!(published(&projector).iter().zip(&before).all(|(new, old)| Arc::ptr_eq(new, old)));
+    operation.status = OperationStatus::Completed;
+    projector.observe("global", &operation, 101);
+    let ended = published(&projector);
+    assert_eq!(before.last().unwrap()["status"], "running");
+    assert_eq!(ended.last().unwrap()["status"], "completed");
+    assert!(ended[..OP_LOG - 1].iter().zip(&before).all(|(new, old)| Arc::ptr_eq(new, old)));
+    operation.id = "next".into();
+    projector.observe("global", &operation, 102);
+    assert!(published(&projector)[..OP_LOG - 1].iter().zip(&ended[1..]).all(|(new, old)| Arc::ptr_eq(new, old)));
+}
+
+#[test]
 fn streamed_text_changes_only_the_entry_that_grew() {
     let mut registry = registry();
     chunk(&mut registry, "a", "one");

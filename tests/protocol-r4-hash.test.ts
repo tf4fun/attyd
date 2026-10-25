@@ -9,6 +9,7 @@ import {
   type Hash,
   type TextRule,
   cachedValueHash,
+  inheritTextHashes,
   chainStates,
   listHash,
   mapHash,
@@ -94,5 +95,20 @@ describe("revision 4 hashes", () => {
     expect(hex(first)).toBe(hex(valueHash("entry", entry)));
     expect(cachedValueHash("none", entry)).not.toBe(first);
     expect(hex(cachedValueHash("none", { ...entry }))).toBe(hex(valueHash("none", entry)));
+  });
+
+  it("continues cached text chains across Unicode appends and multiple unhashed updates", () => {
+    for (const initial of ["", "x".repeat(4096), `${"a".repeat(4095)}日😀`.repeat(3), `${"x".repeat(8190)}\ud83d`, `\ufeff${"x".repeat(8200)}`]) {
+      let held = Object.freeze({ text: initial });
+      cachedValueHash("outputView", held);
+      for (const suffix of ["\ude00", "日", "😀", "z".repeat(5000)]) {
+        const next = Object.freeze({ text: held.text + suffix });
+        inheritTextHashes("outputView", held, next, ["/text"]);
+        held = next;
+      }
+      expect(hex(cachedValueHash("outputView", held))).toBe(hex(valueHash("outputView", held)));
+      const changed = Object.freeze({ text: `changed${held.text.slice(7)}` });
+      expect(hex(cachedValueHash("outputView", changed))).toBe(hex(valueHash("outputView", changed)));
+    }
   });
 });

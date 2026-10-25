@@ -200,6 +200,37 @@ The replica engine and page projection remain TypeScript because the browser run
 them. Their tests and the independent test-Agent fixtures do not constitute a
 second backend. Client agreement cannot replace the direct source-memory tests.
 
+## Protocol publication benchmark
+
+The opt-in CI job `protocol-benchmark` runs only for non-draft pull requests carrying
+the `protocol-benchmark` label. Add the label before marking ready or pushing the next
+commit. It runs `scripts/protocol-benchmark.py` on one runner, comparing `ff9890e` (before
+the #216 performance changes) with the tested head; `--baseline` selects another revision
+for a future performance review.
+The same ignored Rust fixture runs on both revisions; only its view-call adapter changes
+for the earlier API. The application is cleaned and rebuilt between revisions, while
+dependency artifacts are reused. Logs and a comparison table are uploaded as the
+`protocol-benchmark` artifact and written to the job summary. There is no timing gate.
+
+Each case starts with 2,000 entries and 500 turns, a full operation log, and a warm hash.
+It measures one incoming text chunk through the production reducer, projection and tree
+commit, with 5 warm-ups and 30 samples. The three modes are commit alone, commit plus a
+session/output checkpoint, and commit plus publication to a 4 KiB output window. Current
+output sizes are 4 KiB and 1 MiB; the latter also runs with 256 metadata-separated blocks.
+The report includes median and p95 time and requested allocation bytes/counts. Allocation
+traffic is not peak memory or RSS; forcing a checkpoint after every chunk isolates its
+cost and does not model the normal checkpoint timer.
+
+The optimization preserves the complete tree and its ordinary reconciliation: it still
+walks the session's entries and turn index. Output views retain immutable JSON strings,
+so updating one still copies its existing projected text; the append path avoids building
+that text again from all blocks and allocating a growing concatenation buffer. Text-chain
+caches reuse already hashed prefixes, retaining segment boundaries/states rather than
+old bodies. Replacements rebuild the affected chains. Rust also reuses those chains for
+window and segment reads; the browser carries only the last stable prefix of a text
+through immutable append updates. Independent hash vectors and negative checkpoint tests
+remain the correctness checks for both implementations.
+
 ## Zed-derived cases
 
 The ACP specification and negotiated capabilities remain the acceptance standard.

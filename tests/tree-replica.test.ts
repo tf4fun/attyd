@@ -2,7 +2,8 @@
 // it verifies and when it asks for the whole subtree again. Hashes are those of `hashAt`, which
 // rests on the primitives checked against the independent vectors (protocol-r4-hash.test.ts) and
 // the shape checked against the bridge's tree (tree-shape.test.ts).
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as digest from "../shared/digest";
 import { wire } from "../shared/digest";
 import {
   type Change,
@@ -34,6 +35,60 @@ function event(changes: Change[], rev: number, instance?: string, check?: TreeEv
 }
 
 describe("a tree replica", () => {
+  it("rejects wrong hashes after cached appends, prefix replacements, and freshly parsed snapshots", () => {
+    const original = "x".repeat(32 * 1024);
+    for (const replacement of [false, true]) {
+      const { set, stream } = open();
+      set.receive(stream, event([snapshot(PATH, [entry(original)], 1)], 1, "I"));
+      const appended = original + "tail";
+      set.receive(stream, event([{ path: PATH, from: 1,
+        ops: [{ op: "append", path: "/0/chunks/0/content/text", text: "tail" }] }], 2));
+      if (replacement) {
+        set.receive(stream, { rev: 2, check: [{ path: PATH, at: 2, hash: H(PATH, [entry(appended)]) }] });
+        set.receive(stream, event([{ path: PATH, from: 2,
+          ops: [{ op: "set", path: "/0/chunks/0/content/text", value: `y${appended.slice(1)}` }] }], 3));
+      }
+      const version = replacement ? 3 : 2;
+      const staleHash = H(PATH, [entry(replacement ? appended : original)]);
+      expect(set.receive(stream, { rev: version, check: [{ path: PATH, at: version, hash: staleHash }] }).kind).toBe("resubscribe");
+      expect(set.lastResubscribe).toMatchObject({ full: true, path: PATH });
+      expect(set.get(PATH)).toBeUndefined();
+    }
+    const { set, stream } = open();
+    const parsed = JSON.parse(JSON.stringify([entry(`y${original.slice(1)}`)])) as unknown;
+    expect(set.receive(stream, event([{ path: PATH, snapshot: { base: null, at: 1,
+      hash: H(PATH, [entry(original)]), node: { v: parsed } } }], 1, "I")).kind).toBe("resubscribe");
+    expect(set.lastResubscribe).toMatchObject({ full: true });
+  });
+
+  it("hashes only the changed tail after several appends to a long text, then detects an edit normally", () => {
+    const { set, stream } = open();
+    let text = "x".repeat(1024 * 1024);
+    set.receive(stream, event([snapshot(PATH, [entry(text)], 1)], 1, "I"));
+    const retained = set.get(PATH)!.value;
+    for (let version = 2; version <= 4; version += 1) {
+      text += "日😀";
+      expect(set.receive(stream, event([{ path: PATH, from: version - 1,
+        ops: [{ op: "append", path: "/0/chunks/0/content/text", text: "日😀" }] }], version)).kind).toBe("applied");
+    }
+    const hash = H(PATH, [entry(text)]);
+    const sha = vi.spyOn(digest, "sha256");
+    try {
+      expect(set.receive(stream, { rev: 4, check: [{ path: PATH, at: 4, hash }] }).kind).toBe("ignored");
+      const bytes = sha.mock.calls.reduce((total, [input]) => total + input.length, 0);
+      expect(bytes).toBeLessThan(16 * 1024);
+      expect(set.get(PATH)!.verified).toBe(4);
+    } finally {
+      sha.mockRestore();
+    }
+    expect((retained as ReturnType<typeof entry>[])[0].chunks[0].content.text).toHaveLength(1024 * 1024);
+    text = `y${text.slice(1)}`;
+    set.receive(stream, event([{ path: PATH, from: 4,
+      ops: [{ op: "set", path: "/0/chunks/0/content/text", value: text }] }], 5));
+    expect(set.receive(stream, { rev: 5, check: [{ path: PATH, at: 5, hash: H(PATH, [entry(text)]) }] }).kind).toBe("ignored");
+    expect(set.get(PATH)!.verified).toBe(5);
+  });
+
   it("installs a whole snapshot, verified by its hash, at the path version it states", () => {
     const { set, stream } = open();
     const value = [entry("a")];

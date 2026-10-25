@@ -18,7 +18,7 @@ use super::documents::{
 };
 use super::hash::TextRule;
 use super::project;
-use super::timeline::{Entry, Role, Timeline};
+use super::timeline::{Entry, Prompt, Role, Timeline};
 use super::timeline_doc::{AttachmentIndex, publish_entry};
 use super::tree::Spec;
 use crate::session_registry::SessionRegistry;
@@ -241,7 +241,7 @@ pub(crate) const OP_LOG: usize = 64;
 struct TargetLog {
     /// The `op.id` the target showed at the last commit; none before the first.
     last: Option<String>,
-    records: std::collections::VecDeque<OpRecord>,
+    records: std::collections::VecDeque<(OpRecord, Arc<Value>)>,
 }
 
 /// How many failed loads `/global/loadFailures` keeps (design §6.2).
@@ -266,6 +266,26 @@ struct Memo {
     /// The timeline the history was last installed as, and the revision it was.
     timeline: Option<String>,
     history_rev: u64,
+    /// The turn heads and prompts as last published, so that those that did not change keep the
+    /// value they were published as (and the tree compares them by pointer).
+    turns: Vec<(TurnHead, Arc<Value>)>,
+    prompts: Vec<(Prompt, Arc<Value>)>,
+}
+
+/// `items` as value nodes, an item equal to the one at its index in `cache` keeping that one's
+/// value; `cache` then holds `items`.
+fn reuse<T: Clone + PartialEq + Serialize>(cache: &mut Vec<(T, Arc<Value>)>, items: &[T]) -> Vec<Spec> {
+    cache.truncate(items.len());
+    for (index, item) in items.iter().enumerate() {
+        match cache.get(index) {
+            Some((held, _)) if held == item => {}
+            Some(_) => {
+                cache[index] = (item.clone(), Arc::new(serde_json::to_value(item).expect("a node serializes")));
+            }
+            None => cache.push((item.clone(), Arc::new(serde_json::to_value(item).expect("a node serializes")))),
+        }
+    }
+    cache.iter().map(|(_, value)| Spec::text_value(Arc::clone(value), TextRule::None)).collect()
 }
 
 impl Projector {
@@ -293,29 +313,35 @@ impl Projector {
             && *last != operation.id
         {
             debug_assert!(
-                !log.records.iter().any(|record| {
+                !log.records.iter().any(|(record, _)| {
                     record.id == operation.id
                         || record.after.as_deref() == Some(operation.id.as_str())
                 }),
                 "operation ID returned in {target}: {}",
                 operation.id
             );
-            log.records.push_back(OpRecord {
+            let record = OpRecord {
                 id: operation.id.clone(),
                 after: Some(last.clone()),
                 kind: operation.kind,
                 rev: next_rev,
                 status: operation.status,
-                error: None,
-            });
+                error: operation.error.as_ref().map(ErrorSummary::of),
+            };
+            let published = Arc::new(serde_json::to_value(&record).expect("an operation record serializes"));
+            log.records.push_back((record, published));
             while log.records.len() > OP_LOG {
                 log.records.pop_front();
             }
         }
         log.last = Some(operation.id.clone());
-        if let Some(record) = log.records.iter_mut().rev().find(|record| record.id == operation.id) {
-            record.status = operation.status;
-            record.error = operation.error.as_ref().map(ErrorSummary::of);
+        if let Some((record, published)) = log.records.back_mut().filter(|(record, _)| record.id == operation.id) {
+            let error = operation.error.as_ref().map(ErrorSummary::of);
+            if record.status != operation.status || record.error != error {
+                record.status = operation.status;
+                record.error = error;
+                *published = Arc::new(serde_json::to_value(&record).expect("an operation record serializes"));
+            }
         }
     }
 
@@ -326,7 +352,7 @@ impl Projector {
                 .get(target)
                 .into_iter()
                 .flat_map(|log| log.records.iter())
-                .map(value)
+                .map(|(_, published)| Spec::text_value(Arc::clone(published), TextRule::None))
                 .collect(),
         )
     }
@@ -439,15 +465,14 @@ impl Projector {
                 );
                 children.insert(
                     "turns".into(),
-                    Spec::List(turn_heads(timeline, memo.history_rev).iter().map(value).collect()),
+                    Spec::List(reuse(&mut memo.turns, &turn_heads(timeline, memo.history_rev))),
                 );
-                children.insert(
-                    "prompts".into(),
-                    Spec::List(timeline.prompts().iter().map(value).collect()),
-                );
+                children.insert("prompts".into(), Spec::List(reuse(&mut memo.prompts, timeline.prompts())));
             }
             None => {
                 cache.clear();
+                memo.turns.clear();
+                memo.prompts.clear();
                 children.insert("prompts".into(), Spec::List(Vec::new()));
             }
         }
@@ -467,3 +492,6 @@ pub(crate) fn project_tree(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod perf_tests;
