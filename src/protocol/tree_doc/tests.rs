@@ -245,6 +245,35 @@ fn an_unknown_history_has_no_entries_and_no_history() {
 }
 
 #[test]
+fn turn_heads_and_prompts_that_did_not_change_keep_the_value_they_were_published_as() {
+    let mut registry = registry();
+    for n in 0..3 {
+        let timeline = Arc::make_mut(registry.sessions.get_mut("s").unwrap().state.timeline.as_mut().unwrap());
+        timeline.begin_prompt(&[json!({ "type": "text", "text": format!("q{n}") })]);
+        chunk(&mut registry, &format!("a{n}"), "answer");
+        let timeline = Arc::make_mut(registry.sessions.get_mut("s").unwrap().state.timeline.as_mut().unwrap());
+        timeline.end_prompt(PromptEnd::Response(json!({ "stopReason": "end_turn" })));
+    }
+    let mut projector = Projector::default();
+    let mut tree = Tree::new("i");
+    tree.commit(projector.project(&registry, &agent(), 1, tree.rev() + 1));
+    let shared = |tree: &Tree, path: &str| tree.get(path).unwrap().value_arc().unwrap();
+    let before: Vec<_> = ["/sessions/s/turns/0", "/sessions/s/turns/1", "/sessions/s/prompts/0", "/sessions/s/prompts/1"]
+        .iter()
+        .map(|path| shared(&tree, path))
+        .collect();
+    // The last turn grows; the others are untouched, and nothing is serialized again for them.
+    chunk(&mut registry, "a2", " more");
+    tree.commit(projector.project(&registry, &agent(), 1, tree.rev() + 1)).unwrap();
+    for (path, held) in ["/sessions/s/turns/0", "/sessions/s/turns/1", "/sessions/s/prompts/0", "/sessions/s/prompts/1"]
+        .iter()
+        .zip(&before)
+    {
+        assert!(Arc::ptr_eq(&shared(&tree, path), held), "{path} keeps its value");
+    }
+}
+
+#[test]
 fn streamed_text_changes_only_the_entry_that_grew() {
     let mut registry = registry();
     chunk(&mut registry, "a", "one");

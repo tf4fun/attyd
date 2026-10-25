@@ -55,6 +55,8 @@ pub(crate) struct Feed {
     /// Views a read keeps materialized for a while, so that a client that polls finds the same
     /// path version and is told nothing changed.
     view_pins: BTreeMap<View, Instant>,
+    /// The output views as last derived, kept while their inputs are the same values.
+    view_cache: views::ViewCache,
     /// Sessions a read asked for, by the directory it gave: the bridge starts their load once,
     /// after the read's subscription is gone.
     pending_loads: BTreeMap<String, Option<String>>,
@@ -81,6 +83,7 @@ impl Feed {
             projector: Projector::default(),
             tree_subscribers: BTreeMap::new(),
             view_pins: BTreeMap::new(),
+            view_cache: views::ViewCache::default(),
             pending_loads: BTreeMap::new(),
             touched: std::collections::BTreeSet::new(),
             #[cfg(test)]
@@ -132,7 +135,7 @@ impl Feed {
             }
         }
         let wanted = self.wanted_views(Some(extra), now);
-        if let Some(committed) = self.tree.commit_views(|tree| views::derive(tree, &wanted)) {
+        if let Some(committed) = self.tree.commit_views(|tree| views::derive_cached(tree, &wanted, &mut self.view_cache)) {
             self.publish_tree(&committed, now, &BTreeMap::new());
         }
     }
@@ -439,7 +442,7 @@ impl Feed {
         let next = self.tree.rev() + 1;
         let root = self.projector.project(registry, agent, catalog_revision, next);
         let wanted = self.wanted_views(None, now);
-        if let Some(committed) = self.tree.commit_with_views(root, |tree| views::derive(tree, &wanted)) {
+        if let Some(committed) = self.tree.commit_with_views(root, |tree| views::derive_cached(tree, &wanted, &mut self.view_cache)) {
             let ends: BTreeMap<String, TreeEnd> = ended
                 .iter()
                 .map(|(session_id, end)| (session_id.clone(), tree_end(end)))

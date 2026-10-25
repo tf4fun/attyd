@@ -94,8 +94,11 @@ fn turns<'a>(tree: &'a Tree, session: &str) -> Option<&'a [Node]> {
     Some(node.items())
 }
 
-fn head(node: &Node) -> Value {
-    node.as_value().map(|(value, _)| value.clone()).unwrap_or(Value::Null)
+static NULL: Value = Value::Null;
+
+/// The value of a turn head, borrowed: it is read for every turn, on every commit.
+fn head(node: &Node) -> &Value {
+    node.as_value().map_or(&NULL, |(value, _)| value)
 }
 
 /// Whether a fixed `view` is over now. Following or reading it is over for good: with `have` or
@@ -133,7 +136,7 @@ fn output_view(tree: &Tree, session: &str, turn: Option<&Node>) -> Spec {
     let Some(turn) = turn else {
         return output_spec(json!({ "turn": null, "entry": null, "other": 0 }), String::new());
     };
-    let head = head(turn);
+    let head = head(turn).clone();
     let summary = {
         let mut summary = Map::new();
         for key in ["historyRev", "start", "messageId", "state"] {
@@ -158,7 +161,7 @@ fn output_spec(mut members: Value, text: String) -> Spec {
 }
 
 fn turn_view(tree: &Tree, session: &str, turn: &Node) -> Spec {
-    let head = head(turn);
+    let head = head(turn).clone();
     let (start, length) = (head["start"].as_u64().unwrap_or(0), head["length"].as_u64().unwrap_or(0));
     let entries = (start..start + length)
         .filter_map(|index| tree.get(&format!("/sessions/{}/entries/{index}", escape(session)))?.value_arc())
@@ -168,25 +171,68 @@ fn turn_view(tree: &Tree, session: &str, turn: &Node) -> Spec {
     Spec::object(fields, [("entries", Spec::List(entries))])
 }
 
+/// What an output view was built from, and what it was built as: while the turn head and the
+/// output entry are the very values they were, the view is the same and is not built again.
+struct Built {
+    head: Arc<Value>,
+    entry: Option<Arc<Value>>,
+    spec: Spec,
+}
+
+/// The output views derived so far, by view.
+#[derive(Default)]
+pub(crate) struct ViewCache(BTreeMap<View, Built>);
+
 /// The spec of `view` in `tree`; none while it does not exist (over, or the history unknown).
-fn materialize(tree: &Tree, view: &View) -> Option<Spec> {
+fn materialize(tree: &Tree, view: &View, cache: &mut ViewCache) -> Option<Spec> {
     if gone(tree, view).is_some() {
         return None;
     }
     let session = view.session();
     let heads = turns(tree, session)?;
     match view {
-        View::Latest { .. } => Some(output_view(tree, session, heads.last())),
+        View::Latest { .. } => Some(cached_output(tree, session, view, heads.last(), cache)),
         View::Output { start, .. } | View::Turn { start, .. } => {
             let turn = heads.iter().find(|turn| {
                 turn.as_value().is_some_and(|(head, _)| head["start"].as_u64() == Some(*start as u64))
             })?;
             Some(match view {
                 View::Turn { .. } => turn_view(tree, session, turn),
-                _ => output_view(tree, session, Some(turn)),
+                _ => cached_output(tree, session, view, Some(turn), cache),
             })
         }
     }
+}
+
+/// `output_view`, kept while its turn head and output entry are the values it was built from.
+fn cached_output(tree: &Tree, session: &str, view: &View, turn: Option<&Node>, cache: &mut ViewCache) -> Spec {
+    let Some(turn) = turn else {
+        cache.0.remove(view);
+        return output_view(tree, session, None);
+    };
+    let Some(head_arc) = turn.value_arc() else {
+        return output_view(tree, session, Some(turn));
+    };
+    let entry_arc = output_entry(tree, session, turn).and_then(Node::value_arc);
+    if let Some(built) = cache.0.get(view)
+        && Arc::ptr_eq(&built.head, &head_arc)
+        && match (&built.entry, &entry_arc) {
+            (Some(held), Some(now)) => Arc::ptr_eq(held, now),
+            (None, None) => true,
+            _ => false,
+        }
+    {
+        return built.spec.clone();
+    }
+    let spec = output_view(tree, session, Some(turn));
+    cache.0.insert(view.clone(), Built { head: head_arc, entry: entry_arc, spec: spec.clone() });
+    spec
+}
+
+/// The node of the entry that holds the output of the turn with head `turn`, if it has one.
+fn output_entry<'a>(tree: &'a Tree, session: &str, turn: &Node) -> Option<&'a Node> {
+    let index = head(turn)["output"].as_u64()?;
+    tree.get(&format!("/sessions/{}/entries/{index}", escape(session)))
 }
 
 /// A trie of the leaves, then nested maps.
@@ -204,9 +250,18 @@ fn nested(trie: Trie) -> Spec {
 
 /// The `views` subtree for the views wanted, read from `tree` as a commit makes it.
 pub(crate) fn derive(tree: &Tree, wanted: &BTreeSet<View>) -> Spec {
+    derive_cached(tree, wanted, &mut ViewCache::default())
+}
+
+/// `derive`, keeping the output views that did not change from one commit to the next.
+pub(crate) fn derive_cached(tree: &Tree, wanted: &BTreeSet<View>, cache: &mut ViewCache) -> Spec {
+    cache.0.retain(|view, _| wanted.contains(view));
     let mut root = BTreeMap::new();
     for view in wanted {
-        let Some(spec) = materialize(tree, view) else { continue };
+        let Some(spec) = materialize(tree, view, cache) else {
+            cache.0.remove(view);
+            continue;
+        };
         let tokens = view.tokens();
         let (leaf, branches) = tokens.split_last().expect("a view has a path");
         let mut level = &mut root;

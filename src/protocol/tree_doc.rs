@@ -18,7 +18,7 @@ use super::documents::{
 };
 use super::hash::TextRule;
 use super::project;
-use super::timeline::{Entry, Role, Timeline};
+use super::timeline::{Entry, Prompt, Role, Timeline};
 use super::timeline_doc::{AttachmentIndex, publish_entry};
 use super::tree::Spec;
 use crate::session_registry::SessionRegistry;
@@ -266,6 +266,26 @@ struct Memo {
     /// The timeline the history was last installed as, and the revision it was.
     timeline: Option<String>,
     history_rev: u64,
+    /// The turn heads and prompts as last published, so that those that did not change keep the
+    /// value they were published as (and the tree compares them by pointer).
+    turns: Vec<(TurnHead, Arc<Value>)>,
+    prompts: Vec<(Prompt, Arc<Value>)>,
+}
+
+/// `items` as value nodes, an item equal to the one at its index in `cache` keeping that one's
+/// value; `cache` then holds `items`.
+fn reuse<T: Clone + PartialEq + Serialize>(cache: &mut Vec<(T, Arc<Value>)>, items: &[T]) -> Vec<Spec> {
+    cache.truncate(items.len());
+    for (index, item) in items.iter().enumerate() {
+        match cache.get(index) {
+            Some((held, _)) if held == item => {}
+            Some(_) => {
+                cache[index] = (item.clone(), Arc::new(serde_json::to_value(item).expect("a node serializes")));
+            }
+            None => cache.push((item.clone(), Arc::new(serde_json::to_value(item).expect("a node serializes")))),
+        }
+    }
+    cache.iter().map(|(_, value)| Spec::text_value(Arc::clone(value), TextRule::None)).collect()
 }
 
 impl Projector {
@@ -431,15 +451,14 @@ impl Projector {
                 );
                 children.insert(
                     "turns".into(),
-                    Spec::List(turn_heads(timeline, memo.history_rev).iter().map(value).collect()),
+                    Spec::List(reuse(&mut memo.turns, &turn_heads(timeline, memo.history_rev))),
                 );
-                children.insert(
-                    "prompts".into(),
-                    Spec::List(timeline.prompts().iter().map(value).collect()),
-                );
+                children.insert("prompts".into(), Spec::List(reuse(&mut memo.prompts, timeline.prompts())));
             }
             None => {
                 cache.clear();
+                memo.turns.clear();
+                memo.prompts.clear();
                 children.insert("prompts".into(), Spec::List(Vec::new()));
             }
         }

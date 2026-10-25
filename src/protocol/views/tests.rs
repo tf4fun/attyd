@@ -271,3 +271,32 @@ fn every_node_of_the_tree_is_of_the_kind_the_shape_names() {
         assert!(seen.contains(pattern), "{pattern} was not produced: {seen:?}");
     }
 }
+
+#[test]
+fn an_output_view_whose_inputs_did_not_change_is_not_built_again() {
+    use crate::protocol::documents::{OperationKind, Scope};
+    let mut world = World::new();
+    world.update(text("agent_message_chunk", "m", "hello"));
+    world.wanted.insert(latest());
+    let mut cache = ViewCache::default();
+    let commit = |world: &mut World, cache: &mut ViewCache| {
+        let next = world.tree.rev() + 1;
+        let root = world.projector.project(&world.registry, &agent(), 1, next);
+        let wanted = world.wanted.clone();
+        world.tree.commit_with_views(root, |tree| derive_cached(tree, &wanted, cache))
+    };
+    commit(&mut world, &mut cache).unwrap();
+    let built = world.tree.get(LATEST).unwrap().value_arc().unwrap();
+    let rev = world.tree.get(LATEST).unwrap().rev();
+
+    // A commit that touches something else leaves the view, and its revision, as they were.
+    world.registry.install_operation(&Scope::Global, OperationKind::Logout, json!({})).unwrap();
+    assert!(commit(&mut world, &mut cache).is_some());
+    assert!(Arc::ptr_eq(&world.tree.get(LATEST).unwrap().value_arc().unwrap(), &built));
+    assert_eq!(world.tree.get(LATEST).unwrap().rev(), rev);
+
+    // The output growing builds it again.
+    world.update(text("agent_message_chunk", "m", " there"));
+    commit(&mut world, &mut cache).unwrap();
+    assert_eq!(world.view(LATEST)["text"], "hello there");
+}
