@@ -467,8 +467,10 @@ interface Interaction {
 Scopes and lifetimes are memory model §8.2. An interaction is shown in the
 `interactions` node of its target: its session; for a request-scoped elicitation, the
 target of the write or load that sent the request (`global` when none did); for a session
-being installed, the target of the installing operation (`global`, which also runs `fork`,
-memory model §9) until installation, when it moves into `sessions/<id>`.
+being installed, `global` stages session-scoped interactions until installation, when
+they move into `sessions/<id>`. This staging does not change `global.op` during a fork;
+the fork operation and its request-scoped elicitations belong to the source session
+(memory model §9).
 
 ### 4.5 Controls
 
@@ -731,7 +733,7 @@ the last request asks what became of a write (§6.6).
 | Target | Kind | `args` | Occupies | Allowed while | Result |
 | --- | --- | --- | --- | --- | --- |
 | `sessions/<id>` | `prompt` | `{ prompt: PromptBlock[] }` | the session | `op` ended, not `closing` | `{ stopReason, usage? }` |
-| `sessions/<id>` | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source; excludes writes to `global` while it runs (admission, below) | `op` ended, `global`'s `op` ended | `{ sessionId }` |
+| `sessions/<id>` | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source; excludes writes to `global` and other forks while it runs | `op` ended, `global`'s `op` ended, no fork running | `{ sessionId }` |
 | `global` | `create` | `{ cwd }` | `global` | `op` ended | `{ sessionId }` |
 | `global` | `delete` | `{ sessionId }` | `global`, `sessions/<sessionId>` | `op` ended, the session free | `{}` |
 | `global` | `authenticate` | `{ methodId }` | `global` | `op` ended | `{}` |
@@ -749,7 +751,9 @@ the last request asks what became of a write (§6.6).
   changes nothing; the operation keeps its scopes until it actually ends. A cancel is
   not an operation of its own: its `id` is ignored and `op` is unchanged.
 - **Fork** and **create** install the returned session (memory model §6.3, §9); its
-  summary carries `origin`, the operation's `id`.
+  summary carries `origin`, the operation's `id`. Only one installation runs: admission
+  refuses a global write or another session's fork while a fork runs, without replacing
+  `global.op` or adding a fork to `global.ops`.
 - **Delete** closes a held session (`session/close`, when advertised), deletes it
   (`session/delete`), and ends the paths of `/sessions/<sessionId>` with `deleted`. It needs the
   Agent's delete capability and works on sessions the bridge does not hold.

@@ -166,6 +166,24 @@ async fn shutting_the_server_down_ends_the_path_streams_after_what_is_queued() {
 
 // --- segments (design §7.1) -----------------------------------------------------------
 
+#[tokio::test]
+async fn non_node_paths_are_refused_before_a_session_is_loaded_or_observed() {
+    let (server, mut link) = Server::start(json!({"loadSession": true})).await;
+    for path in ["/sessions/saved/controls/modes", "/views/saved/output/latest/text"] {
+        let (status, _) = open(
+            &server,
+            &format!("follow={path}&cwd={}", query_scope(&format!("saved:{CWD}"))),
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        let (status, body) = read(&server, &format!("/api/v2/nodes{path}?cwd={}", query_scope(CWD))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+    link.quiet(Duration::from_millis(300)).await;
+    let (_, global) = read(&server, "/api/v2/nodes/global").await;
+    assert!(global["change"]["snapshot"]["node"]["v"]["sessions"].get("saved").is_none());
+}
+
 /// `GET path`: the status and the JSON body.
 async fn read(server: &Server, path: &str) -> (StatusCode, Value) {
     let response = send(server.address, Method::GET, path, None).await;
@@ -229,7 +247,7 @@ async fn a_segment_read_needs_a_version_and_a_text_position() {
 
 /// A client-chosen operation id: 22 characters of base64url.
 const CREATE: &str = "Cr3ateOperation_Id-001";
-const OTHER: &str = "Other0peration_Id-002";
+const OTHER: &str = "Other0peration_Id-0002";
 
 /// What a client holds of `global` when it writes: the instance, the version and the `op.id`.
 async fn global_held(server: &Server) -> (String, u64, String) {
@@ -250,6 +268,50 @@ async fn post(server: &Server, path: &str, body: Value) -> (StatusCode, Value) {
 
 fn resolution(id: &str, expect: &str, instance: &str, at: u64) -> String {
     format!("/api/v2/targets/global/ops/{id}?expect={expect}&instance={instance}&at={at}")
+}
+
+#[tokio::test]
+async fn a_lost_fork_answer_is_resolved_on_its_source_after_another_operation() {
+    let (server, mut link) = Server::start(json!({"sessionCapabilities": {"fork": {}}})).await;
+    server.create(&mut link, "source").await;
+    let (instance, _, global_op) = global_held(&server).await;
+    let (_, mut source) = open(&server, "follow=/sessions/source").await;
+    let first = next(&mut source).await;
+    let snapshot = &change(&first, "/sessions/source")["snapshot"];
+    let at = snapshot["at"].as_u64().unwrap();
+    let e = snapshot["node"]["v"]["op"]["id"].as_str().unwrap().to_string();
+    let ask = format!("/api/v2/targets/sessions/source/ops/{CREATE}?expect={e}&instance={instance}&at={at}");
+    let (status, _) = post(&server, "/api/v2/targets/sessions/source/ops", json!({
+        "id": CREATE, "expect": e, "kind": "fork", "args": {},
+    })).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let fork = link.request("session/fork").await;
+    link.reply(&fork, json!({"sessionId": "forked"})).await;
+    // The writer loses its HTTP answer. Wait for the completed record through the outcome API.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (_, result) = read(&server, &ask).await;
+        if result["record"]["status"] == "completed" { break; }
+        assert!(tokio::time::Instant::now() < deadline, "fork never completed: {result}");
+        tokio::task::yield_now().await;
+    }
+    let (status, _) = post(&server, "/api/v2/targets/sessions/source/ops", json!({
+        "id": OTHER, "expect": CREATE, "kind": "prompt", "args": {"prompt": [text("next")]},
+    })).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let prompt = link.request("session/prompt").await;
+    let (_, result) = read(&server, &ask).await;
+    assert_eq!(result["outcome"], "admitted");
+    assert_eq!(result["record"]["id"], CREATE);
+    assert_eq!(result["record"]["after"], e);
+    assert_eq!(result["record"]["kind"], "fork");
+    assert_eq!(result["record"]["status"], "completed");
+    let (_, global) = read(&server, "/api/v2/nodes/global").await;
+    let global = &global["change"]["snapshot"]["node"]["v"];
+    assert_eq!(global["op"]["id"], global_op);
+    assert!(global["ops"].as_array().unwrap().iter().all(|op| op["id"] != CREATE));
+    assert_eq!(global["sessions"]["forked"]["origin"], CREATE);
+    link.reply(&prompt, json!({"stopReason": "end_turn"})).await;
 }
 
 #[tokio::test]

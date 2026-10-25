@@ -214,7 +214,7 @@ async fn global_writes_need_the_current_ended_op_and_replace_it() {
     watch.converged(&bench).await;
 }
 
-/// A fork occupies `global` while it runs (protocol §6.2, memory model §9): a
+/// A fork excludes writes in `global` while it runs (protocol §6.2, memory model §9): a
 /// session being installed has one installing operation, so what it receives
 /// before its ID is known has one owner.
 fn fork_capabilities() -> Value {
@@ -226,6 +226,28 @@ fn fork_capabilities() -> Value {
         },
         "authMethods": [{"id": "agent-login", "name": "Login"}],
     })
+}
+
+#[tokio::test]
+async fn forks_of_different_sessions_cannot_install_together() {
+    let (bench, mut link) = Bench::ws_initialized(fork_capabilities()).await;
+    bench.create_with(&mut link, "s", json!({})).await;
+    bench.create_with(&mut link, "t", json!({})).await;
+    let source = bench.expect_of("session/s").await;
+    let other = bench.expect_of("session/t").await;
+    let forked = bench.spawn_op("session/s", &source, "fork", json!({}));
+    let request = link.request("session/fork").await;
+    let before = bench.document("session/t").await;
+    let (status, body) = bench.op("session/t", &other, "fork", json!({})).await;
+    not_allowed(status, &body, "a second fork while one installation is running");
+    assert_eq!(bench.document("session/t").await, before);
+    link.quiet(QUIET).await;
+    link.reply(&request, json!({"sessionId": "forked-s"})).await;
+    assert_eq!(forked.await.unwrap().0, StatusCode::OK);
+    let next = bench.spawn_op("session/t", &other, "fork", json!({}));
+    let request = link.request("session/fork").await;
+    link.reply(&request, json!({"sessionId": "forked-t"})).await;
+    assert_eq!(next.await.unwrap().0, StatusCode::OK);
 }
 
 #[tokio::test]

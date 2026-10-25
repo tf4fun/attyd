@@ -169,10 +169,8 @@ pub(crate) fn admit(
             format!("session/{session_id} is not free"),
         ));
     }
-    // A fork occupies `global` while it runs (protocol §6.2): one session is
-    // installed at a time, so what it receives before its ID is known has one
-    // owner (bridge memory model §9). A fork needs `global` free, and a write
-    // in `global` needs no fork running.
+    // A fork is recorded only in its source session. Admission excludes both global writes
+    // and other forks while it runs, so pre-installation messages have one owner (§9).
     let global = live_of(&Scope::Global);
     if kind == OperationKind::Fork
         && global
@@ -181,7 +179,7 @@ pub(crate) fn admit(
     {
         return Err(refuse(ErrorCode::NotAllowed, "global is not free"));
     }
-    if matches!(scope, Scope::Global)
+    if (matches!(scope, Scope::Global) || kind == OperationKind::Fork)
         && global
             .as_ref()
             .and_then(|global| global["sessions"].as_object())
