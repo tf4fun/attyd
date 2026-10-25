@@ -11,7 +11,7 @@
 import { newOperationId } from "../shared/write-resolution.js";
 import { isTextWindow } from "../shared/tree-hash.js";
 import { TreeFeedClient, type StreamSource } from "../shared/tree-feed.js";
-import { TreeReplicaSet, type Follow, type PathReplica, type TreeEvent } from "../shared/tree-replica.js";
+import { TreeReplicaSet, type Change, type Follow, type PathReplica, type TreeEvent } from "../shared/tree-replica.js";
 import { openStream } from "./protocol-smoke-client.js";
 
 export interface ReferenceStats {
@@ -79,6 +79,11 @@ export class ReferenceClient {
     );
   }
 
+  /** The instance of the bridge the replicas belong to. */
+  get instance(): string | undefined {
+    return this.#feed.instance ?? this.#set.instance;
+  }
+
   get outputPath(): string {
     return `/views/${this.session}/output/latest`;
   }
@@ -107,7 +112,7 @@ export class ReferenceClient {
       if (have !== undefined) node.searchParams.set("have", have.slice(follow.path.length + 1));
       const response = await fetch(node);
       if (response.status !== 200) throw new Error(`${node.pathname} returned ${response.status}: ${await response.text()}`);
-      const answer = await response.json() as { instance: string; rev: number; unchanged?: true; change?: TreeEvent["changes"] extends readonly (infer C)[] | undefined ? C : never };
+      const answer = await response.json() as { instance: string; rev: number; unchanged?: true; change?: Change };
       if (answer.unchanged === true || answer.change === undefined) continue;
       const event: TreeEvent = { instance: answer.instance, rev: answer.rev, changes: [answer.change] };
       this.#measure(JSON.stringify(event), event);
@@ -137,10 +142,13 @@ export class ReferenceClient {
   }
 
   /** Writes a prompt to the session with the `expect` it read; the answer's status. */
-  async prompt(text: string): Promise<{ status: number; body: unknown; id: string; expect: string }> {
-    const expect = this.op?.id;
+  async prompt(
+    text: string,
+    request: { id?: string; expect?: string } = {},
+  ): Promise<{ status: number; body: unknown; id: string; expect: string }> {
+    const expect = request.expect ?? this.op?.id;
     if (expect === undefined) throw new Error("the operation head is not held yet");
-    const id = newOperationId();
+    const id = request.id ?? newOperationId();
     const response = await fetch(new URL(`/api/v2/targets/sessions/${encodeURIComponent(this.session)}/ops`, this.origin), {
       method: "POST",
       headers: { "content-type": "application/json" },
