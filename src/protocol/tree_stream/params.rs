@@ -65,7 +65,7 @@ pub(crate) fn is_node(path: &str) -> bool {
         ["sessions", _id, rest @ ..] => session_child(rest),
         ["views", _id, rest @ ..] => match rest {
             [] | ["output"] | ["output", "latest"] | ["history"] => true,
-            ["history", _instance] | ["history", _instance, _rev] => true,
+            ["history", _] | ["history", _, _] => true,
             ["history", _instance, _rev, "output" | "turn"] => true,
             ["history", _instance, _rev, "output", _start] => true,
             ["history", _instance, _rev, "turn", _start] => true,
