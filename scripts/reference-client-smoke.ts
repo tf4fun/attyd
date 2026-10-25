@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,15 +50,32 @@ try {
   const first = await stream.prompt("output-window-flow");
   assert.equal(first.status, 202, JSON.stringify(first.body));
   const turn = (first.body as { op: string }).op;
+  // The version at which the whole text was first held: the turn ends, and the view changes besides
+  // its text, after it, and neither makes the segments of that text stale.
+  const complete = await stream.until(() => (stream.output?.text.length === FLOW_BYTES ? stream.version : undefined), "the whole output");
   await stream.until(() => (stream.op?.id === turn && stream.op.status !== "running" ? true : undefined), "the turn to end");
   assert.equal(stream.op?.status, "completed");
-  await stream.until(() => (stream.output?.text.length === FLOW_BYTES ? true : undefined), "the whole output");
   // A checkpoint confirms what the device holds, hashed over the window from its 32-byte state.
   await stream.until(() => (stream.verified !== undefined && stream.verified === stream.version ? true : undefined), "a checkpoint");
   const held = stream.output!;
   assert.ok(held.text.text.endsWith("end of output"));
   assert.equal(held.text.offset + new TextEncoder().encode(held.text.text).length, FLOW_BYTES);
   assert.ok(held.text.text.length < bound, `the window holds ${held.text.text.length} characters`);
+
+  // Paging: from the version it held when the text was complete, the device reads the segments before
+  // its window one at a time, however many commits followed, and the chain reaches the window's
+  // 32-byte state (design §7.1).
+  let state = Buffer.alloc(32);
+  const textPath = `${stream.outputPath}/text`;
+  assert.ok(held.text.offset > 0 && held.text.offset % SEGMENT_LENGTH === 0, `the window starts at ${held.text.offset}`);
+  for (let index = 0; index < held.text.offset / SEGMENT_LENGTH; index++) {
+    const response = await fetch(`${origin}/api/v2/nodes${textPath}/segments/${index}?at=${complete}`);
+    assert.equal(response.status, 200, `segment ${index}: ${await response.clone().text()}`);
+    const read = await response.json() as { before: string; segment: string };
+    assert.equal(read.before, state.toString("base64url"), `the chain before segment ${index}`);
+    state = createHash("sha256").update(state).update(read.segment, "utf8").digest();
+  }
+  assert.equal(state.toString("base64url"), held.text.before, "the chain reaches the state the window starts from");
 
   // The figures: no event carries a window's text of N + L bytes, nothing is held beyond it, and
   // applying an event needs under 2 (N + L) bytes of text, however long the output is.
@@ -83,6 +101,45 @@ try {
   assert.equal(bytes.length, FLOW_BYTES);
   assert.ok(reply.endsWith(held.text.text));
   assert.equal(new TextEncoder().encode(reply.slice(0, reply.length - held.text.text.length)).length, held.text.offset);
+
+  // Page an older window while the same prompt is still running. ACP permission requests are
+  // barriers: the text starts short, grows to 1 MiB, then grows through 40 more commits before
+  // any segment read. This must not depend on how many recent lengths the bridge remembers.
+  const paging = await stream.prompt("output-paging-flow");
+  assert.equal(paging.status, 202);
+  const pagingOp = (paging.body as { op: string }).op;
+  const gate = (title: string) => desktop.until(scope, (replica) => {
+    const interactions = sessionLive(replica)?.interactions ?? {};
+    return Object.entries(interactions).find(([, interaction]) =>
+      interaction.kind === "permission" && interaction.request.toolCall.title === title)?.[0];
+  }, title);
+  const captured = await gate("Capture paging version");
+  await stream.until(() => stream.output?.text.length === 1 + 524_288 * 2 ? true : undefined, "the paging prefix");
+  const prefix = stream.output!.text;
+  const prefixVersion = stream.version!;
+  assert.equal(stream.op?.id, pagingOp);
+  assert.equal(stream.op?.status, "running");
+  await desktop.actions.answer(scope, captured, { outcome: { outcome: "selected", optionId: "continue" } });
+  const finish = await gate("Page before the turn ends");
+  await stream.until(() => stream.output?.text.length === prefix.length + 40 ? true : undefined, "40 later chunks");
+  assert.ok(stream.version! >= prefixVersion + 40, "the held version is older than the former eight-commit history");
+  let prefixState = Buffer.alloc(32);
+  let offset = 0;
+  for (let index = 0; offset < prefix.offset; index += 1) {
+    const response = await fetch(`${origin}/api/v2/nodes${textPath}/segments/${index}?at=${prefixVersion}`);
+    assert.equal(response.status, 200, `streaming segment ${index}: ${await response.clone().text()}`);
+    const read = await response.json() as { before: string; segment: string };
+    assert.equal(read.before, prefixState.toString("base64url"));
+    prefixState = createHash("sha256").update(prefixState).update(read.segment, "utf8").digest();
+    offset += Buffer.byteLength(read.segment);
+  }
+  assert.equal(offset, prefix.offset);
+  assert.equal(prefixState.toString("base64url"), prefix.before);
+  assert.equal(stream.op?.id, pagingOp);
+  assert.equal(stream.op?.status, "running", "paging finished before the Agent was allowed to finish");
+  await desktop.actions.answer(scope, finish, { outcome: { outcome: "selected", optionId: "continue" } });
+  await desktop.ended(scope, pagingOp);
+  await stream.until(() => stream.op?.id === pagingOp && stream.op.status === "completed" ? true : undefined, "the paged turn to end");
 
   // S3. A change that does not advance the path is ignored; a request repeated with its own
   // identity executes once.
@@ -130,7 +187,7 @@ try {
   assert.ok(cancel.kind === "accepted" && cancel.op === running.op, JSON.stringify(cancel));
   await desktop.ended(scope, running.op);
 
-  console.log("reference client smoke passed (S1 stream and poll with the figures of a window, S2 the window against the whole session, S3 a repeated request, S4 conflicting writes, S5 answers and cancel)");
+  console.log("reference client smoke passed (S1 stream, poll and old-version paging while the prompt runs, S2 the window against the whole session, S3 a repeated request, S4 conflicting writes, S5 answers and cancel)");
 } finally {
   for (const client of clients) client.close();
   desktop.close();
