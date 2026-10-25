@@ -1400,6 +1400,21 @@ const agent = acp
       await waitForStage("finish");
       return { stopReason: "end_turn" };
     }
+    if (promptText.includes("output-window-flow")) {
+      // One Agent message that grows in the ways a window of its text must follow: many small
+      // chunks, one piece of 1 MiB, one byte, and 12,000 bytes after it (docs/protocol.md §5.4).
+      const messageId = `output-window-${requestId}`;
+      const chunk = (text: string) => client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk" as const, messageId, content: { type: "text" as const, text } },
+      });
+      for (let index = 0; index < 40; index += 1) await chunk(`small ${String(index).padStart(2, "0")}\n`);
+      await chunk("é".repeat(524_288));
+      await chunk("!");
+      await chunk("0123456789ab".repeat(1000));
+      await chunk("end of output");
+      return { stopReason: "end_turn" };
+    }
     if (promptText.includes("stream-follow-flow")) {
       // Chunks share a session-scoped message ID; a later prompt starts a new message.
       const messageId = `stream-follow-answer-${requestId}`;

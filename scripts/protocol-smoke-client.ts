@@ -126,7 +126,7 @@ export function agentMessages(replica: DocumentReplica | undefined): Entry[] {
 }
 
 /** One SSE stream as `EventSource` offers it; it reports a failure once, through `onerror`. */
-function openStream(url: URL, failed: (error: string) => void): StreamSource {
+export function openStream(url: URL, failed: (error: string) => void): StreamSource {
   const controller = new AbortController();
   const source: StreamSource = { onmessage: null, onerror: null, close: () => controller.abort() };
   void (async () => {
