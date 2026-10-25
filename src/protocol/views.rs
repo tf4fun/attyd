@@ -112,7 +112,7 @@ pub(crate) fn gone(tree: &Tree, view: &View) -> Option<Gone> {
     }
     let found = turns(tree, session)?
         .iter()
-        .any(|turn| head(turn)["start"].as_u64() == Some(start as u64));
+        .any(|turn| turn.as_value().is_some_and(|(head, _)| head["start"].as_u64() == Some(start as u64)));
     (!found).then_some(Gone::Absent)
 }
 
@@ -178,7 +178,9 @@ fn materialize(tree: &Tree, view: &View) -> Option<Spec> {
     match view {
         View::Latest { .. } => Some(output_view(tree, session, heads.last())),
         View::Output { start, .. } | View::Turn { start, .. } => {
-            let turn = heads.iter().find(|turn| head(turn)["start"].as_u64() == Some(*start as u64))?;
+            let turn = heads.iter().find(|turn| {
+                turn.as_value().is_some_and(|(head, _)| head["start"].as_u64() == Some(*start as u64))
+            })?;
             Some(match view {
                 View::Turn { .. } => turn_view(tree, session, turn),
                 _ => output_view(tree, session, Some(turn)),
