@@ -17,7 +17,7 @@ import { wire, type Hash } from "./digest";
 import { PatchError, applyOps } from "./patch";
 import type { Op } from "./protocol";
 import { shapeAt } from "./tree-shape";
-import { cachedValueHash, listHash, mapHash, objectHash } from "./tree-hash";
+import { SEGMENT_LENGTH, cachedValueHash, isTextWindow, listHash, mapHash, objectHash } from "./tree-hash";
 
 // ---------------------------------------------------------------------------
 // The events (design §6.2, §6.3)
@@ -166,6 +166,18 @@ function installNode(held: unknown, node: SNode): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// Windows (docs/protocol.md §5.4)
+
+const encoder = new TextEncoder();
+
+/** Whether `value` holds a window of `window` that carries `window + L` bytes of text or more. */
+function windowExceeded(value: unknown, window: number | undefined): boolean {
+  if (window === undefined || typeof value !== "object" || value === null) return false;
+  if (isTextWindow(value)) return encoder.encode(value.text).length >= window + SEGMENT_LENGTH;
+  return Object.values(value).some((member) => windowExceeded(member, window));
+}
+
+// ---------------------------------------------------------------------------
 // One path
 
 export interface PathReplica {
@@ -187,7 +199,7 @@ function resubscribe(reason: string, full: boolean): Applied {
   return { kind: "resubscribe", reason, full };
 }
 
-function install(path: string, held: PathReplica | undefined, snapshot: Snapshot): Applied {
+function install(path: string, held: PathReplica | undefined, snapshot: Snapshot, window: number | undefined): Applied {
   if (!Number.isInteger(snapshot.at) || typeof snapshot.hash !== "string" || typeof snapshot.node !== "object") {
     return resubscribe("a malformed snapshot", true);
   }
@@ -202,6 +214,7 @@ function install(path: string, held: PathReplica | undefined, snapshot: Snapshot
       return resubscribe("a snapshot from nothing that is not whole", true);
     }
     value = freeze(installNode(snapshot.base === null ? undefined : held?.value, snapshot.node));
+    if (windowExceeded(value, window)) return resubscribe("a text window of N + L bytes or more", true);
     // Confirmed only if what was installed is what the bridge hashed.
     if (wire(hashAt(tokensOf(path), value)) !== snapshot.hash) {
       return resubscribe("the snapshot does not match its hash", true);
@@ -218,9 +231,10 @@ function applyChange(
   held: PathReplica | undefined,
   change: Change,
   rev: number,
+  window: number | undefined,
 ): Applied {
   if ("end" in change) return { kind: "ended", end: change.end };
-  if ("snapshot" in change) return install(path, held, change.snapshot);
+  if ("snapshot" in change) return install(path, held, change.snapshot, window);
   if (held === undefined) return resubscribe("ops before any snapshot", false);
   // A repeat of a commit the replica has.
   if (rev <= held.version) return { kind: "unchanged" };
@@ -228,6 +242,9 @@ function applyChange(
   let value: unknown;
   try {
     value = freeze(applyOps(held.value, change.ops));
+    // A window of a followed path holds fewer than N + L bytes of text: more is the bridge's error, and
+    // the memory a small client reserved for it is not the replica's to spend.
+    if (windowExceeded(value, window)) return resubscribe("a text window of N + L bytes or more", true);
   } catch (error) {
     if (error instanceof PatchError) return resubscribe(error.message, false);
     throw error;
@@ -273,6 +290,8 @@ export const KEPT_UNFOLLOWED = 4;
 export class TreeReplicaSet {
   readonly #replicas = new Map<string, PathReplica>();
   readonly #failures = new Map<string, number>();
+  /** The window each path was last followed with: a replica is only the shape of what was asked for. */
+  readonly #windows = new Map<string, number | undefined>();
   #instance: string | undefined;
   #stream = 0;
   #current: number | undefined;
@@ -294,6 +313,11 @@ export class TreeReplicaSet {
   /** Opens a new stream for `follow`; returns its ID and URL, built from the versions held now. */
   open(follow: readonly Follow[]): { readonly stream: number; readonly url: string } {
     const params = new URLSearchParams();
+    for (const { path, window } of follow) {
+      // What was installed under another window (or none) is not what is asked for now.
+      if (this.#windows.has(path) && this.#windows.get(path) !== window) this.#replicas.delete(path);
+      this.#windows.set(path, window);
+    }
     const held = follow.filter(({ path }) => this.#replicas.has(path));
     if (this.#instance !== undefined && held.length > 0) params.append("instance", this.#instance);
     for (const { path } of follow) params.append("follow", path);
@@ -315,6 +339,7 @@ export class TreeReplicaSet {
     while (this.#unfollowed.length > KEPT_UNFOLLOWED) {
       const dropped = this.#unfollowed.shift()!;
       this.#replicas.delete(dropped);
+      this.#windows.delete(dropped);
       this.#failures.delete(dropped);
     }
     this.#following = following;
@@ -335,7 +360,7 @@ export class TreeReplicaSet {
     const changed: string[] = [];
     for (const change of event.changes ?? []) {
       if (!this.#following.has(change.path)) continue;
-      const result = applyChange(change.path, next.get(change.path), change, event.rev);
+      const result = applyChange(change.path, next.get(change.path), change, event.rev, this.#windows.get(change.path));
       if (result.kind === "resubscribe") return this.#fail(result.reason, result.full, change.path, dropped, event.instance);
       if (result.kind === "applied") {
         next.set(change.path, result.replica);

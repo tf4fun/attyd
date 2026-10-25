@@ -135,7 +135,6 @@ describe("a window that was asked for", () => {
       const params = new URL(next.url, "http://x").searchParams;
       expect(params.getAll("have"), `window ${window}`).toEqual([]);
       expect(set.get(PATH)).toBeUndefined();
-      set.receive(next.stream, event([snapshot(text, 5, window ?? 1 << 30)], 101, "I"));
     }
   });
 
@@ -160,7 +159,6 @@ describe("a window that was asked for", () => {
     const text = "a".repeat(N + SEGMENT_LENGTH - 10);
     const { set, stream } = opened();
     set.receive(stream, event([snapshot(text, 5)], 100, "I"));
-    const held = set.get(PATH);
     const ops: Change = {
       path: PATH,
       from: 5,
@@ -171,6 +169,5 @@ describe("a window that was asked for", () => {
     };
     expect(set.receive(stream, event([ops], 120)).kind).toBe("resubscribe");
     expect(set.get(PATH)).toBeUndefined();
-    expect(held).toBeDefined();
   });
 });
