@@ -1400,6 +1400,30 @@ const agent = acp
       await waitForStage("finish");
       return { stopReason: "end_turn" };
     }
+    if (promptText === "output-paging-flow") {
+      const toolCallId = `paging-${requestId}-gate`;
+      // Both barriers update this existing tool. Adding a tool between chunks would start a
+      // different message entry, so it would not exercise paging one growing text position.
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "tool_call", toolCallId, title: "Paging checkpoints", status: "in_progress" },
+      });
+      const chunk = (text: string) => client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk" as const, messageId: `paging-${requestId}`, content: { type: "text" as const, text } },
+      });
+      const gate = (stage: string) => client.request(acp.methods.client.session.requestPermission, {
+        sessionId: params.sessionId,
+        toolCall: { toolCallId, title: stage },
+        options: [{ optionId: "continue", name: "Continue", kind: "allow_once" }],
+      });
+      await chunk("x");
+      await chunk("é".repeat(524_288));
+      await gate("Capture paging version");
+      for (let index = 0; index < 40; index += 1) await chunk("y");
+      await gate("Page before the turn ends");
+      return { stopReason: "end_turn" };
+    }
     if (promptText.includes("output-window-flow")) {
       // One Agent message that grows in the ways a window of its text must follow: many small
       // chunks, one piece of 1 MiB, one byte, and 12,000 bytes after it (docs/protocol.md §5.4).
