@@ -122,3 +122,55 @@ describe("following a path as a window", () => {
     expect(set.lastResubscribe).toMatchObject({ full: true, path: PATH });
   });
 });
+
+describe("a window that was asked for", () => {
+  it("is not kept as what a replica holds when the path is followed with another window or none", () => {
+    const text = "w".repeat(30_000);
+    const set = new TreeReplicaSet();
+    const first = set.open([{ path: PATH, window: N }]);
+    set.receive(first.stream, event([snapshot(text, 5)], 100, "I"));
+    expect(set.get(PATH)).toBeDefined();
+    for (const window of [8192, undefined]) {
+      const next = set.open([{ path: PATH, ...(window === undefined ? {} : { window }) }]);
+      const params = new URL(next.url, "http://x").searchParams;
+      expect(params.getAll("have"), `window ${window}`).toEqual([]);
+      expect(set.get(PATH)).toBeUndefined();
+      set.receive(next.stream, event([snapshot(text, 5, window ?? 1 << 30)], 101, "I"));
+    }
+  });
+
+  it("is kept when the same window is asked for again", () => {
+    const set = new TreeReplicaSet();
+    const first = set.open([{ path: PATH, window: N }]);
+    set.receive(first.stream, event([snapshot("w".repeat(30_000), 5)], 100, "I"));
+    const again = set.open([{ path: PATH, window: N }]);
+    expect(new URL(again.url, "http://x").searchParams.getAll("have")).toEqual([`${PATH}:5`]);
+  });
+
+  it("is refused when the bridge sends a window of N + L bytes or more", () => {
+    const text = "w".repeat(30_000);
+    const { set, stream } = opened();
+    const tooLong = { ...windowed(text), text: { ...windowOf(text, N), text: "w".repeat(N + SEGMENT_LENGTH) } };
+    const change: Change = { path: PATH, snapshot: { base: null, at: 5, hash: H(view(text)), node: { v: tooLong } } };
+    expect(set.receive(stream, event([change], 100, "I")).kind).toBe("resubscribe");
+    expect(set.lastResubscribe?.reason).toMatch(/window/);
+  });
+
+  it("is refused when an append makes the held window N + L bytes or more, leaving the replica as it was", () => {
+    const text = "a".repeat(N + SEGMENT_LENGTH - 10);
+    const { set, stream } = opened();
+    set.receive(stream, event([snapshot(text, 5)], 100, "I"));
+    const held = set.get(PATH);
+    const ops: Change = {
+      path: PATH,
+      from: 5,
+      ops: [
+        { op: "append", path: "/text/text", text: "b".repeat(20) },
+        { op: "set", path: "/text/length", value: text.length + 20 },
+      ],
+    };
+    expect(set.receive(stream, event([ops], 120)).kind).toBe("resubscribe");
+    expect(set.get(PATH)).toBeUndefined();
+    expect(held).toBeDefined();
+  });
+});
