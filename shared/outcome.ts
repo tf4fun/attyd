@@ -43,8 +43,10 @@ export function outcome(target: TargetState, request: Request): Outcome {
   }
   const admitted = target.ops.find((record) => record.id === request.id);
   if (admitted !== undefined) return { outcome: "admitted", record: admitted.id };
-  if (target.ops.some((record) => record.after === request.expect)) return { outcome: "superseded" };
+  // `e` still being the target's `op` means no operation replaced it, whatever the log says: it is
+  // checked before `superseded`, which must never be answered for a request that may yet be admitted.
   if (target.op === request.expect) return { outcome: "open" };
+  if (target.ops.some((record) => record.after === request.expect)) return { outcome: "superseded" };
   return { outcome: "unknown", reason: "expired" };
 }
 
