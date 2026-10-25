@@ -782,8 +782,9 @@ The bridge admits operation writes and loads one at a time against the target's 
 
 Capability, argument and Agent checks follow: `unsupported`, `invalid_request`,
 `unavailable`. A refused write changes nothing. An admitted operation is the `op` of
-every held target it occupies, with the same `id`, until it actually ends; an unheld
-occupied session cannot be loaded meanwhile. There is no queue: competing writes are
+every held target it occupies, with the same `id`, until it actually ends, and an occupied
+target keeps showing it after it ended or failed: a target's `op.id` never returns to an ID it
+showed before, which §9.3 relies on. An unheld occupied session cannot be loaded meanwhile. There is no queue: competing writes are
 refused (R4 of the design). `cancel` is admitted while the `op` runs; interaction answers
 are actions. Neither waits for the running operation.
 
@@ -838,9 +839,12 @@ The outcome of a request `(x, e)` written to target `W`, while the client held i
 | the instance is not `i` | `unknown` (`restarted`) | `(x, e)` can no longer be admitted (above), but whether it was is lost |
 | `W` was installed after `t` (released and held again) | `unknown` (`released`) | as above |
 | `x` is in `W.ops` | `admitted`, with its record | it took effect |
-| a record in `W.ops` has `after == e` and `id ≠ x` | `superseded` | another operation replaced `e`; `(x, e)` can never be admitted |
 | `W.op.id == e` | `open` | not admitted **yet**: a delayed copy may still be |
+| a record in `W.ops` has `after == e` and `id ≠ x` | `superseded` | another operation replaced `e`; `(x, e)` can never be admitted |
 | otherwise (`e` is older than the window) | `unknown` (`expired`) | |
+
+The rows are read in order. `open` precedes `superseded` so that a request that may still be
+admitted is never answered `superseded`, whatever the log says.
 
 `GET /targets/{W}/ops/{x}?expect=e&instance=i&at=t` answers this. A client following
 `W/op` and `W/ops` computes the same from its replica; the rule is implemented once in
@@ -1099,7 +1103,7 @@ decode, apply, verify and install steps.
 | Turn index | a partition change rewrites only the index; a fixed view ends `absent`; a load ends fixed views `replaced`, also after a resubscription without `have` |
 | Text windows | a 1 MiB append arrives as one window of at most `N + L` bytes that verifies from its 32-byte `before`; 1 byte then 12,000 bytes at `N = 4096` is a `set`; a stale segment read is refused |
 | Several clients | two followers at one version have equal hashes; their writes race as §6.6 states; two answers to one interaction deliver exactly one |
-| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, a write lost while another operation replaced `global`'s `op`, and a session released and held again (`released`); only `superseded` allows a new request |
+| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, a lost `fork` resolved from its source session's log after another operation, a write lost while another operation replaced `global`'s `op`, and a session released and held again (`released`); a delete that occupied a session and failed leaves its `op` in the session, so a request that expected the replaced `op` is `superseded` and no `op.id` returns; only `superseded` allows a new request |
 | A delayed request | the query answers `open` while `op.id == e`; the repeat of `(x, e)` is admitted or a no-op; exactly one prompt runs |
 | Bounded heads | with a 1 MiB Agent error, `OpHead`, `OpRecord` and `End` stay bounded |
 | Reconnect races | a superseded stream's late events cannot overwrite a newer replica; a late `GET` of an old instance is not installed (§8.3) |

@@ -209,3 +209,68 @@ fn a_session_the_bridge_does_not_hold_is_released_or_restarted_and_a_missing_tar
     );
     assert!(resolve(&bridge.tree, "nowhere", &request("I")).is_none());
 }
+
+// --- an occupation never gives the session's `op` back ----------------------------------
+
+/// A global `delete` occupies the held session `s`, then fails by `fail`.
+fn delete_that_fails(fail: impl FnOnce(&mut SessionRegistry, &str)) -> (Bridge, String, String) {
+    let mut bridge = Bridge::new();
+    let before = bridge.state("sessions/s").op;
+    let delete = bridge
+        .registry
+        .install_operation(&Scope::Global, OperationKind::Delete, json!({ "sessionId": "s" }))
+        .unwrap();
+    bridge.commit();
+    fail(&mut bridge.registry, &delete);
+    bridge.commit();
+    (bridge, before, delete)
+}
+
+fn failure() -> crate::protocol::documents::ProtocolError {
+    crate::protocol::documents::ProtocolError::new(crate::protocol::documents::ErrorCode::Unavailable, "failed")
+}
+
+/// The session keeps showing the failed delete; the request that expected the operation the delete
+/// replaced is superseded for good, and the log never names an ID twice.
+fn assert_never_gives_the_op_back((bridge, before, delete): (Bridge, String, String)) {
+    let state = bridge.state("sessions/s");
+    assert_eq!(state.op, delete, "the session shows the delete that occupied it");
+    let ids: Vec<&str> = state.ops.iter().map(|record| record.id.as_str()).collect();
+    let unique: std::collections::BTreeSet<&&str> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "no ID is recorded twice: {ids:?}");
+    assert_eq!(asked("x", &before, &bridge, "sessions/s"), Outcome::Superseded);
+    assert_eq!(asked("y", &delete, &bridge, "sessions/s"), Outcome::Open);
+    assert_eq!(bridge.tree.get("/sessions/s/op").unwrap().as_value().unwrap().0["status"], "failed");
+}
+
+#[test]
+fn a_delete_failed_by_its_operation_leaves_its_op_in_the_occupied_session() {
+    assert_never_gives_the_op_back(delete_that_fails(|registry, delete| {
+        registry.fail_protocol_operation(delete, failure());
+    }));
+}
+
+#[test]
+fn a_delete_failed_in_its_scope_leaves_its_op_in_the_occupied_session() {
+    assert_never_gives_the_op_back(delete_that_fails(|registry, _| {
+        registry.fail_scope_operation(&Scope::Global, OperationKind::Delete, failure());
+    }));
+}
+
+#[test]
+fn a_delete_the_session_operation_failed_leaves_its_op_in_the_occupied_session() {
+    assert_never_gives_the_op_back(delete_that_fails(|registry, _| {
+        registry.fail_session_operation(
+            "s",
+            crate::runtime_state::SessionOperationKind::Delete,
+            &json!({ "code": -32000, "message": "refused" }),
+        );
+    }));
+}
+
+#[test]
+fn a_connection_that_ends_during_a_delete_leaves_its_op_in_the_occupied_session() {
+    assert_never_gives_the_op_back(delete_that_fails(|registry, _| {
+        registry.end_connection(failure());
+    }));
+}

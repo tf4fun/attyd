@@ -49,22 +49,11 @@ pub(crate) fn read_segment(tree: &Tree, path: &str, index: usize, at: u64) -> Se
     let segments: Vec<&str> = hash::segments(text).collect();
     let Some(segment) = segments.get(index) else { return SegmentRead::NotFound };
     let history = node.text_history();
-    if history.replaced > at {
+    // Only this position's own history counts: another position of the node, or a field beside
+    // the text, changing leaves its segments as they were.
+    let Some(held) = history.positions.get(&position) else { return SegmentRead::Stale };
+    if held.replaced > at || held.segments[index] > at {
         return SegmentRead::Stale;
-    }
-    if node.rev() > at {
-        // Only appended to since: the segment is as it was if it was complete at `at`.
-        let end: usize = segments[..=index].iter().map(|segment| segment.len()).sum();
-        let length_at = history
-            .lengths
-            .iter()
-            .rev()
-            .find(|(rev, _)| *rev <= at)
-            .and_then(|(_, lengths)| lengths.iter().find(|(held, _)| *held == position))
-            .map(|(_, length)| *length);
-        if !length_at.is_some_and(|length| length >= end as u64) {
-            return SegmentRead::Stale;
-        }
     }
     let before = segments[..index].iter().fold(ZERO, |state, segment| hash::chain_step(&state, segment));
     SegmentRead::Segment(Segment { before: state_wire(&before), segment: (*segment).to_string() })

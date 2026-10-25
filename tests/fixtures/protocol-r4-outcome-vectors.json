@@ -181,6 +181,61 @@
    }
   },
   {
+   "name": "open wins over a log that says e was replaced: the op is e again",
+   "target": {
+    "instance": "I",
+    "op": "e",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "d",
+      "after": "e"
+     },
+     {
+      "id": "e",
+      "after": "d"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "open"
+   }
+  },
+  {
+   "name": "admitted still wins when the op came back to e",
+   "target": {
+    "instance": "I",
+    "op": "e",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "x",
+      "after": "e"
+     },
+     {
+      "id": "e",
+      "after": "x"
+     }
+    ]
+   },
+   "request": {
+    "id": "x",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "admitted",
+    "record": "x"
+   }
+  },
+  {
    "name": "expired: e is older than the window and nothing replaced it in it",
    "target": {
     "instance": "I",

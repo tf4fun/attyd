@@ -41,6 +41,29 @@ and release-parity classifications remain in their respective ledgers.
 | S4 | two prompts with the same `expect`: one `202`, the other `stale`, whose outcome is `superseded` |
 | S5 | two answers to one interaction: one delivered, one refused; a `cancel` against the running prompt is admitted and the prompt ends |
 
+**Delayed writes and occupation (issue #216, P1-1).** The coordinator tests in
+`src/bridge/protocol_gate_tests.rs` use the real ACP transport and explicit admission
+and response boundaries, without a timing sleep:
+
+- `a_delayed_prompt_and_its_unchanged_retries_execute_once`: hold the original before
+  ingress, read `open`, admit its unchanged retry, then deliver the original while the
+  Agent's response is pending and repeat again after completion. All copies identify
+  the same operation; the Agent receives exactly one `session/prompt`, one user entry
+  is retained, and the outcome is `admitted`.
+- `a_failed_delete_rejects_a_delayed_prompt_and_allows_one_new_request`: prepare a
+  prompt against the session's current operation, let a global delete occupy the
+  session, then refuse its ACP close. Both targets keep the failed delete's ID and the
+  old prompt is permanently `superseded`. A new request against the failed delete
+  runs once; the delayed old request is `stale`, and copies of the new request do not
+  send another ACP prompt. EOF joins the coordinator before the remaining outgoing
+  messages are checked, so the absence check includes all completed sends.
+
+The projector also asserts in debug builds that a changing operation ID is absent
+from the retained records and their predecessors. Status updates of the current
+operation are allowed; the bounded log is not an archive of older IDs. Unit cases in
+`src/protocol/outcome/tests.rs` cover the operation, scope, session and connection-end
+failure paths; `src/protocol/tree_doc/tests.rs` checks the invariant assertion.
+
 ## Acceptance
 
 Revision 4 review boundaries (#216) have these concrete gates in addition to S1–S5:
@@ -227,7 +250,10 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
 <a id="a14"></a>
 
 14. **Delete (§6.1).** Delete of a held session ends its scope with `deleted`; a failed
-    delete leaves its error on `global.op`.
+    delete leaves its operation on both `global` and the held session, with the error
+    summary in `op` and its body in `opDetail`. The session does not restore the ID the
+    delete replaced; a delayed write against that ID stays `superseded` and is refused
+    as `stale`, while a new write against the failed delete may proceed.
 
 <a id="a15"></a>
 

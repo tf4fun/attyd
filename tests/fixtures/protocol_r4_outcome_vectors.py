@@ -23,11 +23,12 @@ def outcome(target, request):
     for record in target["ops"]:
         if record["id"] == x:
             return {"outcome": "admitted", "record": x}
+    # e still being the op means nothing replaced it, whatever the log says.
+    if target["op"] == e:
+        return {"outcome": "open"}
     for record in target["ops"]:
         if record["after"] == e and record["id"] != x:
             return {"outcome": "superseded"}
-    if target["op"] == e:
-        return {"outcome": "open"}
     return {"outcome": "unknown", "reason": "expired"}
 
 
@@ -54,6 +55,10 @@ CASES = [
      target("e", []), request("x", "e")),
     ("open: e is the current op and the log holds older records",
      target("e", [("e", "d"), ("d", "c")]), request("x", "e")),
+    ("open wins over a log that says e was replaced: the op is e again",
+     target("e", [("d", "e"), ("e", "d")]), request("x", "e")),
+    ("admitted still wins when the op came back to e",
+     target("e", [("x", "e"), ("e", "x")]), request("x", "e")),
     ("expired: e is older than the window and nothing replaced it in it",
      target("z", [("z", "y"), ("y", "w")]), request("x", "e")),
     ("expired: an empty log whose op is not e",
