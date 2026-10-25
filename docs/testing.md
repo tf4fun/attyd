@@ -46,6 +46,14 @@ remote-transport and host smokes, the `dev` feature check, the instrumented cove
 suite and the binaries of every target. Pushes to `main` and release tags always run everything.
 Work on a pull request as a draft, and mark it ready (`gh pr ready`) once the fast checks pass;
 merge it when the full run is green.
+
+Rust dependencies are audited with `cargo audit --file Cargo.lock --deny unsound` in
+both draft and full CI. Unsoundness advisories must fail the check even when the audit
+tool classifies them as warnings. Update the affected dependency; any necessary exception
+must identify the advisory and document why it applies, rather than disabling this category.
+Tokio's production and test requirements start at 1.53.3, the compatible patch for
+[RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+
 Linux CI jobs pin `ubuntu-26.04`, with `ubuntu-26.04-arm` for native ARM64 binaries.
 This adopts Ubuntu 26.04 explicitly ahead of the
 [`ubuntu-latest` migration to Ubuntu 26.04](https://github.com/actions/runner-images/issues/14748)
