@@ -116,6 +116,7 @@ async fn sign_in(address: SocketAddr) {
         Method::POST,
         "/api/v2/targets/global/ops",
         Some(json!({
+            "id": crate::protocol::op::operation_id(),
             "expect": expect,
             "kind": "terminal_login",
             "args": {"methodId": "terminal-login", "cols": 80, "rows": 24},

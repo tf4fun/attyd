@@ -349,6 +349,7 @@ impl Server {
     async fn create(&self, link: &mut Link, session_id: &str) {
         let (_, global) = self.read("global").await;
         let body = json!({
+            "id": crate::protocol::op::operation_id(),
             "expect": global["snapshot"]["doc"]["live"]["op"]["id"], "kind": "create",
             "args": {"cwd": CWD},
         });

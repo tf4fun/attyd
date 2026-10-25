@@ -12,6 +12,7 @@ import { startRustTestServer, type RustTestServer } from "../../scripts/rust-tes
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
 import { controlsOf, nodeValue, opIdOf, opsOf, scopesOf, trackApi } from "./api-requests";
 import { collectBrowserErrors } from "./browser-errors";
+import { newOperationId } from "../../shared/write-resolution";
 
 /** The PID of the current Agent process, as the fake Agent writes it at start. */
 type AgentPid = () => Promise<string>;
@@ -398,7 +399,7 @@ for (const { kind, listState } of [
       // The pages the catalog's document holds stay while its revision stays; a list is needed again
       // only after it changed, which another client creating a session does. Listing stalls from here on.
       const other = await page.request.post("/api/v2/targets/global/ops", {
-        data: { expect: await opIdOf(page.request, "global"), kind: "create", args: { cwd: process.cwd() } },
+        data: { id: newOperationId(), expect: await opIdOf(page.request, "global"), kind: "create", args: { cwd: process.cwd() } },
       });
       expect(other.status()).toBe(202);
 
@@ -799,7 +800,7 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   ];
   const scope = "sessions/saved-session";
   const accepted = await page.request.post(`/api/v2/targets/${scope}/ops`, {
-    data: { expect: await opIdOf(page.request, scope), kind: "prompt", args: { prompt: blocks } },
+    data: { id: newOperationId(), expect: await opIdOf(page.request, scope), kind: "prompt", args: { prompt: blocks } },
   });
   expect(accepted.status()).toBe(202);
   await expect(page.getByText("Received prompt blocks: text,image,text,resource.", { exact: true })).toBeVisible();
@@ -1575,7 +1576,7 @@ test("retires the open session after another client deletes it without subscribi
   // A separate API client deletes the session. This page gets no response of
   // its own: the stream's `end: deleted` must drive the exit.
   const response = await page.request.post("/api/v2/targets/global/ops", {
-    data: { expect: await opIdOf(page.request, "global"), kind: "delete", args: { sessionId: "saved-session" } },
+    data: { id: newOperationId(), expect: await opIdOf(page.request, "global"), kind: "delete", args: { sessionId: "saved-session" } },
   });
   expect(response.status()).toBe(202);
   await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));

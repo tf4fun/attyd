@@ -6,7 +6,7 @@
 // itself (C3): the client returns what it needs to repeat it or to find out what became of it
 // from the target's log (§9.3).
 
-import type { OpArgs, ProtocolError } from "./protocol";
+import type { OpArgs, OpRequest, ProtocolError } from "./protocol";
 import {
   isProtocolError,
   isRecord,
@@ -83,12 +83,12 @@ export class OpsClient {
       ...(held?.epoch === undefined ? {} : { instance: held.epoch }),
       ...(held?.rev === undefined ? {} : { at: held.rev }),
     };
-    return this.#send(write.scope, { id: write.id, expect: write.expect, kind: args.kind, args: args.args }, write);
+    return this.#send(write.scope, { ...args, id: write.id, expect: write.expect }, write);
   }
 
   /** Sends `write` again, with the same id and `expect`: harmless if it was admitted (§6.6). */
   repeat(write: Write, args: StartingWrite): Promise<WriteOutcome> {
-    return this.#send(write.scope, { id: write.id, expect: write.expect, kind: args.kind, args: args.args }, write);
+    return this.#send(write.scope, { ...args, id: write.id, expect: write.expect }, write);
   }
 
   /** What became of `write`, from the log of the target it was written to as the client holds it (§9.3). */
@@ -163,7 +163,7 @@ export class OpsClient {
     return this.#send(scope, { expect: op.id, kind: "cancel", args: {} }, undefined);
   }
 
-  async #send(scope: string, body: unknown, write: Write | undefined): Promise<WriteOutcome> {
+  async #send(scope: string, body: OpRequest, write: Write | undefined): Promise<WriteOutcome> {
     let response: Awaited<ReturnType<HttpFetch>>;
     try {
       response = await this.#fetch(`/api/v2/targets/${targetOf(scope)}/ops`, {

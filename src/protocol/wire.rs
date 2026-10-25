@@ -14,14 +14,56 @@ use super::documents::ProtocolError;
 // ---------------------------------------------------------------------------
 // Operations (protocol §6)
 
-/// `POST /api/v2/scopes/{scope}/ops` (§6.1).
+/// `POST /api/v2/targets/{target}/ops` (§6.1).
+/// New operations carry a client-chosen identity; cancellation acts on `expect`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-pub(crate) struct OpRequest {
-    /// The `op.id` the write expects the scope to show.
-    pub expect: String,
-    #[serde(flatten)]
-    pub write: OpArgs,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum OpRequest {
+    Prompt {
+        id: String,
+        expect: String,
+        args: PromptArgs,
+    },
+    Fork {
+        id: String,
+        expect: String,
+        args: ForkArgs,
+    },
+    Create {
+        id: String,
+        expect: String,
+        args: CreateArgs,
+    },
+    Delete {
+        id: String,
+        expect: String,
+        args: DeleteArgs,
+    },
+    Authenticate {
+        id: String,
+        expect: String,
+        args: MethodArgs,
+    },
+    Logout {
+        id: String,
+        expect: String,
+        args: Empty,
+    },
+    TerminalLogin {
+        id: String,
+        expect: String,
+        args: TerminalLoginArgs,
+    },
+    List {
+        id: String,
+        expect: String,
+        args: ListArgs,
+    },
+    Cancel {
+        expect: String,
+        args: Empty,
+    },
 }
 
 /// A client-written kind and its `args` (§6.2).

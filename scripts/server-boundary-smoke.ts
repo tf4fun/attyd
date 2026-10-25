@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import * as acp from "@agentclientprotocol/sdk";
 import { startRustTestServer } from "./rust-test-server.js";
 import type { OpArgs } from "../shared/protocol.js";
+import { newOperationId } from "../shared/write-resolution.js";
 import {
   agentMessages, globalLive, replyText, sessionLive, sessionScope, SmokeClient,
 } from "./protocol-smoke-client.js";
@@ -74,7 +75,7 @@ try {
     const response = await fetch(`${origin}/api/v2/targets/global/ops`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
-      body: JSON.stringify({ expect: await globalOp(), ...write }),
+      body: JSON.stringify({ id: newOperationId(), expect: await globalOp(), ...write }),
     });
     const text = await response.text();
     assert.equal(response.status, 202, `${write.kind} with ${JSON.stringify(headers)}: ${text}`);
@@ -112,7 +113,7 @@ try {
     const forged = await fetch(`${origin}/api/v2/targets/global/ops`, {
       method: "POST",
       headers: { Origin: attackOrigin, "Content-Type": "application/json" },
-      body: JSON.stringify({ expect: await globalOp(), kind: "logout", args: {} }),
+      body: JSON.stringify({ id: newOperationId(), expect: await globalOp(), kind: "logout", args: {} }),
     });
     assert.equal(forged.status, 403, `unexpected acceptance of a JSON write from ${attackOrigin}`);
     assert.equal((await fetch(`${origin}/api/health`, { headers: { Origin: attackOrigin } })).status, 403, "cross-origin reads must also be denied");
@@ -237,7 +238,7 @@ async function verifyLargeRequestBody(origin: string, client: SmokeClient): Prom
   wav.writeUInt32LE(8_000, 24); wav.writeUInt32LE(16_000, 28);
   wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
   wav.write("data", 36); wav.writeUInt32LE(wav.length - 44, 40);
-  const body = JSON.stringify({ expect: opened.id, kind: "prompt", args: { prompt: [
+  const body = JSON.stringify({ id: newOperationId(), expect: opened.id, kind: "prompt", args: { prompt: [
     ...Array.from({ length: 65 }, () => ({ type: "text", text: "large-attachment-input-flow" })),
     { type: "audio", mimeType: "audio/wav", data: wav.toString("base64") },
   ] } });

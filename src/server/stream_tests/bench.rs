@@ -21,6 +21,7 @@ mod login_terminals;
 mod occupation;
 mod reads;
 mod recovery;
+mod request_identity;
 mod restart;
 mod retired_v1;
 #[cfg(unix)]
@@ -50,6 +51,15 @@ fn target_of(scope: &str) -> String {
 /// The path of a scope's ops.
 fn ops_path(scope: &str) -> String {
     format!("/api/v2/targets/{}/ops", target_of(scope))
+}
+
+/// A test client chooses its identity before sending a new operation.
+fn operation_request(expect: &Value, kind: &str, args: Value) -> Value {
+    let mut body = json!({ "expect": expect, "kind": kind, "args": args });
+    if kind != "cancel" {
+        body["id"] = json!(crate::protocol::op::operation_id());
+    }
+    body
 }
 
 /// Percent-encodes one path segment: a session scope's `/` included.
@@ -218,7 +228,7 @@ impl Bench {
         self.call(
             Method::POST,
             &ops_path(scope),
-            Some(json!({ "expect": expect, "kind": kind, "args": args })),
+            Some(operation_request(expect, kind, args)),
         )
         .await
     }
@@ -264,7 +274,7 @@ impl Bench {
         args: Value,
     ) -> JoinHandle<(StatusCode, Value)> {
         let address = self.address;
-        let body = json!({ "expect": expect, "kind": kind, "args": args });
+        let body = operation_request(expect, kind, args);
         let path = ops_path(scope);
         let scope = scope.to_string();
         tokio::spawn(async move {

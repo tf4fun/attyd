@@ -545,6 +545,10 @@ GET  /api/v2/targets/{target}/ops/{id}?expect=<e>&instance=<i>&at=<version>
 Kinds, actions, arguments, occupation and admission are revision 3's (§6.2, §6.4, §7),
 renamed from scopes to targets.
 
+Every new operation requires the client-generated `id` defined in protocol §6.5:
+missing, null or malformed IDs are refused before admission. `cancel` starts no new
+operation and does not require an ID; it retains the supplied-ID validation in §6.2.
+
 ## 9. Writes
 
 ### 9.1 Admission (unchanged)
