@@ -94,7 +94,7 @@ pub(crate) fn windowed_value_hash(rule: TextRule, windowed: &Value) -> Option<Ha
 /// decision depends on the appended bytes alone, so a client needs at most the window it holds
 /// plus one event's text.
 pub(crate) fn appends(appended: usize, bytes: usize) -> bool {
-    appended < bytes + L
+    appended < bytes.saturating_add(L)
 }
 
 #[cfg(test)]

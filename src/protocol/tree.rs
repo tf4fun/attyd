@@ -700,11 +700,11 @@ impl Tree {
         let tokens: Vec<String> = path.strip_prefix('/')?.split('/').map(unescape).collect();
         let next = self.rev + 1;
         let mut ops = Vec::new();
-        let mut root = self.root.clone();
-        if !root.replace_at(&tokens, spec, next, "", &mut ops) || root.srev < next {
+        // `replace_at` changes the tree only when it succeeds, and a replacement that changes no
+        // value leaves every revision as it was: there is nothing to undo, and no copy to make.
+        if !self.root.replace_at(&tokens, spec, next, "", &mut ops) || self.root.srev < next {
             return None;
         }
-        self.root = root;
         self.rev = next;
         Some(Committed { rev: next, ops })
     }
