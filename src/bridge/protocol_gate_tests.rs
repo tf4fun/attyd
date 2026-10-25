@@ -24,7 +24,6 @@ use crate::protocol::tree_stream::client::Client;
 use crate::protocol::tree_stream::documents::{Document, document, path_of};
 use crate::protocol::tree_stream::params::{Follow, StreamQuery};
 use crate::protocol::tree_stream::wire::{Change, Event};
-use crate::protocol::op::OpEnd;
 use crate::protocol::outcome::{self, Request as OutcomeRequest};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -511,15 +510,13 @@ impl Peer {
             .unwrap_or_else(|error| panic!("the control was refused: {error:?}"))
     }
 
-    /// Starts an operation of `kind` in `scope` and waits until it is
-    /// published: its ID, and for `create`, `fork` and `list` the end its
-    /// response waits for.
+    /// Starts an operation and returns its ID and the scope/ID to observe for its end.
     async fn start_op(
         &mut self,
         scope: &str,
         kind: &str,
         args: Value,
-    ) -> (String, Option<oneshot::Receiver<OpEnd>>) {
+    ) -> (String, (String, String)) {
         let admission = self
             .write(scope, kind, args)
             .await
@@ -529,15 +526,22 @@ impl Peer {
             peer.live(scope)["op"]["id"] == id.as_str()
         })
         .await;
-        (admission.op, admission.end)
+        (admission.op.clone(), (scope.to_string(), admission.op))
     }
 
-    /// The end a held `create`, `fork` or `list` response takes.
-    async fn ended(end: Option<oneshot::Receiver<OpEnd>>) -> OpEnd {
-        tokio::time::timeout(WAIT, end.expect("a held response"))
-            .await
-            .expect("the operation did not end")
-            .expect("the operation's end was dropped")
+    /// Reads the final result through the same published tree as the client.
+    async fn ended(&mut self, (scope, id): (String, String)) -> Result<Value, ProtocolError> {
+        self.until("the operation's end is published", |peer| {
+            let op = &peer.live(&scope)["op"];
+            op["id"] == id && matches!(op["status"].as_str(), Some("completed" | "failed"))
+        })
+        .await;
+        let op = &self.live(&scope)["op"];
+        if op["status"] == "completed" {
+            Ok(op["result"].clone())
+        } else {
+            Err(serde_json::from_value(op["error"].clone()).unwrap())
+        }
     }
 
     /// Answers one interaction at its resource (protocol §7), as the route does.
@@ -583,7 +587,7 @@ impl Peer {
         response["sessionId"] = json!(session_id);
         self.reply(&new, response).await;
         assert_eq!(
-            Self::ended(end).await.unwrap(),
+            self.ended(end).await.unwrap(),
             json!({"sessionId": session_id})
         );
         let scope = format!("session/{session_id}");
@@ -1374,7 +1378,7 @@ async fn a_failed_create_fails_its_operation() {
         .await;
     let request = peer.request("session/new").await;
     peer.refuse(&request).await;
-    Peer::ended(created).await.unwrap_err();
+    peer.ended(created).await.unwrap_err();
     peer.until("the create fails", |peer| {
         peer.live("global")["op"]["status"] == "failed"
     })
@@ -1418,7 +1422,7 @@ async fn a_fork_completes_on_its_source_and_its_target_appears() {
         }},
     ]))
     .await;
-    Peer::ended(forked).await.unwrap();
+    peer.ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
         peer.live("session/source")["op"]["id"] == op
             && peer.live("session/source")["op"]["status"] == "completed"
@@ -1472,7 +1476,7 @@ async fn a_forks_early_process_updates_alone_keep_the_sources_log() {
     )
     .await;
     peer.reply(&request, json!({"sessionId": "forked"})).await;
-    Peer::ended(forked).await.unwrap();
+    peer.ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
         peer.live("session/source")["op"]["id"] == op
             && peer.live("session/source")["op"]["status"] == "completed"
@@ -1509,7 +1513,7 @@ async fn a_forks_early_messages_are_its_targets_log_without_load_support() {
         peer.update("forked", update.clone()).await;
     }
     peer.reply(&request, json!({"sessionId": "forked"})).await;
-    Peer::ended(forked).await.unwrap();
+    peer.ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
         peer.live("session/source")["op"]["id"] == op
             && peer.live("session/source")["op"]["status"] == "completed"
@@ -1550,7 +1554,7 @@ async fn a_new_sessions_early_messages_are_the_start_of_its_timeline() {
     )
     .await;
     peer.reply(&new, json!({"sessionId": "early"})).await;
-    Peer::ended(end).await.unwrap();
+    peer.ended(end).await.unwrap();
     peer.until("the created session is published", |peer| {
         peer.has("session/early")
     })
@@ -1605,7 +1609,7 @@ async fn a_forks_timeline_is_its_own_notifications_and_never_the_sources() {
     .await;
     peer.update("forked", chunk("t", text("target says"))).await;
     peer.reply(&request, json!({"sessionId": "forked"})).await;
-    Peer::ended(forked).await.unwrap();
+    peer.ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
         peer.live("session/source")["op"]["id"] == op
             && peer.live("session/source")["op"]["status"] == "completed"
@@ -1643,7 +1647,7 @@ async fn a_fork_without_early_notifications_has_an_empty_partial_timeline() {
     let (op, forked) = peer.start_op("session/source", "fork", json!({})).await;
     let request = peer.request("session/fork").await;
     peer.reply(&request, json!({"sessionId": "forked"})).await;
-    Peer::ended(forked).await.unwrap();
+    peer.ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
         peer.live("session/source")["op"]["id"] == op
             && peer.live("session/source")["op"]["status"] == "completed"
@@ -1669,7 +1673,7 @@ async fn a_forks_load_replaces_its_timeline_with_the_replay_as_complete() {
     let request = peer.request("session/fork").await;
     peer.update("forked", chunk("early", text("early"))).await;
     peer.reply(&request, json!({"sessionId": "forked"})).await;
-    Peer::ended(forked).await.unwrap();
+    peer.ended(forked).await.unwrap();
     peer.until("the fork completes", |peer| {
         peer.live("session/source")["op"]["id"] == op
             && peer.live("session/source")["op"]["status"] == "completed"
@@ -1896,7 +1900,7 @@ async fn a_list_completes_on_the_catalog_with_its_page() {
         json!({"sessions": [{"sessionId": "saved", "cwd": "/workspace"}], "nextCursor": null}),
     )
     .await;
-    Peer::ended(listed).await.unwrap();
+    peer.ended(listed).await.unwrap();
     peer.until("the list completes", |peer| {
         peer.live("catalog")["op"]["status"] == "completed"
     })
@@ -1962,7 +1966,7 @@ async fn a_request_scoped_elicitation_followed_by_its_response_joins_the_catalog
         &request,
     )
     .await;
-    Peer::ended(listed).await.unwrap();
+    peer.ended(listed).await.unwrap();
     peer.until("the list completes", |peer| {
         peer.live("catalog")["op"]["status"] == "completed"
     })
@@ -2018,7 +2022,7 @@ async fn a_request_scoped_url_flow_on_global_outlives_its_operation() {
     })
     .await;
     peer.reply(&request, json!({"sessionId": CREATED})).await;
-    Peer::ended(created).await.unwrap();
+    peer.ended(created).await.unwrap();
     peer.until("the create completes", |peer| {
         peer.live("global")["op"]["status"] == "completed"
     })

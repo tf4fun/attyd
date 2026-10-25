@@ -312,7 +312,7 @@ async fn a_new_sessions_early_controls_survive_its_creation_response() {
         {"jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": "new"}},
     ]))
     .await;
-    assert_eq!(Peer::ended(created).await.unwrap(), json!({"sessionId": "new"}));
+    assert_eq!(peer.ended(created).await.unwrap(), json!({"sessionId": "new"}));
 
     let scope = session("new");
     let mut stream = Stream::open(&peer, &[scope.as_str()], None);

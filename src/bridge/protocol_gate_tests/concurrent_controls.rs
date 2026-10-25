@@ -174,7 +174,7 @@ async fn a_prompt_and_controls_progress_independently_but_public_operations_stay
     let fork = peer.request("session/fork").await;
     peer.reply(&fork, json!({"sessionId": "forked"})).await;
     assert_eq!(
-        Peer::ended(forked).await.unwrap(),
+        peer.ended(forked).await.unwrap(),
         json!({"sessionId": "forked"})
     );
     peer.settled().await;
@@ -264,7 +264,7 @@ async fn controls_resume_after_an_in_progress_history_installation() {
     let load = peer.request("session/load").await;
     assert_eq!(load["params"]["sessionId"], "replaying");
     assert_eq!(
-        Peer::ended(forked).await.unwrap(),
+        peer.ended(forked).await.unwrap(),
         json!({"sessionId": "replaying"})
     );
 

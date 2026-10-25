@@ -6235,20 +6235,32 @@ mod tests {
             admitted.await.unwrap().unwrap()
         }
 
-        /// Lists the catalog: the page its held response ends with.
+        /// Observes this operation's final result through the R4 stream.
+        pub(super) async fn ended(
+            &mut self,
+            scope: &str,
+            id: &str,
+        ) -> Result<Value, crate::protocol::documents::ProtocolError> {
+            self.until(|stream| {
+                let op = &stream.live(scope)["op"];
+                op["id"] == id && matches!(op["status"].as_str(), Some("completed" | "failed"))
+            })
+            .await;
+            let op = &self.live(scope)["op"];
+            if op["status"] == "completed" {
+                Ok(op["result"].clone())
+            } else {
+                Err(serde_json::from_value(op["error"].clone()).unwrap())
+            }
+        }
+
+        /// Lists the catalog and reads its published page.
         pub(super) async fn list(
             &mut self,
             commands: &mpsc::UnboundedSender<BridgeInput>,
         ) -> Value {
             let admission = self.write(commands, "catalog", "list", json!({})).await;
-            let page = tokio::time::timeout(Duration::from_secs(10), admission.end.unwrap())
-                .await
-                .expect("the list did not end")
-                .unwrap()
-                .unwrap();
-            self.until(|stream| stream.live("catalog")["op"]["id"] == admission.op)
-                .await;
-            page
+            self.ended("catalog", &admission.op).await.unwrap()
         }
     }
 
@@ -6378,11 +6390,7 @@ mod tests {
         let created = global
             .write(&commands, "global", "create", json!({"cwd": cwd}))
             .await;
-        let created = tokio::time::timeout(Duration::from_secs(10), created.end.unwrap())
-            .await
-            .expect("the create did not end")
-            .unwrap()
-            .unwrap();
+        let created = global.ended("global", &created.op).await.unwrap();
         assert_eq!(created["sessionId"], "test-session");
         let scope = "session/test-session";
         let mut session = V2Stream::open(&commands, &[(scope, None)]).await;
@@ -9061,17 +9069,10 @@ mod catalog_command_tests {
         let new = wire.next_request().await;
         assert_eq!(new["method"], "session/new");
         wire.reply(&new, json!({"sessionId": "created"})).await;
-        tokio::time::timeout(Duration::from_secs(3), creating.end.unwrap())
-            .await
-            .expect("the create did not end")
-            .unwrap()
-            .unwrap();
+        stream.ended("global", &creating.op).await.unwrap();
         wire.reply(&list, json!({"sessions": [], "nextCursor": null}))
             .await;
-        let stale = tokio::time::timeout(Duration::from_secs(3), listing.end.unwrap())
-            .await
-            .expect("the list did not end")
-            .unwrap();
+        let stale = stream.ended("catalog", &listing.op).await;
         assert!(stale.is_err(), "a stale page was returned: {stale:?}");
         stream
             .until(|stream| {

@@ -4,51 +4,12 @@
 //! keeps its final status, result or error until the next operation replaces
 //! it. Pending interactions and a prompt's process are not stored here; the
 //! projection reads them from the bridge state they live in.
-use std::sync::{Arc, Mutex};
-
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
 use super::canon::{Attachments, normalize};
 use super::documents::{OperationKind, OperationStatus, ProtocolError};
-
-/// How an operation ended, as a held response takes it (protocol §6.3).
-pub(crate) type OpEnd = Result<Value, ProtocolError>;
-
-/// The held response of a `create`, `fork` or `list` (protocol §6.3): it takes
-/// the operation's end once, when its slot ends, and nothing is kept after.
-/// It is not part of what the slot shows.
-#[derive(Clone, Default)]
-pub(crate) struct Completion(Option<Arc<Mutex<Option<tokio::sync::oneshot::Sender<OpEnd>>>>>);
-
-impl Completion {
-    pub(crate) fn new(sender: tokio::sync::oneshot::Sender<OpEnd>) -> Self {
-        Self(Some(Arc::new(Mutex::new(Some(sender)))))
-    }
-
-    fn deliver(&self, end: OpEnd) {
-        if let Some(sender) = self
-            .0
-            .as_ref()
-            .and_then(|sender| sender.lock().expect("completion poisoned").take())
-        {
-            let _ = sender.send(end);
-        }
-    }
-}
-
-impl std::fmt::Debug for Completion {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Completion")
-    }
-}
-
-impl PartialEq for Completion {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
 
 /// A 128-bit random operation ID in unpadded base64url (protocol §6.5).
 pub(crate) fn operation_id() -> String {
@@ -68,8 +29,6 @@ pub(crate) struct OpSlot {
     pub error: Option<ProtocolError>,
     /// The blocks a normalized prompt input references.
     pub attachments: Attachments,
-    /// The held response waiting for this operation's end, if any.
-    pub completion: Completion,
     /// The scope the operation was written to: its issuing scope (protocol §4.4).
     pub scope: Option<String>,
     /// The operation this one replaced in its issuing scope: the `expect` it
@@ -88,7 +47,6 @@ impl OpSlot {
             result: None,
             error: None,
             attachments: Attachments::default(),
-            completion: Completion::default(),
             scope: None,
             after: None,
         }
@@ -123,13 +81,11 @@ impl OpSlot {
 
     pub(crate) fn complete(&mut self, result: Value) {
         self.status = OperationStatus::Completed;
-        self.completion.deliver(Ok(result.clone()));
         self.result = Some(result);
     }
 
     pub(crate) fn fail(&mut self, error: ProtocolError) {
         self.status = OperationStatus::Failed;
-        self.completion.deliver(Err(error.clone()));
         self.error = Some(error);
     }
 }
