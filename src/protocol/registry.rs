@@ -182,6 +182,7 @@ impl SessionRegistry {
     /// Installs a running operation in `scope` and occupies the other scopes it
     /// acts on (a delete occupies its session). Admission (protocol §6.4) is
     /// checked by the caller; this only refuses a scope that is not free.
+    #[cfg(test)]
     pub(crate) fn install_operation(
         &mut self,
         scope: &Scope,
@@ -468,6 +469,7 @@ impl SessionRegistry {
 
     /// The running operation of `kind` in `scope` failed. A failed delete
     /// frees the session it occupied.
+    #[cfg(test)]
     pub(crate) fn fail_scope_operation(
         &mut self,
         scope: &Scope,

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::*;
-use crate::protocol::hash::{Hash, L, ZERO};
+use crate::protocol::hash::{L, ZERO};
 use crate::protocol::tree::Spec;
 
 const PATH: &str = "/s/entries/0/chunks/0/content/text";
@@ -33,11 +33,6 @@ fn segment(read: SegmentRead) -> Segment {
         SegmentRead::Segment(segment) => segment,
         other => panic!("{other:?}"),
     }
-}
-
-fn state(text: &str) -> String {
-    let before: Hash = hash::segments(text).fold(ZERO, |state, segment| hash::chain_step(&state, segment));
-    state_wire(&before)
 }
 
 #[test]

@@ -100,15 +100,6 @@ impl EventSink {
     }
 }
 
-fn ensure_interaction_delivered(delivered: bool, interaction: &str) -> Result<(), Error> {
-    if !delivered {
-        return Err(Error::request_cancelled().data(format!(
-            "Agent cancelled the {interaction} request before delivery"
-        )));
-    }
-    Ok(())
-}
-
 fn relay_bytes(value: &impl Serialize) -> Result<usize, Error> {
     let bytes = serde_json::to_vec(value)?.len();
     Ok(bytes)
@@ -4848,13 +4839,6 @@ fn nonempty_string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, E
         .ok_or_else(|| Error::invalid_params().data(format!("{field} must contain non-empty")))
 }
 
-fn string_field_allow_empty<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::invalid_params().data(format!("{field} must be a string")))
-}
-
 fn u16_field(value: &Value, field: &str) -> Result<u16, Error> {
     value
         .get(field)
@@ -6478,13 +6462,6 @@ mod tests {
         assert!(!remote.auth.terminal);
     }
 
-    #[test]
-    fn failed_interaction_delivery_is_never_reported_as_resolved() {
-        let error = ensure_interaction_delivered(false, "elicitation").unwrap_err();
-        assert_eq!(error.code, ErrorCode::RequestCancelled);
-        ensure_interaction_delivered(true, "elicitation").unwrap();
-    }
-
     #[tokio::test]
     async fn buffers_pre_response_updates_and_drops_late_unknown_sessions() {
         // Zed's ACP regression suite requires load replay notifications arriving before
@@ -7268,7 +7245,6 @@ mod tests {
         assert!(string_field(&command, "wideIdentifier").is_ok());
         assert!(string_field(&command, "tooWideIdentifier").is_ok());
         assert!(nonempty_string_field(&command, "path").is_ok());
-        assert_eq!(string_field_allow_empty(&command, "empty").unwrap(), "");
         assert_eq!(u16_field(&command, "cols").unwrap(), 80);
         assert!(u16_field(&command, "zero").is_err());
         assert!(u16_field(&json!({ "cols": 65_536 }), "cols").is_err());

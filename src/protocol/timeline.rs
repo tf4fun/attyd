@@ -176,6 +176,7 @@ pub(crate) struct Timeline {
 
 impl Timeline {
     /// A load candidate: the replay reduced by the same reducer as live updates.
+    #[cfg(test)]
     pub(crate) fn from_replay<'a>(
         updates: impl IntoIterator<Item = (&'a Value, Option<&'a Value>)>,
     ) -> Self {

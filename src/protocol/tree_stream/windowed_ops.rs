@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use super::super::diff;
-use super::super::hash::{self, TextChain, TextRule};
+use super::super::hash::{self, TextChain};
 use super::super::tree::{Node, Tree, escape, unescape};
 use super::super::window::{self, appends, state_wire};
 use super::super::{AppendTail, Op};

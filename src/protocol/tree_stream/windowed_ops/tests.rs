@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::*;
-use crate::protocol::hash::L;
+use crate::protocol::hash::{L, TextRule};
 use crate::protocol::tree::Spec;
 use crate::protocol::window::windowed_value_hash;
 
@@ -198,7 +198,7 @@ fn with_the_smallest_window_one_byte_is_an_append_and_twelve_thousand_bytes_are_
     let step = |texts: &[&str]| root(&texts.iter().map(|t| t.to_string()).collect::<Vec<_>>());
     let mut tree = Tree::new("i");
     tree.commit(step(&["start"]));
-    let mut ops_of = |tree: &mut Tree, texts: &[&str]| {
+    let ops_of = |tree: &mut Tree, texts: &[&str]| {
         let committed = tree.commit_with_ops(step(texts)).unwrap();
         let mut replaced = BTreeSet::new();
         committed

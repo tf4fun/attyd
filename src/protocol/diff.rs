@@ -154,6 +154,7 @@ fn utf16_len(text: &str) -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ApplyError {
     pub path: String,
     pub reason: &'static str,
@@ -161,6 +162,7 @@ pub(crate) struct ApplyError {
 
 /// Applies one op. A violation is a protocol error; the replica resets the
 /// scope (protocol §5.3).
+#[cfg(test)]
 pub(crate) fn apply(document: &mut Value, op: &Op) -> Result<(), ApplyError> {
     let path = match op {
         Op::Set { path, .. }
@@ -252,6 +254,7 @@ pub(crate) fn apply(document: &mut Value, op: &Op) -> Result<(), ApplyError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn parse(path: &str) -> Option<Vec<String>> {
     if path.is_empty() {
         return Some(Vec::new());
@@ -276,12 +279,14 @@ fn parse(path: &str) -> Option<Vec<String>> {
         .collect()
 }
 
+#[cfg(test)]
 fn index(token: &str) -> Option<usize> {
     (token == "0" || !token.starts_with('0'))
         .then(|| token.parse().ok())
         .flatten()
 }
 
+#[cfg(test)]
 fn walk<'a>(mut value: &'a mut Value, tokens: &[String]) -> Option<&'a mut Value> {
     for token in tokens {
         value = match value {

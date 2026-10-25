@@ -16,21 +16,26 @@
 //! is the unpadded base64url encoding of the first 16 bytes.
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use super::canon::canonical_json;
 
 /// A SHA-256 hash.
 pub(crate) type Hash = [u8; 32];
 
 /// `e_i`: the hash of one entry as it is published.
+#[cfg(test)]
 pub(crate) fn entry_hash(entry: &Value) -> Hash {
     Sha256::digest(canonical_json(entry)).into()
 }
 
 /// `E`: the digest of the entry hashes in order. A session whose history is
 /// unknown has no entries, which is not the same as an empty list.
+#[cfg(test)]
 pub(crate) fn entries_digest(hashes: Option<&[Hash]>) -> Hash {
     match hashes {
         None => Sha256::digest(b"unknown").into(),
@@ -47,6 +52,7 @@ pub(crate) fn entries_digest(hashes: Option<&[Hash]>) -> Hash {
 /// The digest of a session document: `head` is the document without its
 /// entries (`epoch`, `rev`, `history`, `prompts`, `live`; `history` is absent
 /// while the history is unknown), `entries` their hashes, or `None` while unknown.
+#[cfg(test)]
 pub(crate) fn session_digest(head: &Value, entries: Option<&[Hash]>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical_json(head));
@@ -56,6 +62,7 @@ pub(crate) fn session_digest(head: &Value, entries: Option<&[Hash]>) -> String {
 }
 
 /// The digest of a `global` or `catalog` document (`epoch`, `rev`, `live`).
+#[cfg(test)]
 pub(crate) fn scope_digest(document: &Value) -> String {
     let digest: Hash = Sha256::digest(canonical_json(document)).into();
     wire(&digest)

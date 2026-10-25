@@ -118,6 +118,7 @@ impl Feed {
     }
 
     /// Registers a stream of revision 4 and queues its first event.
+    #[cfg(test)]
     pub(crate) fn subscribe_tree(&mut self, query: &StreamQuery) -> SubscriptionId {
         self.subscribe_tree_at(query, false)
     }
@@ -143,6 +144,7 @@ impl Feed {
         self.tree_subscribers.remove(&id);
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribers(&self) -> usize {
         self.tree_subscribers.len()
     }
@@ -232,6 +234,7 @@ impl Feed {
     }
 
     /// The commit step: publishes the paths that changed since the last one.
+    #[cfg(test)]
     pub(crate) fn commit(
         &mut self,
         registry: &SessionRegistry,
@@ -242,6 +245,7 @@ impl Feed {
     }
 
     /// `commit` at `now`, which paces the checkpoints of what changed.
+    #[cfg(test)]
     pub(crate) fn commit_at(
         &mut self,
         registry: &SessionRegistry,
@@ -370,6 +374,7 @@ impl FeedHandle {
     }
 
     /// Publishes what changed (see `Feed::commit`) and wakes the streams.
+    #[cfg(test)]
     pub(crate) fn commit(
         &self,
         registry: &SessionRegistry,
@@ -442,6 +447,7 @@ impl FeedHandle {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribers(&self) -> usize {
         self.feed().subscribers()
     }

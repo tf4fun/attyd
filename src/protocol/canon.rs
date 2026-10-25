@@ -74,6 +74,7 @@ pub(crate) enum AttachmentKind {
 pub(crate) struct Attachments(HashMap<String, Arc<Value>>);
 
 impl Attachments {
+    #[cfg(test)]
     pub(crate) fn get(&self, id: &str) -> Option<&Value> {
         self.0.get(id).map(|block| &**block)
     }
@@ -81,6 +82,7 @@ impl Attachments {
 
 /// A prompt names an attachment the session does not keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct UnknownAttachment(pub String);
 
 /// Normalizes content, keeping each attachment's block in `attachments`. Text and
@@ -166,6 +168,7 @@ fn without_meta(value: &Value) -> Value {
 
 /// Turns a prompt's attachment references back into the blocks they name, before
 /// `session/prompt`.
+#[cfg(test)]
 pub(crate) fn resolve(
     prompt: &[PromptBlock],
     attachments: &Attachments,
